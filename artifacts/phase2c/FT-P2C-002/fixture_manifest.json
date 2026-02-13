@@ -1,0 +1,28 @@
+{
+  "packet_id": "FT-P2C-002",
+  "fixtures": [
+    {
+      "id": "dispatch_strict_autograd_route",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "strict_autograd_route",
+      "oracle_family": "dispatch_key",
+      "assertions": ["output", "selected_key", "backend_key", "kernel", "fallback"]
+    },
+    {
+      "id": "dispatch_strict_cpu_route",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "strict_cpu_route",
+      "oracle_family": "dispatch_key",
+      "assertions": ["output", "selected_key", "backend_key", "kernel", "fallback"]
+    },
+    {
+      "id": "dispatch_mode_split_composite_route",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "composite_route_mode_split",
+      "oracle_family": "dispatch_key",
+      "assertions": ["strict_error", "hardened_fallback", "kernel"]
+    }
+  ],
+  "modes": ["strict", "hardened"],
+  "status": "active"
+}

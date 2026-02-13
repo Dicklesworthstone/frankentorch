@@ -1,0 +1,5 @@
+{
+  "suite": "smoke",
+  "oracle": "legacy_pytorch_code/pytorch",
+  "notes": "Bootstrap fixture for first runnable conformance harness"
+}

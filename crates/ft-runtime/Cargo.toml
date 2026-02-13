@@ -1,0 +1,17 @@
+[package]
+name = "ft-runtime"
+version = "0.1.0"
+edition = "2024"
+
+[features]
+default = []
+asupersync-integration = ["dep:asupersync"]
+frankentui-integration = ["dep:ftui"]
+
+[dependencies]
+ft-core = { workspace = true }
+asupersync = { workspace = true, optional = true }
+ftui = { workspace = true, optional = true }
+
+[lints]
+workspace = true

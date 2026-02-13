@@ -1,0 +1,16 @@
+{
+  "artifact_id": "FT-P2C-001-parity-report",
+  "artifact_type": "conformance",
+  "source_hash": "sha256:deferred",
+  "raptorq": {
+    "k": 0,
+    "repair_symbols": 0,
+    "overhead_ratio": 0.0,
+    "status": "deferred_until_raptorq_pipeline_is_wired"
+  },
+  "scrub": {
+    "status": "deferred",
+    "last_ok_unix_ms": 0
+  },
+  "notes": "RaptorQ sidecar schema is established; encode/decode integration lands in FT-P2C-006."
+}

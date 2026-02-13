@@ -1,0 +1,14 @@
+{
+  "packet_id": "FT-P2C-001",
+  "suite": "scalar_dac",
+  "strict": {
+    "cases_total": 2,
+    "cases_passed": 2
+  },
+  "hardened": {
+    "cases_total": 2,
+    "cases_passed": 2
+  },
+  "status": "parity_green",
+  "generated_from": "cargo test -p ft-conformance -- --nocapture"
+}

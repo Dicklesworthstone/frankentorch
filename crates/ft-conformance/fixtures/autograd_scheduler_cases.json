@@ -1,0 +1,13 @@
+{
+  "cases": [
+    {
+      "name": "composite_scheduler_dac",
+      "x": 2.0,
+      "y": 3.0,
+      "expected_x_grad": 7.0,
+      "expected_y_grad": 2.0,
+      "expected_execution_order": [3, 2, 1, 0],
+      "tolerance": 1e-12
+    }
+  ]
+}

@@ -1,0 +1,24 @@
+{
+  "cases": [
+    {
+      "name": "add_basic",
+      "op": "add",
+      "lhs": 2.0,
+      "rhs": 3.0,
+      "expected_output": 5.0,
+      "expected_lhs_grad": 1.0,
+      "expected_rhs_grad": 1.0,
+      "tolerance": 1e-12
+    },
+    {
+      "name": "mul_basic",
+      "op": "mul",
+      "lhs": 2.0,
+      "rhs": 3.0,
+      "expected_output": 6.0,
+      "expected_lhs_grad": 3.0,
+      "expected_rhs_grad": 2.0,
+      "tolerance": 1e-12
+    }
+  ]
+}

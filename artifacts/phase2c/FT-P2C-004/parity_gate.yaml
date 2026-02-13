@@ -1,0 +1,20 @@
+packet_id: FT-P2C-004
+suite: autograd_scheduler
+release_blocking: true
+
+strict:
+  required_cases_passed_ratio: 1.0
+  critical_drift_budget: 0
+
+hardened:
+  required_cases_passed_ratio: 1.0
+  divergence_budget_ratio: 0.0
+
+checks:
+  - command: CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance strict_scheduler_conformance_is_green -- --nocapture
+  - command: CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance hardened_scheduler_conformance_is_green -- --nocapture
+  - command: CARGO_TARGET_DIR=target_codex cargo test --workspace
+
+artifacts:
+  - crates/ft-conformance/fixtures/autograd_scheduler_cases.json
+  - artifacts/phase2c/FT-P2C-004/fixture_manifest.json

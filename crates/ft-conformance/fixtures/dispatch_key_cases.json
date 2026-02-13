@@ -1,0 +1,72 @@
+{
+  "cases": [
+    {
+      "name": "strict_autograd_route",
+      "op": "add",
+      "lhs": 2.0,
+      "rhs": 3.0,
+      "requires_grad": true,
+      "strict": {
+        "expected_output": 5.0,
+        "expected_selected_key": "AutogradCPU",
+        "expected_backend_key": "CPU",
+        "expected_kernel": "autograd_cpu::add_scalar",
+        "expected_fallback": false,
+        "expect_error": false
+      },
+      "hardened": {
+        "expected_output": 5.0,
+        "expected_selected_key": "AutogradCPU",
+        "expected_backend_key": "CPU",
+        "expected_kernel": "autograd_cpu::add_scalar",
+        "expected_fallback": false,
+        "expect_error": false
+      },
+      "tolerance": 1e-12
+    },
+    {
+      "name": "strict_cpu_route",
+      "op": "mul",
+      "lhs": 2.0,
+      "rhs": 3.0,
+      "requires_grad": false,
+      "strict": {
+        "expected_output": 6.0,
+        "expected_selected_key": "CPU",
+        "expected_backend_key": "CPU",
+        "expected_kernel": "cpu::mul_scalar",
+        "expected_fallback": false,
+        "expect_error": false
+      },
+      "hardened": {
+        "expected_output": 6.0,
+        "expected_selected_key": "CPU",
+        "expected_backend_key": "CPU",
+        "expected_kernel": "cpu::mul_scalar",
+        "expected_fallback": false,
+        "expect_error": false
+      },
+      "tolerance": 1e-12
+    },
+    {
+      "name": "composite_route_mode_split",
+      "op": "add",
+      "lhs": 4.0,
+      "rhs": 5.0,
+      "requires_grad": false,
+      "keyset": ["CompositeExplicitAutograd", "CPU", "BackendSelect"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expected_output": 9.0,
+        "expected_selected_key": "CompositeExplicitAutograd",
+        "expected_backend_key": "CPU",
+        "expected_kernel": "cpu::add_scalar",
+        "expected_fallback": true,
+        "expect_error": false
+      },
+      "tolerance": 1e-12
+    }
+  ]
+}

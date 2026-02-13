@@ -1,0 +1,14 @@
+{
+  "packet_id": "FT-P2C-004",
+  "suite": "autograd_scheduler",
+  "strict": {
+    "cases_total": 1,
+    "cases_passed": 1
+  },
+  "hardened": {
+    "cases_total": 1,
+    "cases_passed": 1
+  },
+  "status": "parity_green",
+  "generated_from": "CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance -- --nocapture"
+}

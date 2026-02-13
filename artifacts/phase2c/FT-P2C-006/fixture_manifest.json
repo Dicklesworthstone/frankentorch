@@ -1,0 +1,21 @@
+{
+  "packet_id": "FT-P2C-006",
+  "fixtures": [
+    {
+      "id": "serialization_checkpoint_basic",
+      "file": "crates/ft-conformance/fixtures/serialization_cases.json",
+      "case_name": "checkpoint_basic",
+      "oracle_family": "serialization",
+      "assertions": ["decode_roundtrip", "sidecar_generated", "proof_deterministic"]
+    },
+    {
+      "id": "serialization_checkpoint_sparse_grad",
+      "file": "crates/ft-conformance/fixtures/serialization_cases.json",
+      "case_name": "checkpoint_sparse_grad",
+      "oracle_family": "serialization",
+      "assertions": ["decode_roundtrip", "sidecar_generated", "proof_deterministic"]
+    }
+  ],
+  "modes": ["strict", "hardened"],
+  "status": "active"
+}

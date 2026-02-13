@@ -1,0 +1,17 @@
+{
+  "mode": "hardened",
+  "cases": [
+    {
+      "name": "add_basic",
+      "output": 5.0,
+      "lhs_grad": 1.0,
+      "rhs_grad": 1.0
+    },
+    {
+      "name": "mul_basic",
+      "output": 6.0,
+      "lhs_grad": 3.0,
+      "rhs_grad": 2.0
+    }
+  ]
+}

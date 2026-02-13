@@ -1,0 +1,19 @@
+packet_id: FT-P2C-001
+suite: scalar_dac
+release_blocking: true
+
+strict:
+  required_cases_passed_ratio: 1.0
+  critical_drift_budget: 0
+
+hardened:
+  required_cases_passed_ratio: 1.0
+  divergence_budget_ratio: 0.0
+
+checks:
+  - command: cargo test -p ft-conformance -- --nocapture
+  - command: cargo clippy --all-targets -- -D warnings
+
+artifacts:
+  - crates/ft-conformance/fixtures/scalar_autograd_cases.json
+  - artifacts/phase2c/FT-P2C-001/fixture_manifest.json

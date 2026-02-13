@@ -1,0 +1,21 @@
+{
+  "packet_id": "FT-P2C-001",
+  "fixtures": [
+    {
+      "id": "scalar_add_basic",
+      "file": "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+      "case_name": "add_basic",
+      "oracle_family": "autograd_scalar",
+      "assertions": ["output", "lhs_grad", "rhs_grad"]
+    },
+    {
+      "id": "scalar_mul_basic",
+      "file": "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+      "case_name": "mul_basic",
+      "oracle_family": "autograd_scalar",
+      "assertions": ["output", "lhs_grad", "rhs_grad"]
+    }
+  ],
+  "modes": ["strict", "hardened"],
+  "status": "active"
+}

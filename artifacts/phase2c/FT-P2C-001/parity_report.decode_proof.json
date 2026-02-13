@@ -1,0 +1,6 @@
+{
+  "artifact_id": "FT-P2C-001-parity-report",
+  "decode_events": [],
+  "status": "no_recovery_event",
+  "notes": "No decode event occurred in this packet because RaptorQ sidecar generation is deferred."
+}

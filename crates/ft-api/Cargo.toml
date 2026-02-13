@@ -1,0 +1,12 @@
+[package]
+name = "ft-api"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ft-autograd = { workspace = true }
+ft-core = { workspace = true }
+ft-runtime = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,14 @@
+{
+  "packet_id": "FT-P2C-002",
+  "suite": "dispatch_key",
+  "strict": {
+    "cases_total": 3,
+    "cases_passed": 3
+  },
+  "hardened": {
+    "cases_total": 3,
+    "cases_passed": 3
+  },
+  "status": "parity_green",
+  "generated_from": "CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance -- --nocapture"
+}

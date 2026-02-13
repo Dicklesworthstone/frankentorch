@@ -1,0 +1,11 @@
+[package]
+name = "ft-dispatch"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ft-core = { workspace = true }
+ft-kernel-cpu = { workspace = true }
+
+[lints]
+workspace = true

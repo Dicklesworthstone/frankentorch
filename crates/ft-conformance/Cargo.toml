@@ -1,0 +1,16 @@
+[package]
+name = "ft-conformance"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ft-api = { workspace = true }
+ft-core = { workspace = true }
+ft-autograd = { workspace = true }
+ft-dispatch = { workspace = true }
+ft-serialize = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

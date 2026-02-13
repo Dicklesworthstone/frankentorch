@@ -1,0 +1,14 @@
+{
+  "packet_id": "FT-P2C-006",
+  "suite": "serialization",
+  "strict": {
+    "cases_total": 2,
+    "cases_passed": 2
+  },
+  "hardened": {
+    "cases_total": 2,
+    "cases_passed": 2
+  },
+  "status": "parity_green",
+  "generated_from": "CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance -- --nocapture"
+}

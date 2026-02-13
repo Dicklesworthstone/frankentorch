@@ -1,0 +1,14 @@
+{
+  "packet_id": "FT-P2C-004",
+  "fixtures": [
+    {
+      "id": "autograd_scheduler_composite_dac",
+      "file": "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+      "case_name": "composite_scheduler_dac",
+      "oracle_family": "autograd_scheduler",
+      "assertions": ["gradients", "execution_order", "strict_reentrant_fail", "hardened_reentrant_fallback"]
+    }
+  ],
+  "modes": ["strict", "hardened"],
+  "status": "active"
+}

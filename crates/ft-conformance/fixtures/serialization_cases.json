@@ -1,0 +1,41 @@
+{
+  "cases": [
+    {
+      "name": "checkpoint_basic",
+      "entries": [
+        {
+          "node_id": 0,
+          "value": 2.0,
+          "grad": 1.0
+        },
+        {
+          "node_id": 1,
+          "value": 3.0,
+          "grad": 2.0
+        },
+        {
+          "node_id": 2,
+          "value": 6.0,
+          "grad": null
+        }
+      ],
+      "repair_symbols": 4
+    },
+    {
+      "name": "checkpoint_sparse_grad",
+      "entries": [
+        {
+          "node_id": 10,
+          "value": 42.0,
+          "grad": null
+        },
+        {
+          "node_id": 3,
+          "value": -1.5,
+          "grad": -0.25
+        }
+      ],
+      "repair_symbols": 3
+    }
+  ]
+}

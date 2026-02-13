@@ -1,0 +1,2 @@
+4da11ae85e450429aced9e5ba9f1ee9f6e34fbd0f311fe68df45b0eb42f9ceb4  artifacts/optimization/golden_outputs/scalar_dac_hardened.json
+660949e308396a77d63cc0cf4dbe1812cd640f31cc96a4db0657579e4488022b  artifacts/optimization/golden_outputs/scalar_dac_strict.json
