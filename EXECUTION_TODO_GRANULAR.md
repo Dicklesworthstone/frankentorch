@@ -140,3 +140,59 @@ Objective: complete `FT-P2C-002`, `FT-P2C-004`, and `FT-P2C-006` end-to-end (cod
 - [x] Re-scan checklist for any unchecked tasks and complete or explicitly defer with rationale.
 - [x] Summarize completed work, residual risks, and next-highest-value tasks.
 - [x] Explicitly confirm no destructive operations were used.
+
+## 8. Current Bead Execution — bd-3v0.3
+- [x] Run `bv --robot-triage` / `bv --robot-next` and select top actionable bead.
+- [x] Mark `bd-3v0.3` as `in_progress`.
+- [x] Reserve implementation files through Agent Mail.
+- [x] Implement machine-checkable artifact schema lock validator.
+- [x] Add schema lock spec doc (`SCHEMA_LOCK_V1.md`).
+- [x] Run validator + required cargo gates after schema-lock change.
+- [x] Send completion update via Agent Mail and mark bead status appropriately.
+
+## 9. Current Bead Execution — bd-3v0.2
+- [x] Select next top-impact bead via `bv --robot-next`.
+- [x] Mark `bd-3v0.2` as `in_progress`.
+- [x] Add versioned security/compatibility threat matrix.
+- [x] Add hardened-mode deviation allowlist (explicit allowlist-only policy).
+- [x] Extend schema validator with global checks for matrix+allowlist presence/shape.
+- [x] Validate all current packets and global controls resolve `READY`.
+- [x] Send completion updates through Agent Mail and close bead.
+
+## 10. Extreme/Alien Uplift Pass (Code + Beads)
+
+### 10.1 Optimization Loop — Validator Hotpath
+- [x] Build isolated benchmark binary target (`/tmp/frankentorch-target`) to avoid cargo lock contention.
+- [x] Create synthetic large-corpus benchmark root (`/tmp/ft_phase2c_bench_before_ep1sp0`) with 250 packet directories.
+- [x] Record baseline wall-time with hyperfine (`mean 68.8 ms`).
+- [x] Record baseline syscall profile with `strace -c` (`12,354` total calls).
+- [x] Implement one optimization lever only: single-pass packet file cache in `validate_phase2c_artifacts`.
+- [x] Re-run identical benchmark command and capture after metrics (`mean 64.7 ms`).
+- [x] Re-run syscall profile and capture after metrics (`10,098` total calls).
+- [x] Attach optimization evidence + risk note to bead `bd-3v0.8`.
+
+### 10.2 Behavior-Isomorphism + Safety Gates
+- [x] `cargo fmt --check`
+- [x] `cargo check --all-targets`
+- [x] `cargo clippy --all-targets -- -D warnings`
+- [x] `cargo test --workspace`
+- [x] `cargo test -p ft-conformance -- --nocapture`
+- [x] `cargo bench`
+- [x] Re-validate binary-scoped tests: `cargo test -p ft-conformance --bin validate_phase2c_artifacts`
+
+### 10.3 Bead Graph Uplift (All Open/In-Progress `bd-3v0*`)
+- [x] Export working set (`open + in_progress`) and quantify missing method-stack labels.
+- [x] Add `extreme-software-optimization` label to every open/in-progress bead.
+- [x] Add `alien-artifact-coding` label to every open/in-progress bead.
+- [x] Add `alien-graveyard` label to every open/in-progress bead.
+- [x] Verify zero missing labels for all three method tags.
+- [x] Pull high-confidence (`>=0.95`) dependency suggestions via `bv --robot-suggest`.
+- [x] Apply cycle-safe `missing_dependency` suggestions with `br dep add` (18 edges added).
+- [x] Reject cycle-inducing suggestions (2 rejected by cycle guard, intentionally not forced).
+- [x] Verify dependency graph is acyclic (`br dep cycles --json` => empty).
+- [x] Mark `bd-3v0.8` in-progress and log measured optimization evidence.
+- [x] Post graph-uplift summary comment on master bead `bd-3v0`.
+
+### 10.4 Multi-Agent Coordination
+- [ ] Fetch/respond to Agent Mail inbox messages (blocked: MCP transport decode failure in this environment).
+- [ ] Broadcast optimization + bead changes to agent peers after MCP transport recovery.

@@ -1,0 +1,61 @@
+{
+  "schema_version": "hardened-deviation-allowlist-v1",
+  "policy": "allowlist-only",
+  "strict_mode": {
+    "unknown_incompatible_behavior": "fail_closed",
+    "behavior_altering_repair": "forbidden"
+  },
+  "hardened_mode": {
+    "require_allowlist_entry": true,
+    "require_evidence_log": true,
+    "bounded_recovery_only": true
+  },
+  "packets": {
+    "FT-P2C-001": {
+      "disallowed_by_default": true,
+      "allowed_deviations": []
+    },
+    "FT-P2C-002": {
+      "disallowed_by_default": true,
+      "allowed_deviations": [
+        {
+          "id": "dispatch.composite_backend_fallback",
+          "description": "Permit composite/backend-select dispatch keys to resolve to backend key in hardened mode only",
+          "constraints": [
+            "mode == hardened",
+            "backend key is present",
+            "fallback_used evidence recorded"
+          ]
+        }
+      ]
+    },
+    "FT-P2C-004": {
+      "disallowed_by_default": true,
+      "allowed_deviations": [
+        {
+          "id": "autograd.reentrant_depth_bounded_fallback",
+          "description": "Permit bounded reentrant depth clamp in hardened mode",
+          "constraints": [
+            "mode == hardened",
+            "max depth configured",
+            "reentrant_guard_triggered telemetry recorded"
+          ]
+        }
+      ]
+    },
+    "FT-P2C-006": {
+      "disallowed_by_default": true,
+      "allowed_deviations": [
+        {
+          "id": "serialization.bounded_malformed_diagnostic",
+          "description": "Permit bounded diagnostic payload details for malformed input in hardened mode",
+          "constraints": [
+            "mode == hardened",
+            "incompatible payload still rejected",
+            "diagnostic output length bounded"
+          ]
+        }
+      ]
+    }
+  }
+}

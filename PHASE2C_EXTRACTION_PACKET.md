@@ -33,6 +33,10 @@ For each ticket above, deliver all artifacts in the same PR:
 - Hardened mode: same outward contract with bounded defensive checks (invalid graph/device/state).
 - Unknown incompatible schema/serialization/version path: fail-closed.
 
+Foundational policy artifacts:
+- `artifacts/phase2c/SECURITY_COMPATIBILITY_THREAT_MATRIX_V1.md`
+- `artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json`
+
 ## 4. Immediate Execution Order
 
 1. `FT-P2C-001`
@@ -97,6 +101,9 @@ Directory template:
 - `artifacts/phase2c/FT-P2C-00X/parity_report.raptorq.json`
 - `artifacts/phase2c/FT-P2C-00X/parity_report.decode_proof.json`
 
+Schema lock reference:
+- `artifacts/phase2c/SCHEMA_LOCK_V1.md`
+
 ## 9. Optimization and Isomorphism Proof Hooks
 
 Optimization allowed only after strict parity baseline.
@@ -116,6 +123,14 @@ Packet is `READY_FOR_IMPL` only when:
 4. risk note includes compatibility + security mitigations,
 5. parity report has RaptorQ sidecar + decode proof.
 
+Machine-check command:
+
+```bash
+cargo run -p ft-conformance --bin validate_phase2c_artifacts
+```
+
+Non-zero exit means at least one packet is `NOT_READY`.
+
 ## 11. Current Packet Status (2026-02-13)
 
 - `FT-P2C-001`: first implementation slice landed (`parity_green`).
@@ -127,3 +142,24 @@ Packet is `READY_FOR_IMPL` only when:
   - `artifacts/phase2c/FT-P2C-002/`
   - `artifacts/phase2c/FT-P2C-004/`
   - `artifacts/phase2c/FT-P2C-006/`
+
+## 12. Extreme Optimization Evidence Snapshot (2026-02-13)
+
+- Target: `crates/ft-conformance/src/bin/validate_phase2c_artifacts.rs`
+- Lever applied: single-pass packet file cache (read required packet artifacts once; validate from cached payloads).
+- Corpus: synthetic 250-packet tree at `/tmp/ft_phase2c_bench_before_ep1sp0`.
+- Before: `68.8 ms` mean (`hyperfine`, 15 runs, warmup 3, ignore failure).
+- After: `64.7 ms` mean (same command).
+- Delta: `~6.0%` faster wall-time.
+- Syscall delta (`strace -c`, same corpus):
+  - Before total calls: `12,354`
+  - After total calls: `10,098`
+  - Improvement: `~18.3%` fewer calls.
+
+Behavior-isomorphism gates run after change:
+- `cargo fmt --check`
+- `cargo check --all-targets`
+- `cargo clippy --all-targets -- -D warnings`
+- `cargo test --workspace`
+- `cargo test -p ft-conformance -- --nocapture`
+- `cargo bench`
