@@ -1,5 +1,9 @@
 # FEATURE_PARITY
 
+## Absolute Parity Doctrine
+
+This matrix tracks execution progress, not allowable scope reduction. Release readiness requires complete feature/functionality overlap with upstream PyTorch for intended drop-in replacement operation.
+
 ## Status Legend
 
 - `not_started`
@@ -14,8 +18,9 @@
 | Tensor core semantics | in_progress | `FT-P2C-001` scalar metadata/value/version slice shipped |
 | Dispatch key routing | parity_green | `FT-P2C-002` keyset model + strict/hardened mode split conformance |
 | Autograd correctness | parity_green | `FT-P2C-004` dependency-driven scheduler + deterministic replay telemetry |
-| CPU kernel subset | in_progress | scalar `add`/`mul` kernels green; tensor ops pending |
+| CPU kernel semantics | in_progress | scalar `add`/`mul` kernels green; tensor-op expansion in progress |
 | Checkpoint compatibility | parity_green | `FT-P2C-006` typed checkpoint + fail-closed decode + RaptorQ sidecars |
+| Full PyTorch drop-in surface | in_progress | aggregate parity-closure tracker; no intentional feature omissions permitted at release |
 
 ## Current Green Scope
 
@@ -25,6 +30,12 @@
 - `crates/ft-conformance/fixtures/serialization_cases.json`
 
 Modes tested for all listed families: strict + hardened.
+
+## Gap Policy
+
+- Any `parity_gap` item must have explicit closure beads and dependencies.
+- Temporary sequencing gaps are acceptable only with closure evidence plans.
+- Release sign-off requires `Full PyTorch drop-in surface` to be `parity_green`.
 
 ## Required Evidence Per Feature Family
 

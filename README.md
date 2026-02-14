@@ -6,6 +6,16 @@
 
 FrankenTorch is a clean-room Rust reimplementation targeting grand-scope excellence: semantic fidelity, mathematical rigor, operational safety, and profile-proven performance.
 
+## Absolute Parity Doctrine
+
+FrankenTorch is not a partial rewrite. The target is a true drop-in replacement with complete feature and functionality overlap with upstream PyTorch observable behavior.
+
+Non-negotiable rules:
+- no permanent scope cuts accepted as a release condition
+- no "minimal viable parity" acceptance standard
+- sequencing is allowed only as temporary execution order, never as feature removal
+- every temporary gap must map to explicit parity-closure beads plus conformance evidence
+
 ## What Makes This Project Special
 
 Deterministic Autograd Contract (DAC): replayable gradient graph execution with provenance-complete gradient evidence.
@@ -27,9 +37,9 @@ This project uses four pervasive disciplines:
 - legacy oracle cloned:
   - /dp/frankentorch/legacy_pytorch_code/pytorch
 
-## V1 Scope
+## Delivery Sequencing (Not Scope Reduction)
 
-- tensor storage/view/index semantics; - core op families with backward rules; - minimal nn and optimizer workflows; - checkpoint scope.
+Implementation proceeds in packetized waves (`FT-P2C-*`) to control risk and improve proof quality, but the terminal target remains complete PyTorch drop-in compatibility.
 
 ## Architecture Direction
 
@@ -37,7 +47,7 @@ tensor API -> dispatcher -> device kernels -> autograd engine -> nn and optimize
 
 ## Compatibility and Security Stance
 
-Preserve PyTorch-observable tensor semantics, autograd contracts, and scoped optimizer behaviors.
+Preserve full PyTorch-observable tensor semantics, autograd contracts, optimizer behaviors, serialization contracts, and runtime compatibility invariants required for drop-in use.
 
 Protect against gradient corruption, unsafe in-place mutation paths, and serialization mismatch or replay inconsistencies.
 
@@ -66,7 +76,7 @@ Maintain deterministic gradient accumulation, alias/versioning rules, and backwa
 ## Next Steps
 
 1. Scaffold Cargo workspace and crate map.
-2. Implement first end-to-end V1 vertical slice.
+2. Expand from the first shipped vertical slice through parity-closure packets until all intentional parity gaps are closed.
 3. Establish differential conformance harness vs legacy oracle.
 4. Record baseline benchmarks and wire regression gates.
 5. Add RaptorQ sidecar durability for persistent evidence artifacts.

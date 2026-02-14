@@ -1,0 +1,1817 @@
+{
+  "schema_version": "ft-conformance-differential-v1",
+  "oracle": {
+    "configured_python": "/data/projects/frankentorch/crates/ft-conformance/../../.venv-py314/bin/python",
+    "active_python": "/data/projects/frankentorch/crates/ft-conformance/../../.venv-py314/bin/python",
+    "available": true,
+    "message": "torch_available:2.10.0+cpu"
+  },
+  "modes": [
+    "strict",
+    "hardened"
+  ],
+  "total_checks": 100,
+  "failed_checks": 0,
+  "allowlisted_drifts": 2,
+  "blocking_drifts": 0,
+  "checks": [
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/hardened:add_basic",
+      "case_name": "add_basic",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "5.000000000000000",
+      "expected": "5.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/hardened:add_basic",
+      "case_name": "add_basic",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "1.000000000000000",
+      "expected": "1.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/hardened:add_basic",
+      "case_name": "add_basic",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "1.000000000000000",
+      "expected": "1.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/hardened:mul_basic",
+      "case_name": "mul_basic",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "6.000000000000000",
+      "expected": "6.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/hardened:mul_basic",
+      "case_name": "mul_basic",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "3.000000000000000",
+      "expected": "3.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/hardened:mul_basic",
+      "case_name": "mul_basic",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "2.000000000000000",
+      "expected": "2.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/strict:add_basic",
+      "case_name": "add_basic",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "5.000000000000000",
+      "expected": "5.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/strict:add_basic",
+      "case_name": "add_basic",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "1.000000000000000",
+      "expected": "1.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/strict:add_basic",
+      "case_name": "add_basic",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "1.000000000000000",
+      "expected": "1.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/strict:mul_basic",
+      "case_name": "mul_basic",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "6.000000000000000",
+      "expected": "6.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/strict:mul_basic",
+      "case_name": "mul_basic",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "3.000000000000000",
+      "expected": "3.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "scalar_dac",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "scalar_dac/strict:mul_basic",
+      "case_name": "mul_basic",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "2.000000000000000",
+      "expected": "2.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "alias_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "contiguous",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "linear_index",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "numel",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "hardened",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "hardened",
+      "comparator": "fail_closed_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "hardened",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "hardened",
+      "comparator": "fail_closed_oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "oracle_guard_skip",
+      "observed": "guarded_skip",
+      "expected": "guarded_skip",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "alias_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "contiguous",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "linear_index",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "numel",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "alias_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "contiguous",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "linear_index",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "numel",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "alias_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "contiguous",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "linear_index",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "numel",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "strict",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "strict",
+      "comparator": "fail_closed_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "strict",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "strict",
+      "comparator": "fail_closed_oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "oracle_guard_skip",
+      "observed": "guarded_skip",
+      "expected": "guarded_skip",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "alias_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "contiguous",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "linear_index",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "numel",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "alias_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "contiguous",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "linear_index",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "numel",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "tensor_meta",
+      "packet_id": "FT-P2C-001",
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "oracle_guard",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "true",
+      "expected": "true",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+        "artifacts/phase2c/FT-P2C-001/parity_report.json"
+      ]
+    },
+    {
+      "suite": "dispatch_key",
+      "packet_id": "FT-P2C-002",
+      "scenario_id": "dispatch_key/hardened:composite_route_mode_split",
+      "case_name": "composite_route_mode_split",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "allowlisted": true,
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback",
+      "observed": "true",
+      "expected": "false",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+        "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json"
+      ]
+    },
+    {
+      "suite": "dispatch_key",
+      "packet_id": "FT-P2C-002",
+      "scenario_id": "dispatch_key/hardened:strict_autograd_route",
+      "case_name": "strict_autograd_route",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "5.000000000000000",
+      "expected": "5.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+        "artifacts/phase2c/FT-P2C-002/parity_report.json"
+      ]
+    },
+    {
+      "suite": "dispatch_key",
+      "packet_id": "FT-P2C-002",
+      "scenario_id": "dispatch_key/hardened:strict_cpu_route",
+      "case_name": "strict_cpu_route",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "6.000000000000000",
+      "expected": "6.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+        "artifacts/phase2c/FT-P2C-002/parity_report.json"
+      ]
+    },
+    {
+      "suite": "dispatch_key",
+      "packet_id": "FT-P2C-002",
+      "scenario_id": "dispatch_key/strict:composite_route_mode_split",
+      "case_name": "composite_route_mode_split",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split",
+      "observed": "strict_fail_closed",
+      "expected": "strict_fail_closed",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json"
+      ]
+    },
+    {
+      "suite": "dispatch_key",
+      "packet_id": "FT-P2C-002",
+      "scenario_id": "dispatch_key/strict:strict_autograd_route",
+      "case_name": "strict_autograd_route",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "5.000000000000000",
+      "expected": "5.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+        "artifacts/phase2c/FT-P2C-002/parity_report.json"
+      ]
+    },
+    {
+      "suite": "dispatch_key",
+      "packet_id": "FT-P2C-002",
+      "scenario_id": "dispatch_key/strict:strict_cpu_route",
+      "case_name": "strict_cpu_route",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "6.000000000000000",
+      "expected": "6.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+        "artifacts/phase2c/FT-P2C-002/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/hardened:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "10.000000000000000",
+      "expected": "10.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/FT-P2C-004/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/hardened:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "7.000000000000000",
+      "expected": "7.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/FT-P2C-004/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/hardened:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "hardened",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "2.000000000000000",
+      "expected": "2.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/FT-P2C-004/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/hardened:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "hardened",
+      "comparator": "policy",
+      "status": "allowlisted_drift",
+      "allowlisted": true,
+      "drift_id": "autograd.reentrant_depth_bounded_fallback",
+      "reason_code": "autograd.reentrant_depth_bounded_fallback",
+      "observed": "true",
+      "expected": "false",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/strict:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "10.000000000000000",
+      "expected": "10.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/FT-P2C-004/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/strict:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "7.000000000000000",
+      "expected": "7.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/FT-P2C-004/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/strict:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "strict",
+      "comparator": "abs_tol",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "parity_ok",
+      "observed": "2.000000000000000",
+      "expected": "2.000000000000000",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+        "artifacts/phase2c/FT-P2C-004/parity_report.json"
+      ]
+    },
+    {
+      "suite": "autograd_scheduler",
+      "packet_id": "FT-P2C-004",
+      "scenario_id": "autograd_scheduler/strict:composite_scheduler_dac",
+      "case_name": "composite_scheduler_dac",
+      "mode": "strict",
+      "comparator": "policy",
+      "status": "pass",
+      "allowlisted": false,
+      "drift_id": null,
+      "reason_code": "reentrant_policy_match",
+      "observed": "guard_not_triggered",
+      "expected": "strict_fail_closed",
+      "evidence_refs": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json"
+      ]
+    }
+  ]
+}

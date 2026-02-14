@@ -1,16 +1,42 @@
 {
   "artifact_id": "FT-P2C-001-parity-report",
   "artifact_type": "conformance",
-  "source_hash": "sha256:deferred",
+  "notes": "Generated via ft-serialize::generate_raptorq_sidecar",
   "raptorq": {
-    "k": 0,
-    "repair_symbols": 0,
-    "overhead_ratio": 0.0,
-    "status": "deferred_until_raptorq_pipeline_is_wired"
+    "constraints": 10,
+    "k": 5,
+    "object_id_high": 5067780223329653855,
+    "object_id_low": 4923932207837957189,
+    "repair_manifest": [
+      {
+        "bytes": 64,
+        "degree": 3,
+        "esi": 5
+      },
+      {
+        "bytes": 64,
+        "degree": 2,
+        "esi": 6
+      },
+      {
+        "bytes": 64,
+        "degree": 6,
+        "esi": 7
+      },
+      {
+        "bytes": 64,
+        "degree": 3,
+        "esi": 8
+      }
+    ],
+    "repair_symbols": 4,
+    "schema_version": 1,
+    "seed": 5067780287586391121,
+    "symbol_size": 64
   },
   "scrub": {
-    "status": "deferred",
-    "last_ok_unix_ms": 0
+    "last_ok_unix_ms": 0,
+    "status": "ok"
   },
-  "notes": "RaptorQ sidecar schema is established; encode/decode integration lands in FT-P2C-006."
+  "source_hash": "det64:5308abf739e2a12b"
 }

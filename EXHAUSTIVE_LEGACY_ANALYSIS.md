@@ -3,9 +3,12 @@
 Date: 2026-02-13  
 Method stack: `$porting-to-rust` Phase-2 Deep Extraction + `$alien-artifact-coding` + `$extreme-software-optimization` + RaptorQ durability + frankenlibc/frankenfs strict/hardened doctrine.
 
+Doc-overhaul baseline matrix:
+- `artifacts/phase2c/DOC_PASS00_BASELINE_GAP_MATRIX_V1.md`
+
 ## 0. Mission and Completion Criteria
 
-This document defines exhaustive legacy extraction for FrankenTorch. Phase-2 is complete only when each scoped subsystem has:
+This document defines exhaustive legacy extraction for FrankenTorch. Phase-2 is complete only when each subsystem required for full drop-in parity has:
 1. explicit invariants,
 2. explicit crate ownership,
 3. explicit oracle families,
@@ -55,11 +58,11 @@ High-density zones:
 
 ## 4. Alien-Artifact Invariant Ledger (Formal Obligations)
 
-- `FT-I1` Tensor metadata integrity: `(storage, sizes, strides, dtype, device)` tuple remains valid under scoped ops.
+- `FT-I1` Tensor metadata integrity: `(storage, sizes, strides, dtype, device)` tuple remains valid under all implemented ops with explicit closure paths to full coverage.
 - `FT-I2` Dispatch determinism: identical dispatch context chooses identical kernel.
 - `FT-I3` Autograd consistency: backward graph scheduling preserves dependency and accumulation semantics.
 - `FT-I4` In-place version safety: mutation paths uphold versioning and alias guarantees.
-- `FT-I5` Checkpoint round-trip stability: scoped model state survives save/load without semantic drift.
+- `FT-I5` Checkpoint round-trip stability: model state survives save/load without semantic drift across implemented surfaces with explicit closure to full parity.
 
 Required proof artifacts per implemented slice:
 1. invariant statement,
@@ -154,10 +157,10 @@ Required envelope fields:
 
 1. Extract TensorImpl/storage invariants from `c10/core`.
 2. Extract dispatch-key ordering and fallback rules.
-3. Extract minimal CPU op semantic contracts (scoped op set).
+3. Extract CPU op semantic contracts in staged waves with explicit closure to full operator coverage.
 4. Extract autograd engine state transitions and queue invariants.
 5. Extract module state/register semantics from nn core.
-6. Extract checkpoint format semantics for scoped payloads.
+6. Extract checkpoint format semantics with closure path to full payload compatibility.
 7. Extract device guard and stream contract behavior.
 8. Build first differential fixture corpus for items 1-7.
 9. Implement mismatch/gradient taxonomy in `ft-conformance`.
@@ -193,7 +196,7 @@ Top source hotspots by line count (first-wave extraction anchors):
 Interpretation:
 - semantics are spread across C++ core + Python test oracles,
 - dispatch/autograd/serialization boundaries remain highest risk,
-- conformance harness must intentionally scope op coverage to prevent false completeness.
+- conformance harness must sequence op coverage by waves while preserving explicit closure plans to full coverage.
 
 ## 13. Phase-2C Extraction Payload Contract (Per Ticket)
 
@@ -201,10 +204,10 @@ Each `FT-P2C-*` ticket MUST produce:
 1. type and state inventory (tensor/storage/device/grad metadata),
 2. dispatch route and fallback decision tables,
 3. error and diagnostics contract map,
-4. gradient/graph invariants for scoped ops,
+4. gradient/graph invariants for implemented ops plus closure criteria for remaining parity surface,
 5. serialization format and version behavior notes,
 6. strict/hardened split policy,
-7. exclusion ledger,
+7. sequencing-boundary ledger with explicit parity-closure dependencies,
 8. fixture mapping manifest,
 9. optimization candidate and isomorphism risk note,
 10. RaptorQ artifact declaration.

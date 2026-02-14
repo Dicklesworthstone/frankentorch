@@ -1,7 +1,12 @@
 # EXECUTION_TODO_GRANULAR
 
 Execution date: 2026-02-13  
-Objective: complete `FT-P2C-002`, `FT-P2C-004`, and `FT-P2C-006` end-to-end (code, artifacts, conformance, optimization evidence, and validation).
+Objective: complete `FT-P2C-002`, `FT-P2C-004`, and `FT-P2C-006` end-to-end (code, artifacts, conformance, optimization evidence, and validation) as part of a larger full-parity program.
+
+## Absolute Parity Mandate
+- This checklist captures a batch execution wave, not final scope.
+- FrankenTorch release acceptance requires total feature/functionality overlap for drop-in replacement behavior.
+- Any temporary sequencing gaps must be tracked as explicit parity-closure work with unit/property, differential/adversarial, and e2e-forensics evidence.
 
 ## 0. Governance + Tracking
 - [x] Create persistent granular TODO list file.
@@ -235,3 +240,39 @@ Objective: complete `FT-P2C-002`, `FT-P2C-004`, and `FT-P2C-006` end-to-end (cod
 - [x] Re-run `bv --robot-next` and confirm next bead is `bd-3v0.4`.
 - [x] Mark `bd-3v0.4` as `in_progress`.
 - [x] Post progress comment describing closed gaps and remaining differential-oracle work.
+
+## 12. Current Execution Wave (2026-02-14) — Differential Core + FT-P2C-001 Foundations
+
+### 12.1 Absolute-Parity Doctrine Permeation
+- [x] Harden top-level planning/spec docs to state total drop-in parity as non-negotiable.
+- [x] Add `absolute-parity` + `drop-in-replacement` labels and explicit parity mandate block across active beads.
+- [x] Verify no dependency cycles after doctrine updates.
+
+### 12.2 Differential Conformance Harness Closure (`bd-3v0.4`)
+- [x] Add legacy oracle execution path using real PyTorch (`.venv-py314`) for scoped packet families.
+- [x] Add deterministic differential report schema with drift taxonomy.
+- [x] Add hardened allowlist evaluation for policy deviations.
+- [x] Add CLI emitter `run_differential_report`.
+- [x] Emit `artifacts/phase2c/conformance/differential_report_v1.json`.
+- [x] Add tests for differential sorting, JSON emission, and allowlist integrity.
+- [x] Run full validation suite and close `bd-3v0.4`.
+
+### 12.3 FT-P2C-001 Core Implementation Pass (`bd-3v0.12` in progress)
+- [x] Strengthen `ft-core` metadata invariants: rank/stride checks, overflow-safe offset math, index bounds/rank guards.
+- [x] Add explicit storage identity (`storage_id`) and alias-view semantics.
+- [x] Add deterministic tensor/meta evidence fingerprints.
+- [x] Add in-place version bump path and out-of-place version/storage behavior tests.
+- [x] Expand `ft-core` unit suite to 10 tests with new invariant coverage.
+- [x] Re-run workspace gates after core changes.
+- [ ] Close packet contract/threat-model prerequisite beads (`bd-3v0.12.2`, `bd-3v0.12.3`) so child implementation beads can be claimed.
+
+### 12.4 Essence Extraction Ledger (`bd-3v0.1`)
+- [x] Create `artifacts/phase2c/ESSENCE_EXTRACTION_LEDGER_V1.md` with row-level anchors, uncertainty tags, and test/e2e traceability.
+- [x] Link ledger from `PHASE2C_EXTRACTION_PACKET.md`.
+- [x] Validate packet artifact integrity via `validate_phase2c_artifacts`.
+- [x] Close `bd-3v0.1`.
+
+### 12.5 Coordination + Residuals
+- [x] Keep active bead status/comments synchronized via `br`.
+- [x] Record Agent Mail transport unavailability and fallback coordination approach in bead comments.
+- [ ] Resume direct agent-mail inbox/reply workflow once MCP transport is available.

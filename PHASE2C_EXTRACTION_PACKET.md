@@ -12,7 +12,7 @@ Purpose: convert Phase-2 analysis into direct implementation tickets with concre
 | `FT-P2C-002` | Dispatch key model | `DispatchKey` enum in `DispatchKey.h`; `DispatchKeySet` class in `DispatchKeySet.h`; dispatch macros in `aten/src/ATen/Dispatch.h` | `ft-dispatch` | `test/test_dispatch.py`, `test/test_python_dispatch.py` |
 | `FT-P2C-003` | Op schema ingestion | `DispatchKey`/`NativeFunction` classes in `torchgen/model.py`; `- func:` schema entries in `aten/src/ATen/native/native_functions.yaml` | `ft-dispatch`, `ft-kernel-cpu` | schema and dispatch integration tests |
 | `FT-P2C-004` | Autograd engine scheduling | `NodeTask`, `ReadyQueue`, `Engine::execute`, `thread_main`, `GraphTask` in `torch/csrc/autograd/engine.h` + `engine.cpp` | `ft-autograd` | `test/test_autograd.py`, `test/autograd/*` |
-| `FT-P2C-005` | CPU kernel first-wave semantics | selected kernel contracts from `aten/src/ATen/native/cpu/*` aligned to scoped schema list | `ft-kernel-cpu` | op parity suites in `test/test_torch.py` and op-specific tests |
+| `FT-P2C-005` | CPU kernel first-wave semantics | selected kernel contracts from `aten/src/ATen/native/cpu/*` aligned to staged schema closure plan | `ft-kernel-cpu` | op parity suites in `test/test_torch.py` and op-specific tests |
 | `FT-P2C-006` | Serialization/checkpoint contract | `THPStorage_writeFileRaw`, `THPStorage_readFileRaw` in `torch/csrc/serialization.cpp` | `ft-serialize`, `ft-core` | `test/test_serialization.py` |
 | `FT-P2C-007` | Device guard and backend transitions | `DeviceGuard` and backend transition semantics from `c10/core/*` + backend tests | `ft-device`, `ft-dispatch` | `test/test_cuda.py`, backend-specific suites |
 | `FT-P2C-008` | NN module/state contract first-wave | module/state behavior from `torch/nn/*` and state-dict interactions | `ft-nn`, `ft-serialize` | `test/test_nn.py`, `test/nn/*` |
@@ -29,13 +29,14 @@ For each ticket above, deliver all artifacts in the same PR:
 
 ## 3. Strict/Hardened Expectations per Packet
 
-- Strict mode: exact scoped PyTorch observable behavior.
+- Strict mode: exact PyTorch observable behavior for implemented surface, with explicit closure to full drop-in parity.
 - Hardened mode: same outward contract with bounded defensive checks (invalid graph/device/state).
 - Unknown incompatible schema/serialization/version path: fail-closed.
 
 Foundational policy artifacts:
 - `artifacts/phase2c/SECURITY_COMPATIBILITY_THREAT_MATRIX_V1.md`
 - `artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json`
+- `artifacts/phase2c/ESSENCE_EXTRACTION_LEDGER_V1.md`
 
 ## 4. Immediate Execution Order
 
@@ -68,7 +69,7 @@ Every `FT-P2C-*` packet MUST include:
 8. `serialization_contract`
 9. `strict_mode_policy`
 10. `hardened_mode_policy`
-11. `excluded_scope`
+11. `sequencing_boundary`
 12. `oracle_tests`
 13. `performance_sentinels`
 14. `compatibility_risks`
@@ -100,6 +101,7 @@ Directory template:
 - `artifacts/phase2c/FT-P2C-00X/parity_report.json`
 - `artifacts/phase2c/FT-P2C-00X/parity_report.raptorq.json`
 - `artifacts/phase2c/FT-P2C-00X/parity_report.decode_proof.json`
+- cross-packet extraction ledger: `artifacts/phase2c/ESSENCE_EXTRACTION_LEDGER_V1.md`
 
 Schema lock reference:
 - `artifacts/phase2c/SCHEMA_LOCK_V1.md`
@@ -111,7 +113,7 @@ Optimization allowed only after strict parity baseline.
 Required proof block:
 - dispatch ordering preserved
 - tensor metadata invariants preserved
-- gradient behavior preserved for scoped ops
+- gradient behavior preserved for implemented ops with explicit closure criteria for remaining parity surface
 - fixture checksum verification pass/fail
 
 ## 10. Packet Readiness Rubric

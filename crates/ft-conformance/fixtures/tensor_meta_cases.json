@@ -1,0 +1,54 @@
+{
+  "cases": [
+    {
+      "name": "contiguous_basic_index",
+      "shape": [2, 3],
+      "storage_offset": 0,
+      "index": [1, 2],
+      "expected_linear_index": 5,
+      "expected_numel": 6,
+      "expected_contiguous": true,
+      "expect_valid": true,
+      "alias_offset": 0
+    },
+    {
+      "name": "strided_offset_index",
+      "shape": [2, 2],
+      "strides": [4, 1],
+      "storage_offset": 3,
+      "index": [1, 1],
+      "expected_linear_index": 8,
+      "expected_numel": 4,
+      "expected_contiguous": false,
+      "expect_valid": true,
+      "alias_offset": 2
+    },
+    {
+      "name": "scalar_offset_index",
+      "shape": [],
+      "storage_offset": 7,
+      "index": [],
+      "expected_linear_index": 7,
+      "expected_numel": 1,
+      "expected_contiguous": true,
+      "expect_valid": true,
+      "alias_offset": 5
+    },
+    {
+      "name": "invalid_rank_stride_mismatch",
+      "shape": [2, 2],
+      "strides": [2],
+      "storage_offset": 0,
+      "index": [0, 0],
+      "expect_valid": false
+    },
+    {
+      "name": "invalid_storage_offset_overflow",
+      "shape": [2],
+      "strides": [18446744073709551615],
+      "storage_offset": 1,
+      "index": [0],
+      "expect_valid": false
+    }
+  ]
+}

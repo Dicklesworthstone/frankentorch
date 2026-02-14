@@ -14,6 +14,56 @@
       "case_name": "mul_basic",
       "oracle_family": "autograd_scalar",
       "assertions": ["output", "lhs_grad", "rhs_grad"]
+    },
+    {
+      "id": "tensor_meta_contiguous_basic_index",
+      "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+      "case_name": "contiguous_basic_index",
+      "oracle_family": "tensor_meta_contract",
+      "assertions": [
+        "numel",
+        "contiguous",
+        "storage_index",
+        "alias_storage_identity"
+      ]
+    },
+    {
+      "id": "tensor_meta_strided_offset_index",
+      "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+      "case_name": "strided_offset_index",
+      "oracle_family": "tensor_meta_contract",
+      "assertions": [
+        "numel",
+        "non_contiguous",
+        "storage_index",
+        "alias_storage_identity"
+      ]
+    },
+    {
+      "id": "tensor_meta_scalar_offset_index",
+      "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+      "case_name": "scalar_offset_index",
+      "oracle_family": "tensor_meta_contract",
+      "assertions": [
+        "numel",
+        "contiguous",
+        "storage_index",
+        "alias_storage_identity"
+      ]
+    },
+    {
+      "id": "tensor_meta_invalid_rank_stride_mismatch",
+      "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+      "case_name": "invalid_rank_stride_mismatch",
+      "oracle_family": "tensor_meta_contract",
+      "assertions": ["expect_fail_closed"]
+    },
+    {
+      "id": "tensor_meta_invalid_storage_offset_overflow",
+      "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+      "case_name": "invalid_storage_offset_overflow",
+      "oracle_family": "tensor_meta_contract",
+      "assertions": ["expect_fail_closed"]
     }
   ],
   "modes": ["strict", "hardened"],

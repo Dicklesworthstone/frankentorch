@@ -1,13 +1,13 @@
 {
   "packet_id": "FT-P2C-001",
-  "suite": "scalar_dac",
+  "suite": "tensor_core_dac",
   "strict": {
-    "cases_total": 2,
-    "cases_passed": 2
+    "cases_total": 7,
+    "cases_passed": 7
   },
   "hardened": {
-    "cases_total": 2,
-    "cases_passed": 2
+    "cases_total": 7,
+    "cases_passed": 7
   },
   "status": "parity_green",
   "generated_from": "cargo test -p ft-conformance -- --nocapture"

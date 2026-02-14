@@ -14,15 +14,15 @@ Critical.
 2. Explicit compatibility checks before kernel execution (`dtype/device`).
 3. Mode-aware dispatch decision records in evidence ledger.
 4. Strict + hardened conformance execution for the same fixture family.
+5. Tensor-meta differential layer now includes metamorphic offset-shift checks and adversarial oracle fail-closed checks with resource guards.
 
 ## Residual Risk
 
-- Current fixture family is scalar-only; vector/tensor shape interactions are not yet covered.
-- Storage alias/view semantics not yet implemented in this packet.
+- Tensor metadata fixtures still under-sample high-rank and symbolic shape families.
+- Oracle guard intentionally skips unsafe huge-allocation adversarial probes; those remain covered by local fail-closed checks only.
 
 ## Next Controls
 
-- Add tensor-shape and alias/version fixtures in `FT-P2C-002`.
-- Add adversarial mutation fixtures in `FT-P2C-004`.
-- Add RaptorQ sidecar generation for parity reports once packet report serialization lands.
-
+- Expand tensor-meta adversarial corpus with seeded fuzz-style case generation and bounded oracle mirror probes.
+- Add symbolic-shape parity coverage in `FT-P2C-002`.
+- Add mutation-path adversarial fixtures in `FT-P2C-004`.

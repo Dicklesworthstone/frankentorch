@@ -3,15 +3,16 @@
 ## 1. Architecture Principles
 
 1. Spec-first implementation; no line translation.
-2. Strict mode for compatibility; hardened mode for defensive operation.
+2. Strict mode for full compatibility parity; hardened mode for defensive operation without contract drift.
 3. RaptorQ sidecars for long-lived conformance and benchmark artifacts.
 4. Profile-first optimization with isomorphism proofs.
 5. Deterministic Autograd Contract (DAC): replayable backward traces with evidence ledger entries.
+6. No permanent feature/functionality exclusions; all staged gaps require explicit closure tracking.
 
 ## 2. Crate Map
 
 - `ft-core`: tensor metadata/value/version model and compatibility invariants.
-- `ft-dispatch`: scoped op routing and dispatch decision records.
+- `ft-dispatch`: op routing and dispatch decision records across parity-closure families.
 - `ft-kernel-cpu`: eager CPU kernels (first wave).
 - `ft-autograd`: graph capture + deterministic backward replay.
 - `ft-device`: device guards and same-device contracts.
@@ -39,7 +40,7 @@
 
 ## 5. Compatibility and Security
 
-- strict mode: maximize scoped PyTorch parity.
+- strict mode: maximize full PyTorch drop-in parity.
 - hardened mode: same outward contract with defensive checks and audited diagnostics.
 - unknown incompatible metadata/protocol fields: fail-closed.
 
@@ -52,4 +53,4 @@
 
 - fixture families are versioned and machine-readable.
 - strict and hardened mode both required for green status.
-- parity reports are release-gating for scoped API families.
+- parity reports are release-gating for full drop-in target families.

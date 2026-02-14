@@ -1,5 +1,8 @@
 # EXISTING_PYTORCH_STRUCTURE
 
+Doc-overhaul baseline matrix:
+- `artifacts/phase2c/DOC_PASS00_BASELINE_GAP_MATRIX_V1.md`
+
 ## 1. Legacy Oracle
 
 - Root: `/dp/frankentorch/legacy_pytorch_code/pytorch`
@@ -28,7 +31,7 @@
 
 - Dispatcher fallback/table lookup behavior.
 - Backward ordering and stream contracts.
-- Checkpoint/serialization format behavior for scoped state.
+- Checkpoint/serialization format behavior across full state surface needed for drop-in use.
 - Device guard behavior in mixed backend execution paths.
 
 ## 5. Security and Stability Risk Areas
@@ -38,16 +41,16 @@
 - GPU stream/event lifecycle correctness.
 - autograd race/deadlock hazards under worker scheduling.
 
-## 6. V1 Extraction Boundary
+## 6. Extraction Sequencing Boundary (No Permanent Exclusions)
 
-### Include now
+### Immediate wave
 
 - `c10` runtime primitives.
-- eager CPU kernel subset.
+- eager CPU kernel first wave.
 - autograd engine core.
 - essential bridge glue for conformance.
 
-### Exclude for V1
+### Mandatory closure waves
 
 - TorchScript/JIT breadth.
 - distributed/RPC breadth.
@@ -57,9 +60,9 @@
 ## 7. High-Value Conformance Fixture Families
 
 - c10 dispatch key tests.
-- ATen tensor/kernel subsets.
+- ATen tensor/kernel staged waves with explicit parity closure.
 - autograd fixture families in `torch/testing/_internal`.
-- serialization and state round-trip subsets.
+- serialization and state round-trip staged waves with explicit parity closure.
 
 ## 8. First Packet Anchors Already Extracted
 

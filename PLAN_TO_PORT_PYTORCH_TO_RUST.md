@@ -8,29 +8,31 @@ This project follows the spec-first `porting-to-rust` method:
 2. Implement from spec (never line-by-line translation).
 3. Prove parity via differential conformance.
 4. Gate all optimization behind behavior-isomorphism proofs.
+5. Maintain explicit closure paths until complete drop-in parity is achieved.
 
 ## 2. Legacy Oracle
 
 - Path: `/dp/frankentorch/legacy_pytorch_code/pytorch`
 
-## 3. V1 Scope
+## 3. Parity-Complete Target Surface
 
 - Tensor metadata/storage/view/index semantics.
-- Dispatch routing for scoped op families.
-- Autograd engine core semantics and gradient correctness.
-- Scoped checkpoint/state serialization compatibility.
-- Minimal NN + optimizer first-wave behavior.
+- Dispatch routing across full supported operator families.
+- Autograd engine semantics and gradient correctness.
+- Checkpoint/state serialization compatibility.
+- NN + optimizer behavioral parity.
+- Device/backend transition parity and execution-mode compatibility.
 
-## 4. Explicit Exclusions for V1
+## 4. Sequencing Boundaries (No Permanent Exclusions)
 
-- TorchScript/JIT and distributed RPC breadth.
-- Compiler-stack breadth (`dynamo`, `inductor`, `functorch`) in V1.
-- Mobile/platform wrappers and broad ecosystem tooling.
+- Execution is staged by packets to reduce risk and enforce proof quality.
+- Deferred families remain mandatory parity-closure work, not optional scope.
+- Every deferred behavior must have explicit downstream beads and conformance plans.
 
 ## 5. Phase Plan with Status
 
 ### Phase 1: Bootstrap + Planning (`complete`)
-- scope and exclusions frozen
+- parity doctrine and sequencing policy frozen
 - compatibility contract drafted
 
 ### Phase 2: Deep Structure Extraction (`in_progress`)
@@ -51,7 +53,8 @@ This project follows the spec-first `porting-to-rust` method:
 
 ## 6. Mandatory Exit Criteria
 
-1. Differential parity green for scoped APIs.
+1. Differential parity green for full drop-in target surface.
 2. No unresolved critical semantic drift.
 3. Performance gates pass without correctness regressions.
 4. RaptorQ sidecar artifacts validated for conformance + benchmark evidence.
+5. No intentional feature/functionality omissions remain.

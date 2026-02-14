@@ -5,6 +5,10 @@ Normative exemplar copied into this repository:
 
 This document maps proven FrankenSQLite patterns onto FrankenTorch's deterministic autograd mission.
 
+Absolute doctrine carried from this project into all adaptations:
+- FrankenTorch targets total feature/functionality overlap for true drop-in replacement behavior.
+- Packetized sequencing controls execution risk but does not permit permanent exclusions.
+
 ## 1. Direct Pattern Reuse
 
 | FrankenSQLite Pattern | FrankenTorch Adaptation |
@@ -44,4 +48,3 @@ This document maps proven FrankenSQLite patterns onto FrankenTorch's determinist
 2. `FT-P2C-003`: schema ingestion + op registration parity.
 3. `FT-P2C-004`: autograd scheduler state machine extraction.
 4. `FT-P2C-006`: checkpoint format parity and fail-closed unknown-field policy.
-

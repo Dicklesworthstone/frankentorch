@@ -1,10 +1,12 @@
 # COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1
 
+Document-version note: "V1" is spec revisioning, not a reduced parity target. This spec governs the full drop-in replacement objective.
+
 ## 0. Prime Directive
 
 Build a system that is simultaneously:
 
-1. Behaviorally trustworthy for scoped compatibility.
+1. Behaviorally trustworthy for full drop-in compatibility.
 2. Mathematically explicit in decision and risk handling.
 3. Operationally resilient via RaptorQ-backed durability.
 4. Performance-competitive via profile-and-proof discipline.
@@ -22,17 +24,16 @@ Legacy oracle:
 
 Most reimplementations fail by being partially compatible and operationally brittle. FrankenTorch will instead combine compatibility realism with first-principles architecture and strict quality gates.
 
-## 2. V1 Scope Contract
+## 2. Absolute Parity Contract
 
-Included in V1:
+FrankenTorch is specified as a full drop-in replacement target for upstream PyTorch observable behavior.
 
-- tensor storage/view/index semantics; - core op families with backward rules; - minimal nn and optimizer workflows; - checkpoint scope.
+Execution is packetized and staged, but staging is sequencing only, never a release-time scope reduction.
 
-Deferred from V1:
-
-- long-tail API surface outside highest-value use cases
-- broad ecosystem parity not required for core migration value
-- distributed/platform expansion not needed for V1 acceptance
+Temporary sequencing policy:
+- deferred work must be represented as explicit parity-closure beads with dependencies
+- every deferred behavior must include oracle fixture and conformance plans
+- release sign-off requires zero intentional feature/functionality gaps
 
 ## 3. Architecture Blueprint
 
@@ -55,14 +56,14 @@ Planned crate families:
 Two explicit operating modes:
 
 1. strict mode:
-   - maximize observable compatibility for scoped APIs
+   - maximize observable compatibility for full drop-in behavior
    - no behavior-altering repair heuristics
 2. hardened mode:
    - maintain outward contract while enabling defensive runtime checks and bounded repairs
 
 Compatibility focus for this project:
 
-Preserve PyTorch-observable tensor semantics, autograd contracts, and scoped optimizer behaviors.
+Preserve full PyTorch-observable tensor semantics, autograd contracts, optimizer/module behaviors, serialization contracts, and execution invariants required for drop-in use.
 
 Fail-closed policy:
 
@@ -173,15 +174,15 @@ Exit:
 
 ### M2 — First Vertical Slice
 
-- end-to-end scoped workflow implemented
+- end-to-end workflow implemented with explicit parity-closure backlog
 
 Exit:
 - differential parity for first major API family
 - baseline benchmark report published
 
-### M3 — Scope Expansion
+### M3 — Parity Expansion
 
-- additional V1 API families
+- additional API families closed toward total parity
 
 Exit:
 - expanded parity reports green
@@ -193,11 +194,11 @@ Exit:
 
 Exit:
 - regression gates stable
-- conformance drift zero for V1 scope
+- conformance drift zero for full drop-in target surface
 
 ## 11. Acceptance Gates
 
-Gate A: compatibility parity report passes for V1 scope.
+Gate A: compatibility parity report passes for full drop-in target surface.
 
 Gate B: security/fuzz/adversarial suite passes for high-risk paths.
 
@@ -205,7 +206,7 @@ Gate C: performance budgets pass with no semantic regressions.
 
 Gate D: RaptorQ durability artifacts validated and scrub-clean.
 
-All four gates must pass for V1 release readiness.
+All four gates must pass for release readiness.
 
 ## 12. Risk Register
 
@@ -224,12 +225,12 @@ Mitigations:
 ## 13. Immediate Execution Checklist
 
 1. Create workspace and crate skeleton.
-2. Implement smallest high-value end-to-end path in V1 scope.
+2. Implement smallest high-value end-to-end path and maintain explicit parity-closure chain to full coverage.
 3. Stand up differential conformance harness against legacy oracle.
 4. Add benchmark baseline generation and regression gating.
 5. Add RaptorQ sidecar pipeline for conformance and benchmark artifacts.
 
-## 14. Detailed Crate Contracts (V1)
+## 14. Detailed Crate Contracts
 
 | Crate | Primary Responsibility | Explicit Non-Goal | Invariants | Mandatory Tests |
 |---|---|---|---|---|
@@ -244,7 +245,7 @@ Mitigations:
 | ft-conformance | PyTorch differential harness | production dispatch | comparator policy explicit by op/dtype | differential harness tests |
 | frankentorch | integration + mode policy | low-level kernels | strict/hardened mode and evidence ledger available | integration startup tests |
 
-## 15. Conformance Matrix (V1)
+## 15. Conformance Matrix
 
 | Family | Oracle Workload | Pass Criterion | Drift Severity |
 |---|---|---|---|
@@ -253,7 +254,7 @@ Mitigations:
 | Matmul/reduction | core linear algebra suite | value and shape parity | critical |
 | Autograd backward | gradient-check corpus | gradient parity within budget | critical |
 | In-place behavior | mutation/version fixtures | alias/version parity | critical |
-| nn module forward | minimal model suite | output parity | high |
+| nn module forward | baseline model suite with closure expansion | output parity | high |
 | Optimizer step | SGD/Adam traces | parameter update parity | critical |
 | Checkpoint round-trip | save/load suites | state parity | high |
 
@@ -326,11 +327,11 @@ Weeks 1-2:
 - scaffold crate boundaries and tensor metadata contracts
 
 Weeks 3-5:
-- tensor core + autograd minimal path
+- tensor core + autograd baseline path with explicit closure chain
 - strict conformance and gradient-check harness
 
 Weeks 6-8:
-- nn/optimizer scoped workflows + baseline benchmarks
+- nn/optimizer workflows + baseline benchmarks
 
 Weeks 9-10:
 - checkpoint/parser hardening and adversarial fixtures
@@ -351,7 +352,7 @@ This spec is paired with the following methodology artifacts:
 Rule of use:
 
 - Extraction and behavior understanding happens in EXISTING_PYTORCH_STRUCTURE.md.
-- Scope, exclusions, and phase sequencing live in PLAN_TO_PORT_PYTORCH_TO_RUST.md.
+- Sequencing and parity-closure dependency policy live in PLAN_TO_PORT_PYTORCH_TO_RUST.md.
 - Rust crate boundaries live in PROPOSED_ARCHITECTURE.md.
 - Delivery readiness is tracked in FEATURE_PARITY.md.
 
@@ -403,7 +404,7 @@ Implementation anchors:
 Implemented packets in this revision:
 
 1. `FT-P2C-002`:
-   - scoped `DispatchKey` + `DispatchKeySet` contract with explicit priority ordering.
+   - `DispatchKey` + `DispatchKeySet` contract with explicit priority ordering.
    - strict fail-closed behavior for incompatible composite/backend fallback routes.
    - hardened bounded fallback with explicit evidence metadata.
 2. `FT-P2C-004`:
