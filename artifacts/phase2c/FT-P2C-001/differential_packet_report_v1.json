@@ -1,0 +1,471 @@
+{
+  "schema_version": "ft-p2c-differential-packet-v1",
+  "packet_id": "FT-P2C-001",
+  "source_report": "artifacts/phase2c/conformance/differential_report_v1.json",
+  "generated_at": "2026-02-14T17:07:01Z",
+  "total_checks": 86,
+  "pass_checks": 86,
+  "non_pass_checks": 0,
+  "allowlisted_checks": 0,
+  "blocking_checks": 0,
+  "suite_breakdown": [
+    {
+      "suite": "scalar_dac",
+      "count": 12
+    },
+    {
+      "suite": "tensor_meta",
+      "count": 74
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 43
+    },
+    {
+      "mode": "strict",
+      "count": 43
+    }
+  ],
+  "status_breakdown": [
+    {
+      "status": "pass",
+      "count": 86
+    }
+  ],
+  "comparator_breakdown": [
+    {
+      "comparator": "abs_tol",
+      "count": 12
+    },
+    {
+      "comparator": "alias_policy",
+      "count": 6
+    },
+    {
+      "comparator": "contiguous",
+      "count": 6
+    },
+    {
+      "comparator": "fail_closed",
+      "count": 4
+    },
+    {
+      "comparator": "fail_closed_oracle",
+      "count": 2
+    },
+    {
+      "comparator": "fail_closed_oracle_guard",
+      "count": 2
+    },
+    {
+      "comparator": "linear_index",
+      "count": 6
+    },
+    {
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "count": 6
+    },
+    {
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "count": 6
+    },
+    {
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "count": 6
+    },
+    {
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "count": 6
+    },
+    {
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "count": 6
+    },
+    {
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "count": 6
+    },
+    {
+      "comparator": "numel",
+      "count": 6
+    },
+    {
+      "comparator": "oracle_guard",
+      "count": 6
+    }
+  ],
+  "metamorphic_checks": [
+    {
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "hardened",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:contiguous_basic_index",
+      "case_name": "contiguous_basic_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:scalar_offset_index",
+      "case_name": "scalar_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_contiguous_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_linear_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:strided_offset_index",
+      "case_name": "strided_offset_index",
+      "mode": "strict",
+      "comparator": "metamorphic_offset_shift_numel_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    }
+  ],
+  "adversarial_fail_closed_checks": [
+    {
+      "scenario_id": "tensor_meta/hardened:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "hardened",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "hardened",
+      "comparator": "fail_closed_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "hardened",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/hardened:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "hardened",
+      "comparator": "fail_closed_oracle_guard",
+      "status": "pass",
+      "reason_code": "oracle_guard_skip"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "strict",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:invalid_rank_stride_mismatch",
+      "case_name": "invalid_rank_stride_mismatch",
+      "mode": "strict",
+      "comparator": "fail_closed_oracle",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "strict",
+      "comparator": "fail_closed",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "tensor_meta/strict:invalid_storage_offset_overflow",
+      "case_name": "invalid_storage_offset_overflow",
+      "mode": "strict",
+      "comparator": "fail_closed_oracle_guard",
+      "status": "pass",
+      "reason_code": "oracle_guard_skip"
+    }
+  ],
+  "packet_allowlist_reconciliation": {
+    "global_allowlisted_drifts": 2,
+    "packet_allowlisted_drifts": 0,
+    "note": "Global allowlists are confined to FT-P2C-002 and FT-P2C-004; FT-P2C-001 remains zero-drift in strict and hardened modes."
+  },
+  "risk_linkage": {
+    "threat_ids_covered": [
+      "THR-001",
+      "THR-002",
+      "THR-004"
+    ],
+    "deferred_gap_ids": [
+      "GAP-UX-001"
+    ],
+    "risk_note_path": "artifacts/phase2c/FT-P2C-001/risk_note.md"
+  }
+}

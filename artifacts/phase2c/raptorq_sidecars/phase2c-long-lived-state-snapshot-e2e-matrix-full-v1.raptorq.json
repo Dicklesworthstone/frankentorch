@@ -1,0 +1,45 @@
+{
+  "artifact_id": "phase2c-long-lived-state-snapshot-e2e-matrix-full-v1",
+  "artifact_type": "long_lived_state_snapshot",
+  "notes": "Generated via ft-serialize::generate_raptorq_sidecar",
+  "packet_id": null,
+  "raptorq": {
+    "constraints": 19,
+    "k": 62,
+    "object_id_high": 5067780223329653855,
+    "object_id_low": 4923932207837957189,
+    "repair_manifest": [
+      {
+        "bytes": 256,
+        "degree": 1,
+        "esi": 62
+      },
+      {
+        "bytes": 256,
+        "degree": 6,
+        "esi": 63
+      },
+      {
+        "bytes": 256,
+        "degree": 6,
+        "esi": 64
+      },
+      {
+        "bytes": 256,
+        "degree": 2,
+        "esi": 65
+      }
+    ],
+    "repair_symbols": 4,
+    "schema_version": 1,
+    "seed": 5067780287586391121,
+    "symbol_size": 256
+  },
+  "scrub": {
+    "corruption_probe_detected": true,
+    "last_ok_unix_ms": 1771089367519,
+    "status": "ok"
+  },
+  "source_hash": "det64:b6f912a2e4c9f19b",
+  "source_path": "/data/projects/frankentorch/crates/ft-conformance/../../artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+}

@@ -37,6 +37,10 @@ const REQUIRED_RAPTORQ_KEYS: [&str; 5] = [
 
 const SECURITY_MATRIX_FILE: &str = "artifacts/phase2c/SECURITY_COMPATIBILITY_THREAT_MATRIX_V1.md";
 const HARDENED_ALLOWLIST_FILE: &str = "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json";
+const RAPTORQ_REPAIR_MANIFEST_FILE: &str =
+    "artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json";
+const RAPTORQ_SCRUB_REPORT_FILE: &str = "artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json";
+const RAPTORQ_DECODE_EVENTS_FILE: &str = "artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json";
 const REQUIRED_ALLOWLIST_TOP_LEVEL_KEYS: [&str; 5] = [
     "schema_version",
     "policy",
@@ -44,6 +48,12 @@ const REQUIRED_ALLOWLIST_TOP_LEVEL_KEYS: [&str; 5] = [
     "hardened_mode",
     "packets",
 ];
+const REQUIRED_RAPTORQ_MANIFEST_KEYS: [&str; 4] =
+    ["schema_version", "generated_unix_ms", "summary", "entries"];
+const REQUIRED_RAPTORQ_SCRUB_KEYS: [&str; 4] =
+    ["schema_version", "generated_unix_ms", "summary", "entries"];
+const REQUIRED_RAPTORQ_DECODE_EVENTS_KEYS: [&str; 4] =
+    ["schema_version", "generated_unix_ms", "summary", "events"];
 
 #[derive(Debug, Serialize)]
 struct ValidationSummary {
@@ -255,6 +265,8 @@ fn validate_global(root: &Path, packet_ids: &[String]) -> GlobalValidation {
             HARDENED_ALLOWLIST_FILE
         ));
     }
+
+    validate_global_raptorq_artifacts(root, &mut errors, &mut checks);
 
     let status = if errors.is_empty() {
         "READY"
@@ -616,6 +628,186 @@ fn read_file(path: &Path) -> Option<String> {
 fn read_json(path: &Path) -> Option<Value> {
     let raw = read_file(path)?;
     parse_json(&raw)
+}
+
+fn validate_global_raptorq_artifacts(
+    root: &Path,
+    errors: &mut Vec<String>,
+    checks: &mut BTreeMap<String, bool>,
+) {
+    let manifest_path = root.join(RAPTORQ_REPAIR_MANIFEST_FILE);
+    let scrub_path = root.join(RAPTORQ_SCRUB_REPORT_FILE);
+    let events_path = root.join(RAPTORQ_DECODE_EVENTS_FILE);
+
+    let manifest_exists = manifest_path.exists();
+    checks.insert(
+        "raptorq_global:manifest_exists".to_string(),
+        manifest_exists,
+    );
+    if !manifest_exists {
+        errors.push(format!(
+            "missing required raptorq manifest '{}'",
+            RAPTORQ_REPAIR_MANIFEST_FILE
+        ));
+        return;
+    }
+
+    let scrub_exists = scrub_path.exists();
+    checks.insert("raptorq_global:scrub_exists".to_string(), scrub_exists);
+    if !scrub_exists {
+        errors.push(format!(
+            "missing required raptorq scrub report '{}'",
+            RAPTORQ_SCRUB_REPORT_FILE
+        ));
+        return;
+    }
+
+    let events_exists = events_path.exists();
+    checks.insert("raptorq_global:events_exists".to_string(), events_exists);
+    if !events_exists {
+        errors.push(format!(
+            "missing required raptorq decode events report '{}'",
+            RAPTORQ_DECODE_EVENTS_FILE
+        ));
+        return;
+    }
+
+    let Some(manifest_value) = read_json(manifest_path.as_path()) else {
+        errors.push(format!(
+            "{} is present but is not valid json",
+            RAPTORQ_REPAIR_MANIFEST_FILE
+        ));
+        return;
+    };
+    check_required_keys(
+        &manifest_value,
+        RAPTORQ_REPAIR_MANIFEST_FILE,
+        REQUIRED_RAPTORQ_MANIFEST_KEYS.as_slice(),
+        errors,
+        checks,
+    );
+    let manifest_schema_ok = manifest_value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema == "ft-raptorq-repair-manifest-v1");
+    checks.insert(
+        "raptorq_global:manifest_schema_ok".to_string(),
+        manifest_schema_ok,
+    );
+    if !manifest_schema_ok {
+        errors.push(
+            "raptorq repair manifest schema_version must be 'ft-raptorq-repair-manifest-v1'"
+                .to_string(),
+        );
+    }
+
+    let manifest_failed_targets = manifest_value
+        .get("summary")
+        .and_then(|summary| summary.get("failed_targets"))
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count == 0);
+    checks.insert(
+        "raptorq_global:manifest_failed_targets_zero".to_string(),
+        manifest_failed_targets,
+    );
+    if !manifest_failed_targets {
+        errors.push(
+            "raptorq repair manifest summary.failed_targets must be 0 for READY status".to_string(),
+        );
+    }
+
+    let Some(scrub_value) = read_json(scrub_path.as_path()) else {
+        errors.push(format!(
+            "{} is present but is not valid json",
+            RAPTORQ_SCRUB_REPORT_FILE
+        ));
+        return;
+    };
+    check_required_keys(
+        &scrub_value,
+        RAPTORQ_SCRUB_REPORT_FILE,
+        REQUIRED_RAPTORQ_SCRUB_KEYS.as_slice(),
+        errors,
+        checks,
+    );
+    let scrub_schema_ok = scrub_value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema == "ft-raptorq-integrity-scrub-v1");
+    checks.insert(
+        "raptorq_global:scrub_schema_ok".to_string(),
+        scrub_schema_ok,
+    );
+    if !scrub_schema_ok {
+        errors.push(
+            "raptorq scrub report schema_version must be 'ft-raptorq-integrity-scrub-v1'"
+                .to_string(),
+        );
+    }
+
+    let scrub_failed_zero = scrub_value
+        .get("summary")
+        .and_then(|summary| summary.get("failed"))
+        .and_then(Value::as_u64)
+        .is_some_and(|count| count == 0);
+    checks.insert(
+        "raptorq_global:scrub_failed_zero".to_string(),
+        scrub_failed_zero,
+    );
+    if !scrub_failed_zero {
+        errors.push("raptorq scrub report summary.failed must be 0 for READY status".to_string());
+    }
+
+    let Some(events_value) = read_json(events_path.as_path()) else {
+        errors.push(format!(
+            "{} is present but is not valid json",
+            RAPTORQ_DECODE_EVENTS_FILE
+        ));
+        return;
+    };
+    check_required_keys(
+        &events_value,
+        RAPTORQ_DECODE_EVENTS_FILE,
+        REQUIRED_RAPTORQ_DECODE_EVENTS_KEYS.as_slice(),
+        errors,
+        checks,
+    );
+    let events_schema_ok = events_value
+        .get("schema_version")
+        .and_then(Value::as_str)
+        .is_some_and(|schema| schema == "ft-raptorq-decode-events-v1");
+    checks.insert(
+        "raptorq_global:decode_events_schema_ok".to_string(),
+        events_schema_ok,
+    );
+    if !events_schema_ok {
+        errors.push(
+            "raptorq decode events schema_version must be 'ft-raptorq-decode-events-v1'"
+                .to_string(),
+        );
+    }
+
+    let events_corruption_passes = events_value
+        .get("summary")
+        .and_then(|summary| summary.get("corruption_probe_passed"))
+        .and_then(Value::as_u64);
+    let events_total = events_value
+        .get("summary")
+        .and_then(|summary| summary.get("total_events"))
+        .and_then(Value::as_u64);
+    let corruption_probe_ok = events_corruption_passes.is_some()
+        && events_total.is_some()
+        && events_corruption_passes == events_total;
+    checks.insert(
+        "raptorq_global:decode_events_corruption_probe_ok".to_string(),
+        corruption_probe_ok,
+    );
+    if !corruption_probe_ok {
+        errors.push(
+            "raptorq decode events summary must show corruption_probe_passed == total_events"
+                .to_string(),
+        );
+    }
 }
 
 fn parse_json(raw: &str) -> Option<Value> {

@@ -10,11 +10,13 @@ static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum DType {
     F64,
+    F32,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Device {
     Cpu,
+    Cuda,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -404,10 +406,90 @@ pub fn contiguous_strides(shape: &[usize]) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::*;
+
     use super::{
         DType, Device, ScalarTensor, TensorMeta, TensorMetaError, contiguous_strides,
         ensure_compatible,
     };
+
+    fn det_seed(parts: &[usize]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for value in parts {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    fn build_property_log(
+        test_id: &str,
+        mode: &str,
+        seed: u64,
+        input_digest: u64,
+        output_digest: u64,
+        reason_code: &str,
+    ) -> BTreeMap<String, String> {
+        let mut log = BTreeMap::new();
+        log.insert("ts_utc".to_string(), "1970-01-01T00:00:00Z".to_string());
+        log.insert("suite_id".to_string(), "ft_core_property".to_string());
+        log.insert("test_id".to_string(), test_id.to_string());
+        log.insert("packet_id".to_string(), "FT-P2C-001".to_string());
+        log.insert(
+            "fixture_id".to_string(),
+            "ft_core_property_generated".to_string(),
+        );
+        log.insert("mode".to_string(), mode.to_string());
+        log.insert("seed".to_string(), seed.to_string());
+        log.insert(
+            "input_digest".to_string(),
+            format!("det64:{input_digest:016x}"),
+        );
+        log.insert(
+            "output_digest".to_string(),
+            format!("det64:{output_digest:016x}"),
+        );
+        log.insert(
+            "env_fingerprint".to_string(),
+            "det64:ft-core-test".to_string(),
+        );
+        log.insert(
+            "artifact_refs".to_string(),
+            "artifacts/phase2c/FT-P2C-001/fixture_manifest.json".to_string(),
+        );
+        log.insert("duration_ms".to_string(), "0".to_string());
+        log.insert("outcome".to_string(), "pass".to_string());
+        log.insert("reason_code".to_string(), reason_code.to_string());
+        log
+    }
+
+    fn assert_log_contract(log: &BTreeMap<String, String>) {
+        for key in [
+            "ts_utc",
+            "suite_id",
+            "test_id",
+            "packet_id",
+            "fixture_id",
+            "mode",
+            "seed",
+            "input_digest",
+            "output_digest",
+            "env_fingerprint",
+            "artifact_refs",
+            "duration_ms",
+            "outcome",
+            "reason_code",
+        ] {
+            assert!(
+                log.contains_key(key),
+                "property log missing required key '{key}'"
+            );
+        }
+    }
 
     #[test]
     fn scalar_meta_is_valid() {
@@ -473,6 +555,34 @@ mod tests {
     }
 
     #[test]
+    fn compatibility_checks_reject_dtype_mismatch() {
+        let lhs = ScalarTensor::new(1.0, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(2.0, DType::F32, Device::Cpu);
+        let err = ensure_compatible(&lhs, &rhs).expect_err("dtype mismatch must fail");
+        assert!(matches!(
+            err,
+            super::TensorCompatError::DTypeMismatch {
+                lhs: DType::F64,
+                rhs: DType::F32
+            }
+        ));
+    }
+
+    #[test]
+    fn compatibility_checks_reject_device_mismatch() {
+        let lhs = ScalarTensor::new(1.0, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(2.0, DType::F64, Device::Cuda);
+        let err = ensure_compatible(&lhs, &rhs).expect_err("device mismatch must fail");
+        assert!(matches!(
+            err,
+            super::TensorCompatError::DeviceMismatch {
+                lhs: Device::Cpu,
+                rhs: Device::Cuda
+            }
+        ));
+    }
+
+    #[test]
     fn contiguous_stride_helper_handles_scalar() {
         assert_eq!(contiguous_strides(&[]), Vec::<usize>::new());
     }
@@ -515,5 +625,124 @@ mod tests {
         let a = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
         let b = a.clone().with_storage_offset(1);
         assert_ne!(a.fingerprint64(), b.fingerprint64());
+    }
+
+    proptest! {
+        #[test]
+        fn prop_contiguous_stride_contract(shape in prop::collection::vec(1usize..=4, 1..=4)) {
+            let strides = contiguous_strides(shape.as_slice());
+            prop_assert_eq!(strides.len(), shape.len());
+            prop_assert_eq!(strides.last().copied(), Some(1));
+
+            let seed = det_seed(shape.as_slice());
+            let log = build_property_log(
+                "prop_contiguous_stride_contract",
+                "strict",
+                seed,
+                seed,
+                det_seed(strides.as_slice()),
+                "contiguous_stride_contract_ok",
+            );
+            assert_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_numel_matches_shape_product(shape in prop::collection::vec(1usize..=6, 1..=4)) {
+            let meta = TensorMeta::from_shape(shape.clone(), DType::F64, Device::Cpu);
+            let expected: usize = shape.iter().copied().product();
+            prop_assert_eq!(meta.numel(), expected);
+
+            let seed = det_seed(shape.as_slice());
+            let log = build_property_log(
+                "prop_numel_matches_shape_product",
+                "strict",
+                seed,
+                seed,
+                expected as u64,
+                "numel_product_contract_ok",
+            );
+            assert_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_contiguous_index_bounds(shape in prop::collection::vec(1usize..=4, 1..=4)) {
+            let meta = TensorMeta::from_shape(shape.clone(), DType::F64, Device::Cpu);
+            let zero_index = vec![0; shape.len()];
+            let max_index = shape.iter().map(|dim| dim - 1).collect::<Vec<_>>();
+
+            let zero_linear = meta.storage_index_for(zero_index.as_slice()).expect("zero index must be valid");
+            let max_linear = meta.storage_index_for(max_index.as_slice()).expect("max index must be valid");
+
+            prop_assert_eq!(zero_linear, 0);
+            prop_assert!(max_linear < meta.numel());
+
+            let seed = det_seed(shape.as_slice());
+            let log = build_property_log(
+                "prop_contiguous_index_bounds",
+                "strict",
+                seed,
+                seed,
+                max_linear as u64,
+                "index_bounds_contract_ok",
+            );
+            assert_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_with_value_bumps_version_and_storage(
+            source_value in -1_000.0f64..1_000.0f64,
+            derived_value in -1_000.0f64..1_000.0f64,
+        ) {
+            let source = ScalarTensor::new(source_value, DType::F64, Device::Cpu);
+            let derived = source.with_value(derived_value);
+
+            prop_assert_eq!(derived.version(), source.version() + 1);
+            prop_assert_ne!(derived.storage_id(), source.storage_id());
+
+            let source_seed = source_value.to_bits() as usize;
+            let derived_seed = derived_value.to_bits() as usize;
+            let seed = det_seed([source_seed, derived_seed].as_slice());
+            let log = build_property_log(
+                "prop_with_value_bumps_version_and_storage",
+                "strict",
+                seed,
+                source.evidence_fingerprint64(),
+                derived.evidence_fingerprint64(),
+                "version_storage_contract_ok",
+            );
+            assert_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_rank_stride_mismatch_fail_closed(
+            shape in prop::collection::vec(1usize..=4, 1..=4),
+            extra in 1usize..=3,
+        ) {
+            let strides = vec![1usize; shape.len() + extra];
+            let err = TensorMeta::from_shape_and_strides(
+                shape.clone(),
+                strides,
+                0,
+                DType::F64,
+                Device::Cpu,
+            )
+            .expect_err("rank/stride mismatch must fail");
+
+            match err {
+                TensorMetaError::RankStrideMismatch { .. } => {}
+                other => prop_assert!(false, "expected RankStrideMismatch, got {other:?}"),
+            }
+
+            let seed = det_seed(shape.as_slice());
+            let log = build_property_log(
+                "prop_rank_stride_mismatch_fail_closed",
+                "strict",
+                seed,
+                seed,
+                0,
+                "rank_stride_mismatch_fail_closed",
+            );
+            assert_log_contract(&log);
+        }
     }
 }

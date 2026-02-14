@@ -1,0 +1,74 @@
+{
+  "schema_version": "ft-p2c-001-unit-property-quality-v1",
+  "generated_on": "2026-02-14",
+  "packet_id": "FT-P2C-001",
+  "coverage": {
+    "line_percent": 92.3469387755102,
+    "region_percent": 92.60935143288084,
+    "line_floor": 90.0,
+    "region_floor": 80.0,
+    "line_floor_pass": true,
+    "region_floor_pass": true,
+    "command": "cargo llvm-cov -p ft-core --json --summary-only --output-path artifacts/phase2c/FT-P2C-001/unit_property_coverage_v1.json --fail-under-lines 90 --fail-under-regions 80"
+  },
+  "property_suite": {
+    "invariant_family_count": 5,
+    "shrink_enabled": true,
+    "invariant_families": [
+      "contiguous_stride_contract",
+      "numel_product_contract",
+      "contiguous_index_bounds",
+      "version_storage_contract",
+      "rank_stride_fail_closed_contract"
+    ],
+    "test_ids": [
+      "prop_contiguous_stride_contract",
+      "prop_numel_matches_shape_product",
+      "prop_contiguous_index_bounds",
+      "prop_with_value_bumps_version_and_storage",
+      "prop_rank_stride_mismatch_fail_closed"
+    ]
+  },
+  "structured_log_contract": {
+    "required_fields": [
+      "ts_utc",
+      "suite_id",
+      "test_id",
+      "packet_id",
+      "fixture_id",
+      "mode",
+      "seed",
+      "input_digest",
+      "output_digest",
+      "env_fingerprint",
+      "artifact_refs",
+      "duration_ms",
+      "outcome",
+      "reason_code"
+    ],
+    "test_helper_anchor": "crates/ft-core/src/lib.rs"
+  },
+  "e2e_scenario_mapping": {
+    "prop_numel_matches_shape_product": [
+      "tensor_meta/strict:contiguous_basic_index",
+      "tensor_meta/hardened:contiguous_basic_index"
+    ],
+    "prop_rank_stride_mismatch_fail_closed": [
+      "tensor_meta/strict:invalid_rank_stride_mismatch",
+      "tensor_meta/hardened:invalid_rank_stride_mismatch"
+    ],
+    "prop_contiguous_index_bounds": [
+      "tensor_meta/strict:strided_offset_index",
+      "tensor_meta/hardened:strided_offset_index"
+    ],
+    "prop_with_value_bumps_version_and_storage": [
+      "scalar_dac/strict:add_basic",
+      "scalar_dac/hardened:add_basic"
+    ],
+    "prop_contiguous_stride_contract": [
+      "tensor_meta/strict:scalar_offset_index",
+      "tensor_meta/hardened:scalar_offset_index"
+    ]
+  },
+  "status": "pass"
+}

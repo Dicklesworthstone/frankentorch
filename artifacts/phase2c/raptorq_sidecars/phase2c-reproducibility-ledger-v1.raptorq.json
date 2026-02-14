@@ -1,0 +1,45 @@
+{
+  "artifact_id": "phase2c-reproducibility-ledger-v1",
+  "artifact_type": "reproducibility_ledger",
+  "notes": "Generated via ft-serialize::generate_raptorq_sidecar",
+  "packet_id": null,
+  "raptorq": {
+    "constraints": 13,
+    "k": 30,
+    "object_id_high": 5067780223329653855,
+    "object_id_low": 4923932207837957189,
+    "repair_manifest": [
+      {
+        "bytes": 256,
+        "degree": 1,
+        "esi": 30
+      },
+      {
+        "bytes": 256,
+        "degree": 4,
+        "esi": 31
+      },
+      {
+        "bytes": 256,
+        "degree": 4,
+        "esi": 32
+      },
+      {
+        "bytes": 256,
+        "degree": 2,
+        "esi": 33
+      }
+    ],
+    "repair_symbols": 4,
+    "schema_version": 1,
+    "seed": 5067780287586391121,
+    "symbol_size": 256
+  },
+  "scrub": {
+    "corruption_probe_detected": true,
+    "last_ok_unix_ms": 1771089367519,
+    "status": "ok"
+  },
+  "source_hash": "det64:ec55212254819e5c",
+  "source_path": "/data/projects/frankentorch/crates/ft-conformance/../../artifacts/phase2c/ESSENCE_EXTRACTION_LEDGER_V1.md"
+}

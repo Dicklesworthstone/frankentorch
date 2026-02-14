@@ -1,0 +1,45 @@
+{
+  "artifact_id": "phase2c-benchmark-baseline-validator-optimization-evidence",
+  "artifact_type": "benchmark_baseline_bundle",
+  "notes": "Generated via ft-serialize::generate_raptorq_sidecar",
+  "packet_id": null,
+  "raptorq": {
+    "constraints": 11,
+    "k": 13,
+    "object_id_high": 5067780223329653855,
+    "object_id_low": 4923932207837957189,
+    "repair_manifest": [
+      {
+        "bytes": 128,
+        "degree": 3,
+        "esi": 13
+      },
+      {
+        "bytes": 128,
+        "degree": 2,
+        "esi": 14
+      },
+      {
+        "bytes": 128,
+        "degree": 9,
+        "esi": 15
+      },
+      {
+        "bytes": 128,
+        "degree": 3,
+        "esi": 16
+      }
+    ],
+    "repair_symbols": 4,
+    "schema_version": 1,
+    "seed": 5067780287586391121,
+    "symbol_size": 128
+  },
+  "scrub": {
+    "corruption_probe_detected": true,
+    "last_ok_unix_ms": 1771089367519,
+    "status": "ok"
+  },
+  "source_hash": "det64:cde24f1238801008",
+  "source_path": "/data/projects/frankentorch/crates/ft-conformance/../../artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+}

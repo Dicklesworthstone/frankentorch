@@ -1,0 +1,75 @@
+{
+  "schema_version": "ft-p2c-e2e-linkage-v1",
+  "packet_id": "FT-P2C-001",
+  "generated_at": "2026-02-14T17:11:17Z",
+  "source_e2e_log": "artifacts/phase2c/e2e_forensics/e2e_matrix_ft_p2c_001.jsonl",
+  "source_triage": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_001_v1.json",
+  "source_failure_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_001_v1.json",
+  "total_entries": 14,
+  "failed_entries": 0,
+  "suite_breakdown": [
+    {
+      "suite_id": "scalar_dac",
+      "count": 4
+    },
+    {
+      "suite_id": "tensor_meta",
+      "count": 10
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 7
+    },
+    {
+      "mode": "strict",
+      "count": 7
+    }
+  ],
+  "deterministic_replay_field_coverage": {
+    "scenario_id": true,
+    "seed": true,
+    "env_fingerprint": true,
+    "artifact_refs": true,
+    "replay_command": true,
+    "reason_code": true
+  },
+  "replay_command_catalog": [
+    "cargo test -p ft-conformance strict_scalar_conformance_is_green -- --nocapture # mode=hardened",
+    "cargo test -p ft-conformance strict_scalar_conformance_is_green -- --nocapture # mode=strict",
+    "cargo test -p ft-conformance strict_tensor_meta_conformance_is_green -- --nocapture # mode=hardened",
+    "cargo test -p ft-conformance strict_tensor_meta_conformance_is_green -- --nocapture # mode=strict"
+  ],
+  "scenario_ids": [
+    "scalar_dac/hardened:add_basic",
+    "scalar_dac/hardened:mul_basic",
+    "scalar_dac/strict:add_basic",
+    "scalar_dac/strict:mul_basic",
+    "tensor_meta/hardened:contiguous_basic_index",
+    "tensor_meta/hardened:invalid_rank_stride_mismatch",
+    "tensor_meta/hardened:invalid_storage_offset_overflow",
+    "tensor_meta/hardened:scalar_offset_index",
+    "tensor_meta/hardened:strided_offset_index",
+    "tensor_meta/strict:contiguous_basic_index",
+    "tensor_meta/strict:invalid_rank_stride_mismatch",
+    "tensor_meta/strict:invalid_storage_offset_overflow",
+    "tensor_meta/strict:scalar_offset_index",
+    "tensor_meta/strict:strided_offset_index"
+  ],
+  "linkage_refs": {
+    "unit_property": [
+      "cargo test -p ft-core index_rank_and_bounds_are_guarded -- --nocapture",
+      "cargo test -p ft-core custom_strides_validate_and_index_into_storage -- --nocapture",
+      "cargo test -p ft-autograd add_backward_matches_expected_gradient -- --nocapture",
+      "cargo test -p ft-autograd mul_backward_matches_expected_gradient -- --nocapture"
+    ],
+    "differential": [
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-001/differential_packet_report_v1.json",
+      "artifacts/phase2c/FT-P2C-001/differential_reconciliation_v1.md"
+    ],
+    "risk_note": "artifacts/phase2c/FT-P2C-001/risk_note.md"
+  },
+  "status": "pass"
+}

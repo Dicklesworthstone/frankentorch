@@ -27,3 +27,9 @@ Related reliability budget gate artifacts:
 - `artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json`
 - `artifacts/phase2c/RELIABILITY_GATE_WORKFLOW_V1.md`
 - `artifacts/phase2c/e2e_forensics/reliability_gate_report_v1.json`
+
+Related RaptorQ durability pipeline artifacts:
+- `artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json`
+- `artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json`
+- `artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json`
+- `artifacts/phase2c/raptorq_sidecars/`

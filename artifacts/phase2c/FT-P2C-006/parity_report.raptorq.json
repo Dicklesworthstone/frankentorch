@@ -1,7 +1,8 @@
 {
   "artifact_id": "FT-P2C-006-parity-report",
-  "artifact_type": "conformance",
+  "artifact_type": "packet_parity_report",
   "notes": "Generated via ft-serialize::generate_raptorq_sidecar",
+  "packet_id": "FT-P2C-006",
   "raptorq": {
     "constraints": 10,
     "k": 5,
@@ -35,8 +36,10 @@
     "symbol_size": 64
   },
   "scrub": {
-    "last_ok_unix_ms": 0,
+    "corruption_probe_detected": true,
+    "last_ok_unix_ms": 1771089367519,
     "status": "ok"
   },
-  "source_hash": "det64:dbc0e2afdc2f0023"
+  "source_hash": "det64:dbc0e2afdc2f0023",
+  "source_path": "/data/projects/frankentorch/crates/ft-conformance/../../artifacts/phase2c/FT-P2C-006/parity_report.json"
 }

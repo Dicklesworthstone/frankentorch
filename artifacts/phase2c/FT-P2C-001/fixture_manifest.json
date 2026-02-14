@@ -1,6 +1,15 @@
 {
   "packet_id": "FT-P2C-001",
   "behavior_ledger": "artifacts/phase2c/FT-P2C-001/behavior_extraction_ledger.md",
+  "differential_packet_report": "artifacts/phase2c/FT-P2C-001/differential_packet_report_v1.json",
+  "differential_reconciliation_note": "artifacts/phase2c/FT-P2C-001/differential_reconciliation_v1.md",
+  "e2e_log_artifact": "artifacts/phase2c/e2e_forensics/e2e_matrix_ft_p2c_001.jsonl",
+  "e2e_crash_triage_artifact": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_001_v1.json",
+  "e2e_failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_001_v1.json",
+  "e2e_linkage_summary": "artifacts/phase2c/FT-P2C-001/e2e_replay_forensics_linkage_v1.json",
+  "e2e_linkage_note": "artifacts/phase2c/FT-P2C-001/e2e_replay_forensics_linkage_v1.md",
+  "unit_property_quality_report": "artifacts/phase2c/FT-P2C-001/unit_property_quality_report_v1.json",
+  "coverage_artifact": "artifacts/phase2c/FT-P2C-001/unit_property_coverage_v1.json",
   "fixtures": [
     {
       "id": "scalar_add_basic",

@@ -85,6 +85,14 @@ Maintain deterministic gradient accumulation, alias/versioning rules, and backwa
   - `cargo run -p ft-conformance --bin build_failure_forensics_index -- --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl --triage artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json --output artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json`
 - Run reliability budgets gate (coverage floors + flake budgets):
   - `cargo run -p ft-conformance --bin check_reliability_budgets -- --policy artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl --output artifacts/phase2c/e2e_forensics/reliability_gate_report_v1.json`
+- Run RaptorQ durability automation (sidecars + scrub + decode-event ledger):
+  - `cargo run -p ft-conformance --bin run_raptorq_durability_pipeline`
+  - outputs:
+    - `artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json`
+    - `artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json`
+    - `artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json`
+- Validate packet + global durability gates (includes RaptorQ global artifacts):
+  - `cargo run -p ft-conformance --bin validate_phase2c_artifacts`
 - Reliability policy + workflow contracts:
   - `artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json`
   - `artifacts/phase2c/RELIABILITY_GATE_WORKFLOW_V1.md`
