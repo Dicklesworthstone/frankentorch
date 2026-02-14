@@ -79,13 +79,12 @@ fn main() {
         .unwrap_or_else(default_root);
     let phase2c_root = root.join("artifacts/phase2c");
 
-    let mut packets = Vec::new();
-
     let Ok(entries) = fs::read_dir(&phase2c_root) else {
         eprintln!("phase2c root missing: {}", phase2c_root.display());
         std::process::exit(2);
     };
 
+    let mut packet_dirs = Vec::new();
     for entry in entries.flatten() {
         let Ok(file_type) = entry.file_type() else {
             continue;
@@ -100,9 +99,10 @@ fn main() {
         if !packet_id.starts_with("FT-P2C-") {
             continue;
         }
-        packets.push(validate_packet(packet_id, &entry.path()));
+        packet_dirs.push((packet_id.to_string(), entry.path()));
     }
 
+    let mut packets = validate_packets(packet_dirs);
     packets.sort_by(|left, right| left.packet_id.cmp(&right.packet_id));
     let packet_ids: Vec<String> = packets
         .iter()
@@ -267,6 +267,51 @@ fn validate_global(root: &Path, packet_ids: &[String]) -> GlobalValidation {
         warnings,
         checks,
     }
+}
+
+fn validate_packets(packet_dirs: Vec<(String, PathBuf)>) -> Vec<PacketValidation> {
+    if packet_dirs.is_empty() {
+        return Vec::new();
+    }
+
+    let workers = if std::env::var_os("FT_DISABLE_PACKET_PARALLELISM").is_some() {
+        1
+    } else {
+        std::thread::available_parallelism()
+            .map_or(1, |parallelism| parallelism.get())
+            .min(packet_dirs.len())
+    };
+
+    if workers <= 1 {
+        let mut packets = Vec::with_capacity(packet_dirs.len());
+        for (packet_id, packet_path) in packet_dirs {
+            packets.push(validate_packet(packet_id.as_str(), packet_path.as_path()));
+        }
+        return packets;
+    }
+
+    let chunk_size = packet_dirs.len().div_ceil(workers);
+    let mut packets = Vec::with_capacity(packet_dirs.len());
+    std::thread::scope(|scope| {
+        let mut handles = Vec::new();
+        for chunk in packet_dirs.chunks(chunk_size) {
+            handles.push(scope.spawn(move || {
+                let mut partial = Vec::with_capacity(chunk.len());
+                for (packet_id, packet_path) in chunk {
+                    partial.push(validate_packet(packet_id.as_str(), packet_path.as_path()));
+                }
+                partial
+            }));
+        }
+
+        for handle in handles {
+            let mut partial = handle
+                .join()
+                .expect("validate_phase2c_artifacts worker panicked");
+            packets.append(&mut partial);
+        }
+    });
+    packets
 }
 
 fn validate_packet(packet_id: &str, packet_path: &Path) -> PacketValidation {

@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+mod logging;
+
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -15,6 +17,7 @@ use ft_serialize::{
     CheckpointMode, DecodeMode, SnapshotEntry as SerializedSnapshotEntry, decode_checkpoint,
     encode_checkpoint, generate_raptorq_sidecar,
 };
+use logging::{StructuredCaseLog, mode_label};
 use serde::Deserialize;
 
 #[derive(Debug, Clone)]
@@ -49,6 +52,7 @@ pub struct CaseReport {
     pub output_ok: bool,
     pub lhs_grad_ok: bool,
     pub rhs_grad_ok: bool,
+    pub forensic_log: StructuredCaseLog,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -61,6 +65,7 @@ pub struct DispatchCaseReport {
     pub kernel_ok: bool,
     pub fallback_ok: bool,
     pub error_ok: bool,
+    pub forensic_log: StructuredCaseLog,
 }
 
 impl DispatchCaseReport {
@@ -82,6 +87,7 @@ pub struct SchedulerCaseReport {
     pub grad_ok: bool,
     pub order_ok: bool,
     pub reentrant_policy_ok: bool,
+    pub forensic_log: StructuredCaseLog,
 }
 
 impl SchedulerCaseReport {
@@ -98,6 +104,7 @@ pub struct SerializationCaseReport {
     pub decode_ok: bool,
     pub sidecar_ok: bool,
     pub proof_deterministic_ok: bool,
+    pub forensic_log: StructuredCaseLog,
 }
 
 impl SerializationCaseReport {
@@ -126,12 +133,12 @@ pub struct BenchReport {
     pub mean_ns: u128,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ScalarFixtureFile {
     cases: Vec<ScalarCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct ScalarCase {
     name: String,
     op: String,
@@ -143,12 +150,12 @@ struct ScalarCase {
     tolerance: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DispatchFixtureFile {
     cases: Vec<DispatchCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DispatchCase {
     name: String,
     op: String,
@@ -161,7 +168,7 @@ struct DispatchCase {
     tolerance: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct DispatchModeExpectation {
     expected_output: Option<f64>,
     expected_selected_key: Option<String>,
@@ -171,12 +178,12 @@ struct DispatchModeExpectation {
     expect_error: Option<bool>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SchedulerFixtureFile {
     cases: Vec<SchedulerCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SchedulerCase {
     name: String,
     x: f64,
@@ -187,23 +194,31 @@ struct SchedulerCase {
     tolerance: Option<f64>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SerializationFixtureFile {
     cases: Vec<SerializationCase>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SerializationCase {
     name: String,
     entries: Vec<SerializationCaseEntry>,
     repair_symbols: Option<usize>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 struct SerializationCaseEntry {
     node_id: usize,
     value: f64,
     grad: Option<f64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct E2EForensicsSummary {
+    pub output_path: PathBuf,
+    pub log_entries: usize,
+    pub failed_entries: usize,
+    pub modes: Vec<ExecutionMode>,
 }
 
 #[must_use]
@@ -362,6 +377,83 @@ pub fn run_serialization_conformance(
     Ok((report, case_reports))
 }
 
+pub fn emit_e2e_forensics_matrix(
+    config: &HarnessConfig,
+    output_path: &Path,
+    modes: &[ExecutionMode],
+) -> Result<E2EForensicsSummary, String> {
+    emit_e2e_forensics_matrix_filtered(config, output_path, modes, None)
+}
+
+pub fn emit_e2e_forensics_matrix_filtered(
+    config: &HarnessConfig,
+    output_path: &Path,
+    modes: &[ExecutionMode],
+    packet_filter: Option<&str>,
+) -> Result<E2EForensicsSummary, String> {
+    let selected_modes = if modes.is_empty() {
+        vec![ExecutionMode::Strict, ExecutionMode::Hardened]
+    } else {
+        modes.to_vec()
+    };
+
+    let mut logs = Vec::new();
+    for mode in selected_modes.iter().copied() {
+        let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
+        logs.extend(scalar_cases.into_iter().map(|case| case.forensic_log));
+
+        let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
+        logs.extend(dispatch_cases.into_iter().map(|case| case.forensic_log));
+
+        let (_, scheduler_cases) = run_autograd_scheduler_conformance(config, mode)?;
+        logs.extend(scheduler_cases.into_iter().map(|case| case.forensic_log));
+
+        let (_, serialization_cases) = run_serialization_conformance(config, mode)?;
+        logs.extend(
+            serialization_cases
+                .into_iter()
+                .map(|case| case.forensic_log),
+        );
+    }
+
+    if let Some(packet_id) = packet_filter {
+        logs.retain(|entry| entry.packet_id == packet_id);
+    }
+
+    let mut lines = String::new();
+    for entry in &logs {
+        let line = serde_json::to_string(entry)
+            .map_err(|error| format!("failed to serialize structured log entry: {error}"))?;
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create e2e forensics output dir {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(output_path, lines).map_err(|error| {
+        format!(
+            "failed to write e2e forensics log {}: {error}",
+            output_path.display()
+        )
+    })?;
+
+    let failed_entries = logs.iter().filter(|entry| entry.outcome != "pass").count();
+
+    Ok(E2EForensicsSummary {
+        output_path: output_path.to_path_buf(),
+        log_entries: logs.len(),
+        failed_entries,
+        modes: selected_modes,
+    })
+}
+
 #[must_use]
 pub fn run_scalar_microbench(iterations: usize, mode: ExecutionMode) -> BenchReport {
     let mut samples = Vec::with_capacity(iterations.max(1));
@@ -420,13 +512,42 @@ fn run_scalar_case(case: &ScalarCase, mode: ExecutionMode) -> Result<CaseReport,
         .ok_or_else(|| format!("missing rhs grad for '{}'", case.name))?;
 
     let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = within(actual_output, case.expected_output, tolerance);
+    let lhs_grad_ok = within(actual_lhs_grad, case.expected_lhs_grad, tolerance);
+    let rhs_grad_ok = within(actual_rhs_grad, case.expected_rhs_grad, tolerance);
+    let outcome = if output_ok && lhs_grad_ok && rhs_grad_ok {
+        "pass"
+    } else {
+        "fail"
+    };
 
     Ok(CaseReport {
         name: case.name.clone(),
         mode,
-        output_ok: within(actual_output, case.expected_output, tolerance),
-        lhs_grad_ok: within(actual_lhs_grad, case.expected_lhs_grad, tolerance),
-        rhs_grad_ok: within(actual_rhs_grad, case.expected_rhs_grad, tolerance),
+        output_ok,
+        lhs_grad_ok,
+        rhs_grad_ok,
+        forensic_log: StructuredCaseLog::new(
+            "scalar_dac",
+            "scalar_autograd_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/scalar_autograd_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance strict_scalar_conformance_is_green -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            if outcome == "pass" {
+                "parity_ok"
+            } else {
+                "scalar_or_grad_mismatch"
+            },
+        ),
     })
 }
 
@@ -454,6 +575,7 @@ fn run_dispatch_case(
     let tolerance = case.tolerance.unwrap_or(1e-12);
 
     if expected_error {
+        let error_ok = result.is_err();
         return Ok(DispatchCaseReport {
             name: case.name.clone(),
             mode,
@@ -462,7 +584,28 @@ fn run_dispatch_case(
             backend_key_ok: true,
             kernel_ok: true,
             fallback_ok: true,
-            error_ok: result.is_err(),
+            error_ok,
+            forensic_log: StructuredCaseLog::new(
+                "dispatch_key",
+                "dispatch_key_cases.json",
+                "FT-P2C-002",
+                case.name.as_str(),
+                mode,
+                vec![
+                    "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                    "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+                ],
+                format!(
+                    "cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture # mode={}",
+                    mode_label(mode)
+                ),
+                if error_ok { "pass" } else { "fail" },
+                if error_ok {
+                    "expected_error_observed"
+                } else {
+                    "expected_error_missing"
+                },
+            ),
         });
     }
 
@@ -493,6 +636,7 @@ fn run_dispatch_case(
     let fallback_ok = expectation
         .expected_fallback
         .is_none_or(|expected| expected == outcome.decision.fallback_used);
+    let passed = output_ok && selected_key_ok && backend_key_ok && kernel_ok && fallback_ok;
 
     Ok(DispatchCaseReport {
         name: case.name.clone(),
@@ -503,6 +647,27 @@ fn run_dispatch_case(
         kernel_ok,
         fallback_ok,
         error_ok: true,
+        forensic_log: StructuredCaseLog::new(
+            "dispatch_key",
+            "dispatch_key_cases.json",
+            "FT-P2C-002",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            if passed { "pass" } else { "fail" },
+            if passed {
+                "dispatch_parity_ok"
+            } else {
+                "dispatch_expectation_mismatch"
+            },
+        ),
     })
 }
 
@@ -564,6 +729,7 @@ fn run_scheduler_case(
             .map(|overflow_report| overflow_report.telemetry.reentrant_guard_triggered)
             .unwrap_or(false),
     };
+    let passed = grad_ok && order_ok && reentrant_policy_ok;
 
     Ok(SchedulerCaseReport {
         name: case.name.clone(),
@@ -571,6 +737,27 @@ fn run_scheduler_case(
         grad_ok,
         order_ok,
         reentrant_policy_ok,
+        forensic_log: StructuredCaseLog::new(
+            "autograd_scheduler",
+            "autograd_scheduler_cases.json",
+            "FT-P2C-004",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/autograd_scheduler_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-004/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance strict_scheduler_conformance_is_green -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            if passed { "pass" } else { "fail" },
+            if passed {
+                "scheduler_parity_ok"
+            } else {
+                "scheduler_expectation_mismatch"
+            },
+        ),
     })
 }
 
@@ -618,6 +805,7 @@ fn run_serialization_case(
 
     let sidecar_ok = sidecar_a.repair_symbol_count >= 1 && sidecar_a.constraints_symbol_count >= 1;
     let proof_deterministic_ok = proof_a.proof_hash == proof_b.proof_hash;
+    let passed = decode_ok && sidecar_ok && proof_deterministic_ok;
 
     Ok(SerializationCaseReport {
         name: case.name.clone(),
@@ -625,6 +813,28 @@ fn run_serialization_case(
         decode_ok,
         sidecar_ok,
         proof_deterministic_ok,
+        forensic_log: StructuredCaseLog::new(
+            "serialization",
+            "serialization_cases.json",
+            "FT-P2C-006",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/serialization_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-006/parity_report.json".to_string(),
+                "artifacts/phase2c/FT-P2C-006/parity_report.raptorq.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance strict_serialization_conformance_is_green -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            if passed { "pass" } else { "fail" },
+            if passed {
+                "serialization_parity_ok"
+            } else {
+                "serialization_expectation_mismatch"
+            },
+        ),
     })
 }
 
@@ -698,9 +908,14 @@ fn percentile(samples: &[u128], p: usize) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
     use super::{
-        ExecutionMode, HarnessConfig, run_autograd_scheduler_conformance, run_dispatch_conformance,
-        run_scalar_conformance, run_scalar_microbench, run_serialization_conformance, run_smoke,
+        ExecutionMode, HarnessConfig, emit_e2e_forensics_matrix,
+        emit_e2e_forensics_matrix_filtered, run_autograd_scheduler_conformance,
+        run_dispatch_conformance, run_scalar_conformance, run_scalar_microbench,
+        run_serialization_conformance, run_smoke,
     };
 
     #[test]
@@ -779,6 +994,103 @@ mod tests {
             .expect("serialization conformance should run");
 
         assert_eq!(report.cases_total, report.cases_passed);
+    }
+
+    #[test]
+    fn structured_logs_include_replay_contract_fields() {
+        let cfg = HarnessConfig::default_paths();
+        let (_, cases) = run_scalar_conformance(&cfg, ExecutionMode::Strict)
+            .expect("strict conformance should run");
+
+        assert!(!cases.is_empty(), "expected at least one scalar case");
+        let log = &cases[0].forensic_log;
+        assert_eq!(log.schema_version, "ft-conformance-log-v1");
+        assert!(!log.scenario_id.is_empty());
+        assert!(log.seed > 0);
+        assert_eq!(log.mode, "strict");
+        assert!(log.env_fingerprint.starts_with("det64:"));
+        assert!(!log.replay_command.is_empty());
+        assert!(!log.artifact_refs.is_empty());
+    }
+
+    #[test]
+    fn e2e_matrix_writer_emits_jsonl() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+        )
+        .expect("e2e matrix should emit logs");
+
+        assert!(summary.log_entries >= 8);
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        let mut lines = raw.lines();
+        let first = lines
+            .next()
+            .expect("jsonl should contain at least one line");
+        let value: serde_json::Value =
+            serde_json::from_str(first).expect("jsonl line should be valid json");
+
+        for required in [
+            "scenario_id",
+            "seed",
+            "mode",
+            "env_fingerprint",
+            "artifact_refs",
+            "replay_command",
+            "outcome",
+        ] {
+            assert!(
+                value.get(required).is_some(),
+                "missing required key {required}"
+            );
+        }
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn e2e_matrix_packet_filter_limits_output() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_packet_filter_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix_filtered(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+            Some("FT-P2C-004"),
+        )
+        .expect("packet-filtered e2e matrix should emit logs");
+
+        assert!(summary.log_entries > 0);
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        for line in raw.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("jsonl line should be valid json");
+            assert_eq!(
+                value.get("packet_id").and_then(serde_json::Value::as_str),
+                Some("FT-P2C-004")
+            );
+        }
+
+        let _ = fs::remove_file(output_path);
     }
 
     #[test]

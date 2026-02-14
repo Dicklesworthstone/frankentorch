@@ -234,14 +234,15 @@ impl Tape {
         rhs: NodeId,
         mode: ExecutionMode,
     ) -> Result<(NodeId, OperationEvent), AutogradError> {
-        let lhs_node = self.node(lhs)?;
-        let rhs_node = self.node(rhs)?;
-        let lhs_tensor = lhs_node.tensor.clone();
-        let rhs_tensor = rhs_node.tensor.clone();
-        let requires_grad = lhs_node.requires_grad || rhs_node.requires_grad;
-
-        let outcome = dispatch_scalar_binary(op, mode, &lhs_tensor, &rhs_tensor, requires_grad)
-            .map_err(AutogradError::Dispatch)?;
+        let (requires_grad, outcome) = {
+            let lhs_node = self.node(lhs)?;
+            let rhs_node = self.node(rhs)?;
+            let requires_grad = lhs_node.requires_grad || rhs_node.requires_grad;
+            let outcome =
+                dispatch_scalar_binary(op, mode, &lhs_node.tensor, &rhs_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
 
         let out = NodeId(self.nodes.len());
         self.nodes.push(Node {
