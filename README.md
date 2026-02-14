@@ -52,6 +52,17 @@ Maintain deterministic gradient accumulation, alias/versioning rules, and backwa
 - AGENTS.md
 - COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md
 
+## Conformance + E2E Forensics
+
+- Run packet-side conformance:
+  - `cargo test -p ft-conformance -- --nocapture`
+- Emit structured e2e forensic JSONL logs:
+  - `cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --output artifacts/phase2c/e2e_forensics/e2e_matrix.jsonl`
+- Packet-scoped e2e forensic slice:
+  - `cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-004 --output artifacts/phase2c/e2e_forensics/ft-p2c-004.jsonl`
+- Log schema contract:
+  - `artifacts/phase2c/TEST_LOG_CONTRACT_V1.md`
+
 ## Next Steps
 
 1. Scaffold Cargo workspace and crate map.

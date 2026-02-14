@@ -201,3 +201,37 @@ Objective: complete `FT-P2C-002`, `FT-P2C-004`, and `FT-P2C-006` end-to-end (cod
 ### 10.4 Multi-Agent Coordination
 - [ ] Fetch/respond to Agent Mail inbox messages (blocked: MCP transport decode failure in this environment).
 - [ ] Broadcast optimization + bead changes to agent peers after MCP transport recovery.
+
+## 11. Structured Logging + E2E Matrix + Validator Parallelism (Current Pass)
+
+### 11.1 Structured Logging Contract (bd-3v0.5 scope)
+- [x] Add canonical structured test/e2e logging schema implementation (`ft-conformance-log-v1`).
+- [x] Attach structured forensic logs to scalar/dispatch/scheduler/serialization case reports.
+- [x] Enforce required log fields (`scenario_id`, `seed`, `mode`, `env_fingerprint`, `artifact_refs`, `replay_command`, `outcome`, `reason_code`).
+- [x] Add contract document `artifacts/phase2c/TEST_LOG_CONTRACT_V1.md`.
+- [x] Add unit tests proving log contract fields are populated.
+- [x] Post implementation evidence comment on `bd-3v0.5` and close bead.
+
+### 11.2 E2E Replay/Forensics Emitter
+- [x] Add `emit_e2e_forensics_matrix` API to emit JSONL forensic logs.
+- [x] Add CLI binary `run_e2e_matrix` with mode/output controls.
+- [x] Add test validating JSONL emission and required key presence.
+- [x] Add packet-scoped filtering (`--packet FT-P2C-00X`) and validation test.
+- [x] Post implementation evidence comment on `bd-3v0.6` and close bead.
+
+### 11.3 Extreme Optimization Lever (Retained)
+- [x] Profile packet validator hotpath on synthetic large-corpus benchmark root.
+- [x] Implement one lever only: packet-level parallel validation in `validate_phase2c_artifacts`.
+- [x] Add deterministic fallback switch (`FT_DISABLE_PACKET_PARALLELISM=1`).
+- [x] Benchmark baseline-vs-optimized in same revision and confirm speedup.
+- [x] Record optimization + isomorphism artifact at `artifacts/optimization/2026-02-14_packet_parallel_validation.md`.
+
+### 11.4 Optimization Candidate Rejected (Not Retained)
+- [x] Evaluate typed fixture memoization in `ft-conformance`.
+- [x] Re-benchmark and detect no win/regression on target workload.
+- [x] Remove candidate implementation to avoid unnecessary complexity/perf drag.
+
+### 11.5 Next Highest-Impact Bead Started
+- [x] Re-run `bv --robot-next` and confirm next bead is `bd-3v0.4`.
+- [x] Mark `bd-3v0.4` as `in_progress`.
+- [x] Post progress comment describing closed gaps and remaining differential-oracle work.
