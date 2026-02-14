@@ -85,3 +85,21 @@ Execution evidence link status:
 Threat-control status:
 - `THR-001`, `THR-002`, and `THR-004` are covered by active unit/property + differential + forensics artifacts.
 - `THR-005` remains explicitly deferred under `GAP-UX-001` until mismatch fixtures are added to packet differential/e2e suites.
+
+## 7) Optimization/Performance Evidence Refresh (bd-3v0.12.8 linkage)
+
+Offloaded baseline replay command (project-policy compliant):
+- `~/.local/bin/rch exec -- bash -lc "cd /data/projects/frankentorch && env CARGO_TARGET_DIR=/tmp/frankentorch-target-self /usr/bin/time -f 'max_rss_kb=%M elapsed_s=%e' cargo test -q -p ft-conformance microbench_produces_percentiles -- --nocapture"`
+
+Observed strict-mode baseline:
+- `microbench_ns p50=3477 p95=4698 p99=4698 mean=7509`
+- `max_rss_kb=44192 elapsed_s=0.14`
+
+Performance/isomorphism stance for FT-P2C-001:
+- no packet-specific optimization lever was introduced in this refresh;
+- packet remains behavior-isomorphic by retaining green unit/property + differential + e2e evidence with zero drift/failures;
+- optimization evidence inherits the foundation retained lever documentation and isomorphism anchors:
+  - `artifacts/optimization/2026-02-14_foundation_perf_rebaseline.md`
+  - `artifacts/optimization/2026-02-14_foundation_perf_rebaseline.json`
+  - `artifacts/optimization/2026-02-14_packet_parallel_validation.md`
+  - `artifacts/optimization/2026-02-13_phase2c_isomorphism.md`

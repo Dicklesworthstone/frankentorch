@@ -3,17 +3,17 @@
   "generated_on": "2026-02-14",
   "scope": "bd-3v0.8 foundation performance baseline refresh",
   "benchmark": {
-    "command": "env CARGO_TARGET_DIR=/tmp/frankentorch-target-self /usr/bin/time -f 'max_rss_kb=%M elapsed_s=%e' cargo test -q -p ft-conformance microbench_produces_percentiles -- --nocapture",
+    "command": "~/.local/bin/rch exec -- bash -lc \"cd /data/projects/frankentorch && env CARGO_TARGET_DIR=/tmp/frankentorch-target-self /usr/bin/time -f 'max_rss_kb=%M elapsed_s=%e' cargo test -q -p ft-conformance microbench_produces_percentiles -- --nocapture\"",
     "mode": "strict",
     "iterations": 10,
     "step_time_tails_ns": {
-      "p50": 3537,
-      "p95": 4749,
-      "p99": 4749,
-      "mean": 6180
+      "p50": 3477,
+      "p95": 4698,
+      "p99": 4698,
+      "mean": 7509
     },
     "memory": {
-      "max_rss_kb": 42144,
+      "max_rss_kb": 44192,
       "elapsed_s": 0.14
     },
     "backward_path_included": true

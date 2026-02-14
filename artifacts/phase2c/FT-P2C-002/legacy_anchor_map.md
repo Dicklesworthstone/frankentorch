@@ -22,6 +22,9 @@ Legacy root: `legacy_pytorch_code/pytorch`
 | `ft-autograd` | `crates/ft-autograd/src/lib.rs` | `dispatch_scalar_binary(... requires_grad)` integration for autograd-aware key selection |
 | `ft-conformance` | `crates/ft-conformance/src/lib.rs` | dispatch-route conformance family (`dispatch_key_cases.json`) |
 
+Behavior extraction ledger:
+- `artifacts/phase2c/FT-P2C-002/behavior_extraction_ledger.md`
+
 ## Extraction Schema (Mandatory)
 
 1. `packet_id`: `FT-P2C-002`

@@ -1,5 +1,8 @@
 {
   "packet_id": "FT-P2C-002",
+  "behavior_ledger": "artifacts/phase2c/FT-P2C-002/behavior_extraction_ledger.md",
+  "legacy_anchor_map": "artifacts/phase2c/FT-P2C-002/legacy_anchor_map.md",
+  "implementation_plan": "artifacts/phase2c/FT-P2C-002/implementation_plan.md",
   "fixtures": [
     {
       "id": "dispatch_strict_autograd_route",
@@ -24,5 +27,40 @@
     }
   ],
   "modes": ["strict", "hardened"],
+  "logging_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code"
+  ],
+  "scenario_seed_map": {
+    "dispatch_key/strict:strict_autograd_route": 12780237016247668875,
+    "dispatch_key/strict:strict_cpu_route": 6654506012862553729,
+    "dispatch_key/strict:composite_route_mode_split": 14228129716249401336,
+    "dispatch_key/hardened:strict_autograd_route": 456065680046437289,
+    "dispatch_key/hardened:strict_cpu_route": 7720564810062027209,
+    "dispatch_key/hardened:composite_route_mode_split": 2146157517907283417
+  },
+  "deferred_seed_candidates": {
+    "dispatch_key/strict:unknown_bits_mask_candidate": 201313001,
+    "dispatch_key/hardened:unknown_bits_mask_candidate": 201313002,
+    "dispatch_key/strict:incompatible_autograd_without_cpu_candidate": 201313003,
+    "dispatch_key/hardened:incompatible_autograd_without_cpu_candidate": 201313004,
+    "dispatch_key/strict:non_cpu_backend_key_candidate": 201313005,
+    "dispatch_key/hardened:non_cpu_backend_key_candidate": 201313006
+  },
+  "security_compatibility_artifact": "artifacts/phase2c/FT-P2C-002/risk_note.md",
+  "contract_artifacts": [
+    "artifacts/phase2c/FT-P2C-002/contract_table.md",
+    "artifacts/phase2c/FT-P2C-002/parity_gate.yaml",
+    "artifacts/phase2c/FT-P2C-002/parity_report.json"
+  ],
   "status": "active"
 }

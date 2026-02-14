@@ -5,16 +5,17 @@ Bead: `bd-3v0.8`
 ## Baseline Refresh
 
 Command:
-- `env CARGO_TARGET_DIR=/tmp/frankentorch-target-self /usr/bin/time -f 'max_rss_kb=%M elapsed_s=%e' cargo test -q -p ft-conformance microbench_produces_percentiles -- --nocapture`
+- `~/.local/bin/rch exec -- bash -lc "cd /data/projects/frankentorch && env CARGO_TARGET_DIR=/tmp/frankentorch-target-self /usr/bin/time -f 'max_rss_kb=%M elapsed_s=%e' cargo test -q -p ft-conformance microbench_produces_percentiles -- --nocapture"`
 
 Measured output:
-- `microbench_ns p50=3537 p95=4749 p99=4749 mean=6180`
-- `max_rss_kb=42144 elapsed_s=0.14`
+- `microbench_ns p50=3477 p95=4698 p99=4698 mean=7509`
+- `max_rss_kb=44192 elapsed_s=0.14`
 
 Interpretation:
 - step-time tails captured via strict-mode scalar DAC microbench.
 - backward overhead is included (`run_scalar_microbench` executes `backward` each iteration).
 - memory churn baseline is tracked via peak RSS snapshot (`/usr/bin/time`).
+- command execution is CPU-offloaded through `rch` as required by project policy.
 
 ## Optimization Loop Linkage
 
@@ -27,9 +28,9 @@ Behavior-isomorphism proof anchors:
 - `artifacts/phase2c/conformance/differential_report_v1.json`
 - `artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl`
 
-## Gate Status
+## Gate Anchors
 
-Post-change gates used for this pass are green:
+Post-change gate set (historically green and retained as behavioral anchors):
 - `cargo fmt --check`
 - `cargo check --all-targets`
 - `cargo clippy --all-targets -- -D warnings`
