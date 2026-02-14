@@ -1,19 +1,28 @@
 {
   "packet_id": "FT-P2C-001",
+  "behavior_ledger": "artifacts/phase2c/FT-P2C-001/behavior_extraction_ledger.md",
   "fixtures": [
     {
       "id": "scalar_add_basic",
       "file": "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
       "case_name": "add_basic",
       "oracle_family": "autograd_scalar",
-      "assertions": ["output", "lhs_grad", "rhs_grad"]
+      "assertions": [
+        "output",
+        "lhs_grad",
+        "rhs_grad"
+      ]
     },
     {
       "id": "scalar_mul_basic",
       "file": "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
       "case_name": "mul_basic",
       "oracle_family": "autograd_scalar",
-      "assertions": ["output", "lhs_grad", "rhs_grad"]
+      "assertions": [
+        "output",
+        "lhs_grad",
+        "rhs_grad"
+      ]
     },
     {
       "id": "tensor_meta_contiguous_basic_index",
@@ -56,16 +65,56 @@
       "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
       "case_name": "invalid_rank_stride_mismatch",
       "oracle_family": "tensor_meta_contract",
-      "assertions": ["expect_fail_closed"]
+      "assertions": [
+        "expect_fail_closed"
+      ]
     },
     {
       "id": "tensor_meta_invalid_storage_offset_overflow",
       "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
       "case_name": "invalid_storage_offset_overflow",
       "oracle_family": "tensor_meta_contract",
-      "assertions": ["expect_fail_closed"]
+      "assertions": [
+        "expect_fail_closed"
+      ]
     }
   ],
-  "modes": ["strict", "hardened"],
+  "modes": [
+    "strict",
+    "hardened"
+  ],
+  "logging_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code"
+  ],
+  "scenario_seed_map": {
+    "scalar_dac/strict:add_basic": 11230214846748554265,
+    "scalar_dac/strict:mul_basic": 1767315763877827661,
+    "scalar_dac/hardened:add_basic": 7472292100909643468,
+    "scalar_dac/hardened:mul_basic": 17290219769398318397,
+    "tensor_meta/strict:contiguous_basic_index": 4395520818158430929,
+    "tensor_meta/strict:strided_offset_index": 14323049674851941302,
+    "tensor_meta/strict:scalar_offset_index": 2717510909112554909,
+    "tensor_meta/strict:invalid_rank_stride_mismatch": 9353830229903822145,
+    "tensor_meta/strict:invalid_storage_offset_overflow": 11931105988727078667,
+    "tensor_meta/hardened:contiguous_basic_index": 7837796412515040673,
+    "tensor_meta/hardened:strided_offset_index": 9223797700649824762,
+    "tensor_meta/hardened:scalar_offset_index": 12558646690359430722,
+    "tensor_meta/hardened:invalid_rank_stride_mismatch": 5997540812546318856,
+    "tensor_meta/hardened:invalid_storage_offset_overflow": 1156477838142738040
+  },
+  "deferred_seed_candidates": {
+    "tensor_meta/strict:compat_device_mismatch_candidate": 1609459201001,
+    "tensor_meta/hardened:compat_device_mismatch_candidate": 1609459201002
+  },
   "status": "active"
 }
