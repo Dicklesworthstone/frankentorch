@@ -66,10 +66,30 @@ Maintain deterministic gradient accumulation, alias/versioning rules, and backwa
 
 - Run packet-side conformance:
   - `cargo test -p ft-conformance -- --nocapture`
+- Versioned user workflow scenario corpus:
+  - `artifacts/phase2c/USER_WORKFLOW_SCENARIO_CORPUS_V1.json`
+- Scenario gap ledger (explicit non-covered branches + follow-up beads):
+  - `artifacts/phase2c/USER_WORKFLOW_SCENARIO_GAP_LEDGER_V1.md`
+- Unit/E2E/logging crosswalk (machine-diffable):
+  - `artifacts/phase2c/UNIT_E2E_LOGGING_CROSSWALK_V1.json`
 - Emit structured e2e forensic JSONL logs:
   - `cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --output artifacts/phase2c/e2e_forensics/e2e_matrix.jsonl`
+- Emit full golden-journey matrix and derive coverage summary:
+  - `cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --output artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl`
+  - `jq -s '{schema_version:\"ft-user-journey-coverage-v1\", generated_on:\"2026-02-14\", source:\"artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl\", total_entries:length, total_failed: map(select(.outcome != \"pass\")) | length, suites:(map(.suite_id)|unique), packets:(map(.packet_id)|unique), reason_codes:(map(.reason_code)|unique), scenario_ids:(map(.scenario_id)|unique)}' artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl > artifacts/phase2c/e2e_forensics/golden_journey_coverage_v1.json`
 - Packet-scoped e2e forensic slice:
   - `cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-004 --output artifacts/phase2c/e2e_forensics/ft-p2c-004.jsonl`
+- Triage failed forensic entries into replay-ready crash incidents:
+  - `cargo run -p ft-conformance --bin triage_forensics_failures -- --input artifacts/phase2c/e2e_forensics/e2e_matrix.jsonl --output artifacts/phase2c/e2e_forensics/crash_triage_v1.json`
+- Build failure forensics artifact index (unit/differential/e2e/perf/RaptorQ link map):
+  - `cargo run -p ft-conformance --bin build_failure_forensics_index -- --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl --triage artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json --output artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json`
+- Run reliability budgets gate (coverage floors + flake budgets):
+  - `cargo run -p ft-conformance --bin check_reliability_budgets -- --policy artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl --output artifacts/phase2c/e2e_forensics/reliability_gate_report_v1.json`
+- Reliability policy + workflow contracts:
+  - `artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json`
+  - `artifacts/phase2c/RELIABILITY_GATE_WORKFLOW_V1.md`
+- Failure envelope schema contract:
+  - `artifacts/phase2c/FAILURE_FORENSICS_ENVELOPE_SCHEMA_V1.md`
 - Log schema contract:
   - `artifacts/phase2c/TEST_LOG_CONTRACT_V1.md`
 

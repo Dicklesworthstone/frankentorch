@@ -1,0 +1,258 @@
+{
+  "schema_version": "ft-user-journey-corpus-v1",
+  "artifact_version": 1,
+  "generated_on": "2026-02-14",
+  "scope": "FrankenTorch Phase-2C user workflow scenario corpus",
+  "scenario_id_contract": {
+    "function_anchor": "crates/ft-conformance/src/lib.rs:2345",
+    "format": "{suite}/{mode}:{canonical_case_name}",
+    "mode_values": [
+      "strict",
+      "hardened"
+    ]
+  },
+  "logging_contract": {
+    "schema": "ft-conformance-log-v1",
+    "anchor": "crates/ft-conformance/src/logging.rs:11",
+    "required_fields": [
+      "suite_id",
+      "scenario_id",
+      "packet_id",
+      "mode",
+      "seed",
+      "env_fingerprint",
+      "artifact_refs",
+      "replay_command",
+      "outcome",
+      "reason_code"
+    ]
+  },
+  "evidence_artifacts": {
+    "e2e_matrix": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
+    "coverage_summary": "artifacts/phase2c/e2e_forensics/golden_journey_coverage_v1.json"
+  },
+  "journeys": [
+    {
+      "journey_id": "UJ-FT-001",
+      "name": "Scalar gradient happy path",
+      "class": "golden_happy_path",
+      "packet_scopes": [
+        "FT-P2C-001"
+      ],
+      "fixture_cases": [
+        "scalar_autograd_cases.json:add_basic",
+        "scalar_autograd_cases.json:mul_basic"
+      ],
+      "scenario_ids": [
+        "scalar_dac/strict:add_basic",
+        "scalar_dac/hardened:add_basic",
+        "scalar_dac/strict:mul_basic",
+        "scalar_dac/hardened:mul_basic"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-api session_add_backward_records_evidence -- --nocapture",
+        "cargo test -p ft-autograd add_backward_matches_expected_gradient -- --nocapture",
+        "cargo test -p ft-autograd mul_backward_matches_expected_gradient -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=scalar_dac comparator=oracle.scalar_output drift_id=scalar.output_mismatch",
+        "suite=scalar_dac comparator=oracle.scalar_x_grad drift_id=scalar.x_grad_mismatch",
+        "suite=scalar_dac comparator=oracle.scalar_y_grad drift_id=scalar.y_grad_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-002",
+      "name": "Tensor metadata indexing happy path",
+      "class": "golden_happy_path",
+      "packet_scopes": [
+        "FT-P2C-001"
+      ],
+      "fixture_cases": [
+        "tensor_meta_cases.json:contiguous_basic_index",
+        "tensor_meta_cases.json:strided_offset_index",
+        "tensor_meta_cases.json:scalar_offset_index"
+      ],
+      "scenario_ids": [
+        "tensor_meta/strict:contiguous_basic_index",
+        "tensor_meta/hardened:contiguous_basic_index",
+        "tensor_meta/strict:strided_offset_index",
+        "tensor_meta/hardened:strided_offset_index",
+        "tensor_meta/strict:scalar_offset_index",
+        "tensor_meta/hardened:scalar_offset_index"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-core index_rank_and_bounds_are_guarded -- --nocapture",
+        "cargo test -p ft-core custom_strides_validate_and_index_into_storage -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=tensor_meta comparator=oracle.tensor_meta drift_id=tensor_meta.numel_mismatch",
+        "suite=tensor_meta comparator=oracle.tensor_meta drift_id=tensor_meta.linear_index_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-003",
+      "name": "Dispatch route parity (autograd + cpu)",
+      "class": "golden_regression_path",
+      "packet_scopes": [
+        "FT-P2C-002"
+      ],
+      "fixture_cases": [
+        "dispatch_key_cases.json:strict_autograd_route",
+        "dispatch_key_cases.json:strict_cpu_route"
+      ],
+      "scenario_ids": [
+        "dispatch_key/strict:strict_autograd_route",
+        "dispatch_key/hardened:strict_autograd_route",
+        "dispatch_key/strict:strict_cpu_route",
+        "dispatch_key/hardened:strict_cpu_route"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-dispatch dispatch_returns_kernel_metadata -- --nocapture",
+        "cargo test -p ft-dispatch priority_resolution_prefers_autograd_cpu -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=dispatch_key comparator=dispatch.selected_key drift_id=dispatch.key_mismatch",
+        "suite=dispatch_key comparator=dispatch.fallback_used drift_id=dispatch.fallback_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-002 --output artifacts/phase2c/e2e_forensics/ft-p2c-002.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-004",
+      "name": "Autograd scheduler deterministic composite graph",
+      "class": "golden_regression_path",
+      "packet_scopes": [
+        "FT-P2C-004"
+      ],
+      "fixture_cases": [
+        "autograd_scheduler_cases.json:composite_scheduler_dac"
+      ],
+      "scenario_ids": [
+        "autograd_scheduler/strict:composite_scheduler_dac",
+        "autograd_scheduler/hardened:composite_scheduler_dac"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-autograd composite_graph_gradient_is_deterministic -- --nocapture",
+        "cargo test -p ft-autograd dependency_scheduler_waits_for_all_children -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=autograd_scheduler comparator=scheduler.output drift_id=scheduler.output_mismatch",
+        "suite=autograd_scheduler comparator=scheduler.execution_order drift_id=scheduler.execution_order_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-004 --output artifacts/phase2c/e2e_forensics/ft-p2c-004.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-005",
+      "name": "Malformed tensor metadata (rank/stride mismatch)",
+      "class": "malformed_input_path",
+      "packet_scopes": [
+        "FT-P2C-001"
+      ],
+      "fixture_cases": [
+        "tensor_meta_cases.json:invalid_rank_stride_mismatch"
+      ],
+      "scenario_ids": [
+        "tensor_meta/strict:invalid_rank_stride_mismatch",
+        "tensor_meta/hardened:invalid_rank_stride_mismatch"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-core index_rank_and_bounds_are_guarded -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=tensor_meta comparator=local.tensor_meta drift_id=tensor_meta.invalid_fail_closed_mismatch",
+        "suite=tensor_meta comparator=oracle.tensor_meta drift_id=tensor_meta.invalid_oracle_policy_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-006",
+      "name": "Malformed tensor metadata (storage offset overflow)",
+      "class": "malformed_input_path",
+      "packet_scopes": [
+        "FT-P2C-001"
+      ],
+      "fixture_cases": [
+        "tensor_meta_cases.json:invalid_storage_offset_overflow"
+      ],
+      "scenario_ids": [
+        "tensor_meta/strict:invalid_storage_offset_overflow",
+        "tensor_meta/hardened:invalid_storage_offset_overflow"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-core custom_strides_validate_and_index_into_storage -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=tensor_meta comparator=local.tensor_meta drift_id=tensor_meta.invalid_fail_closed_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-007",
+      "name": "Degraded policy branch split (dispatch composite fallback)",
+      "class": "degraded_environment_path",
+      "packet_scopes": [
+        "FT-P2C-002"
+      ],
+      "fixture_cases": [
+        "dispatch_key_cases.json:composite_route_mode_split"
+      ],
+      "scenario_ids": [
+        "dispatch_key/strict:composite_route_mode_split",
+        "dispatch_key/hardened:composite_route_mode_split"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-dispatch strict_mode_rejects_composite_fallback -- --nocapture",
+        "cargo test -p ft-dispatch hardened_mode_allows_composite_fallback -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=dispatch_key comparator=dispatch.fallback_used drift_id=dispatch.composite_backend_fallback"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-002 --output artifacts/phase2c/e2e_forensics/ft-p2c-002.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-008",
+      "name": "Serialization replay + sparse checkpoint durability",
+      "class": "golden_regression_path",
+      "packet_scopes": [
+        "FT-P2C-006"
+      ],
+      "fixture_cases": [
+        "serialization_cases.json:checkpoint_basic",
+        "serialization_cases.json:checkpoint_sparse_grad"
+      ],
+      "scenario_ids": [
+        "serialization/strict:checkpoint_basic",
+        "serialization/hardened:checkpoint_basic",
+        "serialization/strict:checkpoint_sparse_grad",
+        "serialization/hardened:checkpoint_sparse_grad"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-serialize strict_unknown_field_fail_closed -- --nocapture",
+        "cargo test -p ft-serialize version_mismatch_is_fail_closed -- --nocapture",
+        "cargo test -p ft-serialize checksum_mismatch_is_fail_closed -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=serialization comparator=serialization.decode drift_id=serialization.decode_mismatch",
+        "suite=serialization comparator=serialization.sidecar_determinism drift_id=serialization.sidecar_mismatch"
+      ],
+      "e2e_coverage": [
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl"
+      ]
+    }
+  ]
+}

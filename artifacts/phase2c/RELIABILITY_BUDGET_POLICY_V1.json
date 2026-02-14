@@ -1,0 +1,65 @@
+{
+  "schema_version": "ft-reliability-budget-policy-v1",
+  "policy_version": 1,
+  "generated_on": "2026-02-14",
+  "scope": "Phase-2C conformance + e2e reliability gating",
+  "coverage_floors": {
+    "FT-P2C-001": {
+      "min_scenarios": 14,
+      "min_pass_ratio": 1.0,
+      "required_suites": [
+        "scalar_dac",
+        "tensor_meta"
+      ]
+    },
+    "FT-P2C-002": {
+      "min_scenarios": 6,
+      "min_pass_ratio": 1.0,
+      "required_suites": [
+        "dispatch_key"
+      ]
+    },
+    "FT-P2C-004": {
+      "min_scenarios": 2,
+      "min_pass_ratio": 1.0,
+      "required_suites": [
+        "autograd_scheduler"
+      ]
+    },
+    "FT-P2C-006": {
+      "min_scenarios": 4,
+      "min_pass_ratio": 1.0,
+      "required_suites": [
+        "serialization"
+      ]
+    }
+  },
+  "flake_budget": {
+    "max_flake_suspects": 0,
+    "detection_rule": "same scenario_id appears with both pass and non-pass outcomes in one gate window",
+    "retry_limit": 2,
+    "quarantine_label": "flake-quarantine",
+    "de_flake_owner_workflow": [
+      "open/update bead under bd-3v0.22 with scenario_id and reason_code",
+      "attach replay command + forensic artifact refs",
+      "assign owning packet team",
+      "remove quarantine only after 3 clean consecutive gate runs"
+    ]
+  },
+  "global_budgets": {
+    "max_failed_entries": 0,
+    "max_unknown_reason_codes": 0
+  },
+  "remediation_hints": {
+    "coverage_floor": "Regenerate missing scenarios and update corpus/fixtures before merging.",
+    "pass_ratio": "Replay failed scenario_ids and inspect failure_forensics_index_v1.json.",
+    "required_suite": "Run packet-scoped e2e matrix and confirm suite-level logs are present.",
+    "flake_budget": "Trigger retry policy and quarantine scenario_id when instability persists.",
+    "unknown_reason": "Extend reason taxonomy in triage/index tooling before accepting the run."
+  },
+  "artifact_refs": {
+    "crosswalk": "artifacts/phase2c/UNIT_E2E_LOGGING_CROSSWALK_V1.json",
+    "scenario_corpus": "artifacts/phase2c/USER_WORKFLOW_SCENARIO_CORPUS_V1.json",
+    "forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json"
+  }
+}

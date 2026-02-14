@@ -1,0 +1,8 @@
+{
+  "schema_version": "ft-user-journey-coverage-audit-v1",
+  "generated_on": "2026-02-14",
+  "corpus_journey_count": 8,
+  "corpus_scenario_id_count": 26,
+  "missing_scenario_ids": [],
+  "missing_count": 0
+}

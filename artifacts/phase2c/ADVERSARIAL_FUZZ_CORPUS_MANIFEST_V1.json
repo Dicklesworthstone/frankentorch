@@ -1,0 +1,118 @@
+{
+  "schema_version": "ft-adversarial-corpus-v1",
+  "generated_on": "2026-02-14",
+  "bead_id": "bd-3v0.7",
+  "seed_provenance": {
+    "strategy": "deterministic seed from suite/fixture/packet/scenario/mode",
+    "anchor": "crates/ft-conformance/src/logging.rs:97",
+    "notes": "Seeds are stable for replay and triage correlation."
+  },
+  "coverage_tags": [
+    "parser-fail-closed",
+    "state-transition",
+    "mode-split",
+    "reentrant-guard",
+    "dispatch-fallback",
+    "durability-proof",
+    "e2e-replay"
+  ],
+  "families": [
+    {
+      "family_id": "tensor_meta_invalid_state",
+      "packet_id": "FT-P2C-001",
+      "fixtures": [
+        "crates/ft-conformance/fixtures/tensor_meta_cases.json"
+      ],
+      "coverage_tags": [
+        "state-transition",
+        "parser-fail-closed",
+        "e2e-replay"
+      ],
+      "replay_command": "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl",
+      "deterministic_seed_examples": [
+        {
+          "scenario_id": "tensor_meta/strict:invalid_rank_stride",
+          "seed": 13886952229929167484
+        },
+        {
+          "scenario_id": "tensor_meta/hardened:out_of_bounds_index",
+          "seed": 11560212793627058775
+        }
+      ]
+    },
+    {
+      "family_id": "dispatch_fail_closed_and_fallback",
+      "packet_id": "FT-P2C-002",
+      "fixtures": [
+        "crates/ft-conformance/fixtures/dispatch_key_cases.json"
+      ],
+      "coverage_tags": [
+        "mode-split",
+        "dispatch-fallback",
+        "e2e-replay"
+      ],
+      "replay_command": "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-002 --output artifacts/phase2c/e2e_forensics/ft-p2c-002.jsonl",
+      "deterministic_seed_examples": [
+        {
+          "scenario_id": "dispatch_key/strict:strict_rejects_composite_fallback",
+          "seed": 2590591187312390466
+        },
+        {
+          "scenario_id": "dispatch_key/hardened:hardened_allows_composite_fallback",
+          "seed": 17808195182480721486
+        }
+      ]
+    },
+    {
+      "family_id": "autograd_reentrant_guard",
+      "packet_id": "FT-P2C-004",
+      "fixtures": [
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json"
+      ],
+      "coverage_tags": [
+        "reentrant-guard",
+        "state-transition",
+        "e2e-replay"
+      ],
+      "replay_command": "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-004 --output artifacts/phase2c/e2e_forensics/ft-p2c-004.jsonl",
+      "deterministic_seed_examples": [
+        {
+          "scenario_id": "autograd_scheduler/strict:scheduler_chain",
+          "seed": 12856897130756503459
+        },
+        {
+          "scenario_id": "autograd_scheduler/hardened:scheduler_chain",
+          "seed": 4056182831483653040
+        }
+      ]
+    },
+    {
+      "family_id": "serialization_parser_and_durability",
+      "packet_id": "FT-P2C-006",
+      "fixtures": [
+        "crates/ft-conformance/fixtures/serialization_cases.json"
+      ],
+      "coverage_tags": [
+        "parser-fail-closed",
+        "durability-proof",
+        "e2e-replay"
+      ],
+      "replay_command": "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl",
+      "deterministic_seed_examples": [
+        {
+          "scenario_id": "serialization/strict:checkpoint_roundtrip",
+          "seed": 11768399339480325886
+        },
+        {
+          "scenario_id": "serialization/hardened:checkpoint_roundtrip",
+          "seed": 4877603649969877309
+        }
+      ]
+    }
+  ],
+  "crash_triage_pipeline": {
+    "classifier_binary": "cargo run -p ft-conformance --bin triage_forensics_failures -- --input <e2e_jsonl> --output <triage_json>",
+    "workflow_doc": "artifacts/phase2c/CRASH_TRIAGE_WORKFLOW_V1.md",
+    "output_schema_version": "ft-crash-triage-v1"
+  }
+}

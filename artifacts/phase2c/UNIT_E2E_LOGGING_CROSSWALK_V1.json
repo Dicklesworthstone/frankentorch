@@ -1,0 +1,334 @@
+{
+  "schema_version": "ft-unit-e2e-logging-crosswalk-v1",
+  "artifact_version": 1,
+  "generated_on": "2026-02-14",
+  "source_artifacts": {
+    "scenario_corpus": "artifacts/phase2c/USER_WORKFLOW_SCENARIO_CORPUS_V1.json",
+    "e2e_matrix": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
+    "coverage_summary": "artifacts/phase2c/e2e_forensics/golden_journey_coverage_v1.json",
+    "forensics_schema": "artifacts/phase2c/FAILURE_FORENSICS_ENVELOPE_SCHEMA_V1.md"
+  },
+  "log_schema_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code"
+  ],
+  "replay_obligations": [
+    "Every behavior row must include at least one deterministic replay command.",
+    "Scenario IDs must follow the scenario_id contract at crates/ft-conformance/src/lib.rs:2345.",
+    "Failure envelopes must include replay_command and env_fingerprint for every failed scenario."
+  ],
+  "behaviors": [
+    {
+      "behavior_id": "BHV-FT-001",
+      "name": "Scalar DAC arithmetic + gradient parity",
+      "subsystem": "ft-api/ft-autograd",
+      "packet_scope": [
+        "FT-P2C-001"
+      ],
+      "unit_property_tests": [
+        {
+          "test_id": "ft_api::session_add_backward_records_evidence",
+          "command": "cargo test -p ft-api session_add_backward_records_evidence -- --nocapture"
+        },
+        {
+          "test_id": "ft_autograd::add_backward_matches_expected_gradient",
+          "command": "cargo test -p ft-autograd add_backward_matches_expected_gradient -- --nocapture"
+        },
+        {
+          "test_id": "ft_autograd::mul_backward_matches_expected_gradient",
+          "command": "cargo test -p ft-autograd mul_backward_matches_expected_gradient -- --nocapture"
+        }
+      ],
+      "differential_assertions": [
+        {
+          "suite": "scalar_dac",
+          "comparators": [
+            "oracle.scalar_output",
+            "oracle.scalar_x_grad",
+            "oracle.scalar_y_grad"
+          ],
+          "artifact": "artifacts/phase2c/conformance/differential_report_v1.json"
+        }
+      ],
+      "e2e_coverage": {
+        "scenario_ids": [
+          "scalar_dac/strict:add_basic",
+          "scalar_dac/hardened:add_basic",
+          "scalar_dac/strict:mul_basic",
+          "scalar_dac/hardened:mul_basic"
+        ],
+        "replay_commands": [
+          "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl"
+        ],
+        "artifact": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      },
+      "coverage_status": "covered"
+    },
+    {
+      "behavior_id": "BHV-FT-002",
+      "name": "Tensor metadata validation/indexing fail-closed semantics",
+      "subsystem": "ft-core",
+      "packet_scope": [
+        "FT-P2C-001"
+      ],
+      "unit_property_tests": [
+        {
+          "test_id": "ft_core::index_rank_and_bounds_are_guarded",
+          "command": "cargo test -p ft-core index_rank_and_bounds_are_guarded -- --nocapture"
+        },
+        {
+          "test_id": "ft_core::custom_strides_validate_and_index_into_storage",
+          "command": "cargo test -p ft-core custom_strides_validate_and_index_into_storage -- --nocapture"
+        }
+      ],
+      "differential_assertions": [
+        {
+          "suite": "tensor_meta",
+          "comparators": [
+            "local.tensor_meta",
+            "oracle.tensor_meta"
+          ],
+          "artifact": "artifacts/phase2c/conformance/differential_report_v1.json"
+        }
+      ],
+      "e2e_coverage": {
+        "scenario_ids": [
+          "tensor_meta/strict:contiguous_basic_index",
+          "tensor_meta/hardened:contiguous_basic_index",
+          "tensor_meta/strict:invalid_rank_stride_mismatch",
+          "tensor_meta/hardened:invalid_rank_stride_mismatch",
+          "tensor_meta/strict:invalid_storage_offset_overflow",
+          "tensor_meta/hardened:invalid_storage_offset_overflow"
+        ],
+        "replay_commands": [
+          "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-001 --output artifacts/phase2c/e2e_forensics/ft-p2c-001.jsonl"
+        ],
+        "artifact": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      },
+      "coverage_status": "covered"
+    },
+    {
+      "behavior_id": "BHV-FT-003",
+      "name": "Dispatch key routing + strict/hardened fallback split",
+      "subsystem": "ft-dispatch",
+      "packet_scope": [
+        "FT-P2C-002"
+      ],
+      "unit_property_tests": [
+        {
+          "test_id": "ft_dispatch::unknown_bits_fail_closed",
+          "command": "cargo test -p ft-dispatch unknown_bits_fail_closed -- --nocapture"
+        },
+        {
+          "test_id": "ft_dispatch::strict_mode_rejects_composite_fallback",
+          "command": "cargo test -p ft-dispatch strict_mode_rejects_composite_fallback -- --nocapture"
+        },
+        {
+          "test_id": "ft_dispatch::hardened_mode_allows_composite_fallback",
+          "command": "cargo test -p ft-dispatch hardened_mode_allows_composite_fallback -- --nocapture"
+        }
+      ],
+      "differential_assertions": [
+        {
+          "suite": "dispatch_key",
+          "comparators": [
+            "dispatch.selected_key",
+            "dispatch.fallback_used"
+          ],
+          "artifact": "artifacts/phase2c/conformance/differential_report_v1.json"
+        }
+      ],
+      "e2e_coverage": {
+        "scenario_ids": [
+          "dispatch_key/strict:strict_autograd_route",
+          "dispatch_key/hardened:strict_autograd_route",
+          "dispatch_key/strict:strict_cpu_route",
+          "dispatch_key/hardened:strict_cpu_route",
+          "dispatch_key/strict:composite_route_mode_split",
+          "dispatch_key/hardened:composite_route_mode_split"
+        ],
+        "replay_commands": [
+          "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-002 --output artifacts/phase2c/e2e_forensics/ft-p2c-002.jsonl"
+        ],
+        "artifact": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      },
+      "coverage_status": "covered"
+    },
+    {
+      "behavior_id": "BHV-FT-004",
+      "name": "Autograd scheduler ordering + reentrant policy",
+      "subsystem": "ft-autograd",
+      "packet_scope": [
+        "FT-P2C-004"
+      ],
+      "unit_property_tests": [
+        {
+          "test_id": "ft_autograd::dependency_scheduler_waits_for_all_children",
+          "command": "cargo test -p ft-autograd dependency_scheduler_waits_for_all_children -- --nocapture"
+        },
+        {
+          "test_id": "ft_autograd::strict_mode_reentrant_depth_overflow_fails",
+          "command": "cargo test -p ft-autograd strict_mode_reentrant_depth_overflow_fails -- --nocapture"
+        },
+        {
+          "test_id": "ft_autograd::hardened_mode_reentrant_depth_overflow_fallbacks",
+          "command": "cargo test -p ft-autograd hardened_mode_reentrant_depth_overflow_fallbacks -- --nocapture"
+        }
+      ],
+      "differential_assertions": [
+        {
+          "suite": "autograd_scheduler",
+          "comparators": [
+            "scheduler.output",
+            "scheduler.execution_order"
+          ],
+          "artifact": "artifacts/phase2c/conformance/differential_report_v1.json"
+        }
+      ],
+      "e2e_coverage": {
+        "scenario_ids": [
+          "autograd_scheduler/strict:composite_scheduler_dac",
+          "autograd_scheduler/hardened:composite_scheduler_dac"
+        ],
+        "replay_commands": [
+          "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-004 --output artifacts/phase2c/e2e_forensics/ft-p2c-004.jsonl"
+        ],
+        "artifact": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      },
+      "coverage_status": "covered"
+    },
+    {
+      "behavior_id": "BHV-FT-005",
+      "name": "Serialization decode integrity + sidecar durability checks",
+      "subsystem": "ft-serialize",
+      "packet_scope": [
+        "FT-P2C-006"
+      ],
+      "unit_property_tests": [
+        {
+          "test_id": "ft_serialize::strict_unknown_field_fail_closed",
+          "command": "cargo test -p ft-serialize strict_unknown_field_fail_closed -- --nocapture"
+        },
+        {
+          "test_id": "ft_serialize::version_mismatch_is_fail_closed",
+          "command": "cargo test -p ft-serialize version_mismatch_is_fail_closed -- --nocapture"
+        },
+        {
+          "test_id": "ft_serialize::checksum_mismatch_is_fail_closed",
+          "command": "cargo test -p ft-serialize checksum_mismatch_is_fail_closed -- --nocapture"
+        }
+      ],
+      "differential_assertions": [
+        {
+          "suite": "serialization",
+          "comparators": [
+            "serialization.decode",
+            "serialization.sidecar_determinism"
+          ],
+          "artifact": "artifacts/phase2c/conformance/differential_report_v1.json"
+        }
+      ],
+      "e2e_coverage": {
+        "scenario_ids": [
+          "serialization/strict:checkpoint_basic",
+          "serialization/hardened:checkpoint_basic",
+          "serialization/strict:checkpoint_sparse_grad",
+          "serialization/hardened:checkpoint_sparse_grad"
+        ],
+        "replay_commands": [
+          "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl"
+        ],
+        "artifact": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      },
+      "coverage_status": "covered"
+    },
+    {
+      "behavior_id": "BHV-FT-006",
+      "name": "Failure forensics envelope + artifact index UX",
+      "subsystem": "ft-conformance tooling",
+      "packet_scope": [
+        "FT-P2C-001",
+        "FT-P2C-002",
+        "FT-P2C-004",
+        "FT-P2C-006"
+      ],
+      "unit_property_tests": [
+        {
+          "test_id": "triage_forensics_failures::reason_code_classification_is_stable",
+          "command": "cargo test -p ft-conformance --bin triage_forensics_failures"
+        },
+        {
+          "test_id": "build_failure_forensics_index::failure_envelope_carries_replay_and_environment_fields",
+          "command": "cargo test -p ft-conformance --bin build_failure_forensics_index"
+        }
+      ],
+      "differential_assertions": [
+        {
+          "suite": "cross-suite",
+          "comparators": [
+            "forensics.reason_code_taxonomy",
+            "forensics.failure_id_determinism"
+          ],
+          "artifact": "artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json"
+        }
+      ],
+      "e2e_coverage": {
+        "scenario_ids": [
+          "all_scenarios_in_e2e_matrix_full_v1"
+        ],
+        "replay_commands": [
+          "cargo run -p ft-conformance --bin triage_forensics_failures -- --input artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl --output artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json",
+          "cargo run -p ft-conformance --bin build_failure_forensics_index -- --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl --triage artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json --output artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json"
+        ],
+        "artifact": "artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json"
+      },
+      "coverage_status": "covered"
+    }
+  ],
+  "coverage_gaps": [
+    {
+      "gap_id": "GAP-UX-001",
+      "behavior_scope": "device mismatch + tensor compat negative workflows",
+      "priority": "high",
+      "status": "open",
+      "dependency_links": [
+        "bd-3v0.20",
+        "bd-3v0.23.10",
+        "bd-3v0.12.6"
+      ],
+      "closure_notes": "Add dedicated conformance fixtures and scenario IDs for DeviceError and TensorCompatError mismatch branches."
+    },
+    {
+      "gap_id": "GAP-UX-002",
+      "behavior_scope": "legacy oracle timeout/cancel failure branch",
+      "priority": "high",
+      "status": "open",
+      "dependency_links": [
+        "bd-3v0.21",
+        "bd-3v0.23.10"
+      ],
+      "closure_notes": "Add timeout reason taxonomy and one-command replay for oracle hang simulations."
+    },
+    {
+      "gap_id": "GAP-UX-003",
+      "behavior_scope": "runtime durability-ledger integration in conformance/e2e path",
+      "priority": "medium",
+      "status": "open",
+      "dependency_links": [
+        "bd-3v0.9",
+        "bd-3v0.10",
+        "bd-3v0.17.7"
+      ],
+      "closure_notes": "Bind sidecar/decode-proof outcomes to runtime durability evidence entries in forensics index artifacts."
+    }
+  ]
+}

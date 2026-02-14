@@ -1,0 +1,56 @@
+{
+  "schema_version": "ft-user-journey-coverage-v1",
+  "generated_on": "2026-02-14",
+  "source": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
+  "total_entries": 26,
+  "total_failed": 0,
+  "suites": [
+    "autograd_scheduler",
+    "dispatch_key",
+    "scalar_dac",
+    "serialization",
+    "tensor_meta"
+  ],
+  "packets": [
+    "FT-P2C-001",
+    "FT-P2C-002",
+    "FT-P2C-004",
+    "FT-P2C-006"
+  ],
+  "reason_codes": [
+    "dispatch_parity_ok",
+    "expected_error_observed",
+    "parity_ok",
+    "scheduler_parity_ok",
+    "serialization_parity_ok",
+    "tensor_meta_parity_ok"
+  ],
+  "scenario_ids": [
+    "autograd_scheduler/hardened:composite_scheduler_dac",
+    "autograd_scheduler/strict:composite_scheduler_dac",
+    "dispatch_key/hardened:composite_route_mode_split",
+    "dispatch_key/hardened:strict_autograd_route",
+    "dispatch_key/hardened:strict_cpu_route",
+    "dispatch_key/strict:composite_route_mode_split",
+    "dispatch_key/strict:strict_autograd_route",
+    "dispatch_key/strict:strict_cpu_route",
+    "scalar_dac/hardened:add_basic",
+    "scalar_dac/hardened:mul_basic",
+    "scalar_dac/strict:add_basic",
+    "scalar_dac/strict:mul_basic",
+    "serialization/hardened:checkpoint_basic",
+    "serialization/hardened:checkpoint_sparse_grad",
+    "serialization/strict:checkpoint_basic",
+    "serialization/strict:checkpoint_sparse_grad",
+    "tensor_meta/hardened:contiguous_basic_index",
+    "tensor_meta/hardened:invalid_rank_stride_mismatch",
+    "tensor_meta/hardened:invalid_storage_offset_overflow",
+    "tensor_meta/hardened:scalar_offset_index",
+    "tensor_meta/hardened:strided_offset_index",
+    "tensor_meta/strict:contiguous_basic_index",
+    "tensor_meta/strict:invalid_rank_stride_mismatch",
+    "tensor_meta/strict:invalid_storage_offset_overflow",
+    "tensor_meta/strict:scalar_offset_index",
+    "tensor_meta/strict:strided_offset_index"
+  ]
+}
