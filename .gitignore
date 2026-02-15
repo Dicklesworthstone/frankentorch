@@ -36,3 +36,8 @@ target-codex*/
 
 # Local legacy-oracle mirrors (too large for source repo)
 /legacy_*/
+
+# Ephemeral files (agent-generated, build artifacts, test detritus)
+ci-artifacts/
+proptest-regressions/
+test_meminfo
