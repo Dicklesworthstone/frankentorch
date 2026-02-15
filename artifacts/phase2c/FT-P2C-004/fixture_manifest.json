@@ -9,10 +9,42 @@
       "file": "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
       "case_name": "composite_scheduler_dac",
       "oracle_family": "autograd_scheduler",
-      "assertions": ["gradients", "execution_order", "strict_reentrant_fail", "hardened_reentrant_fallback"]
+      "assertions": [
+        "gradients",
+        "execution_order",
+        "strict_reentrant_fail",
+        "hardened_reentrant_fallback"
+      ]
+    },
+    {
+      "id": "autograd_scheduler_chain",
+      "file": "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+      "case_name": "scheduler_chain",
+      "oracle_family": "autograd_scheduler",
+      "assertions": [
+        "gradients",
+        "execution_order",
+        "strict_reentrant_fail",
+        "hardened_reentrant_fallback"
+      ]
+    },
+    {
+      "id": "autograd_scheduler_dependency_underflow_probe",
+      "file": "crates/ft-conformance/fixtures/autograd_scheduler_cases.json",
+      "case_name": "dependency_underflow_probe",
+      "oracle_family": "autograd_scheduler",
+      "assertions": [
+        "gradients",
+        "execution_order",
+        "strict_reentrant_fail",
+        "hardened_reentrant_fallback"
+      ]
     }
   ],
-  "modes": ["strict", "hardened"],
+  "modes": [
+    "strict",
+    "hardened"
+  ],
   "logging_fields_required": [
     "suite_id",
     "scenario_id",
@@ -36,13 +68,16 @@
   ],
   "scenario_seed_map": {
     "autograd_scheduler/strict:composite_scheduler_dac": 7059225966474559304,
-    "autograd_scheduler/hardened:composite_scheduler_dac": 12527830154622575501
-  },
-  "deferred_seed_candidates": {
+    "autograd_scheduler/hardened:composite_scheduler_dac": 12527830154622575501,
     "autograd_scheduler/strict:scheduler_chain": 12856897130756503459,
     "autograd_scheduler/hardened:scheduler_chain": 4056182831483653040,
     "autograd_scheduler/strict:dependency_underflow_probe": 8420101970047811095,
     "autograd_scheduler/hardened:dependency_underflow_probe": 5298414977992276633
+  },
+  "unit_property_validation": {
+    "bead_id": "bd-3v0.15.5",
+    "quality_report": "artifacts/phase2c/FT-P2C-004/unit_property_quality_report_v1.json",
+    "coverage_report": "artifacts/phase2c/FT-P2C-004/unit_property_coverage_v1.json"
   },
   "security_compatibility_artifact": "artifacts/phase2c/FT-P2C-004/risk_note.md",
   "contract_artifacts": [
@@ -50,7 +85,8 @@
     "artifacts/phase2c/FT-P2C-004/behavior_extraction_ledger.md",
     "artifacts/phase2c/FT-P2C-004/contract_table.md",
     "artifacts/phase2c/FT-P2C-004/implementation_plan.md",
-    "artifacts/phase2c/FT-P2C-004/risk_note.md"
+    "artifacts/phase2c/FT-P2C-004/risk_note.md",
+    "artifacts/phase2c/FT-P2C-004/unit_property_quality_report_v1.json"
   ],
   "status": "active"
 }

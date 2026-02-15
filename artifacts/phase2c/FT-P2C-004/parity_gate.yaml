@@ -11,6 +11,7 @@ hardened:
   divergence_budget_ratio: 0.0
 
 checks:
+  - command: CARGO_TARGET_DIR=target_codex cargo test -p ft-autograd
   - command: CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance strict_scheduler_conformance_is_green -- --nocapture
   - command: CARGO_TARGET_DIR=target_codex cargo test -p ft-conformance hardened_scheduler_conformance_is_green -- --nocapture
   - command: CARGO_TARGET_DIR=target_codex cargo test --workspace
@@ -18,3 +19,4 @@ checks:
 artifacts:
   - crates/ft-conformance/fixtures/autograd_scheduler_cases.json
   - artifacts/phase2c/FT-P2C-004/fixture_manifest.json
+  - artifacts/phase2c/FT-P2C-004/unit_property_quality_report_v1.json

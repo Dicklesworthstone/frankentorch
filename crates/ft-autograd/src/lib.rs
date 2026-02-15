@@ -460,9 +460,174 @@ impl Tape {
 
 #[cfg(test)]
 mod tests {
-    use ft_core::ExecutionMode;
+    use std::collections::BTreeMap;
 
-    use super::{BackwardOptions, NodeId, ReentrantPolicy, Tape};
+    use ft_core::ExecutionMode;
+    use proptest::prelude::*;
+
+    use super::{
+        AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
+    };
+
+    fn as_u64(value: usize) -> u64 {
+        u64::try_from(value).unwrap_or(u64::MAX)
+    }
+
+    fn det_seed(parts: &[u64]) -> u64 {
+        let mut hash = 0xcbf2_9ce4_8422_2325u64;
+        for value in parts {
+            for byte in value.to_le_bytes() {
+                hash ^= u64::from(byte);
+                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        hash
+    }
+
+    fn output_digest(telemetry: &SchedulerTelemetry) -> u64 {
+        let mut parts = Vec::with_capacity(telemetry.execution_order.len() + 6);
+        parts.extend(telemetry.execution_order.iter().map(|node| as_u64(node.0)));
+        parts.push(as_u64(telemetry.queue_pushes));
+        parts.push(as_u64(telemetry.queue_pops));
+        parts.push(as_u64(telemetry.max_queue_len));
+        parts.push(as_u64(telemetry.reentrant_depth));
+        parts.push(u64::from(telemetry.reentrant_guard_triggered));
+        parts.push(u64::from(telemetry.hardened_fallback_used));
+        det_seed(parts.as_slice())
+    }
+
+    fn build_scheduler_property_log(
+        test_id: &str,
+        mode: ExecutionMode,
+        seed: u64,
+        telemetry: &SchedulerTelemetry,
+        reason_code: &str,
+    ) -> BTreeMap<String, String> {
+        let mode_label = match mode {
+            ExecutionMode::Strict => "strict",
+            ExecutionMode::Hardened => "hardened",
+        };
+        let input_digest = det_seed(
+            [
+                seed,
+                as_u64(telemetry.execution_order.len()),
+                as_u64(telemetry.dependency_snapshot.len()),
+            ]
+            .as_slice(),
+        );
+        let mut log = BTreeMap::new();
+        log.insert("ts_utc".to_string(), "1970-01-01T00:00:00Z".to_string());
+        log.insert("suite_id".to_string(), "ft_autograd_property".to_string());
+        log.insert("test_id".to_string(), test_id.to_string());
+        log.insert("packet_id".to_string(), "FT-P2C-004".to_string());
+        log.insert(
+            "fixture_id".to_string(),
+            "ft_autograd_property_generated".to_string(),
+        );
+        log.insert(
+            "scenario_id".to_string(),
+            format!("autograd_scheduler_property/{mode_label}:{test_id}"),
+        );
+        log.insert("mode".to_string(), mode_label.to_string());
+        log.insert("seed".to_string(), seed.to_string());
+        log.insert(
+            "input_digest".to_string(),
+            format!("det64:{input_digest:016x}"),
+        );
+        log.insert(
+            "output_digest".to_string(),
+            format!("det64:{:016x}", output_digest(telemetry)),
+        );
+        log.insert(
+            "env_fingerprint".to_string(),
+            "det64:ft-autograd-test".to_string(),
+        );
+        log.insert(
+            "artifact_refs".to_string(),
+            "artifacts/phase2c/FT-P2C-004/fixture_manifest.json".to_string(),
+        );
+        log.insert(
+            "replay_command".to_string(),
+            "cargo test -p ft-autograd -- --nocapture".to_string(),
+        );
+        log.insert("duration_ms".to_string(), "0".to_string());
+        log.insert("outcome".to_string(), "pass".to_string());
+        log.insert("reason_code".to_string(), reason_code.to_string());
+        log.insert(
+            "execution_order".to_string(),
+            telemetry
+                .execution_order
+                .iter()
+                .map(|node| node.0.to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        log.insert(
+            "queue_pushes".to_string(),
+            telemetry.queue_pushes.to_string(),
+        );
+        log.insert("queue_pops".to_string(), telemetry.queue_pops.to_string());
+        log.insert(
+            "max_queue_len".to_string(),
+            telemetry.max_queue_len.to_string(),
+        );
+        log.insert(
+            "dependency_snapshot".to_string(),
+            telemetry
+                .dependency_snapshot
+                .iter()
+                .map(usize::to_string)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+        log.insert(
+            "reentrant_depth".to_string(),
+            telemetry.reentrant_depth.to_string(),
+        );
+        log.insert(
+            "reentrant_guard_triggered".to_string(),
+            telemetry.reentrant_guard_triggered.to_string(),
+        );
+        log.insert(
+            "hardened_fallback_used".to_string(),
+            telemetry.hardened_fallback_used.to_string(),
+        );
+        log
+    }
+
+    fn assert_scheduler_log_contract(log: &BTreeMap<String, String>) {
+        for key in [
+            "ts_utc",
+            "suite_id",
+            "test_id",
+            "packet_id",
+            "fixture_id",
+            "scenario_id",
+            "mode",
+            "seed",
+            "input_digest",
+            "output_digest",
+            "env_fingerprint",
+            "artifact_refs",
+            "replay_command",
+            "duration_ms",
+            "outcome",
+            "reason_code",
+            "execution_order",
+            "queue_pushes",
+            "queue_pops",
+            "max_queue_len",
+            "dependency_snapshot",
+            "reentrant_depth",
+            "reentrant_guard_triggered",
+            "hardened_fallback_used",
+        ] {
+            assert!(
+                log.contains_key(key),
+                "property log missing required key '{key}'"
+            );
+        }
+    }
 
     #[test]
     fn add_backward_matches_expected_gradient() {
@@ -610,5 +775,212 @@ mod tests {
             .expect_err("expected unknown node");
         let msg = err.to_string();
         assert!(msg.contains("unknown node"));
+    }
+
+    #[test]
+    fn dependency_underflow_is_fail_closed() {
+        let mut pending = vec![0usize];
+        let mut queue = super::ReadyQueue::default();
+        let err = Tape::complete_dependency(&mut pending, NodeId(0), &mut queue)
+            .expect_err("underflow should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::DependencyUnderflow { node } if node == NodeId(0)
+        ));
+    }
+
+    proptest! {
+        #[test]
+        fn prop_scheduler_replay_is_deterministic(
+            x_in in -32i16..32i16,
+            y_in in -32i16..32i16,
+        ) {
+            let x = f64::from(x_in);
+            let y = f64::from(y_in);
+            let mut tape = Tape::new();
+            let lhs = tape.leaf(x, true);
+            let rhs = tape.leaf(y, true);
+            let (sum, _) = tape
+                .add(lhs, rhs, ExecutionMode::Strict)
+                .expect("add should succeed");
+            let (out, _) = tape
+                .mul(sum, lhs, ExecutionMode::Strict)
+                .expect("mul should succeed");
+
+            let first = tape.backward(out).expect("backward should succeed");
+            let second = tape.backward(out).expect("backward should succeed");
+
+            prop_assert_eq!(first.gradients(), second.gradients());
+            prop_assert_eq!(first.telemetry.execution_order, second.telemetry.execution_order);
+
+            let seed = det_seed(&[
+                u64::from(x_in.unsigned_abs()),
+                u64::from(y_in.unsigned_abs()),
+                as_u64(first.telemetry.execution_order.len()),
+            ]);
+            let log = build_scheduler_property_log(
+                "prop_scheduler_replay_is_deterministic",
+                ExecutionMode::Strict,
+                seed,
+                &first.telemetry,
+                "scheduler_replay_stable",
+            );
+            assert_scheduler_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_shared_parent_waits_for_all_children(
+            x_in in 1i16..16i16,
+            y_in in 1i16..16i16,
+            z_in in 1i16..16i16,
+        ) {
+            let x = f64::from(x_in);
+            let y = f64::from(y_in);
+            let z = f64::from(z_in);
+
+            let mut tape = Tape::new();
+            let parent = tape.leaf(x, true);
+            let lhs = tape.leaf(y, true);
+            let rhs = tape.leaf(z, true);
+            let (left_branch, _) = tape
+                .mul(parent, lhs, ExecutionMode::Strict)
+                .expect("mul should succeed");
+            let (right_branch, _) = tape
+                .mul(parent, rhs, ExecutionMode::Strict)
+                .expect("mul should succeed");
+            let (root, _) = tape
+                .add(left_branch, right_branch, ExecutionMode::Strict)
+                .expect("add should succeed");
+
+            let report = tape.backward(root).expect("backward should succeed");
+            let order = &report.telemetry.execution_order;
+            let parent_pos = order.iter().position(|node| *node == parent).expect("parent should be scheduled");
+            let left_pos = order.iter().position(|node| *node == left_branch).expect("left branch should be scheduled");
+            let right_pos = order.iter().position(|node| *node == right_branch).expect("right branch should be scheduled");
+
+            prop_assert!(parent_pos > left_pos);
+            prop_assert!(parent_pos > right_pos);
+
+            let seed = det_seed(&[
+                u64::from(x_in.unsigned_abs()),
+                u64::from(y_in.unsigned_abs()),
+                u64::from(z_in.unsigned_abs()),
+                as_u64(order.len()),
+            ]);
+            let log = build_scheduler_property_log(
+                "prop_shared_parent_waits_for_all_children",
+                ExecutionMode::Strict,
+                seed,
+                &report.telemetry,
+                "dependency_scheduler_waits_for_all_children",
+            );
+            assert_scheduler_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_strict_reentrant_overflow_is_fail_closed(
+            x_in in 1i16..16i16,
+            y_in in 1i16..16i16,
+        ) {
+            let x = f64::from(x_in);
+            let y = f64::from(y_in);
+            let mut tape = Tape::new();
+            let lhs = tape.leaf(x, true);
+            let rhs = tape.leaf(y, true);
+            let (root, _) = tape
+                .add(lhs, rhs, ExecutionMode::Strict)
+                .expect("add should succeed");
+
+            let overflow = tape.backward_with_options(
+                root,
+                BackwardOptions {
+                    max_reentrant_depth: 1,
+                    current_reentrant_depth: 2,
+                    policy: ReentrantPolicy::StrictFail,
+                },
+            );
+            prop_assert!(matches!(overflow, Err(AutogradError::ReentrantDepthExceeded { .. })));
+        }
+
+        #[test]
+        fn prop_hardened_reentrant_overflow_is_explicitly_flagged(
+            x_in in 1i16..16i16,
+            y_in in 1i16..16i16,
+        ) {
+            let x = f64::from(x_in);
+            let y = f64::from(y_in);
+            let mut tape = Tape::new();
+            let lhs = tape.leaf(x, true);
+            let rhs = tape.leaf(y, true);
+            let (root, _) = tape
+                .add(lhs, rhs, ExecutionMode::Hardened)
+                .expect("add should succeed");
+
+            let report = tape
+                .backward_with_options(
+                    root,
+                    BackwardOptions {
+                        max_reentrant_depth: 1,
+                        current_reentrant_depth: 2,
+                        policy: ReentrantPolicy::HardenedBoundedFallback,
+                    },
+                )
+                .expect("hardened fallback should succeed");
+            prop_assert!(report.telemetry.reentrant_guard_triggered);
+            prop_assert!(report.telemetry.hardened_fallback_used);
+            prop_assert_eq!(report.telemetry.reentrant_depth, 1);
+
+            let seed = det_seed(&[
+                u64::from(x_in.unsigned_abs()),
+                u64::from(y_in.unsigned_abs()),
+                as_u64(report.telemetry.reentrant_depth),
+            ]);
+            let log = build_scheduler_property_log(
+                "prop_hardened_reentrant_overflow_is_explicitly_flagged",
+                ExecutionMode::Hardened,
+                seed,
+                &report.telemetry,
+                "hardened_reentrant_guard_triggered",
+            );
+            assert_scheduler_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_scheduler_telemetry_is_self_consistent(
+            x_in in -16i16..16i16,
+            y_in in -16i16..16i16,
+        ) {
+            let x = f64::from(x_in);
+            let y = f64::from(y_in);
+            let mut tape = Tape::new();
+            let lhs = tape.leaf(x, true);
+            let rhs = tape.leaf(y, true);
+            let (sum, _) = tape
+                .add(lhs, rhs, ExecutionMode::Strict)
+                .expect("add should succeed");
+            let (root, _) = tape
+                .mul(sum, lhs, ExecutionMode::Strict)
+                .expect("mul should succeed");
+            let report = tape.backward(root).expect("backward should succeed");
+
+            prop_assert!(report.telemetry.queue_pushes >= report.telemetry.queue_pops);
+            prop_assert!(report.telemetry.max_queue_len >= 1);
+            prop_assert_eq!(report.telemetry.dependency_snapshot.len(), tape.node_count());
+
+            let seed = det_seed(&[
+                u64::from(x_in.unsigned_abs()),
+                u64::from(y_in.unsigned_abs()),
+                as_u64(report.telemetry.queue_pushes),
+                as_u64(report.telemetry.queue_pops),
+            ]);
+            let log = build_scheduler_property_log(
+                "prop_scheduler_telemetry_is_self_consistent",
+                ExecutionMode::Strict,
+                seed,
+                &report.telemetry,
+                "scheduler_telemetry_contract_ok",
+            );
+            assert_scheduler_log_contract(&log);
+        }
     }
 }

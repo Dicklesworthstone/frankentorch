@@ -1,9 +1,11 @@
 #![forbid(unsafe_code)]
 
+use std::collections::BTreeMap;
 use std::hash::{Hash, Hasher};
 
 use ft_core::ExecutionMode;
 use serde::Serialize;
+use serde_json::Value;
 
 pub const STRUCTURED_LOG_SCHEMA_VERSION: &str = "ft-conformance-log-v1";
 
@@ -22,6 +24,8 @@ pub struct StructuredCaseLog {
     pub replay_command: String,
     pub outcome: &'static str,
     pub reason_code: String,
+    #[serde(flatten)]
+    pub extra_fields: BTreeMap<String, Value>,
 }
 
 impl StructuredCaseLog {
@@ -67,7 +71,14 @@ impl StructuredCaseLog {
             replay_command,
             outcome,
             reason_code: reason_code.into(),
+            extra_fields: BTreeMap::new(),
         }
+    }
+
+    #[must_use]
+    pub fn with_extra_fields(mut self, extra_fields: BTreeMap<String, Value>) -> Self {
+        self.extra_fields = extra_fields;
+        self
     }
 }
 

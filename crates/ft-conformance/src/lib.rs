@@ -10,7 +10,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
-use ft_autograd::{AutogradError, BackwardOptions, ReentrantPolicy, Tape};
+use ft_autograd::{AutogradError, BackwardOptions, ReentrantPolicy, SchedulerTelemetry, Tape};
 use ft_core::{DType, Device, ExecutionMode, ScalarTensor, TensorMeta, contiguous_strides};
 use ft_dispatch::{
     BinaryOp, DispatchKey, DispatchKeySet, ParsedSchemaInput, dispatch_scalar_binary,
@@ -1478,11 +1478,7 @@ pub fn run_differential_conformance(
                         local.output,
                         oracle.output,
                         case.tolerance.unwrap_or(1e-12),
-                        vec![
-                            "crates/ft-conformance/fixtures/autograd_scheduler_cases.json"
-                                .to_string(),
-                            "artifacts/phase2c/FT-P2C-004/parity_report.json".to_string(),
-                        ],
+                        autograd_scheduler_evidence_refs(),
                     ));
                     checks.push(compare_abs_tol(
                         &allowlist,
@@ -1495,11 +1491,7 @@ pub fn run_differential_conformance(
                         local.x_grad,
                         oracle.x_grad,
                         case.tolerance.unwrap_or(1e-12),
-                        vec![
-                            "crates/ft-conformance/fixtures/autograd_scheduler_cases.json"
-                                .to_string(),
-                            "artifacts/phase2c/FT-P2C-004/parity_report.json".to_string(),
-                        ],
+                        autograd_scheduler_evidence_refs(),
                     ));
                     checks.push(compare_abs_tol(
                         &allowlist,
@@ -1512,11 +1504,7 @@ pub fn run_differential_conformance(
                         local.y_grad,
                         oracle.y_grad,
                         case.tolerance.unwrap_or(1e-12),
-                        vec![
-                            "crates/ft-conformance/fixtures/autograd_scheduler_cases.json"
-                                .to_string(),
-                            "artifacts/phase2c/FT-P2C-004/parity_report.json".to_string(),
-                        ],
+                        autograd_scheduler_evidence_refs(),
                     ));
                 }
                 Err(reason) => checks.push(DifferentialCheck {
@@ -1549,10 +1537,13 @@ pub fn run_differential_conformance(
                     "autograd.reentrant_depth_bounded_fallback",
                     true,
                     false,
-                    vec![
-                        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json".to_string(),
-                        "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json".to_string(),
-                    ],
+                    {
+                        let mut refs = autograd_scheduler_evidence_refs();
+                        refs.push(
+                            "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json".to_string(),
+                        );
+                        refs
+                    },
                 ));
             } else {
                 checks.push(DifferentialCheck {
@@ -1578,9 +1569,7 @@ pub fn run_differential_conformance(
                         "hardened_guard_optional"
                     }
                     .to_string(),
-                    evidence_refs: vec![
-                        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json".to_string(),
-                    ],
+                    evidence_refs: autograd_scheduler_evidence_refs(),
                 });
             }
         }
@@ -2233,6 +2222,11 @@ fn run_scheduler_case(
             .unwrap_or(false),
     };
     let passed = grad_ok && order_ok && reentrant_policy_ok;
+    let reason_code = if passed {
+        "scheduler_parity_ok"
+    } else {
+        "scheduler_expectation_mismatch"
+    };
 
     Ok(SchedulerCaseReport {
         name: case.name.clone(),
@@ -2246,22 +2240,50 @@ fn run_scheduler_case(
             "FT-P2C-004",
             case.name.as_str(),
             mode,
-            vec![
-                "crates/ft-conformance/fixtures/autograd_scheduler_cases.json".to_string(),
-                "artifacts/phase2c/FT-P2C-004/parity_report.json".to_string(),
-            ],
+            autograd_scheduler_evidence_refs(),
             format!(
                 "cargo test -p ft-conformance strict_scheduler_conformance_is_green -- --nocapture # mode={}",
                 mode_label(mode)
             ),
             if passed { "pass" } else { "fail" },
-            if passed {
-                "scheduler_parity_ok"
-            } else {
-                "scheduler_expectation_mismatch"
-            },
-        ),
+            reason_code,
+        )
+        .with_extra_fields(scheduler_forensic_fields(&report.telemetry)),
     })
+}
+
+fn scheduler_forensic_fields(telemetry: &SchedulerTelemetry) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "execution_order".to_string(),
+        json!(
+            telemetry
+                .execution_order
+                .iter()
+                .map(|node| node.0)
+                .collect::<Vec<_>>()
+        ),
+    );
+    fields.insert("queue_pushes".to_string(), json!(telemetry.queue_pushes));
+    fields.insert("queue_pops".to_string(), json!(telemetry.queue_pops));
+    fields.insert("max_queue_len".to_string(), json!(telemetry.max_queue_len));
+    fields.insert(
+        "dependency_snapshot".to_string(),
+        json!(telemetry.dependency_snapshot),
+    );
+    fields.insert(
+        "reentrant_depth".to_string(),
+        json!(telemetry.reentrant_depth),
+    );
+    fields.insert(
+        "reentrant_guard_triggered".to_string(),
+        json!(telemetry.reentrant_guard_triggered),
+    );
+    fields.insert(
+        "hardened_fallback_used".to_string(),
+        json!(telemetry.hardened_fallback_used),
+    );
+    fields
 }
 
 fn run_serialization_case(
@@ -2915,6 +2937,14 @@ fn op_schema_evidence_refs() -> Vec<String> {
     ]
 }
 
+fn autograd_scheduler_evidence_refs() -> Vec<String> {
+    vec![
+        "crates/ft-conformance/fixtures/autograd_scheduler_cases.json".to_string(),
+        "artifacts/phase2c/FT-P2C-004/parity_report.json".to_string(),
+        "artifacts/phase2c/FT-P2C-004/unit_property_quality_report_v1.json".to_string(),
+    ]
+}
+
 fn load_fixture<T>(path: &Path) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
@@ -3089,6 +3119,32 @@ mod tests {
         assert!(log.env_fingerprint.starts_with("det64:"));
         assert!(!log.replay_command.is_empty());
         assert!(!log.artifact_refs.is_empty());
+    }
+
+    #[test]
+    fn scheduler_logs_include_packet_004_telemetry_fields() {
+        let cfg = HarnessConfig::default_paths();
+        let (_, cases) = run_autograd_scheduler_conformance(&cfg, ExecutionMode::Strict)
+            .expect("scheduler conformance should run");
+
+        assert!(!cases.is_empty(), "expected at least one scheduler case");
+        let value =
+            serde_json::to_value(&cases[0].forensic_log).expect("scheduler log should serialize");
+        for key in [
+            "execution_order",
+            "queue_pushes",
+            "queue_pops",
+            "max_queue_len",
+            "dependency_snapshot",
+            "reentrant_depth",
+            "reentrant_guard_triggered",
+            "hardened_fallback_used",
+        ] {
+            assert!(
+                value.get(key).is_some(),
+                "missing scheduler telemetry key {key}"
+            );
+        }
     }
 
     #[test]
