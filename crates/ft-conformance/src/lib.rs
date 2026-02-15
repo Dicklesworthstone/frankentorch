@@ -1172,7 +1172,80 @@ pub fn run_differential_conformance(
                     ],
                 }),
             }
+
+            let swapped_case = DispatchCase {
+                name: format!("{}__swapped_args", case.name),
+                op: case.op.clone(),
+                lhs: case.rhs,
+                rhs: case.lhs,
+                requires_grad: case.requires_grad,
+                keyset: None,
+                strict: case.strict.clone(),
+                hardened: case.hardened.clone(),
+                tolerance: case.tolerance,
+            };
+            let swapped_local_output = evaluate_dispatch_output(&swapped_case, mode)?;
+            checks.push(compare_abs_tol(
+                &allowlist,
+                "dispatch_key",
+                "FT-P2C-002",
+                mode,
+                case.name.as_str(),
+                "metamorphic_commutative_local",
+                "dispatch.metamorphic_commutative_local_mismatch",
+                swapped_local_output,
+                local_output,
+                case.tolerance.unwrap_or(1e-12),
+                vec![
+                    "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                    "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+                ],
+            ));
         }
+
+        let malformed_dispatch_key_rejected =
+            parse_keyset(["UnknownDispatchKey".to_string()].as_slice()).is_err();
+        checks.push(compare_bool(
+            &allowlist,
+            "dispatch_key",
+            "FT-P2C-002",
+            mode,
+            "adversarial_unknown_key",
+            "adversarial_unknown_key_rejected",
+            "dispatch.adversarial_unknown_key_accepted",
+            malformed_dispatch_key_rejected,
+            true,
+            vec![
+                "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+            ],
+        ));
+
+        let adversarial_lhs = ScalarTensor::new(1.0, DType::F64, Device::Cpu);
+        let adversarial_rhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+        let autograd_without_cpu_rejected = dispatch_scalar_binary_with_keyset(
+            BinaryOp::Add,
+            mode,
+            &adversarial_lhs,
+            &adversarial_rhs,
+            DispatchKeySet::from_keys(&[DispatchKey::AutogradCPU]),
+        )
+        .is_err();
+        checks.push(compare_bool(
+            &allowlist,
+            "dispatch_key",
+            "FT-P2C-002",
+            mode,
+            "adversarial_autograd_without_cpu",
+            "adversarial_autograd_without_cpu_rejected",
+            "dispatch.adversarial_autograd_without_cpu_accepted",
+            autograd_without_cpu_rejected,
+            true,
+            vec![
+                "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+            ],
+        ));
 
         let scheduler_fixture: SchedulerFixtureFile =
             load_fixture(&config.fixture_root.join("autograd_scheduler_cases.json"))?;
@@ -2797,6 +2870,27 @@ mod tests {
                     && check.comparator == "fail_closed_oracle"
             }));
         }
+    }
+
+    #[test]
+    fn differential_dispatch_adds_metamorphic_and_adversarial_checks() {
+        let cfg = HarnessConfig::default_paths();
+        let report = run_differential_conformance(&cfg, &[ExecutionMode::Strict])
+            .expect("differential report should run");
+
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "dispatch_key" && check.comparator == "metamorphic_commutative_local"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "dispatch_key"
+                && check.case_name == "adversarial_unknown_key"
+                && check.comparator == "adversarial_unknown_key_rejected"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "dispatch_key"
+                && check.case_name == "adversarial_autograd_without_cpu"
+                && check.comparator == "adversarial_autograd_without_cpu_rejected"
+        }));
     }
 
     #[test]
