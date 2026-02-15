@@ -1,0 +1,131 @@
+{
+  "schema_version": "ft-p2c-006-unit-property-quality-v1",
+  "generated_on": "2026-02-15",
+  "packet_id": "FT-P2C-006",
+  "coverage": {
+    "scope": "packet_module",
+    "target_file": "crates/ft-serialize/src/lib.rs",
+    "line_percent": 91.39579349904396,
+    "region_percent": 91.51732377538829,
+    "line_floor": 90.0,
+    "region_floor": 80.0,
+    "line_floor_pass": true,
+    "region_floor_pass": true,
+    "workspace_rollup_line_percent": 91.39579349904396,
+    "workspace_rollup_region_percent": 91.51732377538829,
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_corallion_cov6 cargo llvm-cov -p ft-serialize --json --summary-only --output-path artifacts/phase2c/FT-P2C-006/unit_property_coverage_v1.json",
+    "extraction_command": "jq '.data[].files[] | select(.filename==\"/data/projects/frankentorch/crates/ft-serialize/src/lib.rs\") | {line_percent:.summary.lines.percent, region_percent:.summary.regions.percent}' artifacts/phase2c/FT-P2C-006/unit_property_coverage_v1.json",
+    "status": "coverage_floor_pass"
+  },
+  "property_suite": {
+    "invariant_family_count": 5,
+    "shrink_enabled": true,
+    "invariant_families": [
+      "checkpoint_roundtrip_sorted_contract",
+      "checkpoint_hash_order_invariant_contract",
+      "strict_unknown_field_fail_closed_contract",
+      "hardened_malformed_diagnostic_bounded_contract",
+      "raptorq_deterministic_outcome_contract"
+    ],
+    "test_ids": [
+      "checkpoint_round_trip_strict_works",
+      "strict_unknown_field_fail_closed",
+      "hardened_malformed_payload_returns_bounded_diagnostic",
+      "version_mismatch_is_fail_closed",
+      "checksum_mismatch_is_fail_closed",
+      "sidecar_generation_and_decode_proof_are_available",
+      "decode_proof_hash_is_deterministic",
+      "legacy_snapshot_wrappers_round_trip",
+      "prop_checkpoint_roundtrip_preserves_sorted_entries",
+      "prop_checkpoint_hash_is_order_invariant_for_unique_node_ids",
+      "prop_strict_unknown_field_remains_fail_closed",
+      "prop_hardened_malformed_diagnostics_are_bounded",
+      "prop_raptorq_decode_proof_hash_stays_deterministic"
+    ]
+  },
+  "structured_log_contract": {
+    "required_fields": [
+      "ts_utc",
+      "suite_id",
+      "test_id",
+      "packet_id",
+      "fixture_id",
+      "scenario_id",
+      "mode",
+      "seed",
+      "input_digest",
+      "output_digest",
+      "env_fingerprint",
+      "artifact_refs",
+      "replay_command",
+      "duration_ms",
+      "outcome",
+      "reason_code"
+    ],
+    "test_helper_anchors": [
+      "crates/ft-serialize/src/lib.rs"
+    ]
+  },
+  "e2e_scenario_mapping": {
+    "checkpoint_round_trip_strict_works": [
+      "serialization/strict:checkpoint_basic",
+      "serialization/hardened:checkpoint_basic"
+    ],
+    "legacy_snapshot_wrappers_round_trip": [
+      "serialization/strict:checkpoint_sparse_grad",
+      "serialization/hardened:checkpoint_sparse_grad"
+    ],
+    "strict_unknown_field_fail_closed": [
+      "serialization/strict:unknown_field_injection",
+      "serialization/hardened:unknown_field_injection"
+    ],
+    "prop_strict_unknown_field_remains_fail_closed": [
+      "serialization/strict:unknown_field_injection",
+      "serialization/hardened:unknown_field_injection"
+    ],
+    "version_mismatch_is_fail_closed": [
+      "serialization/strict:version_mismatch",
+      "serialization/hardened:version_mismatch"
+    ],
+    "checksum_mismatch_is_fail_closed": [
+      "serialization/strict:checksum_tamper",
+      "serialization/hardened:checksum_tamper"
+    ],
+    "hardened_malformed_payload_returns_bounded_diagnostic": [
+      "serialization/strict:malformed_json",
+      "serialization/hardened:malformed_json"
+    ],
+    "prop_hardened_malformed_diagnostics_are_bounded": [
+      "serialization/strict:malformed_json",
+      "serialization/hardened:malformed_json"
+    ],
+    "sidecar_generation_and_decode_proof_are_available": [
+      "serialization/strict:raptorq_corruption_probe",
+      "serialization/hardened:raptorq_corruption_probe"
+    ],
+    "decode_proof_hash_is_deterministic": [
+      "serialization/strict:raptorq_corruption_probe",
+      "serialization/hardened:raptorq_corruption_probe"
+    ],
+    "prop_raptorq_decode_proof_hash_stays_deterministic": [
+      "serialization/strict:raptorq_corruption_probe",
+      "serialization/hardened:raptorq_corruption_probe"
+    ],
+    "prop_checkpoint_roundtrip_preserves_sorted_entries": [
+      "serialization/strict:checkpoint_basic",
+      "serialization/hardened:checkpoint_basic"
+    ],
+    "prop_checkpoint_hash_is_order_invariant_for_unique_node_ids": [
+      "serialization/strict:checkpoint_basic",
+      "serialization/hardened:checkpoint_basic"
+    ]
+  },
+  "validation_runs": {
+    "serialize_tests": "rch exec -- env CARGO_TARGET_DIR=target_corallion cargo test -p ft-serialize",
+    "serialize_check": "rch exec -- env CARGO_TARGET_DIR=target_corallion cargo check -p ft-serialize --all-targets",
+    "serialize_clippy": "rch exec -- env CARGO_TARGET_DIR=target_corallion cargo clippy -p ft-serialize --all-targets -- -D warnings",
+    "coverage_capture": "rch exec -- env CARGO_TARGET_DIR=target_corallion_cov6 cargo llvm-cov -p ft-serialize --json --summary-only --output-path artifacts/phase2c/FT-P2C-006/unit_property_coverage_v1.json",
+    "status": "completed"
+  },
+  "status": "completed"
+}

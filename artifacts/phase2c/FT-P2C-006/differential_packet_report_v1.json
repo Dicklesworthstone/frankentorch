@@ -1,0 +1,289 @@
+{
+  "schema_version": "ft-p2c-differential-packet-v1",
+  "packet_id": "FT-P2C-006",
+  "source_report": "artifacts/phase2c/conformance/differential_report_v1.json",
+  "generated_at": "2026-02-15T21:52:55Z",
+  "total_checks": 36,
+  "pass_checks": 34,
+  "non_pass_checks": 2,
+  "allowlisted_checks": 2,
+  "blocking_checks": 0,
+  "suite_breakdown": [
+    {
+      "suite": "serialization",
+      "count": 36
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 18
+    },
+    {
+      "mode": "strict",
+      "count": 18
+    }
+  ],
+  "status_breakdown": [
+    {
+      "status": "allowlisted_drift",
+      "count": 2
+    },
+    {
+      "status": "pass",
+      "count": 34
+    }
+  ],
+  "comparator_breakdown": [
+    {
+      "comparator": "adversarial_checksum_tamper_rejected",
+      "count": 4
+    },
+    {
+      "comparator": "adversarial_malformed_json_rejected",
+      "count": 4
+    },
+    {
+      "comparator": "adversarial_raptorq_corruption_probe",
+      "count": 4
+    },
+    {
+      "comparator": "adversarial_unknown_field_rejected",
+      "count": 4
+    },
+    {
+      "comparator": "adversarial_version_mismatch_rejected",
+      "count": 4
+    },
+    {
+      "comparator": "decode_roundtrip_contract",
+      "count": 4
+    },
+    {
+      "comparator": "metamorphic_entry_order_hash_invariant",
+      "count": 4
+    },
+    {
+      "comparator": "policy",
+      "count": 4
+    },
+    {
+      "comparator": "proof_determinism_contract",
+      "count": 4
+    }
+  ],
+  "metamorphic_checks": [
+    {
+      "scenario_id": "serialization/hardened:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "hardened",
+      "comparator": "metamorphic_entry_order_hash_invariant",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "hardened",
+      "comparator": "metamorphic_entry_order_hash_invariant",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "strict",
+      "comparator": "metamorphic_entry_order_hash_invariant",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "strict",
+      "comparator": "metamorphic_entry_order_hash_invariant",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    }
+  ],
+  "adversarial_fail_closed_checks": [
+    {
+      "scenario_id": "serialization/hardened:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "hardened",
+      "comparator": "adversarial_checksum_tamper_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "hardened",
+      "comparator": "adversarial_malformed_json_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "hardened",
+      "comparator": "adversarial_raptorq_corruption_probe",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "hardened",
+      "comparator": "adversarial_unknown_field_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "hardened",
+      "comparator": "adversarial_version_mismatch_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "hardened",
+      "comparator": "adversarial_checksum_tamper_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "hardened",
+      "comparator": "adversarial_malformed_json_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "hardened",
+      "comparator": "adversarial_raptorq_corruption_probe",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "hardened",
+      "comparator": "adversarial_unknown_field_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/hardened:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "hardened",
+      "comparator": "adversarial_version_mismatch_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "strict",
+      "comparator": "adversarial_checksum_tamper_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "strict",
+      "comparator": "adversarial_malformed_json_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "strict",
+      "comparator": "adversarial_raptorq_corruption_probe",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "strict",
+      "comparator": "adversarial_unknown_field_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_basic",
+      "case_name": "checkpoint_basic",
+      "mode": "strict",
+      "comparator": "adversarial_version_mismatch_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "strict",
+      "comparator": "adversarial_checksum_tamper_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "strict",
+      "comparator": "adversarial_malformed_json_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "strict",
+      "comparator": "adversarial_raptorq_corruption_probe",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "strict",
+      "comparator": "adversarial_unknown_field_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "serialization/strict:checkpoint_sparse_grad",
+      "case_name": "checkpoint_sparse_grad",
+      "mode": "strict",
+      "comparator": "adversarial_version_mismatch_rejected",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    }
+  ],
+  "packet_allowlist_reconciliation": {
+    "global_allowlisted_drifts": 6,
+    "packet_allowlisted_drifts": 2,
+    "note": "Global allowlisted drifts include FT-P2C-002, FT-P2C-004, and this packet; this slice isolates FT-P2C-006 serialization drift posture."
+  },
+  "risk_linkage": {
+    "threat_ids_covered": [
+      "T006-01",
+      "T006-02",
+      "T006-03",
+      "T006-04",
+      "T006-05"
+    ],
+    "deferred_gap_ids": [
+      "serialization:multi_storage_alias_graph_gap"
+    ],
+    "risk_note_path": "artifacts/phase2c/FT-P2C-006/risk_note.md"
+  }
+}

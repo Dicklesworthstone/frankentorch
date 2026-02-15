@@ -1,21 +1,132 @@
 {
   "packet_id": "FT-P2C-006",
+  "behavior_ledger": "artifacts/phase2c/FT-P2C-006/behavior_extraction_ledger.md",
+  "legacy_anchor_map": "artifacts/phase2c/FT-P2C-006/legacy_anchor_map.md",
+  "implementation_plan": "artifacts/phase2c/FT-P2C-006/implementation_plan.md",
+  "differential_packet_report": "artifacts/phase2c/FT-P2C-006/differential_packet_report_v1.json",
+  "differential_reconciliation_note": "artifacts/phase2c/FT-P2C-006/differential_reconciliation_v1.md",
+  "e2e_log_artifact": "artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl",
+  "e2e_crash_triage_artifact": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_006_v1.json",
+  "e2e_failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_006_v1.json",
+  "e2e_linkage_summary": "artifacts/phase2c/FT-P2C-006/e2e_replay_forensics_linkage_v1.json",
+  "e2e_linkage_note": "artifacts/phase2c/FT-P2C-006/e2e_replay_forensics_linkage_v1.md",
+  "optimization_delta": "artifacts/phase2c/FT-P2C-006/optimization_delta_v1.json",
+  "optimization_isomorphism_note": "artifacts/phase2c/FT-P2C-006/optimization_isomorphism_v1.md",
   "fixtures": [
     {
       "id": "serialization_checkpoint_basic",
       "file": "crates/ft-conformance/fixtures/serialization_cases.json",
       "case_name": "checkpoint_basic",
       "oracle_family": "serialization",
-      "assertions": ["decode_roundtrip", "sidecar_generated", "proof_deterministic"]
+      "assertions": [
+        "decode_roundtrip",
+        "sidecar_generated",
+        "proof_deterministic"
+      ]
     },
     {
       "id": "serialization_checkpoint_sparse_grad",
       "file": "crates/ft-conformance/fixtures/serialization_cases.json",
       "case_name": "checkpoint_sparse_grad",
       "oracle_family": "serialization",
-      "assertions": ["decode_roundtrip", "sidecar_generated", "proof_deterministic"]
+      "assertions": [
+        "decode_roundtrip",
+        "sidecar_generated",
+        "proof_deterministic"
+      ]
     }
   ],
-  "modes": ["strict", "hardened"],
+  "modes": [
+    "strict",
+    "hardened"
+  ],
+  "logging_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code"
+  ],
+  "scenario_seed_map": {
+    "serialization/strict:checkpoint_basic": 7596209695846718624,
+    "serialization/strict:checkpoint_sparse_grad": 13849157011772189882,
+    "serialization/hardened:checkpoint_basic": 1907934922088109760,
+    "serialization/hardened:checkpoint_sparse_grad": 4781980514316948847
+  },
+  "unit_property_validation": {
+    "bead_id": "bd-3v0.17.5",
+    "quality_report": "artifacts/phase2c/FT-P2C-006/unit_property_quality_report_v1.json",
+    "coverage_report": "artifacts/phase2c/FT-P2C-006/unit_property_coverage_v1.json"
+  },
+  "differential_validation": {
+    "bead_id": "bd-3v0.17.6",
+    "report_path": "artifacts/phase2c/conformance/differential_report_v1.json",
+    "packet_report": "artifacts/phase2c/FT-P2C-006/differential_packet_report_v1.json",
+    "reconciliation_note": "artifacts/phase2c/FT-P2C-006/differential_reconciliation_v1.md",
+    "required_comparators": [
+      "decode_roundtrip_contract",
+      "proof_determinism_contract",
+      "metamorphic_entry_order_hash_invariant",
+      "adversarial_unknown_field_rejected",
+      "adversarial_version_mismatch_rejected",
+      "adversarial_checksum_tamper_rejected",
+      "adversarial_malformed_json_rejected",
+      "adversarial_raptorq_corruption_probe",
+      "policy"
+    ]
+  },
+  "e2e_validation": {
+    "bead_id": "bd-3v0.17.7",
+    "packet_log_path": "artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl",
+    "triage_path": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_006_v1.json",
+    "failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_006_v1.json",
+    "linkage_summary": "artifacts/phase2c/FT-P2C-006/e2e_replay_forensics_linkage_v1.json",
+    "linkage_note": "artifacts/phase2c/FT-P2C-006/e2e_replay_forensics_linkage_v1.md",
+    "command": "rch exec -- cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl --print-full-log",
+    "as_of_utc": "2026-02-15T16:15:47Z",
+    "log_entries": 4,
+    "failed_entries": 0,
+    "modes": [
+      "strict",
+      "hardened"
+    ],
+    "scenario_ids": [
+      "serialization/strict:checkpoint_basic",
+      "serialization/strict:checkpoint_sparse_grad",
+      "serialization/hardened:checkpoint_basic",
+      "serialization/hardened:checkpoint_sparse_grad"
+    ],
+    "reason_codes": [
+      "serialization_parity_ok"
+    ],
+    "triage_incidents": 0
+  },
+  "optimization_validation": {
+    "bead_id": "bd-3v0.17.8",
+    "delta_report": "artifacts/phase2c/FT-P2C-006/optimization_delta_v1.json",
+    "isomorphism_note": "artifacts/phase2c/FT-P2C-006/optimization_isomorphism_v1.md"
+  },
+  "security_compatibility_artifact": "artifacts/phase2c/FT-P2C-006/risk_note.md",
+  "contract_artifacts": [
+    "artifacts/phase2c/FT-P2C-006/legacy_anchor_map.md",
+    "artifacts/phase2c/FT-P2C-006/behavior_extraction_ledger.md",
+    "artifacts/phase2c/FT-P2C-006/contract_table.md",
+    "artifacts/phase2c/FT-P2C-006/implementation_plan.md",
+    "artifacts/phase2c/FT-P2C-006/threat_model.md",
+    "artifacts/phase2c/FT-P2C-006/risk_note.md",
+    "artifacts/phase2c/FT-P2C-006/unit_property_quality_report_v1.json",
+    "artifacts/phase2c/FT-P2C-006/differential_packet_report_v1.json",
+    "artifacts/phase2c/FT-P2C-006/differential_reconciliation_v1.md",
+    "artifacts/phase2c/FT-P2C-006/e2e_replay_forensics_linkage_v1.json",
+    "artifacts/phase2c/FT-P2C-006/e2e_replay_forensics_linkage_v1.md",
+    "artifacts/phase2c/FT-P2C-006/optimization_delta_v1.json",
+    "artifacts/phase2c/FT-P2C-006/optimization_isomorphism_v1.md"
+  ],
   "status": "active"
 }

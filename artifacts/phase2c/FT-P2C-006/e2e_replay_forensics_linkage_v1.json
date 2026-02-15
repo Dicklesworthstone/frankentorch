@@ -1,0 +1,63 @@
+{
+  "schema_version": "ft-p2c-e2e-linkage-v1",
+  "packet_id": "FT-P2C-006",
+  "generated_at": "2026-02-15T22:32:44Z",
+  "source_e2e_log": "artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl",
+  "source_triage": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_006_v1.json",
+  "source_failure_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_006_v1.json",
+  "total_entries": 4,
+  "failed_entries": 0,
+  "suite_breakdown": [
+    {
+      "suite_id": "serialization",
+      "count": 4
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 2
+    },
+    {
+      "mode": "strict",
+      "count": 2
+    }
+  ],
+  "deterministic_replay_field_coverage": {
+    "scenario_id": true,
+    "seed": true,
+    "env_fingerprint": true,
+    "artifact_refs": true,
+    "replay_command": true,
+    "reason_code": true
+  },
+  "replay_command_catalog": [
+    "cargo test -p ft-conformance strict_serialization_conformance_is_green -- --nocapture # mode=hardened",
+    "cargo test -p ft-conformance strict_serialization_conformance_is_green -- --nocapture # mode=strict"
+  ],
+  "scenario_ids": [
+    "serialization/hardened:checkpoint_basic",
+    "serialization/hardened:checkpoint_sparse_grad",
+    "serialization/strict:checkpoint_basic",
+    "serialization/strict:checkpoint_sparse_grad"
+  ],
+  "linkage_refs": {
+    "unit_property": [
+      "rch exec -- cargo test -p ft-serialize strict_unknown_field_fail_closed -- --nocapture",
+      "rch exec -- cargo test -p ft-serialize hardened_malformed_payload_returns_bounded_diagnostic -- --nocapture",
+      "rch exec -- cargo test -p ft-serialize version_mismatch_is_fail_closed -- --nocapture",
+      "rch exec -- cargo test -p ft-serialize checksum_mismatch_is_fail_closed -- --nocapture"
+    ],
+    "differential": [
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-006/differential_packet_report_v1.json",
+      "artifacts/phase2c/FT-P2C-006/differential_reconciliation_v1.md"
+    ],
+    "optimization": [
+      "artifacts/phase2c/FT-P2C-006/optimization_delta_v1.json",
+      "artifacts/phase2c/FT-P2C-006/optimization_isomorphism_v1.md"
+    ],
+    "risk_note": "artifacts/phase2c/FT-P2C-006/risk_note.md"
+  },
+  "status": "pass"
+}

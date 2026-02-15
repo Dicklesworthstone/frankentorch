@@ -7,7 +7,7 @@ Legacy root: `legacy_pytorch_code/pytorch`
 
 | Legacy path | Line anchor | Symbol | Porting relevance |
 |---|---:|---|---|
-| `torch/csrc/serialization.cpp` | 149 | `void doRead(io fildes, void* raw_buf, size_t nbytes)` | exact-size read contract (EOF fail-closed) |
+| `torch/csrc/serialization.cpp` | 151 | `void doRead(io fildes, void* raw_buf, size_t nbytes)` | exact-size read contract (EOF fail-closed) |
 | `torch/csrc/serialization.cpp` | 197 | `void doWrite(io fildes, void* raw_buf, size_t nbytes)` | exact-size write contract |
 | `torch/csrc/serialization.cpp` | 235 | `void THPStorage_writeFileRaw(...)` | raw storage write semantics |
 | `torch/csrc/serialization.cpp` | 243 | `size_t size_bytes = self->nbytes();` | byte-accurate payload sizing |

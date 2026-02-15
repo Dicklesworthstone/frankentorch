@@ -1,0 +1,70 @@
+{
+  "schema_version": "ft-p2c-optimization-delta-v1",
+  "packet_id": "FT-P2C-006",
+  "bead_id": "bd-3v0.17.8",
+  "generated_at": "2026-02-15T22:28:55Z",
+  "optimization_lever": {
+    "id": "serialization-sidecar-cache-with-uncached-determinism-check",
+    "description": "Cache successful RaptorQ sidecar/proof generation for identical payload+budget pairs and force the second determinism probe call to bypass cache, reducing repeated packet-level sidecar cost while preserving proof-hash isomorphism checks.",
+    "implementation_paths": [
+      "crates/ft-conformance/src/lib.rs"
+    ]
+  },
+  "benchmark": {
+    "name": "packet_e2e_microbench_serialization_produces_percentiles",
+    "command": "rch exec -- cargo test -p ft-conformance packet_e2e_microbench_serialization_produces_percentiles -- --nocapture",
+    "mode": "strict+hardened",
+    "packet_filter": "FT-P2C-006"
+  },
+  "baseline": {
+    "p50_ns": 23203512,
+    "p95_ns": 24940434,
+    "p99_ns": 24940434,
+    "mean_ns": 23712256,
+    "iterations": 10
+  },
+  "post": {
+    "p50_ns": 13893901,
+    "p95_ns": 16884031,
+    "p99_ns": 16884031,
+    "mean_ns": 15962527,
+    "iterations": 10
+  },
+  "delta_ns": {
+    "p50_ns": -9309611,
+    "p95_ns": -8056403,
+    "p99_ns": -8056403,
+    "mean_ns": -7749729
+  },
+  "improvement": {
+    "p50_pct_reduction": 40.122,
+    "p95_pct_reduction": 32.303,
+    "p99_pct_reduction": 32.303,
+    "mean_pct_reduction": 32.682
+  },
+  "memory_churn": {
+    "baseline_max_rss_kb": null,
+    "post_max_rss_kb": null,
+    "note": "rch cargo-test stream does not emit max RSS; optimization evidence is expressed via deterministic packet latency tails and mean deltas."
+  },
+  "isomorphism_evidence": {
+    "unit_property": [
+      "rch exec -- cargo test -p ft-conformance -- --nocapture"
+    ],
+    "differential": [
+      "rch exec -- cargo test -p ft-conformance differential_serialization_adds_metamorphic_and_adversarial_checks -- --nocapture",
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-006/differential_packet_report_v1.json"
+    ],
+    "e2e": [
+      "rch exec -- cargo test -p ft-conformance e2e_matrix_packet_filter_includes_serialization_packet_entries -- --nocapture",
+      "artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl"
+    ],
+    "quality_gates": [
+      "rch exec -- cargo check --workspace --all-targets",
+      "rch exec -- cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo fmt --check"
+    ]
+  },
+  "status": "pass"
+}
