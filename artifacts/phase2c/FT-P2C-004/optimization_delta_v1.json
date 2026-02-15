@@ -1,0 +1,71 @@
+{
+  "schema_version": "ft-p2c-optimization-delta-v1",
+  "packet_id": "FT-P2C-004",
+  "bead_id": "bd-3v0.15.8",
+  "generated_at": "2026-02-15T22:11:08Z",
+  "optimization_lever": {
+    "id": "autograd-scheduler-queue-capacity-compaction",
+    "description": "Pre-size scheduler queue/trace buffers and remove redundant reachable-branch in the backward ready-queue loop to reduce scheduler-tail overhead while preserving execution semantics.",
+    "implementation_paths": [
+      "crates/ft-autograd/src/lib.rs",
+      "crates/ft-conformance/src/lib.rs"
+    ]
+  },
+  "benchmark": {
+    "name": "packet_e2e_microbench_autograd_scheduler_produces_percentiles",
+    "command": "rch exec -- cargo test -p ft-conformance packet_e2e_microbench_autograd_scheduler_produces_percentiles -- --nocapture",
+    "mode": "strict+hardened",
+    "packet_filter": "FT-P2C-004"
+  },
+  "baseline": {
+    "p50_ns": 296246,
+    "p95_ns": 416726,
+    "p99_ns": 416726,
+    "mean_ns": 335356,
+    "iterations": 10
+  },
+  "post": {
+    "p50_ns": 297897,
+    "p95_ns": 376948,
+    "p99_ns": 376948,
+    "mean_ns": 335703,
+    "iterations": 10
+  },
+  "delta_ns": {
+    "p50_ns": 1651,
+    "p95_ns": -39778,
+    "p99_ns": -39778,
+    "mean_ns": 347
+  },
+  "improvement": {
+    "p50_pct_reduction": -0.557,
+    "p95_pct_reduction": 9.545,
+    "p99_pct_reduction": 9.545,
+    "mean_pct_reduction": -0.103
+  },
+  "memory_churn": {
+    "baseline_max_rss_kb": null,
+    "post_max_rss_kb": null,
+    "note": "rch cargo-test stream does not emit max RSS; this artifact tracks deterministic latency tails for packet-level scheduler workloads."
+  },
+  "isomorphism_evidence": {
+    "unit_property": [
+      "rch exec -- cargo test -p ft-autograd -- --nocapture"
+    ],
+    "differential": [
+      "rch exec -- cargo test -p ft-conformance differential_autograd_scheduler_adds_metamorphic_and_adversarial_checks -- --nocapture",
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-004/differential_packet_report_v1.json"
+    ],
+    "e2e": [
+      "rch exec -- cargo test -p ft-conformance e2e_matrix_packet_filter_includes_autograd_scheduler_packet_entries -- --nocapture",
+      "artifacts/phase2c/e2e_forensics/ft-p2c-004.jsonl"
+    ],
+    "quality_gates": [
+      "rch exec -- cargo check --workspace --all-targets",
+      "rch exec -- cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo fmt --check"
+    ]
+  },
+  "status": "pass"
+}
