@@ -1,0 +1,130 @@
+{
+  "schema_version": "ft-failure-forensics-index-v1",
+  "generated_unix_ms": 1771192958503,
+  "source_artifacts": {
+    "e2e_log_path": "artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl",
+    "triage_path": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_006_v1.json",
+    "differential_report_path": "artifacts/phase2c/conformance/differential_report_v1.json"
+  },
+  "summary": {
+    "e2e_entries": 4,
+    "failed_entries": 0,
+    "triaged_incidents": 0
+  },
+  "suite_evidence_templates": {
+    "autograd_scheduler": {
+      "unit_property_commands": [
+        "cargo test -p ft-autograd composite_graph_gradient_is_deterministic -- --nocapture",
+        "cargo test -p ft-autograd dependency_scheduler_waits_for_all_children -- --nocapture",
+        "cargo test -p ft-autograd strict_mode_reentrant_depth_overflow_fails -- --nocapture",
+        "cargo test -p ft-autograd hardened_mode_reentrant_depth_overflow_fallbacks -- --nocapture"
+      ],
+      "differential_refs": [
+        "artifacts/phase2c/conformance/differential_report_v1.json"
+      ],
+      "e2e_refs": [
+        "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      ],
+      "performance_refs": [
+        "artifacts/phase2c/METHOD_STACK_REPORT_2026-02-14.md",
+        "artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+      ],
+      "raptorq_ref_pattern": "artifacts/phase2c/{packet_id}/parity_report.{raptorq|decode_proof}.json"
+    },
+    "dispatch_key": {
+      "unit_property_commands": [
+        "cargo test -p ft-dispatch strict_mode_rejects_composite_fallback -- --nocapture",
+        "cargo test -p ft-dispatch hardened_mode_allows_composite_fallback -- --nocapture",
+        "cargo test -p ft-dispatch unknown_bits_fail_closed -- --nocapture"
+      ],
+      "differential_refs": [
+        "artifacts/phase2c/conformance/differential_report_v1.json"
+      ],
+      "e2e_refs": [
+        "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      ],
+      "performance_refs": [
+        "artifacts/phase2c/METHOD_STACK_REPORT_2026-02-14.md",
+        "artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+      ],
+      "raptorq_ref_pattern": "artifacts/phase2c/{packet_id}/parity_report.{raptorq|decode_proof}.json"
+    },
+    "op_schema": {
+      "unit_property_commands": [
+        "cargo test -p ft-dispatch schema_parser_rejects_malformed_tokens -- --nocapture",
+        "cargo test -p ft-dispatch schema_out_variant_requires_mutable_out_alias -- --nocapture",
+        "cargo test -p ft-dispatch schema_dispatch_keyset_requires_cpu_backend_for_scoped_ops -- --nocapture",
+        "cargo test -p ft-conformance strict_op_schema_conformance_is_green -- --nocapture"
+      ],
+      "differential_refs": [
+        "artifacts/phase2c/conformance/differential_report_v1.json",
+        "artifacts/phase2c/FT-P2C-003/differential_packet_report_v1.json"
+      ],
+      "e2e_refs": [
+        "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
+        "artifacts/phase2c/e2e_forensics/ft-p2c-003.jsonl"
+      ],
+      "performance_refs": [
+        "artifacts/phase2c/METHOD_STACK_REPORT_2026-02-14.md",
+        "artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+      ],
+      "raptorq_ref_pattern": "artifacts/phase2c/{packet_id}/parity_report.{raptorq|decode_proof}.json"
+    },
+    "scalar_dac": {
+      "unit_property_commands": [
+        "cargo test -p ft-api session_add_backward_records_evidence -- --nocapture",
+        "cargo test -p ft-autograd add_backward_matches_expected_gradient -- --nocapture",
+        "cargo test -p ft-autograd mul_backward_matches_expected_gradient -- --nocapture"
+      ],
+      "differential_refs": [
+        "artifacts/phase2c/conformance/differential_report_v1.json"
+      ],
+      "e2e_refs": [
+        "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      ],
+      "performance_refs": [
+        "artifacts/phase2c/METHOD_STACK_REPORT_2026-02-14.md",
+        "artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+      ],
+      "raptorq_ref_pattern": "artifacts/phase2c/{packet_id}/parity_report.{raptorq|decode_proof}.json"
+    },
+    "serialization": {
+      "unit_property_commands": [
+        "cargo test -p ft-serialize strict_unknown_field_fail_closed -- --nocapture",
+        "cargo test -p ft-serialize hardened_malformed_payload_returns_bounded_diagnostic -- --nocapture",
+        "cargo test -p ft-serialize version_mismatch_is_fail_closed -- --nocapture",
+        "cargo test -p ft-serialize checksum_mismatch_is_fail_closed -- --nocapture"
+      ],
+      "differential_refs": [
+        "artifacts/phase2c/conformance/differential_report_v1.json"
+      ],
+      "e2e_refs": [
+        "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      ],
+      "performance_refs": [
+        "artifacts/phase2c/METHOD_STACK_REPORT_2026-02-14.md",
+        "artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+      ],
+      "raptorq_ref_pattern": "artifacts/phase2c/{packet_id}/parity_report.{raptorq|decode_proof}.json"
+    },
+    "tensor_meta": {
+      "unit_property_commands": [
+        "cargo test -p ft-core index_rank_and_bounds_are_guarded -- --nocapture",
+        "cargo test -p ft-core custom_strides_validate_and_index_into_storage -- --nocapture"
+      ],
+      "differential_refs": [
+        "artifacts/phase2c/conformance/differential_report_v1.json"
+      ],
+      "e2e_refs": [
+        "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl"
+      ],
+      "performance_refs": [
+        "artifacts/phase2c/METHOD_STACK_REPORT_2026-02-14.md",
+        "artifacts/phase2c/VALIDATOR_OPTIMIZATION_EVIDENCE_20260213.md"
+      ],
+      "raptorq_ref_pattern": "artifacts/phase2c/{packet_id}/parity_report.{raptorq|decode_proof}.json"
+    }
+  },
+  "failures": [],
+  "triaged_incidents": []
+}
