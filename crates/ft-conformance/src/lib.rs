@@ -645,58 +645,69 @@ pub fn emit_e2e_forensics_matrix_filtered(
 
     let mut logs = Vec::new();
     for mode in selected_modes.iter().copied() {
-        if packet_in_scope(packet_filter, "FT-P2C-001") {
+        let include_ft_p2c_001 = packet_in_scope(packet_filter, "FT-P2C-001");
+        let include_ft_p2c_002 = packet_in_scope(packet_filter, "FT-P2C-002");
+        let include_ft_p2c_003 = packet_in_scope(packet_filter, "FT-P2C-003");
+        let include_ft_p2c_004 = packet_in_scope(packet_filter, "FT-P2C-004");
+        let include_ft_p2c_005 = packet_in_scope(packet_filter, "FT-P2C-005");
+        let include_ft_p2c_006 = packet_in_scope(packet_filter, "FT-P2C-006");
+
+        if include_ft_p2c_001 || include_ft_p2c_005 {
             let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
-            logs.extend(scalar_cases.into_iter().map(|case| case.forensic_log));
+            let scalar_logs = scalar_cases
+                .into_iter()
+                .map(|case| case.forensic_log)
+                .collect::<Vec<_>>();
+            extend_ft_p2c_005_projection_logs(
+                &mut logs,
+                scalar_logs,
+                include_ft_p2c_001,
+                include_ft_p2c_005,
+            );
 
             let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
-            logs.extend(tensor_meta_cases.into_iter().map(|case| case.forensic_log));
+            let tensor_meta_logs = tensor_meta_cases
+                .into_iter()
+                .map(|case| case.forensic_log)
+                .collect::<Vec<_>>();
+            extend_ft_p2c_005_projection_logs(
+                &mut logs,
+                tensor_meta_logs,
+                include_ft_p2c_001,
+                include_ft_p2c_005,
+            );
         }
 
-        if packet_in_scope(packet_filter, "FT-P2C-002") {
+        if include_ft_p2c_002 || include_ft_p2c_005 {
             let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
-            logs.extend(dispatch_cases.into_iter().map(|case| case.forensic_log));
+            let dispatch_logs = dispatch_cases
+                .into_iter()
+                .map(|case| case.forensic_log)
+                .collect::<Vec<_>>();
+            extend_ft_p2c_005_projection_logs(
+                &mut logs,
+                dispatch_logs,
+                include_ft_p2c_002,
+                include_ft_p2c_005,
+            );
         }
 
-        if packet_in_scope(packet_filter, "FT-P2C-003") {
+        if include_ft_p2c_003 {
             let (_, op_schema_cases) = run_op_schema_conformance(config, mode)?;
             logs.extend(op_schema_cases.into_iter().map(|case| case.forensic_log));
         }
 
-        if packet_in_scope(packet_filter, "FT-P2C-004") {
+        if include_ft_p2c_004 {
             let (_, scheduler_cases) = run_autograd_scheduler_conformance(config, mode)?;
             logs.extend(scheduler_cases.into_iter().map(|case| case.forensic_log));
         }
 
-        if packet_in_scope(packet_filter, "FT-P2C-006") {
+        if include_ft_p2c_006 {
             let (_, serialization_cases) = run_serialization_conformance(config, mode)?;
             logs.extend(
                 serialization_cases
                     .into_iter()
                     .map(|case| case.forensic_log),
-            );
-        }
-
-        if packet_in_scope(packet_filter, "FT-P2C-005") {
-            let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
-            logs.extend(
-                scalar_cases
-                    .into_iter()
-                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
-            );
-
-            let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
-            logs.extend(
-                tensor_meta_cases
-                    .into_iter()
-                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
-            );
-
-            let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
-            logs.extend(
-                dispatch_cases
-                    .into_iter()
-                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
             );
         }
     }
@@ -737,6 +748,27 @@ pub fn emit_e2e_forensics_matrix_filtered(
         failed_entries,
         modes: selected_modes,
     })
+}
+
+fn extend_ft_p2c_005_projection_logs(
+    logs: &mut Vec<StructuredCaseLog>,
+    base_logs: Vec<StructuredCaseLog>,
+    include_base_packet: bool,
+    include_ft_p2c_005: bool,
+) {
+    match (include_base_packet, include_ft_p2c_005) {
+        (true, true) => {
+            logs.extend(base_logs.iter().cloned());
+            logs.extend(base_logs.into_iter().map(project_log_to_ft_p2c_005));
+        }
+        (true, false) => {
+            logs.extend(base_logs);
+        }
+        (false, true) => {
+            logs.extend(base_logs.into_iter().map(project_log_to_ft_p2c_005));
+        }
+        (false, false) => {}
+    }
 }
 
 fn packet_in_scope(packet_filter: Option<&str>, packet_id: &str) -> bool {
@@ -4097,6 +4129,76 @@ mod tests {
                 "missing required key {required}"
             );
         }
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn e2e_matrix_unfiltered_keeps_ft_p2c_005_projection_entries() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_unfiltered_projection_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix_filtered(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+            None,
+        )
+        .expect("unfiltered e2e matrix should emit logs");
+
+        assert!(summary.log_entries >= 20);
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        let mut saw_ft_p2c_001 = false;
+        let mut saw_ft_p2c_002 = false;
+        let mut ft_p2c_005_suites = BTreeSet::new();
+        for line in raw.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("jsonl line should be valid json");
+            let packet_id = value
+                .get("packet_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("packet_id must be present");
+            let suite_id = value
+                .get("suite_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("suite_id must be present");
+            match packet_id {
+                "FT-P2C-001" if matches!(suite_id, "scalar_dac" | "tensor_meta") => {
+                    saw_ft_p2c_001 = true;
+                }
+                "FT-P2C-002" if suite_id == "dispatch_key" => {
+                    saw_ft_p2c_002 = true;
+                }
+                "FT-P2C-005" => {
+                    let scenario_id = value
+                        .get("scenario_id")
+                        .and_then(serde_json::Value::as_str)
+                        .expect("scenario_id must be present");
+                    assert!(
+                        scenario_id.starts_with("ft_p2c_005/"),
+                        "FT-P2C-005 projection must retain namespaced scenario IDs"
+                    );
+                    ft_p2c_005_suites.insert(suite_id.to_string());
+                }
+                _ => {}
+            }
+        }
+
+        assert!(saw_ft_p2c_001, "expected FT-P2C-001 source entries");
+        assert!(saw_ft_p2c_002, "expected FT-P2C-002 source entries");
+        assert!(
+            ft_p2c_005_suites.contains("scalar_dac")
+                && ft_p2c_005_suites.contains("tensor_meta")
+                && ft_p2c_005_suites.contains("dispatch_key"),
+            "expected FT-P2C-005 projected suites from scalar/tensor_meta/dispatch sources"
+        );
 
         let _ = fs::remove_file(output_path);
     }
