@@ -9,9 +9,9 @@
 
 ## Benchmark Delta (`packet_e2e_microbench_cpu_kernel_legacy_vs_optimized_profiles`)
 
-- Baseline (legacy fixture-loading path): `p50=4809861ns`, `p95=5100683ns`, `p99=5100683ns`, `mean=4880602ns`
-- Post (optimized preload path): `p50=4218929ns`, `p95=4351767ns`, `p99=4351767ns`, `mean=4237366ns`
-- Improvement: `p50=12.286% reduction`, `p95=14.683% reduction`, `p99=14.683% reduction`, `mean=13.179% reduction`
+- Baseline (legacy fixture-loading path): `p50=10282230ns`, `p95=14150815ns`, `p99=14150815ns`, `mean=10814785ns`
+- Post (optimized preload path): `p50=9629848ns`, `p95=9885917ns`, `p99=9885917ns`, `mean=9232517ns`
+- Improvement: `p50=6.345% reduction`, `p95=30.139% reduction`, `p99=30.139% reduction`, `mean=14.631% reduction`
 
 ## Isomorphism Checks
 

@@ -1,6 +1,6 @@
 # FT-P2C-005 Profiling Note — bd-3v0.16.8
 
-Generated: `2026-02-16T04:03:08Z`
+Generated: `2026-02-16T04:08:07Z`
 
 ## Objective
 
@@ -17,15 +17,15 @@ The comparator test executes both legacy and optimized paths in the same process
 ## Raw Comparator Output
 
 ```text
-packet_e2e_microbench_compare_ns packet=FT-P2C-005 legacy_p50=4809861 legacy_p95=5100683 legacy_p99=5100683 legacy_mean=4880602 optimized_p50=4218929 optimized_p95=4351767 optimized_p99=4351767 optimized_mean=4237366
+packet_e2e_microbench_compare_ns packet=FT-P2C-005 legacy_p50=10282230 legacy_p95=14150815 legacy_p99=14150815 legacy_mean=10814785 optimized_p50=9629848 optimized_p95=9885917 optimized_p99=9885917 optimized_mean=9232517
 ```
 
 ## Delta Summary
 
-- `p50`: `-590932ns` (`12.286%` faster)
-- `p95`: `-748916ns` (`14.683%` faster)
-- `p99`: `-748916ns` (`14.683%` faster)
-- `mean`: `-643236ns` (`13.179%` faster)
+- `p50`: `-652382ns` (`6.345%` faster)
+- `p95`: `-4264898ns` (`30.139%` faster)
+- `p99`: `-4264898ns` (`30.139%` faster)
+- `mean`: `-1582268ns` (`14.631%` faster)
 
 ## Isomorphism Guardrails
 

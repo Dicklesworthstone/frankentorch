@@ -1,0 +1,172 @@
+{
+  "packet_id": "FT-P2C-005",
+  "behavior_ledger": "artifacts/phase2c/FT-P2C-005/behavior_extraction_ledger.md",
+  "legacy_anchor_map": "artifacts/phase2c/FT-P2C-005/legacy_anchor_map.md",
+  "implementation_plan": "artifacts/phase2c/FT-P2C-005/implementation_plan.md",
+  "differential_packet_report": "artifacts/phase2c/FT-P2C-005/differential_packet_report_v1.json",
+  "differential_reconciliation_note": "artifacts/phase2c/FT-P2C-005/differential_reconciliation_v1.md",
+  "e2e_log_artifact": "artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl",
+  "e2e_crash_triage_artifact": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_005_v1.json",
+  "e2e_failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_005_v1.json",
+  "e2e_linkage_summary": "artifacts/phase2c/FT-P2C-005/e2e_replay_forensics_linkage_v1.json",
+  "e2e_linkage_note": "artifacts/phase2c/FT-P2C-005/e2e_replay_forensics_linkage_v1.md",
+  "optimization_delta": "artifacts/phase2c/FT-P2C-005/optimization_delta_v1.json",
+  "optimization_isomorphism_note": "artifacts/phase2c/FT-P2C-005/optimization_isomorphism_v1.md",
+  "optimization_profile_note": "artifacts/phase2c/FT-P2C-005/bd-3v0.16.8_profile_v1.md",
+  "fixtures": [
+    {
+      "id": "cpu_kernel_scalar_add_mul",
+      "file": "crates/ft-conformance/fixtures/scalar_autograd_cases.json",
+      "oracle_family": "scalar_dac",
+      "assertions": [
+        "deterministic_output",
+        "deterministic_gradients",
+        "strict_hardened_mode_parity"
+      ]
+    },
+    {
+      "id": "cpu_kernel_tensor_meta_guards",
+      "file": "crates/ft-conformance/fixtures/tensor_meta_cases.json",
+      "oracle_family": "tensor_meta",
+      "assertions": [
+        "linear_index_parity",
+        "numel_and_contiguous_parity",
+        "invalid_shape_stride_fail_closed"
+      ]
+    },
+    {
+      "id": "cpu_kernel_dispatch_resolution",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "oracle_family": "dispatch_key",
+      "assertions": [
+        "dispatch_key_selection_parity",
+        "strict_composite_fail_closed",
+        "hardened_fallback_boundary"
+      ]
+    }
+  ],
+  "modes": [
+    "strict",
+    "hardened"
+  ],
+  "logging_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code",
+    "dispatch_key",
+    "selected_kernel",
+    "backend_key",
+    "dtype_pair",
+    "input_shape",
+    "output_shape",
+    "broadcast_applied",
+    "contract_ids",
+    "packet_projection"
+  ],
+  "scenario_seed_map": {
+    "ft_p2c_005/scalar_dac/strict:add_basic": 11230214846748554265,
+    "ft_p2c_005/scalar_dac/hardened:add_basic": 7472292100909643468,
+    "ft_p2c_005/scalar_dac/strict:mul_basic": 1767315763877827661,
+    "ft_p2c_005/scalar_dac/hardened:mul_basic": 17290219769398318397,
+    "ft_p2c_005/tensor_meta/strict:contiguous_basic_index": 4395520818158430929,
+    "ft_p2c_005/tensor_meta/hardened:contiguous_basic_index": 7837796412515040673,
+    "ft_p2c_005/tensor_meta/strict:invalid_rank_stride_mismatch": 9353830229903822145,
+    "ft_p2c_005/tensor_meta/hardened:invalid_rank_stride_mismatch": 5997540812546318856,
+    "ft_p2c_005/dispatch_key/strict:strict_autograd_route": 12780237016247668875,
+    "ft_p2c_005/dispatch_key/hardened:strict_autograd_route": 456065680046437289,
+    "ft_p2c_005/dispatch_key/strict:unknown_dispatch_key_fail_closed": 16228262575860461841,
+    "ft_p2c_005/dispatch_key/hardened:unknown_dispatch_key_fail_closed": 6481405883647676142
+  },
+  "unit_property_validation": {
+    "bead_id": "bd-3v0.16.5",
+    "quality_report": "artifacts/phase2c/FT-P2C-005/unit_property_quality_report_v1.json",
+    "coverage_report": "artifacts/phase2c/FT-P2C-005/unit_property_coverage_v1.json"
+  },
+  "differential_validation": {
+    "bead_id": "bd-3v0.16.6",
+    "report_path": "artifacts/phase2c/conformance/differential_report_v1.json",
+    "packet_report": "artifacts/phase2c/FT-P2C-005/differential_packet_report_v1.json",
+    "reconciliation_note": "artifacts/phase2c/FT-P2C-005/differential_reconciliation_v1.md",
+    "required_comparators": [
+      "abs_tol",
+      "adversarial_autograd_without_cpu_rejected",
+      "adversarial_unknown_key_rejected",
+      "alias_policy",
+      "contiguous",
+      "fail_closed",
+      "fail_closed_oracle",
+      "fail_closed_oracle_guard",
+      "linear_index",
+      "metamorphic_commutative_local",
+      "metamorphic_offset_shift_contiguous_local",
+      "metamorphic_offset_shift_contiguous_oracle",
+      "metamorphic_offset_shift_linear_local",
+      "metamorphic_offset_shift_linear_oracle",
+      "metamorphic_offset_shift_numel_local",
+      "metamorphic_offset_shift_numel_oracle",
+      "mode_split_policy",
+      "numel",
+      "oracle_guard"
+    ]
+  },
+  "e2e_validation": {
+    "bead_id": "bd-3v0.16.7",
+    "packet_log_path": "artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl",
+    "triage_path": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_005_v1.json",
+    "failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_005_v1.json",
+    "linkage_summary": "artifacts/phase2c/FT-P2C-005/e2e_replay_forensics_linkage_v1.json",
+    "linkage_note": "artifacts/phase2c/FT-P2C-005/e2e_replay_forensics_linkage_v1.md",
+    "command": "rch exec -- cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl --print-full-log",
+    "as_of_utc": "2026-02-16T04:08:07Z",
+    "log_entries": 48,
+    "failed_entries": 0,
+    "modes": [
+      "strict",
+      "hardened"
+    ],
+    "reason_codes": [
+      "dispatch_parity_ok",
+      "expected_error_observed",
+      "parity_ok",
+      "tensor_meta_parity_ok"
+    ],
+    "triage_incidents": 0
+  },
+  "optimization_validation": {
+    "bead_id": "bd-3v0.16.8",
+    "delta_report": "artifacts/phase2c/FT-P2C-005/optimization_delta_v1.json",
+    "isomorphism_note": "artifacts/phase2c/FT-P2C-005/optimization_isomorphism_v1.md",
+    "profiling_note": "artifacts/phase2c/FT-P2C-005/bd-3v0.16.8_profile_v1.md"
+  },
+  "security_compatibility_artifact": "artifacts/phase2c/FT-P2C-005/risk_note.md",
+  "contract_artifacts": [
+    "artifacts/phase2c/FT-P2C-005/legacy_anchor_map.md",
+    "artifacts/phase2c/FT-P2C-005/behavior_extraction_ledger.md",
+    "artifacts/phase2c/FT-P2C-005/contract_table.md",
+    "artifacts/phase2c/FT-P2C-005/implementation_plan.md",
+    "artifacts/phase2c/FT-P2C-005/threat_model.md",
+    "artifacts/phase2c/FT-P2C-005/risk_note.md",
+    "artifacts/phase2c/FT-P2C-005/unit_property_quality_report_v1.json",
+    "artifacts/phase2c/FT-P2C-005/unit_property_coverage_v1.json",
+    "artifacts/phase2c/FT-P2C-005/differential_packet_report_v1.json",
+    "artifacts/phase2c/FT-P2C-005/differential_reconciliation_v1.md",
+    "artifacts/phase2c/FT-P2C-005/e2e_replay_forensics_linkage_v1.json",
+    "artifacts/phase2c/FT-P2C-005/e2e_replay_forensics_linkage_v1.md",
+    "artifacts/phase2c/FT-P2C-005/optimization_delta_v1.json",
+    "artifacts/phase2c/FT-P2C-005/optimization_isomorphism_v1.md",
+    "artifacts/phase2c/FT-P2C-005/bd-3v0.16.8_profile_v1.md",
+    "artifacts/phase2c/FT-P2C-005/parity_gate.yaml",
+    "artifacts/phase2c/FT-P2C-005/parity_report.json",
+    "artifacts/phase2c/FT-P2C-005/parity_report.raptorq.json",
+    "artifacts/phase2c/FT-P2C-005/parity_report.decode_proof.json"
+  ],
+  "status": "completed"
+}
