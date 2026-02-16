@@ -199,6 +199,10 @@ struct ScalarCase {
     expected_lhs_grad: f64,
     expected_rhs_grad: f64,
     tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -218,6 +222,10 @@ struct TensorMetaCase {
     expected_contiguous: Option<bool>,
     expect_valid: Option<bool>,
     alias_offset: Option<usize>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -231,11 +239,19 @@ struct DispatchCase {
     op: String,
     lhs: f64,
     rhs: f64,
+    lhs_dtype: Option<String>,
+    rhs_dtype: Option<String>,
+    lhs_device: Option<String>,
+    rhs_device: Option<String>,
     requires_grad: bool,
     keyset: Option<Vec<String>>,
     strict: DispatchModeExpectation,
     hardened: DispatchModeExpectation,
     tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -660,6 +676,29 @@ pub fn emit_e2e_forensics_matrix_filtered(
                     .map(|case| case.forensic_log),
             );
         }
+
+        if packet_in_scope(packet_filter, "FT-P2C-005") {
+            let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
+            logs.extend(
+                scalar_cases
+                    .into_iter()
+                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
+            );
+
+            let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
+            logs.extend(
+                tensor_meta_cases
+                    .into_iter()
+                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
+            );
+
+            let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
+            logs.extend(
+                dispatch_cases
+                    .into_iter()
+                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
+            );
+        }
     }
 
     if let Some(packet_id) = packet_filter {
@@ -702,6 +741,25 @@ pub fn emit_e2e_forensics_matrix_filtered(
 
 fn packet_in_scope(packet_filter: Option<&str>, packet_id: &str) -> bool {
     packet_filter.is_none_or(|filter| filter == packet_id)
+}
+
+fn project_log_to_ft_p2c_005(mut log: StructuredCaseLog) -> StructuredCaseLog {
+    let original_packet = log.packet_id;
+    log.packet_id = "FT-P2C-005";
+    log.scenario_id = format!("ft_p2c_005/{}", log.scenario_id);
+    log.replay_command = format!(
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode {} --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl",
+        log.mode
+    );
+    log.artifact_refs
+        .push("artifacts/phase2c/FT-P2C-005/contract_table.md".to_string());
+    log.artifact_refs
+        .push("artifacts/phase2c/FT-P2C-005/unit_property_quality_report_v1.json".to_string());
+    log.extra_fields.insert(
+        "packet_projection".to_string(),
+        json!(format!("{original_packet}->FT-P2C-005")),
+    );
+    log
 }
 
 pub fn run_differential_conformance(
@@ -1233,6 +1291,8 @@ pub fn run_differential_conformance(
                     expected_lhs_grad: 0.0,
                     expected_rhs_grad: 0.0,
                     tolerance: case.tolerance,
+                    contract_ids: case.contract_ids.clone(),
+                    e2e_scenarios: case.e2e_scenarios.clone(),
                 },
             ) {
                 Ok(oracle) => checks.push(compare_abs_tol(
@@ -1275,11 +1335,17 @@ pub fn run_differential_conformance(
                 op: case.op.clone(),
                 lhs: case.rhs,
                 rhs: case.lhs,
+                lhs_dtype: case.rhs_dtype.clone(),
+                rhs_dtype: case.lhs_dtype.clone(),
+                lhs_device: case.rhs_device.clone(),
+                rhs_device: case.lhs_device.clone(),
                 requires_grad: case.requires_grad,
                 keyset: None,
                 strict: case.strict.clone(),
                 hardened: case.hardened.clone(),
                 tolerance: case.tolerance,
+                contract_ids: case.contract_ids.clone(),
+                e2e_scenarios: case.e2e_scenarios.clone(),
             };
             let swapped_local_output = evaluate_dispatch_output(&swapped_case, mode)?;
             checks.push(compare_abs_tol(
@@ -2079,6 +2145,11 @@ fn run_scalar_case(case: &ScalarCase, mode: ExecutionMode) -> Result<CaseReport,
     } else {
         "fail"
     };
+    let reason_code = if outcome == "pass" {
+        "parity_ok"
+    } else {
+        "scalar_or_grad_mismatch"
+    };
 
     Ok(CaseReport {
         name: case.name.clone(),
@@ -2101,12 +2172,17 @@ fn run_scalar_case(case: &ScalarCase, mode: ExecutionMode) -> Result<CaseReport,
                 mode_label(mode)
             ),
             outcome,
-            if outcome == "pass" {
-                "parity_ok"
-            } else {
-                "scalar_or_grad_mismatch"
-            },
-        ),
+            reason_code,
+        )
+        .with_extra_fields(scalar_forensic_fields(
+            case,
+            mode,
+            actual_output,
+            actual_lhs_grad,
+            actual_rhs_grad,
+            outcome == "pass",
+            reason_code,
+        )),
     })
 }
 
@@ -2164,7 +2240,8 @@ fn run_tensor_meta_case(
             } else {
                 "tensor_meta_expectation_mismatch"
             },
-        ),
+        )
+        .with_extra_fields(tensor_meta_forensic_fields(case, &local, passed)),
     })
 }
 
@@ -2278,21 +2355,47 @@ fn run_dispatch_case(
     };
 
     let op = parse_binary_op(&case.op)?;
-    let lhs = ScalarTensor::new(case.lhs, DType::F64, Device::Cpu);
-    let rhs = ScalarTensor::new(case.rhs, DType::F64, Device::Cpu);
-
-    let result = if let Some(keys) = &case.keyset {
-        let keyset = parse_keyset(keys)?;
-        dispatch_scalar_binary_with_keyset(op, mode, &lhs, &rhs, keyset)
-    } else {
-        dispatch_scalar_binary(op, mode, &lhs, &rhs, case.requires_grad)
-    };
+    let lhs_dtype = case
+        .lhs_dtype
+        .as_deref()
+        .map_or(Ok(DType::F64), parse_dtype)?;
+    let rhs_dtype = case
+        .rhs_dtype
+        .as_deref()
+        .map_or(Ok(DType::F64), parse_dtype)?;
+    let lhs_device = case
+        .lhs_device
+        .as_deref()
+        .map_or(Ok(Device::Cpu), parse_device)?;
+    let rhs_device = case
+        .rhs_device
+        .as_deref()
+        .map_or(Ok(Device::Cpu), parse_device)?;
+    let lhs = ScalarTensor::new(case.lhs, lhs_dtype, lhs_device);
+    let rhs = ScalarTensor::new(case.rhs, rhs_dtype, rhs_device);
 
     let expected_error = expectation.expect_error.unwrap_or(false);
+    let result = if let Some(keys) = &case.keyset {
+        match parse_keyset(keys) {
+            Ok(keyset) => dispatch_scalar_binary_with_keyset(op, mode, &lhs, &rhs, keyset)
+                .map_err(|error| error.to_string()),
+            Err(error) => Err(error),
+        }
+    } else {
+        dispatch_scalar_binary(op, mode, &lhs, &rhs, case.requires_grad)
+            .map_err(|error| error.to_string())
+    };
+
     let tolerance = case.tolerance.unwrap_or(1e-12);
 
     if expected_error {
         let error_ok = result.is_err();
+        let error_message = result.as_ref().err().map(ToString::to_string);
+        let reason_code = if error_ok {
+            "expected_error_observed"
+        } else {
+            "expected_error_missing"
+        };
         return Ok(DispatchCaseReport {
             name: case.name.clone(),
             mode,
@@ -2317,12 +2420,18 @@ fn run_dispatch_case(
                     mode_label(mode)
                 ),
                 if error_ok { "pass" } else { "fail" },
-                if error_ok {
-                    "expected_error_observed"
-                } else {
-                    "expected_error_missing"
-                },
-            ),
+                reason_code,
+            )
+            .with_extra_fields(dispatch_error_forensic_fields(
+                case,
+                mode,
+                lhs_dtype,
+                rhs_dtype,
+                lhs_device,
+                rhs_device,
+                reason_code,
+                error_message,
+            )),
         });
     }
 
@@ -2354,6 +2463,11 @@ fn run_dispatch_case(
         .expected_fallback
         .is_none_or(|expected| expected == outcome.decision.fallback_used);
     let passed = output_ok && selected_key_ok && backend_key_ok && kernel_ok && fallback_ok;
+    let reason_code = if passed {
+        "dispatch_parity_ok"
+    } else {
+        "dispatch_expectation_mismatch"
+    };
 
     Ok(DispatchCaseReport {
         name: case.name.clone(),
@@ -2379,12 +2493,23 @@ fn run_dispatch_case(
                 mode_label(mode)
             ),
             if passed { "pass" } else { "fail" },
-            if passed {
-                "dispatch_parity_ok"
-            } else {
-                "dispatch_expectation_mismatch"
-            },
-        ),
+            reason_code,
+        )
+        .with_extra_fields(dispatch_forensic_fields(
+            case,
+            mode,
+            outcome.tensor.value(),
+            outcome.decision.selected_key,
+            outcome.decision.backend_key,
+            outcome.decision.kernel,
+            outcome.decision.keyset_bits,
+            outcome.decision.fallback_used,
+            lhs_dtype,
+            rhs_dtype,
+            lhs_device,
+            rhs_device,
+            reason_code,
+        )),
     })
 }
 
@@ -3287,11 +3412,217 @@ print(json.dumps({
 }, sort_keys=True))
 "#;
 
+fn scalar_forensic_fields(
+    case: &ScalarCase,
+    mode: ExecutionMode,
+    actual_output: f64,
+    actual_lhs_grad: f64,
+    actual_rhs_grad: f64,
+    passed: bool,
+    reason_code: &str,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    let selected_kernel = match case.op.as_str() {
+        "add" => "autograd_cpu::add_scalar",
+        "mul" => "autograd_cpu::mul_scalar",
+        _ => "autograd_cpu::unknown",
+    };
+    fields.insert("contract_ids".to_string(), json!(case.contract_ids));
+    fields.insert(
+        "downstream_e2e_scenarios".to_string(),
+        json!(case.e2e_scenarios),
+    );
+    fields.insert("op".to_string(), json!(case.op));
+    fields.insert("lhs".to_string(), json!(case.lhs));
+    fields.insert("rhs".to_string(), json!(case.rhs));
+    fields.insert("expected_output".to_string(), json!(case.expected_output));
+    fields.insert("actual_output".to_string(), json!(actual_output));
+    fields.insert(
+        "expected_lhs_grad".to_string(),
+        json!(case.expected_lhs_grad),
+    );
+    fields.insert("actual_lhs_grad".to_string(), json!(actual_lhs_grad));
+    fields.insert(
+        "expected_rhs_grad".to_string(),
+        json!(case.expected_rhs_grad),
+    );
+    fields.insert("actual_rhs_grad".to_string(), json!(actual_rhs_grad));
+    fields.insert("dispatch_key".to_string(), json!("AutogradCPU"));
+    fields.insert("selected_kernel".to_string(), json!(selected_kernel));
+    fields.insert("backend_key".to_string(), json!("CPU"));
+    fields.insert("input_shape".to_string(), json!([[]]));
+    fields.insert("output_shape".to_string(), json!([]));
+    fields.insert("dtype_pair".to_string(), json!("F64/F64"));
+    fields.insert("broadcast_applied".to_string(), json!(false));
+    fields.insert("fallback_path".to_string(), json!(false));
+    fields.insert("pass".to_string(), json!(passed));
+    fields.insert("mode".to_string(), json!(mode_label(mode)));
+    fields.insert("reason_code".to_string(), json!(reason_code));
+    fields
+}
+
+fn tensor_meta_forensic_fields(
+    case: &TensorMetaCase,
+    observed: &TensorMetaObservation,
+    passed: bool,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("contract_ids".to_string(), json!(case.contract_ids));
+    fields.insert(
+        "downstream_e2e_scenarios".to_string(),
+        json!(case.e2e_scenarios),
+    );
+    fields.insert("shape".to_string(), json!(case.shape));
+    fields.insert("strides".to_string(), json!(case.strides));
+    fields.insert(
+        "storage_offset".to_string(),
+        json!(case.storage_offset.unwrap_or(0)),
+    );
+    fields.insert("index".to_string(), json!(case.index));
+    fields.insert(
+        "expected_linear_index".to_string(),
+        json!(case.expected_linear_index),
+    );
+    fields.insert(
+        "actual_linear_index".to_string(),
+        json!(observed.linear_index),
+    );
+    fields.insert("expected_numel".to_string(), json!(case.expected_numel));
+    fields.insert("actual_numel".to_string(), json!(observed.numel));
+    fields.insert(
+        "expected_contiguous".to_string(),
+        json!(case.expected_contiguous),
+    );
+    fields.insert("actual_contiguous".to_string(), json!(observed.contiguous));
+    fields.insert(
+        "expect_valid".to_string(),
+        json!(case.expect_valid.unwrap_or(true)),
+    );
+    fields.insert("actual_valid".to_string(), json!(observed.valid));
+    fields.insert("pass".to_string(), json!(passed));
+    fields.insert(
+        "selected_kernel".to_string(),
+        json!("tensor_meta::validate"),
+    );
+    fields.insert("dispatch_key".to_string(), json!("CPU"));
+    fields.insert("backend_key".to_string(), json!("CPU"));
+    fields.insert("broadcast_applied".to_string(), json!(false));
+    fields.insert("fallback_path".to_string(), json!(false));
+    fields
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_forensic_fields(
+    case: &DispatchCase,
+    mode: ExecutionMode,
+    output_value: f64,
+    selected_key: DispatchKey,
+    backend_key: DispatchKey,
+    kernel: &str,
+    keyset_bits: u64,
+    fallback_used: bool,
+    lhs_dtype: DType,
+    rhs_dtype: DType,
+    lhs_device: Device,
+    rhs_device: Device,
+    reason_code: &str,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("contract_ids".to_string(), json!(case.contract_ids));
+    fields.insert(
+        "downstream_e2e_scenarios".to_string(),
+        json!(case.e2e_scenarios),
+    );
+    fields.insert("op".to_string(), json!(case.op));
+    fields.insert("lhs".to_string(), json!(case.lhs));
+    fields.insert("rhs".to_string(), json!(case.rhs));
+    fields.insert("mode".to_string(), json!(mode_label(mode)));
+    fields.insert(
+        "dispatch_key".to_string(),
+        json!(format!("{selected_key:?}")),
+    );
+    fields.insert("selected_kernel".to_string(), json!(kernel));
+    fields.insert("backend_key".to_string(), json!(format!("{backend_key:?}")));
+    fields.insert("keyset_bits".to_string(), json!(keyset_bits));
+    fields.insert("fallback_path".to_string(), json!(fallback_used));
+    fields.insert(
+        "dtype_pair".to_string(),
+        json!(format!("{lhs_dtype:?}/{rhs_dtype:?}")),
+    );
+    fields.insert(
+        "device_pair".to_string(),
+        json!(format!("{lhs_device:?}/{rhs_device:?}")),
+    );
+    fields.insert("input_shape".to_string(), json!([[], []]));
+    fields.insert("output_shape".to_string(), json!([]));
+    fields.insert("broadcast_applied".to_string(), json!(false));
+    fields.insert("actual_output".to_string(), json!(output_value));
+    fields.insert("reason_code".to_string(), json!(reason_code));
+    fields
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dispatch_error_forensic_fields(
+    case: &DispatchCase,
+    mode: ExecutionMode,
+    lhs_dtype: DType,
+    rhs_dtype: DType,
+    lhs_device: Device,
+    rhs_device: Device,
+    reason_code: &str,
+    error_message: Option<String>,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("contract_ids".to_string(), json!(case.contract_ids));
+    fields.insert(
+        "downstream_e2e_scenarios".to_string(),
+        json!(case.e2e_scenarios),
+    );
+    fields.insert("op".to_string(), json!(case.op));
+    fields.insert("lhs".to_string(), json!(case.lhs));
+    fields.insert("rhs".to_string(), json!(case.rhs));
+    fields.insert("mode".to_string(), json!(mode_label(mode)));
+    fields.insert(
+        "dtype_pair".to_string(),
+        json!(format!("{lhs_dtype:?}/{rhs_dtype:?}")),
+    );
+    fields.insert(
+        "device_pair".to_string(),
+        json!(format!("{lhs_device:?}/{rhs_device:?}")),
+    );
+    fields.insert("input_shape".to_string(), json!([[], []]));
+    fields.insert("output_shape".to_string(), Value::Null);
+    fields.insert("dispatch_key".to_string(), Value::Null);
+    fields.insert("selected_kernel".to_string(), Value::Null);
+    fields.insert("backend_key".to_string(), Value::Null);
+    fields.insert("broadcast_applied".to_string(), json!(false));
+    fields.insert("fallback_path".to_string(), json!(false));
+    fields.insert("reason_code".to_string(), json!(reason_code));
+    fields.insert("error_message".to_string(), json!(error_message));
+    fields
+}
+
 fn parse_binary_op(op: &str) -> Result<BinaryOp, String> {
     match op {
         "add" => Ok(BinaryOp::Add),
         "mul" => Ok(BinaryOp::Mul),
         _ => Err(format!("unsupported binary op '{op}'")),
+    }
+}
+
+fn parse_dtype(raw: &str) -> Result<DType, String> {
+    match raw {
+        "F64" => Ok(DType::F64),
+        "F32" => Ok(DType::F32),
+        _ => Err(format!("unsupported dtype '{raw}'")),
+    }
+}
+
+fn parse_device(raw: &str) -> Result<Device, String> {
+    match raw {
+        "Cpu" | "CPU" => Ok(Device::Cpu),
+        "Cuda" | "CUDA" => Ok(Device::Cuda),
+        _ => Err(format!("unsupported device '{raw}'")),
     }
 }
 
@@ -3456,6 +3787,7 @@ fn percentile(samples: &[u128], p: usize) -> u128 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -3771,6 +4103,53 @@ mod tests {
             );
         }
 
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn e2e_matrix_packet_filter_includes_cpu_kernel_packet_entries() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_packet_filter_cpu_kernel_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix_filtered(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+            Some("FT-P2C-005"),
+        )
+        .expect("packet-filtered e2e matrix should emit logs");
+
+        assert!(summary.log_entries >= 24);
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        let mut suites = BTreeSet::new();
+        for line in raw.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("jsonl line should be valid json");
+            assert_eq!(
+                value.get("packet_id").and_then(serde_json::Value::as_str),
+                Some("FT-P2C-005")
+            );
+            assert!(
+                value.get("contract_ids").is_some(),
+                "missing contract_ids field for FT-P2C-005 log"
+            );
+            let suite = value
+                .get("suite_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("suite_id must be present");
+            suites.insert(suite.to_string());
+        }
+
+        assert!(suites.contains("scalar_dac"));
+        assert!(suites.contains("dispatch_key"));
+        assert!(suites.contains("tensor_meta"));
         let _ = fs::remove_file(output_path);
     }
 

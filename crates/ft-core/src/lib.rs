@@ -435,6 +435,7 @@ mod tests {
         reason_code: &str,
     ) -> BTreeMap<String, String> {
         let mut log = BTreeMap::new();
+        let scenario_id = format!("ft_core_property/{mode}:{test_id}");
         log.insert("ts_utc".to_string(), "1970-01-01T00:00:00Z".to_string());
         log.insert("suite_id".to_string(), "ft_core_property".to_string());
         log.insert("test_id".to_string(), test_id.to_string());
@@ -443,6 +444,7 @@ mod tests {
             "fixture_id".to_string(),
             "ft_core_property_generated".to_string(),
         );
+        log.insert("scenario_id".to_string(), scenario_id);
         log.insert("mode".to_string(), mode.to_string());
         log.insert("seed".to_string(), seed.to_string());
         log.insert(
@@ -461,8 +463,14 @@ mod tests {
             "artifact_refs".to_string(),
             "artifacts/phase2c/FT-P2C-001/fixture_manifest.json".to_string(),
         );
+        log.insert(
+            "replay_command".to_string(),
+            format!("cargo test -p ft-core {test_id} -- --nocapture"),
+        );
         log.insert("duration_ms".to_string(), "0".to_string());
         log.insert("outcome".to_string(), "pass".to_string());
+        log.insert("contract_id".to_string(), reason_code.to_string());
+        log.insert("shrink_trace".to_string(), "none".to_string());
         log.insert("reason_code".to_string(), reason_code.to_string());
         log
     }
@@ -474,14 +482,18 @@ mod tests {
             "test_id",
             "packet_id",
             "fixture_id",
+            "scenario_id",
             "mode",
             "seed",
             "input_digest",
             "output_digest",
             "env_fingerprint",
             "artifact_refs",
+            "replay_command",
             "duration_ms",
             "outcome",
+            "contract_id",
+            "shrink_trace",
             "reason_code",
         ] {
             assert!(

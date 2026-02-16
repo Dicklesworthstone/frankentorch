@@ -19,6 +19,15 @@
         "dispatch_key"
       ]
     },
+    "FT-P2C-005": {
+      "min_scenarios": 24,
+      "min_pass_ratio": 1.0,
+      "required_suites": [
+        "scalar_dac",
+        "dispatch_key",
+        "tensor_meta"
+      ]
+    },
     "FT-P2C-004": {
       "min_scenarios": 2,
       "min_pass_ratio": 1.0,

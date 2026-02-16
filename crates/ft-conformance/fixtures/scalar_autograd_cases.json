@@ -8,7 +8,9 @@
       "expected_output": 5.0,
       "expected_lhs_grad": 1.0,
       "expected_rhs_grad": 1.0,
-      "tolerance": 1e-12
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-001", "INV-KERNEL-MATH"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
     },
     {
       "name": "mul_basic",
@@ -18,7 +20,57 @@
       "expected_output": 6.0,
       "expected_lhs_grad": 3.0,
       "expected_rhs_grad": 2.0,
-      "tolerance": 1e-12
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-002", "INV-KERNEL-MATH"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
+    },
+    {
+      "name": "add_negative_rhs",
+      "op": "add",
+      "lhs": 4.0,
+      "rhs": -1.5,
+      "expected_output": 2.5,
+      "expected_lhs_grad": 1.0,
+      "expected_rhs_grad": 1.0,
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-001", "INV-KERNEL-MATH"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
+    },
+    {
+      "name": "add_zero_identity",
+      "op": "add",
+      "lhs": 0.0,
+      "rhs": 42.0,
+      "expected_output": 42.0,
+      "expected_lhs_grad": 1.0,
+      "expected_rhs_grad": 1.0,
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-001", "INV-KERNEL-MATH"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
+    },
+    {
+      "name": "mul_zero_absorber",
+      "op": "mul",
+      "lhs": 0.0,
+      "rhs": 7.0,
+      "expected_output": 0.0,
+      "expected_lhs_grad": 7.0,
+      "expected_rhs_grad": 0.0,
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-002", "INV-KERNEL-MATH"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
+    },
+    {
+      "name": "mul_negative_lhs",
+      "op": "mul",
+      "lhs": -4.0,
+      "rhs": 1.5,
+      "expected_output": -6.0,
+      "expected_lhs_grad": 1.5,
+      "expected_rhs_grad": -4.0,
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-002", "INV-KERNEL-MATH"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
     }
   ]
 }

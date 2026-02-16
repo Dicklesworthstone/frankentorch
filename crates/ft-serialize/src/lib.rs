@@ -520,6 +520,8 @@ mod tests {
         );
         log.insert("duration_ms".to_string(), "0".to_string());
         log.insert("outcome".to_string(), "pass".to_string());
+        log.insert("contract_id".to_string(), reason_code.to_string());
+        log.insert("shrink_trace".to_string(), "none".to_string());
         log.insert("reason_code".to_string(), reason_code.to_string());
         log
     }
@@ -541,6 +543,8 @@ mod tests {
             "replay_command",
             "duration_ms",
             "outcome",
+            "contract_id",
+            "shrink_trace",
             "reason_code",
         ] {
             assert!(

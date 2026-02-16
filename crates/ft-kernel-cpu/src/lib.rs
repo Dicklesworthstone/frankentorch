@@ -37,9 +37,9 @@ pub fn mul_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor
 
 #[cfg(test)]
 mod tests {
-    use ft_core::{DType, Device, ScalarTensor};
+    use ft_core::{DType, Device, ScalarTensor, TensorCompatError};
 
-    use super::{add_scalar, mul_scalar};
+    use super::{KernelError, add_scalar, mul_scalar};
 
     #[test]
     fn add_scalar_returns_expected_value() {
@@ -57,5 +57,29 @@ mod tests {
 
         let out = mul_scalar(&lhs, &rhs).expect("mul should succeed");
         assert_eq!(out.value(), 8.0);
+    }
+
+    #[test]
+    fn add_scalar_rejects_dtype_mismatch() {
+        let lhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(4.0, DType::F32, Device::Cpu);
+
+        let err = add_scalar(&lhs, &rhs).expect_err("dtype mismatch must fail closed");
+        assert!(matches!(
+            err,
+            KernelError::Incompatible(TensorCompatError::DTypeMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn mul_scalar_rejects_device_mismatch() {
+        let lhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(4.0, DType::F64, Device::Cuda);
+
+        let err = mul_scalar(&lhs, &rhs).expect_err("device mismatch must fail closed");
+        assert!(matches!(
+            err,
+            KernelError::Incompatible(TensorCompatError::DeviceMismatch { .. })
+        ));
     }
 }

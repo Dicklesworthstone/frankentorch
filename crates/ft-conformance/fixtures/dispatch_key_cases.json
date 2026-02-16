@@ -22,7 +22,9 @@
         "expected_fallback": false,
         "expect_error": false
       },
-      "tolerance": 1e-12
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
     },
     {
       "name": "strict_cpu_route",
@@ -46,7 +48,9 @@
         "expected_fallback": false,
         "expect_error": false
       },
-      "tolerance": 1e-12
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:add_mul_scalar_core"]
     },
     {
       "name": "composite_route_mode_split",
@@ -66,7 +70,136 @@
         "expected_fallback": true,
         "expect_error": false
       },
-      "tolerance": 1e-12
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-HARDENED-BOUNDARY"],
+      "e2e_scenarios": ["cpu_kernel:broadcast_shape_match"]
+    },
+    {
+      "name": "empty_keyset_fail_closed",
+      "op": "add",
+      "lhs": 1.0,
+      "rhs": 2.0,
+      "requires_grad": false,
+      "keyset": [],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:not_broadcastable_probe"]
+    },
+    {
+      "name": "no_type_key_fail_closed",
+      "op": "add",
+      "lhs": 1.0,
+      "rhs": 2.0,
+      "requires_grad": false,
+      "keyset": ["BackendSelect"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:not_broadcastable_probe"]
+    },
+    {
+      "name": "no_backend_key_fail_closed",
+      "op": "add",
+      "lhs": 1.0,
+      "rhs": 2.0,
+      "requires_grad": false,
+      "keyset": ["CompositeExplicitAutograd"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:not_broadcastable_probe"]
+    },
+    {
+      "name": "autograd_without_cpu_fail_closed",
+      "op": "mul",
+      "lhs": 2.0,
+      "rhs": 3.0,
+      "requires_grad": true,
+      "keyset": ["AutogradCPU"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:not_broadcastable_probe"]
+    },
+    {
+      "name": "unknown_dispatch_key_fail_closed",
+      "op": "add",
+      "lhs": 1.0,
+      "rhs": 1.0,
+      "requires_grad": false,
+      "keyset": ["BogusKey"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-003", "INV-DISPATCH-RESOLUTION"],
+      "e2e_scenarios": ["cpu_kernel:not_broadcastable_probe"]
+    },
+    {
+      "name": "dtype_mismatch_fail_closed",
+      "op": "add",
+      "lhs": 1.0,
+      "rhs": 2.0,
+      "lhs_dtype": "F64",
+      "rhs_dtype": "F32",
+      "lhs_device": "Cpu",
+      "rhs_device": "Cpu",
+      "requires_grad": false,
+      "keyset": ["CPU", "BackendSelect"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-001", "INV-DTYPE-DEVICE-COMPAT"],
+      "e2e_scenarios": ["cpu_kernel:scalar_wrapper_alpha"]
+    },
+    {
+      "name": "device_mismatch_fail_closed",
+      "op": "mul",
+      "lhs": 1.0,
+      "rhs": 2.0,
+      "lhs_dtype": "F64",
+      "rhs_dtype": "F64",
+      "lhs_device": "Cpu",
+      "rhs_device": "Cuda",
+      "requires_grad": false,
+      "keyset": ["CPU", "BackendSelect"],
+      "strict": {
+        "expect_error": true
+      },
+      "hardened": {
+        "expect_error": true
+      },
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-002", "INV-DTYPE-DEVICE-COMPAT"],
+      "e2e_scenarios": ["cpu_kernel:scalar_wrapper_alpha"]
     }
   ]
 }
