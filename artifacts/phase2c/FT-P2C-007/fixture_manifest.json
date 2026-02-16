@@ -1,0 +1,206 @@
+{
+  "packet_id": "FT-P2C-007",
+  "behavior_ledger": "artifacts/phase2c/FT-P2C-007/behavior_extraction_ledger.md",
+  "legacy_anchor_map": "artifacts/phase2c/FT-P2C-007/legacy_anchor_map.md",
+  "implementation_plan": "artifacts/phase2c/FT-P2C-007/implementation_plan.md",
+  "differential_packet_report": "artifacts/phase2c/FT-P2C-007/differential_packet_report_v1.json",
+  "differential_reconciliation_note": "artifacts/phase2c/FT-P2C-007/differential_reconciliation_v1.md",
+  "e2e_log_artifact": "artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl",
+  "e2e_crash_triage_artifact": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_007_v1.json",
+  "e2e_failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_007_v1.json",
+  "e2e_linkage_summary": "artifacts/phase2c/FT-P2C-007/e2e_replay_forensics_linkage_v1.json",
+  "e2e_linkage_note": "artifacts/phase2c/FT-P2C-007/e2e_replay_forensics_linkage_v1.md",
+  "optimization_delta": "artifacts/phase2c/FT-P2C-007/optimization_delta_v1.json",
+  "optimization_isomorphism_note": "artifacts/phase2c/FT-P2C-007/optimization_isomorphism_v1.md",
+  "fixtures": [
+    {
+      "id": "dispatch_strict_autograd_route",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "strict_autograd_route",
+      "oracle_family": "dispatch_key",
+      "assertions": ["selected_key", "backend_key", "kernel", "mode_policy"]
+    },
+    {
+      "id": "dispatch_strict_cpu_route",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "strict_cpu_route",
+      "oracle_family": "dispatch_key",
+      "assertions": ["selected_key", "backend_key", "kernel", "mode_policy"]
+    },
+    {
+      "id": "dispatch_composite_route_mode_split",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "composite_route_mode_split",
+      "oracle_family": "dispatch_key",
+      "assertions": ["mode_policy", "fallback_path", "fail_closed_strict"]
+    },
+    {
+      "id": "dispatch_empty_keyset_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "empty_keyset_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed"]
+    },
+    {
+      "id": "dispatch_no_type_key_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "no_type_key_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed"]
+    },
+    {
+      "id": "dispatch_no_backend_key_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "no_backend_key_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed"]
+    },
+    {
+      "id": "dispatch_autograd_without_cpu_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "autograd_without_cpu_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed"]
+    },
+    {
+      "id": "dispatch_unknown_dispatch_key_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "unknown_dispatch_key_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed"]
+    },
+    {
+      "id": "dispatch_dtype_mismatch_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "dtype_mismatch_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed", "dtype_guard"]
+    },
+    {
+      "id": "dispatch_device_mismatch_fail_closed",
+      "file": "crates/ft-conformance/fixtures/dispatch_key_cases.json",
+      "case_name": "device_mismatch_fail_closed",
+      "oracle_family": "dispatch_key",
+      "assertions": ["fail_closed", "device_guard"]
+    }
+  ],
+  "modes": [
+    "strict",
+    "hardened"
+  ],
+  "logging_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code"
+  ],
+  "scenario_seed_map": {
+    "ft_p2c_007/dispatch_key/strict:strict_autograd_route": 12780237016247668875,
+    "ft_p2c_007/dispatch_key/strict:strict_cpu_route": 6654506012862553729,
+    "ft_p2c_007/dispatch_key/strict:composite_route_mode_split": 14228129716249401336,
+    "ft_p2c_007/dispatch_key/strict:empty_keyset_fail_closed": 17570381862974015464,
+    "ft_p2c_007/dispatch_key/strict:no_type_key_fail_closed": 13941445040236647079,
+    "ft_p2c_007/dispatch_key/strict:no_backend_key_fail_closed": 426922091350273105,
+    "ft_p2c_007/dispatch_key/strict:autograd_without_cpu_fail_closed": 7393412218162034649,
+    "ft_p2c_007/dispatch_key/strict:unknown_dispatch_key_fail_closed": 16228262575860461841,
+    "ft_p2c_007/dispatch_key/strict:dtype_mismatch_fail_closed": 1945855344420388393,
+    "ft_p2c_007/dispatch_key/strict:device_mismatch_fail_closed": 6866107161847777644,
+    "ft_p2c_007/dispatch_key/hardened:strict_autograd_route": 456065680046437289,
+    "ft_p2c_007/dispatch_key/hardened:strict_cpu_route": 7720564810062027209,
+    "ft_p2c_007/dispatch_key/hardened:composite_route_mode_split": 2146157517907283417,
+    "ft_p2c_007/dispatch_key/hardened:empty_keyset_fail_closed": 14701668349512464216,
+    "ft_p2c_007/dispatch_key/hardened:no_type_key_fail_closed": 13928139344954464895,
+    "ft_p2c_007/dispatch_key/hardened:no_backend_key_fail_closed": 497858022351787853,
+    "ft_p2c_007/dispatch_key/hardened:autograd_without_cpu_fail_closed": 8135661821154981850,
+    "ft_p2c_007/dispatch_key/hardened:unknown_dispatch_key_fail_closed": 6481405883647676142,
+    "ft_p2c_007/dispatch_key/hardened:dtype_mismatch_fail_closed": 18297654663329102904,
+    "ft_p2c_007/dispatch_key/hardened:device_mismatch_fail_closed": 12535334678939657837
+  },
+  "unit_property_validation": {
+    "bead_id": "bd-3v0.18.5",
+    "quality_report": "artifacts/phase2c/FT-P2C-007/unit_property_quality_report_v1.json",
+    "coverage_report": "artifacts/phase2c/FT-P2C-007/unit_property_coverage_v1.json"
+  },
+  "differential_validation": {
+    "bead_id": "bd-3v0.18.6",
+    "report_path": "artifacts/phase2c/conformance/differential_report_v1.json",
+    "packet_report": "artifacts/phase2c/FT-P2C-007/differential_packet_report_v1.json",
+    "reconciliation_note": "artifacts/phase2c/FT-P2C-007/differential_reconciliation_v1.md",
+    "required_comparators": [
+      "abs_tol",
+      "mode_split_policy",
+      "metamorphic_commutative_local",
+      "adversarial_unknown_key_rejected",
+      "adversarial_autograd_without_cpu_rejected"
+    ]
+  },
+  "e2e_validation": {
+    "bead_id": "bd-3v0.18.7",
+    "packet_log_path": "artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl",
+    "triage_path": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_007_v1.json",
+    "failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_007_v1.json",
+    "linkage_summary": "artifacts/phase2c/FT-P2C-007/e2e_replay_forensics_linkage_v1.json",
+    "linkage_note": "artifacts/phase2c/FT-P2C-007/e2e_replay_forensics_linkage_v1.md",
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-007 --output artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl",
+    "as_of_utc": "2026-02-16T15:25:22Z",
+    "log_entries": 20,
+    "failed_entries": 0,
+    "modes": ["strict", "hardened"],
+    "scenario_ids": [
+      "ft_p2c_007/dispatch_key/hardened:autograd_without_cpu_fail_closed",
+      "ft_p2c_007/dispatch_key/hardened:composite_route_mode_split",
+      "ft_p2c_007/dispatch_key/hardened:device_mismatch_fail_closed",
+      "ft_p2c_007/dispatch_key/hardened:dtype_mismatch_fail_closed",
+      "ft_p2c_007/dispatch_key/hardened:empty_keyset_fail_closed",
+      "ft_p2c_007/dispatch_key/hardened:no_backend_key_fail_closed",
+      "ft_p2c_007/dispatch_key/hardened:no_type_key_fail_closed",
+      "ft_p2c_007/dispatch_key/hardened:strict_autograd_route",
+      "ft_p2c_007/dispatch_key/hardened:strict_cpu_route",
+      "ft_p2c_007/dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:autograd_without_cpu_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:composite_route_mode_split",
+      "ft_p2c_007/dispatch_key/strict:device_mismatch_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:dtype_mismatch_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:empty_keyset_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:no_backend_key_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:no_type_key_fail_closed",
+      "ft_p2c_007/dispatch_key/strict:strict_autograd_route",
+      "ft_p2c_007/dispatch_key/strict:strict_cpu_route",
+      "ft_p2c_007/dispatch_key/strict:unknown_dispatch_key_fail_closed"
+    ],
+    "reason_codes": [
+      "dispatch_parity_ok",
+      "expected_error_observed"
+    ],
+    "triage_incidents": 0
+  },
+  "optimization_validation": {
+    "bead_id": "bd-3v0.18.8",
+    "delta_report": "artifacts/phase2c/FT-P2C-007/optimization_delta_v1.json",
+    "isomorphism_note": "artifacts/phase2c/FT-P2C-007/optimization_isomorphism_v1.md"
+  },
+  "security_compatibility_artifact": "artifacts/phase2c/FT-P2C-007/risk_note.md",
+  "contract_artifacts": [
+    "artifacts/phase2c/FT-P2C-007/legacy_anchor_map.md",
+    "artifacts/phase2c/FT-P2C-007/behavior_extraction_ledger.md",
+    "artifacts/phase2c/FT-P2C-007/contract_table.md",
+    "artifacts/phase2c/FT-P2C-007/implementation_plan.md",
+    "artifacts/phase2c/FT-P2C-007/threat_model.md",
+    "artifacts/phase2c/FT-P2C-007/risk_note.md",
+    "artifacts/phase2c/FT-P2C-007/unit_property_quality_report_v1.json",
+    "artifacts/phase2c/FT-P2C-007/differential_packet_report_v1.json",
+    "artifacts/phase2c/FT-P2C-007/differential_reconciliation_v1.md",
+    "artifacts/phase2c/FT-P2C-007/e2e_replay_forensics_linkage_v1.json",
+    "artifacts/phase2c/FT-P2C-007/e2e_replay_forensics_linkage_v1.md",
+    "artifacts/phase2c/FT-P2C-007/optimization_delta_v1.json",
+    "artifacts/phase2c/FT-P2C-007/optimization_isomorphism_v1.md"
+  ],
+  "status": "active"
+}

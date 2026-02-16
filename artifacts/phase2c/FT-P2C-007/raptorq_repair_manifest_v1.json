@@ -1,0 +1,29 @@
+{
+  "schema_version": "ft-raptorq-repair-manifest-v1",
+  "generated_unix_ms": 1771256279480,
+  "repair_symbols_requested": 4,
+  "summary": {
+    "total_targets": 1,
+    "sidecars_emitted": 1,
+    "failed_targets": 0
+  },
+  "entries": [
+    {
+      "artifact_id": "FT-P2C-007-parity-report",
+      "artifact_type": "packet_parity_report",
+      "packet_id": "FT-P2C-007",
+      "source_path": "artifacts/phase2c/FT-P2C-007/parity_report.json",
+      "sidecar_path": "artifacts/phase2c/FT-P2C-007/parity_report.raptorq.json",
+      "decode_proof_path": "artifacts/phase2c/FT-P2C-007/parity_report.decode_proof.json",
+      "source_hash": "det64:2e1884ec3ffbe2da",
+      "symbol_size": 64,
+      "source_symbol_count": 7,
+      "constraints_symbol_count": 17,
+      "repair_symbol_count": 4,
+      "repair_manifest_entries": 4,
+      "proof_hash_hex": "det64:add2f98ebb7b42f7",
+      "proof_received_symbol_count": 27,
+      "recovered_bytes": 403
+    }
+  ]
+}

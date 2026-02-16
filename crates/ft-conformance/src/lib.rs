@@ -149,6 +149,23 @@ impl OpSchemaCaseReport {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct NnStateCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub contract_ok: bool,
+    pub expectation_ok: bool,
+    pub detail_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl NnStateCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.expectation_ok && self.detail_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TensorMetaCaseReport {
     pub name: String,
     pub mode: ExecutionMode,
@@ -317,6 +334,61 @@ struct OpSchemaCase {
     expect_name_normalization: Option<bool>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct NnStateFixtureFile {
+    cases: Vec<NnStateCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NnStateCase {
+    name: String,
+    operation: String,
+    module_path: String,
+    state_key: Option<String>,
+    state_key_kind: Option<String>,
+    #[serde(default)]
+    parameter_keys: Vec<String>,
+    #[serde(default)]
+    persistent_buffer_keys: Vec<String>,
+    #[serde(default)]
+    non_persistent_buffer_keys: Vec<String>,
+    #[serde(default)]
+    expected_state_keys: Vec<String>,
+    #[serde(default)]
+    training_transitions: Vec<bool>,
+    initial_training: Option<bool>,
+    expected_training_flag: Option<bool>,
+    #[serde(default)]
+    missing_keys: Vec<String>,
+    #[serde(default)]
+    unexpected_keys: Vec<String>,
+    #[serde(default)]
+    incompatible_shapes: Vec<String>,
+    #[serde(default)]
+    prefix_keys: Vec<String>,
+    #[serde(default)]
+    expected_canonical_keys: Vec<String>,
+    allow_prefix_normalization: Option<bool>,
+    #[serde(default)]
+    hook_trace: Vec<String>,
+    #[serde(default)]
+    expected_hook_trace: Vec<String>,
+    assign_flag: Option<bool>,
+    strict: NnStateModeExpectation,
+    hardened: NnStateModeExpectation,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct NnStateModeExpectation {
+    expect_pass: bool,
+    expected_reason_code: Option<String>,
+    expect_prefix_normalization_applied: Option<bool>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 struct ScalarObservation {
     output: f64,
@@ -437,6 +509,10 @@ pub fn run_smoke(config: &HarnessConfig) -> HarnessReport {
         .map_or((0, 0), |(_, cases)| {
             summarize_passes(cases.iter().map(SerializationCaseReport::passed))
         });
+    let (nn_state_total, nn_state_passed) = run_nn_state_conformance(config, mode)
+        .map_or((0, 0), |(_, cases)| {
+            summarize_passes(cases.iter().map(NnStateCaseReport::passed))
+        });
 
     HarnessReport {
         suite: "smoke",
@@ -448,13 +524,15 @@ pub fn run_smoke(config: &HarnessConfig) -> HarnessReport {
             + dispatch_total
             + op_schema_total
             + scheduler_total
-            + serialization_total,
+            + serialization_total
+            + nn_state_total,
         cases_passed: scalar_passed
             + tensor_meta_passed
             + dispatch_passed
             + op_schema_passed
             + scheduler_passed
-            + serialization_passed,
+            + serialization_passed
+            + nn_state_passed,
     }
 }
 
@@ -644,6 +722,40 @@ pub fn run_serialization_conformance(
     Ok((report, case_reports))
 }
 
+pub fn run_nn_state_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<NnStateCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("nn_state_cases.json");
+    let fixture: NnStateFixtureFile = load_fixture(&fixture_path)?;
+    run_nn_state_conformance_with_fixture(config, mode, &fixture)
+}
+
+fn run_nn_state_conformance_with_fixture(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+    fixture: &NnStateFixtureFile,
+) -> Result<(HarnessReport, Vec<NnStateCaseReport>), String> {
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_nn_state_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(NnStateCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "nn_state",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
 pub fn emit_e2e_forensics_matrix(
     config: &HarnessConfig,
     output_path: &Path,
@@ -669,6 +781,8 @@ pub fn emit_e2e_forensics_matrix_filtered(
     let include_ft_p2c_004 = packet_in_scope(packet_filter, "FT-P2C-004");
     let include_ft_p2c_005 = packet_in_scope(packet_filter, "FT-P2C-005");
     let include_ft_p2c_006 = packet_in_scope(packet_filter, "FT-P2C-006");
+    let include_ft_p2c_007 = packet_in_scope(packet_filter, "FT-P2C-007");
+    let include_ft_p2c_008 = packet_in_scope(packet_filter, "FT-P2C-008");
 
     let scalar_fixture = if include_ft_p2c_001 || include_ft_p2c_005 {
         let fixture_path = config.fixture_root.join("scalar_autograd_cases.json");
@@ -682,9 +796,15 @@ pub fn emit_e2e_forensics_matrix_filtered(
     } else {
         None
     };
-    let dispatch_fixture = if include_ft_p2c_002 || include_ft_p2c_005 {
+    let dispatch_fixture = if include_ft_p2c_002 || include_ft_p2c_005 || include_ft_p2c_007 {
         let fixture_path = config.fixture_root.join("dispatch_key_cases.json");
         Some(load_fixture::<DispatchFixtureFile>(&fixture_path)?)
+    } else {
+        None
+    };
+    let nn_state_fixture = if include_ft_p2c_008 {
+        let fixture_path = config.fixture_root.join("nn_state_cases.json");
+        Some(load_fixture::<NnStateFixtureFile>(&fixture_path)?)
     } else {
         None
     };
@@ -726,11 +846,12 @@ pub fn emit_e2e_forensics_matrix_filtered(
                 .into_iter()
                 .map(|case| case.forensic_log)
                 .collect::<Vec<_>>();
-            extend_ft_p2c_005_projection_logs(
+            extend_dispatch_projection_logs(
                 &mut logs,
                 dispatch_logs,
                 include_ft_p2c_002,
                 include_ft_p2c_005,
+                include_ft_p2c_007,
             );
         }
 
@@ -751,6 +872,11 @@ pub fn emit_e2e_forensics_matrix_filtered(
                     .into_iter()
                     .map(|case| case.forensic_log),
             );
+        }
+
+        if let Some(fixture) = nn_state_fixture.as_ref() {
+            let (_, nn_state_cases) = run_nn_state_conformance_with_fixture(config, mode, fixture)?;
+            logs.extend(nn_state_cases.into_iter().map(|case| case.forensic_log));
         }
     }
 
@@ -813,6 +939,8 @@ fn emit_e2e_forensics_matrix_filtered_legacy(
         let include_ft_p2c_004 = packet_in_scope(packet_filter, "FT-P2C-004");
         let include_ft_p2c_005 = packet_in_scope(packet_filter, "FT-P2C-005");
         let include_ft_p2c_006 = packet_in_scope(packet_filter, "FT-P2C-006");
+        let include_ft_p2c_007 = packet_in_scope(packet_filter, "FT-P2C-007");
+        let include_ft_p2c_008 = packet_in_scope(packet_filter, "FT-P2C-008");
 
         if include_ft_p2c_001 {
             let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
@@ -822,9 +950,19 @@ fn emit_e2e_forensics_matrix_filtered_legacy(
             logs.extend(tensor_meta_cases.into_iter().map(|case| case.forensic_log));
         }
 
-        if include_ft_p2c_002 {
+        if include_ft_p2c_002 || include_ft_p2c_005 || include_ft_p2c_007 {
             let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
-            logs.extend(dispatch_cases.into_iter().map(|case| case.forensic_log));
+            let dispatch_logs = dispatch_cases
+                .into_iter()
+                .map(|case| case.forensic_log)
+                .collect::<Vec<_>>();
+            extend_dispatch_projection_logs(
+                &mut logs,
+                dispatch_logs,
+                include_ft_p2c_002,
+                include_ft_p2c_005,
+                include_ft_p2c_007,
+            );
         }
 
         if include_ft_p2c_003 {
@@ -846,6 +984,11 @@ fn emit_e2e_forensics_matrix_filtered_legacy(
             );
         }
 
+        if include_ft_p2c_008 {
+            let (_, nn_state_cases) = run_nn_state_conformance(config, mode)?;
+            logs.extend(nn_state_cases.into_iter().map(|case| case.forensic_log));
+        }
+
         if include_ft_p2c_005 {
             let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
             logs.extend(
@@ -857,13 +1000,6 @@ fn emit_e2e_forensics_matrix_filtered_legacy(
             let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
             logs.extend(
                 tensor_meta_cases
-                    .into_iter()
-                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
-            );
-
-            let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
-            logs.extend(
-                dispatch_cases
                     .into_iter()
                     .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
             );
@@ -929,6 +1065,31 @@ fn extend_ft_p2c_005_projection_logs(
     }
 }
 
+fn extend_dispatch_projection_logs(
+    logs: &mut Vec<StructuredCaseLog>,
+    base_logs: Vec<StructuredCaseLog>,
+    include_base_packet: bool,
+    include_ft_p2c_005: bool,
+    include_ft_p2c_007: bool,
+) {
+    match (include_base_packet, include_ft_p2c_005, include_ft_p2c_007) {
+        (false, false, false) => {}
+        _ => {
+            for log in base_logs {
+                if include_base_packet {
+                    logs.push(log.clone());
+                }
+                if include_ft_p2c_005 {
+                    logs.push(project_log_to_ft_p2c_005(log.clone()));
+                }
+                if include_ft_p2c_007 {
+                    logs.push(project_log_to_ft_p2c_007(log));
+                }
+            }
+        }
+    }
+}
+
 fn packet_in_scope(packet_filter: Option<&str>, packet_id: &str) -> bool {
     packet_filter.is_none_or(|filter| filter == packet_id)
 }
@@ -937,6 +1098,43 @@ fn project_log_to_ft_p2c_005(mut log: StructuredCaseLog) -> StructuredCaseLog {
     let original_packet = log.packet_id;
     log.packet_id = "FT-P2C-005";
     log.scenario_id = format!("ft_p2c_005/{}", log.scenario_id);
+    sanitize_projection_extra_fields(&mut log);
+    log.replay_command = format!(
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode {} --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl",
+        log.mode
+    );
+    log.artifact_refs
+        .push("artifacts/phase2c/FT-P2C-005/contract_table.md".to_string());
+    log.artifact_refs
+        .push("artifacts/phase2c/FT-P2C-005/unit_property_quality_report_v1.json".to_string());
+    log.extra_fields.insert(
+        "packet_projection".to_string(),
+        json!(format!("{original_packet}->FT-P2C-005")),
+    );
+    log
+}
+
+fn project_log_to_ft_p2c_007(mut log: StructuredCaseLog) -> StructuredCaseLog {
+    let original_packet = log.packet_id;
+    log.packet_id = "FT-P2C-007";
+    log.scenario_id = format!("ft_p2c_007/{}", log.scenario_id);
+    sanitize_projection_extra_fields(&mut log);
+    log.replay_command = format!(
+        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode {} --packet FT-P2C-007 --output artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl",
+        log.mode
+    );
+    log.artifact_refs
+        .push("artifacts/phase2c/FT-P2C-007/contract_table.md".to_string());
+    log.artifact_refs
+        .push("artifacts/phase2c/FT-P2C-007/unit_property_quality_report_v1.json".to_string());
+    log.extra_fields.insert(
+        "packet_projection".to_string(),
+        json!(format!("{original_packet}->FT-P2C-007")),
+    );
+    log
+}
+
+fn sanitize_projection_extra_fields(log: &mut StructuredCaseLog) {
     // Flattened structured logs must not shadow top-level envelope fields.
     for shadowed_key in [
         "schema_version",
@@ -955,19 +1153,6 @@ fn project_log_to_ft_p2c_005(mut log: StructuredCaseLog) -> StructuredCaseLog {
     ] {
         log.extra_fields.remove(shadowed_key);
     }
-    log.replay_command = format!(
-        "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode {} --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl",
-        log.mode
-    );
-    log.artifact_refs
-        .push("artifacts/phase2c/FT-P2C-005/contract_table.md".to_string());
-    log.artifact_refs
-        .push("artifacts/phase2c/FT-P2C-005/unit_property_quality_report_v1.json".to_string());
-    log.extra_fields.insert(
-        "packet_projection".to_string(),
-        json!(format!("{original_packet}->FT-P2C-005")),
-    );
-    log
 }
 
 pub fn run_differential_conformance(
@@ -2164,6 +2349,221 @@ pub fn run_differential_conformance(
                 serialization_evidence_refs,
             ));
         }
+
+        let nn_state_fixture: NnStateFixtureFile =
+            load_fixture(&config.fixture_root.join("nn_state_cases.json"))?;
+        for case in nn_state_fixture.cases {
+            let nn_state_evidence_refs = nn_state_differential_evidence_refs();
+            let local = run_nn_state_case(&case, mode)?;
+
+            checks.push(compare_bool(
+                &allowlist,
+                "nn_state",
+                "FT-P2C-008",
+                mode,
+                case.name.as_str(),
+                "contract_expectation",
+                "nn_state.contract_expectation_mismatch",
+                local.expectation_ok,
+                true,
+                nn_state_evidence_refs.clone(),
+            ));
+            checks.push(compare_bool(
+                &allowlist,
+                "nn_state",
+                "FT-P2C-008",
+                mode,
+                case.name.as_str(),
+                "structured_log_detail",
+                "nn_state.structured_log_detail_mismatch",
+                local.detail_ok,
+                true,
+                nn_state_evidence_refs.clone(),
+            ));
+
+            if case.operation == "register_parameter" || case.operation == "register_buffer" {
+                let registration_rejected = !nn_state_is_valid_key(
+                    case.state_key.as_deref().unwrap_or_default(),
+                );
+                checks.push(compare_bool(
+                    &allowlist,
+                    "nn_state",
+                    "FT-P2C-008",
+                    mode,
+                    case.name.as_str(),
+                    "adversarial_invalid_registration_name_rejected",
+                    "nn_state.adversarial_invalid_registration_name_accepted",
+                    registration_rejected,
+                    true,
+                    nn_state_evidence_refs.clone(),
+                ));
+            }
+
+            if case.operation == "state_export" {
+                let mut permuted_case = case.clone();
+                permuted_case.name = format!("{}__metamorphic_permuted", case.name);
+                permuted_case.parameter_keys.reverse();
+                permuted_case.persistent_buffer_keys.reverse();
+                let permuted = run_nn_state_case(&permuted_case, mode)?;
+
+                let base_keys = log_string_vec_field(&local.forensic_log, "actual_state_keys");
+                let permuted_keys = log_string_vec_field(&permuted.forensic_log, "actual_state_keys");
+                checks.push(compare_bool(
+                    &allowlist,
+                    "nn_state",
+                    "FT-P2C-008",
+                    mode,
+                    case.name.as_str(),
+                    "metamorphic_state_export_order_invariant",
+                    "nn_state.metamorphic_state_export_order_mismatch",
+                    base_keys == permuted_keys,
+                    true,
+                    nn_state_evidence_refs.clone(),
+                ));
+
+                let non_persistent_excluded = case
+                    .non_persistent_buffer_keys
+                    .iter()
+                    .all(|key| !base_keys.contains(key));
+                checks.push(compare_bool(
+                    &allowlist,
+                    "nn_state",
+                    "FT-P2C-008",
+                    mode,
+                    case.name.as_str(),
+                    "adversarial_non_persistent_buffer_excluded",
+                    "nn_state.adversarial_non_persistent_buffer_leak",
+                    non_persistent_excluded,
+                    true,
+                    nn_state_evidence_refs.clone(),
+                ));
+            }
+
+            if case.operation == "mode_transition" {
+                let rerun = run_nn_state_case(&case, mode)?;
+                let left_trace = log_bool_vec_field(&local.forensic_log, "training_flag_transition");
+                let right_trace = log_bool_vec_field(&rerun.forensic_log, "training_flag_transition");
+                checks.push(compare_bool(
+                    &allowlist,
+                    "nn_state",
+                    "FT-P2C-008",
+                    mode,
+                    case.name.as_str(),
+                    "metamorphic_mode_transition_idempotent",
+                    "nn_state.metamorphic_mode_transition_idempotence_mismatch",
+                    left_trace == right_trace,
+                    true,
+                    nn_state_evidence_refs.clone(),
+                ));
+            }
+
+            if case.operation == "load_state" {
+                let has_missing_or_unexpected =
+                    !case.missing_keys.is_empty() || !case.unexpected_keys.is_empty();
+                let has_incompatible = !case.incompatible_shapes.is_empty();
+                if has_missing_or_unexpected && !has_incompatible {
+                    if mode == ExecutionMode::Hardened {
+                        let mut evidence_refs = nn_state_evidence_refs.clone();
+                        evidence_refs.push(
+                            "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json".to_string(),
+                        );
+                        checks.push(compare_bool(
+                            &allowlist,
+                            "nn_state",
+                            "FT-P2C-008",
+                            mode,
+                            case.name.as_str(),
+                            "policy",
+                            "nn_state.non_strict_missing_unexpected",
+                            local.contract_ok,
+                            false,
+                            evidence_refs,
+                        ));
+                    } else {
+                        checks.push(DifferentialCheck {
+                            suite: "nn_state",
+                            packet_id: "FT-P2C-008",
+                            scenario_id: scenario_id("nn_state", mode, case.name.as_str()),
+                            case_name: case.name.clone(),
+                            mode: mode_str,
+                            comparator: "policy",
+                            status: "pass",
+                            allowlisted: false,
+                            drift_id: None,
+                            reason_code: "strict_fail_closed_mode_split".to_string(),
+                            observed: "strict_fail_closed".to_string(),
+                            expected: "strict_fail_closed".to_string(),
+                            evidence_refs: nn_state_evidence_refs.clone(),
+                        });
+                    }
+                }
+                if has_incompatible {
+                    checks.push(compare_bool(
+                        &allowlist,
+                        "nn_state",
+                        "FT-P2C-008",
+                        mode,
+                        case.name.as_str(),
+                        "adversarial_incompatible_shape_rejected",
+                        "nn_state.adversarial_incompatible_shape_accepted",
+                        !local.contract_ok,
+                        true,
+                        nn_state_evidence_refs.clone(),
+                    ));
+                }
+                if case.assign_flag.unwrap_or(false) {
+                    checks.push(compare_bool(
+                        &allowlist,
+                        "nn_state",
+                        "FT-P2C-008",
+                        mode,
+                        case.name.as_str(),
+                        "adversarial_assign_shape_rejected",
+                        "nn_state.adversarial_assign_shape_accepted",
+                        !local.contract_ok,
+                        true,
+                        nn_state_evidence_refs.clone(),
+                    ));
+                }
+            }
+
+            if case.operation == "prefix_normalization" {
+                let (normalized_once, applied_once) = nn_state_normalize_prefix_keys(
+                    case.prefix_keys.as_slice(),
+                    case.allow_prefix_normalization.unwrap_or(false),
+                );
+                let (normalized_twice, applied_twice) =
+                    nn_state_normalize_prefix_keys(normalized_once.as_slice(), true);
+                checks.push(compare_bool(
+                    &allowlist,
+                    "nn_state",
+                    "FT-P2C-008",
+                    mode,
+                    case.name.as_str(),
+                    "metamorphic_prefix_normalization_idempotent",
+                    "nn_state.metamorphic_prefix_normalization_idempotence_mismatch",
+                    normalized_once == normalized_twice && applied_once == applied_twice,
+                    true,
+                    nn_state_evidence_refs.clone(),
+                ));
+            }
+
+            if case.operation == "hook_trace" {
+                let hook_trace = log_string_vec_field(&local.forensic_log, "hook_trace");
+                checks.push(compare_bool(
+                    &allowlist,
+                    "nn_state",
+                    "FT-P2C-008",
+                    mode,
+                    case.name.as_str(),
+                    "metamorphic_hook_trace_stable",
+                    "nn_state.metamorphic_hook_trace_mismatch",
+                    hook_trace == case.expected_hook_trace,
+                    true,
+                    nn_state_evidence_refs,
+                ));
+            }
+        }
     }
 
     checks.sort_by(|left, right| {
@@ -3120,6 +3520,266 @@ fn run_serialization_case(
     })
 }
 
+fn run_nn_state_case(case: &NnStateCase, mode: ExecutionMode) -> Result<NnStateCaseReport, String> {
+    let expectation = match mode {
+        ExecutionMode::Strict => &case.strict,
+        ExecutionMode::Hardened => &case.hardened,
+    };
+    let strict_flag = mode == ExecutionMode::Strict;
+
+    let (
+        operation_ok,
+        policy_ok,
+        observed_reason_code,
+        actual_state_keys,
+        prefix_normalization_applied,
+        training_flag_transition,
+    ) = match case.operation.as_str() {
+        "register_parameter" | "register_buffer" => {
+            let key = case.state_key.as_deref().unwrap_or_default();
+            let operation_ok = nn_state_is_valid_key(key);
+            let observed_reason_code = if operation_ok {
+                "nn_state_register_ok".to_string()
+            } else {
+                "nn_state_register_rejected".to_string()
+            };
+            (
+                operation_ok,
+                true,
+                observed_reason_code,
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
+        }
+        "state_export" => {
+            let actual_state_keys = nn_state_export_keys(case);
+            let expected_state_keys = dedupe_sorted(case.expected_state_keys.clone());
+            let operation_ok = actual_state_keys == expected_state_keys;
+            let observed_reason_code = if operation_ok {
+                "nn_state_state_export_ok".to_string()
+            } else {
+                "nn_state_state_export_mismatch".to_string()
+            };
+            (
+                operation_ok,
+                true,
+                observed_reason_code,
+                actual_state_keys,
+                false,
+                Vec::new(),
+            )
+        }
+        "mode_transition" => {
+            let mut training = case.initial_training.unwrap_or(true);
+            let mut training_flag_transition = vec![training];
+            for next in case.training_transitions.iter().copied() {
+                training = next;
+                training_flag_transition.push(training);
+            }
+            let expected_training = case.expected_training_flag.unwrap_or(training);
+            let operation_ok = training == expected_training;
+            let observed_reason_code = if operation_ok {
+                "nn_state_mode_transition_ok".to_string()
+            } else {
+                "nn_state_mode_transition_mismatch".to_string()
+            };
+            (
+                operation_ok,
+                true,
+                observed_reason_code,
+                Vec::new(),
+                false,
+                training_flag_transition,
+            )
+        }
+        "load_state" => {
+            let has_missing = !case.missing_keys.is_empty();
+            let has_unexpected = !case.unexpected_keys.is_empty();
+            let has_incompatible = !case.incompatible_shapes.is_empty();
+
+            let strict_error = has_missing || has_unexpected || has_incompatible;
+            let hardened_error = has_incompatible;
+            let observed_error = if strict_flag {
+                strict_error
+            } else {
+                hardened_error
+            };
+
+            let operation_ok = !observed_error;
+            let policy_ok = if strict_flag {
+                observed_error == strict_error
+            } else {
+                observed_error == hardened_error
+            };
+
+            let observed_reason_code = if observed_error {
+                if has_incompatible {
+                    "nn_state_load_incompatible_shapes_rejected".to_string()
+                } else {
+                    "nn_state_load_missing_or_unexpected_rejected".to_string()
+                }
+            } else if has_missing || has_unexpected {
+                "nn_state_load_hardened_allowlisted".to_string()
+            } else {
+                "nn_state_load_ok".to_string()
+            };
+            (
+                operation_ok,
+                policy_ok,
+                observed_reason_code,
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
+        }
+        "prefix_normalization" => {
+            let allow = case.allow_prefix_normalization.unwrap_or(false);
+            let (normalized_keys, applied) =
+                nn_state_normalize_prefix_keys(case.prefix_keys.as_slice(), allow);
+            let expected_canonical = if case.expected_canonical_keys.is_empty() {
+                normalized_keys.clone()
+            } else {
+                dedupe_sorted(case.expected_canonical_keys.clone())
+            };
+            let operation_ok = normalized_keys == expected_canonical;
+            let observed_reason_code = if operation_ok {
+                "nn_state_prefix_normalization_ok".to_string()
+            } else {
+                "nn_state_prefix_normalization_mismatch".to_string()
+            };
+            (
+                operation_ok,
+                true,
+                observed_reason_code,
+                normalized_keys,
+                applied,
+                Vec::new(),
+            )
+        }
+        "hook_trace" => {
+            let operation_ok = case.hook_trace == case.expected_hook_trace;
+            let observed_reason_code = if operation_ok {
+                "nn_state_hook_trace_ok".to_string()
+            } else {
+                "nn_state_hook_trace_mismatch".to_string()
+            };
+            (
+                operation_ok,
+                true,
+                observed_reason_code,
+                Vec::new(),
+                false,
+                Vec::new(),
+            )
+        }
+        other => {
+            return Err(format!(
+                "unsupported nn_state operation '{other}' in case '{}'",
+                case.name
+            ));
+        }
+    };
+
+    let contract_ok = operation_ok && policy_ok;
+    let expectation_ok = contract_ok == expectation.expect_pass;
+    let mut detail_ok = true;
+    let mut reason_code = observed_reason_code.clone();
+
+    if !expectation_ok {
+        reason_code = "nn_state_mode_expectation_mismatch".to_string();
+    }
+    if let Some(expected_prefix_applied) = expectation.expect_prefix_normalization_applied
+        && prefix_normalization_applied != expected_prefix_applied
+    {
+        detail_ok = false;
+        reason_code = "nn_state_prefix_policy_mismatch".to_string();
+    }
+    if let Some(expected_reason_code) = expectation.expected_reason_code.as_deref()
+        && observed_reason_code != expected_reason_code
+    {
+        detail_ok = false;
+        reason_code = "nn_state_reason_code_mismatch".to_string();
+    }
+
+    let passed = expectation_ok && detail_ok;
+    if passed {
+        reason_code = observed_reason_code.clone();
+    }
+
+    Ok(NnStateCaseReport {
+        name: case.name.clone(),
+        mode,
+        contract_ok,
+        expectation_ok,
+        detail_ok,
+        forensic_log: StructuredCaseLog::new(
+            "nn_state",
+            "nn_state_cases.json",
+            "FT-P2C-008",
+            case.name.as_str(),
+            mode,
+            nn_state_evidence_refs(),
+            format!(
+                "cargo test -p ft-conformance strict_nn_state_conformance_is_green -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            if passed { "pass" } else { "fail" },
+            reason_code.clone(),
+        )
+        .with_extra_fields(nn_state_forensic_fields(
+            case,
+            mode,
+            contract_ok,
+            expectation_ok,
+            detail_ok,
+            actual_state_keys.as_slice(),
+            prefix_normalization_applied,
+            training_flag_transition.as_slice(),
+            observed_reason_code.as_str(),
+        )),
+    })
+}
+
+fn nn_state_export_keys(case: &NnStateCase) -> Vec<String> {
+    let mut keys = case.parameter_keys.clone();
+    keys.extend(case.persistent_buffer_keys.iter().cloned());
+    dedupe_sorted(keys)
+}
+
+fn nn_state_normalize_prefix_keys(keys: &[String], allow: bool) -> (Vec<String>, bool) {
+    let mut normalized = Vec::with_capacity(keys.len());
+    let mut applied = false;
+    for key in keys {
+        if allow && let Some(stripped) = key.strip_prefix("module.") {
+            normalized.push(stripped.to_string());
+            applied = true;
+            continue;
+        }
+        normalized.push(key.clone());
+    }
+    (dedupe_sorted(normalized), applied)
+}
+
+fn nn_state_is_valid_key(key: &str) -> bool {
+    !key.is_empty()
+        && !key.starts_with('.')
+        && !key.ends_with('.')
+        && !key.contains("..")
+        && key.split('.').all(|segment| {
+            !segment.is_empty()
+                && segment
+                    .chars()
+                    .all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
+        })
+}
+
+fn dedupe_sorted(mut keys: Vec<String>) -> Vec<String> {
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
 #[allow(clippy::too_many_arguments)]
 fn compare_abs_tol(
     allowlist: &AllowlistIndex,
@@ -3926,6 +4586,80 @@ fn dispatch_error_forensic_fields(
     fields
 }
 
+#[allow(clippy::too_many_arguments)]
+fn nn_state_forensic_fields(
+    case: &NnStateCase,
+    mode: ExecutionMode,
+    contract_ok: bool,
+    expectation_ok: bool,
+    detail_ok: bool,
+    actual_state_keys: &[String],
+    prefix_normalization_applied: bool,
+    training_flag_transition: &[bool],
+    observed_reason_code: &str,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("contract_ids".to_string(), json!(case.contract_ids));
+    fields.insert(
+        "downstream_e2e_scenarios".to_string(),
+        json!(case.e2e_scenarios),
+    );
+    fields.insert("operation".to_string(), json!(case.operation));
+    fields.insert("module_path".to_string(), json!(case.module_path));
+    fields.insert("state_key".to_string(), json!(case.state_key));
+    fields.insert("state_key_kind".to_string(), json!(case.state_key_kind));
+    fields.insert(
+        "strict_flag".to_string(),
+        json!(mode == ExecutionMode::Strict),
+    );
+    fields.insert(
+        "assign_flag".to_string(),
+        json!(case.assign_flag.unwrap_or(false)),
+    );
+    fields.insert("missing_keys".to_string(), json!(case.missing_keys));
+    fields.insert("unexpected_keys".to_string(), json!(case.unexpected_keys));
+    fields.insert(
+        "incompatible_shapes".to_string(),
+        json!(case.incompatible_shapes),
+    );
+    fields.insert("hook_trace".to_string(), json!(case.hook_trace));
+    fields.insert(
+        "prefix_normalization_applied".to_string(),
+        json!(prefix_normalization_applied),
+    );
+    fields.insert(
+        "training_flag_transition".to_string(),
+        json!(training_flag_transition),
+    );
+    fields.insert("parameter_keys".to_string(), json!(case.parameter_keys));
+    fields.insert(
+        "persistent_buffer_keys".to_string(),
+        json!(case.persistent_buffer_keys),
+    );
+    fields.insert(
+        "non_persistent_buffer_keys".to_string(),
+        json!(case.non_persistent_buffer_keys),
+    );
+    fields.insert(
+        "expected_state_keys".to_string(),
+        json!(case.expected_state_keys),
+    );
+    fields.insert("actual_state_keys".to_string(), json!(actual_state_keys));
+    fields.insert("prefix_keys".to_string(), json!(case.prefix_keys));
+    fields.insert(
+        "expected_canonical_keys".to_string(),
+        json!(case.expected_canonical_keys),
+    );
+    fields.insert("contract_ok".to_string(), json!(contract_ok));
+    fields.insert("expectation_ok".to_string(), json!(expectation_ok));
+    fields.insert("detail_ok".to_string(), json!(detail_ok));
+    fields.insert(
+        "observed_reason_code".to_string(),
+        json!(observed_reason_code),
+    );
+    fields
+}
+
 fn parse_binary_op(op: &str) -> Result<BinaryOp, String> {
     match op {
         "add" => Ok(BinaryOp::Add),
@@ -3999,6 +4733,15 @@ fn serialization_evidence_refs() -> Vec<String> {
         "artifacts/phase2c/FT-P2C-006/unit_property_quality_report_v1.json".to_string(),
         "artifacts/phase2c/FT-P2C-006/differential_packet_report_v1.json".to_string(),
         "artifacts/phase2c/FT-P2C-006/differential_reconciliation_v1.md".to_string(),
+    ]
+}
+
+fn nn_state_evidence_refs() -> Vec<String> {
+    vec![
+        "crates/ft-conformance/fixtures/nn_state_cases.json".to_string(),
+        "artifacts/phase2c/FT-P2C-008/contract_table.md".to_string(),
+        "artifacts/phase2c/FT-P2C-008/threat_model.md".to_string(),
+        "artifacts/phase2c/FT-P2C-008/unit_property_quality_report_v1.json".to_string(),
     ]
 }
 
@@ -4129,10 +4872,12 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        ExecutionMode, HarnessConfig, StructuredCaseLog, emit_differential_report,
-        emit_differential_report_filtered, emit_e2e_forensics_matrix,
-        emit_e2e_forensics_matrix_filtered, load_allowlist, project_log_to_ft_p2c_005,
-        run_autograd_scheduler_conformance, run_differential_conformance, run_dispatch_conformance,
+        ExecutionMode, HarnessConfig, NnStateCase, NnStateCaseReport, NnStateModeExpectation,
+        StructuredCaseLog, emit_differential_report, emit_differential_report_filtered,
+        emit_e2e_forensics_matrix, emit_e2e_forensics_matrix_filtered, load_allowlist,
+        nn_state_export_keys, nn_state_is_valid_key, project_log_to_ft_p2c_005,
+        project_log_to_ft_p2c_007, run_autograd_scheduler_conformance,
+        run_differential_conformance, run_dispatch_conformance, run_nn_state_conformance,
         run_op_schema_conformance, run_packet_e2e_microbench, run_packet_e2e_microbench_legacy,
         run_scalar_conformance, run_scalar_microbench, run_serialization_conformance, run_smoke,
         run_tensor_meta_conformance,
@@ -4263,6 +5008,147 @@ mod tests {
     }
 
     #[test]
+    fn strict_nn_state_conformance_is_green() {
+        let cfg = HarnessConfig::default_paths();
+        let (report, cases) =
+            run_nn_state_conformance(&cfg, ExecutionMode::Strict).expect("nn_state should run");
+
+        assert_eq!(report.suite, "nn_state");
+        assert_eq!(report.cases_total, cases.len());
+        assert_eq!(report.cases_total, report.cases_passed);
+        assert!(cases.iter().all(NnStateCaseReport::passed));
+    }
+
+    #[test]
+    fn hardened_nn_state_conformance_is_green() {
+        let cfg = HarnessConfig::default_paths();
+        let (report, cases) =
+            run_nn_state_conformance(&cfg, ExecutionMode::Hardened).expect("nn_state should run");
+
+        assert_eq!(report.suite, "nn_state");
+        assert_eq!(report.cases_total, cases.len());
+        assert_eq!(report.cases_total, report.cases_passed);
+        assert!(cases.iter().all(NnStateCaseReport::passed));
+    }
+
+    #[test]
+    fn nn_state_logs_include_packet_008_contract_fields() {
+        let cfg = HarnessConfig::default_paths();
+        let (_, cases) =
+            run_nn_state_conformance(&cfg, ExecutionMode::Strict).expect("nn_state should run");
+
+        assert!(!cases.is_empty(), "expected at least one nn_state case");
+        let value = serde_json::to_value(&cases[0].forensic_log)
+            .expect("nn_state log should serialize to json");
+        for key in [
+            "module_path",
+            "state_key",
+            "state_key_kind",
+            "strict_flag",
+            "assign_flag",
+            "missing_keys",
+            "unexpected_keys",
+            "incompatible_shapes",
+            "hook_trace",
+            "prefix_normalization_applied",
+            "training_flag_transition",
+        ] {
+            assert!(value.get(key).is_some(), "missing nn_state field {key}");
+        }
+    }
+
+    #[test]
+    fn nn_state_property_key_validation_stays_fail_closed() {
+        let valid_keys = [
+            "weight",
+            "layer1.weight",
+            "encoder_block_0.buffer_1",
+            "module_2.submodule_3.param4",
+        ];
+        for key in valid_keys {
+            assert!(nn_state_is_valid_key(key), "expected valid key: {key}");
+        }
+
+        let invalid_keys = [
+            "",
+            ".weight",
+            "weight.",
+            "layer..weight",
+            "layer-1.weight",
+            "layer weight",
+        ];
+        for key in invalid_keys {
+            assert!(!nn_state_is_valid_key(key), "expected invalid key: {key}");
+        }
+    }
+
+    #[test]
+    fn nn_state_property_export_excludes_non_persistent_buffers() {
+        let expectation = NnStateModeExpectation {
+            expect_pass: true,
+            expected_reason_code: None,
+            expect_prefix_normalization_applied: None,
+        };
+
+        let parameter_sets = [
+            Vec::<String>::new(),
+            vec!["encoder.weight".to_string()],
+            vec!["encoder.weight".to_string(), "decoder.bias".to_string()],
+        ];
+        let persistent_sets = [
+            Vec::<String>::new(),
+            vec!["running_mean".to_string()],
+            vec!["running_mean".to_string(), "running_var".to_string()],
+        ];
+        let non_persistent_sets = [
+            Vec::<String>::new(),
+            vec!["tmp_stats".to_string()],
+            vec!["tmp_stats".to_string(), "scratch".to_string()],
+        ];
+
+        for parameter_keys in parameter_sets {
+            for persistent_buffer_keys in persistent_sets.clone() {
+                for non_persistent_buffer_keys in non_persistent_sets.clone() {
+                    let case = NnStateCase {
+                        name: "property_export".to_string(),
+                        operation: "state_export".to_string(),
+                        module_path: "root".to_string(),
+                        state_key: None,
+                        state_key_kind: None,
+                        parameter_keys: parameter_keys.clone(),
+                        persistent_buffer_keys: persistent_buffer_keys.clone(),
+                        non_persistent_buffer_keys: non_persistent_buffer_keys.clone(),
+                        expected_state_keys: Vec::new(),
+                        training_transitions: Vec::new(),
+                        initial_training: None,
+                        expected_training_flag: None,
+                        missing_keys: Vec::new(),
+                        unexpected_keys: Vec::new(),
+                        incompatible_shapes: Vec::new(),
+                        prefix_keys: Vec::new(),
+                        expected_canonical_keys: Vec::new(),
+                        allow_prefix_normalization: None,
+                        hook_trace: Vec::new(),
+                        expected_hook_trace: Vec::new(),
+                        assign_flag: None,
+                        strict: expectation.clone(),
+                        hardened: expectation.clone(),
+                        contract_ids: Vec::new(),
+                        e2e_scenarios: Vec::new(),
+                    };
+                    let exported = nn_state_export_keys(&case);
+                    for key in non_persistent_buffer_keys {
+                        assert!(
+                            !exported.contains(&key),
+                            "non-persistent key leaked into state export: {key}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn structured_logs_include_replay_contract_fields() {
         let cfg = HarnessConfig::default_paths();
         let (_, cases) = run_scalar_conformance(&cfg, ExecutionMode::Strict)
@@ -4375,6 +5261,8 @@ mod tests {
         let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
         let mut saw_ft_p2c_001 = false;
         let mut saw_ft_p2c_002 = false;
+        let mut saw_ft_p2c_007 = false;
+        let mut saw_ft_p2c_008 = false;
         let mut ft_p2c_005_suites = BTreeSet::new();
         for line in raw.lines() {
             let value: serde_json::Value =
@@ -4405,12 +5293,23 @@ mod tests {
                     );
                     ft_p2c_005_suites.insert(suite_id.to_string());
                 }
+                "FT-P2C-007" if suite_id == "dispatch_key" => {
+                    saw_ft_p2c_007 = true;
+                }
+                "FT-P2C-008" if suite_id == "nn_state" => {
+                    saw_ft_p2c_008 = true;
+                }
                 _ => {}
             }
         }
 
         assert!(saw_ft_p2c_001, "expected FT-P2C-001 source entries");
         assert!(saw_ft_p2c_002, "expected FT-P2C-002 source entries");
+        assert!(
+            saw_ft_p2c_007,
+            "expected FT-P2C-007 projected dispatch entries"
+        );
+        assert!(saw_ft_p2c_008, "expected FT-P2C-008 nn_state entries");
         assert!(
             ft_p2c_005_suites.contains("scalar_dac")
                 && ft_p2c_005_suites.contains("tensor_meta")
@@ -4620,6 +5519,63 @@ mod tests {
     }
 
     #[test]
+    fn ft_p2c_007_projection_strips_shadowed_flatten_keys() {
+        let mut extra_fields = BTreeMap::new();
+        extra_fields.insert("mode".to_string(), json!("shadowed_mode"));
+        extra_fields.insert("reason_code".to_string(), json!("shadowed_reason"));
+        extra_fields.insert("contract_ids".to_string(), json!(["DEVICE-GUARD-001"]));
+
+        let base_log = StructuredCaseLog::new(
+            "dispatch_key",
+            "dispatch_key_cases.json",
+            "FT-P2C-002",
+            "strict_cpu_route",
+            ExecutionMode::Strict,
+            vec!["artifacts/phase2c/FT-P2C-002/parity_report.json".to_string()],
+            "cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture"
+                .to_string(),
+            "pass",
+            "dispatch_parity_ok",
+        )
+        .with_extra_fields(extra_fields);
+
+        let projected = project_log_to_ft_p2c_007(base_log);
+        assert_eq!(projected.packet_id, "FT-P2C-007");
+        assert!(
+            projected.scenario_id.starts_with("ft_p2c_007/"),
+            "scenario must be namespaced under FT-P2C-007 projection"
+        );
+        assert!(
+            projected.replay_command.contains("--packet FT-P2C-007"),
+            "replay command must target packet FT-P2C-007"
+        );
+        assert!(
+            projected
+                .artifact_refs
+                .contains(&"artifacts/phase2c/FT-P2C-007/contract_table.md".to_string()),
+            "projected artifact refs must include packet-007 contract table"
+        );
+        assert!(
+            projected.artifact_refs.contains(
+                &"artifacts/phase2c/FT-P2C-007/unit_property_quality_report_v1.json".to_string()
+            ),
+            "projected artifact refs must include packet-007 unit/property evidence"
+        );
+        assert!(
+            !projected.extra_fields.contains_key("mode"),
+            "mode must stay only at top-level envelope"
+        );
+        assert!(
+            !projected.extra_fields.contains_key("reason_code"),
+            "reason_code must stay only at top-level envelope"
+        );
+        assert!(
+            projected.extra_fields.contains_key("contract_ids"),
+            "non-shadowed forensic fields must be preserved"
+        );
+    }
+
+    #[test]
     fn e2e_matrix_packet_filter_includes_serialization_packet_entries() {
         let cfg = HarnessConfig::default_paths();
         let now = SystemTime::now()
@@ -4651,6 +5607,98 @@ mod tests {
             assert_eq!(
                 value.get("suite_id").and_then(serde_json::Value::as_str),
                 Some("serialization")
+            );
+        }
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn e2e_matrix_packet_filter_includes_device_guard_packet_entries() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_packet_filter_device_guard_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix_filtered(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+            Some("FT-P2C-007"),
+        )
+        .expect("packet-filtered e2e matrix should emit logs");
+
+        assert_eq!(summary.log_entries, 20);
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        for line in raw.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("jsonl line should be valid json");
+            assert_eq!(
+                value.get("packet_id").and_then(serde_json::Value::as_str),
+                Some("FT-P2C-007")
+            );
+            assert_eq!(
+                value.get("suite_id").and_then(serde_json::Value::as_str),
+                Some("dispatch_key")
+            );
+            let scenario = value
+                .get("scenario_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("scenario_id must be present");
+            assert!(
+                scenario.starts_with("ft_p2c_007/dispatch_key/"),
+                "FT-P2C-007 projection must retain namespaced scenario IDs"
+            );
+        }
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn e2e_matrix_packet_filter_includes_nn_state_packet_entries() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_packet_filter_nn_state_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix_filtered(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+            Some("FT-P2C-008"),
+        )
+        .expect("packet-filtered e2e matrix should emit logs");
+
+        assert_eq!(summary.log_entries, 20);
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        for line in raw.lines() {
+            let value: serde_json::Value =
+                serde_json::from_str(line).expect("jsonl line should be valid json");
+            assert_eq!(
+                value.get("packet_id").and_then(serde_json::Value::as_str),
+                Some("FT-P2C-008")
+            );
+            assert_eq!(
+                value.get("suite_id").and_then(serde_json::Value::as_str),
+                Some("nn_state")
+            );
+            let scenario = value
+                .get("scenario_id")
+                .and_then(serde_json::Value::as_str)
+                .expect("scenario_id must be present");
+            assert!(
+                scenario.starts_with("nn_state/"),
+                "FT-P2C-008 logs must remain under nn_state scenario namespace"
             );
         }
 
@@ -4727,6 +5775,20 @@ mod tests {
     }
 
     #[test]
+    fn packet_e2e_microbench_device_guard_produces_percentiles() {
+        let report = run_packet_e2e_microbench(&HarnessConfig::default_paths(), 10, "FT-P2C-007")
+            .expect("packet e2e microbench should run");
+        eprintln!(
+            "packet_e2e_microbench_ns packet=FT-P2C-007 p50={} p95={} p99={} mean={}",
+            report.p50_ns, report.p95_ns, report.p99_ns, report.mean_ns
+        );
+        assert_eq!(report.iterations, 10);
+        assert!(report.p50_ns > 0);
+        assert!(report.p95_ns >= report.p50_ns);
+        assert!(report.p99_ns >= report.p95_ns);
+    }
+
+    #[test]
     fn packet_e2e_microbench_cpu_kernel_legacy_vs_optimized_profiles() {
         let cfg = HarnessConfig::default_paths();
         let legacy = run_packet_e2e_microbench_legacy(&cfg, 10, "FT-P2C-005")
@@ -4736,6 +5798,29 @@ mod tests {
 
         eprintln!(
             "packet_e2e_microbench_compare_ns packet=FT-P2C-005 legacy_p50={} legacy_p95={} legacy_p99={} legacy_mean={} optimized_p50={} optimized_p95={} optimized_p99={} optimized_mean={}",
+            legacy.p50_ns,
+            legacy.p95_ns,
+            legacy.p99_ns,
+            legacy.mean_ns,
+            optimized.p50_ns,
+            optimized.p95_ns,
+            optimized.p99_ns,
+            optimized.mean_ns
+        );
+        assert_eq!(legacy.iterations, optimized.iterations);
+        assert!(legacy.p50_ns > 0 && optimized.p50_ns > 0);
+    }
+
+    #[test]
+    fn packet_e2e_microbench_device_guard_legacy_vs_optimized_profiles() {
+        let cfg = HarnessConfig::default_paths();
+        let legacy = run_packet_e2e_microbench_legacy(&cfg, 10, "FT-P2C-007")
+            .expect("legacy packet microbench should run");
+        let optimized = run_packet_e2e_microbench(&cfg, 10, "FT-P2C-007")
+            .expect("optimized packet microbench should run");
+
+        eprintln!(
+            "packet_e2e_microbench_compare_ns packet=FT-P2C-007 legacy_p50={} legacy_p95={} legacy_p99={} legacy_mean={} optimized_p50={} optimized_p95={} optimized_p99={} optimized_mean={}",
             legacy.p50_ns,
             legacy.p95_ns,
             legacy.p99_ns,

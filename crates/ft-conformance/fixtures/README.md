@@ -9,6 +9,7 @@ This folder stores normalized oracle-vs-target fixtures for `ft-conformance`.
 - `op_schema_cases.json`: op schema ingestion differential/metamorphic/adversarial contract for packet `FT-P2C-003`.
 - `autograd_scheduler_cases.json`: deterministic scheduler ordering + reentrant policy contract.
 - `serialization_cases.json`: checkpoint encode/decode + RaptorQ sidecar/proof contract.
+- `nn_state_cases.json`: NN module/state contract first-wave fixture family (registration, state export, mode propagation, load strictness split, prefix normalization, hooks) for packet `FT-P2C-008`.
 
 Related adversarial/fuzz manifest (versioned):
 - `artifacts/phase2c/ADVERSARIAL_FUZZ_CORPUS_MANIFEST_V1.json`

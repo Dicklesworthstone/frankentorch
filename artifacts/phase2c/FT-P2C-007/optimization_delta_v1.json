@@ -1,0 +1,73 @@
+{
+  "schema_version": "ft-p2c-optimization-delta-v1",
+  "packet_id": "FT-P2C-007",
+  "bead_id": "bd-3v0.18.8",
+  "generated_at": "2026-02-16T15:31:19Z",
+  "optimization_lever": {
+    "id": "dispatch-packet-projection-fixture-cache-fastpath",
+    "description": "Extend the fixture-cached dispatch e2e projection path to FT-P2C-007 so packet-filtered runs use the optimized emitter path with one fixture load and deterministic projection metadata, while legacy mode remains the baseline for comparison.",
+    "implementation_paths": [
+      "crates/ft-conformance/src/lib.rs"
+    ]
+  },
+  "benchmark": {
+    "name": "packet_e2e_microbench_device_guard_legacy_vs_optimized_profiles",
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-conformance packet_e2e_microbench_device_guard_legacy_vs_optimized_profiles -- --nocapture",
+    "mode": "strict+hardened",
+    "packet_filter": "FT-P2C-007"
+  },
+  "baseline": {
+    "p50_ns": 1523698,
+    "p95_ns": 2041713,
+    "p99_ns": 2041713,
+    "mean_ns": 1660851,
+    "iterations": 10
+  },
+  "post": {
+    "p50_ns": 1465032,
+    "p95_ns": 1605280,
+    "p99_ns": 1605280,
+    "mean_ns": 1482731,
+    "iterations": 10
+  },
+  "delta_ns": {
+    "p50_ns": -58666,
+    "p95_ns": -436433,
+    "p99_ns": -436433,
+    "mean_ns": -178120
+  },
+  "improvement": {
+    "p50_pct_reduction": 3.850,
+    "p95_pct_reduction": 21.376,
+    "p99_pct_reduction": 21.376,
+    "mean_pct_reduction": 10.725
+  },
+  "memory_churn": {
+    "baseline_max_rss_kb": null,
+    "post_max_rss_kb": null,
+    "note": "rch cargo-test stream does not emit max RSS; optimization evidence is expressed via deterministic packet latency tails and mean deltas."
+  },
+  "isomorphism_evidence": {
+    "unit_property": [
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-device guard_rejects_mismatched_device -- --nocapture",
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-device same_device_check_rejects_cross_device_pair -- --nocapture",
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-dispatch prop_packet_007_autograd_without_cpu_stays_fail_closed -- --nocapture",
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-dispatch prop_packet_007_dtype_or_device_mismatch_stays_fail_closed -- --nocapture"
+    ],
+    "differential": [
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-007/differential_packet_report_v1.json",
+      "artifacts/phase2c/FT-P2C-007/differential_reconciliation_v1.md"
+    ],
+    "e2e": [
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-conformance e2e_matrix_packet_filter_includes_device_guard_packet_entries -- --nocapture",
+      "artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl"
+    ],
+    "quality_gates": [
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo check --workspace --all-targets",
+      "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo clippy --workspace --all-targets -- -D warnings",
+      "cargo fmt --check"
+    ]
+  },
+  "status": "pass"
+}

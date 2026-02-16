@@ -1,0 +1,21 @@
+packet_id: FT-P2C-007
+suite: dispatch_key
+release_blocking: true
+
+strict:
+  required_cases_passed_ratio: 1.0
+  critical_drift_budget: 0
+
+hardened:
+  required_cases_passed_ratio: 1.0
+  divergence_budget_ratio: 0.0
+
+checks:
+  - command: CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture
+  - command: CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-conformance hardened_dispatch_conformance_is_green -- --nocapture
+  - command: CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-dispatch
+  - command: CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-device
+
+artifacts:
+  - crates/ft-conformance/fixtures/dispatch_key_cases.json
+  - artifacts/phase2c/FT-P2C-007/fixture_manifest.json

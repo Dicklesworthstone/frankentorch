@@ -1,0 +1,113 @@
+{
+  "schema_version": "ft-p2c-008-unit-property-quality-v1",
+  "generated_on": "2026-02-16",
+  "packet_id": "FT-P2C-008",
+  "coverage": {
+    "scope": "packet_module",
+    "target_file": "crates/ft-conformance/src/lib.rs",
+    "line_percent": 91.10653863740283,
+    "region_percent": 91.16984532212044,
+    "line_floor": 85.0,
+    "region_floor": 80.0,
+    "line_floor_pass": true,
+    "region_floor_pass": true,
+    "workspace_rollup_line_percent": 69.65864440078585,
+    "workspace_rollup_region_percent": 70.04457152468252,
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_cov008 cargo llvm-cov -p ft-conformance --json --summary-only --output-path artifacts/phase2c/FT-P2C-008/unit_property_coverage_v1.json",
+    "extraction_command": "jq '.data[0].files[] | select(.filename|endswith(\"crates/ft-conformance/src/lib.rs\")) | {line_percent:.summary.lines.percent, region_percent:.summary.regions.percent}' artifacts/phase2c/FT-P2C-008/unit_property_coverage_v1.json",
+    "status": "coverage_floor_pass"
+  },
+  "property_suite": {
+    "invariant_family_count": 6,
+    "shrink_enabled": false,
+    "invariant_families": [
+      "module_registration_fail_closed_contract",
+      "persistent_buffer_state_export_contract",
+      "strict_hardened_load_mode_split_contract",
+      "prefix_normalization_contract",
+      "hook_trace_order_contract",
+      "structured_replay_log_contract"
+    ],
+    "test_ids": [
+      "strict_nn_state_conformance_is_green",
+      "hardened_nn_state_conformance_is_green",
+      "nn_state_logs_include_packet_008_contract_fields",
+      "nn_state_property_key_validation_stays_fail_closed",
+      "nn_state_property_export_excludes_non_persistent_buffers",
+      "e2e_matrix_packet_filter_includes_nn_state_packet_entries"
+    ]
+  },
+  "structured_log_contract": {
+    "required_fields": [
+      "schema_version",
+      "ts_unix_ms",
+      "suite_id",
+      "scenario_id",
+      "fixture_id",
+      "packet_id",
+      "mode",
+      "seed",
+      "env_fingerprint",
+      "artifact_refs",
+      "replay_command",
+      "outcome",
+      "reason_code",
+      "module_path",
+      "state_key",
+      "state_key_kind",
+      "strict_flag",
+      "assign_flag",
+      "missing_keys",
+      "unexpected_keys",
+      "incompatible_shapes",
+      "hook_trace",
+      "prefix_normalization_applied",
+      "training_flag_transition"
+    ],
+    "test_helper_anchors": [
+      "crates/ft-conformance/src/lib.rs",
+      "crates/ft-conformance/src/logging.rs",
+      "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "artifacts/phase2c/FT-P2C-008/contract_table.md"
+    ]
+  },
+  "e2e_scenario_mapping": {
+    "strict_nn_state_conformance_is_green": [
+      "nn_state/strict:register_parameter_rejects_invalid_name",
+      "nn_state/strict:load_state_missing_unexpected_mode_split",
+      "nn_state/strict:prefix_consumption_maps_ddp_state_dict_keys"
+    ],
+    "hardened_nn_state_conformance_is_green": [
+      "nn_state/hardened:register_parameter_rejects_invalid_name",
+      "nn_state/hardened:load_state_missing_unexpected_mode_split",
+      "nn_state/hardened:prefix_consumption_maps_ddp_state_dict_keys"
+    ],
+    "nn_state_logs_include_packet_008_contract_fields": [
+      "nn_state/strict:register_parameter_rejects_invalid_name"
+    ],
+    "nn_state_property_key_validation_stays_fail_closed": [
+      "nn_state/strict:register_parameter_rejects_invalid_name",
+      "nn_state/hardened:register_parameter_rejects_invalid_name"
+    ],
+    "nn_state_property_export_excludes_non_persistent_buffers": [
+      "nn_state/strict:register_buffer_tracks_persistence_flag",
+      "nn_state/hardened:register_buffer_tracks_persistence_flag",
+      "nn_state/strict:module_to_preserves_keyset_and_shapes",
+      "nn_state/hardened:module_to_preserves_keyset_and_shapes"
+    ],
+    "e2e_matrix_packet_filter_includes_nn_state_packet_entries": [
+      "nn_state/strict:*",
+      "nn_state/hardened:*"
+    ]
+  },
+  "validation_runs": {
+    "nn_state_tests": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance nn_state -- --nocapture",
+    "ft_conformance_tests": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance",
+    "workspace_check": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_008 cargo check --workspace --all-targets",
+    "workspace_clippy": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_008 cargo clippy --workspace --all-targets -- -D warnings",
+    "fmt_check": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_008 cargo fmt --check",
+    "coverage_capture": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_cov008 cargo llvm-cov -p ft-conformance --json --summary-only --output-path artifacts/phase2c/FT-P2C-008/unit_property_coverage_v1.json",
+    "status": "completed"
+  },
+  "status": "completed"
+}

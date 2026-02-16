@@ -1,0 +1,80 @@
+{
+  "schema_version": "ft-p2c-e2e-linkage-v1",
+  "packet_id": "FT-P2C-007",
+  "generated_at": "2026-02-16T15:26:58Z",
+  "source_e2e_log": "artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl",
+  "source_triage": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_007_v1.json",
+  "source_failure_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_007_v1.json",
+  "total_entries": 20,
+  "failed_entries": 0,
+  "suite_breakdown": [
+    {
+      "suite_id": "dispatch_key",
+      "count": 20
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 10
+    },
+    {
+      "mode": "strict",
+      "count": 10
+    }
+  ],
+  "deterministic_replay_field_coverage": {
+    "scenario_id": true,
+    "seed": true,
+    "env_fingerprint": true,
+    "artifact_refs": true,
+    "replay_command": true,
+    "reason_code": true
+  },
+  "replay_command_catalog": [
+    "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode hardened --packet FT-P2C-007 --output artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl",
+    "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode strict --packet FT-P2C-007 --output artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl"
+  ],
+  "scenario_ids": [
+    "ft_p2c_007/dispatch_key/hardened:autograd_without_cpu_fail_closed",
+    "ft_p2c_007/dispatch_key/hardened:composite_route_mode_split",
+    "ft_p2c_007/dispatch_key/hardened:device_mismatch_fail_closed",
+    "ft_p2c_007/dispatch_key/hardened:dtype_mismatch_fail_closed",
+    "ft_p2c_007/dispatch_key/hardened:empty_keyset_fail_closed",
+    "ft_p2c_007/dispatch_key/hardened:no_backend_key_fail_closed",
+    "ft_p2c_007/dispatch_key/hardened:no_type_key_fail_closed",
+    "ft_p2c_007/dispatch_key/hardened:strict_autograd_route",
+    "ft_p2c_007/dispatch_key/hardened:strict_cpu_route",
+    "ft_p2c_007/dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:autograd_without_cpu_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:composite_route_mode_split",
+    "ft_p2c_007/dispatch_key/strict:device_mismatch_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:dtype_mismatch_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:empty_keyset_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:no_backend_key_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:no_type_key_fail_closed",
+    "ft_p2c_007/dispatch_key/strict:strict_autograd_route",
+    "ft_p2c_007/dispatch_key/strict:strict_cpu_route",
+    "ft_p2c_007/dispatch_key/strict:unknown_dispatch_key_fail_closed"
+  ],
+  "linkage_refs": {
+    "unit_property": [
+      "rch exec -- cargo test -p ft-device guard_rejects_mismatched_device -- --nocapture",
+      "rch exec -- cargo test -p ft-device same_device_check_rejects_cross_device_pair -- --nocapture",
+      "rch exec -- cargo test -p ft-dispatch prop_packet_007_autograd_without_cpu_stays_fail_closed -- --nocapture",
+      "rch exec -- cargo test -p ft-dispatch prop_packet_007_dtype_or_device_mismatch_stays_fail_closed -- --nocapture",
+      "rch exec -- cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture",
+      "rch exec -- cargo test -p ft-conformance hardened_dispatch_conformance_is_green -- --nocapture"
+    ],
+    "differential": [
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-007/differential_packet_report_v1.json",
+      "artifacts/phase2c/FT-P2C-007/differential_reconciliation_v1.md"
+    ],
+    "optimization": [
+      "artifacts/phase2c/FT-P2C-007/optimization_delta_v1.json",
+      "artifacts/phase2c/FT-P2C-007/optimization_isomorphism_v1.md"
+    ]
+  },
+  "status": "pass"
+}

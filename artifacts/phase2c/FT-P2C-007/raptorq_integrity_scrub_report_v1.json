@@ -1,0 +1,25 @@
+{
+  "schema_version": "ft-raptorq-integrity-scrub-v1",
+  "generated_unix_ms": 1771256279480,
+  "summary": {
+    "total_targets": 1,
+    "passed": 1,
+    "failed": 0
+  },
+  "entries": [
+    {
+      "artifact_id": "FT-P2C-007-parity-report",
+      "artifact_type": "packet_parity_report",
+      "packet_id": "FT-P2C-007",
+      "source_path": "artifacts/phase2c/FT-P2C-007/parity_report.json",
+      "source_exists": true,
+      "sidecar_path": "artifacts/phase2c/FT-P2C-007/parity_report.raptorq.json",
+      "decode_proof_path": "artifacts/phase2c/FT-P2C-007/parity_report.decode_proof.json",
+      "sidecar_written": true,
+      "decode_proof_written": true,
+      "corruption_probe_detected": true,
+      "status": "ok",
+      "message": "packet-scoped parity sidecar/decode proof generated and validated"
+    }
+  ]
+}

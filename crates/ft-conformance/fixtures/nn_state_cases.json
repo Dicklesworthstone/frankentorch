@@ -1,0 +1,240 @@
+{
+  "cases": [
+    {
+      "name": "register_parameter_rejects_invalid_name",
+      "operation": "register_parameter",
+      "module_path": "root",
+      "state_key": "",
+      "state_key_kind": "parameter",
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_register_rejected"
+      },
+      "hardened": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_register_rejected"
+      },
+      "contract_ids": ["MODULE-REGISTER-001"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:register_paths",
+        "ft_p2c_008/nn_state/hardened:register_paths"
+      ]
+    },
+    {
+      "name": "register_buffer_tracks_persistence_flag",
+      "operation": "state_export",
+      "module_path": "root",
+      "state_key_kind": "buffer",
+      "parameter_keys": ["encoder.weight"],
+      "persistent_buffer_keys": ["running_mean"],
+      "non_persistent_buffer_keys": ["scratchpad"],
+      "expected_state_keys": ["encoder.weight", "running_mean"],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-REGISTER-001", "MODULE-STATE-002"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:state_export",
+        "ft_p2c_008/nn_state/hardened:state_export"
+      ]
+    },
+    {
+      "name": "state_dict_nested_prefixes_are_stable",
+      "operation": "state_export",
+      "module_path": "root.encoder",
+      "state_key_kind": "state_dict",
+      "parameter_keys": ["decoder.block1.weight", "encoder.block0.weight"],
+      "persistent_buffer_keys": ["encoder.block0.running_mean"],
+      "non_persistent_buffer_keys": ["encoder.block0.ephemeral"],
+      "expected_state_keys": [
+        "decoder.block1.weight",
+        "encoder.block0.running_mean",
+        "encoder.block0.weight"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-STATE-002", "MODULE-TRAVERSAL-003"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:module_traversal",
+        "ft_p2c_008/nn_state/hardened:module_traversal"
+      ]
+    },
+    {
+      "name": "mode_propagation_train_eval_alias",
+      "operation": "mode_transition",
+      "module_path": "root.encoder",
+      "state_key_kind": "training_mode",
+      "initial_training": true,
+      "training_transitions": [true, false, true, false],
+      "expected_training_flag": false,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "contract_ids": ["MODULE-MODE-004"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:mode_propagation",
+        "ft_p2c_008/nn_state/hardened:mode_propagation"
+      ]
+    },
+    {
+      "name": "load_state_missing_unexpected_mode_split",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "missing_keys": ["encoder.weight"],
+      "unexpected_keys": ["decoder.bias"],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_load_hardened_allowlisted"
+      },
+      "contract_ids": ["MODULE-LOAD-STRICT-005"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:load_mismatch",
+        "ft_p2c_008/nn_state/hardened:load_mismatch"
+      ]
+    },
+    {
+      "name": "load_state_incompatible_shape_rejected",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "incompatible_shapes": ["head.weight:[2,4]!=[4,4]"],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_incompatible_shapes_rejected"
+      },
+      "hardened": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_incompatible_shapes_rejected"
+      },
+      "contract_ids": ["MODULE-LOAD-STRICT-005", "MODULE-ADVERSARIAL-009"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:adversarial_state_payload",
+        "ft_p2c_008/nn_state/hardened:adversarial_state_payload"
+      ]
+    },
+    {
+      "name": "prefix_consumption_maps_ddp_state_dict_keys",
+      "operation": "prefix_normalization",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "prefix_keys": ["module.encoder.weight", "module.encoder.bias"],
+      "expected_canonical_keys": ["encoder.bias", "encoder.weight"],
+      "allow_prefix_normalization": true,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": true
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": true
+      },
+      "contract_ids": ["MODULE-PREFIX-006"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:prefix_normalization",
+        "ft_p2c_008/nn_state/hardened:prefix_normalization"
+      ]
+    },
+    {
+      "name": "state_dict_hooks_fire_in_order",
+      "operation": "hook_trace",
+      "module_path": "root",
+      "state_key_kind": "hook_trace",
+      "hook_trace": [
+        "state_dict_pre_hook",
+        "state_dict_post_hook",
+        "load_pre_hook",
+        "load_post_hook"
+      ],
+      "expected_hook_trace": [
+        "state_dict_pre_hook",
+        "state_dict_post_hook",
+        "load_pre_hook",
+        "load_post_hook"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_hook_trace_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_hook_trace_ok"
+      },
+      "contract_ids": ["MODULE-HOOKS-007"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:hook_paths",
+        "ft_p2c_008/nn_state/hardened:hook_paths"
+      ]
+    },
+    {
+      "name": "module_to_preserves_keyset_and_shapes",
+      "operation": "state_export",
+      "module_path": "root.encoder",
+      "state_key_kind": "transfer",
+      "parameter_keys": ["encoder.bias", "encoder.weight"],
+      "persistent_buffer_keys": ["encoder.running_mean"],
+      "non_persistent_buffer_keys": ["encoder.scratch"],
+      "expected_state_keys": [
+        "encoder.bias",
+        "encoder.running_mean",
+        "encoder.weight"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-TRANSFER-008"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:transfer_paths",
+        "ft_p2c_008/nn_state/hardened:transfer_paths"
+      ]
+    },
+    {
+      "name": "load_state_assign_rejects_incompatible_tensor_shape",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "assign",
+      "assign_flag": true,
+      "incompatible_shapes": ["decoder.weight:[8,8]!=[8,4]"],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_incompatible_shapes_rejected"
+      },
+      "hardened": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_incompatible_shapes_rejected"
+      },
+      "contract_ids": ["MODULE-ADVERSARIAL-009"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:adversarial_state_payload",
+        "ft_p2c_008/nn_state/hardened:adversarial_state_payload"
+      ]
+    }
+  ]
+}
