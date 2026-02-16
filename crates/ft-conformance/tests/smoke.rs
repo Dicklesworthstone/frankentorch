@@ -12,7 +12,7 @@ fn smoke_report_is_stable() {
     let report = run_smoke(&cfg);
     assert_eq!(report.suite, "smoke");
     assert!(report.fixture_count >= 1);
-    assert!(report.oracle_present);
+    assert_eq!(report.oracle_present, cfg.oracle_root.exists());
 
     let fixture_path = cfg.fixture_root.join("smoke_case.json");
     assert!(Path::new(&fixture_path).exists());
