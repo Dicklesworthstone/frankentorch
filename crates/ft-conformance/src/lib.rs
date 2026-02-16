@@ -4422,12 +4422,12 @@ print(json.dumps({
 
 fn scalar_forensic_fields(
     case: &ScalarCase,
-    mode: ExecutionMode,
+    _mode: ExecutionMode,
     actual_output: f64,
     actual_lhs_grad: f64,
     actual_rhs_grad: f64,
     passed: bool,
-    reason_code: &str,
+    _reason_code: &str,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
     let selected_kernel = match case.op.as_str() {
@@ -4464,8 +4464,6 @@ fn scalar_forensic_fields(
     fields.insert("broadcast_applied".to_string(), json!(false));
     fields.insert("fallback_path".to_string(), json!(false));
     fields.insert("pass".to_string(), json!(passed));
-    fields.insert("mode".to_string(), json!(mode_label(mode)));
-    fields.insert("reason_code".to_string(), json!(reason_code));
     fields
 }
 
@@ -4522,7 +4520,7 @@ fn tensor_meta_forensic_fields(
 #[allow(clippy::too_many_arguments)]
 fn dispatch_forensic_fields(
     case: &DispatchCase,
-    mode: ExecutionMode,
+    _mode: ExecutionMode,
     output_value: f64,
     selected_key: DispatchKey,
     backend_key: DispatchKey,
@@ -4533,7 +4531,7 @@ fn dispatch_forensic_fields(
     rhs_dtype: DType,
     lhs_device: Device,
     rhs_device: Device,
-    reason_code: &str,
+    _reason_code: &str,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
     fields.insert("contract_ids".to_string(), json!(case.contract_ids));
@@ -4544,7 +4542,6 @@ fn dispatch_forensic_fields(
     fields.insert("op".to_string(), json!(case.op));
     fields.insert("lhs".to_string(), json!(case.lhs));
     fields.insert("rhs".to_string(), json!(case.rhs));
-    fields.insert("mode".to_string(), json!(mode_label(mode)));
     fields.insert(
         "dispatch_key".to_string(),
         json!(format!("{selected_key:?}")),
@@ -4565,19 +4562,18 @@ fn dispatch_forensic_fields(
     fields.insert("output_shape".to_string(), json!([]));
     fields.insert("broadcast_applied".to_string(), json!(false));
     fields.insert("actual_output".to_string(), json!(output_value));
-    fields.insert("reason_code".to_string(), json!(reason_code));
     fields
 }
 
 #[allow(clippy::too_many_arguments)]
 fn dispatch_error_forensic_fields(
     case: &DispatchCase,
-    mode: ExecutionMode,
+    _mode: ExecutionMode,
     lhs_dtype: DType,
     rhs_dtype: DType,
     lhs_device: Device,
     rhs_device: Device,
-    reason_code: &str,
+    _reason_code: &str,
     error_message: Option<String>,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
@@ -4589,7 +4585,6 @@ fn dispatch_error_forensic_fields(
     fields.insert("op".to_string(), json!(case.op));
     fields.insert("lhs".to_string(), json!(case.lhs));
     fields.insert("rhs".to_string(), json!(case.rhs));
-    fields.insert("mode".to_string(), json!(mode_label(mode)));
     fields.insert(
         "dtype_pair".to_string(),
         json!(format!("{lhs_dtype:?}/{rhs_dtype:?}")),
@@ -4605,7 +4600,6 @@ fn dispatch_error_forensic_fields(
     fields.insert("backend_key".to_string(), Value::Null);
     fields.insert("broadcast_applied".to_string(), json!(false));
     fields.insert("fallback_path".to_string(), json!(false));
-    fields.insert("reason_code".to_string(), json!(reason_code));
     fields.insert("error_message".to_string(), json!(error_message));
     fields
 }

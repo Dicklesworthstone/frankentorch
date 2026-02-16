@@ -1,13 +1,13 @@
 {
   "schema_version": "ft-failure-forensics-index-v1",
-  "generated_unix_ms": 1771273739819,
+  "generated_unix_ms": 1771275653618,
   "source_artifacts": {
     "e2e_log_path": "artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl",
     "triage_path": "artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json",
     "differential_report_path": "artifacts/phase2c/conformance/differential_report_v1.json"
   },
   "summary": {
-    "e2e_entries": 124,
+    "e2e_entries": 254,
     "failed_entries": 0,
     "triaged_incidents": 0
   },

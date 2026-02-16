@@ -1,18 +1,18 @@
 {
   "schema_version": "ft-reliability-gate-report-v1",
-  "generated_unix_ms": 1771266073279,
+  "generated_unix_ms": 1771275654530,
   "policy_path": "artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json",
   "e2e_path": "artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl",
   "status": "pass",
   "summary": {
-    "total_entries": 124,
+    "total_entries": 254,
     "failed_entries": 0,
     "flake_suspect_count": 0,
     "unknown_reason_code_count": 0,
     "packet_metrics": {
       "FT-P2C-001": {
-        "total_entries": 14,
-        "passed_entries": 14,
+        "total_entries": 28,
+        "passed_entries": 28,
         "pass_ratio": 1.0,
         "suites_present": [
           "scalar_dac",
@@ -20,40 +20,68 @@
         ],
         "scenario_ids": [
           "scalar_dac/hardened:add_basic",
+          "scalar_dac/hardened:add_negative_rhs",
+          "scalar_dac/hardened:add_zero_identity",
           "scalar_dac/hardened:mul_basic",
+          "scalar_dac/hardened:mul_negative_lhs",
+          "scalar_dac/hardened:mul_zero_absorber",
           "scalar_dac/strict:add_basic",
+          "scalar_dac/strict:add_negative_rhs",
+          "scalar_dac/strict:add_zero_identity",
           "scalar_dac/strict:mul_basic",
+          "scalar_dac/strict:mul_negative_lhs",
+          "scalar_dac/strict:mul_zero_absorber",
+          "tensor_meta/hardened:broadcast_stride_zero_valid",
           "tensor_meta/hardened:contiguous_basic_index",
+          "tensor_meta/hardened:invalid_rank_stride_extra_fail_closed",
           "tensor_meta/hardened:invalid_rank_stride_mismatch",
           "tensor_meta/hardened:invalid_storage_offset_overflow",
+          "tensor_meta/hardened:invalid_storage_offset_overflow_large",
           "tensor_meta/hardened:scalar_offset_index",
           "tensor_meta/hardened:strided_offset_index",
+          "tensor_meta/strict:broadcast_stride_zero_valid",
           "tensor_meta/strict:contiguous_basic_index",
+          "tensor_meta/strict:invalid_rank_stride_extra_fail_closed",
           "tensor_meta/strict:invalid_rank_stride_mismatch",
           "tensor_meta/strict:invalid_storage_offset_overflow",
+          "tensor_meta/strict:invalid_storage_offset_overflow_large",
           "tensor_meta/strict:scalar_offset_index",
           "tensor_meta/strict:strided_offset_index"
         ]
       },
       "FT-P2C-002": {
-        "total_entries": 6,
-        "passed_entries": 6,
+        "total_entries": 20,
+        "passed_entries": 20,
         "pass_ratio": 1.0,
         "suites_present": [
           "dispatch_key"
         ],
         "scenario_ids": [
+          "dispatch_key/hardened:autograd_without_cpu_fail_closed",
           "dispatch_key/hardened:composite_route_mode_split",
+          "dispatch_key/hardened:device_mismatch_fail_closed",
+          "dispatch_key/hardened:dtype_mismatch_fail_closed",
+          "dispatch_key/hardened:empty_keyset_fail_closed",
+          "dispatch_key/hardened:no_backend_key_fail_closed",
+          "dispatch_key/hardened:no_type_key_fail_closed",
           "dispatch_key/hardened:strict_autograd_route",
           "dispatch_key/hardened:strict_cpu_route",
+          "dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+          "dispatch_key/strict:autograd_without_cpu_fail_closed",
           "dispatch_key/strict:composite_route_mode_split",
+          "dispatch_key/strict:device_mismatch_fail_closed",
+          "dispatch_key/strict:dtype_mismatch_fail_closed",
+          "dispatch_key/strict:empty_keyset_fail_closed",
+          "dispatch_key/strict:no_backend_key_fail_closed",
+          "dispatch_key/strict:no_type_key_fail_closed",
           "dispatch_key/strict:strict_autograd_route",
-          "dispatch_key/strict:strict_cpu_route"
+          "dispatch_key/strict:strict_cpu_route",
+          "dispatch_key/strict:unknown_dispatch_key_fail_closed"
         ]
       },
       "FT-P2C-003": {
-        "total_entries": 10,
-        "passed_entries": 10,
+        "total_entries": 20,
+        "passed_entries": 20,
         "pass_ratio": 1.0,
         "suites_present": [
           "op_schema"
@@ -72,20 +100,24 @@
         ]
       },
       "FT-P2C-004": {
-        "total_entries": 2,
-        "passed_entries": 2,
+        "total_entries": 6,
+        "passed_entries": 6,
         "pass_ratio": 1.0,
         "suites_present": [
           "autograd_scheduler"
         ],
         "scenario_ids": [
           "autograd_scheduler/hardened:composite_scheduler_dac",
-          "autograd_scheduler/strict:composite_scheduler_dac"
+          "autograd_scheduler/hardened:dependency_underflow_probe",
+          "autograd_scheduler/hardened:scheduler_chain",
+          "autograd_scheduler/strict:composite_scheduler_dac",
+          "autograd_scheduler/strict:dependency_underflow_probe",
+          "autograd_scheduler/strict:scheduler_chain"
         ]
       },
       "FT-P2C-005": {
-        "total_entries": 48,
-        "passed_entries": 48,
+        "total_entries": 96,
+        "passed_entries": 96,
         "pass_ratio": 1.0,
         "suites_present": [
           "dispatch_key",
@@ -158,8 +190,8 @@
         ]
       },
       "FT-P2C-007": {
-        "total_entries": 20,
-        "passed_entries": 20,
+        "total_entries": 40,
+        "passed_entries": 40,
         "pass_ratio": 1.0,
         "suites_present": [
           "dispatch_key"
@@ -188,8 +220,8 @@
         ]
       },
       "FT-P2C-008": {
-        "total_entries": 20,
-        "passed_entries": 20,
+        "total_entries": 40,
+        "passed_entries": 40,
         "pass_ratio": 1.0,
         "suites_present": [
           "nn_state"

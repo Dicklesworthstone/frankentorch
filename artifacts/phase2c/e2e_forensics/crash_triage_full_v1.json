@@ -1,9 +1,9 @@
 {
   "schema_version": "ft-crash-triage-v1",
-  "generated_unix_ms": 1771087451857,
-  "input_log_path": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
+  "generated_unix_ms": 1771275652834,
+  "input_log_path": "artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl",
   "packet_filter": null,
-  "total_entries": 26,
+  "total_entries": 254,
   "failed_entries": 0,
   "class_counts": {},
   "incidents": []
