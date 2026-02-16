@@ -2382,9 +2382,8 @@ pub fn run_differential_conformance(
             ));
 
             if case.operation == "register_parameter" || case.operation == "register_buffer" {
-                let registration_rejected = !nn_state_is_valid_key(
-                    case.state_key.as_deref().unwrap_or_default(),
-                );
+                let registration_rejected =
+                    !nn_state_is_valid_key(case.state_key.as_deref().unwrap_or_default());
                 checks.push(compare_bool(
                     &allowlist,
                     "nn_state",
@@ -2407,7 +2406,8 @@ pub fn run_differential_conformance(
                 let permuted = run_nn_state_case(&permuted_case, mode)?;
 
                 let base_keys = log_string_vec_field(&local.forensic_log, "actual_state_keys");
-                let permuted_keys = log_string_vec_field(&permuted.forensic_log, "actual_state_keys");
+                let permuted_keys =
+                    log_string_vec_field(&permuted.forensic_log, "actual_state_keys");
                 checks.push(compare_bool(
                     &allowlist,
                     "nn_state",
@@ -2441,8 +2441,10 @@ pub fn run_differential_conformance(
 
             if case.operation == "mode_transition" {
                 let rerun = run_nn_state_case(&case, mode)?;
-                let left_trace = log_bool_vec_field(&local.forensic_log, "training_flag_transition");
-                let right_trace = log_bool_vec_field(&rerun.forensic_log, "training_flag_transition");
+                let left_trace =
+                    log_bool_vec_field(&local.forensic_log, "training_flag_transition");
+                let right_trace =
+                    log_bool_vec_field(&rerun.forensic_log, "training_flag_transition");
                 checks.push(compare_bool(
                     &allowlist,
                     "nn_state",
@@ -2528,7 +2530,7 @@ pub fn run_differential_conformance(
             }
 
             if case.operation == "prefix_normalization" {
-                let (normalized_once, applied_once) = nn_state_normalize_prefix_keys(
+                let (normalized_once, _) = nn_state_normalize_prefix_keys(
                     case.prefix_keys.as_slice(),
                     case.allow_prefix_normalization.unwrap_or(false),
                 );
@@ -2542,7 +2544,7 @@ pub fn run_differential_conformance(
                     case.name.as_str(),
                     "metamorphic_prefix_normalization_idempotent",
                     "nn_state.metamorphic_prefix_normalization_idempotence_mismatch",
-                    normalized_once == normalized_twice && applied_once == applied_twice,
+                    normalized_once == normalized_twice && !applied_twice,
                     true,
                     nn_state_evidence_refs.clone(),
                 ));
@@ -3774,6 +3776,28 @@ fn nn_state_is_valid_key(key: &str) -> bool {
         })
 }
 
+fn log_string_vec_field(log: &StructuredCaseLog, key: &str) -> Vec<String> {
+    log.extra_fields
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(Value::as_str)
+                .map(ToString::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn log_bool_vec_field(log: &StructuredCaseLog, key: &str) -> Vec<bool> {
+    log.extra_fields
+        .get(key)
+        .and_then(Value::as_array)
+        .map(|values| values.iter().filter_map(Value::as_bool).collect())
+        .unwrap_or_default()
+}
+
 fn dedupe_sorted(mut keys: Vec<String>) -> Vec<String> {
     keys.sort();
     keys.dedup();
@@ -4742,6 +4766,17 @@ fn nn_state_evidence_refs() -> Vec<String> {
         "artifacts/phase2c/FT-P2C-008/contract_table.md".to_string(),
         "artifacts/phase2c/FT-P2C-008/threat_model.md".to_string(),
         "artifacts/phase2c/FT-P2C-008/unit_property_quality_report_v1.json".to_string(),
+    ]
+}
+
+fn nn_state_differential_evidence_refs() -> Vec<String> {
+    vec![
+        "crates/ft-conformance/fixtures/nn_state_cases.json".to_string(),
+        "artifacts/phase2c/FT-P2C-008/contract_table.md".to_string(),
+        "artifacts/phase2c/FT-P2C-008/threat_model.md".to_string(),
+        "artifacts/phase2c/FT-P2C-008/unit_property_quality_report_v1.json".to_string(),
+        "artifacts/phase2c/FT-P2C-008/differential_packet_report_v1.json".to_string(),
+        "artifacts/phase2c/FT-P2C-008/differential_reconciliation_v1.md".to_string(),
     ]
 }
 
@@ -5789,6 +5824,20 @@ mod tests {
     }
 
     #[test]
+    fn packet_e2e_microbench_nn_state_produces_percentiles() {
+        let report = run_packet_e2e_microbench(&HarnessConfig::default_paths(), 10, "FT-P2C-008")
+            .expect("packet e2e microbench should run");
+        eprintln!(
+            "packet_e2e_microbench_ns packet=FT-P2C-008 p50={} p95={} p99={} mean={}",
+            report.p50_ns, report.p95_ns, report.p99_ns, report.mean_ns
+        );
+        assert_eq!(report.iterations, 10);
+        assert!(report.p50_ns > 0);
+        assert!(report.p95_ns >= report.p50_ns);
+        assert!(report.p99_ns >= report.p95_ns);
+    }
+
+    #[test]
     fn packet_e2e_microbench_cpu_kernel_legacy_vs_optimized_profiles() {
         let cfg = HarnessConfig::default_paths();
         let legacy = run_packet_e2e_microbench_legacy(&cfg, 10, "FT-P2C-005")
@@ -5798,6 +5847,29 @@ mod tests {
 
         eprintln!(
             "packet_e2e_microbench_compare_ns packet=FT-P2C-005 legacy_p50={} legacy_p95={} legacy_p99={} legacy_mean={} optimized_p50={} optimized_p95={} optimized_p99={} optimized_mean={}",
+            legacy.p50_ns,
+            legacy.p95_ns,
+            legacy.p99_ns,
+            legacy.mean_ns,
+            optimized.p50_ns,
+            optimized.p95_ns,
+            optimized.p99_ns,
+            optimized.mean_ns
+        );
+        assert_eq!(legacy.iterations, optimized.iterations);
+        assert!(legacy.p50_ns > 0 && optimized.p50_ns > 0);
+    }
+
+    #[test]
+    fn packet_e2e_microbench_nn_state_legacy_vs_optimized_profiles() {
+        let cfg = HarnessConfig::default_paths();
+        let legacy = run_packet_e2e_microbench_legacy(&cfg, 10, "FT-P2C-008")
+            .expect("legacy packet microbench should run");
+        let optimized = run_packet_e2e_microbench(&cfg, 10, "FT-P2C-008")
+            .expect("optimized packet microbench should run");
+
+        eprintln!(
+            "packet_e2e_microbench_compare_ns packet=FT-P2C-008 legacy_p50={} legacy_p95={} legacy_p99={} legacy_mean={} optimized_p50={} optimized_p95={} optimized_p99={} optimized_mean={}",
             legacy.p50_ns,
             legacy.p95_ns,
             legacy.p99_ns,
@@ -5993,6 +6065,43 @@ mod tests {
     }
 
     #[test]
+    fn differential_nn_state_adds_metamorphic_and_adversarial_checks() {
+        let cfg = HarnessConfig::default_paths();
+        let report =
+            run_differential_conformance(&cfg, &[ExecutionMode::Strict, ExecutionMode::Hardened])
+                .expect("differential report should run");
+
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "nn_state"
+                && check.comparator == "metamorphic_state_export_order_invariant"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "nn_state" && check.comparator == "adversarial_assign_shape_rejected"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "nn_state"
+                && check.mode == "hardened"
+                && check.comparator == "policy"
+                && check.drift_id.as_deref() == Some("nn_state.non_strict_missing_unexpected")
+                && check.status == "allowlisted_drift"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "nn_state"
+                && check.mode == "strict"
+                && check.case_name == "prefix_consumption_maps_ddp_state_dict_keys"
+                && check.comparator == "metamorphic_prefix_normalization_idempotent"
+                && check.status == "pass"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "nn_state"
+                && check.mode == "hardened"
+                && check.case_name == "prefix_consumption_maps_ddp_state_dict_keys"
+                && check.comparator == "metamorphic_prefix_normalization_idempotent"
+                && check.status == "pass"
+        }));
+    }
+
+    #[test]
     fn differential_report_writer_emits_json() {
         let cfg = HarnessConfig::default_paths();
         let now = SystemTime::now()
@@ -6130,5 +6239,6 @@ mod tests {
             load_allowlist(cfg.allowlist_path.as_path()).expect("allowlist fixture should parse");
         assert!(allowlist.contains("FT-P2C-002", "dispatch.composite_backend_fallback"));
         assert!(allowlist.contains("FT-P2C-004", "autograd.reentrant_depth_bounded_fallback"));
+        assert!(allowlist.contains("FT-P2C-008", "nn_state.non_strict_missing_unexpected"));
     }
 }
