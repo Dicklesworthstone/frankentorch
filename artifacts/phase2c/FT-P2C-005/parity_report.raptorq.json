@@ -1,0 +1,45 @@
+{
+  "artifact_id": "FT-P2C-005-parity-report",
+  "artifact_type": "packet_parity_report",
+  "notes": "Generated for FT-P2C-005 parity evidence closure.",
+  "packet_id": "FT-P2C-005",
+  "raptorq": {
+    "schema_version": 1,
+    "symbol_size": 128,
+    "k": 6,
+    "constraints": 10,
+    "repair_symbols": 4,
+    "seed": 5067780287586391121,
+    "object_id_high": 5067780223329653855,
+    "object_id_low": 4923932207837957189,
+    "repair_manifest": [
+      {
+        "esi": 6,
+        "degree": 3,
+        "bytes": 128
+      },
+      {
+        "esi": 7,
+        "degree": 2,
+        "bytes": 128
+      },
+      {
+        "esi": 8,
+        "degree": 6,
+        "bytes": 128
+      },
+      {
+        "esi": 9,
+        "degree": 3,
+        "bytes": 128
+      }
+    ]
+  },
+  "scrub": {
+    "status": "ok",
+    "corruption_probe_detected": true,
+    "last_ok_unix_ms": 1771223559000
+  },
+  "source_hash": "det64:612935dc559ac622",
+  "source_path": "/data/projects/frankentorch/artifacts/phase2c/FT-P2C-005/parity_report.json"
+}

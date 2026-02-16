@@ -1,0 +1,35 @@
+packet_id: FT-P2C-005
+suite: cpu_kernel_first_wave
+release_blocking: true
+
+strict:
+  required_cases_passed_ratio: 1.0
+  critical_drift_budget: 0
+
+hardened:
+  required_cases_passed_ratio: 1.0
+  divergence_budget_ratio: 0.0
+
+checks:
+  - command: rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-kernel-cpu
+  - command: rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-conformance strict_scalar_conformance_is_green -- --nocapture
+  - command: rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture
+  - command: rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-conformance strict_tensor_meta_conformance_is_green -- --nocapture
+  - command: rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl --print-full-log
+  - command: rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo run -p ft-conformance --bin validate_phase2c_artifacts
+
+artifacts:
+  - crates/ft-conformance/fixtures/scalar_autograd_cases.json
+  - crates/ft-conformance/fixtures/dispatch_key_cases.json
+  - crates/ft-conformance/fixtures/tensor_meta_cases.json
+  - artifacts/phase2c/FT-P2C-005/fixture_manifest.json
+  - artifacts/phase2c/FT-P2C-005/unit_property_quality_report_v1.json
+  - artifacts/phase2c/FT-P2C-005/differential_packet_report_v1.json
+  - artifacts/phase2c/FT-P2C-005/differential_reconciliation_v1.md
+  - artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl
+  - artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_005_v1.json
+  - artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_005_v1.json
+  - artifacts/phase2c/FT-P2C-005/risk_note.md
+  - artifacts/phase2c/FT-P2C-005/parity_report.json
+  - artifacts/phase2c/FT-P2C-005/parity_report.raptorq.json
+  - artifacts/phase2c/FT-P2C-005/parity_report.decode_proof.json

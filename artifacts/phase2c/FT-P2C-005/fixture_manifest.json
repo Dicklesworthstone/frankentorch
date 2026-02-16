@@ -168,5 +168,5 @@
     "artifacts/phase2c/FT-P2C-005/parity_report.raptorq.json",
     "artifacts/phase2c/FT-P2C-005/parity_report.decode_proof.json"
   ],
-  "status": "completed"
+  "status": "active"
 }

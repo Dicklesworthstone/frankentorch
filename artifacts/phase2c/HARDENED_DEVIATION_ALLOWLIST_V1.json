@@ -47,6 +47,21 @@
         }
       ]
     },
+    "FT-P2C-005": {
+      "disallowed_by_default": true,
+      "allowed_deviations": [
+        {
+          "id": "dispatch.composite_backend_fallback",
+          "description": "Permit projected hardened dispatch composite/backend-select key fallback for FT-P2C-005 packet evidence",
+          "constraints": [
+            "mode == hardened",
+            "backend key is present",
+            "fallback_used evidence recorded",
+            "scoped to projected dispatch-key checks in FT-P2C-005"
+          ]
+        }
+      ]
+    },
     "FT-P2C-006": {
       "disallowed_by_default": true,
       "allowed_deviations": [

@@ -1,0 +1,19 @@
+{
+  "artifact_id": "FT-P2C-005-parity-report",
+  "artifact_type": "packet_parity_report",
+  "packet_id": "FT-P2C-005",
+  "status": "decode_verified",
+  "corruption_probe": {
+    "status": "hash_mismatch_detected",
+    "tampered_source_hash": "det64:b12935dc559ac622"
+  },
+  "decode_proof": {
+    "schema_version": 1,
+    "source_hash": "det64:612935dc559ac622",
+    "proof_hash": 398828107649634907,
+    "proof_hash_hex": "det64:0588ec0d02e5d25b",
+    "received_symbol_count": 15,
+    "recovered_bytes": 714
+  },
+  "notes": "Decode-proof artifact for FT-P2C-005 parity report."
+}

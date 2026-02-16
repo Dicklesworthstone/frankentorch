@@ -1,0 +1,105 @@
+{
+  "schema_version": "ft-p2c-005-unit-property-quality-v1",
+  "generated_on": "2026-02-16",
+  "packet_id": "FT-P2C-005",
+  "coverage": {
+    "scope": "packet_module",
+    "target_file": "crates/ft-kernel-cpu/src/lib.rs",
+    "line_percent": 100.0,
+    "region_percent": 100.0,
+    "line_floor": 90.0,
+    "region_floor": 80.0,
+    "line_floor_pass": true,
+    "region_floor_pass": true,
+    "workspace_rollup_line_percent": 67.38753170471232,
+    "workspace_rollup_region_percent": 67.67463235294117,
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_plumprairie_cov5 cargo llvm-cov --workspace --json --summary-only --output-path artifacts/phase2c/FT-P2C-005/unit_property_coverage_v1.json",
+    "extraction_command": "jq '.data[0].files[] | select(.filename==\"/data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs\") | {line_percent:.summary.lines.percent, region_percent:.summary.regions.percent}' artifacts/phase2c/FT-P2C-005/unit_property_coverage_v1.json",
+    "status": "coverage_floor_pass"
+  },
+  "property_suite": {
+    "invariant_family_count": 6,
+    "shrink_enabled": true,
+    "invariant_families": [
+      "scalar_kernel_determinism_contract",
+      "dtype_device_fail_closed_contract",
+      "dispatch_key_resolution_contract",
+      "strict_hardened_mode_split_contract",
+      "tensor_meta_guard_contract",
+      "packet_replay_forensics_contract"
+    ],
+    "test_ids": [
+      "add_scalar_returns_expected_value",
+      "mul_scalar_returns_expected_value",
+      "add_scalar_rejects_dtype_mismatch",
+      "mul_scalar_rejects_device_mismatch",
+      "strict_scalar_conformance_is_green",
+      "strict_dispatch_conformance_is_green",
+      "hardened_dispatch_conformance_is_green",
+      "strict_tensor_meta_conformance_is_green",
+      "hardened_tensor_meta_conformance_is_green"
+    ]
+  },
+  "structured_log_contract": {
+    "required_fields": [
+      "suite_id",
+      "scenario_id",
+      "fixture_id",
+      "packet_id",
+      "mode",
+      "seed",
+      "env_fingerprint",
+      "artifact_refs",
+      "replay_command",
+      "outcome",
+      "reason_code",
+      "dispatch_key",
+      "selected_kernel",
+      "backend_key",
+      "dtype_pair",
+      "input_shape",
+      "output_shape",
+      "broadcast_applied",
+      "contract_ids",
+      "packet_projection"
+    ],
+    "test_helper_anchors": [
+      "crates/ft-kernel-cpu/src/lib.rs",
+      "crates/ft-conformance/src/lib.rs",
+      "crates/ft-conformance/src/logging.rs"
+    ]
+  },
+  "e2e_scenario_mapping": {
+    "add_scalar_returns_expected_value": [
+      "ft_p2c_005/scalar_dac/strict:add_basic",
+      "ft_p2c_005/scalar_dac/hardened:add_basic"
+    ],
+    "mul_scalar_returns_expected_value": [
+      "ft_p2c_005/scalar_dac/strict:mul_basic",
+      "ft_p2c_005/scalar_dac/hardened:mul_basic"
+    ],
+    "add_scalar_rejects_dtype_mismatch": [
+      "ft_p2c_005/dispatch_key/strict:dtype_mismatch_fail_closed",
+      "ft_p2c_005/dispatch_key/hardened:dtype_mismatch_fail_closed"
+    ],
+    "mul_scalar_rejects_device_mismatch": [
+      "ft_p2c_005/dispatch_key/strict:device_mismatch_fail_closed",
+      "ft_p2c_005/dispatch_key/hardened:device_mismatch_fail_closed"
+    ],
+    "strict_tensor_meta_conformance_is_green": [
+      "ft_p2c_005/tensor_meta/strict:contiguous_basic_index"
+    ],
+    "hardened_tensor_meta_conformance_is_green": [
+      "ft_p2c_005/tensor_meta/hardened:contiguous_basic_index"
+    ]
+  },
+  "validation_runs": {
+    "kernel_tests": "rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-kernel-cpu",
+    "conformance_scalar": "rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-conformance strict_scalar_conformance_is_green -- --nocapture",
+    "conformance_dispatch": "rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture",
+    "conformance_tensor_meta": "rch exec -- env CARGO_TARGET_DIR=target_rusticcrane_ftp2c005 cargo test -p ft-conformance strict_tensor_meta_conformance_is_green -- --nocapture",
+    "coverage_capture": "rch exec -- env CARGO_TARGET_DIR=target_plumprairie_cov5 cargo llvm-cov --workspace --json --summary-only --output-path artifacts/phase2c/FT-P2C-005/unit_property_coverage_v1.json",
+    "status": "completed_from_packet_evidence"
+  },
+  "status": "completed"
+}

@@ -1,0 +1,25 @@
+{
+  "packet_id": "FT-P2C-005",
+  "suite": "cpu_kernel_first_wave",
+  "strict": {
+    "cases_total": 24,
+    "cases_passed": 24
+  },
+  "hardened": {
+    "cases_total": 24,
+    "cases_passed": 24
+  },
+  "status": "parity_blocked",
+  "generated_from": "rch exec -- cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl --print-full-log",
+  "e2e_summary": {
+    "total_entries": 48,
+    "failed_entries": 0
+  },
+  "differential_summary": {
+    "source": "artifacts/phase2c/FT-P2C-005/differential_packet_report_v1.json",
+    "total_checks": 168,
+    "pass_checks": 158,
+    "allowlisted_checks": 8,
+    "blocking_checks": 2
+  }
+}
