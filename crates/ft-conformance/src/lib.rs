@@ -4176,18 +4176,34 @@ mod tests {
         let cfg = HarnessConfig::default_paths();
         let (report, cases) = run_tensor_meta_conformance(&cfg, ExecutionMode::Strict)
             .expect("tensor-meta should run");
+        let failed_cases: Vec<&str> = cases
+            .iter()
+            .filter(|case| !(case.meta_ok && case.index_ok && case.alias_ok))
+            .map(|case| case.name.as_str())
+            .collect();
 
         assert_eq!(report.cases_total, cases.len());
-        assert_eq!(report.cases_total, report.cases_passed);
+        assert_eq!(
+            report.cases_total, report.cases_passed,
+            "strict tensor-meta failing cases: {failed_cases:?}"
+        );
     }
 
     #[test]
     fn hardened_tensor_meta_conformance_is_green() {
         let cfg = HarnessConfig::default_paths();
-        let (report, _) = run_tensor_meta_conformance(&cfg, ExecutionMode::Hardened)
+        let (report, cases) = run_tensor_meta_conformance(&cfg, ExecutionMode::Hardened)
             .expect("tensor-meta should run");
+        let failed_cases: Vec<&str> = cases
+            .iter()
+            .filter(|case| !(case.meta_ok && case.index_ok && case.alias_ok))
+            .map(|case| case.name.as_str())
+            .collect();
 
-        assert_eq!(report.cases_total, report.cases_passed);
+        assert_eq!(
+            report.cases_total, report.cases_passed,
+            "hardened tensor-meta failing cases: {failed_cases:?}"
+        );
     }
 
     #[test]
