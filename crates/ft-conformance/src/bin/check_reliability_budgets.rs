@@ -398,6 +398,9 @@ fn is_known_reason_code(reason_code: &str) -> bool {
         "dispatch",
         "tensor_meta",
         "scheduler",
+        "op_schema",
+        "nn_state",
+        "fail_closed",
         "checksum",
         "version",
         "invalid_json",
@@ -540,6 +543,8 @@ mod tests {
     fn known_reason_code_classifier_is_broad_but_bounded() {
         assert!(is_known_reason_code("dispatch_expectation_mismatch"));
         assert!(is_known_reason_code("serialization_parity_ok"));
+        assert!(is_known_reason_code("nn_state_hook_trace_ok"));
+        assert!(is_known_reason_code("op_schema_adversarial_fail_closed_ok"));
         assert!(!is_known_reason_code("totally_unknown_reason_code"));
     }
 

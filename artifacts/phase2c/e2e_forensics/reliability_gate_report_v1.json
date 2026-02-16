@@ -1,11 +1,11 @@
 {
   "schema_version": "ft-reliability-gate-report-v1",
-  "generated_unix_ms": 1771087829540,
+  "generated_unix_ms": 1771266073279,
   "policy_path": "artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json",
-  "e2e_path": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
+  "e2e_path": "artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl",
   "status": "pass",
   "summary": {
-    "total_entries": 26,
+    "total_entries": 124,
     "failed_entries": 0,
     "flake_suspect_count": 0,
     "unknown_reason_code_count": 0,
@@ -51,6 +51,26 @@
           "dispatch_key/strict:strict_cpu_route"
         ]
       },
+      "FT-P2C-003": {
+        "total_entries": 10,
+        "passed_entries": 10,
+        "pass_ratio": 1.0,
+        "suites_present": [
+          "op_schema"
+        ],
+        "scenario_ids": [
+          "op_schema/hardened:add_out_schema_alignment",
+          "op_schema/hardened:add_tensor_schema_roundtrip",
+          "op_schema/hardened:dispatch_metadata_incompatible",
+          "op_schema/hardened:malformed_schema_rejected",
+          "op_schema/hardened:operator_name_normalization",
+          "op_schema/strict:add_out_schema_alignment",
+          "op_schema/strict:add_tensor_schema_roundtrip",
+          "op_schema/strict:dispatch_metadata_incompatible",
+          "op_schema/strict:malformed_schema_rejected",
+          "op_schema/strict:operator_name_normalization"
+        ]
+      },
       "FT-P2C-004": {
         "total_entries": 2,
         "passed_entries": 2,
@@ -61,6 +81,66 @@
         "scenario_ids": [
           "autograd_scheduler/hardened:composite_scheduler_dac",
           "autograd_scheduler/strict:composite_scheduler_dac"
+        ]
+      },
+      "FT-P2C-005": {
+        "total_entries": 48,
+        "passed_entries": 48,
+        "pass_ratio": 1.0,
+        "suites_present": [
+          "dispatch_key",
+          "scalar_dac",
+          "tensor_meta"
+        ],
+        "scenario_ids": [
+          "ft_p2c_005/dispatch_key/hardened:autograd_without_cpu_fail_closed",
+          "ft_p2c_005/dispatch_key/hardened:composite_route_mode_split",
+          "ft_p2c_005/dispatch_key/hardened:device_mismatch_fail_closed",
+          "ft_p2c_005/dispatch_key/hardened:dtype_mismatch_fail_closed",
+          "ft_p2c_005/dispatch_key/hardened:empty_keyset_fail_closed",
+          "ft_p2c_005/dispatch_key/hardened:no_backend_key_fail_closed",
+          "ft_p2c_005/dispatch_key/hardened:no_type_key_fail_closed",
+          "ft_p2c_005/dispatch_key/hardened:strict_autograd_route",
+          "ft_p2c_005/dispatch_key/hardened:strict_cpu_route",
+          "ft_p2c_005/dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:autograd_without_cpu_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:composite_route_mode_split",
+          "ft_p2c_005/dispatch_key/strict:device_mismatch_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:dtype_mismatch_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:empty_keyset_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:no_backend_key_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:no_type_key_fail_closed",
+          "ft_p2c_005/dispatch_key/strict:strict_autograd_route",
+          "ft_p2c_005/dispatch_key/strict:strict_cpu_route",
+          "ft_p2c_005/dispatch_key/strict:unknown_dispatch_key_fail_closed",
+          "ft_p2c_005/scalar_dac/hardened:add_basic",
+          "ft_p2c_005/scalar_dac/hardened:add_negative_rhs",
+          "ft_p2c_005/scalar_dac/hardened:add_zero_identity",
+          "ft_p2c_005/scalar_dac/hardened:mul_basic",
+          "ft_p2c_005/scalar_dac/hardened:mul_negative_lhs",
+          "ft_p2c_005/scalar_dac/hardened:mul_zero_absorber",
+          "ft_p2c_005/scalar_dac/strict:add_basic",
+          "ft_p2c_005/scalar_dac/strict:add_negative_rhs",
+          "ft_p2c_005/scalar_dac/strict:add_zero_identity",
+          "ft_p2c_005/scalar_dac/strict:mul_basic",
+          "ft_p2c_005/scalar_dac/strict:mul_negative_lhs",
+          "ft_p2c_005/scalar_dac/strict:mul_zero_absorber",
+          "ft_p2c_005/tensor_meta/hardened:broadcast_stride_zero_valid",
+          "ft_p2c_005/tensor_meta/hardened:contiguous_basic_index",
+          "ft_p2c_005/tensor_meta/hardened:invalid_rank_stride_extra_fail_closed",
+          "ft_p2c_005/tensor_meta/hardened:invalid_rank_stride_mismatch",
+          "ft_p2c_005/tensor_meta/hardened:invalid_storage_offset_overflow",
+          "ft_p2c_005/tensor_meta/hardened:invalid_storage_offset_overflow_large",
+          "ft_p2c_005/tensor_meta/hardened:scalar_offset_index",
+          "ft_p2c_005/tensor_meta/hardened:strided_offset_index",
+          "ft_p2c_005/tensor_meta/strict:broadcast_stride_zero_valid",
+          "ft_p2c_005/tensor_meta/strict:contiguous_basic_index",
+          "ft_p2c_005/tensor_meta/strict:invalid_rank_stride_extra_fail_closed",
+          "ft_p2c_005/tensor_meta/strict:invalid_rank_stride_mismatch",
+          "ft_p2c_005/tensor_meta/strict:invalid_storage_offset_overflow",
+          "ft_p2c_005/tensor_meta/strict:invalid_storage_offset_overflow_large",
+          "ft_p2c_005/tensor_meta/strict:scalar_offset_index",
+          "ft_p2c_005/tensor_meta/strict:strided_offset_index"
         ]
       },
       "FT-P2C-006": {
@@ -75,6 +155,66 @@
           "serialization/hardened:checkpoint_sparse_grad",
           "serialization/strict:checkpoint_basic",
           "serialization/strict:checkpoint_sparse_grad"
+        ]
+      },
+      "FT-P2C-007": {
+        "total_entries": 20,
+        "passed_entries": 20,
+        "pass_ratio": 1.0,
+        "suites_present": [
+          "dispatch_key"
+        ],
+        "scenario_ids": [
+          "ft_p2c_007/dispatch_key/hardened:autograd_without_cpu_fail_closed",
+          "ft_p2c_007/dispatch_key/hardened:composite_route_mode_split",
+          "ft_p2c_007/dispatch_key/hardened:device_mismatch_fail_closed",
+          "ft_p2c_007/dispatch_key/hardened:dtype_mismatch_fail_closed",
+          "ft_p2c_007/dispatch_key/hardened:empty_keyset_fail_closed",
+          "ft_p2c_007/dispatch_key/hardened:no_backend_key_fail_closed",
+          "ft_p2c_007/dispatch_key/hardened:no_type_key_fail_closed",
+          "ft_p2c_007/dispatch_key/hardened:strict_autograd_route",
+          "ft_p2c_007/dispatch_key/hardened:strict_cpu_route",
+          "ft_p2c_007/dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:autograd_without_cpu_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:composite_route_mode_split",
+          "ft_p2c_007/dispatch_key/strict:device_mismatch_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:dtype_mismatch_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:empty_keyset_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:no_backend_key_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:no_type_key_fail_closed",
+          "ft_p2c_007/dispatch_key/strict:strict_autograd_route",
+          "ft_p2c_007/dispatch_key/strict:strict_cpu_route",
+          "ft_p2c_007/dispatch_key/strict:unknown_dispatch_key_fail_closed"
+        ]
+      },
+      "FT-P2C-008": {
+        "total_entries": 20,
+        "passed_entries": 20,
+        "pass_ratio": 1.0,
+        "suites_present": [
+          "nn_state"
+        ],
+        "scenario_ids": [
+          "nn_state/hardened:load_state_assign_rejects_incompatible_tensor_shape",
+          "nn_state/hardened:load_state_incompatible_shape_rejected",
+          "nn_state/hardened:load_state_missing_unexpected_mode_split",
+          "nn_state/hardened:mode_propagation_train_eval_alias",
+          "nn_state/hardened:module_to_preserves_keyset_and_shapes",
+          "nn_state/hardened:prefix_consumption_maps_ddp_state_dict_keys",
+          "nn_state/hardened:register_buffer_tracks_persistence_flag",
+          "nn_state/hardened:register_parameter_rejects_invalid_name",
+          "nn_state/hardened:state_dict_hooks_fire_in_order",
+          "nn_state/hardened:state_dict_nested_prefixes_are_stable",
+          "nn_state/strict:load_state_assign_rejects_incompatible_tensor_shape",
+          "nn_state/strict:load_state_incompatible_shape_rejected",
+          "nn_state/strict:load_state_missing_unexpected_mode_split",
+          "nn_state/strict:mode_propagation_train_eval_alias",
+          "nn_state/strict:module_to_preserves_keyset_and_shapes",
+          "nn_state/strict:prefix_consumption_maps_ddp_state_dict_keys",
+          "nn_state/strict:register_buffer_tracks_persistence_flag",
+          "nn_state/strict:register_parameter_rejects_invalid_name",
+          "nn_state/strict:state_dict_hooks_fire_in_order",
+          "nn_state/strict:state_dict_nested_prefixes_are_stable"
         ]
       }
     }

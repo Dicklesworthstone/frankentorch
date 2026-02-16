@@ -1,0 +1,243 @@
+name: phase2c-reliability-gates
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+  workflow_dispatch:
+    inputs:
+      enforce_g8:
+        description: "Enforce G8 readiness sign-off gate"
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: phase2c-reliability-gates-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  gate-topology:
+    name: G1..G8 gate topology
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: phase2c-reliability-gates
+
+      - name: Prepare artifact directories
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts/phase2c/conformance
+          mkdir -p artifacts/phase2c/e2e_forensics
+
+      - name: G1 fmt/lint hygiene
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G1 failure::gate_id=G1 budget_ids=n/a failing_packet=n/a failing_suite=fmt_or_clippy replay='env CARGO_TARGET_DIR=target_phase2c cargo fmt --check && env CARGO_TARGET_DIR=target_phase2c cargo clippy --workspace --all-targets -- -D warnings' artifact_refs='CI log stream' reason_code=g1_fmt_or_clippy remediation_hint='Fix formatting/lint violations and rerun G1'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo fmt --check
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: G2 unit/property + structured log contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G2 failure::gate_id=G2 budget_ids=n/a failing_packet=workspace failing_suite=unit_property replay='env CARGO_TARGET_DIR=target_phase2c cargo test --workspace' artifact_refs='artifacts/phase2c/UNIT_E2E_LOGGING_CROSSWALK_V1.json,artifacts/phase2c/FT-P2C-*/unit_property_quality_report_v1.json' reason_code=g2_unit_or_log_contract remediation_hint='Fix failing unit/property tests or structured log contract drift'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test --workspace
+
+      - name: G3 differential/metamorphic/adversarial parity
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G3 failure::gate_id=G3 budget_ids=n/a failing_packet=phase2c failing_suite=differential replay='env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_differential_report -- --mode both --output artifacts/phase2c/conformance/differential_report_v1.json' artifact_refs='artifacts/phase2c/conformance/differential_report_v1.json,artifacts/phase2c/FT-P2C-*/differential_packet_report_v1.json' reason_code=g3_differential_regression remediation_hint='Inspect differential report and reconcile drift before rerun'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_differential_report -- --mode both --output artifacts/phase2c/conformance/differential_report_v1.json
+
+      - name: G4 e2e replay/forensics + reliability budgets
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G4 failure::gate_id=G4 budget_ids='phase2c-coverage-floor-v1,phase2c-pass-ratio-v1,phase2c-global-failure-ceiling-v1,phase2c-flake-ceiling-v1,phase2c-reason-taxonomy-v1' failing_packet=phase2c failing_suite=e2e_forensics replay='env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --output artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl' artifact_refs='artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl,artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl,artifacts/phase2c/e2e_forensics/ft-p2c-003.jsonl,artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl,artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl,artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl,artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json,artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json,artifacts/phase2c/e2e_forensics/reliability_gate_report_v1.json' reason_code=g4_e2e_or_budget_violation remediation_hint='Review reliability_gate_report_v1.json, failing scenario_ids, and replay commands'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --output artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-003 --output artifacts/phase2c/e2e_forensics/ft-p2c-003.jsonl
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-005 --output artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-007 --output artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-008 --output artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl
+          cat \
+            artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl \
+            artifacts/phase2c/e2e_forensics/ft-p2c-003.jsonl \
+            artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl \
+            artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl \
+            artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl \
+            | awk '!seen[$0]++' > artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin triage_forensics_failures -- --input artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl --output artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin build_failure_forensics_index -- --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl --triage artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json --output artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin check_reliability_budgets -- --policy artifacts/phase2c/RELIABILITY_BUDGET_POLICY_V1.json --e2e artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl --output artifacts/phase2c/e2e_forensics/reliability_gate_report_v1.json
+
+      - name: G5 perf tails + isomorphism guardrail
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G5 failure::gate_id=G5 budget_ids=n/a failing_packet=phase2c failing_suite=packet_e2e_microbench replay='env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance packet_e2e_microbench -- --nocapture' artifact_refs='artifacts/phase2c/FT-P2C-*/optimization_delta_v1.json,artifacts/phase2c/FT-P2C-*/optimization_isomorphism_v1.md' reason_code=g5_perf_or_isomorphism_regression remediation_hint='Investigate microbench tail regressions and isomorphism proof drift'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance packet_e2e_microbench -- --nocapture
+
+      - name: G6 artifact schema + packet lock validation
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G6 failure::gate_id=G6 budget_ids=n/a failing_packet=phase2c failing_suite=artifact_validator replay='env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin validate_phase2c_artifacts -- ${GITHUB_WORKSPACE}' artifact_refs='artifacts/phase2c/SCHEMA_LOCK_V1.md,artifacts/phase2c/FT-P2C-*/parity_gate.yaml' reason_code=g6_schema_or_packet_lock_violation remediation_hint='Fix missing/invalid packet artifacts and rerun validator'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin validate_phase2c_artifacts -- "$GITHUB_WORKSPACE"
+
+      - name: G7 RaptorQ decode/integrity durability
+        shell: bash
+        run: |
+          set -euo pipefail
+          run_or_offload() {
+            if command -v rch >/dev/null 2>&1; then
+              rch exec -- "$@"
+            else
+              "$@"
+            fi
+          }
+          gate_fail() {
+            local status=$?
+            echo "::error title=Gate G7 failure::gate_id=G7 budget_ids=n/a failing_packet=phase2c failing_suite=raptorq_durability replay='env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_raptorq_durability_pipeline' artifact_refs='artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json,artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json,artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json' reason_code=g7_raptorq_durability_failure remediation_hint='Inspect RaptorQ pipeline output and repair missing/corrupt sidecars'"
+            exit "$status"
+          }
+          trap gate_fail ERR
+          run_or_offload env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_raptorq_durability_pipeline
+
+      - name: G8 readiness sign-off + residual risk (enforced)
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.enforce_g8 == true }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          required=(
+            "artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json"
+            "artifacts/phase2c/READINESS_DRILL_SIGNOFF_V1.md"
+          )
+          missing=0
+          for path in "${required[@]}"; do
+            if [[ ! -f "$path" ]]; then
+              echo "::error title=Gate G8 failure::gate_id=G8 budget_ids=n/a failing_packet=phase2c failing_suite=readiness_signoff replay='workflow_dispatch with enforce_g8=true after producing readiness artifact' artifact_refs='artifacts/phase2c/HARDENED_DEVIATION_ALLOWLIST_V1.json,artifacts/phase2c/READINESS_DRILL_SIGNOFF_V1.md' reason_code=g8_missing_readiness_artifact remediation_hint='Complete bd-3v0.11 readiness drill and commit sign-off artifact'"
+              echo "Missing required readiness artifact: $path"
+              missing=1
+            fi
+          done
+          if [[ "$missing" -ne 0 ]]; then
+            exit 1
+          fi
+
+      - name: G8 readiness sign-off + residual risk (deferred)
+        if: ${{ !(github.event_name == 'workflow_dispatch' && inputs.enforce_g8 == true) }}
+        shell: bash
+        run: |
+          echo "G8 readiness sign-off is defined but not enforced in this run."
+          echo "Use workflow_dispatch with enforce_g8=true after bd-3v0.11 closes."
+
+      - name: Upload Phase-2C forensic artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: phase2c-forensics-${{ github.run_id }}
+          if-no-files-found: warn
+          path: |
+            artifacts/phase2c/conformance/differential_report_v1.json
+            artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl
+            artifacts/phase2c/e2e_forensics/e2e_matrix_gate_window_v1.jsonl
+            artifacts/phase2c/e2e_forensics/ft-p2c-003.jsonl
+            artifacts/phase2c/e2e_forensics/ft-p2c-005.jsonl
+            artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl
+            artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl
+            artifacts/phase2c/e2e_forensics/crash_triage_full_v1.json
+            artifacts/phase2c/e2e_forensics/failure_forensics_index_v1.json
+            artifacts/phase2c/e2e_forensics/reliability_gate_report_v1.json
+            artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json
+            artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json
+            artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json
