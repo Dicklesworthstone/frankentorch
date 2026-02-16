@@ -1,0 +1,14 @@
+{
+  "packet_id": "FT-P2C-008",
+  "suite": "nn_state",
+  "strict": {
+    "cases_total": 10,
+    "cases_passed": 10
+  },
+  "hardened": {
+    "cases_total": 10,
+    "cases_passed": 10
+  },
+  "status": "parity_green",
+  "generated_from": "CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance strict_nn_state_conformance_is_green hardened_nn_state_conformance_is_green -- --nocapture"
+}

@@ -1,0 +1,79 @@
+{
+  "schema_version": "ft-p2c-e2e-linkage-v1",
+  "packet_id": "FT-P2C-008",
+  "generated_at": "2026-02-16T16:38:43Z",
+  "source_e2e_log": "artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl",
+  "source_triage": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_008_v1.json",
+  "source_failure_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_008_v1.json",
+  "total_entries": 20,
+  "failed_entries": 0,
+  "suite_breakdown": [
+    {
+      "suite_id": "nn_state",
+      "count": 20
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 10
+    },
+    {
+      "mode": "strict",
+      "count": 10
+    }
+  ],
+  "deterministic_replay_field_coverage": {
+    "scenario_id": true,
+    "seed": true,
+    "env_fingerprint": true,
+    "artifact_refs": true,
+    "replay_command": true,
+    "reason_code": true
+  },
+  "replay_command_catalog": [
+    "cargo test -p ft-conformance strict_nn_state_conformance_is_green -- --nocapture # mode=hardened",
+    "cargo test -p ft-conformance strict_nn_state_conformance_is_green -- --nocapture # mode=strict"
+  ],
+  "scenario_ids": [
+    "nn_state/hardened:load_state_assign_rejects_incompatible_tensor_shape",
+    "nn_state/hardened:load_state_incompatible_shape_rejected",
+    "nn_state/hardened:load_state_missing_unexpected_mode_split",
+    "nn_state/hardened:mode_propagation_train_eval_alias",
+    "nn_state/hardened:module_to_preserves_keyset_and_shapes",
+    "nn_state/hardened:prefix_consumption_maps_ddp_state_dict_keys",
+    "nn_state/hardened:register_buffer_tracks_persistence_flag",
+    "nn_state/hardened:register_parameter_rejects_invalid_name",
+    "nn_state/hardened:state_dict_hooks_fire_in_order",
+    "nn_state/hardened:state_dict_nested_prefixes_are_stable",
+    "nn_state/strict:load_state_assign_rejects_incompatible_tensor_shape",
+    "nn_state/strict:load_state_incompatible_shape_rejected",
+    "nn_state/strict:load_state_missing_unexpected_mode_split",
+    "nn_state/strict:mode_propagation_train_eval_alias",
+    "nn_state/strict:module_to_preserves_keyset_and_shapes",
+    "nn_state/strict:prefix_consumption_maps_ddp_state_dict_keys",
+    "nn_state/strict:register_buffer_tracks_persistence_flag",
+    "nn_state/strict:register_parameter_rejects_invalid_name",
+    "nn_state/strict:state_dict_hooks_fire_in_order",
+    "nn_state/strict:state_dict_nested_prefixes_are_stable"
+  ],
+  "linkage_refs": {
+    "unit_property": [
+      "rch exec -- cargo test -p ft-conformance strict_nn_state_conformance_is_green -- --nocapture",
+      "rch exec -- cargo test -p ft-conformance hardened_nn_state_conformance_is_green -- --nocapture",
+      "rch exec -- cargo test -p ft-conformance nn_state_logs_include_packet_008_contract_fields -- --nocapture",
+      "rch exec -- cargo test -p ft-conformance nn_state_property_key_validation_stays_fail_closed -- --nocapture",
+      "rch exec -- cargo test -p ft-conformance nn_state_property_export_excludes_non_persistent_buffers -- --nocapture"
+    ],
+    "differential": [
+      "artifacts/phase2c/conformance/differential_report_v1.json",
+      "artifacts/phase2c/FT-P2C-008/differential_packet_report_v1.json",
+      "artifacts/phase2c/FT-P2C-008/differential_reconciliation_v1.md"
+    ],
+    "optimization": [
+      "artifacts/phase2c/FT-P2C-008/optimization_delta_v1.json",
+      "artifacts/phase2c/FT-P2C-008/optimization_isomorphism_v1.md"
+    ]
+  },
+  "status": "pass"
+}

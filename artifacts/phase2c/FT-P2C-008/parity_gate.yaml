@@ -1,0 +1,21 @@
+packet_id: FT-P2C-008
+suite: nn_state
+release_blocking: true
+
+strict:
+  required_cases_passed_ratio: 1.0
+  critical_drift_budget: 0
+
+hardened:
+  required_cases_passed_ratio: 1.0
+  divergence_budget_ratio: 0.0
+
+checks:
+  - command: CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance strict_nn_state_conformance_is_green -- --nocapture
+  - command: CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance hardened_nn_state_conformance_is_green -- --nocapture
+  - command: CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance differential_nn_state_adds_metamorphic_and_adversarial_checks -- --nocapture
+  - command: CARGO_TARGET_DIR=target_amberpelican_008 cargo test -p ft-conformance e2e_matrix_packet_filter_includes_nn_state_packet_entries -- --nocapture
+
+artifacts:
+  - crates/ft-conformance/fixtures/nn_state_cases.json
+  - artifacts/phase2c/FT-P2C-008/fixture_manifest.json

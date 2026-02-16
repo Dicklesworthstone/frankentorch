@@ -1,0 +1,216 @@
+{
+  "packet_id": "FT-P2C-008",
+  "behavior_ledger": "artifacts/phase2c/FT-P2C-008/behavior_extraction_ledger.md",
+  "legacy_anchor_map": "artifacts/phase2c/FT-P2C-008/legacy_anchor_map.md",
+  "implementation_plan": "artifacts/phase2c/FT-P2C-008/implementation_plan.md",
+  "differential_packet_report": "artifacts/phase2c/FT-P2C-008/differential_packet_report_v1.json",
+  "differential_reconciliation_note": "artifacts/phase2c/FT-P2C-008/differential_reconciliation_v1.md",
+  "e2e_log_artifact": "artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl",
+  "e2e_crash_triage_artifact": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_008_v1.json",
+  "e2e_failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_008_v1.json",
+  "e2e_linkage_summary": "artifacts/phase2c/FT-P2C-008/e2e_replay_forensics_linkage_v1.json",
+  "e2e_linkage_note": "artifacts/phase2c/FT-P2C-008/e2e_replay_forensics_linkage_v1.md",
+  "optimization_delta": "artifacts/phase2c/FT-P2C-008/optimization_delta_v1.json",
+  "optimization_isomorphism_note": "artifacts/phase2c/FT-P2C-008/optimization_isomorphism_v1.md",
+  "fixtures": [
+    {
+      "id": "nn_state_register_parameter_rejects_invalid_name",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "register_parameter_rejects_invalid_name",
+      "oracle_family": "nn_state",
+      "assertions": ["fail_closed", "reason_code"]
+    },
+    {
+      "id": "nn_state_register_buffer_tracks_persistence_flag",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "register_buffer_tracks_persistence_flag",
+      "oracle_family": "nn_state",
+      "assertions": ["persistent_buffer_only", "state_keys"]
+    },
+    {
+      "id": "nn_state_state_dict_nested_prefixes_are_stable",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "state_dict_nested_prefixes_are_stable",
+      "oracle_family": "nn_state",
+      "assertions": ["state_keys", "prefix_stability"]
+    },
+    {
+      "id": "nn_state_mode_propagation_train_eval_alias",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "mode_propagation_train_eval_alias",
+      "oracle_family": "nn_state",
+      "assertions": ["training_flag_transition", "metamorphic_mode_idempotence"]
+    },
+    {
+      "id": "nn_state_load_state_missing_unexpected_mode_split",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "load_state_missing_unexpected_mode_split",
+      "oracle_family": "nn_state",
+      "assertions": ["strict_fail_closed", "hardened_allowlist_policy"]
+    },
+    {
+      "id": "nn_state_load_state_incompatible_shape_rejected",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "load_state_incompatible_shape_rejected",
+      "oracle_family": "nn_state",
+      "assertions": ["incompatible_shape_rejected", "reason_code"]
+    },
+    {
+      "id": "nn_state_prefix_consumption_maps_ddp_state_dict_keys",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "prefix_consumption_maps_ddp_state_dict_keys",
+      "oracle_family": "nn_state",
+      "assertions": ["prefix_normalization_applied", "canonical_key_map"]
+    },
+    {
+      "id": "nn_state_state_dict_hooks_fire_in_order",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "state_dict_hooks_fire_in_order",
+      "oracle_family": "nn_state",
+      "assertions": ["hook_trace_order", "hook_trace_stability"]
+    },
+    {
+      "id": "nn_state_module_to_preserves_keyset_and_shapes",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "module_to_preserves_keyset_and_shapes",
+      "oracle_family": "nn_state",
+      "assertions": ["keyset_preserved", "non_persistent_buffer_excluded"]
+    },
+    {
+      "id": "nn_state_load_state_assign_rejects_incompatible_tensor_shape",
+      "file": "crates/ft-conformance/fixtures/nn_state_cases.json",
+      "case_name": "load_state_assign_rejects_incompatible_tensor_shape",
+      "oracle_family": "nn_state",
+      "assertions": ["assign_path_fail_closed", "incompatible_shape_rejected"]
+    }
+  ],
+  "modes": [
+    "strict",
+    "hardened"
+  ],
+  "logging_fields_required": [
+    "suite_id",
+    "scenario_id",
+    "fixture_id",
+    "packet_id",
+    "mode",
+    "seed",
+    "env_fingerprint",
+    "artifact_refs",
+    "replay_command",
+    "outcome",
+    "reason_code"
+  ],
+  "scenario_seed_map": {
+    "nn_state/strict:register_parameter_rejects_invalid_name": 16718412775492013401,
+    "nn_state/strict:register_buffer_tracks_persistence_flag": 17431904315013854904,
+    "nn_state/strict:state_dict_nested_prefixes_are_stable": 7852284913050687554,
+    "nn_state/strict:mode_propagation_train_eval_alias": 381229097882778972,
+    "nn_state/strict:load_state_missing_unexpected_mode_split": 37240648936643437,
+    "nn_state/strict:load_state_incompatible_shape_rejected": 3733052369910529892,
+    "nn_state/strict:prefix_consumption_maps_ddp_state_dict_keys": 13875613561773434278,
+    "nn_state/strict:state_dict_hooks_fire_in_order": 16978299035371592175,
+    "nn_state/strict:module_to_preserves_keyset_and_shapes": 17423047019656801511,
+    "nn_state/strict:load_state_assign_rejects_incompatible_tensor_shape": 2179544862486913088,
+    "nn_state/hardened:register_parameter_rejects_invalid_name": 13293221716727813487,
+    "nn_state/hardened:register_buffer_tracks_persistence_flag": 14883337254597632294,
+    "nn_state/hardened:state_dict_nested_prefixes_are_stable": 933276310607701581,
+    "nn_state/hardened:mode_propagation_train_eval_alias": 5466591154941328597,
+    "nn_state/hardened:load_state_missing_unexpected_mode_split": 7361232525011555190,
+    "nn_state/hardened:load_state_incompatible_shape_rejected": 17063638471612821105,
+    "nn_state/hardened:prefix_consumption_maps_ddp_state_dict_keys": 5047304702007858444,
+    "nn_state/hardened:state_dict_hooks_fire_in_order": 11863962429143804223,
+    "nn_state/hardened:module_to_preserves_keyset_and_shapes": 1204208843193412060,
+    "nn_state/hardened:load_state_assign_rejects_incompatible_tensor_shape": 16006249320005824350
+  },
+  "unit_property_validation": {
+    "bead_id": "bd-3v0.19.5",
+    "quality_report": "artifacts/phase2c/FT-P2C-008/unit_property_quality_report_v1.json",
+    "coverage_report": "artifacts/phase2c/FT-P2C-008/unit_property_coverage_v1.json"
+  },
+  "differential_validation": {
+    "bead_id": "bd-3v0.19.6",
+    "report_path": "artifacts/phase2c/conformance/differential_report_v1.json",
+    "packet_report": "artifacts/phase2c/FT-P2C-008/differential_packet_report_v1.json",
+    "reconciliation_note": "artifacts/phase2c/FT-P2C-008/differential_reconciliation_v1.md",
+    "required_comparators": [
+      "contract_expectation",
+      "policy",
+      "structured_log_detail",
+      "metamorphic_mode_transition_idempotent",
+      "metamorphic_prefix_normalization_idempotent",
+      "metamorphic_hook_trace_stable",
+      "adversarial_incompatible_shape_rejected",
+      "adversarial_assign_shape_rejected",
+      "adversarial_non_persistent_buffer_excluded"
+    ]
+  },
+  "e2e_validation": {
+    "bead_id": "bd-3v0.19.7",
+    "packet_log_path": "artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl",
+    "triage_path": "artifacts/phase2c/e2e_forensics/crash_triage_ft_p2c_008_v1.json",
+    "failure_forensics_index": "artifacts/phase2c/e2e_forensics/failure_forensics_index_ft_p2c_008_v1.json",
+    "linkage_summary": "artifacts/phase2c/FT-P2C-008/e2e_replay_forensics_linkage_v1.json",
+    "linkage_note": "artifacts/phase2c/FT-P2C-008/e2e_replay_forensics_linkage_v1.md",
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_008 cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-008 --output artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl",
+    "as_of_utc": "2026-02-16T16:38:43Z",
+    "log_entries": 20,
+    "failed_entries": 0,
+    "modes": [
+      "strict",
+      "hardened"
+    ],
+    "scenario_ids": [
+      "nn_state/hardened:load_state_assign_rejects_incompatible_tensor_shape",
+      "nn_state/hardened:load_state_incompatible_shape_rejected",
+      "nn_state/hardened:load_state_missing_unexpected_mode_split",
+      "nn_state/hardened:mode_propagation_train_eval_alias",
+      "nn_state/hardened:module_to_preserves_keyset_and_shapes",
+      "nn_state/hardened:prefix_consumption_maps_ddp_state_dict_keys",
+      "nn_state/hardened:register_buffer_tracks_persistence_flag",
+      "nn_state/hardened:register_parameter_rejects_invalid_name",
+      "nn_state/hardened:state_dict_hooks_fire_in_order",
+      "nn_state/hardened:state_dict_nested_prefixes_are_stable",
+      "nn_state/strict:load_state_assign_rejects_incompatible_tensor_shape",
+      "nn_state/strict:load_state_incompatible_shape_rejected",
+      "nn_state/strict:load_state_missing_unexpected_mode_split",
+      "nn_state/strict:mode_propagation_train_eval_alias",
+      "nn_state/strict:module_to_preserves_keyset_and_shapes",
+      "nn_state/strict:prefix_consumption_maps_ddp_state_dict_keys",
+      "nn_state/strict:register_buffer_tracks_persistence_flag",
+      "nn_state/strict:register_parameter_rejects_invalid_name",
+      "nn_state/strict:state_dict_hooks_fire_in_order",
+      "nn_state/strict:state_dict_nested_prefixes_are_stable"
+    ],
+    "reason_codes": [
+      "nn_state_contract_pass",
+      "expected_error_observed",
+      "allowlisted_hardened_recovery"
+    ],
+    "triage_incidents": 0
+  },
+  "optimization_validation": {
+    "bead_id": "bd-3v0.19.8",
+    "delta_report": "artifacts/phase2c/FT-P2C-008/optimization_delta_v1.json",
+    "isomorphism_note": "artifacts/phase2c/FT-P2C-008/optimization_isomorphism_v1.md"
+  },
+  "security_compatibility_artifact": "artifacts/phase2c/FT-P2C-008/risk_note.md",
+  "contract_artifacts": [
+    "artifacts/phase2c/FT-P2C-008/legacy_anchor_map.md",
+    "artifacts/phase2c/FT-P2C-008/behavior_extraction_ledger.md",
+    "artifacts/phase2c/FT-P2C-008/contract_table.md",
+    "artifacts/phase2c/FT-P2C-008/implementation_plan.md",
+    "artifacts/phase2c/FT-P2C-008/threat_model.md",
+    "artifacts/phase2c/FT-P2C-008/risk_note.md",
+    "artifacts/phase2c/FT-P2C-008/unit_property_quality_report_v1.json",
+    "artifacts/phase2c/FT-P2C-008/differential_packet_report_v1.json",
+    "artifacts/phase2c/FT-P2C-008/differential_reconciliation_v1.md",
+    "artifacts/phase2c/FT-P2C-008/e2e_replay_forensics_linkage_v1.json",
+    "artifacts/phase2c/FT-P2C-008/e2e_replay_forensics_linkage_v1.md",
+    "artifacts/phase2c/FT-P2C-008/optimization_delta_v1.json",
+    "artifacts/phase2c/FT-P2C-008/optimization_isomorphism_v1.md",
+    "artifacts/phase2c/FT-P2C-008/parity_report.raptorq.json",
+    "artifacts/phase2c/FT-P2C-008/parity_report.decode_proof.json"
+  ],
+  "status": "active"
+}

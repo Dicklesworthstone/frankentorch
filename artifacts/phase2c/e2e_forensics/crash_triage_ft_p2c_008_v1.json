@@ -1,0 +1,10 @@
+{
+  "schema_version": "ft-crash-triage-v1",
+  "generated_unix_ms": 1771259880049,
+  "input_log_path": "artifacts/phase2c/e2e_forensics/ft-p2c-008.jsonl",
+  "packet_filter": "FT-P2C-008",
+  "total_entries": 20,
+  "failed_entries": 0,
+  "class_counts": {},
+  "incidents": []
+}
