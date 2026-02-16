@@ -464,10 +464,17 @@ pub fn run_scalar_conformance(
 ) -> Result<(HarnessReport, Vec<CaseReport>), String> {
     let fixture_path = config.fixture_root.join("scalar_autograd_cases.json");
     let fixture: ScalarFixtureFile = load_fixture(&fixture_path)?;
+    run_scalar_conformance_with_fixture(config, mode, &fixture)
+}
 
+fn run_scalar_conformance_with_fixture(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+    fixture: &ScalarFixtureFile,
+) -> Result<(HarnessReport, Vec<CaseReport>), String> {
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
-    for case in fixture.cases {
-        case_reports.push(run_scalar_case(&case, mode)?);
+    for case in &fixture.cases {
+        case_reports.push(run_scalar_case(case, mode)?);
     }
 
     let (cases_total, cases_passed) = summarize_passes(
@@ -494,10 +501,17 @@ pub fn run_tensor_meta_conformance(
 ) -> Result<(HarnessReport, Vec<TensorMetaCaseReport>), String> {
     let fixture_path = config.fixture_root.join("tensor_meta_cases.json");
     let fixture: TensorMetaFixtureFile = load_fixture(&fixture_path)?;
+    run_tensor_meta_conformance_with_fixture(config, mode, &fixture)
+}
 
+fn run_tensor_meta_conformance_with_fixture(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+    fixture: &TensorMetaFixtureFile,
+) -> Result<(HarnessReport, Vec<TensorMetaCaseReport>), String> {
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
-    for case in fixture.cases {
-        case_reports.push(run_tensor_meta_case(&case, mode)?);
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_meta_case(case, mode)?);
     }
 
     let (cases_total, cases_passed) =
@@ -521,10 +535,17 @@ pub fn run_dispatch_conformance(
 ) -> Result<(HarnessReport, Vec<DispatchCaseReport>), String> {
     let fixture_path = config.fixture_root.join("dispatch_key_cases.json");
     let fixture: DispatchFixtureFile = load_fixture(&fixture_path)?;
+    run_dispatch_conformance_with_fixture(config, mode, &fixture)
+}
 
+fn run_dispatch_conformance_with_fixture(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+    fixture: &DispatchFixtureFile,
+) -> Result<(HarnessReport, Vec<DispatchCaseReport>), String> {
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
-    for case in fixture.cases {
-        case_reports.push(run_dispatch_case(&case, mode)?);
+    for case in &fixture.cases {
+        case_reports.push(run_dispatch_case(case, mode)?);
     }
 
     let (cases_total, cases_passed) =
@@ -642,18 +663,36 @@ pub fn emit_e2e_forensics_matrix_filtered(
     } else {
         modes.to_vec()
     };
+    let include_ft_p2c_001 = packet_in_scope(packet_filter, "FT-P2C-001");
+    let include_ft_p2c_002 = packet_in_scope(packet_filter, "FT-P2C-002");
+    let include_ft_p2c_003 = packet_in_scope(packet_filter, "FT-P2C-003");
+    let include_ft_p2c_004 = packet_in_scope(packet_filter, "FT-P2C-004");
+    let include_ft_p2c_005 = packet_in_scope(packet_filter, "FT-P2C-005");
+    let include_ft_p2c_006 = packet_in_scope(packet_filter, "FT-P2C-006");
+
+    let scalar_fixture = if include_ft_p2c_001 || include_ft_p2c_005 {
+        let fixture_path = config.fixture_root.join("scalar_autograd_cases.json");
+        Some(load_fixture::<ScalarFixtureFile>(&fixture_path)?)
+    } else {
+        None
+    };
+    let tensor_meta_fixture = if include_ft_p2c_001 || include_ft_p2c_005 {
+        let fixture_path = config.fixture_root.join("tensor_meta_cases.json");
+        Some(load_fixture::<TensorMetaFixtureFile>(&fixture_path)?)
+    } else {
+        None
+    };
+    let dispatch_fixture = if include_ft_p2c_002 || include_ft_p2c_005 {
+        let fixture_path = config.fixture_root.join("dispatch_key_cases.json");
+        Some(load_fixture::<DispatchFixtureFile>(&fixture_path)?)
+    } else {
+        None
+    };
 
     let mut logs = Vec::new();
     for mode in selected_modes.iter().copied() {
-        let include_ft_p2c_001 = packet_in_scope(packet_filter, "FT-P2C-001");
-        let include_ft_p2c_002 = packet_in_scope(packet_filter, "FT-P2C-002");
-        let include_ft_p2c_003 = packet_in_scope(packet_filter, "FT-P2C-003");
-        let include_ft_p2c_004 = packet_in_scope(packet_filter, "FT-P2C-004");
-        let include_ft_p2c_005 = packet_in_scope(packet_filter, "FT-P2C-005");
-        let include_ft_p2c_006 = packet_in_scope(packet_filter, "FT-P2C-006");
-
-        if include_ft_p2c_001 || include_ft_p2c_005 {
-            let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
+        if let Some(fixture) = scalar_fixture.as_ref() {
+            let (_, scalar_cases) = run_scalar_conformance_with_fixture(config, mode, fixture)?;
             let scalar_logs = scalar_cases
                 .into_iter()
                 .map(|case| case.forensic_log)
@@ -664,8 +703,11 @@ pub fn emit_e2e_forensics_matrix_filtered(
                 include_ft_p2c_001,
                 include_ft_p2c_005,
             );
+        }
 
-            let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
+        if let Some(fixture) = tensor_meta_fixture.as_ref() {
+            let (_, tensor_meta_cases) =
+                run_tensor_meta_conformance_with_fixture(config, mode, fixture)?;
             let tensor_meta_logs = tensor_meta_cases
                 .into_iter()
                 .map(|case| case.forensic_log)
@@ -678,8 +720,8 @@ pub fn emit_e2e_forensics_matrix_filtered(
             );
         }
 
-        if include_ft_p2c_002 || include_ft_p2c_005 {
-            let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
+        if let Some(fixture) = dispatch_fixture.as_ref() {
+            let (_, dispatch_cases) = run_dispatch_conformance_with_fixture(config, mode, fixture)?;
             let dispatch_logs = dispatch_cases
                 .into_iter()
                 .map(|case| case.forensic_log)
@@ -708,6 +750,122 @@ pub fn emit_e2e_forensics_matrix_filtered(
                 serialization_cases
                     .into_iter()
                     .map(|case| case.forensic_log),
+            );
+        }
+    }
+
+    if let Some(packet_id) = packet_filter {
+        logs.retain(|entry| entry.packet_id == packet_id);
+    }
+
+    let mut lines = String::new();
+    for entry in &logs {
+        let line = serde_json::to_string(entry)
+            .map_err(|error| format!("failed to serialize structured log entry: {error}"))?;
+        lines.push_str(&line);
+        lines.push('\n');
+    }
+
+    if let Some(parent) = output_path.parent() {
+        fs::create_dir_all(parent).map_err(|error| {
+            format!(
+                "failed to create e2e forensics output dir {}: {error}",
+                parent.display()
+            )
+        })?;
+    }
+
+    fs::write(output_path, lines).map_err(|error| {
+        format!(
+            "failed to write e2e forensics log {}: {error}",
+            output_path.display()
+        )
+    })?;
+
+    let failed_entries = logs.iter().filter(|entry| entry.outcome != "pass").count();
+
+    Ok(E2EForensicsSummary {
+        output_path: output_path.to_path_buf(),
+        log_entries: logs.len(),
+        failed_entries,
+        modes: selected_modes,
+    })
+}
+
+#[cfg(test)]
+fn emit_e2e_forensics_matrix_filtered_legacy(
+    config: &HarnessConfig,
+    output_path: &Path,
+    modes: &[ExecutionMode],
+    packet_filter: Option<&str>,
+) -> Result<E2EForensicsSummary, String> {
+    let selected_modes = if modes.is_empty() {
+        vec![ExecutionMode::Strict, ExecutionMode::Hardened]
+    } else {
+        modes.to_vec()
+    };
+
+    let mut logs = Vec::new();
+    for mode in selected_modes.iter().copied() {
+        let include_ft_p2c_001 = packet_in_scope(packet_filter, "FT-P2C-001");
+        let include_ft_p2c_002 = packet_in_scope(packet_filter, "FT-P2C-002");
+        let include_ft_p2c_003 = packet_in_scope(packet_filter, "FT-P2C-003");
+        let include_ft_p2c_004 = packet_in_scope(packet_filter, "FT-P2C-004");
+        let include_ft_p2c_005 = packet_in_scope(packet_filter, "FT-P2C-005");
+        let include_ft_p2c_006 = packet_in_scope(packet_filter, "FT-P2C-006");
+
+        if include_ft_p2c_001 {
+            let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
+            logs.extend(scalar_cases.into_iter().map(|case| case.forensic_log));
+
+            let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
+            logs.extend(tensor_meta_cases.into_iter().map(|case| case.forensic_log));
+        }
+
+        if include_ft_p2c_002 {
+            let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
+            logs.extend(dispatch_cases.into_iter().map(|case| case.forensic_log));
+        }
+
+        if include_ft_p2c_003 {
+            let (_, op_schema_cases) = run_op_schema_conformance(config, mode)?;
+            logs.extend(op_schema_cases.into_iter().map(|case| case.forensic_log));
+        }
+
+        if include_ft_p2c_004 {
+            let (_, scheduler_cases) = run_autograd_scheduler_conformance(config, mode)?;
+            logs.extend(scheduler_cases.into_iter().map(|case| case.forensic_log));
+        }
+
+        if include_ft_p2c_006 {
+            let (_, serialization_cases) = run_serialization_conformance(config, mode)?;
+            logs.extend(
+                serialization_cases
+                    .into_iter()
+                    .map(|case| case.forensic_log),
+            );
+        }
+
+        if include_ft_p2c_005 {
+            let (_, scalar_cases) = run_scalar_conformance(config, mode)?;
+            logs.extend(
+                scalar_cases
+                    .into_iter()
+                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
+            );
+
+            let (_, tensor_meta_cases) = run_tensor_meta_conformance(config, mode)?;
+            logs.extend(
+                tensor_meta_cases
+                    .into_iter()
+                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
+            );
+
+            let (_, dispatch_cases) = run_dispatch_conformance(config, mode)?;
+            logs.extend(
+                dispatch_cases
+                    .into_iter()
+                    .map(|case| project_log_to_ft_p2c_005(case.forensic_log)),
             );
         }
     }
@@ -2211,6 +2369,50 @@ pub fn run_packet_e2e_microbench(
         if summary.failed_entries > 0 {
             return Err(format!(
                 "packet e2e microbench observed {} failed entries for packet {}",
+                summary.failed_entries, packet_id
+            ));
+        }
+        samples.push(started.elapsed().as_nanos());
+    }
+
+    let _ = fs::remove_file(output_path);
+    samples.sort_unstable();
+    let sum = samples.iter().copied().sum::<u128>();
+    let mean = sum / (samples.len() as u128);
+
+    Ok(BenchReport {
+        iterations: samples.len(),
+        p50_ns: percentile(&samples, 50),
+        p95_ns: percentile(&samples, 95),
+        p99_ns: percentile(&samples, 99),
+        mean_ns: mean,
+    })
+}
+
+#[cfg(test)]
+fn run_packet_e2e_microbench_legacy(
+    config: &HarnessConfig,
+    iterations: usize,
+    packet_id: &str,
+) -> Result<BenchReport, String> {
+    let mut samples = Vec::with_capacity(iterations.max(1));
+    let output_path = std::env::temp_dir().join(format!(
+        "ft_conformance_packet_e2e_microbench_legacy_{}_{}.jsonl",
+        packet_id.to_ascii_lowercase(),
+        std::process::id()
+    ));
+
+    for _ in 0..iterations.max(1) {
+        let started = Instant::now();
+        let summary = emit_e2e_forensics_matrix_filtered_legacy(
+            config,
+            output_path.as_path(),
+            &[ExecutionMode::Strict, ExecutionMode::Hardened],
+            Some(packet_id),
+        )?;
+        if summary.failed_entries > 0 {
+            return Err(format!(
+                "packet e2e legacy microbench observed {} failed entries for packet {}",
                 summary.failed_entries, packet_id
             ));
         }
@@ -3931,8 +4133,8 @@ mod tests {
         emit_differential_report_filtered, emit_e2e_forensics_matrix,
         emit_e2e_forensics_matrix_filtered, load_allowlist, project_log_to_ft_p2c_005,
         run_autograd_scheduler_conformance, run_differential_conformance, run_dispatch_conformance,
-        run_op_schema_conformance, run_packet_e2e_microbench, run_scalar_conformance,
-        run_scalar_microbench, run_serialization_conformance, run_smoke,
+        run_op_schema_conformance, run_packet_e2e_microbench, run_packet_e2e_microbench_legacy,
+        run_scalar_conformance, run_scalar_microbench, run_serialization_conformance, run_smoke,
         run_tensor_meta_conformance,
     };
 
@@ -4492,6 +4694,46 @@ mod tests {
         assert!(report.p50_ns > 0);
         assert!(report.p95_ns >= report.p50_ns);
         assert!(report.p99_ns >= report.p95_ns);
+    }
+
+    #[test]
+    fn packet_e2e_microbench_cpu_kernel_produces_percentiles() {
+        let report = run_packet_e2e_microbench(&HarnessConfig::default_paths(), 10, "FT-P2C-005")
+            .expect("packet e2e microbench should run");
+        eprintln!(
+            "packet_e2e_microbench_ns packet=FT-P2C-005 p50={} p95={} p99={} mean={}",
+            report.p50_ns, report.p95_ns, report.p99_ns, report.mean_ns
+        );
+        assert_eq!(report.iterations, 10);
+        assert!(report.p50_ns > 0);
+        assert!(report.p95_ns >= report.p50_ns);
+        assert!(report.p99_ns >= report.p95_ns);
+    }
+
+    #[test]
+    fn packet_e2e_microbench_cpu_kernel_optimized_beats_legacy() {
+        let cfg = HarnessConfig::default_paths();
+        let legacy = run_packet_e2e_microbench_legacy(&cfg, 10, "FT-P2C-005")
+            .expect("legacy packet microbench should run");
+        let optimized = run_packet_e2e_microbench(&cfg, 10, "FT-P2C-005")
+            .expect("optimized packet microbench should run");
+
+        eprintln!(
+            "packet_e2e_microbench_compare_ns packet=FT-P2C-005 legacy_p50={} legacy_p95={} legacy_p99={} legacy_mean={} optimized_p50={} optimized_p95={} optimized_p99={} optimized_mean={}",
+            legacy.p50_ns,
+            legacy.p95_ns,
+            legacy.p99_ns,
+            legacy.mean_ns,
+            optimized.p50_ns,
+            optimized.p95_ns,
+            optimized.p99_ns,
+            optimized.mean_ns
+        );
+        assert_eq!(legacy.iterations, optimized.iterations);
+        assert!(
+            optimized.p95_ns <= legacy.p95_ns && optimized.mean_ns <= legacy.mean_ns,
+            "optimized FT-P2C-005 path should not regress relative to legacy fixture-loading behavior"
+        );
     }
 
     #[test]
