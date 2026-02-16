@@ -1,0 +1,142 @@
+{
+  "schema_version": "ft-p2c-007-unit-property-quality-v1",
+  "generated_on": "2026-02-16",
+  "packet_id": "FT-P2C-007",
+  "coverage": {
+    "scope": "packet_module",
+    "target_file": "crates/ft-dispatch/src/lib.rs",
+    "line_percent": 92.93333333333334,
+    "region_percent": 94.27168576104748,
+    "line_floor": 90.0,
+    "region_floor": 80.0,
+    "line_floor_pass": true,
+    "region_floor_pass": true,
+    "workspace_rollup_line_percent": 77.09551656920078,
+    "workspace_rollup_region_percent": 81.29722921914357,
+    "command": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_cov007 cargo llvm-cov -p ft-dispatch --json --summary-only --output-path artifacts/phase2c/FT-P2C-007/unit_property_coverage_v1.json",
+    "extraction_command": "jq '.data[].files[] | select(.filename==\"/data/projects/frankentorch/crates/ft-dispatch/src/lib.rs\") | {line_percent:.summary.lines.percent, region_percent:.summary.regions.percent}' artifacts/phase2c/FT-P2C-007/unit_property_coverage_v1.json",
+    "status": "coverage_floor_pass"
+  },
+  "property_suite": {
+    "invariant_family_count": 7,
+    "shrink_enabled": true,
+    "invariant_families": [
+      "device_guard_match_contract",
+      "device_pair_fail_closed_contract",
+      "dispatch_keyset_fail_closed_contract",
+      "autograd_backend_coupling_contract",
+      "strict_hardened_mode_split_contract",
+      "dtype_device_mismatch_fail_closed_contract",
+      "packet_replay_log_contract"
+    ],
+    "test_ids": [
+      "guard_accepts_matching_device",
+      "same_device_check_returns_cpu",
+      "guard_rejects_mismatched_device",
+      "same_device_check_rejects_cross_device_pair",
+      "validate_requires_cpu_for_autograd",
+      "strict_mode_rejects_composite_fallback",
+      "hardened_mode_allows_composite_fallback",
+      "prop_validate_requires_cpu_for_autograd",
+      "prop_mode_split_for_composite_keysets",
+      "prop_packet_007_autograd_without_cpu_stays_fail_closed",
+      "prop_packet_007_dtype_or_device_mismatch_stays_fail_closed",
+      "strict_dispatch_conformance_is_green",
+      "hardened_dispatch_conformance_is_green"
+    ]
+  },
+  "structured_log_contract": {
+    "required_fields": [
+      "ts_utc",
+      "suite_id",
+      "test_id",
+      "packet_id",
+      "fixture_id",
+      "scenario_id",
+      "mode",
+      "seed",
+      "input_digest",
+      "output_digest",
+      "env_fingerprint",
+      "artifact_refs",
+      "replay_command",
+      "duration_ms",
+      "outcome",
+      "reason_code"
+    ],
+    "test_helper_anchors": [
+      "crates/ft-device/src/lib.rs",
+      "crates/ft-dispatch/src/lib.rs",
+      "crates/ft-conformance/src/lib.rs",
+      "crates/ft-conformance/src/logging.rs"
+    ]
+  },
+  "e2e_scenario_mapping": {
+    "guard_accepts_matching_device": [
+      "dispatch_key/strict:strict_cpu_route",
+      "dispatch_key/hardened:strict_cpu_route"
+    ],
+    "same_device_check_returns_cpu": [
+      "dispatch_key/strict:strict_cpu_route",
+      "dispatch_key/hardened:strict_cpu_route"
+    ],
+    "guard_rejects_mismatched_device": [
+      "dispatch_key/strict:device_mismatch_fail_closed",
+      "dispatch_key/hardened:device_mismatch_fail_closed"
+    ],
+    "same_device_check_rejects_cross_device_pair": [
+      "dispatch_key/strict:device_mismatch_fail_closed",
+      "dispatch_key/hardened:device_mismatch_fail_closed"
+    ],
+    "validate_requires_cpu_for_autograd": [
+      "dispatch_key/strict:autograd_without_cpu_fail_closed",
+      "dispatch_key/hardened:autograd_without_cpu_fail_closed"
+    ],
+    "strict_mode_rejects_composite_fallback": [
+      "dispatch_key/strict:composite_route_mode_split"
+    ],
+    "hardened_mode_allows_composite_fallback": [
+      "dispatch_key/hardened:composite_route_mode_split"
+    ],
+    "prop_validate_requires_cpu_for_autograd": [
+      "dispatch_key/strict:autograd_without_cpu_fail_closed",
+      "dispatch_key/hardened:autograd_without_cpu_fail_closed"
+    ],
+    "prop_mode_split_for_composite_keysets": [
+      "dispatch_key/strict:composite_route_mode_split",
+      "dispatch_key/hardened:composite_route_mode_split"
+    ],
+    "prop_packet_007_autograd_without_cpu_stays_fail_closed": [
+      "dispatch_key/strict:autograd_without_cpu_fail_closed",
+      "dispatch_key/hardened:autograd_without_cpu_fail_closed"
+    ],
+    "prop_packet_007_dtype_or_device_mismatch_stays_fail_closed": [
+      "dispatch_key/strict:dtype_mismatch_fail_closed",
+      "dispatch_key/hardened:dtype_mismatch_fail_closed",
+      "dispatch_key/strict:device_mismatch_fail_closed",
+      "dispatch_key/hardened:device_mismatch_fail_closed"
+    ],
+    "strict_dispatch_conformance_is_green": [
+      "dispatch_key/strict:strict_autograd_route",
+      "dispatch_key/strict:strict_cpu_route",
+      "dispatch_key/strict:composite_route_mode_split"
+    ],
+    "hardened_dispatch_conformance_is_green": [
+      "dispatch_key/hardened:strict_autograd_route",
+      "dispatch_key/hardened:strict_cpu_route",
+      "dispatch_key/hardened:composite_route_mode_split"
+    ]
+  },
+  "validation_runs": {
+    "fmt_check": "cargo fmt --check",
+    "workspace_check": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo check --workspace --all-targets",
+    "workspace_clippy": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo clippy --workspace --all-targets -- -D warnings",
+    "device_tests": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-device",
+    "dispatch_tests": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-dispatch",
+    "dispatch_conformance_strict": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture",
+    "dispatch_conformance_hardened": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_007 cargo test -p ft-conformance hardened_dispatch_conformance_is_green -- --nocapture",
+    "coverage_capture": "rch exec -- env CARGO_TARGET_DIR=target_amberpelican_cov007 cargo llvm-cov -p ft-dispatch --json --summary-only --output-path artifacts/phase2c/FT-P2C-007/unit_property_coverage_v1.json",
+    "status": "completed"
+  },
+  "status": "completed"
+}

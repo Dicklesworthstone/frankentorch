@@ -1,0 +1,405 @@
+{
+  "schema_version": "ft-p2c-differential-packet-v1",
+  "packet_id": "FT-P2C-007",
+  "source_report": "artifacts/phase2c/conformance/differential_report_v1.json",
+  "generated_at": "2026-02-16T15:11:06Z",
+  "total_checks": 28,
+  "pass_checks": 20,
+  "non_pass_checks": 8,
+  "allowlisted_checks": 8,
+  "blocking_checks": 0,
+  "suite_breakdown": [
+    {
+      "suite": "dispatch_key",
+      "count": 28
+    }
+  ],
+  "mode_breakdown": [
+    {
+      "mode": "hardened",
+      "count": 14
+    },
+    {
+      "mode": "strict",
+      "count": 14
+    }
+  ],
+  "status_breakdown": [
+    {
+      "status": "allowlisted_drift",
+      "count": 8
+    },
+    {
+      "status": "pass",
+      "count": 20
+    }
+  ],
+  "comparator_breakdown": [
+    {
+      "comparator": "abs_tol",
+      "count": 4
+    },
+    {
+      "comparator": "adversarial_autograd_without_cpu_rejected",
+      "count": 2
+    },
+    {
+      "comparator": "adversarial_unknown_key_rejected",
+      "count": 2
+    },
+    {
+      "comparator": "metamorphic_commutative_local",
+      "count": 4
+    },
+    {
+      "comparator": "mode_split_policy",
+      "count": 16
+    }
+  ],
+  "metamorphic_checks": [
+    {
+      "scenario_id": "dispatch_key/hardened:strict_autograd_route",
+      "case_name": "strict_autograd_route",
+      "mode": "hardened",
+      "comparator": "metamorphic_commutative_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:strict_cpu_route",
+      "case_name": "strict_cpu_route",
+      "mode": "hardened",
+      "comparator": "metamorphic_commutative_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:strict_autograd_route",
+      "case_name": "strict_autograd_route",
+      "mode": "strict",
+      "comparator": "metamorphic_commutative_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:strict_cpu_route",
+      "case_name": "strict_cpu_route",
+      "mode": "strict",
+      "comparator": "metamorphic_commutative_local",
+      "status": "pass",
+      "reason_code": "parity_ok"
+    }
+  ],
+  "adversarial_fail_closed_checks": [
+    {
+      "scenario_id": "dispatch_key/hardened:adversarial_autograd_without_cpu",
+      "case_name": "adversarial_autograd_without_cpu",
+      "mode": "hardened",
+      "comparator": "adversarial_autograd_without_cpu_rejected",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:adversarial_unknown_key",
+      "case_name": "adversarial_unknown_key",
+      "mode": "hardened",
+      "comparator": "adversarial_unknown_key_rejected",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:autograd_without_cpu_fail_closed",
+      "case_name": "autograd_without_cpu_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:composite_route_mode_split",
+      "case_name": "composite_route_mode_split",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:device_mismatch_fail_closed",
+      "case_name": "device_mismatch_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:dtype_mismatch_fail_closed",
+      "case_name": "dtype_mismatch_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:empty_keyset_fail_closed",
+      "case_name": "empty_keyset_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:no_backend_key_fail_closed",
+      "case_name": "no_backend_key_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:no_type_key_fail_closed",
+      "case_name": "no_type_key_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+      "case_name": "unknown_dispatch_key_fail_closed",
+      "mode": "hardened",
+      "comparator": "mode_split_policy",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:adversarial_autograd_without_cpu",
+      "case_name": "adversarial_autograd_without_cpu",
+      "mode": "strict",
+      "comparator": "adversarial_autograd_without_cpu_rejected",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:adversarial_unknown_key",
+      "case_name": "adversarial_unknown_key",
+      "mode": "strict",
+      "comparator": "adversarial_unknown_key_rejected",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "parity_ok"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:autograd_without_cpu_fail_closed",
+      "case_name": "autograd_without_cpu_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:composite_route_mode_split",
+      "case_name": "composite_route_mode_split",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:device_mismatch_fail_closed",
+      "case_name": "device_mismatch_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:dtype_mismatch_fail_closed",
+      "case_name": "dtype_mismatch_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:empty_keyset_fail_closed",
+      "case_name": "empty_keyset_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:no_backend_key_fail_closed",
+      "case_name": "no_backend_key_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:no_type_key_fail_closed",
+      "case_name": "no_type_key_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:unknown_dispatch_key_fail_closed",
+      "case_name": "unknown_dispatch_key_fail_closed",
+      "mode": "strict",
+      "comparator": "mode_split_policy",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    }
+  ],
+  "mode_split_policy_checks": [
+    {
+      "scenario_id": "dispatch_key/hardened:autograd_without_cpu_fail_closed",
+      "case_name": "autograd_without_cpu_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:composite_route_mode_split",
+      "case_name": "composite_route_mode_split",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:device_mismatch_fail_closed",
+      "case_name": "device_mismatch_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:dtype_mismatch_fail_closed",
+      "case_name": "dtype_mismatch_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:empty_keyset_fail_closed",
+      "case_name": "empty_keyset_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:no_backend_key_fail_closed",
+      "case_name": "no_backend_key_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:no_type_key_fail_closed",
+      "case_name": "no_type_key_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/hardened:unknown_dispatch_key_fail_closed",
+      "case_name": "unknown_dispatch_key_fail_closed",
+      "mode": "hardened",
+      "status": "allowlisted_drift",
+      "drift_id": "dispatch.composite_backend_fallback",
+      "reason_code": "dispatch.composite_backend_fallback"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:autograd_without_cpu_fail_closed",
+      "case_name": "autograd_without_cpu_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:composite_route_mode_split",
+      "case_name": "composite_route_mode_split",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:device_mismatch_fail_closed",
+      "case_name": "device_mismatch_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:dtype_mismatch_fail_closed",
+      "case_name": "dtype_mismatch_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:empty_keyset_fail_closed",
+      "case_name": "empty_keyset_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:no_backend_key_fail_closed",
+      "case_name": "no_backend_key_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:no_type_key_fail_closed",
+      "case_name": "no_type_key_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    },
+    {
+      "scenario_id": "dispatch_key/strict:unknown_dispatch_key_fail_closed",
+      "case_name": "unknown_dispatch_key_fail_closed",
+      "mode": "strict",
+      "status": "pass",
+      "drift_id": null,
+      "reason_code": "strict_fail_closed_mode_split"
+    }
+  ]
+}

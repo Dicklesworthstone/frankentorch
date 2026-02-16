@@ -75,6 +75,21 @@
           ]
         }
       ]
+    },
+    "FT-P2C-007": {
+      "disallowed_by_default": true,
+      "allowed_deviations": [
+        {
+          "id": "dispatch.composite_backend_fallback",
+          "description": "Permit bounded hardened dispatch composite/backend-select fallback for FT-P2C-007 device guard and backend transition scenarios",
+          "constraints": [
+            "mode == hardened",
+            "backend key is present",
+            "fallback_used evidence recorded",
+            "scoped to packet FT-P2C-007 dispatch_key transition checks"
+          ]
+        }
+      ]
     }
   }
 }

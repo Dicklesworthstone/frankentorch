@@ -609,6 +609,32 @@ mod tests {
         log
     }
 
+    fn build_packet_007_property_log(
+        test_id: &str,
+        mode: &str,
+        seed: u64,
+        input_digest: u64,
+        output_digest: u64,
+        reason_code: &str,
+        scenario_id: &str,
+    ) -> BTreeMap<String, String> {
+        let mut log = build_property_log(
+            test_id,
+            mode,
+            seed,
+            input_digest,
+            output_digest,
+            reason_code,
+        );
+        log.insert("packet_id".to_string(), "FT-P2C-007".to_string());
+        log.insert("scenario_id".to_string(), scenario_id.to_string());
+        log.insert(
+            "artifact_refs".to_string(),
+            "artifacts/phase2c/FT-P2C-007/contract_table.md".to_string(),
+        );
+        log
+    }
+
     fn assert_log_contract(log: &BTreeMap<String, String>) {
         for key in [
             "ts_utc",
@@ -1381,6 +1407,140 @@ mod tests {
                 "dispatch_mode_split_contract_ok",
             );
             assert_log_contract(&log);
+        }
+
+        #[test]
+        fn prop_packet_007_autograd_without_cpu_stays_fail_closed(
+            backend_select in any::<bool>(),
+            composite_implicit in any::<bool>(),
+            composite_explicit in any::<bool>(),
+        ) {
+            let mut keyset = DispatchKeySet::empty();
+            keyset.add(DispatchKey::AutogradCPU);
+            if backend_select {
+                keyset.add(DispatchKey::BackendSelect);
+            }
+            if composite_implicit {
+                keyset.add(DispatchKey::CompositeImplicitAutograd);
+            }
+            if composite_explicit {
+                keyset.add(DispatchKey::CompositeExplicitAutograd);
+            }
+
+            let validation = keyset.validate_for_scalar_binary();
+            match validation {
+                Err(DispatchKeyError::IncompatibleSet { .. }) => {}
+                other => prop_assert!(false, "expected IncompatibleSet, got {other:?}"),
+            }
+
+            let bits = keyset.bits();
+            let seed = det_seed(&[
+                bits,
+                backend_select as u64,
+                composite_implicit as u64,
+                composite_explicit as u64,
+            ]);
+            let strict_log = build_packet_007_property_log(
+                "prop_packet_007_autograd_without_cpu_stays_fail_closed",
+                "strict",
+                seed,
+                bits,
+                0,
+                "dispatch007_autograd_without_cpu_fail_closed",
+                "dispatch_key/strict:autograd_without_cpu_fail_closed",
+            );
+            assert_log_contract(&strict_log);
+
+            let hardened_log = build_packet_007_property_log(
+                "prop_packet_007_autograd_without_cpu_stays_fail_closed",
+                "hardened",
+                seed,
+                bits,
+                0,
+                "dispatch007_autograd_without_cpu_fail_closed",
+                "dispatch_key/hardened:autograd_without_cpu_fail_closed",
+            );
+            assert_log_contract(&hardened_log);
+        }
+
+        #[test]
+        fn prop_packet_007_dtype_or_device_mismatch_stays_fail_closed(
+            lhs_value in -1_000.0f64..1_000.0f64,
+            rhs_value in -1_000.0f64..1_000.0f64,
+            use_dtype_mismatch in any::<bool>(),
+            use_mul in any::<bool>(),
+        ) {
+            let (lhs, rhs, reason_code, strict_scenario, hardened_scenario) = if use_dtype_mismatch {
+                (
+                    ScalarTensor::new(lhs_value, DType::F64, Device::Cpu),
+                    ScalarTensor::new(rhs_value, DType::F32, Device::Cpu),
+                    "dispatch007_dtype_mismatch_fail_closed",
+                    "dispatch_key/strict:dtype_mismatch_fail_closed",
+                    "dispatch_key/hardened:dtype_mismatch_fail_closed",
+                )
+            } else {
+                (
+                    ScalarTensor::new(lhs_value, DType::F64, Device::Cpu),
+                    ScalarTensor::new(rhs_value, DType::F64, Device::Cuda),
+                    "dispatch007_device_mismatch_fail_closed",
+                    "dispatch_key/strict:device_mismatch_fail_closed",
+                    "dispatch_key/hardened:device_mismatch_fail_closed",
+                )
+            };
+
+            let op = if use_mul { BinaryOp::Mul } else { BinaryOp::Add };
+            let keyset = DispatchKeySet::from_keys(&[DispatchKey::CPU, DispatchKey::BackendSelect]);
+
+            let strict_err = dispatch_scalar_binary_with_keyset(
+                op,
+                ExecutionMode::Strict,
+                &lhs,
+                &rhs,
+                keyset,
+            )
+            .expect_err("strict mode mismatch path must fail closed");
+            prop_assert!(strict_err.to_string().contains("incompatible tensors"));
+
+            let hardened_err = dispatch_scalar_binary_with_keyset(
+                op,
+                ExecutionMode::Hardened,
+                &lhs,
+                &rhs,
+                keyset,
+            )
+            .expect_err("hardened mode mismatch path must fail closed");
+            prop_assert!(hardened_err.to_string().contains("incompatible tensors"));
+
+            let input_digest = lhs.evidence_fingerprint64() ^ rhs.evidence_fingerprint64();
+            let output_digest = det_seed(&[input_digest, use_dtype_mismatch as u64, use_mul as u64]);
+            let seed = det_seed(&[
+                lhs_value.to_bits(),
+                rhs_value.to_bits(),
+                use_dtype_mismatch as u64,
+                use_mul as u64,
+            ]);
+
+            let strict_log = build_packet_007_property_log(
+                "prop_packet_007_dtype_or_device_mismatch_stays_fail_closed",
+                "strict",
+                seed,
+                input_digest,
+                output_digest,
+                reason_code,
+                strict_scenario,
+            );
+            assert_log_contract(&strict_log);
+
+            let hardened_log = build_packet_007_property_log(
+                "prop_packet_007_dtype_or_device_mismatch_stays_fail_closed",
+                "hardened",
+                seed,
+                input_digest,
+                output_digest,
+                reason_code,
+                hardened_scenario,
+            );
+            assert_log_contract(&hardened_log);
         }
     }
 }
