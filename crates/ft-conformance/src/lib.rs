@@ -455,8 +455,11 @@ type SidecarCache = BTreeMap<(String, usize), (RaptorQSidecar, DecodeProofArtifa
 
 static SERIALIZATION_SIDECAR_CACHE: OnceLock<Mutex<SidecarCache>> = OnceLock::new();
 const MAX_FIXTURE_BYTES: u64 = 1_048_576;
+const MAX_LEGACY_ORACLE_STDOUT_BYTES: usize = 1_048_576;
+const MAX_LEGACY_ORACLE_STDERR_BYTES: usize = 262_144;
 const MAX_LEGACY_ORACLE_OUTPUT_LINE_BYTES: usize = 65_536;
 const LEGACY_ORACLE_RAW_DIAGNOSTIC_BYTES: usize = 256;
+const LEGACY_ORACLE_STDERR_DIAGNOSTIC_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LegacyOracleStatus {
@@ -4296,11 +4299,12 @@ fn run_legacy_oracle_script(
     let output = child
         .wait_with_output()
         .map_err(|error| format!("legacy oracle process wait failed: {error}"))?;
+    validate_legacy_oracle_stream_bounds(output.stdout.len(), output.stderr.len())?;
     if !output.status.success() {
-        return Err(format!(
-            "legacy oracle exited with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
+        let status_display = output.status.to_string();
+        return Err(format_legacy_oracle_exit_error(
+            status_display.as_str(),
+            output.stderr.as_slice(),
         ));
     }
 
@@ -4329,6 +4333,28 @@ fn parse_legacy_oracle_stdout(stdout: &str) -> Result<Value, String> {
             bounded_diagnostic(line, LEGACY_ORACLE_RAW_DIAGNOSTIC_BYTES)
         )
     })
+}
+
+fn validate_legacy_oracle_stream_bounds(stdout_len: usize, stderr_len: usize) -> Result<(), String> {
+    if stdout_len > MAX_LEGACY_ORACLE_STDOUT_BYTES {
+        return Err(format!(
+            "legacy oracle stdout exceeds max bytes: actual={stdout_len} max={MAX_LEGACY_ORACLE_STDOUT_BYTES}"
+        ));
+    }
+    if stderr_len > MAX_LEGACY_ORACLE_STDERR_BYTES {
+        return Err(format!(
+            "legacy oracle stderr exceeds max bytes: actual={stderr_len} max={MAX_LEGACY_ORACLE_STDERR_BYTES}"
+        ));
+    }
+    Ok(())
+}
+
+fn format_legacy_oracle_exit_error(status_display: &str, stderr: &[u8]) -> String {
+    let stderr_text = String::from_utf8_lossy(stderr);
+    format!(
+        "legacy oracle exited with status {status_display}: {}",
+        bounded_diagnostic(stderr_text.trim(), LEGACY_ORACLE_STDERR_DIAGNOSTIC_BYTES)
+    )
 }
 
 fn bounded_diagnostic(input: &str, max_len: usize) -> String {
@@ -6518,5 +6544,34 @@ mod tests {
             parsed.get("torch_version").and_then(Value::as_str),
             Some("2.6.0")
         );
+    }
+
+    #[test]
+    fn validate_legacy_oracle_stream_bounds_rejects_oversized_stdout() {
+        let err = super::validate_legacy_oracle_stream_bounds(
+            super::MAX_LEGACY_ORACLE_STDOUT_BYTES + 1,
+            0,
+        )
+        .expect_err("oversized stdout must fail");
+        assert!(err.contains("stdout exceeds max bytes"));
+    }
+
+    #[test]
+    fn validate_legacy_oracle_stream_bounds_rejects_oversized_stderr() {
+        let err = super::validate_legacy_oracle_stream_bounds(
+            0,
+            super::MAX_LEGACY_ORACLE_STDERR_BYTES + 1,
+        )
+        .expect_err("oversized stderr must fail");
+        assert!(err.contains("stderr exceeds max bytes"));
+    }
+
+    #[test]
+    fn format_legacy_oracle_exit_error_bounds_stderr_diagnostic() {
+        let stderr = "e".repeat(super::LEGACY_ORACLE_STDERR_DIAGNOSTIC_BYTES + 64);
+        let message = super::format_legacy_oracle_exit_error("exit status: 1", stderr.as_bytes());
+        assert!(message.contains("legacy oracle exited with status exit status: 1"));
+        assert!(message.contains("..."));
+        assert!(message.len() < 420);
     }
 }
