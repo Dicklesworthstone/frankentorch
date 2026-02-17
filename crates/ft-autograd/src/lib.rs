@@ -4,11 +4,17 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt;
 
-use ft_core::{DType, Device, ExecutionMode, ScalarTensor};
-use ft_dispatch::{BinaryOp, DispatchDecision, DispatchError, dispatch_scalar_binary};
+use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor};
+use ft_dispatch::{
+    BinaryOp, DispatchDecision, DispatchError, dispatch_scalar_binary,
+    dispatch_tensor_binary_contiguous_f64,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct NodeId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TensorNodeId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum NodeOp {
@@ -24,6 +30,34 @@ struct Node {
     tensor: ScalarTensor,
     requires_grad: bool,
     op: NodeOp,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TensorNodeOp {
+    Leaf,
+    Add {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    },
+    Sub {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    },
+    Div {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    },
+    Mul {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct TensorNode {
+    tensor: DenseTensor,
+    requires_grad: bool,
+    op: TensorNodeOp,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,11 +164,70 @@ impl ReadyQueue {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct TensorReadyTask {
+    node: TensorNodeId,
+}
+
+impl Ord for TensorReadyTask {
+    fn cmp(&self, other: &Self) -> Ordering {
+        self.node.0.cmp(&other.node.0)
+    }
+}
+
+impl PartialOrd for TensorReadyTask {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+#[derive(Debug, Default)]
+struct TensorReadyQueue {
+    heap: BinaryHeap<TensorReadyTask>,
+    pushes: usize,
+    pops: usize,
+    max_len: usize,
+}
+
+impl TensorReadyQueue {
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            heap: BinaryHeap::with_capacity(capacity),
+            pushes: 0,
+            pops: 0,
+            max_len: 0,
+        }
+    }
+
+    fn push(&mut self, node: TensorNodeId) {
+        self.heap.push(TensorReadyTask { node });
+        self.pushes += 1;
+        self.max_len = self.max_len.max(self.heap.len());
+    }
+
+    fn pop(&mut self) -> Option<TensorNodeId> {
+        let next = self.heap.pop().map(|task| task.node);
+        if next.is_some() {
+            self.pops += 1;
+        }
+        next
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OperationEvent {
     pub op: BinaryOp,
     pub lhs: NodeId,
     pub rhs: NodeId,
     pub out: NodeId,
+    pub decision: DispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorOperationEvent {
+    pub op: BinaryOp,
+    pub lhs: TensorNodeId,
+    pub rhs: TensorNodeId,
+    pub out: TensorNodeId,
     pub decision: DispatchDecision,
 }
 
@@ -164,19 +257,76 @@ impl BackwardReport {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorSchedulerTelemetry {
+    pub execution_order: Vec<TensorNodeId>,
+    pub queue_pushes: usize,
+    pub queue_pops: usize,
+    pub max_queue_len: usize,
+    pub dependency_snapshot: Vec<usize>,
+    pub reentrant_depth: usize,
+    pub reentrant_guard_triggered: bool,
+    pub hardened_fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorBackwardStep {
+    pub node: TensorNodeId,
+    pub incoming_grad_len: usize,
+    pub rule: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorBackwardReport {
+    gradients: Vec<Option<Vec<f64>>>,
+    pub steps: Vec<TensorBackwardStep>,
+    pub telemetry: TensorSchedulerTelemetry,
+}
+
+impl TensorBackwardReport {
+    #[must_use]
+    pub fn gradient(&self, node: TensorNodeId) -> Option<&[f64]> {
+        self.gradients
+            .get(node.0)
+            .and_then(|entry| entry.as_deref())
+    }
+
+    #[must_use]
+    pub fn gradients(&self) -> &[Option<Vec<f64>>] {
+        &self.gradients
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum AutogradError {
     UnknownNode(NodeId),
+    UnknownTensorNode(TensorNodeId),
     Dispatch(DispatchError),
-    ReentrantDepthExceeded { current: usize, max: usize },
-    DependencyUnderflow { node: NodeId },
+    DenseTensor(DenseTensorError),
+    ReentrantDepthExceeded {
+        current: usize,
+        max: usize,
+    },
+    DependencyUnderflow {
+        node: NodeId,
+    },
+    TensorDependencyUnderflow {
+        node: TensorNodeId,
+    },
+    TensorGradientShapeMismatch {
+        node: TensorNodeId,
+        expected: usize,
+        actual: usize,
+    },
 }
 
 impl fmt::Display for AutogradError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::UnknownNode(node) => write!(f, "unknown node id {}", node.0),
+            Self::UnknownTensorNode(node) => write!(f, "unknown tensor node id {}", node.0),
             Self::Dispatch(error) => write!(f, "dispatch failure: {error}"),
+            Self::DenseTensor(error) => write!(f, "dense tensor failure: {error}"),
             Self::ReentrantDepthExceeded { current, max } => write!(
                 f,
                 "reentrant backward depth exceeded: current={current} max={max}"
@@ -184,11 +334,33 @@ impl fmt::Display for AutogradError {
             Self::DependencyUnderflow { node } => {
                 write!(f, "dependency scheduler underflow at node {}", node.0)
             }
+            Self::TensorDependencyUnderflow { node } => {
+                write!(
+                    f,
+                    "tensor dependency scheduler underflow at node {}",
+                    node.0
+                )
+            }
+            Self::TensorGradientShapeMismatch {
+                node,
+                expected,
+                actual,
+            } => write!(
+                f,
+                "tensor gradient shape mismatch at node {}: expected={expected}, actual={actual}",
+                node.0
+            ),
         }
     }
 }
 
 impl std::error::Error for AutogradError {}
+
+impl From<DenseTensorError> for AutogradError {
+    fn from(value: DenseTensorError) -> Self {
+        Self::DenseTensor(value)
+    }
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct Tape {
@@ -519,15 +691,436 @@ impl Tape {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct TensorTape {
+    nodes: Vec<TensorNode>,
+}
+
+impl TensorTape {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn node_count(&self) -> usize {
+        self.nodes.len()
+    }
+
+    pub fn leaf(
+        &mut self,
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let tensor = DenseTensor::from_contiguous_values(values, shape, Device::Cpu)?;
+        Ok(self.leaf_tensor(tensor, requires_grad))
+    }
+
+    pub fn leaf_tensor(&mut self, tensor: DenseTensor, requires_grad: bool) -> TensorNodeId {
+        let id = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor,
+            requires_grad,
+            op: TensorNodeOp::Leaf,
+        });
+        id
+    }
+
+    pub fn values(&self, node: TensorNodeId) -> Result<Vec<f64>, AutogradError> {
+        Ok(self.node(node)?.tensor.dispatch_values()?.to_vec())
+    }
+
+    pub fn tensor(&self, node: TensorNodeId) -> Result<&DenseTensor, AutogradError> {
+        Ok(&self.node(node)?.tensor)
+    }
+
+    pub fn add(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        self.binary(BinaryOp::Add, lhs, rhs, mode)
+    }
+
+    pub fn mul(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        self.binary(BinaryOp::Mul, lhs, rhs, mode)
+    }
+
+    pub fn sub(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        self.binary(BinaryOp::Sub, lhs, rhs, mode)
+    }
+
+    pub fn div(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        self.binary(BinaryOp::Div, lhs, rhs, mode)
+    }
+
+    fn binary(
+        &mut self,
+        op: BinaryOp,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        let (requires_grad, lhs_meta, outcome) = {
+            let lhs_node = self.node(lhs)?;
+            let rhs_node = self.node(rhs)?;
+            let requires_grad = lhs_node.requires_grad || rhs_node.requires_grad;
+            let lhs_meta = lhs_node.tensor.meta().clone();
+            let rhs_meta = rhs_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_binary_contiguous_f64(
+                op,
+                mode,
+                lhs_node.tensor.dispatch_values()?,
+                rhs_node.tensor.dispatch_values()?,
+                &lhs_meta,
+                &rhs_meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (requires_grad, lhs_meta, outcome)
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(lhs_meta, outcome.values)?,
+            requires_grad,
+            op: match op {
+                BinaryOp::Add => TensorNodeOp::Add { lhs, rhs },
+                BinaryOp::Sub => TensorNodeOp::Sub { lhs, rhs },
+                BinaryOp::Div => TensorNodeOp::Div { lhs, rhs },
+                BinaryOp::Mul => TensorNodeOp::Mul { lhs, rhs },
+            },
+        });
+
+        Ok((
+            out,
+            TensorOperationEvent {
+                op,
+                lhs,
+                rhs,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn backward(&self, root: TensorNodeId) -> Result<TensorBackwardReport, AutogradError> {
+        self.backward_with_options(root, BackwardOptions::strict_default())
+    }
+
+    pub fn backward_with_options(
+        &self,
+        root: TensorNodeId,
+        options: BackwardOptions,
+    ) -> Result<TensorBackwardReport, AutogradError> {
+        if root.0 >= self.nodes.len() {
+            return Err(AutogradError::UnknownTensorNode(root));
+        }
+
+        let mut reentrant_guard_triggered = false;
+        let mut hardened_fallback_used = false;
+        if options.current_reentrant_depth > options.max_reentrant_depth {
+            match options.policy {
+                ReentrantPolicy::StrictFail => {
+                    return Err(AutogradError::ReentrantDepthExceeded {
+                        current: options.current_reentrant_depth,
+                        max: options.max_reentrant_depth,
+                    });
+                }
+                ReentrantPolicy::HardenedBoundedFallback => {
+                    reentrant_guard_triggered = true;
+                    hardened_fallback_used = true;
+                }
+            }
+        }
+
+        let reentrant_depth = options
+            .current_reentrant_depth
+            .min(options.max_reentrant_depth);
+        let reachable = self.compute_reachable(root)?;
+        let mut pending = self.compute_dependencies(&reachable)?;
+
+        let mut grads = self
+            .nodes
+            .iter()
+            .map(|node| vec![0.0; node.tensor.meta().numel()])
+            .collect::<Vec<_>>();
+        grads[root.0] = vec![1.0; self.nodes[root.0].tensor.meta().numel()];
+
+        let mut queue = TensorReadyQueue::with_capacity(self.nodes.len().max(1));
+        queue.push(root);
+
+        let mut steps = Vec::with_capacity(self.nodes.len());
+        let mut execution_order = Vec::with_capacity(self.nodes.len());
+
+        while let Some(node_id) = queue.pop() {
+            let incoming = grads[node_id.0].clone();
+            execution_order.push(node_id);
+
+            match self.nodes[node_id.0].op {
+                TensorNodeOp::Leaf => {
+                    if self.nodes[node_id.0].requires_grad {
+                        steps.push(TensorBackwardStep {
+                            node: node_id,
+                            incoming_grad_len: incoming.len(),
+                            rule: "leaf",
+                        });
+                    }
+                }
+                TensorNodeOp::Add { lhs, rhs } => {
+                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
+                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &incoming)?;
+
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(a+b)/da=1; d(a+b)/db=1",
+                    });
+                }
+                TensorNodeOp::Sub { lhs, rhs } => {
+                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
+                    let rhs_contrib = incoming.iter().map(|value| -*value).collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
+
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(a-b)/da=1; d(a-b)/db=-1",
+                    });
+                }
+                TensorNodeOp::Div { lhs, rhs } => {
+                    let lhs_values = self.nodes[lhs.0].tensor.dispatch_values()?;
+                    let rhs_values = self.nodes[rhs.0].tensor.dispatch_values()?;
+                    Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
+                    Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
+
+                    let lhs_contrib = incoming
+                        .iter()
+                        .zip(rhs_values.iter())
+                        .map(|(grad, rhs_value)| grad / rhs_value)
+                        .collect::<Vec<_>>();
+                    let rhs_contrib = incoming
+                        .iter()
+                        .zip(lhs_values.iter())
+                        .zip(rhs_values.iter())
+                        .map(|((grad, lhs_value), rhs_value)| {
+                            -grad * lhs_value / (rhs_value * rhs_value)
+                        })
+                        .collect::<Vec<_>>();
+
+                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
+                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
+
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(a/b)/da=1/b; d(a/b)/db=-(a/b^2)",
+                    });
+                }
+                TensorNodeOp::Mul { lhs, rhs } => {
+                    let lhs_values = self.nodes[lhs.0].tensor.dispatch_values()?;
+                    let rhs_values = self.nodes[rhs.0].tensor.dispatch_values()?;
+                    Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
+                    Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
+
+                    let lhs_contrib = incoming
+                        .iter()
+                        .zip(rhs_values.iter())
+                        .map(|(grad, rhs_value)| grad * rhs_value)
+                        .collect::<Vec<_>>();
+                    let rhs_contrib = incoming
+                        .iter()
+                        .zip(lhs_values.iter())
+                        .map(|(grad, lhs_value)| grad * lhs_value)
+                        .collect::<Vec<_>>();
+
+                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
+                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
+
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(a*b)/da=b; d(a*b)/db=a",
+                    });
+                }
+            }
+        }
+
+        let gradients = grads
+            .iter()
+            .enumerate()
+            .map(|(idx, grad)| {
+                if self.nodes[idx].requires_grad {
+                    Some(grad.clone())
+                } else {
+                    None
+                }
+            })
+            .collect();
+
+        let telemetry = TensorSchedulerTelemetry {
+            execution_order,
+            queue_pushes: queue.pushes,
+            queue_pops: queue.pops,
+            max_queue_len: queue.max_len,
+            dependency_snapshot: pending,
+            reentrant_depth,
+            reentrant_guard_triggered,
+            hardened_fallback_used,
+        };
+
+        Ok(TensorBackwardReport {
+            gradients,
+            steps,
+            telemetry,
+        })
+    }
+
+    fn compute_reachable(&self, root: TensorNodeId) -> Result<Vec<bool>, AutogradError> {
+        let mut reachable = vec![false; self.nodes.len()];
+        let mut stack = vec![root];
+
+        while let Some(node) = stack.pop() {
+            if node.0 >= self.nodes.len() {
+                return Err(AutogradError::UnknownTensorNode(node));
+            }
+            if reachable[node.0] {
+                continue;
+            }
+            reachable[node.0] = true;
+
+            match self.nodes[node.0].op {
+                TensorNodeOp::Leaf => {}
+                TensorNodeOp::Add { lhs, rhs }
+                | TensorNodeOp::Sub { lhs, rhs }
+                | TensorNodeOp::Div { lhs, rhs }
+                | TensorNodeOp::Mul { lhs, rhs } => {
+                    stack.push(lhs);
+                    stack.push(rhs);
+                }
+            }
+        }
+
+        Ok(reachable)
+    }
+
+    fn compute_dependencies(&self, reachable: &[bool]) -> Result<Vec<usize>, AutogradError> {
+        if reachable.len() != self.nodes.len() {
+            return Err(AutogradError::TensorDependencyUnderflow {
+                node: TensorNodeId(0),
+            });
+        }
+
+        let mut pending = vec![0usize; self.nodes.len()];
+        for (idx, node) in self.nodes.iter().enumerate() {
+            if !reachable[idx] {
+                continue;
+            }
+
+            match node.op {
+                TensorNodeOp::Leaf => {}
+                TensorNodeOp::Add { lhs, rhs }
+                | TensorNodeOp::Sub { lhs, rhs }
+                | TensorNodeOp::Div { lhs, rhs }
+                | TensorNodeOp::Mul { lhs, rhs } => {
+                    pending[lhs.0] = pending[lhs.0].saturating_add(1);
+                    pending[rhs.0] = pending[rhs.0].saturating_add(1);
+                }
+            }
+        }
+
+        Ok(pending)
+    }
+
+    fn complete_dependency(
+        pending: &mut [usize],
+        node: TensorNodeId,
+        queue: &mut TensorReadyQueue,
+    ) -> Result<(), AutogradError> {
+        if pending[node.0] == 0 {
+            return Err(AutogradError::TensorDependencyUnderflow { node });
+        }
+        pending[node.0] -= 1;
+        if pending[node.0] == 0 {
+            queue.push(node);
+        }
+        Ok(())
+    }
+
+    fn ensure_tensor_len(
+        node: TensorNodeId,
+        expected: usize,
+        actual: usize,
+    ) -> Result<(), AutogradError> {
+        if expected != actual {
+            return Err(AutogradError::TensorGradientShapeMismatch {
+                node,
+                expected,
+                actual,
+            });
+        }
+        Ok(())
+    }
+
+    fn accumulate_tensor_gradient(
+        node: TensorNodeId,
+        target: &mut [f64],
+        contribution: &[f64],
+    ) -> Result<(), AutogradError> {
+        Self::ensure_tensor_len(node, target.len(), contribution.len())?;
+        for (target_value, value) in target.iter_mut().zip(contribution.iter()) {
+            *target_value += value;
+        }
+        Ok(())
+    }
+
+    fn node(&self, id: TensorNodeId) -> Result<&TensorNode, AutogradError> {
+        self.nodes
+            .get(id.0)
+            .ok_or(AutogradError::UnknownTensorNode(id))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
 
-    use ft_core::ExecutionMode;
+    use ft_core::{DType, DenseTensor, Device, ExecutionMode, TensorMeta};
+    use ft_dispatch::DispatchError;
     use proptest::prelude::*;
 
     use super::{
         AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
+        TensorTape,
     };
 
     fn as_u64(value: usize) -> u64 {
@@ -748,6 +1341,70 @@ mod tests {
 
         assert!((x_grad - (1.0 / 3.0)).abs() <= 1e-12);
         assert!((y_grad - (-2.0 / 3.0)).abs() <= 1e-12);
+    }
+
+    #[test]
+    fn tensor_add_forward_backward_matches_expected_gradients() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("lhs leaf should succeed");
+        let y = tape
+            .leaf(vec![4.0, 5.0, 6.0], vec![3], true)
+            .expect("rhs leaf should succeed");
+        let (z, event) = tape
+            .add(x, y, ExecutionMode::Strict)
+            .expect("tensor add should succeed");
+
+        assert_eq!(
+            event.decision.kernel,
+            "autograd_cpu::add_tensor_contiguous_f64"
+        );
+        assert_eq!(
+            tape.values(z).expect("tensor values should resolve"),
+            vec![5.0, 7.0, 9.0]
+        );
+
+        let report = tape.backward(z).expect("tensor backward should succeed");
+        assert_eq!(
+            report.gradient(x).expect("x grad should exist"),
+            &[1.0, 1.0, 1.0]
+        );
+        assert_eq!(
+            report.gradient(y).expect("y grad should exist"),
+            &[1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn tensor_dispatch_rejects_non_contiguous_layout_end_to_end() -> Result<(), String> {
+        let mut tape = TensorTape::new();
+        let lhs_meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
+                .expect("non-contiguous meta should validate");
+        let lhs = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0])
+            .expect("lhs should build");
+        let rhs = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu),
+            vec![5.0, 6.0, 7.0, 8.0],
+        )
+        .expect("rhs should build");
+
+        let lhs_node = tape.leaf_tensor(lhs, true);
+        let rhs_node = tape.leaf_tensor(rhs, true);
+        let err = tape
+            .add(lhs_node, rhs_node, ExecutionMode::Strict)
+            .expect_err("non-contiguous layout should fail closed");
+        let error = match err {
+            AutogradError::Dispatch(DispatchError::Kernel(error)) => error,
+            other => return Err(format!("expected kernel dispatch error, got {other:?}")),
+        };
+        assert!(
+            error
+                .to_string()
+                .contains("unsupported non-contiguous layout on lhs")
+        );
+        Ok(())
     }
 
     #[test]

@@ -13,6 +13,7 @@ use serde_json::Value;
 
 pub const CHECKPOINT_SCHEMA_VERSION: u32 = 1;
 pub const RAPTORQ_SIDECAR_SCHEMA_VERSION: u32 = 1;
+const MAX_CHECKPOINT_PAYLOAD_BYTES: usize = 1_048_576;
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -110,8 +111,10 @@ impl fmt::Display for SerializeError {
 
 impl std::error::Error for SerializeError {}
 
-#[must_use]
-pub fn encode_checkpoint(entries: &[SnapshotEntry], mode: CheckpointMode) -> String {
+pub fn encode_checkpoint(
+    entries: &[SnapshotEntry],
+    mode: CheckpointMode,
+) -> Result<String, SerializeError> {
     let normalized_entries = normalize_entries(entries);
     let source_hash = checkpoint_hash(CHECKPOINT_SCHEMA_VERSION, mode, &normalized_entries);
 
@@ -122,21 +125,23 @@ pub fn encode_checkpoint(entries: &[SnapshotEntry], mode: CheckpointMode) -> Str
         source_hash,
     };
 
-    serde_json::to_string(&envelope).expect("checkpoint serialization should be infallible")
+    serde_json::to_string(&envelope).map_err(|error| SerializeError::IncompatiblePayload {
+        reason: format!("checkpoint encoding failed: {error}"),
+    })
 }
 
 pub fn decode_checkpoint(
     input: &str,
     mode: DecodeMode,
 ) -> Result<CheckpointEnvelope, SerializeError> {
+    validate_payload_size(input)?;
     match mode {
         DecodeMode::Strict => decode_checkpoint_strict(input),
         DecodeMode::Hardened => decode_checkpoint_hardened(input),
     }
 }
 
-#[must_use]
-pub fn encode_snapshot(entries: &[SnapshotEntry]) -> String {
+pub fn encode_snapshot(entries: &[SnapshotEntry]) -> Result<String, SerializeError> {
     encode_checkpoint(entries, CheckpointMode::Strict)
 }
 
@@ -352,6 +357,18 @@ fn decode_checkpoint_hardened(input: &str) -> Result<CheckpointEnvelope, Seriali
 
     validate_checkpoint(&envelope)?;
     Ok(envelope)
+}
+
+fn validate_payload_size(input: &str) -> Result<(), SerializeError> {
+    let actual = input.len();
+    if actual > MAX_CHECKPOINT_PAYLOAD_BYTES {
+        return Err(SerializeError::IncompatiblePayload {
+            reason: format!(
+                "checkpoint payload exceeds max bytes: actual={actual} max={MAX_CHECKPOINT_PAYLOAD_BYTES}"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn validate_checkpoint(envelope: &CheckpointEnvelope) -> Result<(), SerializeError> {
@@ -638,7 +655,8 @@ mod tests {
             },
         ];
 
-        let encoded = encode_checkpoint(&entries, CheckpointMode::Strict);
+        let encoded =
+            encode_checkpoint(&entries, CheckpointMode::Strict).expect("strict encode should work");
         let decoded = decode_checkpoint(&encoded, DecodeMode::Strict).expect("strict decode");
 
         assert_eq!(decoded.entries[0].node_id, 0);
@@ -675,9 +693,10 @@ mod tests {
             value: 2.0,
             grad: Some(1.0),
         }];
+        let encoded =
+            encode_checkpoint(&entries, CheckpointMode::Strict).expect("strict encode should work");
         let mut payload: serde_json::Value =
-            serde_json::from_str(&encode_checkpoint(&entries, CheckpointMode::Strict))
-                .expect("valid encoded checkpoint");
+            serde_json::from_str(&encoded).expect("valid encoded checkpoint");
         payload["schema_version"] = json!(2);
 
         let err = decode_checkpoint(payload.to_string().as_str(), DecodeMode::Strict)
@@ -692,14 +711,33 @@ mod tests {
             value: 2.0,
             grad: Some(1.0),
         }];
+        let encoded =
+            encode_checkpoint(&entries, CheckpointMode::Strict).expect("strict encode should work");
         let mut payload: serde_json::Value =
-            serde_json::from_str(&encode_checkpoint(&entries, CheckpointMode::Strict))
-                .expect("valid encoded checkpoint");
+            serde_json::from_str(&encoded).expect("valid encoded checkpoint");
         payload["source_hash"] = json!("det64:deadbeefdeadbeef");
 
         let err = decode_checkpoint(payload.to_string().as_str(), DecodeMode::Strict)
             .expect_err("checksum mismatch should fail");
         assert!(err.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn strict_oversized_payload_is_fail_closed() {
+        let payload = "x".repeat(super::MAX_CHECKPOINT_PAYLOAD_BYTES + 1);
+        let err = decode_checkpoint(payload.as_str(), DecodeMode::Strict)
+            .expect_err("oversized payload must fail");
+        assert!(matches!(err, SerializeError::IncompatiblePayload { .. }));
+        assert!(err.to_string().contains("exceeds max bytes"));
+    }
+
+    #[test]
+    fn hardened_oversized_payload_is_fail_closed() {
+        let payload = "x".repeat(super::MAX_CHECKPOINT_PAYLOAD_BYTES + 1);
+        let err = decode_checkpoint(payload.as_str(), DecodeMode::Hardened)
+            .expect_err("oversized payload must fail");
+        assert!(matches!(err, SerializeError::IncompatiblePayload { .. }));
+        assert!(err.to_string().contains("exceeds max bytes"));
     }
 
     #[test]
@@ -716,7 +754,8 @@ mod tests {
                 grad: Some(2.0),
             },
         ];
-        let payload = encode_checkpoint(&entries, CheckpointMode::Strict);
+        let payload =
+            encode_checkpoint(&entries, CheckpointMode::Strict).expect("strict encode should work");
 
         let (sidecar, proof) =
             generate_sidecar_with_retry(&payload, 4).expect("sidecar generation should succeed");
@@ -741,7 +780,8 @@ mod tests {
                 grad: Some(2.0),
             },
         ];
-        let payload = encode_checkpoint(&entries, CheckpointMode::Strict);
+        let payload =
+            encode_checkpoint(&entries, CheckpointMode::Strict).expect("strict encode should work");
 
         let (_, proof_a) =
             generate_sidecar_with_retry(&payload, 4).expect("first sidecar generation should work");
@@ -759,7 +799,7 @@ mod tests {
             grad: Some(1.0),
         }];
 
-        let encoded = encode_snapshot(&entries);
+        let encoded = encode_snapshot(&entries).expect("strict encode should work");
         let decoded = decode_snapshot(&encoded).expect("legacy wrapper decode should work");
         assert_eq!(decoded, entries);
     }
@@ -769,7 +809,8 @@ mod tests {
         fn prop_checkpoint_roundtrip_preserves_sorted_entries(
             entries in prop::collection::vec(snapshot_entry_strategy(), 1..16),
         ) {
-            let encoded = encode_checkpoint(entries.as_slice(), CheckpointMode::Strict);
+            let encoded = encode_checkpoint(entries.as_slice(), CheckpointMode::Strict)
+                .expect("strict encode should work");
             let decoded =
                 decode_checkpoint(encoded.as_str(), DecodeMode::Strict).expect("decode must succeed");
             let mut expected = entries.clone();
@@ -811,8 +852,10 @@ mod tests {
             let mut reversed_entries = sorted_entries.clone();
             reversed_entries.reverse();
 
-            let encoded_a = encode_checkpoint(sorted_entries.as_slice(), CheckpointMode::Strict);
-            let encoded_b = encode_checkpoint(reversed_entries.as_slice(), CheckpointMode::Strict);
+            let encoded_a = encode_checkpoint(sorted_entries.as_slice(), CheckpointMode::Strict)
+                .expect("strict encode should work");
+            let encoded_b = encode_checkpoint(reversed_entries.as_slice(), CheckpointMode::Strict)
+                .expect("strict encode should work");
 
             prop_assert_eq!(encoded_a, encoded_b);
 
@@ -855,10 +898,10 @@ mod tests {
                     grad: None,
                 },
             ];
-            let mut payload: serde_json::Value = serde_json::from_str(
-                encode_checkpoint(entries.as_slice(), CheckpointMode::Strict).as_str(),
-            )
-            .expect("checkpoint payload should parse");
+            let encoded = encode_checkpoint(entries.as_slice(), CheckpointMode::Strict)
+                .expect("strict encode should work");
+            let mut payload: serde_json::Value =
+                serde_json::from_str(encoded.as_str()).expect("checkpoint payload should parse");
             payload[unknown_field.as_str()] = json!(value);
 
             let result = decode_checkpoint(payload.to_string().as_str(), DecodeMode::Strict);
@@ -918,7 +961,8 @@ mod tests {
                     grad: *grad,
                 })
                 .collect::<Vec<_>>();
-            let payload = encode_checkpoint(entries.as_slice(), CheckpointMode::Strict);
+            let payload = encode_checkpoint(entries.as_slice(), CheckpointMode::Strict)
+                .expect("strict encode should work");
 
             let first = generate_sidecar_with_retry(payload.as_str(), repair_symbols);
             let second = generate_sidecar_with_retry(payload.as_str(), repair_symbols);

@@ -1,7 +1,7 @@
 {
   "schema_version": "ft-user-journey-corpus-v1",
   "artifact_version": 1,
-  "generated_on": "2026-02-14",
+  "generated_on": "2026-02-17",
   "scope": "FrankenTorch Phase-2C user workflow scenario corpus",
   "scenario_id_contract": {
     "function_anchor": "crates/ft-conformance/src/lib.rs:2345",
@@ -252,6 +252,64 @@
       ],
       "e2e_coverage": [
         "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-009",
+      "name": "Dispatch device/dtype mismatch fail-closed boundary",
+      "class": "adversarial_fail_closed_path",
+      "packet_scopes": [
+        "FT-P2C-007"
+      ],
+      "fixture_cases": [
+        "dispatch_key_cases.json:device_mismatch_fail_closed",
+        "dispatch_key_cases.json:dtype_mismatch_fail_closed"
+      ],
+      "scenario_ids": [
+        "ft_p2c_007/dispatch_key/strict:device_mismatch_fail_closed",
+        "ft_p2c_007/dispatch_key/hardened:device_mismatch_fail_closed",
+        "ft_p2c_007/dispatch_key/strict:dtype_mismatch_fail_closed",
+        "ft_p2c_007/dispatch_key/hardened:dtype_mismatch_fail_closed"
+      ],
+      "unit_property_checks": [
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-dispatch prop_packet_007_dtype_or_device_mismatch_stays_fail_closed -- --nocapture",
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture",
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance hardened_dispatch_conformance_is_green -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=dispatch_key comparator=contract_ids drift_id=INV-DTYPE-DEVICE-COMPAT",
+        "suite=dispatch_key comparator=reason_code drift_id=expected_error_observed"
+      ],
+      "e2e_coverage": [
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-007 --output artifacts/phase2c/e2e_forensics/ft-p2c-007.jsonl"
+      ]
+    },
+    {
+      "journey_id": "UJ-FT-010",
+      "name": "Serialization incompatible payload fail-closed branch",
+      "class": "adversarial_fail_closed_path",
+      "packet_scopes": [
+        "FT-P2C-006"
+      ],
+      "fixture_cases": [
+        "serialization_cases.json:checkpoint_incompatible_payload_top_level_array"
+      ],
+      "scenario_ids": [
+        "serialization/strict:checkpoint_incompatible_payload_top_level_array",
+        "serialization/hardened:checkpoint_incompatible_payload_top_level_array"
+      ],
+      "unit_property_checks": [
+        "cargo test -p ft-serialize strict_unknown_field_fail_closed -- --nocapture",
+        "cargo test -p ft-serialize version_mismatch_is_fail_closed -- --nocapture",
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance strict_serialization_conformance_is_green -- --nocapture",
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance hardened_serialization_conformance_is_green -- --nocapture"
+      ],
+      "differential_assertions": [
+        "suite=serialization comparator=reason_code drift_id=expected_error_observed",
+        "suite=serialization comparator=serialization.decode drift_id=serialization.incompatible_payload_not_rejected"
+      ],
+      "e2e_coverage": [
+        "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl"
       ]
     }
   ]

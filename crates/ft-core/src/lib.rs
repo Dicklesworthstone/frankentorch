@@ -396,6 +396,139 @@ impl ScalarTensor {
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DenseTensor {
+    id: u64,
+    storage_id: u64,
+    meta: TensorMeta,
+    storage: Vec<f64>,
+    version: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DenseTensorError {
+    Meta(TensorMetaError),
+    UnsupportedDType(DType),
+    UnsupportedLayout,
+    StorageSpanOverflow { storage_offset: usize, numel: usize },
+    InsufficientStorage { needed: usize, actual: usize },
+}
+
+impl fmt::Display for DenseTensorError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Meta(error) => write!(f, "invalid tensor metadata: {error}"),
+            Self::UnsupportedDType(dtype) => write!(
+                f,
+                "unsupported dense tensor dtype: expected F64, got {dtype:?}"
+            ),
+            Self::UnsupportedLayout => {
+                write!(f, "dense tensor requires contiguous layout")
+            }
+            Self::StorageSpanOverflow {
+                storage_offset,
+                numel,
+            } => write!(
+                f,
+                "dense tensor storage span overflow for storage_offset={storage_offset}, numel={numel}"
+            ),
+            Self::InsufficientStorage { needed, actual } => write!(
+                f,
+                "dense tensor storage length is insufficient: needed={needed}, actual={actual}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for DenseTensorError {}
+
+impl From<TensorMetaError> for DenseTensorError {
+    fn from(value: TensorMetaError) -> Self {
+        Self::Meta(value)
+    }
+}
+
+impl DenseTensor {
+    pub fn from_storage(meta: TensorMeta, storage: Vec<f64>) -> Result<Self, DenseTensorError> {
+        meta.validate()?;
+        if meta.dtype() != DType::F64 {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
+        }
+
+        let needed = Self::contiguous_required_len(&meta)?;
+        if storage.len() < needed {
+            return Err(DenseTensorError::InsufficientStorage {
+                needed,
+                actual: storage.len(),
+            });
+        }
+
+        Ok(Self {
+            id: NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed),
+            storage_id: NEXT_STORAGE_ID.fetch_add(1, Ordering::Relaxed),
+            meta,
+            storage,
+            version: 0,
+        })
+    }
+
+    pub fn from_contiguous_values(
+        values: Vec<f64>,
+        shape: Vec<usize>,
+        device: Device,
+    ) -> Result<Self, DenseTensorError> {
+        let meta = TensorMeta::from_shape(shape, DType::F64, device);
+        Self::from_storage(meta, values)
+    }
+
+    fn contiguous_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError> {
+        meta.storage_offset().checked_add(meta.numel()).ok_or(
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset: meta.storage_offset(),
+                numel: meta.numel(),
+            },
+        )
+    }
+
+    pub fn dispatch_values(&self) -> Result<&[f64], DenseTensorError> {
+        let start = self.meta.storage_offset();
+        let end = Self::contiguous_required_len(&self.meta)?;
+        Ok(&self.storage[start..end])
+    }
+
+    pub fn contiguous_values(&self) -> Result<&[f64], DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        self.dispatch_values()
+    }
+
+    #[must_use]
+    pub fn storage(&self) -> &[f64] {
+        &self.storage
+    }
+
+    #[must_use]
+    pub fn meta(&self) -> &TensorMeta {
+        &self.meta
+    }
+
+    #[must_use]
+    pub fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[must_use]
+    pub fn storage_id(&self) -> u64 {
+        self.storage_id
+    }
+
+    #[must_use]
+    pub fn version(&self) -> u64 {
+        self.version
+    }
+}
+
 pub fn ensure_compatible(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<(), TensorCompatError> {
     if lhs.meta().dtype() != rhs.meta().dtype() {
         return Err(TensorCompatError::DTypeMismatch {
@@ -436,8 +569,8 @@ mod tests {
     use proptest::prelude::*;
 
     use super::{
-        DType, Device, ScalarTensor, TensorMeta, TensorMetaError, contiguous_strides,
-        ensure_compatible,
+        DType, DenseTensor, DenseTensorError, Device, ScalarTensor, TensorMeta, TensorMetaError,
+        contiguous_strides, ensure_compatible,
     };
 
     fn det_seed(parts: &[usize]) -> u64 {
@@ -536,6 +669,45 @@ mod tests {
         assert!(meta.strides().is_empty());
         assert_eq!(meta.numel(), 1);
         assert!(meta.is_contiguous());
+    }
+
+    #[test]
+    fn dense_tensor_from_contiguous_values_accepts_matching_storage() {
+        let tensor = DenseTensor::from_contiguous_values(vec![1.0, 2.0, 3.0], vec![3], Device::Cpu)
+            .expect("contiguous dense tensor should build");
+        assert_eq!(
+            tensor.contiguous_values().expect("slice should resolve"),
+            &[1.0, 2.0, 3.0]
+        );
+        assert_eq!(tensor.meta().shape(), &[3]);
+        assert_eq!(tensor.meta().dtype(), DType::F64);
+    }
+
+    #[test]
+    fn dense_tensor_contiguous_view_rejects_non_contiguous_layout() {
+        let meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
+                .expect("meta should validate");
+        let tensor = DenseTensor::from_storage(meta, vec![1.0; 6])
+            .expect("non-contiguous metadata should still construct tensor storage");
+        let err = tensor
+            .contiguous_values()
+            .expect_err("non-contiguous layout must fail contiguous view");
+        assert!(matches!(err, DenseTensorError::UnsupportedLayout));
+    }
+
+    #[test]
+    fn dense_tensor_rejects_insufficient_storage_for_offset() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu).with_storage_offset(2);
+        let err = DenseTensor::from_storage(meta, vec![1.0, 2.0, 3.0])
+            .expect_err("offset span must require enough storage");
+        assert!(matches!(
+            err,
+            DenseTensorError::InsufficientStorage {
+                needed: 5,
+                actual: 3
+            }
+        ));
     }
 
     #[test]

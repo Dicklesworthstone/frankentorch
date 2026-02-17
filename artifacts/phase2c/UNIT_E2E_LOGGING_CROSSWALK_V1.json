@@ -1,7 +1,7 @@
 {
   "schema_version": "ft-unit-e2e-logging-crosswalk-v1",
   "artifact_version": 1,
-  "generated_on": "2026-02-16",
+  "generated_on": "2026-02-17",
   "source_artifacts": {
     "scenario_corpus": "artifacts/phase2c/USER_WORKFLOW_SCENARIO_CORPUS_V1.json",
     "e2e_matrix": "artifacts/phase2c/e2e_forensics/e2e_matrix_full_v1.jsonl",
@@ -225,6 +225,14 @@
         {
           "test_id": "ft_serialize::checksum_mismatch_is_fail_closed",
           "command": "cargo test -p ft-serialize checksum_mismatch_is_fail_closed -- --nocapture"
+        },
+        {
+          "test_id": "ft_conformance::strict_serialization_conformance_is_green",
+          "command": "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance strict_serialization_conformance_is_green -- --nocapture"
+        },
+        {
+          "test_id": "ft_conformance::hardened_serialization_conformance_is_green",
+          "command": "rch exec -- env CARGO_TARGET_DIR=target_phase2c cargo test -p ft-conformance hardened_serialization_conformance_is_green -- --nocapture"
         }
       ],
       "differential_assertions": [
@@ -242,7 +250,9 @@
           "serialization/strict:checkpoint_basic",
           "serialization/hardened:checkpoint_basic",
           "serialization/strict:checkpoint_sparse_grad",
-          "serialization/hardened:checkpoint_sparse_grad"
+          "serialization/hardened:checkpoint_sparse_grad",
+          "serialization/strict:checkpoint_incompatible_payload_top_level_array",
+          "serialization/hardened:checkpoint_incompatible_payload_top_level_array"
         ],
         "replay_commands": [
           "cargo run -p ft-conformance --bin run_e2e_matrix -- --mode both --packet FT-P2C-006 --output artifacts/phase2c/e2e_forensics/ft-p2c-006.jsonl"
@@ -404,13 +414,14 @@
       "gap_id": "GAP-UX-001",
       "behavior_scope": "device mismatch + tensor compat negative workflows",
       "priority": "high",
-      "status": "open",
+      "status": "closed",
       "dependency_links": [
         "bd-3v0.20",
         "bd-3v0.23.10",
-        "bd-3v0.12.6"
+        "bd-3v0.12.6",
+        "bd-3qrd"
       ],
-      "closure_notes": "Add dedicated conformance fixtures and scenario IDs for DeviceError and TensorCompatError mismatch branches."
+      "closure_notes": "Closed with BHV-FT-007 + UJ-FT-009 coverage: FT-P2C-007 packet-projected scenario IDs now capture strict/hardened device and dtype mismatch fail-closed flows with deterministic replay commands."
     },
     {
       "gap_id": "GAP-UX-002",
@@ -434,6 +445,18 @@
         "bd-3v0.17.7"
       ],
       "closure_notes": "Bind sidecar/decode-proof outcomes to runtime durability evidence entries in forensics index artifacts."
+    },
+    {
+      "gap_id": "GAP-UX-004",
+      "behavior_scope": "explicit adversarial serialization incompatible-payload branch",
+      "priority": "high",
+      "status": "closed",
+      "dependency_links": [
+        "bd-3v0.17.6",
+        "bd-3v0.17.7",
+        "bd-1wcb"
+      ],
+      "closure_notes": "Closed by serialization fixture `checkpoint_incompatible_payload_top_level_array` and journey `UJ-FT-010`, with strict/hardened scenario IDs and replay commands wired into BHV-FT-005."
     }
   ]
 }

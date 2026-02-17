@@ -36,6 +36,26 @@
         }
       ],
       "repair_symbols": 3
+    },
+    {
+      "name": "checkpoint_incompatible_payload_top_level_array",
+      "entries": [
+        {
+          "node_id": 1,
+          "value": 3.5,
+          "grad": 0.5
+        },
+        {
+          "node_id": 2,
+          "value": -8.0,
+          "grad": null
+        }
+      ],
+      "repair_symbols": 3,
+      "payload_mutation": "top_level_array",
+      "expect_decode_error": true,
+      "strict_expect_error_contains": "invalid json",
+      "hardened_expect_error_contains": "incompatible payload"
     }
   ]
 }

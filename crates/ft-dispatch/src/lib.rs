@@ -316,6 +316,10 @@ fn is_valid_ident(value: &str) -> bool {
     chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_')
 }
 
+fn is_reserved_overload_name(value: &str) -> bool {
+    matches!(value, "default") || value.starts_with("__")
+}
+
 fn digest64(input: &str) -> u64 {
     let mut hash = 0xcbf2_9ce4_8422_2325u64;
     for byte in input.as_bytes() {
@@ -342,23 +346,23 @@ pub fn parse_schema_name(input: &str) -> Result<OpSchemaName, OpSchemaError> {
     }
 
     let (raw_base, overload) = match op_without_namespace.split_once('.') {
-        Some((name, overload_token)) => {
-            if overload_token.is_empty() {
+        Some((name, overload_name)) => {
+            if overload_name.is_empty() {
                 return Err(OpSchemaError::InvalidOverloadName {
-                    overload: overload_token.to_string(),
+                    overload: overload_name.to_string(),
                 });
             }
-            if overload_token == "default" || overload_token.starts_with("__") {
+            if is_reserved_overload_name(overload_name) {
                 return Err(OpSchemaError::InvalidOverloadName {
-                    overload: overload_token.to_string(),
+                    overload: overload_name.to_string(),
                 });
             }
-            if !is_valid_ident(overload_token) {
+            if !is_valid_ident(overload_name) {
                 return Err(OpSchemaError::InvalidOverloadName {
-                    overload: overload_token.to_string(),
+                    overload: overload_name.to_string(),
                 });
             }
-            (name, Some(overload_token.to_string()))
+            (name, Some(overload_name.to_string()))
         }
         None => (op_without_namespace, None),
     };
@@ -1270,12 +1274,13 @@ mod tests {
     }
 
     #[test]
-    fn schema_row_parse_round_trips_add_tensor_signature() {
+    fn schema_row_parse_round_trips_add_tensor_signature() -> Result<(), String> {
         let schema_text = "add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor";
-        let parsed = parse_schema_or_name(schema_text).expect("schema should parse");
+        let parsed = parse_schema_or_name(schema_text)
+            .map_err(|error| format!("schema should parse: {error}"))?;
         let schema = match parsed {
             ParsedSchemaInput::Schema(schema) => schema,
-            other => panic!("expected full schema parse, got {other:?}"),
+            other => return Err(format!("expected full schema parse, got {other:?}")),
         };
         assert_eq!(schema.op.base, "add");
         assert_eq!(schema.op.overload.as_deref(), Some("Tensor"));
@@ -1296,6 +1301,7 @@ mod tests {
             reason_code: "op_schema_row_roundtrip_ok",
         });
         assert_schema_log_contract(&log);
+        Ok(())
     }
 
     #[test]
@@ -1316,18 +1322,20 @@ mod tests {
     }
 
     #[test]
-    fn schema_out_variant_requires_mutable_out_alias() {
+    fn schema_out_variant_requires_mutable_out_alias() -> Result<(), String> {
         let schema_text =
             "add.out(Tensor self, Tensor other, *, Scalar alpha=1, Tensor(a!) out) -> Tensor(a!)";
-        let parsed = parse_schema_or_name(schema_text).expect("schema should parse");
+        let parsed = parse_schema_or_name(schema_text)
+            .map_err(|error| format!("schema should parse: {error}"))?;
         let schema = match parsed {
             ParsedSchemaInput::Schema(schema) => schema,
-            other => panic!("expected full schema parse, got {other:?}"),
+            other => return Err(format!("expected full schema parse, got {other:?}")),
         };
         assert_eq!(schema.op.overload.as_deref(), Some("out"));
         assert!(schema.is_out_variant);
         assert!(schema.arguments.contains("Tensor(a!) out"));
         assert_eq!(schema.returns, "Tensor(a!)");
+        Ok(())
     }
 
     #[test]

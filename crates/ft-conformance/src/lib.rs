@@ -307,6 +307,10 @@ struct SerializationCase {
     name: String,
     entries: Vec<SerializationCaseEntry>,
     repair_symbols: Option<usize>,
+    expect_decode_error: Option<bool>,
+    strict_expect_error_contains: Option<String>,
+    hardened_expect_error_contains: Option<String>,
+    payload_mutation: Option<SerializationPayloadMutation>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -314,6 +318,15 @@ struct SerializationCaseEntry {
     node_id: usize,
     value: f64,
     grad: Option<f64>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SerializationPayloadMutation {
+    UnknownField,
+    VersionMismatch,
+    ChecksumMismatch,
+    TopLevelArray,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -441,6 +454,9 @@ pub struct DifferentialHarnessReport {
 type SidecarCache = BTreeMap<(String, usize), (RaptorQSidecar, DecodeProofArtifact)>;
 
 static SERIALIZATION_SIDECAR_CACHE: OnceLock<Mutex<SidecarCache>> = OnceLock::new();
+const MAX_FIXTURE_BYTES: u64 = 1_048_576;
+const MAX_LEGACY_ORACLE_OUTPUT_LINE_BYTES: usize = 65_536;
+const LEGACY_ORACLE_RAW_DIAGNOSTIC_BYTES: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct LegacyOracleStatus {
@@ -2137,7 +2153,10 @@ pub fn run_differential_conformance(
             };
 
             let entries = serialization_entries(&case);
-            let payload = encode_checkpoint(entries.as_slice(), checkpoint_mode);
+            let payload =
+                encode_checkpoint(entries.as_slice(), checkpoint_mode).map_err(|error| {
+                    format!("serialization case '{}' encode failed: {error}", case.name)
+                })?;
             let mut expected_entries = entries.clone();
             expected_entries.sort_by_key(|entry| entry.node_id);
 
@@ -2191,7 +2210,13 @@ pub fn run_differential_conformance(
 
             let mut reversed_entries = entries.clone();
             reversed_entries.reverse();
-            let reversed_payload = encode_checkpoint(reversed_entries.as_slice(), checkpoint_mode);
+            let reversed_payload = encode_checkpoint(reversed_entries.as_slice(), checkpoint_mode)
+                .map_err(|error| {
+                    format!(
+                        "serialization case '{}' reversed encode failed: {error}",
+                        case.name
+                    )
+                })?;
             checks.push(compare_bool(
                 &allowlist,
                 "serialization",
@@ -3471,13 +3496,46 @@ fn run_serialization_case(
 
     let entries = serialization_entries(case);
 
-    let payload = encode_checkpoint(entries.as_slice(), checkpoint_mode);
-    let decoded = decode_checkpoint(payload.as_str(), decode_mode)
-        .map_err(|error| format!("serialization case '{}' decode failed: {error}", case.name))?;
+    let encoded_payload = encode_checkpoint(entries.as_slice(), checkpoint_mode)
+        .map_err(|error| format!("serialization case '{}' encode failed: {error}", case.name))?;
+    let payload = mutate_serialization_payload(encoded_payload.as_str(), case.payload_mutation)
+        .map_err(|error| {
+            format!(
+                "serialization case '{}' payload mutation failed: {error}",
+                case.name
+            )
+        })?;
 
-    let mut expected_entries = entries.clone();
-    expected_entries.sort_by_key(|entry| entry.node_id);
-    let decode_ok = decoded.entries == expected_entries;
+    let expect_decode_error = case.expect_decode_error.unwrap_or(false);
+    let expected_error_contains = match mode {
+        ExecutionMode::Strict => case.strict_expect_error_contains.as_deref(),
+        ExecutionMode::Hardened => case.hardened_expect_error_contains.as_deref(),
+    };
+    let decode_result = decode_checkpoint(payload.as_str(), decode_mode);
+
+    let (decode_ok, decode_error_message) = if expect_decode_error {
+        match decode_result {
+            Ok(_) => (
+                false,
+                Some("decode unexpectedly succeeded for expected-error case".to_string()),
+            ),
+            Err(error) => {
+                let message = error.to_string();
+                let matches_expected = expected_error_contains
+                    .is_none_or(|needle| message.to_lowercase().contains(&needle.to_lowercase()));
+                (matches_expected, Some(message))
+            }
+        }
+    } else {
+        match decode_result {
+            Ok(decoded) => {
+                let mut expected_entries = entries.clone();
+                expected_entries.sort_by_key(|entry| entry.node_id);
+                (decoded.entries == expected_entries, None)
+            }
+            Err(error) => (false, Some(error.to_string())),
+        }
+    };
 
     let repair_symbols = case.repair_symbols.unwrap_or(4);
     let (sidecar_a, proof_a) =
@@ -3496,6 +3554,17 @@ fn run_serialization_case(
     let sidecar_ok = sidecar_a.repair_symbol_count >= 1 && sidecar_a.constraints_symbol_count >= 1;
     let proof_deterministic_ok = proof_a.proof_hash == proof_b.proof_hash;
     let passed = decode_ok && sidecar_ok && proof_deterministic_ok;
+    let reason_code = if expect_decode_error {
+        if decode_ok {
+            "expected_error_observed"
+        } else {
+            "expected_error_not_observed"
+        }
+    } else if passed {
+        "serialization_parity_ok"
+    } else {
+        "serialization_expectation_mismatch"
+    };
 
     Ok(SerializationCaseReport {
         name: case.name.clone(),
@@ -3515,12 +3584,13 @@ fn run_serialization_case(
                 mode_label(mode)
             ),
             if passed { "pass" } else { "fail" },
-            if passed {
-                "serialization_parity_ok"
-            } else {
-                "serialization_expectation_mismatch"
-            },
-        ),
+            reason_code,
+        )
+        .with_extra_fields(serialization_forensic_fields(
+            case,
+            expect_decode_error,
+            decode_error_message.as_deref(),
+        )),
     })
 }
 
@@ -4236,14 +4306,41 @@ fn run_legacy_oracle_script(
 
     let stdout = String::from_utf8(output.stdout)
         .map_err(|error| format!("legacy oracle stdout was not utf8: {error}"))?;
+    parse_legacy_oracle_stdout(stdout.as_str())
+}
+
+fn parse_legacy_oracle_stdout(stdout: &str) -> Result<Value, String> {
     let line = stdout
         .lines()
         .rev()
         .find(|candidate| !candidate.trim().is_empty())
         .ok_or_else(|| "legacy oracle produced empty stdout".to_string())?;
 
-    serde_json::from_str::<Value>(line)
-        .map_err(|error| format!("legacy oracle output parse failure: {error}; raw={line}"))
+    if line.len() > MAX_LEGACY_ORACLE_OUTPUT_LINE_BYTES {
+        return Err(format!(
+            "legacy oracle output line exceeds max bytes: actual={} max={MAX_LEGACY_ORACLE_OUTPUT_LINE_BYTES}",
+            line.len()
+        ));
+    }
+
+    serde_json::from_str::<Value>(line).map_err(|error| {
+        format!(
+            "legacy oracle output parse failure: {error}; raw={}",
+            bounded_diagnostic(line, LEGACY_ORACLE_RAW_DIAGNOSTIC_BYTES)
+        )
+    })
+}
+
+fn bounded_diagnostic(input: &str, max_len: usize) -> String {
+    if input.len() <= max_len {
+        return input.to_string();
+    }
+
+    let mut boundary = max_len.min(input.len());
+    while boundary > 0 && !input.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}...", &input[..boundary])
 }
 
 fn probe_legacy_oracle(config: &HarnessConfig) -> LegacyOracleStatus {
@@ -4797,6 +4894,67 @@ fn ft_p2c_005_differential_evidence_refs() -> Vec<String> {
     ]
 }
 
+fn mutate_serialization_payload(
+    payload: &str,
+    mutation: Option<SerializationPayloadMutation>,
+) -> Result<String, String> {
+    let Some(mutation) = mutation else {
+        return Ok(payload.to_string());
+    };
+
+    if matches!(mutation, SerializationPayloadMutation::TopLevelArray) {
+        return Ok("[1,2,3]".to_string());
+    }
+
+    let mut value: Value = serde_json::from_str(payload)
+        .map_err(|error| format!("failed to parse checkpoint payload as json: {error}"))?;
+    let object = value
+        .as_object_mut()
+        .ok_or_else(|| "checkpoint payload must decode to a json object".to_string())?;
+
+    if matches!(mutation, SerializationPayloadMutation::UnknownField) {
+        object.insert("intruder_field".to_string(), json!("adversarial"));
+    } else if matches!(mutation, SerializationPayloadMutation::VersionMismatch) {
+        object.insert("schema_version".to_string(), json!(999_u32));
+    } else if matches!(mutation, SerializationPayloadMutation::ChecksumMismatch) {
+        object.insert("source_hash".to_string(), json!("det64:0000000000000000"));
+    }
+
+    serde_json::to_string(&value)
+        .map_err(|error| format!("failed to serialize mutated checkpoint payload: {error}"))
+}
+
+fn serialization_payload_mutation_label(mutation: SerializationPayloadMutation) -> &'static str {
+    match mutation {
+        SerializationPayloadMutation::UnknownField => "unknown_field",
+        SerializationPayloadMutation::VersionMismatch => "version_mismatch",
+        SerializationPayloadMutation::ChecksumMismatch => "checksum_mismatch",
+        SerializationPayloadMutation::TopLevelArray => "top_level_array",
+    }
+}
+
+fn serialization_forensic_fields(
+    case: &SerializationCase,
+    expect_decode_error: bool,
+    decode_error_message: Option<&str>,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "expected_decode_error".to_string(),
+        json!(expect_decode_error),
+    );
+    if let Some(mutation) = case.payload_mutation {
+        fields.insert(
+            "payload_mutation".to_string(),
+            json!(serialization_payload_mutation_label(mutation)),
+        );
+    }
+    if let Some(message) = decode_error_message {
+        fields.insert("decode_error_message".to_string(), json!(message));
+    }
+    fields
+}
+
 fn serialization_entries(case: &SerializationCase) -> Vec<SerializedSnapshotEntry> {
     case.entries
         .iter()
@@ -4870,6 +5028,20 @@ fn load_fixture<T>(path: &Path) -> Result<T, String>
 where
     T: for<'de> Deserialize<'de>,
 {
+    let metadata = fs::metadata(path).map_err(|error| {
+        format!(
+            "failed reading fixture metadata {}: {error}",
+            path.display()
+        )
+    })?;
+    let size = metadata.len();
+    if size > MAX_FIXTURE_BYTES {
+        return Err(format!(
+            "fixture {} exceeds max bytes: actual={size} max={MAX_FIXTURE_BYTES}",
+            path.display()
+        ));
+    }
+
     let raw = fs::read_to_string(path)
         .map_err(|error| format!("failed reading fixture {}: {error}", path.display()))?;
     serde_json::from_str::<T>(&raw)
@@ -4910,7 +5082,7 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     use super::{
         DispatchFixtureFile, ExecutionMode, HarnessConfig, NnStateCase, NnStateCaseReport,
@@ -6296,5 +6468,55 @@ mod tests {
         assert!(allowlist.contains("FT-P2C-002", "dispatch.composite_backend_fallback"));
         assert!(allowlist.contains("FT-P2C-004", "autograd.reentrant_depth_bounded_fallback"));
         assert!(allowlist.contains("FT-P2C-008", "nn_state.non_strict_missing_unexpected"));
+    }
+
+    #[test]
+    fn load_fixture_rejects_oversized_files_fail_closed() {
+        let stamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("clock should be after epoch")
+            .as_nanos();
+        let fixture_path =
+            std::env::temp_dir().join(format!("ft_conformance_oversized_fixture_{stamp}.json"));
+        let oversized = "x".repeat((super::MAX_FIXTURE_BYTES + 1) as usize);
+        fs::write(&fixture_path, oversized).expect("oversized fixture should be writable");
+
+        let result = load_fixture::<Value>(&fixture_path);
+        let _ = fs::remove_file(&fixture_path);
+
+        let err = result.expect_err("oversized fixture must fail");
+        assert!(err.contains("exceeds max bytes"));
+    }
+
+    #[test]
+    fn parse_legacy_oracle_stdout_rejects_oversized_line_fail_closed() {
+        let oversized = "x".repeat(super::MAX_LEGACY_ORACLE_OUTPUT_LINE_BYTES + 1);
+        let err = super::parse_legacy_oracle_stdout(format!("{oversized}\n").as_str())
+            .expect_err("oversized oracle output must fail");
+        assert!(err.contains("exceeds max bytes"));
+    }
+
+    #[test]
+    fn parse_legacy_oracle_stdout_bounds_parse_error_diagnostic() {
+        let malformed = format!(
+            "{{{}",
+            "x".repeat(super::LEGACY_ORACLE_RAW_DIAGNOSTIC_BYTES + 80)
+        );
+        let err = super::parse_legacy_oracle_stdout(malformed.as_str())
+            .expect_err("malformed oracle output should fail");
+        assert!(err.contains("legacy oracle output parse failure"));
+        assert!(err.contains("raw="));
+        assert!(err.contains("..."));
+        assert!(err.len() < 420);
+    }
+
+    #[test]
+    fn parse_legacy_oracle_stdout_uses_last_non_empty_line() {
+        let stdout = "not_json\n{\"torch_version\":\"2.6.0\"}\n";
+        let parsed = super::parse_legacy_oracle_stdout(stdout).expect("last line should parse");
+        assert_eq!(
+            parsed.get("torch_version").and_then(Value::as_str),
+            Some("2.6.0")
+        );
     }
 }
