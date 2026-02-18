@@ -117,7 +117,7 @@ fn tensor_session_fails_closed_on_non_contiguous_input() {
     let lhs_meta =
         TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
             .expect("non-contiguous meta should validate");
-    let lhs = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0])
+    let lhs = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
         .expect("lhs tensor should build");
     let rhs = session
         .tensor_variable(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], true)
