@@ -917,8 +917,8 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Div { lhs, rhs } => {
-                    let lhs_values = self.nodes[lhs.0].tensor.dispatch_values()?;
-                    let rhs_values = self.nodes[rhs.0].tensor.dispatch_values()?;
+                    let lhs_values = self.nodes[lhs.0].tensor.contiguous_values()?;
+                    let rhs_values = self.nodes[rhs.0].tensor.contiguous_values()?;
                     Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
                     Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
 
@@ -949,8 +949,8 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Mul { lhs, rhs } => {
-                    let lhs_values = self.nodes[lhs.0].tensor.dispatch_values()?;
-                    let rhs_values = self.nodes[rhs.0].tensor.dispatch_values()?;
+                    let lhs_values = self.nodes[lhs.0].tensor.contiguous_values()?;
+                    let rhs_values = self.nodes[rhs.0].tensor.contiguous_values()?;
                     Self::ensure_tensor_len(lhs, lhs_values.len(), incoming.len())?;
                     Self::ensure_tensor_len(rhs, rhs_values.len(), incoming.len())?;
 
@@ -1125,7 +1125,7 @@ mod tests {
 
     use super::{
         AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
-        TensorNodeId, TensorTape,
+        TensorNode, TensorNodeId, TensorNodeOp, TensorTape,
     };
 
     fn as_u64(value: usize) -> u64 {
@@ -1443,6 +1443,80 @@ mod tests {
         let err = tape
             .values(node)
             .expect_err("non-contiguous values should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::DenseTensor(DenseTensorError::UnsupportedLayout)
+        ));
+    }
+
+    #[test]
+    fn tensor_backward_mul_rejects_non_contiguous_operand_layout() {
+        let mut tape = TensorTape::new();
+        let lhs_meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
+                .expect("non-contiguous meta should validate");
+        let lhs_tensor = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .expect("lhs should build");
+        let rhs_tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu),
+            vec![2.0, 2.0, 2.0, 2.0],
+        )
+        .expect("rhs should build");
+        let out_tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu),
+            vec![2.0, 4.0, 6.0, 8.0],
+        )
+        .expect("out should build");
+
+        let lhs = tape.leaf_tensor(lhs_tensor, true);
+        let rhs = tape.leaf_tensor(rhs_tensor, true);
+        let out = TensorNodeId(tape.nodes.len());
+        tape.nodes.push(TensorNode {
+            tensor: out_tensor,
+            requires_grad: true,
+            op: TensorNodeOp::Mul { lhs, rhs },
+        });
+
+        let err = tape
+            .backward(out)
+            .expect_err("non-contiguous backward operand should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::DenseTensor(DenseTensorError::UnsupportedLayout)
+        ));
+    }
+
+    #[test]
+    fn tensor_backward_div_rejects_non_contiguous_operand_layout() {
+        let mut tape = TensorTape::new();
+        let lhs_meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
+                .expect("non-contiguous meta should validate");
+        let lhs_tensor = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .expect("lhs should build");
+        let rhs_tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu),
+            vec![2.0, 2.0, 2.0, 2.0],
+        )
+        .expect("rhs should build");
+        let out_tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu),
+            vec![0.5, 1.0, 1.5, 2.0],
+        )
+        .expect("out should build");
+
+        let lhs = tape.leaf_tensor(lhs_tensor, true);
+        let rhs = tape.leaf_tensor(rhs_tensor, true);
+        let out = TensorNodeId(tape.nodes.len());
+        tape.nodes.push(TensorNode {
+            tensor: out_tensor,
+            requires_grad: true,
+            op: TensorNodeOp::Div { lhs, rhs },
+        });
+
+        let err = tape
+            .backward(out)
+            .expect_err("non-contiguous backward operand should fail closed");
         assert!(matches!(
             err,
             AutogradError::DenseTensor(DenseTensorError::UnsupportedLayout)
