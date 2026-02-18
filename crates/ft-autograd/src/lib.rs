@@ -778,7 +778,7 @@ impl TensorTape {
         rhs: TensorNodeId,
         mode: ExecutionMode,
     ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
-        let (requires_grad, lhs_meta, outcome) = {
+        let (requires_grad, output_meta, outcome) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
             let requires_grad = lhs_node.requires_grad || rhs_node.requires_grad;
@@ -787,19 +787,24 @@ impl TensorTape {
             let outcome = dispatch_tensor_binary_contiguous_f64(
                 op,
                 mode,
-                lhs_node.tensor.dispatch_values()?,
-                rhs_node.tensor.dispatch_values()?,
+                lhs_node.tensor.storage(),
+                rhs_node.tensor.storage(),
                 &lhs_meta,
                 &rhs_meta,
                 requires_grad,
             )
             .map_err(AutogradError::Dispatch)?;
-            (requires_grad, lhs_meta, outcome)
+            let output_meta = ft_core::TensorMeta::from_shape(
+                lhs_meta.shape().to_vec(),
+                lhs_meta.dtype(),
+                lhs_meta.device(),
+            );
+            (requires_grad, output_meta, outcome)
         };
 
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(lhs_meta, outcome.values)?,
+            tensor: DenseTensor::from_storage(output_meta, outcome.values)?,
             requires_grad,
             op: match op {
                 BinaryOp::Add => TensorNodeOp::Add { lhs, rhs },
@@ -1120,7 +1125,7 @@ mod tests {
 
     use super::{
         AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
-        TensorTape,
+        TensorNodeId, TensorTape,
     };
 
     fn as_u64(value: usize) -> u64 {
@@ -1284,6 +1289,24 @@ mod tests {
     }
 
     #[test]
+    fn backward_options_for_mode_strict_matches_default() {
+        let options = BackwardOptions::for_mode(ExecutionMode::Strict);
+        assert_eq!(options, BackwardOptions::strict_default());
+        assert_eq!(options.policy, ReentrantPolicy::StrictFail);
+        assert_eq!(options.max_reentrant_depth, 0);
+        assert_eq!(options.current_reentrant_depth, 0);
+    }
+
+    #[test]
+    fn backward_options_for_mode_hardened_matches_default() {
+        let options = BackwardOptions::for_mode(ExecutionMode::Hardened);
+        assert_eq!(options, BackwardOptions::hardened_default());
+        assert_eq!(options.policy, ReentrantPolicy::HardenedBoundedFallback);
+        assert_eq!(options.max_reentrant_depth, 2);
+        assert_eq!(options.current_reentrant_depth, 0);
+    }
+
+    #[test]
     fn add_backward_matches_expected_gradient() {
         let mut tape = Tape::new();
         let x = tape.leaf(2.0, true);
@@ -1405,6 +1428,34 @@ mod tests {
                 .contains("unsupported non-contiguous layout on lhs")
         );
         Ok(())
+    }
+
+    #[test]
+    fn tensor_add_with_offset_view_input_returns_fresh_contiguous_output() {
+        let mut tape = TensorTape::new();
+        let lhs_meta =
+            TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu).with_storage_offset(2);
+        let lhs = DenseTensor::from_storage(lhs_meta, vec![0.0, 0.0, 1.0, 2.0, 3.0])
+            .expect("lhs offset view should build");
+        let rhs = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu),
+            vec![10.0, 20.0, 30.0],
+        )
+        .expect("rhs should build");
+
+        let lhs_node = tape.leaf_tensor(lhs, true);
+        let rhs_node = tape.leaf_tensor(rhs, true);
+        let (out_node, _) = tape
+            .add(lhs_node, rhs_node, ExecutionMode::Strict)
+            .expect("offset view add should succeed");
+
+        let out = tape.tensor(out_node).expect("output tensor should resolve");
+        assert_eq!(out.meta().storage_offset(), 0);
+        assert!(out.meta().is_contiguous());
+        assert_eq!(
+            out.dispatch_values().expect("output values"),
+            &[11.0, 22.0, 33.0]
+        );
     }
 
     #[test]
@@ -1536,6 +1587,60 @@ mod tests {
             err,
             AutogradError::DependencyUnderflow { node } if node == NodeId(0)
         ));
+    }
+
+    #[test]
+    fn tensor_dependency_compute_underflow_is_fail_closed() {
+        let tape = TensorTape::new();
+        let err = tape
+            .compute_dependencies(&[true])
+            .expect_err("reachable mismatch must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorDependencyUnderflow { node } if node == TensorNodeId(0)
+        ));
+    }
+
+    #[test]
+    fn tensor_dependency_complete_underflow_is_fail_closed() {
+        let mut pending = vec![0usize];
+        let mut queue = super::TensorReadyQueue::default();
+        let err = TensorTape::complete_dependency(&mut pending, TensorNodeId(0), &mut queue)
+            .expect_err("underflow should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorDependencyUnderflow { node } if node == TensorNodeId(0)
+        ));
+    }
+
+    #[test]
+    fn tensor_ensure_len_mismatch_is_fail_closed() {
+        let err = TensorTape::ensure_tensor_len(TensorNodeId(3), 2, 1)
+            .expect_err("shape mismatch must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorGradientShapeMismatch {
+                node,
+                expected: 2,
+                actual: 1
+            } if node == TensorNodeId(3)
+        ));
+    }
+
+    #[test]
+    fn tensor_accumulate_gradient_mismatch_is_fail_closed() {
+        let mut target = vec![0.0, 0.0];
+        let err = TensorTape::accumulate_tensor_gradient(TensorNodeId(1), &mut target, &[1.0])
+            .expect_err("shape mismatch must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorGradientShapeMismatch {
+                node,
+                expected: 2,
+                actual: 1
+            } if node == TensorNodeId(1)
+        ));
+        assert_eq!(target, vec![0.0, 0.0]);
     }
 
     proptest! {
