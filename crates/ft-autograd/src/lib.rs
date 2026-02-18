@@ -504,6 +504,7 @@ impl Tape {
             .min(options.max_reentrant_depth);
         let reachable = self.compute_reachable(root)?;
         let mut pending = self.compute_dependencies(&reachable)?;
+        let dependency_snapshot = pending.clone();
 
         let mut grads = vec![0.0; self.nodes.len()];
         grads[root.0] = 1.0;
@@ -604,7 +605,7 @@ impl Tape {
             queue_pushes: queue.pushes,
             queue_pops: queue.pops,
             max_queue_len: queue.max_len,
-            dependency_snapshot: pending,
+            dependency_snapshot,
             reentrant_depth,
             reentrant_guard_triggered,
             hardened_fallback_used,
@@ -861,6 +862,7 @@ impl TensorTape {
             .min(options.max_reentrant_depth);
         let reachable = self.compute_reachable(root)?;
         let mut pending = self.compute_dependencies(&reachable)?;
+        let dependency_snapshot = pending.clone();
 
         let mut grads = self
             .nodes
@@ -997,7 +999,7 @@ impl TensorTape {
             queue_pushes: queue.pushes,
             queue_pops: queue.pops,
             max_queue_len: queue.max_len,
-            dependency_snapshot: pending,
+            dependency_snapshot,
             reentrant_depth,
             reentrant_guard_triggered,
             hardened_fallback_used,
@@ -1524,6 +1526,26 @@ mod tests {
     }
 
     #[test]
+    fn tensor_dependency_snapshot_preserves_initial_pending_counts() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![2.0], vec![1], true)
+            .expect("x leaf should build");
+        let y = tape
+            .leaf(vec![3.0], vec![1], true)
+            .expect("y leaf should build");
+        let (sum, _) = tape
+            .add(x, y, ExecutionMode::Strict)
+            .expect("sum should build");
+        let (out, _) = tape
+            .mul(sum, x, ExecutionMode::Strict)
+            .expect("out should build");
+
+        let report = tape.backward(out).expect("backward should succeed");
+        assert_eq!(report.telemetry.dependency_snapshot, vec![2, 1, 1, 0]);
+    }
+
+    #[test]
     fn tensor_add_with_offset_view_input_returns_fresh_contiguous_output() {
         let mut tape = TensorTape::new();
         let lhs_meta =
@@ -1584,6 +1606,22 @@ mod tests {
 
         assert!(x_pos > xy_pos);
         assert!(x_pos > xz_pos);
+    }
+
+    #[test]
+    fn dependency_snapshot_preserves_initial_pending_counts() {
+        let mut tape = Tape::new();
+        let x = tape.leaf(2.0, true);
+        let y = tape.leaf(3.0, true);
+        let (sum, _) = tape
+            .add(x, y, ExecutionMode::Strict)
+            .expect("sum should succeed");
+        let (out, _) = tape
+            .mul(sum, x, ExecutionMode::Strict)
+            .expect("out should succeed");
+
+        let report = tape.backward(out).expect("backward should succeed");
+        assert_eq!(report.telemetry.dependency_snapshot, vec![2, 1, 1, 0]);
     }
 
     #[test]
