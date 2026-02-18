@@ -6,6 +6,8 @@ use ft_conformance::{
     run_scalar_conformance, run_serialization_conformance, run_smoke, run_tensor_meta_conformance,
 };
 use ft_core::{DType, DenseTensor, Device, ExecutionMode, TensorMeta};
+use ft_runtime::{EvidenceKind, RuntimeContext};
+use ft_serialize::{DecodeMode, decode_checkpoint};
 
 #[test]
 fn smoke_report_is_stable() {
@@ -156,5 +158,41 @@ fn tensor_session_fails_closed_on_device_mismatch() {
     assert!(
         message.contains("AutogradCPU requires CPU backend availability"),
         "missing keyset incompatibility reason: {message}"
+    );
+}
+
+#[test]
+fn runtime_records_durability_evidence_for_decode_failure() {
+    let mut ctx = RuntimeContext::new(ExecutionMode::Strict);
+    let payload = r#"{
+        "schema_version": 1,
+        "mode": "strict",
+        "entries": [],
+        "source_hash": "det64:placeholder",
+        "extra": 1
+    }"#;
+
+    let err = decode_checkpoint(payload, DecodeMode::Strict)
+        .expect_err("unknown field payload must fail strict decode");
+    ctx.record_checkpoint_decode_failure("strict", &err);
+
+    let durability_entry = ctx
+        .ledger()
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == EvidenceKind::Durability)
+        .expect("durability evidence entry should be present");
+    assert!(
+        durability_entry
+            .summary
+            .contains("checkpoint decode failure"),
+        "unexpected durability summary: {}",
+        durability_entry.summary
+    );
+    assert!(
+        durability_entry.summary.contains("unknown field"),
+        "durability summary should include decode diagnostic: {}",
+        durability_entry.summary
     );
 }

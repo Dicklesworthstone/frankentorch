@@ -289,6 +289,7 @@ dependencies = [
  "ft-autograd",
  "ft-core",
  "ft-dispatch",
+ "ft-runtime",
  "ft-serialize",
  "serde",
  "serde_json",

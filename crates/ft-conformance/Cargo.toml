@@ -9,6 +9,7 @@ ft-core = { workspace = true }
 ft-autograd = { workspace = true }
 ft-dispatch = { workspace = true }
 ft-serialize = { workspace = true }
+ft-runtime = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 
