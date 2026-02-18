@@ -459,7 +459,7 @@ impl DenseTensor {
             return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
         }
 
-        let needed = Self::contiguous_required_len(&meta)?;
+        let needed = Self::storage_span_required_len(&meta)?;
         if storage.len() < needed {
             return Err(DenseTensorError::InsufficientStorage {
                 needed,
@@ -492,6 +492,49 @@ impl DenseTensor {
                 numel: meta.numel(),
             },
         )
+    }
+
+    fn storage_span_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError> {
+        let mut max_linear_offset = 0usize;
+        for (size, stride) in meta
+            .shape()
+            .iter()
+            .copied()
+            .zip(meta.strides().iter().copied())
+        {
+            if size == 0 {
+                continue;
+            }
+            let span = stride.checked_mul(size.saturating_sub(1)).ok_or(
+                DenseTensorError::StorageSpanOverflow {
+                    storage_offset: meta.storage_offset(),
+                    numel: meta.numel(),
+                },
+            )?;
+            max_linear_offset = max_linear_offset.checked_add(span).ok_or(
+                DenseTensorError::StorageSpanOverflow {
+                    storage_offset: meta.storage_offset(),
+                    numel: meta.numel(),
+                },
+            )?;
+        }
+
+        if meta.numel() == 0 {
+            return Ok(meta.storage_offset());
+        }
+
+        let max_index = meta.storage_offset().checked_add(max_linear_offset).ok_or(
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset: meta.storage_offset(),
+                numel: meta.numel(),
+            },
+        )?;
+        max_index
+            .checked_add(1)
+            .ok_or(DenseTensorError::StorageSpanOverflow {
+                storage_offset: meta.storage_offset(),
+                numel: meta.numel(),
+            })
     }
 
     pub fn dispatch_values(&self) -> Result<&[f64], DenseTensorError> {
@@ -710,6 +753,22 @@ mod tests {
             DenseTensorError::InsufficientStorage {
                 needed: 5,
                 actual: 3
+            }
+        ));
+    }
+
+    #[test]
+    fn dense_tensor_rejects_insufficient_storage_for_strided_layout() {
+        let meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
+                .expect("strided meta should validate");
+        let err = DenseTensor::from_storage(meta, vec![1.0; 5])
+            .expect_err("strided span must require enough backing storage");
+        assert!(matches!(
+            err,
+            DenseTensorError::InsufficientStorage {
+                needed: 6,
+                actual: 5
             }
         ));
     }
