@@ -147,7 +147,11 @@ impl TensorMeta {
         if self.shape.is_empty() {
             return 1;
         }
-        self.shape.iter().copied().product()
+        self.shape
+            .iter()
+            .copied()
+            .try_fold(1usize, usize::checked_mul)
+            .unwrap_or(usize::MAX)
     }
 
     #[must_use]
@@ -863,6 +867,12 @@ mod tests {
     #[test]
     fn contiguous_stride_helper_handles_scalar() {
         assert_eq!(contiguous_strides(&[]), Vec::<usize>::new());
+    }
+
+    #[test]
+    fn numel_saturates_on_overflow() {
+        let meta = TensorMeta::from_shape(vec![usize::MAX, 2], DType::F64, Device::Cpu);
+        assert_eq!(meta.numel(), usize::MAX);
     }
 
     #[test]
