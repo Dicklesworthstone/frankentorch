@@ -6826,6 +6826,183 @@ print(json.dumps({"ok": True}))
     }
 
     #[test]
+    fn run_legacy_oracle_script_rejects_oversized_stdout_fail_closed() {
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let python_available = Command::new(&python)
+            .arg("-c")
+            .arg("import json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !python_available {
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let script = r#"
+import json
+import sys
+json.loads(sys.stdin.read())
+chunk = "x" * 65536
+while True:
+    sys.stdout.write(chunk)
+    sys.stdout.flush()
+"#;
+
+        let err = super::run_legacy_oracle_script(&config, script, &json!({"x": 1}))
+            .expect_err("oversized stdout must fail closed");
+        assert!(err.contains("stdout exceeds max bytes"));
+    }
+
+    #[test]
+    fn run_legacy_oracle_script_rejects_oversized_stderr_fail_closed() {
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let python_available = Command::new(&python)
+            .arg("-c")
+            .arg("import json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !python_available {
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let script = r#"
+import json
+import sys
+json.loads(sys.stdin.read())
+chunk = "x" * 65536
+while True:
+    sys.stderr.write(chunk)
+    sys.stderr.flush()
+"#;
+
+        let err = super::run_legacy_oracle_script(&config, script, &json!({"x": 1}))
+            .expect_err("oversized stderr must fail closed");
+        assert!(err.contains("stderr exceeds max bytes"));
+    }
+
+    #[test]
+    fn run_legacy_oracle_script_rejects_oversized_output_line_fail_closed() {
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let python_available = Command::new(&python)
+            .arg("-c")
+            .arg("import json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !python_available {
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let script = r#"
+import json
+import sys
+payload = json.loads(sys.stdin.read())
+line_len = payload["line_len"]
+sys.stdout.write("x" * line_len + "\n")
+sys.stdout.flush()
+"#;
+
+        let err = super::run_legacy_oracle_script(
+            &config,
+            script,
+            &json!({"line_len": super::MAX_LEGACY_ORACLE_OUTPUT_LINE_BYTES + 1}),
+        )
+        .expect_err("oversized output line must fail closed");
+        assert!(err.contains("output line exceeds max bytes"));
+    }
+
+    #[test]
+    fn run_legacy_oracle_script_rejects_non_utf8_stdout_fail_closed() {
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let python_available = Command::new(&python)
+            .arg("-c")
+            .arg("import json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !python_available {
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let script = r#"
+import json
+import sys
+json.loads(sys.stdin.read())
+sys.stdout.buffer.write(bytes([255, 254, 10]))
+sys.stdout.flush()
+"#;
+
+        let err = super::run_legacy_oracle_script(&config, script, &json!({"x": 1}))
+            .expect_err("non-utf8 stdout must fail closed");
+        assert!(err.contains("stdout was not utf8"));
+    }
+
+    #[test]
+    fn run_legacy_oracle_script_rejects_empty_stdout_fail_closed() {
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let python_available = Command::new(&python)
+            .arg("-c")
+            .arg("import json")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !python_available {
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let script = r#"
+import json
+import sys
+json.loads(sys.stdin.read())
+"#;
+
+        let err = super::run_legacy_oracle_script(&config, script, &json!({"x": 1}))
+            .expect_err("empty stdout must fail closed");
+        assert!(err.contains("produced empty stdout"));
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
