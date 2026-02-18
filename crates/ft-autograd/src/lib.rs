@@ -301,6 +301,12 @@ impl TensorBackwardReport {
 pub enum AutogradError {
     UnknownNode(NodeId),
     UnknownTensorNode(TensorNodeId),
+    RootDoesNotRequireGrad {
+        node: NodeId,
+    },
+    TensorRootDoesNotRequireGrad {
+        node: TensorNodeId,
+    },
     Dispatch(DispatchError),
     DenseTensor(DenseTensorError),
     ReentrantDepthExceeded {
@@ -325,6 +331,18 @@ impl fmt::Display for AutogradError {
         match self {
             Self::UnknownNode(node) => write!(f, "unknown node id {}", node.0),
             Self::UnknownTensorNode(node) => write!(f, "unknown tensor node id {}", node.0),
+            Self::RootDoesNotRequireGrad { node } => {
+                write!(
+                    f,
+                    "cannot run backward: root node {} does not require grad",
+                    node.0
+                )
+            }
+            Self::TensorRootDoesNotRequireGrad { node } => write!(
+                f,
+                "cannot run tensor backward: root node {} does not require grad",
+                node.0
+            ),
             Self::Dispatch(error) => write!(f, "dispatch failure: {error}"),
             Self::DenseTensor(error) => write!(f, "dense tensor failure: {error}"),
             Self::ReentrantDepthExceeded { current, max } => write!(
@@ -480,6 +498,9 @@ impl Tape {
     ) -> Result<BackwardReport, AutogradError> {
         if root.0 >= self.nodes.len() {
             return Err(AutogradError::UnknownNode(root));
+        }
+        if !self.nodes[root.0].requires_grad {
+            return Err(AutogradError::RootDoesNotRequireGrad { node: root });
         }
 
         let mut reentrant_guard_triggered = false;
@@ -838,6 +859,9 @@ impl TensorTape {
     ) -> Result<TensorBackwardReport, AutogradError> {
         if root.0 >= self.nodes.len() {
             return Err(AutogradError::UnknownTensorNode(root));
+        }
+        if !self.nodes[root.0].requires_grad {
+            return Err(AutogradError::TensorRootDoesNotRequireGrad { node: root });
         }
 
         let mut reentrant_guard_triggered = false;
@@ -1706,6 +1730,46 @@ mod tests {
             .expect_err("expected unknown node");
         let msg = err.to_string();
         assert!(msg.contains("unknown node"));
+    }
+
+    #[test]
+    fn backward_rejects_root_without_requires_grad() {
+        let mut tape = Tape::new();
+        let x = tape.leaf(2.0, false);
+        let y = tape.leaf(3.0, false);
+        let (root, _) = tape
+            .add(x, y, ExecutionMode::Strict)
+            .expect("add should succeed");
+
+        let err = tape
+            .backward(root)
+            .expect_err("root without requires_grad must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::RootDoesNotRequireGrad { node } if node == root
+        ));
+    }
+
+    #[test]
+    fn tensor_backward_rejects_root_without_requires_grad() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 2.0], vec![2], false)
+            .expect("x leaf should succeed");
+        let y = tape
+            .leaf(vec![3.0, 4.0], vec![2], false)
+            .expect("y leaf should succeed");
+        let (root, _) = tape
+            .add(x, y, ExecutionMode::Strict)
+            .expect("add should succeed");
+
+        let err = tape
+            .backward(root)
+            .expect_err("tensor root without requires_grad must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorRootDoesNotRequireGrad { node } if node == root
+        ));
     }
 
     #[test]
