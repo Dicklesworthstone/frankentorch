@@ -728,7 +728,7 @@ impl TensorTape {
     }
 
     pub fn values(&self, node: TensorNodeId) -> Result<Vec<f64>, AutogradError> {
-        Ok(self.node(node)?.tensor.dispatch_values()?.to_vec())
+        Ok(self.node(node)?.tensor.contiguous_values()?.to_vec())
     }
 
     pub fn tensor(&self, node: TensorNodeId) -> Result<&DenseTensor, AutogradError> {
@@ -1119,7 +1119,7 @@ impl TensorTape {
 mod tests {
     use std::collections::BTreeMap;
 
-    use ft_core::{DType, DenseTensor, Device, ExecutionMode, TensorMeta};
+    use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, TensorMeta};
     use ft_dispatch::DispatchError;
     use proptest::prelude::*;
 
@@ -1405,7 +1405,7 @@ mod tests {
         let lhs_meta =
             TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
                 .expect("non-contiguous meta should validate");
-        let lhs = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0])
+        let lhs = DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
             .expect("lhs should build");
         let rhs = DenseTensor::from_storage(
             TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu),
@@ -1428,6 +1428,25 @@ mod tests {
                 .contains("unsupported non-contiguous layout on lhs")
         );
         Ok(())
+    }
+
+    #[test]
+    fn tensor_values_reject_non_contiguous_layout() {
+        let mut tape = TensorTape::new();
+        let meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![4, 1], 0, DType::F64, Device::Cpu)
+                .expect("non-contiguous meta should validate");
+        let tensor = DenseTensor::from_storage(meta, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0])
+            .expect("tensor should build");
+
+        let node = tape.leaf_tensor(tensor, true);
+        let err = tape
+            .values(node)
+            .expect_err("non-contiguous values should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::DenseTensor(DenseTensorError::UnsupportedLayout)
+        ));
     }
 
     #[test]
