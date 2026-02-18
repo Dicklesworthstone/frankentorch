@@ -393,4 +393,31 @@ mod tests {
                 .contains("unsupported non-contiguous layout on lhs")
         );
     }
+
+    #[test]
+    fn session_tensor_add_fails_closed_on_device_mismatch() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lhs_meta =
+            TensorMeta::from_shape_and_strides(vec![2], vec![1], 0, DType::F64, Device::Cuda)
+                .expect("cuda meta should validate");
+        let lhs =
+            DenseTensor::from_storage(lhs_meta, vec![1.0, 2.0]).expect("lhs tensor should build");
+        let rhs = session
+            .tensor_variable(vec![3.0, 4.0], vec![2], true)
+            .expect("rhs tensor variable should build");
+        let lhs = session.tensor_variable_from_storage(lhs, true);
+
+        let err = session
+            .tensor_add(lhs, rhs)
+            .expect_err("device-mismatched tensor input must fail closed");
+        let message = err.to_string();
+        assert!(
+            message.contains("incompatible dispatch keyset"),
+            "unexpected error: {message}"
+        );
+        assert!(
+            message.contains("AutogradCPU requires CPU backend availability"),
+            "missing keyset incompatibility reason: {message}"
+        );
+    }
 }
