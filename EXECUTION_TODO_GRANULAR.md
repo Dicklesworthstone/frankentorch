@@ -201,7 +201,7 @@ Objective: complete `FT-P2C-002`, `FT-P2C-004`, and `FT-P2C-006` end-to-end (cod
 - [x] Reject cycle-inducing suggestions (2 rejected by cycle guard, intentionally not forced).
 - [x] Verify dependency graph is acyclic (`br dep cycles --json` => empty).
 - [x] Mark `bd-3v0.8` in-progress and log measured optimization evidence.
-- [x] Post graph-uplift summary comment on master bead `bd-3v0`.
+- [x] Post graph-uplift summary comment on primary bead `bd-3v0`.
 
 ### 10.4 Multi-Agent Coordination
 - [ ] Fetch/respond to Agent Mail inbox messages (blocked: MCP transport decode failure in this environment).

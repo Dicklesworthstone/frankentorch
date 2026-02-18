@@ -792,6 +792,40 @@ mod tests {
     }
 
     #[test]
+    fn validate_rejects_stride_overflow() {
+        let err = TensorMeta::from_shape_and_strides(
+            vec![3],
+            vec![usize::MAX],
+            0,
+            DType::F64,
+            Device::Cpu,
+        )
+        .expect_err("overflowing stride span must fail validation");
+
+        assert!(matches!(
+            err,
+            TensorMetaError::StrideOverflow { size: 3, stride } if stride == usize::MAX
+        ));
+    }
+
+    #[test]
+    fn storage_index_for_rejects_storage_offset_overflow() {
+        let meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu)
+            .with_storage_offset(usize::MAX);
+        let err = meta
+            .storage_index_for(&[1])
+            .expect_err("overflowing storage offset accumulation must fail");
+
+        assert!(matches!(
+            err,
+            TensorMetaError::StorageOffsetOverflow {
+                storage_offset,
+                max_linear_offset: 1
+            } if storage_offset == usize::MAX
+        ));
+    }
+
+    #[test]
     fn compatibility_checks_dtype_and_device() {
         let lhs = ScalarTensor::new(1.0, DType::F64, Device::Cpu);
         let rhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
