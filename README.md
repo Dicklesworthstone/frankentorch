@@ -117,3 +117,7 @@ Maintain deterministic gradient accumulation, alias/versioning rules, and backwa
 - FEATURE_PARITY.md
 
 These four docs are now the canonical porting-to-rust workflow for this repo.
+
+## License
+
+MIT License (with OpenAI/Anthropic Rider). See `LICENSE`.

@@ -2,6 +2,7 @@
 name = "ft-api"
 version = "0.1.0"
 edition = "2024"
+license-file = "../../LICENSE"
 
 [dependencies]
 ft-autograd = { workspace = true }
