@@ -6,8 +6,10 @@ use std::fmt;
 
 use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor};
 use ft_dispatch::{
-    BinaryOp, DispatchDecision, DispatchError, DispatchKeyError, dispatch_scalar_binary,
-    dispatch_tensor_binary_contiguous_f64,
+    BinaryOp, DispatchDecision, DispatchError, DispatchKeyError, ReductionDispatchDecision,
+    ReductionOp, UnaryDispatchDecision, UnaryOp, dispatch_scalar_binary, dispatch_scalar_unary,
+    dispatch_tensor_binary_contiguous_f64, dispatch_tensor_reduction_contiguous_f64,
+    dispatch_tensor_unary_contiguous_f64,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -23,6 +25,13 @@ enum NodeOp {
     Sub { lhs: NodeId, rhs: NodeId },
     Div { lhs: NodeId, rhs: NodeId },
     Mul { lhs: NodeId, rhs: NodeId },
+    Neg { input: NodeId },
+    Abs { input: NodeId },
+    Exp { input: NodeId },
+    Log { input: NodeId },
+    Relu { input: NodeId },
+    Sigmoid { input: NodeId },
+    Tanh { input: NodeId },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +63,35 @@ enum TensorNodeOp {
     MatMul {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
+    },
+    Neg {
+        input: TensorNodeId,
+    },
+    Abs {
+        input: TensorNodeId,
+    },
+    Exp {
+        input: TensorNodeId,
+    },
+    Log {
+        input: TensorNodeId,
+    },
+    Relu {
+        input: TensorNodeId,
+    },
+    Sigmoid {
+        input: TensorNodeId,
+    },
+    Tanh {
+        input: TensorNodeId,
+    },
+    Sum {
+        input: TensorNodeId,
+        input_numel: usize,
+    },
+    Mean {
+        input: TensorNodeId,
+        input_numel: usize,
     },
 }
 
@@ -227,12 +265,36 @@ pub struct OperationEvent {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UnaryOperationEvent {
+    pub op: UnaryOp,
+    pub input: NodeId,
+    pub out: NodeId,
+    pub decision: UnaryDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TensorOperationEvent {
     pub op: BinaryOp,
     pub lhs: TensorNodeId,
     pub rhs: TensorNodeId,
     pub out: TensorNodeId,
     pub decision: DispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TensorUnaryOperationEvent {
+    pub op: UnaryOp,
+    pub input: TensorNodeId,
+    pub out: TensorNodeId,
+    pub decision: UnaryDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorReductionOperationEvent {
+    pub op: ReductionOp,
+    pub input: TensorNodeId,
+    pub out: TensorNodeId,
+    pub decision: ReductionDispatchDecision,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -457,6 +519,230 @@ impl Tape {
         self.binary(BinaryOp::Div, lhs, rhs, mode)
     }
 
+    pub fn neg(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Neg, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Neg { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Neg,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn abs(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Abs, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Abs { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Abs,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn exp(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Exp, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Exp { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Exp,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn log(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Log, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Log { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Log,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn relu(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Relu, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Relu { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Relu,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn sigmoid(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Sigmoid, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Sigmoid { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Sigmoid,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn tanh(
+        &mut self,
+        input: NodeId,
+        mode: ExecutionMode,
+    ) -> Result<(NodeId, UnaryOperationEvent), AutogradError> {
+        let (requires_grad, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let outcome =
+                dispatch_scalar_unary(UnaryOp::Tanh, mode, &input_node.tensor, requires_grad)
+                    .map_err(AutogradError::Dispatch)?;
+            (requires_grad, outcome)
+        };
+
+        let out = NodeId(self.nodes.len());
+        self.nodes.push(Node {
+            tensor: outcome.tensor,
+            requires_grad,
+            op: NodeOp::Tanh { input },
+        });
+
+        Ok((
+            out,
+            UnaryOperationEvent {
+                op: UnaryOp::Tanh,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
     fn binary(
         &mut self,
         op: BinaryOp,
@@ -628,6 +914,96 @@ impl Tape {
                         rule: "d(a*b)/da=b; d(a*b)/db=a",
                     });
                 }
+                NodeOp::Neg { input } => {
+                    grads[input.0] -= incoming;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d(-x)/dx=-1",
+                    });
+                }
+                NodeOp::Abs { input } => {
+                    let input_value = self.nodes[input.0].tensor.value();
+                    let sign = if input_value > 0.0 {
+                        1.0
+                    } else if input_value < 0.0 {
+                        -1.0
+                    } else {
+                        0.0
+                    };
+                    grads[input.0] += incoming * sign;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d|x|/dx=sign(x)",
+                    });
+                }
+                NodeOp::Exp { input } => {
+                    let output_value = self.nodes[node_id.0].tensor.value();
+                    grads[input.0] += incoming * output_value;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d(exp(x))/dx=exp(x)",
+                    });
+                }
+                NodeOp::Log { input } => {
+                    let input_value = self.nodes[input.0].tensor.value();
+                    grads[input.0] += incoming / input_value;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d(ln(x))/dx=1/x",
+                    });
+                }
+                NodeOp::Relu { input } => {
+                    let input_value = self.nodes[input.0].tensor.value();
+                    grads[input.0] += if input_value > 0.0 { incoming } else { 0.0 };
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d(relu(x))/dx=1 if x>0 else 0",
+                    });
+                }
+                NodeOp::Sigmoid { input } => {
+                    let output_value = self.nodes[node_id.0].tensor.value();
+                    grads[input.0] += incoming * output_value * (1.0 - output_value);
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d(sigmoid(x))/dx=sigmoid(x)*(1-sigmoid(x))",
+                    });
+                }
+                NodeOp::Tanh { input } => {
+                    let output_value = self.nodes[node_id.0].tensor.value();
+                    grads[input.0] += incoming * (1.0 - output_value * output_value);
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(BackwardStep {
+                        node: node_id,
+                        incoming_grad: incoming,
+                        rule: "d(tanh(x))/dx=1-tanh(x)^2",
+                    });
+                }
             }
         }
 
@@ -683,6 +1059,15 @@ impl Tape {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                NodeOp::Neg { input }
+                | NodeOp::Abs { input }
+                | NodeOp::Exp { input }
+                | NodeOp::Log { input }
+                | NodeOp::Relu { input }
+                | NodeOp::Sigmoid { input }
+                | NodeOp::Tanh { input } => {
+                    stack.push(input);
+                }
             }
         }
 
@@ -708,6 +1093,15 @@ impl Tape {
                 | NodeOp::Mul { lhs, rhs } => {
                     pending[lhs.0] = pending[lhs.0].saturating_add(1);
                     pending[rhs.0] = pending[rhs.0].saturating_add(1);
+                }
+                NodeOp::Neg { input }
+                | NodeOp::Abs { input }
+                | NodeOp::Exp { input }
+                | NodeOp::Log { input }
+                | NodeOp::Relu { input }
+                | NodeOp::Sigmoid { input }
+                | NodeOp::Tanh { input } => {
+                    pending[input.0] = pending[input.0].saturating_add(1);
                 }
             }
         }
@@ -822,6 +1216,435 @@ impl TensorTape {
         mode: ExecutionMode,
     ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
         self.binary(BinaryOp::MatMul, lhs, rhs, mode)
+    }
+
+    pub fn neg(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Neg,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Neg { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Neg,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn abs(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Abs,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Abs { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Abs,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn exp(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Exp,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Exp { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Exp,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn log(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Log,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Log { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Log,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn relu(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Relu,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Relu { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Relu,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn sigmoid(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Sigmoid,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Sigmoid { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Sigmoid,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn tanh(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorUnaryOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Tanh,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.shape().to_vec(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Tanh { input },
+        });
+
+        Ok((
+            out,
+            TensorUnaryOperationEvent {
+                op: UnaryOp::Tanh,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn sum(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorReductionOperationEvent), AutogradError> {
+        let (requires_grad, input_numel, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_reduction_contiguous_f64(
+                ReductionOp::Sum,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.numel(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(vec![1], output_dtype, output_device),
+                vec![outcome.value],
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Sum {
+                input,
+                input_numel,
+            },
+        });
+
+        Ok((
+            out,
+            TensorReductionOperationEvent {
+                op: ReductionOp::Sum,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn mean(
+        &mut self,
+        input: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorReductionOperationEvent), AutogradError> {
+        let (requires_grad, input_numel, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_reduction_contiguous_f64(
+                ReductionOp::Mean,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (
+                requires_grad,
+                meta.numel(),
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(vec![1], output_dtype, output_device),
+                vec![outcome.value],
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Mean {
+                input,
+                input_numel,
+            },
+        });
+
+        Ok((
+            out,
+            TensorReductionOperationEvent {
+                op: ReductionOp::Mean,
+                input,
+                out,
+                decision: outcome.decision,
+            },
+        ))
     }
 
     fn binary(
@@ -1096,6 +1919,215 @@ impl TensorTape {
                         rule: "d(A@B)/dA=dOut@B^T; d(A@B)/dB=A^T@dOut",
                     });
                 }
+                TensorNodeOp::Neg { input } => {
+                    let neg_contrib =
+                        incoming.iter().map(|value| -*value).collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &neg_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(-x)/dx=-1",
+                    });
+                }
+                TensorNodeOp::Abs { input } => {
+                    let input_values = self.nodes[input.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+
+                    let abs_contrib = incoming
+                        .iter()
+                        .zip(input_values.iter())
+                        .map(|(grad, value)| {
+                            let sign = if *value > 0.0 {
+                                1.0
+                            } else if *value < 0.0 {
+                                -1.0
+                            } else {
+                                0.0
+                            };
+                            grad * sign
+                        })
+                        .collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &abs_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d|x|/dx=sign(x)",
+                    });
+                }
+                TensorNodeOp::Exp { input } => {
+                    let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
+
+                    let exp_contrib = incoming
+                        .iter()
+                        .zip(output_values.iter())
+                        .map(|(grad, out_val)| grad * out_val)
+                        .collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &exp_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(exp(x))/dx=exp(x)",
+                    });
+                }
+                TensorNodeOp::Log { input } => {
+                    let input_values = self.nodes[input.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+
+                    let log_contrib = incoming
+                        .iter()
+                        .zip(input_values.iter())
+                        .map(|(grad, val)| grad / val)
+                        .collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &log_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(ln(x))/dx=1/x",
+                    });
+                }
+                TensorNodeOp::Relu { input } => {
+                    let input_values = self.nodes[input.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+
+                    let relu_contrib = incoming
+                        .iter()
+                        .zip(input_values.iter())
+                        .map(|(grad, val)| if *val > 0.0 { *grad } else { 0.0 })
+                        .collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &relu_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(relu(x))/dx=1 if x>0 else 0",
+                    });
+                }
+                TensorNodeOp::Sigmoid { input } => {
+                    let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
+
+                    let sigmoid_contrib = incoming
+                        .iter()
+                        .zip(output_values.iter())
+                        .map(|(grad, s)| grad * s * (1.0 - s))
+                        .collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &sigmoid_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(sigmoid(x))/dx=sigmoid(x)*(1-sigmoid(x))",
+                    });
+                }
+                TensorNodeOp::Tanh { input } => {
+                    let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
+
+                    let tanh_contrib = incoming
+                        .iter()
+                        .zip(output_values.iter())
+                        .map(|(grad, t)| grad * (1.0 - t * t))
+                        .collect::<Vec<_>>();
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &tanh_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(tanh(x))/dx=1-tanh(x)^2",
+                    });
+                }
+                TensorNodeOp::Sum {
+                    input,
+                    input_numel,
+                } => {
+                    let grad_scalar = incoming[0];
+                    let sum_contrib = vec![grad_scalar; input_numel];
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &sum_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(sum(x))/dx_i=1",
+                    });
+                }
+                TensorNodeOp::Mean {
+                    input,
+                    input_numel,
+                } => {
+                    let grad_scalar = incoming[0];
+                    let scale = if input_numel > 0 {
+                        1.0 / input_numel as f64
+                    } else {
+                        0.0
+                    };
+                    let mean_contrib = vec![grad_scalar * scale; input_numel];
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &mean_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(mean(x))/dx_i=1/n",
+                    });
+                }
             }
         }
 
@@ -1152,6 +2184,17 @@ impl TensorTape {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
+                TensorNodeOp::Neg { input }
+                | TensorNodeOp::Abs { input }
+                | TensorNodeOp::Exp { input }
+                | TensorNodeOp::Log { input }
+                | TensorNodeOp::Relu { input }
+                | TensorNodeOp::Sigmoid { input }
+                | TensorNodeOp::Tanh { input }
+                | TensorNodeOp::Sum { input, .. }
+                | TensorNodeOp::Mean { input, .. } => {
+                    stack.push(input);
+                }
             }
         }
 
@@ -1180,6 +2223,17 @@ impl TensorTape {
                 | TensorNodeOp::MatMul { lhs, rhs } => {
                     pending[lhs.0] = pending[lhs.0].saturating_add(1);
                     pending[rhs.0] = pending[rhs.0].saturating_add(1);
+                }
+                TensorNodeOp::Neg { input }
+                | TensorNodeOp::Abs { input }
+                | TensorNodeOp::Exp { input }
+                | TensorNodeOp::Log { input }
+                | TensorNodeOp::Relu { input }
+                | TensorNodeOp::Sigmoid { input }
+                | TensorNodeOp::Tanh { input }
+                | TensorNodeOp::Sum { input, .. }
+                | TensorNodeOp::Mean { input, .. } => {
+                    pending[input.0] = pending[input.0].saturating_add(1);
                 }
             }
         }

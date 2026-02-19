@@ -269,6 +269,7 @@ version = "0.1.0"
 dependencies = [
  "ft-autograd",
  "ft-core",
+ "ft-dispatch",
  "ft-runtime",
 ]
 
