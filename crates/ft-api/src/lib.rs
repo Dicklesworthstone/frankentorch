@@ -2,9 +2,10 @@
 
 use ft_autograd::{
     AutogradError, BackwardOptions, BackwardReport, ClampOperationEvent, NodeId, OperationEvent,
-    PowOperationEvent, Tape, TensorBackwardReport, TensorClampOperationEvent, TensorNodeId,
-    TensorOperationEvent, TensorPowOperationEvent, TensorReductionDimOperationEvent,
-    TensorReductionOperationEvent, TensorTape, TensorUnaryOperationEvent, UnaryOperationEvent,
+    PowOperationEvent, Tape, TensorBackwardReport, TensorClampOperationEvent,
+    TensorNormalizeDimOperationEvent, TensorNodeId, TensorOperationEvent,
+    TensorPowOperationEvent, TensorReductionDimOperationEvent, TensorReductionOperationEvent,
+    TensorTape, TensorUnaryOperationEvent, UnaryOperationEvent,
 };
 use ft_dispatch::{
     ComparisonDispatchDecision, ComparisonOp, dispatch_scalar_comparison,
@@ -870,6 +871,26 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    pub fn tensor_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (out, event) = self.tensor_tape.softmax(input, dim, self.mode())?;
+        self.record_tensor_normalize_dim_operation(&event);
+        Ok(out)
+    }
+
+    pub fn tensor_log_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (out, event) = self.tensor_tape.log_softmax(input, dim, self.mode())?;
+        self.record_tensor_normalize_dim_operation(&event);
+        Ok(out)
+    }
+
     pub fn tensor_transpose(
         &mut self,
         input: TensorNodeId,
@@ -1052,6 +1073,28 @@ impl FrankenTorchSession {
             EvidenceKind::Dispatch,
             format!(
                 "tensor_reduction_dim_op={:?} input={} out={} dim={} mode={:?} kernel={} key={:?} backend={:?} keyset=0x{:016x} fallback={}",
+                event.op,
+                event.input.0,
+                event.out.0,
+                event.dim,
+                event.decision.mode,
+                event.decision.kernel,
+                event.decision.selected_key,
+                event.decision.backend_key,
+                event.decision.keyset_bits,
+                event.decision.fallback_used
+            ),
+        );
+    }
+
+    fn record_tensor_normalize_dim_operation(
+        &mut self,
+        event: &TensorNormalizeDimOperationEvent,
+    ) {
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "tensor_normalize_dim_op={:?} input={} out={} dim={} mode={:?} kernel={} key={:?} backend={:?} keyset=0x{:016x} fallback={}",
                 event.op,
                 event.input.0,
                 event.out.0,
@@ -3491,5 +3534,55 @@ mod tests {
         assert!((grads[0] - (-1.0)).abs() < 1e-12);
         assert!(grads[1].abs() < 1e-12);
         assert!((grads[2] - 1.0).abs() < 1e-12);
+    }
+
+    // ── softmax/log_softmax API tests ─────────────────────────────
+
+    #[test]
+    fn session_tensor_softmax_sums_to_one() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).expect("leaf");
+        let y = session.tensor_softmax(x, 1).expect("softmax");
+        let vals = session.tensor_values(y).expect("values");
+        let row0_sum: f64 = vals[0..3].iter().sum();
+        let row1_sum: f64 = vals[3..6].iter().sum();
+        assert!((row0_sum - 1.0).abs() < 1e-12);
+        assert!((row1_sum - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn session_tensor_log_softmax_consistent() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false).expect("leaf");
+        let y = session.tensor_log_softmax(x, 1).expect("log_softmax");
+        let vals = session.tensor_values(y).expect("values");
+        // exp of log_softmax should sum to 1
+        let sum: f64 = vals.iter().map(|v| v.exp()).sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn session_tensor_softmax_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let y = session.tensor_softmax(x, 1).expect("softmax");
+        let report = session.tensor_backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+        // Sum of softmax backward gradients (with all-ones incoming) should be 0
+        // because softmax is invariant to constant shift
+        let grad_sum: f64 = grads.iter().sum();
+        assert!(grad_sum.abs() < 1e-12, "softmax grad sum should be 0, got {grad_sum}");
+    }
+
+    #[test]
+    fn session_tensor_log_softmax_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let y = session.tensor_log_softmax(x, 1).expect("log_softmax");
+        let report = session.tensor_backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+        // Sum of log_softmax backward gradients should be 0
+        let grad_sum: f64 = grads.iter().sum();
+        assert!(grad_sum.abs() < 1e-12, "log_softmax grad sum should be 0, got {grad_sum}");
     }
 }

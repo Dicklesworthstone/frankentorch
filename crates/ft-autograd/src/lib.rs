@@ -7,10 +7,11 @@ use std::fmt;
 use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor};
 use ft_dispatch::{
     BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError, DispatchKeyError,
-    PowDispatchDecision, ReductionDimDispatchDecision, ReductionDispatchDecision, ReductionOp,
-    UnaryDispatchDecision, UnaryOp, dispatch_scalar_binary, dispatch_scalar_clamp,
-    dispatch_scalar_pow, dispatch_scalar_unary, dispatch_tensor_binary_contiguous_f64,
-    dispatch_tensor_clamp_contiguous_f64, dispatch_tensor_pow_contiguous_f64,
+    NormalizeDimDispatchDecision, NormalizeOp, PowDispatchDecision, ReductionDimDispatchDecision,
+    ReductionDispatchDecision, ReductionOp, UnaryDispatchDecision, UnaryOp,
+    dispatch_scalar_binary, dispatch_scalar_clamp, dispatch_scalar_pow, dispatch_scalar_unary,
+    dispatch_tensor_binary_contiguous_f64, dispatch_tensor_clamp_contiguous_f64,
+    dispatch_tensor_normalize_dim_contiguous_f64, dispatch_tensor_pow_contiguous_f64,
     dispatch_tensor_reduction_contiguous_f64, dispatch_tensor_reduction_dim_contiguous_f64,
     dispatch_tensor_unary_contiguous_f64,
 };
@@ -4331,6 +4332,96 @@ impl TensorTape {
         ))
     }
 
+    pub fn softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorNormalizeDimOperationEvent), AutogradError> {
+        let (requires_grad, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_normalize_dim_contiguous_f64(
+                NormalizeOp::Softmax,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (requires_grad, meta.dtype(), meta.device(), outcome)
+        };
+
+        let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(input_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Softmax { input, dim },
+        });
+
+        Ok((
+            out,
+            TensorNormalizeDimOperationEvent {
+                op: NormalizeOp::Softmax,
+                input,
+                out,
+                dim,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn log_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorNormalizeDimOperationEvent), AutogradError> {
+        let (requires_grad, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_normalize_dim_contiguous_f64(
+                NormalizeOp::LogSoftmax,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            (requires_grad, meta.dtype(), meta.device(), outcome)
+        };
+
+        let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(input_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::LogSoftmax { input, dim },
+        });
+
+        Ok((
+            out,
+            TensorNormalizeDimOperationEvent {
+                op: NormalizeOp::LogSoftmax,
+                input,
+                out,
+                dim,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
     pub fn reshape(
         &mut self,
         input: TensorNodeId,
@@ -5749,6 +5840,88 @@ impl TensorTape {
                         rule: "d(std_dim(x))/dx_i=(x_i-mean)/((n-1)*std)",
                     });
                 }
+                TensorNodeOp::Softmax { input, dim } => {
+                    let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let reduce_size = shape[dim];
+                    let outer_size: usize = shape[..dim].iter().product();
+                    let inner_size: usize = shape[dim + 1..].iter().product();
+                    let input_numel: usize = shape.iter().product();
+                    let mut softmax_contrib = vec![0.0; input_numel];
+
+                    // grad_input_i = output_i * (grad_i - sum_j(grad_j * output_j))
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let mut dot = 0.0;
+                            for r in 0..reduce_size {
+                                let idx =
+                                    outer * reduce_size * inner_size + r * inner_size + inner;
+                                dot += incoming[idx] * output_values[idx];
+                            }
+                            for r in 0..reduce_size {
+                                let idx =
+                                    outer * reduce_size * inner_size + r * inner_size + inner;
+                                softmax_contrib[idx] =
+                                    output_values[idx] * (incoming[idx] - dot);
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &softmax_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(softmax(x))/dx_i=s_i*(grad_i-sum(grad*s))",
+                    });
+                }
+                TensorNodeOp::LogSoftmax { input, dim } => {
+                    let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let reduce_size = shape[dim];
+                    let outer_size: usize = shape[..dim].iter().product();
+                    let inner_size: usize = shape[dim + 1..].iter().product();
+                    let input_numel: usize = shape.iter().product();
+                    let mut logsoftmax_contrib = vec![0.0; input_numel];
+
+                    // grad_input_i = grad_i - exp(output_i) * sum_j(grad_j)
+                    // where exp(output_i) = softmax_i
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let mut grad_sum = 0.0;
+                            for r in 0..reduce_size {
+                                let idx =
+                                    outer * reduce_size * inner_size + r * inner_size + inner;
+                                grad_sum += incoming[idx];
+                            }
+                            for r in 0..reduce_size {
+                                let idx =
+                                    outer * reduce_size * inner_size + r * inner_size + inner;
+                                let softmax_i = output_values[idx].exp();
+                                logsoftmax_contrib[idx] =
+                                    incoming[idx] - softmax_i * grad_sum;
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(
+                        input,
+                        &mut grads[input.0],
+                        &logsoftmax_contrib,
+                    )?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(log_softmax(x))/dx_i=grad_i-softmax_i*sum(grad)",
+                    });
+                }
                 TensorNodeOp::Reshape { input, .. }
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. } => {
@@ -5912,6 +6085,8 @@ impl TensorTape {
                 | TensorNodeOp::ProdDim { input, .. }
                 | TensorNodeOp::VarDim { input, .. }
                 | TensorNodeOp::StdDim { input, .. }
+                | TensorNodeOp::Softmax { input, .. }
+                | TensorNodeOp::LogSoftmax { input, .. }
                 | TensorNodeOp::Reshape { input, .. }
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. }
@@ -5990,6 +6165,8 @@ impl TensorTape {
                 | TensorNodeOp::ProdDim { input, .. }
                 | TensorNodeOp::VarDim { input, .. }
                 | TensorNodeOp::StdDim { input, .. }
+                | TensorNodeOp::Softmax { input, .. }
+                | TensorNodeOp::LogSoftmax { input, .. }
                 | TensorNodeOp::Reshape { input, .. }
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. }
@@ -8548,5 +8725,95 @@ mod tests {
         assert!((grads[0] - (-0.5)).abs() < 1e-12);
         assert!(grads[1].abs() < 1e-12);
         assert!((grads[2] - 0.5).abs() < 1e-12);
+    }
+
+    // ── softmax/log_softmax tensor tests ──────────────────────────
+
+    #[test]
+    fn tensor_softmax_forward_sums_to_one() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true).expect("leaf");
+        let (y, _) = tape.softmax(x, 1, ExecutionMode::Strict).expect("softmax");
+        let vals = tape.values(y).expect("values");
+        let row0_sum: f64 = vals[0..3].iter().sum();
+        let row1_sum: f64 = vals[3..6].iter().sum();
+        assert!((row0_sum - 1.0).abs() < 1e-12);
+        assert!((row1_sum - 1.0).abs() < 1e-12);
+        assert!(vals.iter().all(|&v| v > 0.0));
+    }
+
+    #[test]
+    fn tensor_softmax_forward_preserves_order() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 3.0, 2.0], vec![1, 3], true).expect("leaf");
+        let (y, _) = tape.softmax(x, 1, ExecutionMode::Strict).expect("softmax");
+        let vals = tape.values(y).expect("values");
+        assert!(vals[1] > vals[2]);
+        assert!(vals[2] > vals[0]);
+    }
+
+    #[test]
+    fn tensor_softmax_backward_grad_sum_is_zero() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let (y, _) = tape.softmax(x, 1, ExecutionMode::Strict).expect("softmax");
+        let report = tape.backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+        // softmax is shift-invariant, so grad sum should be 0
+        let grad_sum: f64 = grads.iter().sum();
+        assert!(grad_sum.abs() < 1e-12, "softmax grad sum should be 0, got {grad_sum}");
+    }
+
+    #[test]
+    fn tensor_softmax_backward_dim0() {
+        let mut tape = TensorTape::new();
+        // shape [3,1]: softmax along dim 0
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![3, 1], true).expect("leaf");
+        let (y, _) = tape.softmax(x, 0, ExecutionMode::Strict).expect("softmax");
+        let report = tape.backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+        let grad_sum: f64 = grads.iter().sum();
+        assert!(grad_sum.abs() < 1e-12);
+    }
+
+    #[test]
+    fn tensor_log_softmax_forward_consistent() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let (y, _) = tape.log_softmax(x, 1, ExecutionMode::Strict).expect("log_softmax");
+        let vals = tape.values(y).expect("values");
+        // exp of log_softmax should sum to 1
+        let sum: f64 = vals.iter().map(|v| v.exp()).sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+        // All values should be negative (log of probability < 1)
+        assert!(vals.iter().all(|&v| v <= 0.0));
+    }
+
+    #[test]
+    fn tensor_log_softmax_backward_grad_sum_is_zero() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let (y, _) = tape.log_softmax(x, 1, ExecutionMode::Strict).expect("log_softmax");
+        let report = tape.backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+        let grad_sum: f64 = grads.iter().sum();
+        assert!(grad_sum.abs() < 1e-12, "log_softmax grad sum should be 0, got {grad_sum}");
+    }
+
+    #[test]
+    fn tensor_log_softmax_equals_log_of_softmax() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let (ls, _) = tape.log_softmax(x, 1, ExecutionMode::Strict).expect("log_softmax");
+        let ls_vals = tape.values(ls).expect("values");
+
+        let mut tape2 = TensorTape::new();
+        let x2 = tape2.leaf(vec![1.0, 2.0, 3.0], vec![1, 3], true).expect("leaf");
+        let (sm, _) = tape2.softmax(x2, 1, ExecutionMode::Strict).expect("softmax");
+        let sm_vals = tape2.values(sm).expect("values");
+
+        for i in 0..3 {
+            assert!((ls_vals[i] - sm_vals[i].ln()).abs() < 1e-12);
+        }
     }
 }
