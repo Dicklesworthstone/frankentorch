@@ -18,6 +18,7 @@ use ft_dispatch::{
     BinaryOp, DispatchKey, DispatchKeySet, ParsedSchemaInput, dispatch_scalar_binary,
     dispatch_scalar_binary_with_keyset, parse_schema_or_name, schema_dispatch_keyset_from_tags,
 };
+use ft_runtime::{EvidenceKind, RuntimeContext};
 use ft_serialize::{
     CheckpointMode, DecodeMode, DecodeProofArtifact, RaptorQSidecar,
     SnapshotEntry as SerializedSnapshotEntry, decode_checkpoint, encode_checkpoint,
@@ -3491,6 +3492,7 @@ fn run_serialization_case(
     case: &SerializationCase,
     mode: ExecutionMode,
 ) -> Result<SerializationCaseReport, String> {
+    let mut runtime = RuntimeContext::new(mode);
     let checkpoint_mode = match mode {
         ExecutionMode::Strict => CheckpointMode::Strict,
         ExecutionMode::Hardened => CheckpointMode::Hardened,
@@ -3526,6 +3528,7 @@ fn run_serialization_case(
                 Some("decode unexpectedly succeeded for expected-error case".to_string()),
             ),
             Err(error) => {
+                runtime.record_checkpoint_decode_failure(mode_label(mode), &error);
                 let message = error.to_string();
                 let matches_expected = expected_error_contains
                     .is_none_or(|needle| message.to_lowercase().contains(&needle.to_lowercase()));
@@ -3539,9 +3542,19 @@ fn run_serialization_case(
                 expected_entries.sort_by_key(|entry| entry.node_id);
                 (decoded.entries == expected_entries, None)
             }
-            Err(error) => (false, Some(error.to_string())),
+            Err(error) => {
+                runtime.record_checkpoint_decode_failure(mode_label(mode), &error);
+                (false, Some(error.to_string()))
+            }
         }
     };
+    let runtime_durability_summary = runtime
+        .ledger()
+        .entries()
+        .iter()
+        .rev()
+        .find(|entry| entry.kind == EvidenceKind::Durability)
+        .map(|entry| entry.summary.clone());
 
     let repair_symbols = case.repair_symbols.unwrap_or(4);
     let (sidecar_a, proof_a) =
@@ -3596,6 +3609,7 @@ fn run_serialization_case(
             case,
             expect_decode_error,
             decode_error_message.as_deref(),
+            runtime_durability_summary.as_deref(),
         )),
     })
 }
@@ -5112,6 +5126,7 @@ fn serialization_forensic_fields(
     case: &SerializationCase,
     expect_decode_error: bool,
     decode_error_message: Option<&str>,
+    runtime_durability_summary: Option<&str>,
 ) -> BTreeMap<String, Value> {
     let mut fields = BTreeMap::new();
     fields.insert(
@@ -5126,6 +5141,9 @@ fn serialization_forensic_fields(
     }
     if let Some(message) = decode_error_message {
         fields.insert("decode_error_message".to_string(), json!(message));
+    }
+    if let Some(summary) = runtime_durability_summary {
+        fields.insert("runtime_durability_summary".to_string(), json!(summary));
     }
     fields
 }
@@ -5388,6 +5406,33 @@ mod tests {
             .expect("serialization conformance should run");
 
         assert_eq!(report.cases_total, report.cases_passed);
+    }
+
+    #[test]
+    fn strict_serialization_expected_error_logs_runtime_durability_summary() {
+        let cfg = HarnessConfig::default_paths();
+        let (_report, cases) = run_serialization_conformance(&cfg, ExecutionMode::Strict)
+            .expect("serialization conformance should run");
+
+        let case = cases
+            .iter()
+            .find(|case| case.name == "checkpoint_incompatible_payload_top_level_array")
+            .expect("expected decode-error serialization case should exist");
+        let summary = case
+            .forensic_log
+            .extra_fields
+            .get("runtime_durability_summary")
+            .and_then(Value::as_str)
+            .expect("runtime durability summary should be present");
+
+        assert!(
+            summary.contains("checkpoint decode failure"),
+            "unexpected durability summary: {summary}"
+        );
+        assert!(
+            summary.contains("invalid json"),
+            "durability summary should include decode diagnostics: {summary}"
+        );
     }
 
     #[test]
