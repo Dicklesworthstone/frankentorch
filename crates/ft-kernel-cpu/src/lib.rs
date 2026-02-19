@@ -84,7 +84,7 @@ pub fn mul_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor
     Ok(lhs.with_value(lhs.value() * rhs.value()))
 }
 
-fn ensure_meta_compatible(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), KernelError> {
+fn ensure_dtype_device_and_layout(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), KernelError> {
     if lhs.dtype() != rhs.dtype() {
         return Err(KernelError::Incompatible(
             TensorCompatError::DTypeMismatch {
@@ -103,13 +103,6 @@ fn ensure_meta_compatible(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), Kern
         ));
     }
 
-    if lhs.shape() != rhs.shape() {
-        return Err(KernelError::ShapeMismatch {
-            lhs: lhs.shape().to_vec(),
-            rhs: rhs.shape().to_vec(),
-        });
-    }
-
     if !lhs.is_contiguous() {
         return Err(KernelError::UnsupportedLayout { side: "lhs" });
     }
@@ -119,6 +112,44 @@ fn ensure_meta_compatible(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), Kern
     }
 
     Ok(())
+}
+
+fn ensure_meta_compatible(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), KernelError> {
+    ensure_dtype_device_and_layout(lhs, rhs)?;
+
+    if lhs.shape() != rhs.shape() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs.shape().to_vec(),
+            rhs: rhs.shape().to_vec(),
+        });
+    }
+
+    Ok(())
+}
+
+fn matmul_dims(
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<(usize, usize, usize), KernelError> {
+    if lhs_meta.shape().len() != 2 || rhs_meta.shape().len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+
+    let m = lhs_meta.shape()[0];
+    let k = lhs_meta.shape()[1];
+    let rhs_k = rhs_meta.shape()[0];
+    let n = rhs_meta.shape()[1];
+    if k != rhs_k {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+
+    Ok((m, k, n))
 }
 
 fn contiguous_required_len(meta: &TensorMeta, side: &'static str) -> Result<usize, KernelError> {
@@ -219,13 +250,47 @@ pub fn mul_tensor_contiguous_f64(
     elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |left, right| left * right)
 }
 
+pub fn matmul_tensor_contiguous_f64(
+    lhs: &[f64],
+    rhs: &[f64],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_dtype_device_and_layout(lhs_meta, rhs_meta)?;
+    let (m, k, n) = matmul_dims(lhs_meta, rhs_meta)?;
+
+    ensure_storage_len(lhs, lhs_meta, "lhs")?;
+    ensure_storage_len(rhs, rhs_meta, "rhs")?;
+
+    let lhs_start = lhs_meta.storage_offset();
+    let rhs_start = rhs_meta.storage_offset();
+    let mut out = vec![0.0; m.saturating_mul(n)];
+
+    for row in 0..m {
+        let out_row_base = row * n;
+        let lhs_row_base = lhs_start + row * k;
+        for col in 0..n {
+            let mut acc = 0.0;
+            for inner in 0..k {
+                let lhs_idx = lhs_row_base + inner;
+                let rhs_idx = rhs_start + inner * n + col;
+                acc += lhs[lhs_idx] * rhs[rhs_idx];
+            }
+            out[out_row_base + col] = acc;
+        }
+    }
+
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use ft_core::{DType, Device, ScalarTensor, TensorCompatError, TensorMeta};
 
     use super::{
         KernelError, add_scalar, add_tensor_contiguous_f64, div_scalar, div_tensor_contiguous_f64,
-        mul_scalar, mul_tensor_contiguous_f64, sub_scalar, sub_tensor_contiguous_f64,
+        matmul_tensor_contiguous_f64, mul_scalar, mul_tensor_contiguous_f64, sub_scalar,
+        sub_tensor_contiguous_f64,
     };
 
     #[test]
@@ -427,5 +492,41 @@ mod tests {
         let out = add_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta)
             .expect("empty tensors should succeed without touching storage");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn matmul_tensor_contiguous_returns_expected_values() {
+        let lhs_meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let lhs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+
+        let out = matmul_tensor_contiguous_f64(&lhs, &rhs, &lhs_meta, &rhs_meta)
+            .expect("contiguous matmul should succeed");
+        assert_eq!(out, vec![58.0, 64.0, 139.0, 154.0]);
+    }
+
+    #[test]
+    fn matmul_tensor_contiguous_rejects_rank_mismatch() {
+        let lhs_meta = TensorMeta::from_shape(vec![6], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let lhs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+
+        let err = matmul_tensor_contiguous_f64(&lhs, &rhs, &lhs_meta, &rhs_meta)
+            .expect_err("rank mismatch must fail closed");
+        assert!(matches!(err, KernelError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn matmul_tensor_contiguous_rejects_inner_dimension_mismatch() {
+        let lhs_meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let lhs = vec![1.0, 2.0, 3.0, 4.0];
+        let rhs = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+
+        let err = matmul_tensor_contiguous_f64(&lhs, &rhs, &lhs_meta, &rhs_meta)
+            .expect_err("inner-dimension mismatch must fail closed");
+        assert!(matches!(err, KernelError::ShapeMismatch { .. }));
     }
 }

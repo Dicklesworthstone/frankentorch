@@ -5,7 +5,8 @@ use std::{collections::BTreeMap, fmt};
 use ft_core::{Device, ExecutionMode, ScalarTensor, TensorMeta};
 use ft_kernel_cpu::{
     KernelError, add_scalar, add_tensor_contiguous_f64, div_scalar, div_tensor_contiguous_f64,
-    mul_scalar, mul_tensor_contiguous_f64, sub_scalar, sub_tensor_contiguous_f64,
+    matmul_tensor_contiguous_f64, mul_scalar, mul_tensor_contiguous_f64, sub_scalar,
+    sub_tensor_contiguous_f64,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -14,6 +15,7 @@ pub enum BinaryOp {
     Sub,
     Div,
     Mul,
+    MatMul,
 }
 
 impl BinaryOp {
@@ -24,6 +26,7 @@ impl BinaryOp {
             "sub" => Some(Self::Sub),
             "div" => Some(Self::Div),
             "mul" => Some(Self::Mul),
+            "matmul" => Some(Self::MatMul),
             _ => None,
         }
     }
@@ -716,10 +719,22 @@ pub fn dispatch_scalar_binary_with_keyset(
         (DispatchKey::AutogradCPU, BinaryOp::Mul) => {
             (mul_scalar(lhs, rhs)?, "autograd_cpu::mul_scalar")
         }
+        (DispatchKey::AutogradCPU, BinaryOp::MatMul) => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "matmul is unsupported for scalar tensors",
+            }
+            .into());
+        }
         (DispatchKey::CPU, BinaryOp::Add) => (add_scalar(lhs, rhs)?, "cpu::add_scalar"),
         (DispatchKey::CPU, BinaryOp::Sub) => (sub_scalar(lhs, rhs)?, "cpu::sub_scalar"),
         (DispatchKey::CPU, BinaryOp::Div) => (div_scalar(lhs, rhs)?, "cpu::div_scalar"),
         (DispatchKey::CPU, BinaryOp::Mul) => (mul_scalar(lhs, rhs)?, "cpu::mul_scalar"),
+        (DispatchKey::CPU, BinaryOp::MatMul) => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "matmul is unsupported for scalar tensors",
+            }
+            .into());
+        }
         _ => {
             return Err(DispatchKeyError::IncompatibleSet {
                 reason: "resolved dispatch key is unsupported for scalar binary ops",
@@ -797,6 +812,10 @@ pub fn dispatch_tensor_binary_contiguous_f64_with_keyset(
             mul_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
             "autograd_cpu::mul_tensor_contiguous_f64",
         ),
+        (DispatchKey::AutogradCPU, BinaryOp::MatMul) => (
+            matmul_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+            "autograd_cpu::matmul_tensor_contiguous_f64",
+        ),
         (DispatchKey::CPU, BinaryOp::Add) => (
             add_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
             "cpu::add_tensor_contiguous_f64",
@@ -812,6 +831,10 @@ pub fn dispatch_tensor_binary_contiguous_f64_with_keyset(
         (DispatchKey::CPU, BinaryOp::Mul) => (
             mul_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
             "cpu::mul_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, BinaryOp::MatMul) => (
+            matmul_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+            "cpu::matmul_tensor_contiguous_f64",
         ),
         _ => {
             return Err(DispatchKeyError::IncompatibleSet {
@@ -1369,6 +1392,32 @@ mod tests {
     }
 
     #[test]
+    fn tensor_dispatch_strict_mode_routes_matmul_to_cpu_kernel() {
+        let lhs_meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let lhs = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let rhs = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let keyset = DispatchKeySet::from_keys(&[DispatchKey::BackendSelect, DispatchKey::CPU]);
+
+        let out = dispatch_tensor_binary_contiguous_f64_with_keyset(
+            BinaryOp::MatMul,
+            ExecutionMode::Strict,
+            &lhs,
+            &rhs,
+            &lhs_meta,
+            &rhs_meta,
+            keyset,
+        )
+        .expect("strict tensor dispatch should route matmul to cpu kernel");
+
+        assert_eq!(out.values, vec![58.0, 64.0, 139.0, 154.0]);
+        assert_eq!(out.decision.kernel, "cpu::matmul_tensor_contiguous_f64");
+        assert_eq!(out.decision.selected_key, DispatchKey::CPU);
+        assert_eq!(out.decision.backend_key, DispatchKey::CPU);
+        assert!(!out.decision.fallback_used);
+    }
+
+    #[test]
     fn tensor_dispatch_strict_mode_rejects_composite_fallback() {
         let lhs_meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
         let rhs_meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
@@ -1625,6 +1674,24 @@ mod tests {
             err,
             SchemaRegistryError::UnsupportedOperator { .. }
         ));
+    }
+
+    #[test]
+    fn schema_registry_accepts_matmul_operator_base() {
+        let parsed = parse_schema_or_name("matmul.Tensor(Tensor self, Tensor other) -> Tensor")
+            .expect("schema should parse");
+        let keyset =
+            schema_dispatch_keyset_from_tags(&["CPU", "AutogradCPU"]).expect("keyset should parse");
+
+        let mut registry = SchemaRegistry::new();
+        let normalized = registry
+            .register(&parsed, keyset)
+            .expect("matmul registration should succeed");
+        let entry = registry
+            .lookup(normalized.as_str())
+            .expect("matmul entry should exist");
+        assert_eq!(entry.op, BinaryOp::MatMul);
+        assert_eq!(entry.keyset.bits(), keyset.bits());
     }
 
     #[test]

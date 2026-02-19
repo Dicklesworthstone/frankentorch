@@ -124,6 +124,16 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    pub fn tensor_matmul(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (out, event) = self.tensor_tape.matmul(lhs, rhs, self.mode())?;
+        self.record_tensor_operation(&event);
+        Ok(out)
+    }
+
     pub fn tensor_values(&self, node: TensorNodeId) -> Result<Vec<f64>, AutogradError> {
         self.tensor_tape.values(node)
     }
@@ -480,6 +490,43 @@ mod tests {
         for (actual, expected) in y_grad.iter().zip(expected_y_grad) {
             assert!((actual - expected).abs() <= 1e-12);
         }
+    }
+
+    #[test]
+    fn session_tensor_matmul_backward_records_expected_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("lhs tensor variable should succeed");
+        let y = session
+            .tensor_variable(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], true)
+            .expect("rhs tensor variable should succeed");
+        let z = session
+            .tensor_matmul(x, y)
+            .expect("tensor matmul should succeed");
+
+        assert_eq!(
+            session
+                .tensor_values(z)
+                .expect("tensor values should resolve"),
+            vec![19.0, 22.0, 43.0, 50.0]
+        );
+
+        let report = session
+            .tensor_backward(z)
+            .expect("tensor backward should succeed");
+        assert_eq!(
+            session
+                .tensor_gradient(&report, x)
+                .expect("x grad should exist"),
+            &[11.0, 15.0, 11.0, 15.0]
+        );
+        assert_eq!(
+            session
+                .tensor_gradient(&report, y)
+                .expect("y grad should exist"),
+            &[4.0, 4.0, 6.0, 6.0]
+        );
     }
 
     #[test]

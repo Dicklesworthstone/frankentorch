@@ -6,7 +6,7 @@ use std::fmt;
 
 use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor};
 use ft_dispatch::{
-    BinaryOp, DispatchDecision, DispatchError, dispatch_scalar_binary,
+    BinaryOp, DispatchDecision, DispatchError, DispatchKeyError, dispatch_scalar_binary,
     dispatch_tensor_binary_contiguous_f64,
 };
 
@@ -48,6 +48,10 @@ enum TensorNodeOp {
         rhs: TensorNodeId,
     },
     Mul {
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    },
+    MatMul {
         lhs: TensorNodeId,
         rhs: TensorNodeId,
     },
@@ -324,6 +328,10 @@ pub enum AutogradError {
         expected: usize,
         actual: usize,
     },
+    TensorMatMulShapeMismatch {
+        lhs: Vec<usize>,
+        rhs: Vec<usize>,
+    },
 }
 
 impl fmt::Display for AutogradError {
@@ -368,6 +376,9 @@ impl fmt::Display for AutogradError {
                 "tensor gradient shape mismatch at node {}: expected={expected}, actual={actual}",
                 node.0
             ),
+            Self::TensorMatMulShapeMismatch { lhs, rhs } => {
+                write!(f, "tensor matmul shape mismatch: lhs={lhs:?}, rhs={rhs:?}")
+            }
         }
     }
 }
@@ -453,6 +464,14 @@ impl Tape {
         rhs: NodeId,
         mode: ExecutionMode,
     ) -> Result<(NodeId, OperationEvent), AutogradError> {
+        if matches!(op, BinaryOp::MatMul) {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "matmul is unsupported for scalar tensors",
+                },
+            )));
+        }
+
         let (requires_grad, outcome) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
@@ -472,6 +491,9 @@ impl Tape {
                 BinaryOp::Sub => NodeOp::Sub { lhs, rhs },
                 BinaryOp::Div => NodeOp::Div { lhs, rhs },
                 BinaryOp::Mul => NodeOp::Mul { lhs, rhs },
+                BinaryOp::MatMul => {
+                    unreachable!("scalar matmul should be rejected before node creation")
+                }
             },
         });
 
@@ -793,6 +815,15 @@ impl TensorTape {
         self.binary(BinaryOp::Div, lhs, rhs, mode)
     }
 
+    pub fn matmul(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        self.binary(BinaryOp::MatMul, lhs, rhs, mode)
+    }
+
     fn binary(
         &mut self,
         op: BinaryOp,
@@ -800,7 +831,7 @@ impl TensorTape {
         rhs: TensorNodeId,
         mode: ExecutionMode,
     ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
-        let (requires_grad, output_meta, outcome) = {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
             let requires_grad = lhs_node.requires_grad || rhs_node.requires_grad;
@@ -816,23 +847,35 @@ impl TensorTape {
                 requires_grad,
             )
             .map_err(AutogradError::Dispatch)?;
-            let output_meta = ft_core::TensorMeta::from_shape(
-                lhs_meta.shape().to_vec(),
+            let output_shape = match op {
+                BinaryOp::MatMul => {
+                    let (m, _, n) = Self::matmul_dims(lhs_meta.shape(), rhs_meta.shape())?;
+                    vec![m, n]
+                }
+                _ => lhs_meta.shape().to_vec(),
+            };
+            (
+                requires_grad,
+                output_shape,
                 lhs_meta.dtype(),
                 lhs_meta.device(),
-            );
-            (requires_grad, output_meta, outcome)
+                outcome,
+            )
         };
 
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(output_meta, outcome.values)?,
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
             requires_grad,
             op: match op {
                 BinaryOp::Add => TensorNodeOp::Add { lhs, rhs },
                 BinaryOp::Sub => TensorNodeOp::Sub { lhs, rhs },
                 BinaryOp::Div => TensorNodeOp::Div { lhs, rhs },
                 BinaryOp::Mul => TensorNodeOp::Mul { lhs, rhs },
+                BinaryOp::MatMul => TensorNodeOp::MatMul { lhs, rhs },
             },
         });
 
@@ -1003,6 +1046,56 @@ impl TensorTape {
                         rule: "d(a*b)/da=b; d(a*b)/db=a",
                     });
                 }
+                TensorNodeOp::MatMul { lhs, rhs } => {
+                    let lhs_values = self.nodes[lhs.0].tensor.contiguous_values()?;
+                    let rhs_values = self.nodes[rhs.0].tensor.contiguous_values()?;
+                    let lhs_shape = self.nodes[lhs.0].tensor.meta().shape();
+                    let rhs_shape = self.nodes[rhs.0].tensor.meta().shape();
+                    let (m, k, n) = Self::matmul_dims(lhs_shape, rhs_shape)?;
+
+                    Self::ensure_tensor_len(lhs, lhs_values.len(), m.saturating_mul(k))?;
+                    Self::ensure_tensor_len(rhs, rhs_values.len(), k.saturating_mul(n))?;
+                    Self::ensure_tensor_len(node_id, incoming.len(), m.saturating_mul(n))?;
+
+                    let mut lhs_contrib = vec![0.0; m.saturating_mul(k)];
+                    let mut rhs_contrib = vec![0.0; k.saturating_mul(n)];
+
+                    for row in 0..m {
+                        for inner in 0..k {
+                            let mut acc = 0.0;
+                            for col in 0..n {
+                                let grad_out = incoming[row * n + col];
+                                let rhs_value = rhs_values[inner * n + col];
+                                acc += grad_out * rhs_value;
+                            }
+                            lhs_contrib[row * k + inner] = acc;
+                        }
+                    }
+
+                    for inner in 0..k {
+                        for col in 0..n {
+                            let mut acc = 0.0;
+                            for row in 0..m {
+                                let lhs_value = lhs_values[row * k + inner];
+                                let grad_out = incoming[row * n + col];
+                                acc += lhs_value * grad_out;
+                            }
+                            rhs_contrib[inner * n + col] = acc;
+                        }
+                    }
+
+                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
+                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
+
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(A@B)/dA=dOut@B^T; d(A@B)/dB=A^T@dOut",
+                    });
+                }
             }
         }
 
@@ -1054,7 +1147,8 @@ impl TensorTape {
                 TensorNodeOp::Add { lhs, rhs }
                 | TensorNodeOp::Sub { lhs, rhs }
                 | TensorNodeOp::Div { lhs, rhs }
-                | TensorNodeOp::Mul { lhs, rhs } => {
+                | TensorNodeOp::Mul { lhs, rhs }
+                | TensorNodeOp::MatMul { lhs, rhs } => {
                     stack.push(lhs);
                     stack.push(rhs);
                 }
@@ -1082,7 +1176,8 @@ impl TensorTape {
                 TensorNodeOp::Add { lhs, rhs }
                 | TensorNodeOp::Sub { lhs, rhs }
                 | TensorNodeOp::Div { lhs, rhs }
-                | TensorNodeOp::Mul { lhs, rhs } => {
+                | TensorNodeOp::Mul { lhs, rhs }
+                | TensorNodeOp::MatMul { lhs, rhs } => {
                     pending[lhs.0] = pending[lhs.0].saturating_add(1);
                     pending[rhs.0] = pending[rhs.0].saturating_add(1);
                 }
@@ -1120,6 +1215,27 @@ impl TensorTape {
             });
         }
         Ok(())
+    }
+
+    fn matmul_dims(lhs: &[usize], rhs: &[usize]) -> Result<(usize, usize, usize), AutogradError> {
+        if lhs.len() != 2 || rhs.len() != 2 {
+            return Err(AutogradError::TensorMatMulShapeMismatch {
+                lhs: lhs.to_vec(),
+                rhs: rhs.to_vec(),
+            });
+        }
+
+        let m = lhs[0];
+        let k = lhs[1];
+        let rhs_k = rhs[0];
+        let n = rhs[1];
+        if k != rhs_k {
+            return Err(AutogradError::TensorMatMulShapeMismatch {
+                lhs: lhs.to_vec(),
+                rhs: rhs.to_vec(),
+            });
+        }
+        Ok((m, k, n))
     }
 
     fn accumulate_tensor_gradient(
@@ -1422,6 +1538,39 @@ mod tests {
         assert_eq!(
             report.gradient(y).expect("y grad should exist"),
             &[1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn tensor_matmul_forward_backward_matches_expected_gradients() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("lhs leaf should succeed");
+        let y = tape
+            .leaf(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], true)
+            .expect("rhs leaf should succeed");
+        let (z, event) = tape
+            .matmul(x, y, ExecutionMode::Strict)
+            .expect("tensor matmul should succeed");
+
+        assert_eq!(
+            event.decision.kernel,
+            "autograd_cpu::matmul_tensor_contiguous_f64"
+        );
+        assert_eq!(
+            tape.values(z).expect("tensor values should resolve"),
+            vec![19.0, 22.0, 43.0, 50.0]
+        );
+
+        let report = tape.backward(z).expect("tensor backward should succeed");
+        assert_eq!(
+            report.gradient(x).expect("x grad should exist"),
+            &[11.0, 15.0, 11.0, 15.0]
+        );
+        assert_eq!(
+            report.gradient(y).expect("y grad should exist"),
+            &[4.0, 4.0, 6.0, 6.0]
         );
     }
 

@@ -3065,6 +3065,7 @@ fn run_tensor_binary_case(
         "sub" => session.tensor_sub(lhs, rhs),
         "div" => session.tensor_div(lhs, rhs),
         "mul" => session.tensor_mul(lhs, rhs),
+        "matmul" => session.tensor_matmul(lhs, rhs),
         _ => return Err(format!("unsupported tensor operation '{}'", case.op)),
     }
     .map_err(|error| format!("tensor operation '{}' failed: {error}", case.name))?;
@@ -5292,6 +5293,7 @@ fn parse_binary_op(op: &str) -> Result<BinaryOp, String> {
         "sub" => Ok(BinaryOp::Sub),
         "div" => Ok(BinaryOp::Div),
         "mul" => Ok(BinaryOp::Mul),
+        "matmul" => Ok(BinaryOp::MatMul),
         _ => Err(format!("unsupported binary op '{op}'")),
     }
 }
