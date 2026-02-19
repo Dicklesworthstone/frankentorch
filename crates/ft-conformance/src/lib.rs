@@ -18,7 +18,7 @@ use ft_dispatch::{
     BinaryOp, DispatchKey, DispatchKeySet, ParsedSchemaInput, dispatch_scalar_binary,
     dispatch_scalar_binary_with_keyset, parse_schema_or_name, schema_dispatch_keyset_from_tags,
 };
-use ft_runtime::{EvidenceKind, RuntimeContext};
+use ft_runtime::{EvidenceEntry, EvidenceKind, RuntimeContext};
 use ft_serialize::{
     CheckpointMode, DecodeMode, DecodeProofArtifact, RaptorQSidecar,
     SnapshotEntry as SerializedSnapshotEntry, decode_checkpoint, encode_checkpoint,
@@ -2911,6 +2911,20 @@ fn run_scalar_case(case: &ScalarCase, mode: ExecutionMode) -> Result<CaseReport,
         "scalar_or_grad_mismatch"
     };
 
+    let mut extra_fields = scalar_forensic_fields(
+        case,
+        mode,
+        actual_output,
+        actual_lhs_grad,
+        actual_rhs_grad,
+        outcome == "pass",
+        reason_code,
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
     Ok(CaseReport {
         name: case.name.clone(),
         mode,
@@ -2934,15 +2948,7 @@ fn run_scalar_case(case: &ScalarCase, mode: ExecutionMode) -> Result<CaseReport,
             outcome,
             reason_code,
         )
-        .with_extra_fields(scalar_forensic_fields(
-            case,
-            mode,
-            actual_output,
-            actual_lhs_grad,
-            actual_rhs_grad,
-            outcome == "pass",
-            reason_code,
-        )),
+        .with_extra_fields(extra_fields),
     })
 }
 
@@ -3585,6 +3591,17 @@ fn run_serialization_case(
         "serialization_expectation_mismatch"
     };
 
+    let mut extra_fields = serialization_forensic_fields(
+        case,
+        expect_decode_error,
+        decode_error_message.as_deref(),
+        runtime_durability_summary.as_deref(),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(runtime.ledger().entries()),
+    );
+
     Ok(SerializationCaseReport {
         name: case.name.clone(),
         mode,
@@ -3605,12 +3622,7 @@ fn run_serialization_case(
             if passed { "pass" } else { "fail" },
             reason_code,
         )
-        .with_extra_fields(serialization_forensic_fields(
-            case,
-            expect_decode_error,
-            decode_error_message.as_deref(),
-            runtime_durability_summary.as_deref(),
-        )),
+        .with_extra_fields(extra_fields),
     })
 }
 
@@ -5148,6 +5160,41 @@ fn serialization_forensic_fields(
     fields
 }
 
+fn runtime_evidence_field(entries: &[EvidenceEntry]) -> Value {
+    let mut kind_counts: BTreeMap<String, usize> = BTreeMap::new();
+    for entry in entries {
+        let kind_label = runtime_evidence_kind_label(entry.kind).to_string();
+        kind_counts
+            .entry(kind_label)
+            .and_modify(|count| *count += 1)
+            .or_insert(1);
+    }
+
+    json!({
+        "total_entries": entries.len(),
+        "kind_counts": kind_counts,
+        "entries": entries
+            .iter()
+            .map(|entry| {
+                json!({
+                    "ts_unix_ms": entry.ts_unix_ms,
+                    "kind": runtime_evidence_kind_label(entry.kind),
+                    "summary": entry.summary,
+                })
+            })
+            .collect::<Vec<_>>(),
+    })
+}
+
+fn runtime_evidence_kind_label(kind: EvidenceKind) -> &'static str {
+    match kind {
+        EvidenceKind::Dispatch => "dispatch",
+        EvidenceKind::Backward => "backward",
+        EvidenceKind::Policy => "policy",
+        EvidenceKind::Durability => "durability",
+    }
+}
+
 fn serialization_entries(case: &SerializationCase) -> Vec<SerializedSnapshotEntry> {
     case.entries
         .iter()
@@ -5317,6 +5364,48 @@ mod tests {
     }
 
     #[test]
+    fn strict_scalar_forensics_include_runtime_evidence() {
+        let cfg = HarnessConfig::default_paths();
+        let (_report, case_reports) = run_scalar_conformance(&cfg, ExecutionMode::Strict)
+            .expect("strict conformance should run");
+
+        let case = case_reports
+            .first()
+            .expect("expected at least one scalar case");
+        let runtime_evidence = case
+            .forensic_log
+            .extra_fields
+            .get("runtime_evidence")
+            .and_then(Value::as_object)
+            .expect("runtime evidence field should be present");
+        let total_entries = runtime_evidence
+            .get("total_entries")
+            .and_then(Value::as_u64)
+            .expect("runtime evidence total entries should be numeric");
+        assert!(
+            total_entries >= 3,
+            "expected policy, dispatch, and backward runtime evidence"
+        );
+
+        let entries = runtime_evidence
+            .get("entries")
+            .and_then(Value::as_array)
+            .expect("runtime evidence entries array should be present");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.get("kind") == Some(&json!("dispatch"))),
+            "runtime evidence should include dispatch entries"
+        );
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.get("kind") == Some(&json!("backward"))),
+            "runtime evidence should include backward entries"
+        );
+    }
+
+    #[test]
     fn strict_dispatch_conformance_is_green() {
         let cfg = HarnessConfig::default_paths();
         let (report, cases) =
@@ -5432,6 +5521,23 @@ mod tests {
         assert!(
             summary.contains("invalid json"),
             "durability summary should include decode diagnostics: {summary}"
+        );
+
+        let runtime_evidence = case
+            .forensic_log
+            .extra_fields
+            .get("runtime_evidence")
+            .and_then(Value::as_object)
+            .expect("runtime evidence should be present");
+        let entries = runtime_evidence
+            .get("entries")
+            .and_then(Value::as_array)
+            .expect("runtime evidence entries array should be present");
+        assert!(
+            entries
+                .iter()
+                .any(|entry| entry.get("kind") == Some(&json!("durability"))),
+            "runtime evidence should include durability entries"
         );
     }
 
