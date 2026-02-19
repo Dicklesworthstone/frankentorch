@@ -1,6 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::fmt;
+use std::{collections::BTreeMap, fmt};
 
 use ft_core::{Device, ExecutionMode, ScalarTensor, TensorMeta};
 use ft_kernel_cpu::{
@@ -14,6 +14,19 @@ pub enum BinaryOp {
     Sub,
     Div,
     Mul,
+}
+
+impl BinaryOp {
+    #[must_use]
+    pub fn from_schema_base(base: &str) -> Option<Self> {
+        match base {
+            "add" => Some(Self::Add),
+            "sub" => Some(Self::Sub),
+            "div" => Some(Self::Div),
+            "mul" => Some(Self::Mul),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -307,6 +320,124 @@ pub enum ParsedSchemaInput {
     Schema(ParsedOpSchema),
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SchemaDispatchEntry {
+    pub normalized_name: String,
+    pub op: BinaryOp,
+    pub keyset: DispatchKeySet,
+    pub is_out_variant: bool,
+    pub schema_digest: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SchemaRegistryError {
+    DuplicateSchema { name: String },
+    MissingSchema { name: String },
+    UnsupportedOperator { base: String },
+    IncompatibleDispatchKeyset(DispatchKeyError),
+}
+
+impl fmt::Display for SchemaRegistryError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::DuplicateSchema { name } => {
+                write!(f, "schema registry already has an entry for '{name}'")
+            }
+            Self::MissingSchema { name } => {
+                write!(f, "schema registry has no entry for '{name}'")
+            }
+            Self::UnsupportedOperator { base } => {
+                write!(f, "schema base operator '{base}' is not yet dispatchable")
+            }
+            Self::IncompatibleDispatchKeyset(error) => {
+                write!(f, "schema dispatch keyset is incompatible: {error}")
+            }
+        }
+    }
+}
+
+impl std::error::Error for SchemaRegistryError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SchemaRegistry {
+    entries: BTreeMap<String, SchemaDispatchEntry>,
+}
+
+impl SchemaRegistry {
+    #[must_use]
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    #[must_use]
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    #[must_use]
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn register(
+        &mut self,
+        parsed: &ParsedSchemaInput,
+        keyset: DispatchKeySet,
+    ) -> Result<String, SchemaRegistryError> {
+        keyset
+            .validate_for_scalar_binary()
+            .map_err(SchemaRegistryError::IncompatibleDispatchKeyset)?;
+
+        let (name, is_out_variant, schema_digest) = match parsed {
+            ParsedSchemaInput::Name(name) => {
+                (name, false, digest64(name.unambiguous_name().as_str()))
+            }
+            ParsedSchemaInput::Schema(schema) => {
+                (&schema.op, schema.is_out_variant, schema.schema_digest)
+            }
+        };
+        let normalized_name = name.unambiguous_name();
+        if self.entries.contains_key(normalized_name.as_str()) {
+            return Err(SchemaRegistryError::DuplicateSchema {
+                name: normalized_name,
+            });
+        }
+
+        let op = BinaryOp::from_schema_base(name.base.as_str()).ok_or_else(|| {
+            SchemaRegistryError::UnsupportedOperator {
+                base: name.base.clone(),
+            }
+        })?;
+
+        self.entries.insert(
+            normalized_name.clone(),
+            SchemaDispatchEntry {
+                normalized_name: normalized_name.clone(),
+                op,
+                keyset,
+                is_out_variant,
+                schema_digest,
+            },
+        );
+        Ok(normalized_name)
+    }
+
+    pub fn lookup(
+        &self,
+        normalized_name: &str,
+    ) -> Result<&SchemaDispatchEntry, SchemaRegistryError> {
+        self.entries
+            .get(normalized_name)
+            .ok_or_else(|| SchemaRegistryError::MissingSchema {
+                name: normalized_name.to_string(),
+            })
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &SchemaDispatchEntry> {
+        self.entries.values()
+    }
+}
+
 fn is_valid_ident(value: &str) -> bool {
     let mut chars = value.chars();
     match chars.next() {
@@ -457,6 +588,35 @@ pub fn schema_dispatch_keyset_from_tags(tags: &[&str]) -> Result<DispatchKeySet,
     Ok(keyset)
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub enum SchemaDispatchError {
+    Registry(SchemaRegistryError),
+    Dispatch(DispatchError),
+}
+
+impl fmt::Display for SchemaDispatchError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Registry(error) => write!(f, "schema registry failure: {error}"),
+            Self::Dispatch(error) => write!(f, "schema dispatch failure: {error}"),
+        }
+    }
+}
+
+impl std::error::Error for SchemaDispatchError {}
+
+impl From<SchemaRegistryError> for SchemaDispatchError {
+    fn from(value: SchemaRegistryError) -> Self {
+        Self::Registry(value)
+    }
+}
+
+impl From<DispatchError> for SchemaDispatchError {
+    fn from(value: DispatchError) -> Self {
+        Self::Dispatch(value)
+    }
+}
+
 #[must_use]
 fn dispatch_keyset_for_device(device: Device, requires_grad: bool) -> DispatchKeySet {
     let mut keyset = DispatchKeySet::empty();
@@ -582,6 +742,17 @@ pub fn dispatch_scalar_binary_with_keyset(
     })
 }
 
+pub fn dispatch_scalar_binary_registered(
+    registry: &SchemaRegistry,
+    normalized_name: &str,
+    mode: ExecutionMode,
+    lhs: &ScalarTensor,
+    rhs: &ScalarTensor,
+) -> Result<DispatchOutcome, SchemaDispatchError> {
+    let entry = registry.lookup(normalized_name)?;
+    dispatch_scalar_binary_with_keyset(entry.op, mode, lhs, rhs, entry.keyset).map_err(Into::into)
+}
+
 pub fn dispatch_tensor_binary_contiguous_f64(
     op: BinaryOp,
     mode: ExecutionMode,
@@ -674,8 +845,9 @@ mod tests {
 
     use super::{
         BinaryOp, DispatchError, DispatchKey, DispatchKeyError, DispatchKeySet, OpSchemaError,
-        ParsedSchemaInput, TYPE_PRIORITY, dispatch_keyset_for_tensor_meta,
-        dispatch_keyset_for_tensors, dispatch_scalar_binary, dispatch_scalar_binary_with_keyset,
+        ParsedSchemaInput, SchemaDispatchError, SchemaRegistry, SchemaRegistryError, TYPE_PRIORITY,
+        dispatch_keyset_for_tensor_meta, dispatch_keyset_for_tensors, dispatch_scalar_binary,
+        dispatch_scalar_binary_registered, dispatch_scalar_binary_with_keyset,
         dispatch_tensor_binary_contiguous_f64, dispatch_tensor_binary_contiguous_f64_with_keyset,
         parse_schema_name, parse_schema_or_name, schema_dispatch_keyset_from_tags,
     };
@@ -1380,6 +1552,97 @@ mod tests {
         assert!(matches!(
             err,
             OpSchemaError::IncompatibleDispatchKeyset(DispatchKeyError::IncompatibleSet { .. })
+        ));
+    }
+
+    #[test]
+    fn schema_registry_registers_and_dispatches_add_tensor_schema() {
+        let parsed = parse_schema_or_name(
+            "add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+        )
+        .expect("schema should parse");
+        let keyset =
+            schema_dispatch_keyset_from_tags(&["CPU", "AutogradCPU"]).expect("keyset should parse");
+
+        let mut registry = SchemaRegistry::new();
+        let normalized = registry
+            .register(&parsed, keyset)
+            .expect("registration should succeed");
+        assert_eq!(normalized, "add_Tensor");
+        assert_eq!(registry.len(), 1);
+        let entry = registry
+            .lookup(normalized.as_str())
+            .expect("entry should exist");
+        assert_eq!(entry.op, BinaryOp::Add);
+        assert_eq!(entry.keyset.bits(), keyset.bits());
+
+        let lhs = ScalarTensor::new(1.5, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+        let out = dispatch_scalar_binary_registered(
+            &registry,
+            normalized.as_str(),
+            ExecutionMode::Strict,
+            &lhs,
+            &rhs,
+        )
+        .expect("registered schema dispatch should succeed");
+        assert_eq!(out.tensor.value(), 3.5);
+        assert_eq!(out.decision.kernel, "autograd_cpu::add_scalar");
+        assert_eq!(out.decision.selected_key, DispatchKey::AutogradCPU);
+    }
+
+    #[test]
+    fn schema_registry_rejects_duplicate_registration() {
+        let parsed = parse_schema_or_name(
+            "add.Tensor(Tensor self, Tensor other, *, Scalar alpha=1) -> Tensor",
+        )
+        .expect("schema should parse");
+        let keyset =
+            schema_dispatch_keyset_from_tags(&["CPU", "AutogradCPU"]).expect("keyset should parse");
+
+        let mut registry = SchemaRegistry::new();
+        registry
+            .register(&parsed, keyset)
+            .expect("first registration should succeed");
+        let err = registry
+            .register(&parsed, keyset)
+            .expect_err("duplicate registration must fail");
+        assert!(matches!(err, SchemaRegistryError::DuplicateSchema { .. }));
+    }
+
+    #[test]
+    fn schema_registry_rejects_unsupported_operator_base() {
+        let parsed = parse_schema_or_name("pow.Tensor(Tensor self, Tensor exponent) -> Tensor")
+            .expect("schema should parse");
+        let keyset =
+            schema_dispatch_keyset_from_tags(&["CPU", "AutogradCPU"]).expect("keyset should parse");
+
+        let mut registry = SchemaRegistry::new();
+        let err = registry
+            .register(&parsed, keyset)
+            .expect_err("unsupported operators should fail closed");
+        assert!(matches!(
+            err,
+            SchemaRegistryError::UnsupportedOperator { .. }
+        ));
+    }
+
+    #[test]
+    fn schema_dispatch_rejects_missing_registry_entry() {
+        let registry = SchemaRegistry::new();
+        let lhs = ScalarTensor::new(1.0, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+        let err = dispatch_scalar_binary_registered(
+            &registry,
+            "add_Tensor",
+            ExecutionMode::Strict,
+            &lhs,
+            &rhs,
+        )
+        .expect_err("unknown schema must fail");
+        assert!(matches!(
+            err,
+            SchemaDispatchError::Registry(SchemaRegistryError::MissingSchema { .. })
         ));
     }
 

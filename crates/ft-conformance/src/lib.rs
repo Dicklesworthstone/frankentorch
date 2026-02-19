@@ -15,8 +15,9 @@ use ft_api::FrankenTorchSession;
 use ft_autograd::{AutogradError, BackwardOptions, ReentrantPolicy, SchedulerTelemetry, Tape};
 use ft_core::{DType, Device, ExecutionMode, ScalarTensor, TensorMeta, contiguous_strides};
 use ft_dispatch::{
-    BinaryOp, DispatchKey, DispatchKeySet, ParsedSchemaInput, dispatch_scalar_binary,
-    dispatch_scalar_binary_with_keyset, parse_schema_or_name, schema_dispatch_keyset_from_tags,
+    BinaryOp, DispatchKey, DispatchKeySet, OpSchemaError, ParsedSchemaInput, SchemaRegistry,
+    dispatch_scalar_binary, dispatch_scalar_binary_registered, dispatch_scalar_binary_with_keyset,
+    parse_schema_or_name, schema_dispatch_keyset_from_tags,
 };
 use ft_runtime::{EvidenceEntry, EvidenceKind, RuntimeContext};
 use ft_serialize::{
@@ -152,6 +153,7 @@ pub struct OpSchemaCaseReport {
     pub schema_variant_ok: bool,
     pub out_variant_ok: bool,
     pub dispatch_ok: bool,
+    pub kernel_ok: bool,
     pub normalization_ok: bool,
     pub forensic_log: StructuredCaseLog,
 }
@@ -163,6 +165,7 @@ impl OpSchemaCaseReport {
             && self.schema_variant_ok
             && self.out_variant_ok
             && self.dispatch_ok
+            && self.kernel_ok
             && self.normalization_ok
     }
 }
@@ -381,6 +384,7 @@ struct OpSchemaCase {
     schema_input: String,
     name_input: Option<String>,
     dispatch_tags: Option<Vec<String>>,
+    expected_kernel: Option<String>,
     expect_parse_ok: bool,
     expect_schema_variant: Option<bool>,
     expect_out_variant: Option<bool>,
@@ -1969,10 +1973,8 @@ pub fn run_differential_conformance(
             }
 
             if let Some(expected_dispatch_ok) = case.expect_dispatch_ok {
-                let observed_dispatch_ok = case.dispatch_tags.as_ref().is_some_and(|tags| {
-                    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-                    schema_dispatch_keyset_from_tags(tag_refs.as_slice()).is_ok()
-                });
+                let (observed_dispatch_ok, observed_kernel) =
+                    probe_op_schema_dispatch(&case, mode, &parsed_schema);
                 let (comparator, drift_id) = if expected_dispatch_ok {
                     (
                         "dispatch_keyset_contract",
@@ -1996,6 +1998,21 @@ pub fn run_differential_conformance(
                     expected_dispatch_ok,
                     evidence_refs.clone(),
                 ));
+
+                if let Some(expected_kernel) = case.expected_kernel.as_deref() {
+                    checks.push(compare_bool(
+                        &allowlist,
+                        "op_schema",
+                        "FT-P2C-003",
+                        mode,
+                        case.name.as_str(),
+                        "dispatch_kernel_contract",
+                        "op_schema.dispatch_kernel_contract_mismatch",
+                        observed_kernel.as_deref() == Some(expected_kernel),
+                        true,
+                        evidence_refs.clone(),
+                    ));
+                }
             }
 
             if let Some(expected_name_normalization) = case.expect_name_normalization {
@@ -3478,13 +3495,14 @@ fn run_op_schema_case(
         ) == expected
     });
 
-    let dispatch_observed = case.dispatch_tags.as_ref().is_some_and(|tags| {
-        let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
-        schema_dispatch_keyset_from_tags(tag_refs.as_slice()).is_ok()
-    });
+    let (dispatch_observed, observed_kernel) = probe_op_schema_dispatch(case, mode, &parsed_schema);
     let dispatch_ok = case
         .expect_dispatch_ok
         .is_none_or(|expected| dispatch_observed == expected);
+    let kernel_ok = case
+        .expected_kernel
+        .as_ref()
+        .is_none_or(|expected| observed_kernel.as_deref() == Some(expected.as_str()));
 
     let normalization_observed = case.name_input.as_deref().is_some_and(|input| {
         let lhs_name = match parsed_schema.as_ref() {
@@ -3504,7 +3522,12 @@ fn run_op_schema_case(
         .expect_name_normalization
         .is_none_or(|expected| normalization_observed == expected);
 
-    let passed = parse_ok && schema_variant_ok && out_variant_ok && dispatch_ok && normalization_ok;
+    let passed = parse_ok
+        && schema_variant_ok
+        && out_variant_ok
+        && dispatch_ok
+        && kernel_ok
+        && normalization_ok;
     let reason_code = if passed {
         if case.expect_parse_ok {
             "op_schema_parity_ok"
@@ -3519,6 +3542,8 @@ fn run_op_schema_case(
         "op_schema_out_variant_mismatch"
     } else if !dispatch_ok {
         "op_schema_dispatch_expectation_mismatch"
+    } else if !kernel_ok {
+        "op_schema_dispatch_kernel_mismatch"
     } else {
         "op_schema_name_normalization_mismatch"
     };
@@ -3530,6 +3555,7 @@ fn run_op_schema_case(
         schema_variant_ok,
         out_variant_ok,
         dispatch_ok,
+        kernel_ok,
         normalization_ok,
         forensic_log: StructuredCaseLog::new(
             "op_schema",
@@ -3548,8 +3574,55 @@ fn run_op_schema_case(
             ),
             if passed { "pass" } else { "fail" },
             reason_code,
-        ),
+        )
+        .with_extra_fields(BTreeMap::from([
+            (
+                "schema_dispatch_observed".to_string(),
+                json!(dispatch_observed),
+            ),
+            (
+                "schema_dispatch_kernel_observed".to_string(),
+                json!(observed_kernel.clone().unwrap_or_else(|| "none".to_string())),
+            ),
+            (
+                "schema_dispatch_kernel_expected".to_string(),
+                json!(
+                    case.expected_kernel
+                        .clone()
+                        .unwrap_or_else(|| "none".to_string())
+                ),
+            ),
+        ])),
     })
+}
+
+fn probe_op_schema_dispatch(
+    case: &OpSchemaCase,
+    mode: ExecutionMode,
+    parsed_schema: &Result<ParsedSchemaInput, OpSchemaError>,
+) -> (bool, Option<String>) {
+    let Some(tags) = case.dispatch_tags.as_ref() else {
+        return (false, None);
+    };
+    let tag_refs: Vec<&str> = tags.iter().map(String::as_str).collect();
+    let Ok(keyset) = schema_dispatch_keyset_from_tags(tag_refs.as_slice()) else {
+        return (false, None);
+    };
+    let Ok(parsed_schema) = parsed_schema.as_ref() else {
+        return (false, None);
+    };
+
+    let mut registry = SchemaRegistry::new();
+    let Ok(normalized_name) = registry.register(parsed_schema, keyset) else {
+        return (false, None);
+    };
+
+    let lhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+    let rhs = ScalarTensor::new(3.0, DType::F64, Device::Cpu);
+    match dispatch_scalar_binary_registered(&registry, normalized_name.as_str(), mode, &lhs, &rhs) {
+        Ok(outcome) => (true, Some(outcome.decision.kernel.to_string())),
+        Err(_) => (false, None),
+    }
 }
 
 fn run_scheduler_case(
