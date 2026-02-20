@@ -239,20 +239,12 @@ pub fn max_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor
 
 pub fn eq_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
     ensure_compatible(lhs, rhs)?;
-    Ok(lhs.with_value(if (lhs.value() - rhs.value()).abs() == 0.0 {
-        1.0
-    } else {
-        0.0
-    }))
+    Ok(lhs.with_value(if lhs.value() == rhs.value() { 1.0 } else { 0.0 }))
 }
 
 pub fn ne_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
     ensure_compatible(lhs, rhs)?;
-    Ok(lhs.with_value(if (lhs.value() - rhs.value()).abs() != 0.0 {
-        1.0
-    } else {
-        0.0
-    }))
+    Ok(lhs.with_value(if lhs.value() != rhs.value() { 1.0 } else { 0.0 }))
 }
 
 pub fn lt_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
@@ -730,9 +722,15 @@ pub fn eq_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| {
-        if (l - r).abs() == 0.0 { 1.0 } else { 0.0 }
-    })
+    elementwise_contiguous_f64(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l == r { 1.0 } else { 0.0 }
+        },
+    )
 }
 
 pub fn ne_tensor_contiguous_f64(
@@ -741,9 +739,15 @@ pub fn ne_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| {
-        if (l - r).abs() != 0.0 { 1.0 } else { 0.0 }
-    })
+    elementwise_contiguous_f64(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l != r { 1.0 } else { 0.0 }
+        },
+    )
 }
 
 pub fn lt_tensor_contiguous_f64(
@@ -1857,6 +1861,62 @@ mod tests {
     }
 
     #[test]
+    fn eq_ne_scalar_respect_ieee_special_values() {
+        let pos_inf = ScalarTensor::new(f64::INFINITY, DType::F64, Device::Cpu);
+        let neg_inf = ScalarTensor::new(f64::NEG_INFINITY, DType::F64, Device::Cpu);
+        let nan = ScalarTensor::new(f64::NAN, DType::F64, Device::Cpu);
+
+        assert_eq!(
+            eq_scalar(&pos_inf, &pos_inf)
+                .expect("eq(+inf,+inf) should succeed")
+                .value(),
+            1.0
+        );
+        assert_eq!(
+            eq_scalar(&neg_inf, &neg_inf)
+                .expect("eq(-inf,-inf) should succeed")
+                .value(),
+            1.0
+        );
+        assert_eq!(
+            ne_scalar(&pos_inf, &pos_inf)
+                .expect("ne(+inf,+inf) should succeed")
+                .value(),
+            0.0
+        );
+        assert_eq!(
+            ne_scalar(&neg_inf, &neg_inf)
+                .expect("ne(-inf,-inf) should succeed")
+                .value(),
+            0.0
+        );
+        assert_eq!(
+            eq_scalar(&nan, &nan)
+                .expect("eq(nan,nan) should succeed")
+                .value(),
+            0.0
+        );
+        assert_eq!(
+            ne_scalar(&nan, &nan)
+                .expect("ne(nan,nan) should succeed")
+                .value(),
+            1.0
+        );
+        assert_eq!(
+            eq_scalar(&pos_inf, &neg_inf)
+                .expect("eq(+inf,-inf) should succeed")
+                .value(),
+            0.0
+        );
+        assert_eq!(
+            ne_scalar(&pos_inf, &neg_inf)
+                .expect("ne(+inf,-inf) should succeed")
+                .value(),
+            1.0
+        );
+    }
+
+    #[test]
     fn lt_gt_scalar_returns_expected_values() {
         let a = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
         let b = ScalarTensor::new(3.0, DType::F64, Device::Cpu);
@@ -1895,6 +1955,21 @@ mod tests {
         let rhs = vec![1.0, 5.0, 3.0, 0.0];
         let out = ne_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("ne should succeed");
         assert_eq!(out, vec![0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn eq_ne_tensor_contiguous_respect_ieee_special_values() {
+        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
+        let lhs = vec![f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1.0];
+        let rhs = vec![f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 2.0];
+
+        let eq_out =
+            eq_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("eq tensor should succeed");
+        let ne_out =
+            ne_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("ne tensor should succeed");
+
+        assert_eq!(eq_out, vec![1.0, 1.0, 0.0, 0.0]);
+        assert_eq!(ne_out, vec![0.0, 0.0, 1.0, 1.0]);
     }
 
     #[test]
