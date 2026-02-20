@@ -574,6 +574,21 @@ impl DenseTensor {
     pub fn version(&self) -> u64 {
         self.version
     }
+
+    /// Replace storage values in-place and bump the version counter.
+    ///
+    /// The new storage must have the same length as the current storage.
+    pub fn replace_storage(&mut self, new_storage: Vec<f64>) -> Result<(), DenseTensorError> {
+        if new_storage.len() != self.storage.len() {
+            return Err(DenseTensorError::InsufficientStorage {
+                needed: self.storage.len(),
+                actual: new_storage.len(),
+            });
+        }
+        self.storage = new_storage;
+        self.version += 1;
+        Ok(())
+    }
 }
 
 pub fn ensure_compatible(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<(), TensorCompatError> {

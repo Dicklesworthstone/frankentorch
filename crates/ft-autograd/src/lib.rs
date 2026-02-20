@@ -4,7 +4,13 @@ use std::cmp::Ordering;
 use std::collections::BinaryHeap;
 use std::fmt;
 
-use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor};
+use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, TensorMeta};
+use ft_kernel_cpu::{
+    argmax_dim_tensor_contiguous_f64, argmin_dim_tensor_contiguous_f64,
+    gather_tensor_contiguous_f64, index_select_tensor_contiguous_f64,
+    masked_fill_tensor_contiguous_f64, max_dim_tensor_contiguous_f64,
+    min_dim_tensor_contiguous_f64, scatter_tensor_contiguous_f64,
+};
 use ft_dispatch::{
     BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError, DispatchKeyError,
     JoinDispatchDecision, JoinOp, NormalizeDimDispatchDecision, NormalizeOp, PowDispatchDecision,
@@ -364,6 +370,48 @@ enum TensorNodeOp {
     Permute {
         input: TensorNodeId,
         dims: Vec<usize>,
+    },
+    Narrow {
+        input: TensorNodeId,
+        dim: usize,
+        start: usize,
+        original_shape: Vec<usize>,
+    },
+    Expand {
+        input: TensorNodeId,
+        original_shape: Vec<usize>,
+    },
+    Split {
+        input: TensorNodeId,
+        chunk_index: usize,
+        dim: usize,
+        start: usize,
+        original_shape: Vec<usize>,
+    },
+    MaxDim {
+        input: TensorNodeId,
+        dim: usize,
+        input_shape: Vec<usize>,
+        indices: Vec<f64>,
+    },
+    MinDim {
+        input: TensorNodeId,
+        dim: usize,
+        input_shape: Vec<usize>,
+        indices: Vec<f64>,
+    },
+    IndexSelect {
+        input: TensorNodeId,
+        dim: usize,
+        indices: Vec<f64>,
+        input_shape: Vec<usize>,
+    },
+    Gather {
+        input: TensorNodeId,
+        dim: usize,
+        index: Vec<f64>,
+        index_shape: Vec<usize>,
+        input_shape: Vec<usize>,
     },
 }
 
@@ -4810,6 +4858,341 @@ impl TensorTape {
         ))
     }
 
+    pub fn argmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, output_shape, output_dtype, output_device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta().clone();
+            let values = argmax_dim_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let mut out_shape = meta.shape().to_vec();
+            out_shape.remove(dim);
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            (values, out_shape, meta.dtype(), meta.device())
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                values,
+            )?,
+            requires_grad: false,
+            op: TensorNodeOp::Leaf,
+        });
+        Ok(out)
+    }
+
+    pub fn argmin(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, output_shape, output_dtype, output_device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta().clone();
+            let values = argmin_dim_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let mut out_shape = meta.shape().to_vec();
+            out_shape.remove(dim);
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            (values, out_shape, meta.dtype(), meta.device())
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                values,
+            )?,
+            requires_grad: false,
+            op: TensorNodeOp::Leaf,
+        });
+        Ok(out)
+    }
+
+    pub fn max_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (values, indices, input_shape, output_shape, output_dtype, output_device, requires_grad) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let (values, indices) = max_dim_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let input_shape = meta.shape().to_vec();
+            let mut out_shape = input_shape.clone();
+            out_shape.remove(dim);
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            (values, indices, input_shape, out_shape, meta.dtype(), meta.device(), requires_grad)
+        };
+
+        let indices_clone = indices.clone();
+        let out_values = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape.clone(), output_dtype, output_device),
+                values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::MaxDim {
+                input,
+                dim,
+                input_shape,
+                indices: indices_clone,
+            },
+        });
+
+        let out_indices = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                indices,
+            )?,
+            requires_grad: false,
+            op: TensorNodeOp::Leaf,
+        });
+
+        Ok((out_values, out_indices))
+    }
+
+    pub fn min_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (values, indices, input_shape, output_shape, output_dtype, output_device, requires_grad) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let (values, indices) = min_dim_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let input_shape = meta.shape().to_vec();
+            let mut out_shape = input_shape.clone();
+            out_shape.remove(dim);
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            (values, indices, input_shape, out_shape, meta.dtype(), meta.device(), requires_grad)
+        };
+
+        let indices_clone = indices.clone();
+        let out_values = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape.clone(), output_dtype, output_device),
+                values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::MinDim {
+                input,
+                dim,
+                input_shape,
+                indices: indices_clone,
+            },
+        });
+
+        let out_indices = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                indices,
+            )?,
+            requires_grad: false,
+            op: TensorNodeOp::Leaf,
+        });
+
+        Ok((out_values, out_indices))
+    }
+
+    pub fn index_select(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        indices: &[f64],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, input_shape, output_shape, output_dtype, output_device, requires_grad) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let values = index_select_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                indices,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let input_shape = meta.shape().to_vec();
+            let mut out_shape = input_shape.clone();
+            out_shape[dim] = indices.len();
+            (values, input_shape, out_shape, meta.dtype(), meta.device(), requires_grad)
+        };
+
+        let indices_owned = indices.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::IndexSelect {
+                input,
+                dim,
+                indices: indices_owned,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    pub fn gather(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: &[f64],
+        index_shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, input_shape, output_dtype, output_device, requires_grad) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let idx_meta = ft_core::TensorMeta::from_shape(
+                index_shape.clone(),
+                meta.dtype(),
+                meta.device(),
+            );
+            let values = gather_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                index,
+                &idx_meta,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let input_shape = meta.shape().to_vec();
+            (values, input_shape, meta.dtype(), meta.device(), requires_grad)
+        };
+
+        let index_owned = index.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(index_shape.clone(), output_dtype, output_device),
+                values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::Gather {
+                input,
+                dim,
+                index: index_owned,
+                index_shape,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    pub fn scatter(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: &[f64],
+        index_shape: Vec<usize>,
+        src: &[f64],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, output_shape, output_dtype, output_device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta().clone();
+            let idx_meta = ft_core::TensorMeta::from_shape(
+                index_shape.clone(),
+                meta.dtype(),
+                meta.device(),
+            );
+            let values = scatter_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                index,
+                &idx_meta,
+                src,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let output_shape = meta.shape().to_vec();
+            (values, output_shape, meta.dtype(), meta.device())
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                values,
+            )?,
+            requires_grad: false,
+            op: TensorNodeOp::Leaf,
+        });
+        Ok(out)
+    }
+
+    pub fn masked_fill(
+        &mut self,
+        input: TensorNodeId,
+        mask: &[f64],
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, output_shape, output_dtype, output_device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta().clone();
+            let values = masked_fill_tensor_contiguous_f64(
+                input_node.tensor.storage(),
+                &meta,
+                mask,
+                value,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let output_shape = meta.shape().to_vec();
+            (values, output_shape, meta.dtype(), meta.device())
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                values,
+            )?,
+            requires_grad: false,
+            op: TensorNodeOp::Leaf,
+        });
+        Ok(out)
+    }
+
     pub fn cat(
         &mut self,
         inputs: &[TensorNodeId],
@@ -5187,6 +5570,245 @@ impl TensorTape {
             },
         });
         Ok(out)
+    }
+
+    pub fn flatten(
+        &mut self,
+        input: TensorNodeId,
+        start_dim: usize,
+        end_dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let new_shape = {
+            let input_node = self.node(input)?;
+            let shape = input_node.tensor.meta().shape();
+            let ndim = shape.len();
+            if start_dim >= ndim || end_dim >= ndim || start_dim > end_dim {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::InvalidDimension { dim: end_dim, ndim },
+                )));
+            }
+            let flat_size: usize = shape[start_dim..=end_dim].iter().product();
+            let mut new_shape = Vec::with_capacity(ndim - (end_dim - start_dim));
+            new_shape.extend_from_slice(&shape[..start_dim]);
+            new_shape.push(flat_size);
+            new_shape.extend_from_slice(&shape[end_dim + 1..]);
+            new_shape
+        };
+        self.reshape(input, new_shape)
+    }
+
+    pub fn unflatten(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        sizes: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let new_shape = {
+            let input_node = self.node(input)?;
+            let shape = input_node.tensor.meta().shape();
+            let ndim = shape.len();
+            if dim >= ndim {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::InvalidDimension { dim, ndim },
+                )));
+            }
+            let expected: usize = sizes.iter().product();
+            if expected != shape[dim] {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::ShapeMismatch {
+                        lhs: shape.to_vec(),
+                        rhs: sizes.clone(),
+                    },
+                )));
+            }
+            let mut new_shape = Vec::with_capacity(ndim - 1 + sizes.len());
+            new_shape.extend_from_slice(&shape[..dim]);
+            new_shape.extend_from_slice(&sizes);
+            new_shape.extend_from_slice(&shape[dim + 1..]);
+            new_shape
+        };
+        self.reshape(input, new_shape)
+    }
+
+    pub fn narrow(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result_data, new_shape, original_shape, dtype, device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta();
+            let shape = meta.shape();
+            let original_shape = shape.to_vec();
+            let storage = input_node.tensor.contiguous_values()?;
+
+            let result_data =
+                ft_kernel_cpu::narrow_tensor_contiguous_f64(storage, meta, dim, start, length)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+
+            let mut new_shape = shape.to_vec();
+            new_shape[dim] = length;
+
+            (
+                input_node.requires_grad,
+                result_data,
+                new_shape,
+                original_shape,
+                meta.dtype(),
+                meta.device(),
+            )
+        };
+
+        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(new_meta, result_data)?,
+            requires_grad,
+            op: TensorNodeOp::Narrow {
+                input,
+                dim,
+                start,
+                original_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    pub fn expand(
+        &mut self,
+        input: TensorNodeId,
+        target_shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result_data, original_shape, dtype, device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta();
+            let original_shape = meta.shape().to_vec();
+            let storage = input_node.tensor.contiguous_values()?;
+
+            let result_data =
+                ft_kernel_cpu::expand_tensor_contiguous_f64(storage, meta, &target_shape)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+
+            (
+                input_node.requires_grad,
+                result_data,
+                original_shape,
+                meta.dtype(),
+                meta.device(),
+            )
+        };
+
+        let new_meta = ft_core::TensorMeta::from_shape(target_shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(new_meta, result_data)?,
+            requires_grad,
+            op: TensorNodeOp::Expand {
+                input,
+                original_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    pub fn split(
+        &mut self,
+        input: TensorNodeId,
+        split_sizes: &[usize],
+        dim: usize,
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        let (requires_grad, storage, shape, dtype, device) = {
+            let input_node = self.node(input)?;
+            let meta = input_node.tensor.meta();
+            let shape = meta.shape().to_vec();
+            let ndim = shape.len();
+            if dim >= ndim {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::InvalidDimension { dim, ndim },
+                )));
+            }
+            let total: usize = split_sizes.iter().sum();
+            if total != shape[dim] {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::ShapeMismatch {
+                        lhs: shape.clone(),
+                        rhs: split_sizes.to_vec(),
+                    },
+                )));
+            }
+            (
+                input_node.requires_grad,
+                input_node.tensor.contiguous_values()?.to_vec(),
+                shape,
+                meta.dtype(),
+                meta.device(),
+            )
+        };
+
+        let original_shape = shape.clone();
+        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let mut outputs = Vec::with_capacity(split_sizes.len());
+        let mut start = 0;
+
+        for (chunk_index, &sz) in split_sizes.iter().enumerate() {
+            let chunk_data =
+                ft_kernel_cpu::narrow_tensor_contiguous_f64(&storage, &meta, dim, start, sz)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+
+            let mut chunk_shape = original_shape.clone();
+            chunk_shape[dim] = sz;
+            let chunk_meta = ft_core::TensorMeta::from_shape(chunk_shape, dtype, device);
+            let out = TensorNodeId(self.nodes.len());
+            self.nodes.push(TensorNode {
+                tensor: DenseTensor::from_storage(chunk_meta, chunk_data)?,
+                requires_grad,
+                op: TensorNodeOp::Split {
+                    input,
+                    chunk_index,
+                    dim,
+                    start,
+                    original_shape: original_shape.clone(),
+                },
+            });
+            outputs.push(out);
+            start += sz;
+        }
+
+        Ok(outputs)
+    }
+
+    pub fn chunk(
+        &mut self,
+        input: TensorNodeId,
+        chunks: usize,
+        dim: usize,
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        let dim_size = {
+            let input_node = self.node(input)?;
+            let shape = input_node.tensor.meta().shape();
+            if dim >= shape.len() {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                    ft_kernel_cpu::KernelError::InvalidDimension {
+                        dim,
+                        ndim: shape.len(),
+                    },
+                )));
+            }
+            shape[dim]
+        };
+
+        let chunk_size = dim_size.div_ceil(chunks);
+        let mut split_sizes = Vec::with_capacity(chunks);
+        let mut remaining = dim_size;
+        while remaining > 0 {
+            let sz = remaining.min(chunk_size);
+            split_sizes.push(sz);
+            remaining -= sz;
+        }
+
+        self.split(input, &split_sizes, dim)
     }
 
     /// Physically rearranges data according to a dimension permutation.
@@ -6552,6 +7174,245 @@ impl TensorTape {
                         rule: "d(permute(x))/dx=inverse_permute(grad)",
                     });
                 }
+                TensorNodeOp::Narrow {
+                    input,
+                    dim,
+                    start,
+                    ref original_shape,
+                } => {
+                    // Backward: place the gradient into a zero tensor at the original
+                    // positions, effectively zero-padding back to the original shape.
+                    let orig_numel: usize = original_shape.iter().product();
+                    let mut contrib = vec![0.0; orig_numel];
+                    let output_shape = self.nodes[node_id.0].tensor.meta().shape();
+                    let length = output_shape[dim];
+                    let outer_size: usize = original_shape[..dim].iter().product();
+                    let inner_size: usize = original_shape[dim + 1..].iter().product();
+                    let orig_dim_size = original_shape[dim];
+
+                    for outer in 0..outer_size {
+                        for r in 0..length {
+                            for inner in 0..inner_size {
+                                let grad_idx = outer * length * inner_size + r * inner_size + inner;
+                                let orig_idx = outer * orig_dim_size * inner_size
+                                    + (start + r) * inner_size
+                                    + inner;
+                                contrib[orig_idx] = incoming[grad_idx];
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(narrow(x))/dx=zero_pad_grad",
+                    });
+                }
+                TensorNodeOp::Expand {
+                    input,
+                    ref original_shape,
+                } => {
+                    // Backward: sum gradient along expanded (broadcast) dimensions.
+                    // Dimensions where original_shape[d] == 1 and output > 1 were expanded;
+                    // we reduce (sum) the gradient back along those dims.
+                    let output_shape = self.nodes[node_id.0].tensor.meta().shape().to_vec();
+                    let ndim = output_shape.len();
+                    let orig_numel: usize = original_shape.iter().product::<usize>().max(1);
+                    let out_numel: usize = output_shape.iter().product::<usize>().max(1);
+                    let mut contrib = vec![0.0; orig_numel];
+
+                    let grad_strides = ft_core::contiguous_strides(&output_shape);
+                    let orig_strides = ft_core::contiguous_strides(original_shape);
+                    let mut coords = vec![0usize; ndim];
+
+                    for _ in 0..out_numel {
+                        let mut orig_idx = 0usize;
+                        let mut grad_idx = 0usize;
+                        for d in 0..ndim {
+                            grad_idx += coords[d] * grad_strides[d];
+                            if original_shape[d] != 1 {
+                                orig_idx += coords[d] * orig_strides[d];
+                            }
+                        }
+                        contrib[orig_idx] += incoming[grad_idx];
+
+                        for d in (0..ndim).rev() {
+                            coords[d] += 1;
+                            if coords[d] < output_shape[d] {
+                                break;
+                            }
+                            coords[d] = 0;
+                        }
+                    }
+
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(expand(x))/dx=sum_broadcast_dims(grad)",
+                    });
+                }
+                TensorNodeOp::Split {
+                    input,
+                    dim,
+                    start,
+                    ref original_shape,
+                    ..
+                } => {
+                    // Backward: place chunk gradient back into the original shape
+                    // (same as narrow backward).
+                    let orig_numel: usize = original_shape.iter().product();
+                    let mut contrib = vec![0.0; orig_numel];
+                    let output_shape = self.nodes[node_id.0].tensor.meta().shape();
+                    let length = output_shape[dim];
+                    let outer_size: usize = original_shape[..dim].iter().product();
+                    let inner_size: usize = original_shape[dim + 1..].iter().product();
+                    let orig_dim_size = original_shape[dim];
+
+                    for outer in 0..outer_size {
+                        for r in 0..length {
+                            for inner in 0..inner_size {
+                                let grad_idx = outer * length * inner_size + r * inner_size + inner;
+                                let orig_idx = outer * orig_dim_size * inner_size
+                                    + (start + r) * inner_size
+                                    + inner;
+                                contrib[orig_idx] = incoming[grad_idx];
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(split(x))/dx=zero_pad_grad",
+                    });
+                }
+                TensorNodeOp::MaxDim {
+                    input,
+                    dim,
+                    ref input_shape,
+                    ref indices,
+                }
+                | TensorNodeOp::MinDim {
+                    input,
+                    dim,
+                    ref input_shape,
+                    ref indices,
+                } => {
+                    let rule = if matches!(self.nodes[node_id.0].op, TensorNodeOp::MaxDim { .. }) {
+                        "d(max_dim(x))/dx=scatter_grad_to_max_positions"
+                    } else {
+                        "d(min_dim(x))/dx=scatter_grad_to_min_positions"
+                    };
+                    let input_numel: usize = input_shape.iter().product();
+                    let reduce_size = input_shape[dim];
+                    let outer_size: usize = input_shape[..dim].iter().product();
+                    let inner_size: usize = input_shape[dim + 1..].iter().product();
+                    let mut contrib = vec![0.0; input_numel];
+
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let out_idx = outer * inner_size + inner;
+                            let selected_r = indices[out_idx] as usize;
+                            if selected_r < reduce_size {
+                                let in_idx = outer * reduce_size * inner_size
+                                    + selected_r * inner_size
+                                    + inner;
+                                contrib[in_idx] = incoming[out_idx];
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule,
+                    });
+                }
+                TensorNodeOp::IndexSelect {
+                    input,
+                    dim,
+                    ref indices,
+                    ref input_shape,
+                } => {
+                    // Backward: scatter_add the gradient back to original positions.
+                    let input_numel: usize = input_shape.iter().product();
+                    let dim_size = input_shape[dim];
+                    let outer_size: usize = input_shape[..dim].iter().product();
+                    let inner_size: usize = input_shape[dim + 1..].iter().product();
+                    let num_indices = indices.len();
+                    let mut contrib = vec![0.0; input_numel];
+
+                    for outer in 0..outer_size {
+                        for (r, &idx_f) in indices.iter().enumerate() {
+                            let idx = idx_f as usize;
+                            if idx < dim_size {
+                                for inner in 0..inner_size {
+                                    let grad_pos =
+                                        outer * num_indices * inner_size + r * inner_size + inner;
+                                    let orig_pos =
+                                        outer * dim_size * inner_size + idx * inner_size + inner;
+                                    contrib[orig_pos] += incoming[grad_pos];
+                                }
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(index_select(x))/dx=scatter_add_grad",
+                    });
+                }
+                TensorNodeOp::Gather {
+                    input,
+                    dim,
+                    ref index,
+                    ref index_shape,
+                    ref input_shape,
+                } => {
+                    // Backward: scatter gradient using the same index to original positions.
+                    let input_numel: usize = input_shape.iter().product();
+                    let dim_size = input_shape[dim];
+                    let idx_dim_size = index_shape[dim];
+                    let outer_size: usize = index_shape[..dim].iter().product();
+                    let inner_size: usize = index_shape[dim + 1..].iter().product();
+                    let mut contrib = vec![0.0; input_numel];
+
+                    for outer in 0..outer_size {
+                        for r in 0..idx_dim_size {
+                            for inner in 0..inner_size {
+                                let idx_pos =
+                                    outer * idx_dim_size * inner_size + r * inner_size + inner;
+                                let selected = index[idx_pos] as usize;
+                                if selected < dim_size {
+                                    let orig_pos = outer * dim_size * inner_size
+                                        + selected * inner_size
+                                        + inner;
+                                    contrib[orig_pos] += incoming[idx_pos];
+                                }
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(gather(x))/dx=scatter_add_grad",
+                    });
+                }
             }
         }
 
@@ -6656,7 +7517,14 @@ impl TensorTape {
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. }
                 | TensorNodeOp::Transpose { input, .. }
-                | TensorNodeOp::Permute { input, .. } => {
+                | TensorNodeOp::Permute { input, .. }
+                | TensorNodeOp::Narrow { input, .. }
+                | TensorNodeOp::Expand { input, .. }
+                | TensorNodeOp::Split { input, .. }
+                | TensorNodeOp::MaxDim { input, .. }
+                | TensorNodeOp::MinDim { input, .. }
+                | TensorNodeOp::IndexSelect { input, .. }
+                | TensorNodeOp::Gather { input, .. } => {
                     stack.push(input);
                 }
                 TensorNodeOp::Cat { ref inputs, .. } | TensorNodeOp::Stack { ref inputs, .. } => {
@@ -6741,7 +7609,14 @@ impl TensorTape {
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. }
                 | TensorNodeOp::Transpose { input, .. }
-                | TensorNodeOp::Permute { input, .. } => {
+                | TensorNodeOp::Permute { input, .. }
+                | TensorNodeOp::Narrow { input, .. }
+                | TensorNodeOp::Expand { input, .. }
+                | TensorNodeOp::Split { input, .. }
+                | TensorNodeOp::MaxDim { input, .. }
+                | TensorNodeOp::MinDim { input, .. }
+                | TensorNodeOp::IndexSelect { input, .. }
+                | TensorNodeOp::Gather { input, .. } => {
                     pending[input.0] = pending[input.0].saturating_add(1);
                 }
                 TensorNodeOp::Cat { ref inputs, .. } | TensorNodeOp::Stack { ref inputs, .. } => {
@@ -6822,6 +7697,29 @@ impl TensorTape {
         self.nodes
             .get(id.0)
             .ok_or(AutogradError::UnknownTensorNode(id))
+    }
+
+    fn node_mut(&mut self, id: TensorNodeId) -> Result<&mut TensorNode, AutogradError> {
+        self.nodes
+            .get_mut(id.0)
+            .ok_or(AutogradError::UnknownTensorNode(id))
+    }
+
+    /// Return the tensor metadata for a node.
+    pub fn tensor_meta(&self, id: TensorNodeId) -> Result<&TensorMeta, AutogradError> {
+        Ok(self.node(id)?.tensor.meta())
+    }
+
+    /// Replace the storage values of a tensor node in-place (version is bumped).
+    pub fn update_tensor_values(
+        &mut self,
+        id: TensorNodeId,
+        new_values: Vec<f64>,
+    ) -> Result<(), AutogradError> {
+        let node = self.node_mut(id)?;
+        node.tensor
+            .replace_storage(new_values)
+            .map_err(AutogradError::DenseTensor)
     }
 }
 
@@ -9877,5 +10775,119 @@ mod tests {
         let report = tape.backward(z).expect("backward");
         let grads = report.gradient(x).expect("grad x");
         assert_eq!(grads, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn tensor_argmax_returns_correct_indices() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], false)
+            .expect("x");
+        let out = tape.argmax(x, 1).expect("argmax");
+        let vals = tape.values(out).expect("values");
+        assert_eq!(vals, &[1.0, 2.0]);
+        let shape = tape.node(out).unwrap().tensor.meta().shape();
+        assert_eq!(shape, &[2]);
+    }
+
+    #[test]
+    fn tensor_argmin_returns_correct_indices() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], false)
+            .expect("x");
+        let out = tape.argmin(x, 1).expect("argmin");
+        let vals = tape.values(out).expect("values");
+        assert_eq!(vals, &[0.0, 1.0]);
+        let shape = tape.node(out).unwrap().tensor.meta().shape();
+        assert_eq!(shape, &[2]);
+    }
+
+    #[test]
+    fn tensor_argmax_not_requires_grad() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let out = tape.argmax(x, 1).expect("argmax");
+        assert!(!tape.node(out).unwrap().requires_grad);
+    }
+
+    #[test]
+    fn tensor_max_dim_returns_values_and_indices() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (values_out, indices_out) = tape.max_dim(x, 1).expect("max_dim");
+        let values = tape.values(values_out).expect("values");
+        let indices = tape.values(indices_out).expect("indices");
+        assert_eq!(values, &[5.0, 6.0]);
+        assert_eq!(indices, &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn tensor_max_dim_backward_scatters_gradient() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (values_out, _indices_out) = tape.max_dim(x, 1).expect("max_dim");
+        let s = tape.sum(values_out, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(s.0).expect("backward");
+        let grads = report.gradient(x).expect("grad x");
+        assert_eq!(grads, &[0.0, 1.0, 0.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn tensor_min_dim_returns_values_and_indices() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (values_out, indices_out) = tape.min_dim(x, 1).expect("min_dim");
+        let values = tape.values(values_out).expect("values");
+        let indices = tape.values(indices_out).expect("indices");
+        assert_eq!(values, &[1.0, 2.0]);
+        assert_eq!(indices, &[0.0, 1.0]);
+    }
+
+    #[test]
+    fn tensor_min_dim_backward_scatters_gradient() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (values_out, _indices_out) = tape.min_dim(x, 1).expect("min_dim");
+        let s = tape.sum(values_out, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(s.0).expect("backward");
+        let grads = report.gradient(x).expect("grad x");
+        assert_eq!(grads, &[1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn tensor_max_dim_along_dim0() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (values_out, indices_out) = tape.max_dim(x, 0).expect("max_dim 0");
+        let values = tape.values(values_out).expect("values");
+        let indices = tape.values(indices_out).expect("indices");
+        assert_eq!(values, &[4.0, 5.0, 6.0]);
+        assert_eq!(indices, &[1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn tensor_max_dim_backward_along_dim0() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (values_out, _indices_out) = tape.max_dim(x, 0).expect("max_dim 0");
+        let s = tape.sum(values_out, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(s.0).expect("backward");
+        let grads = report.gradient(x).expect("grad x");
+        assert_eq!(grads, &[0.0, 1.0, 0.0, 1.0, 0.0, 1.0]);
     }
 }

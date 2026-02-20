@@ -1,0 +1,14 @@
+[package]
+name = "ft-nn"
+version = "0.1.0"
+edition = "2024"
+license-file = "../../LICENSE"
+
+[dependencies]
+ft-core = { workspace = true }
+ft-api = { workspace = true }
+ft-autograd = { workspace = true }
+ft-kernel-cpu = { workspace = true }
+
+[lints]
+workspace = true

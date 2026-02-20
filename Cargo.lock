@@ -328,6 +328,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "ft-nn"
+version = "0.1.0"
+dependencies = [
+ "ft-api",
+ "ft-autograd",
+ "ft-core",
+ "ft-kernel-cpu",
+]
+
+[[package]]
+name = "ft-optim"
+version = "0.1.0"
+dependencies = [
+ "ft-api",
+ "ft-autograd",
+ "ft-core",
+]
+
+[[package]]
 name = "ft-runtime"
 version = "0.1.0"
 dependencies = [

@@ -1,0 +1,13 @@
+[package]
+name = "ft-optim"
+version = "0.1.0"
+edition = "2024"
+license-file = "../../LICENSE"
+
+[dependencies]
+ft-core = { workspace = true }
+ft-api = { workspace = true }
+ft-autograd = { workspace = true }
+
+[lints]
+workspace = true
