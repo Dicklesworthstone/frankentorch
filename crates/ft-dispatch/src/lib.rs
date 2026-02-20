@@ -1877,31 +1877,26 @@ pub fn dispatch_scalar_comparison(
     let (selected_key, backend_key, effective_key, fallback_used) =
         resolve_dispatch_keys(mode, keyset)?;
 
-    let (tensor, kernel) = match (effective_key, op) {
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Eq) => {
-            (eq_scalar(lhs, rhs)?, "cpu::eq_scalar")
-        }
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Ne) => {
-            (ne_scalar(lhs, rhs)?, "cpu::ne_scalar")
-        }
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Lt) => {
-            (lt_scalar(lhs, rhs)?, "cpu::lt_scalar")
-        }
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Gt) => {
-            (gt_scalar(lhs, rhs)?, "cpu::gt_scalar")
-        }
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Le) => {
-            (le_scalar(lhs, rhs)?, "cpu::le_scalar")
-        }
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Ge) => {
-            (ge_scalar(lhs, rhs)?, "cpu::ge_scalar")
-        }
-        _ => {
-            return Err(DispatchKeyError::IncompatibleSet {
-                reason: "resolved dispatch key is unsupported for scalar comparison ops",
-            }
-            .into());
-        }
+    let (tensor, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => match op {
+            ComparisonOp::Eq => (eq_scalar(lhs, rhs)?, "autograd_cpu::eq_scalar"),
+            ComparisonOp::Ne => (ne_scalar(lhs, rhs)?, "autograd_cpu::ne_scalar"),
+            ComparisonOp::Lt => (lt_scalar(lhs, rhs)?, "autograd_cpu::lt_scalar"),
+            ComparisonOp::Gt => (gt_scalar(lhs, rhs)?, "autograd_cpu::gt_scalar"),
+            ComparisonOp::Le => (le_scalar(lhs, rhs)?, "autograd_cpu::le_scalar"),
+            ComparisonOp::Ge => (ge_scalar(lhs, rhs)?, "autograd_cpu::ge_scalar"),
+        },
+        DispatchKey::CPU => match op {
+            ComparisonOp::Eq => (eq_scalar(lhs, rhs)?, "cpu::eq_scalar"),
+            ComparisonOp::Ne => (ne_scalar(lhs, rhs)?, "cpu::ne_scalar"),
+            ComparisonOp::Lt => (lt_scalar(lhs, rhs)?, "cpu::lt_scalar"),
+            ComparisonOp::Gt => (gt_scalar(lhs, rhs)?, "cpu::gt_scalar"),
+            ComparisonOp::Le => (le_scalar(lhs, rhs)?, "cpu::le_scalar"),
+            ComparisonOp::Ge => (ge_scalar(lhs, rhs)?, "cpu::ge_scalar"),
+        },
+        _ => Err(DispatchKeyError::IncompatibleSet {
+            reason: "resolved dispatch key is unsupported for scalar comparison ops",
+        })?,
     };
 
     Ok(ComparisonDispatchOutcome {
@@ -1931,37 +1926,62 @@ pub fn dispatch_tensor_comparison_contiguous_f64(
     let (selected_key, backend_key, effective_key, fallback_used) =
         resolve_dispatch_keys(mode, keyset)?;
 
-    let (values, kernel) = match (effective_key, op) {
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Eq) => (
-            eq_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
-            "cpu::eq_tensor_contiguous_f64",
-        ),
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Ne) => (
-            ne_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
-            "cpu::ne_tensor_contiguous_f64",
-        ),
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Lt) => (
-            lt_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
-            "cpu::lt_tensor_contiguous_f64",
-        ),
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Gt) => (
-            gt_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
-            "cpu::gt_tensor_contiguous_f64",
-        ),
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Le) => (
-            le_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
-            "cpu::le_tensor_contiguous_f64",
-        ),
-        (DispatchKey::AutogradCPU | DispatchKey::CPU, ComparisonOp::Ge) => (
-            ge_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
-            "cpu::ge_tensor_contiguous_f64",
-        ),
-        _ => {
-            return Err(DispatchKeyError::IncompatibleSet {
-                reason: "resolved dispatch key is unsupported for contiguous tensor comparison ops",
-            }
-            .into());
-        }
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => match op {
+            ComparisonOp::Eq => (
+                eq_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "autograd_cpu::eq_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Ne => (
+                ne_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "autograd_cpu::ne_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Lt => (
+                lt_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "autograd_cpu::lt_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Gt => (
+                gt_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "autograd_cpu::gt_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Le => (
+                le_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "autograd_cpu::le_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Ge => (
+                ge_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "autograd_cpu::ge_tensor_contiguous_f64",
+            ),
+        },
+        DispatchKey::CPU => match op {
+            ComparisonOp::Eq => (
+                eq_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "cpu::eq_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Ne => (
+                ne_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "cpu::ne_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Lt => (
+                lt_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "cpu::lt_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Gt => (
+                gt_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "cpu::gt_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Le => (
+                le_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "cpu::le_tensor_contiguous_f64",
+            ),
+            ComparisonOp::Ge => (
+                ge_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+                "cpu::ge_tensor_contiguous_f64",
+            ),
+        },
+        _ => Err(DispatchKeyError::IncompatibleSet {
+            reason: "resolved dispatch key is unsupported for contiguous tensor comparison ops",
+        })?,
     };
 
     Ok(TensorComparisonDispatchOutcome {
@@ -3625,6 +3645,26 @@ mod tests {
     }
 
     #[test]
+    fn dispatch_scalar_comparison_with_grad_uses_autograd_kernel_labels() {
+        let lhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+        let rhs = ScalarTensor::new(2.0, DType::F64, Device::Cpu);
+
+        let eq_out =
+            dispatch_scalar_comparison(ComparisonOp::Eq, ExecutionMode::Strict, &lhs, &rhs, true)
+                .expect("eq dispatch with grad should succeed");
+        assert_eq!(eq_out.tensor.value(), 1.0);
+        assert_eq!(eq_out.decision.selected_key, DispatchKey::AutogradCPU);
+        assert_eq!(eq_out.decision.kernel, "autograd_cpu::eq_scalar");
+
+        let ne_out =
+            dispatch_scalar_comparison(ComparisonOp::Ne, ExecutionMode::Strict, &lhs, &rhs, true)
+                .expect("ne dispatch with grad should succeed");
+        assert_eq!(ne_out.tensor.value(), 0.0);
+        assert_eq!(ne_out.decision.selected_key, DispatchKey::AutogradCPU);
+        assert_eq!(ne_out.decision.kernel, "autograd_cpu::ne_scalar");
+    }
+
+    #[test]
     fn dispatch_tensor_comparison_eq_ne_respect_ieee_special_values() {
         let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
         let lhs = vec![f64::INFINITY, f64::NEG_INFINITY, f64::NAN, 1.0];
@@ -3655,5 +3695,46 @@ mod tests {
         .expect("tensor ne dispatch should succeed");
         assert_eq!(ne_outcome.values, vec![0.0, 0.0, 1.0, 1.0]);
         assert_eq!(ne_outcome.decision.kernel, "cpu::ne_tensor_contiguous_f64");
+    }
+
+    #[test]
+    fn dispatch_tensor_comparison_with_grad_uses_autograd_kernel_labels() {
+        let meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let lhs = vec![1.0, 3.0];
+        let rhs = vec![1.0, 2.0];
+
+        let eq_out = dispatch_tensor_comparison_contiguous_f64(
+            ComparisonOp::Eq,
+            ExecutionMode::Strict,
+            &lhs,
+            &rhs,
+            &meta,
+            &meta,
+            true,
+        )
+        .expect("tensor eq dispatch with grad should succeed");
+        assert_eq!(eq_out.values, vec![1.0, 0.0]);
+        assert_eq!(eq_out.decision.selected_key, DispatchKey::AutogradCPU);
+        assert_eq!(
+            eq_out.decision.kernel,
+            "autograd_cpu::eq_tensor_contiguous_f64"
+        );
+
+        let ne_out = dispatch_tensor_comparison_contiguous_f64(
+            ComparisonOp::Ne,
+            ExecutionMode::Strict,
+            &lhs,
+            &rhs,
+            &meta,
+            &meta,
+            true,
+        )
+        .expect("tensor ne dispatch with grad should succeed");
+        assert_eq!(ne_out.values, vec![0.0, 1.0]);
+        assert_eq!(ne_out.decision.selected_key, DispatchKey::AutogradCPU);
+        assert_eq!(
+            ne_out.decision.kernel,
+            "autograd_cpu::ne_tensor_contiguous_f64"
+        );
     }
 }
