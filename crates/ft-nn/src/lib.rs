@@ -46,7 +46,7 @@ impl Linear {
         let weight_scaled = session.tensor_mul(weight_rand, scale_tensor)?;
         let shift_tensor = session.full(vec![out_features, in_features], bound, false)?;
         let weight_shifted = session.tensor_sub(weight_scaled, shift_tensor)?;
-        
+
         let weight_values = session.tensor_values(weight_shifted)?;
         let weight =
             session.tensor_variable(weight_values, vec![out_features, in_features], true)?;
@@ -58,7 +58,7 @@ impl Linear {
             let bias_scaled = session.tensor_mul(bias_rand, bias_scale)?;
             let bias_shift = session.full(vec![1, out_features], bound, false)?;
             let bias_shifted = session.tensor_sub(bias_scaled, bias_shift)?;
-            
+
             let bias_values = session.tensor_values(bias_shifted)?;
             Some(session.tensor_variable(bias_values, vec![1, out_features], true)?)
         } else {

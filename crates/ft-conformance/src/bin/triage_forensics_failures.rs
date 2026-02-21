@@ -180,10 +180,10 @@ fn triage(
 fn classify(reason_code: &str) -> (&'static str, &'static str, &'static str) {
     let normalized = reason_code.to_ascii_lowercase();
 
-    if normalized.contains("unavailable") || normalized.contains("timeout") {
-        if normalized.contains("oracle") {
-            return ("oracle_infra", "medium", "ft-conformance-infra-owners");
-        }
+    if (normalized.contains("unavailable") || normalized.contains("timeout"))
+        && normalized.contains("oracle")
+    {
+        return ("oracle_infra", "medium", "ft-conformance-infra-owners");
     }
 
     if normalized.contains("reentrant")
