@@ -2131,7 +2131,18 @@ impl Tape {
         let mut pending = self.compute_dependencies(&reachable)?;
         let dependency_snapshot = pending.clone();
 
-        let mut grads = vec![0.0; self.nodes.len()];
+        let mut grads = self
+            .nodes
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                if reachable[idx] {
+                    0.0
+                } else {
+                    f64::NAN
+                }
+            })
+            .collect::<Vec<_>>();
         grads[root.0] = 1.0;
 
         let mut queue = ReadyQueue::with_capacity(self.nodes.len().max(1));
@@ -2577,7 +2588,11 @@ impl Tape {
                 }
                 NodeOp::Pow { input, exponent } => {
                     let input_value = self.nodes[input.0].tensor.value();
-                    grads[input.0] += incoming * exponent * input_value.powf(exponent - 1.0);
+                    grads[input.0] += if exponent == 0.0 {
+                        0.0
+                    } else {
+                        incoming * exponent * input_value.powf(exponent - 1.0)
+                    };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -2590,10 +2605,13 @@ impl Tape {
                 NodeOp::Min { lhs, rhs } => {
                     let lhs_val = self.nodes[lhs.0].tensor.value();
                     let rhs_val = self.nodes[rhs.0].tensor.value();
-                    if lhs_val <= rhs_val {
+                    if lhs_val < rhs_val {
                         grads[lhs.0] += incoming;
-                    } else {
+                    } else if lhs_val > rhs_val {
                         grads[rhs.0] += incoming;
+                    } else {
+                        grads[lhs.0] += incoming * 0.5;
+                        grads[rhs.0] += incoming * 0.5;
                     }
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -2602,16 +2620,19 @@ impl Tape {
                     steps.push(BackwardStep {
                         node: node_id,
                         incoming_grad: incoming,
-                        rule: "d(min(a,b))/da=1 if a<=b else 0",
+                        rule: "d(min(a,b))/da=1(a<b) or 0.5(a=b); db=1(b<a) or 0.5(a=b)",
                     });
                 }
                 NodeOp::Max { lhs, rhs } => {
                     let lhs_val = self.nodes[lhs.0].tensor.value();
                     let rhs_val = self.nodes[rhs.0].tensor.value();
-                    if lhs_val >= rhs_val {
+                    if lhs_val > rhs_val {
                         grads[lhs.0] += incoming;
-                    } else {
+                    } else if lhs_val < rhs_val {
                         grads[rhs.0] += incoming;
+                    } else {
+                        grads[lhs.0] += incoming * 0.5;
+                        grads[rhs.0] += incoming * 0.5;
                     }
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -2620,7 +2641,7 @@ impl Tape {
                     steps.push(BackwardStep {
                         node: node_id,
                         incoming_grad: incoming,
-                        rule: "d(max(a,b))/da=1 if a>=b else 0",
+                        rule: "d(max(a,b))/da=1(a>b) or 0.5(a=b); db=1(b>a) or 0.5(a=b)",
                     });
                 }
                 NodeOp::Clamp {
@@ -2650,7 +2671,7 @@ impl Tape {
             .iter()
             .enumerate()
             .map(|(idx, grad)| {
-                if self.nodes[idx].requires_grad {
+                if self.nodes[idx].requires_grad && reachable[idx] {
                     Some(*grad)
                 } else {
                     None
@@ -5808,6 +5829,11 @@ impl TensorTape {
         chunks: usize,
         dim: usize,
     ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        if chunks == 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::InvalidDimension { dim: chunks, ndim: 1 }
+            )));
+        }
         let dim_size = {
             let input_node = self.node(input)?;
             let shape = input_node.tensor.meta().shape();
@@ -5983,7 +6009,14 @@ impl TensorTape {
         let mut grads = self
             .nodes
             .iter()
-            .map(|node| vec![0.0; node.tensor.meta().numel()])
+            .enumerate()
+            .map(|(idx, node)| {
+                if reachable[idx] {
+                    vec![0.0; node.tensor.meta().numel()]
+                } else {
+                    Vec::new()
+                }
+            })
             .collect::<Vec<_>>();
         grads[root.0] = vec![1.0; self.nodes[root.0].tensor.meta().numel()];
 
@@ -6655,7 +6688,13 @@ impl TensorTape {
                     let pow_contrib = incoming
                         .iter()
                         .zip(input_values.iter())
-                        .map(|(grad, x)| grad * exponent * x.powf(exponent - 1.0))
+                        .map(|(grad, x)| {
+                            if exponent == 0.0 {
+                                0.0
+                            } else {
+                                grad * exponent * x.powf(exponent - 1.0)
+                            }
+                        })
                         .collect::<Vec<_>>();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &pow_contrib)?;
 
@@ -6675,12 +6714,12 @@ impl TensorTape {
                     let lhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a <= b { *grad } else { 0.0 })
+                        .map(|(grad, (a, b))| if a < b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     let rhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if b < a { *grad } else { 0.0 })
+                        .map(|(grad, (a, b))| if b < a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
                     Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
@@ -6691,7 +6730,7 @@ impl TensorTape {
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: incoming.len(),
-                        rule: "d(min(a,b))/da=1 if a<=b else 0",
+                        rule: "d(min(a,b))/da=1(a<b) or 0.5(a=b); db=1(b<a) or 0.5(a=b)",
                     });
                 }
                 TensorNodeOp::Max { lhs, rhs } => {
@@ -6702,12 +6741,12 @@ impl TensorTape {
                     let lhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a >= b { *grad } else { 0.0 })
+                        .map(|(grad, (a, b))| if a > b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     let rhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if b > a { *grad } else { 0.0 })
+                        .map(|(grad, (a, b))| if b > a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
                     Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
@@ -6718,7 +6757,7 @@ impl TensorTape {
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: incoming.len(),
-                        rule: "d(max(a,b))/da=1 if a>=b else 0",
+                        rule: "d(max(a,b))/da=1(a>b) or 0.5(a=b); db=1(b>a) or 0.5(a=b)",
                     });
                 }
                 TensorNodeOp::Clamp {
@@ -7443,7 +7482,7 @@ impl TensorTape {
             .iter()
             .enumerate()
             .map(|(idx, grad)| {
-                if self.nodes[idx].requires_grad {
+                if self.nodes[idx].requires_grad && reachable[idx] {
                     Some(grad.clone())
                 } else {
                     None
@@ -7741,7 +7780,7 @@ impl TensorTape {
     ) -> Result<(), AutogradError> {
         let node = self.node_mut(id)?;
         node.tensor
-            .replace_storage(new_values)
+            .update_contiguous_values(&new_values)
             .map_err(AutogradError::DenseTensor)
     }
 }

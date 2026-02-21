@@ -180,9 +180,12 @@ fn triage(
 fn classify(reason_code: &str) -> (&'static str, &'static str, &'static str) {
     let normalized = reason_code.to_ascii_lowercase();
 
-    if normalized.contains("oracle") {
-        return ("oracle_infra", "medium", "ft-conformance-infra-owners");
+    if normalized.contains("unavailable") || normalized.contains("timeout") {
+        if normalized.contains("oracle") {
+            return ("oracle_infra", "medium", "ft-conformance-infra-owners");
+        }
     }
+
     if normalized.contains("reentrant")
         || normalized.contains("dependency")
         || normalized.contains("unknown_node")
@@ -224,6 +227,21 @@ fn classify(reason_code: &str) -> (&'static str, &'static str, &'static str) {
         || normalized.contains("stride")
     {
         return ("tensor_meta_state", "high", "ft-core-owners");
+    }
+    if normalized.contains("scalar")
+        || normalized.contains("tensor_binary")
+        || normalized.contains("tensor_unary")
+        || normalized.contains("tensor_reduction")
+        || normalized.contains("tensor_join")
+        || normalized.contains("math")
+    {
+        return ("kernel_math", "critical", "ft-kernel-cpu-owners");
+    }
+    if normalized.contains("nn_state") {
+        return ("nn_module_state", "high", "ft-nn-owners");
+    }
+    if normalized.contains("optimizer") {
+        return ("optimizer_state", "high", "ft-optim-owners");
     }
 
     ("unclassified", "high", "crash-triage-owner")

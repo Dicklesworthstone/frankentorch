@@ -224,17 +224,29 @@ pub fn pow_scalar(input: &ScalarTensor, exponent: f64) -> ScalarTensor {
 }
 
 pub fn clamp_scalar(input: &ScalarTensor, min_val: f64, max_val: f64) -> ScalarTensor {
-    input.with_value(input.value().clamp(min_val, max_val))
+    let value = input.value();
+    let clamped = if value.is_nan() {
+        f64::NAN
+    } else if !min_val.is_nan() && value < min_val {
+        min_val
+    } else if !max_val.is_nan() && value > max_val {
+        max_val
+    } else {
+        value
+    };
+    input.with_value(clamped)
 }
 
 pub fn min_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
     ensure_compatible(lhs, rhs)?;
-    Ok(lhs.with_value(lhs.value().min(rhs.value())))
+    let val = if lhs.value().is_nan() || rhs.value().is_nan() { f64::NAN } else { lhs.value().min(rhs.value()) };
+    Ok(lhs.with_value(val))
 }
 
 pub fn max_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
     ensure_compatible(lhs, rhs)?;
-    Ok(lhs.with_value(lhs.value().max(rhs.value())))
+    let val = if lhs.value().is_nan() || rhs.value().is_nan() { f64::NAN } else { lhs.value().max(rhs.value()) };
+    Ok(lhs.with_value(val))
 }
 
 pub fn eq_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
@@ -753,7 +765,17 @@ pub fn clamp_tensor_contiguous_f64(
 
     Ok(window
         .iter()
-        .map(|value| value.clamp(min_val, max_val))
+        .map(|value| {
+            if value.is_nan() {
+                f64::NAN
+            } else if !min_val.is_nan() && *value < min_val {
+                min_val
+            } else if !max_val.is_nan() && *value > max_val {
+                max_val
+            } else {
+                *value
+            }
+        })
         .collect())
 }
 
@@ -763,7 +785,7 @@ pub fn min_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| l.min(r))
+    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| if l.is_nan() || r.is_nan() { f64::NAN } else { l.min(r) })
 }
 
 pub fn max_tensor_contiguous_f64(
@@ -772,7 +794,7 @@ pub fn max_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| l.max(r))
+    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| if l.is_nan() || r.is_nan() { f64::NAN } else { l.max(r) })
 }
 
 pub fn eq_tensor_contiguous_f64(
@@ -1231,8 +1253,12 @@ pub fn argmax_dim_tensor_contiguous_f64(
             let mut best_val = f64::NEG_INFINITY;
             for r in 0..reduce_size {
                 let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                if data[idx] > best_val {
-                    best_val = data[idx];
+                let val = data[idx];
+                if val.is_nan() {
+                    best_idx = r;
+                    break;
+                } else if val > best_val {
+                    best_val = val;
                     best_idx = r;
                 }
             }
@@ -1268,8 +1294,12 @@ pub fn argmin_dim_tensor_contiguous_f64(
             let mut best_val = f64::INFINITY;
             for r in 0..reduce_size {
                 let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                if data[idx] < best_val {
-                    best_val = data[idx];
+                let val = data[idx];
+                if val.is_nan() {
+                    best_idx = r;
+                    break;
+                } else if val < best_val {
+                    best_val = val;
                     best_idx = r;
                 }
             }
@@ -1305,8 +1335,13 @@ pub fn max_dim_tensor_contiguous_f64(
             let out_idx = outer * inner_size + inner;
             for r in 0..reduce_size {
                 let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                if data[idx] > values[out_idx] {
-                    values[out_idx] = data[idx];
+                let val = data[idx];
+                if val.is_nan() {
+                    values[out_idx] = f64::NAN;
+                    indices[out_idx] = r as f64;
+                    break;
+                } else if val > values[out_idx] {
+                    values[out_idx] = val;
                     indices[out_idx] = r as f64;
                 }
             }
@@ -1341,8 +1376,13 @@ pub fn min_dim_tensor_contiguous_f64(
             let out_idx = outer * inner_size + inner;
             for r in 0..reduce_size {
                 let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                if data[idx] < values[out_idx] {
-                    values[out_idx] = data[idx];
+                let val = data[idx];
+                if val.is_nan() {
+                    values[out_idx] = f64::NAN;
+                    indices[out_idx] = r as f64;
+                    break;
+                } else if val < values[out_idx] {
+                    values[out_idx] = val;
                     indices[out_idx] = r as f64;
                 }
             }
@@ -1595,13 +1635,17 @@ pub fn index_select_tensor_contiguous_f64(
 
     for outer in 0..outer_size {
         for &idx_f in indices {
-            let idx = idx_f as usize;
-            if idx >= dim_size {
+            let mut idx_i = idx_f as isize;
+            if idx_i < 0 {
+                idx_i += dim_size as isize;
+            }
+            if idx_i < 0 || idx_i >= dim_size as isize {
                 return Err(KernelError::InvalidDimension {
-                    dim: idx,
+                    dim: idx_i as usize,
                     ndim: dim_size,
                 });
             }
+            let idx = idx_i as usize;
             for inner in 0..inner_size {
                 let src = outer * dim_size * inner_size + idx * inner_size + inner;
                 output.push(data[src]);
@@ -1625,6 +1669,7 @@ pub fn gather_tensor_contiguous_f64(
     index_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(input, meta)?;
+    ensure_unary_layout_and_storage(index, index_meta)?;
     let shape = meta.shape();
     let ndim = shape.len();
     if dim >= ndim {
@@ -1654,19 +1699,25 @@ pub fn gather_tensor_contiguous_f64(
     let out_numel: usize = idx_shape.iter().product();
     let offset = meta.storage_offset();
     let data = &input[offset..];
+    let idx_offset = index_meta.storage_offset();
+    let index_data = &index[idx_offset..];
     let mut output = Vec::with_capacity(out_numel);
 
     for outer in 0..outer_size {
         for r in 0..idx_dim_size {
             for inner in 0..inner_size {
                 let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
-                let selected = index[idx_pos] as usize;
-                if selected >= dim_size {
+                let mut selected_i = index_data[idx_pos] as isize;
+                if selected_i < 0 {
+                    selected_i += dim_size as isize;
+                }
+                if selected_i < 0 || selected_i >= dim_size as isize {
                     return Err(KernelError::InvalidDimension {
-                        dim: selected,
+                        dim: selected_i as usize,
                         ndim: dim_size,
                     });
                 }
+                let selected = selected_i as usize;
                 let src = outer * dim_size * inner_size + selected * inner_size + inner;
                 output.push(data[src]);
             }
@@ -1691,6 +1742,7 @@ pub fn scatter_tensor_contiguous_f64(
     src: &[f64],
 ) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(input, meta)?;
+    ensure_unary_layout_and_storage(index, index_meta)?;
     let shape = meta.shape();
     let ndim = shape.len();
     if dim >= ndim {
@@ -1728,18 +1780,24 @@ pub fn scatter_tensor_contiguous_f64(
     let offset = meta.storage_offset();
     let numel = meta.numel();
     let mut output = input[offset..offset + numel].to_vec();
+    let idx_offset = index_meta.storage_offset();
+    let index_data = &index[idx_offset..];
 
     for outer in 0..outer_size {
         for r in 0..idx_dim_size {
             for inner in 0..inner_size {
                 let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
-                let selected = index[idx_pos] as usize;
-                if selected >= dim_size {
+                let mut selected_i = index_data[idx_pos] as isize;
+                if selected_i < 0 {
+                    selected_i += dim_size as isize;
+                }
+                if selected_i < 0 || selected_i >= dim_size as isize {
                     return Err(KernelError::InvalidDimension {
-                        dim: selected,
+                        dim: selected_i as usize,
                         ndim: dim_size,
                     });
                 }
+                let selected = selected_i as usize;
                 let dst = outer * dim_size * inner_size + selected * inner_size + inner;
                 output[dst] = src[idx_pos];
             }

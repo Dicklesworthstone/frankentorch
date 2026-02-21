@@ -539,7 +539,7 @@ impl DenseTensor {
 
     pub fn dispatch_values(&self) -> Result<&[f64], DenseTensorError> {
         let start = self.meta.storage_offset();
-        let end = Self::contiguous_required_len(&self.meta)?;
+        let end = Self::storage_span_required_len(&self.meta)?;
         Ok(&self.storage[start..end])
     }
 
@@ -575,17 +575,23 @@ impl DenseTensor {
         self.version
     }
 
-    /// Replace storage values in-place and bump the version counter.
+    /// Update the contiguous values in-place and bump the version counter.
     ///
-    /// The new storage must have the same length as the current storage.
-    pub fn replace_storage(&mut self, new_storage: Vec<f64>) -> Result<(), DenseTensorError> {
-        if new_storage.len() != self.storage.len() {
+    /// The new values must exactly match the length of the contiguous slice.
+    pub fn update_contiguous_values(&mut self, new_values: &[f64]) -> Result<(), DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::contiguous_required_len(&self.meta)?;
+        let slice = &mut self.storage[start..end];
+        if new_values.len() != slice.len() {
             return Err(DenseTensorError::InsufficientStorage {
-                needed: self.storage.len(),
-                actual: new_storage.len(),
+                needed: slice.len(),
+                actual: new_values.len(),
             });
         }
-        self.storage = new_storage;
+        slice.copy_from_slice(new_values);
         self.version += 1;
         Ok(())
     }
@@ -1134,7 +1140,7 @@ mod tests {
             .expect("create dense tensor");
         assert_eq!(dt.version(), 0);
 
-        dt.replace_storage(vec![4.0, 5.0, 6.0])
+        dt.update_contiguous_values(&[4.0, 5.0, 6.0])
             .expect("replace with same-length storage should succeed");
         assert_eq!(dt.version(), 1);
         assert_eq!(dt.storage(), &[4.0, 5.0, 6.0]);
@@ -1145,7 +1151,7 @@ mod tests {
         let mut dt = DenseTensor::from_contiguous_values(vec![1.0, 2.0, 3.0], vec![3], Device::Cpu)
             .expect("create dense tensor");
         let err = dt
-            .replace_storage(vec![1.0, 2.0])
+            .update_contiguous_values(&[1.0, 2.0])
             .expect_err("replace with different-length storage should fail");
         assert!(
             matches!(
@@ -1204,7 +1210,7 @@ mod tests {
         let mut dt = DenseTensor::from_contiguous_values(vec![0.0, 0.0], vec![2], Device::Cpu)
             .expect("create dense tensor");
         for i in 1..=5 {
-            dt.replace_storage(vec![i as f64, i as f64 * 2.0])
+            dt.update_contiguous_values(&[i as f64, i as f64 * 2.0])
                 .expect("replace should succeed");
         }
         assert_eq!(dt.version(), 5);

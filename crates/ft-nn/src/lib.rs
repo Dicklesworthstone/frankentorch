@@ -37,23 +37,29 @@ impl Linear {
         out_features: usize,
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
-        // Kaiming uniform: scale = sqrt(1 / in_features)
-        let scale = 1.0 / (in_features as f64).sqrt();
+        // PyTorch Linear initialization: U(-bound, bound) where bound = sqrt(1 / in_features)
+        let bound = 1.0 / (in_features as f64).sqrt();
 
-        // Use randn and scale manually for Kaiming init
-        let weight = session.randn(vec![out_features, in_features], true)?;
-        // Scale weight: weight *= scale
-        // We need to do this through ops to maintain the graph
-        let scale_tensor = session.full(vec![out_features, in_features], scale, false)?;
-        let weight = session.tensor_mul(weight, scale_tensor)?;
-
-        // Rebind as a leaf for parameter tracking
-        let weight_values = session.tensor_values(weight)?;
+        // Initialize weight
+        let weight_rand = session.rand(vec![out_features, in_features], false)?;
+        let scale_tensor = session.full(vec![out_features, in_features], 2.0 * bound, false)?;
+        let weight_scaled = session.tensor_mul(weight_rand, scale_tensor)?;
+        let shift_tensor = session.full(vec![out_features, in_features], bound, false)?;
+        let weight_shifted = session.tensor_sub(weight_scaled, shift_tensor)?;
+        
+        let weight_values = session.tensor_values(weight_shifted)?;
         let weight =
             session.tensor_variable(weight_values, vec![out_features, in_features], true)?;
 
+        // Initialize bias
         let bias = if use_bias {
-            let bias_values = vec![0.0; out_features];
+            let bias_rand = session.rand(vec![1, out_features], false)?;
+            let bias_scale = session.full(vec![1, out_features], 2.0 * bound, false)?;
+            let bias_scaled = session.tensor_mul(bias_rand, bias_scale)?;
+            let bias_shift = session.full(vec![1, out_features], bound, false)?;
+            let bias_shifted = session.tensor_sub(bias_scaled, bias_shift)?;
+            
+            let bias_values = session.tensor_values(bias_shifted)?;
             Some(session.tensor_variable(bias_values, vec![1, out_features], true)?)
         } else {
             None
@@ -104,7 +110,14 @@ impl Module for Linear {
         let output = session.tensor_matmul(input, weight_t)?;
 
         match self.bias {
-            Some(bias) => session.tensor_add(output, bias),
+            Some(bias) => {
+                let out_shape = {
+                    let (_, meta) = session.tensor_values_meta(output)?;
+                    meta.shape().to_vec()
+                };
+                let expanded_bias = session.tensor_expand(bias, out_shape)?;
+                session.tensor_add(output, expanded_bias)
+            }
             None => Ok(output),
         }
     }
@@ -294,7 +307,8 @@ impl Module for Dropout {
                 let (_, meta) = session.tensor_values_meta(input)?;
                 meta.shape().to_vec()
             };
-            return session.zeros(shape, false);
+            let zeros = session.zeros(shape, false)?;
+            return session.tensor_mul(input, zeros);
         }
 
         // Generate random mask: values in [0, 1), keep where > p

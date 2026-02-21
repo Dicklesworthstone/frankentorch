@@ -1119,6 +1119,16 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
+        let target_shape = self.tensor_shape(target)?;
+        let other_shape = self.tensor_shape(other)?;
+        if target_shape != other_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: target_shape,
+                    rhs: other_shape,
+                },
+            )));
+        }
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1135,6 +1145,16 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
+        let target_shape = self.tensor_shape(target)?;
+        let other_shape = self.tensor_shape(other)?;
+        if target_shape != other_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: target_shape,
+                    rhs: other_shape,
+                },
+            )));
+        }
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1151,6 +1171,16 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
+        let target_shape = self.tensor_shape(target)?;
+        let other_shape = self.tensor_shape(other)?;
+        if target_shape != other_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: target_shape,
+                    rhs: other_shape,
+                },
+            )));
+        }
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1167,6 +1197,16 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
+        let target_shape = self.tensor_shape(target)?;
+        let other_shape = self.tensor_shape(other)?;
+        if target_shape != other_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: target_shape,
+                    rhs: other_shape,
+                },
+            )));
+        }
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
