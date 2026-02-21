@@ -239,13 +239,21 @@ pub fn clamp_scalar(input: &ScalarTensor, min_val: f64, max_val: f64) -> ScalarT
 
 pub fn min_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
     ensure_compatible(lhs, rhs)?;
-    let val = if lhs.value().is_nan() || rhs.value().is_nan() { f64::NAN } else { lhs.value().min(rhs.value()) };
+    let val = if lhs.value().is_nan() || rhs.value().is_nan() {
+        f64::NAN
+    } else {
+        lhs.value().min(rhs.value())
+    };
     Ok(lhs.with_value(val))
 }
 
 pub fn max_scalar(lhs: &ScalarTensor, rhs: &ScalarTensor) -> Result<ScalarTensor, KernelError> {
     ensure_compatible(lhs, rhs)?;
-    let val = if lhs.value().is_nan() || rhs.value().is_nan() { f64::NAN } else { lhs.value().max(rhs.value()) };
+    let val = if lhs.value().is_nan() || rhs.value().is_nan() {
+        f64::NAN
+    } else {
+        lhs.value().max(rhs.value())
+    };
     Ok(lhs.with_value(val))
 }
 
@@ -785,7 +793,13 @@ pub fn min_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| if l.is_nan() || r.is_nan() { f64::NAN } else { l.min(r) })
+    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| {
+        if l.is_nan() || r.is_nan() {
+            f64::NAN
+        } else {
+            l.min(r)
+        }
+    })
 }
 
 pub fn max_tensor_contiguous_f64(
@@ -794,7 +808,13 @@ pub fn max_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| if l.is_nan() || r.is_nan() { f64::NAN } else { l.max(r) })
+    elementwise_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| {
+        if l.is_nan() || r.is_nan() {
+            f64::NAN
+        } else {
+            l.max(r)
+        }
+    })
 }
 
 pub fn eq_tensor_contiguous_f64(
@@ -1834,6 +1854,187 @@ pub fn masked_fill_tensor_contiguous_f64(
         .collect();
 
     Ok(output)
+}
+
+/// Cumulative sum along a given dimension.
+///
+/// For a 1-D input [a, b, c] with dim=0, returns [a, a+b, a+b+c].
+/// For higher-dimensional tensors, the accumulation happens along the specified dimension
+/// while iterating over all other dimensions.
+pub fn cumsum_tensor_contiguous_f64(
+    input: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let offset = meta.storage_offset();
+    let dim_size = shape[dim];
+    let outer_size: usize = shape[..dim].iter().product();
+    let inner_size: usize = shape[dim + 1..].iter().product();
+    let numel = outer_size * dim_size * inner_size;
+    let mut output = vec![0.0; numel];
+    let data = &input[offset..];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            let mut acc = 0.0;
+            for d in 0..dim_size {
+                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                acc += data[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Backward pass for cumsum: reverse cumulative sum.
+///
+/// If forward is cumsum along dim, the gradient is a reverse cumsum along the same dim.
+pub fn cumsum_backward_tensor_contiguous_f64(
+    grad_output: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(grad_output, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let offset = meta.storage_offset();
+    let dim_size = shape[dim];
+    let outer_size: usize = shape[..dim].iter().product();
+    let inner_size: usize = shape[dim + 1..].iter().product();
+    let numel = outer_size * dim_size * inner_size;
+    let mut grad_input = vec![0.0; numel];
+    let data = &grad_output[offset..];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            let mut acc = 0.0;
+            // Reverse iteration for reverse cumsum
+            for d in (0..dim_size).rev() {
+                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                acc += data[idx];
+                grad_input[idx] = acc;
+            }
+        }
+    }
+
+    Ok(grad_input)
+}
+
+/// Cumulative product along a given dimension.
+///
+/// For a 1-D input [a, b, c] with dim=0, returns [a, a*b, a*b*c].
+pub fn cumprod_tensor_contiguous_f64(
+    input: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let offset = meta.storage_offset();
+    let dim_size = shape[dim];
+    let outer_size: usize = shape[..dim].iter().product();
+    let inner_size: usize = shape[dim + 1..].iter().product();
+    let numel = outer_size * dim_size * inner_size;
+    let mut output = vec![0.0; numel];
+    let data = &input[offset..];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            let mut acc = 1.0;
+            for d in 0..dim_size {
+                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                acc *= data[idx];
+                output[idx] = acc;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Backward pass for cumprod.
+///
+/// The gradient of cumprod is computed using the relationship:
+/// grad_input[i] = sum_{j>=i} grad_output[j] * output[j] / input[i]
+/// which can be rewritten as a reverse cumsum of (grad_output * output) divided by input,
+/// with special handling for zeros in the input.
+pub fn cumprod_backward_tensor_contiguous_f64(
+    grad_output: &[f64],
+    input: &[f64],
+    output: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let offset = meta.storage_offset();
+    let dim_size = shape[dim];
+    let outer_size: usize = shape[..dim].iter().product();
+    let inner_size: usize = shape[dim + 1..].iter().product();
+    let numel = outer_size * dim_size * inner_size;
+    let mut grad_input = vec![0.0; numel];
+    let in_data = &input[offset..];
+    let out_data = &output[..numel];
+    let go_data = &grad_output[..numel];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            // Compute reverse cumsum of (grad_output * output)
+            let mut acc = 0.0;
+            for d in (0..dim_size).rev() {
+                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                acc += go_data[idx] * out_data[idx];
+                let inp = in_data[idx];
+                if inp.abs() > f64::EPSILON {
+                    grad_input[idx] = acc / inp;
+                } else {
+                    // When input is zero, compute gradient by direct summation
+                    // to avoid division by zero
+                    let mut sum = 0.0;
+                    for j in d..dim_size {
+                        let j_idx = outer * dim_size * inner_size + j * inner_size + inner;
+                        // Product of all elements except position d, from d to j
+                        let mut prod = 1.0;
+                        for k in d..=j {
+                            if k != d {
+                                let k_idx = outer * dim_size * inner_size + k * inner_size + inner;
+                                prod *= in_data[k_idx];
+                            }
+                        }
+                        // Also include the prefix product (elements before d)
+                        if d > 0 {
+                            let prev_idx =
+                                outer * dim_size * inner_size + (d - 1) * inner_size + inner;
+                            prod *= out_data[prev_idx];
+                        }
+                        sum += go_data[j_idx] * prod;
+                    }
+                    grad_input[idx] = sum;
+                }
+            }
+        }
+    }
+
+    Ok(grad_input)
 }
 
 #[cfg(test)]

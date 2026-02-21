@@ -8,6 +8,7 @@ license-file = "../../LICENSE"
 ft-autograd = { workspace = true }
 ft-core = { workspace = true }
 ft-dispatch = { workspace = true }
+ft-kernel-cpu = { workspace = true }
 ft-runtime = { workspace = true }
 
 [lints]

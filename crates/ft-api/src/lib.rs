@@ -5,7 +5,7 @@ use ft_autograd::{
     PowOperationEvent, Tape, TensorBackwardReport, TensorClampOperationEvent,
     TensorJoinOperationEvent, TensorNodeId, TensorNormalizeDimOperationEvent, TensorOperationEvent,
     TensorPowOperationEvent, TensorReductionDimOperationEvent, TensorReductionOperationEvent,
-    TensorTape, TensorUnaryOperationEvent, UnaryOperationEvent,
+    TensorScanDimOperationEvent, TensorTape, TensorUnaryOperationEvent, UnaryOperationEvent,
 };
 use ft_core::{DenseTensor, ExecutionMode, TensorMeta};
 use ft_dispatch::{
@@ -884,6 +884,34 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Cumulative sum along a given dimension.
+    ///
+    /// For a 1-D input [a, b, c] with dim=0, returns [a, a+b, a+b+c].
+    /// Output has the same shape as input.
+    pub fn tensor_cumsum(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (out, event) = self.tensor_tape.cumsum(input, dim, self.mode())?;
+        self.record_tensor_scan_dim_operation(&event);
+        Ok(out)
+    }
+
+    /// Cumulative product along a given dimension.
+    ///
+    /// For a 1-D input [a, b, c] with dim=0, returns [a, a*b, a*b*c].
+    /// Output has the same shape as input.
+    pub fn tensor_cumprod(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (out, event) = self.tensor_tape.cumprod(input, dim, self.mode())?;
+        self.record_tensor_scan_dim_operation(&event);
+        Ok(out)
+    }
+
     pub fn tensor_softmax(
         &mut self,
         input: TensorNodeId,
@@ -1421,6 +1449,25 @@ impl FrankenTorchSession {
             EvidenceKind::Dispatch,
             format!(
                 "tensor_reduction_dim_op={:?} input={} out={} dim={} mode={:?} kernel={} key={:?} backend={:?} keyset=0x{:016x} fallback={}",
+                event.op,
+                event.input.0,
+                event.out.0,
+                event.dim,
+                event.decision.mode,
+                event.decision.kernel,
+                event.decision.selected_key,
+                event.decision.backend_key,
+                event.decision.keyset_bits,
+                event.decision.fallback_used
+            ),
+        );
+    }
+
+    fn record_tensor_scan_dim_operation(&mut self, event: &TensorScanDimOperationEvent) {
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "tensor_scan_dim_op={:?} input={} out={} dim={} mode={:?} kernel={} key={:?} backend={:?} keyset=0x{:016x} fallback={}",
                 event.op,
                 event.input.0,
                 event.out.0,

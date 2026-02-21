@@ -8,29 +8,30 @@ use ft_kernel_cpu::{
     add_scalar, add_tensor_contiguous_f64, asin_scalar, asin_tensor_contiguous_f64, atan_scalar,
     atan_tensor_contiguous_f64, cat_tensor_contiguous_f64, ceil_scalar, ceil_tensor_contiguous_f64,
     clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar, cos_tensor_contiguous_f64, cosh_scalar,
-    cosh_tensor_contiguous_f64, div_scalar, div_tensor_contiguous_f64, elu_scalar,
-    elu_tensor_contiguous_f64, eq_scalar, eq_tensor_contiguous_f64, exp_scalar,
-    exp_tensor_contiguous_f64, expm1_scalar, expm1_tensor_contiguous_f64, floor_scalar,
-    floor_tensor_contiguous_f64, frac_scalar, frac_tensor_contiguous_f64, ge_scalar,
-    ge_tensor_contiguous_f64, gelu_scalar, gelu_tensor_contiguous_f64, gt_scalar,
-    gt_tensor_contiguous_f64, le_scalar, le_tensor_contiguous_f64, leaky_relu_scalar,
-    leaky_relu_tensor_contiguous_f64, log_scalar, log_softmax_dim_tensor_contiguous_f64,
-    log_tensor_contiguous_f64, log1p_scalar, log1p_tensor_contiguous_f64, log2_scalar,
-    log2_tensor_contiguous_f64, log10_scalar, log10_tensor_contiguous_f64, lt_scalar,
-    lt_tensor_contiguous_f64, matmul_tensor_contiguous_f64, max_scalar, max_tensor_contiguous_f64,
-    mean_dim_tensor_contiguous_f64, mean_tensor_contiguous_f64, min_scalar,
-    min_tensor_contiguous_f64, mul_scalar, mul_tensor_contiguous_f64, ne_scalar,
-    ne_tensor_contiguous_f64, neg_scalar, neg_tensor_contiguous_f64, pow_scalar,
-    pow_tensor_contiguous_f64, prod_dim_tensor_contiguous_f64, reciprocal_scalar,
-    reciprocal_tensor_contiguous_f64, relu_scalar, relu_tensor_contiguous_f64, round_scalar,
-    round_tensor_contiguous_f64, sigmoid_scalar, sigmoid_tensor_contiguous_f64, sign_scalar,
-    sign_tensor_contiguous_f64, silu_scalar, silu_tensor_contiguous_f64, sin_scalar,
-    sin_tensor_contiguous_f64, sinh_scalar, sinh_tensor_contiguous_f64,
-    softmax_dim_tensor_contiguous_f64, sqrt_scalar, sqrt_tensor_contiguous_f64,
-    stack_tensor_contiguous_f64, std_dim_tensor_contiguous_f64, sub_scalar,
-    sub_tensor_contiguous_f64, sum_dim_tensor_contiguous_f64, sum_tensor_contiguous_f64,
-    tan_scalar, tan_tensor_contiguous_f64, tanh_scalar, tanh_tensor_contiguous_f64, trunc_scalar,
-    trunc_tensor_contiguous_f64, var_dim_tensor_contiguous_f64,
+    cosh_tensor_contiguous_f64, cumprod_tensor_contiguous_f64, cumsum_tensor_contiguous_f64,
+    div_scalar, div_tensor_contiguous_f64, elu_scalar, elu_tensor_contiguous_f64, eq_scalar,
+    eq_tensor_contiguous_f64, exp_scalar, exp_tensor_contiguous_f64, expm1_scalar,
+    expm1_tensor_contiguous_f64, floor_scalar, floor_tensor_contiguous_f64, frac_scalar,
+    frac_tensor_contiguous_f64, ge_scalar, ge_tensor_contiguous_f64, gelu_scalar,
+    gelu_tensor_contiguous_f64, gt_scalar, gt_tensor_contiguous_f64, le_scalar,
+    le_tensor_contiguous_f64, leaky_relu_scalar, leaky_relu_tensor_contiguous_f64, log_scalar,
+    log_softmax_dim_tensor_contiguous_f64, log_tensor_contiguous_f64, log1p_scalar,
+    log1p_tensor_contiguous_f64, log2_scalar, log2_tensor_contiguous_f64, log10_scalar,
+    log10_tensor_contiguous_f64, lt_scalar, lt_tensor_contiguous_f64, matmul_tensor_contiguous_f64,
+    max_scalar, max_tensor_contiguous_f64, mean_dim_tensor_contiguous_f64,
+    mean_tensor_contiguous_f64, min_scalar, min_tensor_contiguous_f64, mul_scalar,
+    mul_tensor_contiguous_f64, ne_scalar, ne_tensor_contiguous_f64, neg_scalar,
+    neg_tensor_contiguous_f64, pow_scalar, pow_tensor_contiguous_f64,
+    prod_dim_tensor_contiguous_f64, reciprocal_scalar, reciprocal_tensor_contiguous_f64,
+    relu_scalar, relu_tensor_contiguous_f64, round_scalar, round_tensor_contiguous_f64,
+    sigmoid_scalar, sigmoid_tensor_contiguous_f64, sign_scalar, sign_tensor_contiguous_f64,
+    silu_scalar, silu_tensor_contiguous_f64, sin_scalar, sin_tensor_contiguous_f64, sinh_scalar,
+    sinh_tensor_contiguous_f64, softmax_dim_tensor_contiguous_f64, sqrt_scalar,
+    sqrt_tensor_contiguous_f64, stack_tensor_contiguous_f64, std_dim_tensor_contiguous_f64,
+    sub_scalar, sub_tensor_contiguous_f64, sum_dim_tensor_contiguous_f64,
+    sum_tensor_contiguous_f64, tan_scalar, tan_tensor_contiguous_f64, tanh_scalar,
+    tanh_tensor_contiguous_f64, trunc_scalar, trunc_tensor_contiguous_f64,
+    var_dim_tensor_contiguous_f64,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -153,6 +154,23 @@ impl ReductionOp {
             "prod" => Some(Self::Prod),
             "var" => Some(Self::Var),
             "std" => Some(Self::Std),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ScanOp {
+    CumSum,
+    CumProd,
+}
+
+impl ScanOp {
+    #[must_use]
+    pub fn from_schema_base(base: &str) -> Option<Self> {
+        match base {
+            "cumsum" => Some(Self::CumSum),
+            "cumprod" => Some(Self::CumProd),
             _ => None,
         }
     }
@@ -1706,6 +1724,78 @@ pub fn dispatch_tensor_reduction_dim_contiguous_f64(
     Ok(TensorReductionDimDispatchOutcome {
         values,
         decision: ReductionDimDispatchDecision {
+            op,
+            dim,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+// --- Scan (cumsum/cumprod) dispatch ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScanDimDispatchDecision {
+    pub op: ScanOp,
+    pub dim: usize,
+    pub mode: ExecutionMode,
+    pub kernel: &'static str,
+    pub selected_key: DispatchKey,
+    pub backend_key: DispatchKey,
+    pub keyset_bits: u64,
+    pub fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorScanDimDispatchOutcome {
+    pub values: Vec<f64>,
+    pub decision: ScanDimDispatchDecision,
+}
+
+pub fn dispatch_tensor_scan_dim_contiguous_f64(
+    op: ScanOp,
+    mode: ExecutionMode,
+    input: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TensorScanDimDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, ScanOp::CumSum) => (
+            cumsum_tensor_contiguous_f64(input, meta, dim)?,
+            "autograd_cpu::cumsum_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, ScanOp::CumSum) => (
+            cumsum_tensor_contiguous_f64(input, meta, dim)?,
+            "cpu::cumsum_tensor_contiguous_f64",
+        ),
+        (DispatchKey::AutogradCPU, ScanOp::CumProd) => (
+            cumprod_tensor_contiguous_f64(input, meta, dim)?,
+            "autograd_cpu::cumprod_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, ScanOp::CumProd) => (
+            cumprod_tensor_contiguous_f64(input, meta, dim)?,
+            "cpu::cumprod_tensor_contiguous_f64",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor scan ops",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorScanDimDispatchOutcome {
+        values,
+        decision: ScanDimDispatchDecision {
             op,
             dim,
             mode,

@@ -270,6 +270,7 @@ dependencies = [
  "ft-autograd",
  "ft-core",
  "ft-dispatch",
+ "ft-kernel-cpu",
  "ft-runtime",
 ]
 

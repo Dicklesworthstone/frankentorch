@@ -10,13 +10,13 @@ use ft_core::{
 use ft_dispatch::{
     BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError, DispatchKeyError,
     JoinDispatchDecision, JoinOp, NormalizeDimDispatchDecision, NormalizeOp, PowDispatchDecision,
-    ReductionDimDispatchDecision, ReductionDispatchDecision, ReductionOp, UnaryDispatchDecision,
-    UnaryOp, dispatch_scalar_binary, dispatch_scalar_clamp, dispatch_scalar_pow,
-    dispatch_scalar_unary, dispatch_tensor_binary_contiguous_f64,
+    ReductionDimDispatchDecision, ReductionDispatchDecision, ReductionOp, ScanDimDispatchDecision,
+    ScanOp, UnaryDispatchDecision, UnaryOp, dispatch_scalar_binary, dispatch_scalar_clamp,
+    dispatch_scalar_pow, dispatch_scalar_unary, dispatch_tensor_binary_contiguous_f64,
     dispatch_tensor_clamp_contiguous_f64, dispatch_tensor_join_contiguous_f64,
     dispatch_tensor_normalize_dim_contiguous_f64, dispatch_tensor_pow_contiguous_f64,
     dispatch_tensor_reduction_contiguous_f64, dispatch_tensor_reduction_dim_contiguous_f64,
-    dispatch_tensor_unary_contiguous_f64,
+    dispatch_tensor_scan_dim_contiguous_f64, dispatch_tensor_unary_contiguous_f64,
 };
 use ft_kernel_cpu::{
     argmax_dim_tensor_contiguous_f64, argmin_dim_tensor_contiguous_f64,
@@ -335,6 +335,14 @@ enum TensorNodeOp {
         dim: usize,
         input_shape: Vec<usize>,
     },
+    CumSum {
+        input: TensorNodeId,
+        dim: usize,
+    },
+    CumProd {
+        input: TensorNodeId,
+        dim: usize,
+    },
     Softmax {
         input: TensorNodeId,
         dim: usize,
@@ -626,6 +634,15 @@ pub struct TensorReductionDimOperationEvent {
     pub out: TensorNodeId,
     pub dim: usize,
     pub decision: ReductionDimDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorScanDimOperationEvent {
+    pub op: ScanOp,
+    pub input: TensorNodeId,
+    pub out: TensorNodeId,
+    pub dim: usize,
+    pub decision: ScanDimDispatchDecision,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -2135,13 +2152,7 @@ impl Tape {
             .nodes
             .iter()
             .enumerate()
-            .map(|(idx, _)| {
-                if reachable[idx] {
-                    0.0
-                } else {
-                    f64::NAN
-                }
-            })
+            .map(|(idx, _)| if reachable[idx] { 0.0 } else { f64::NAN })
             .collect::<Vec<_>>();
         grads[root.0] = 1.0;
 
@@ -2279,7 +2290,13 @@ impl Tape {
                 }
                 NodeOp::Relu { input } => {
                     let input_value = self.nodes[input.0].tensor.value();
-                    grads[input.0] += if input_value.is_nan() { f64::NAN } else if input_value > 0.0 { incoming } else { 0.0 };
+                    grads[input.0] += if input_value.is_nan() {
+                        f64::NAN
+                    } else if input_value > 0.0 {
+                        incoming
+                    } else {
+                        0.0
+                    };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -2542,7 +2559,14 @@ impl Tape {
                 }
                 NodeOp::LeakyRelu { input } => {
                     let x = self.nodes[input.0].tensor.value();
-                    grads[input.0] += incoming * if x.is_nan() { f64::NAN } else if x >= 0.0 { 1.0 } else { 0.01 };
+                    grads[input.0] += incoming
+                        * if x.is_nan() {
+                            f64::NAN
+                        } else if x >= 0.0 {
+                            1.0
+                        } else {
+                            0.01
+                        };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(BackwardStep {
@@ -2555,7 +2579,14 @@ impl Tape {
                     let x = self.nodes[input.0].tensor.value();
                     let output_value = self.nodes[node_id.0].tensor.value();
                     // d/dx elu(x) = 1 if x > 0, else output + alpha (alpha=1.0)
-                    grads[input.0] += incoming * if x.is_nan() { f64::NAN } else if x > 0.0 { 1.0 } else { output_value + 1.0 };
+                    grads[input.0] += incoming
+                        * if x.is_nan() {
+                            f64::NAN
+                        } else if x > 0.0 {
+                            1.0
+                        } else {
+                            output_value + 1.0
+                        };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(BackwardStep {
@@ -4801,6 +4832,108 @@ impl TensorTape {
         ))
     }
 
+    pub fn cumsum(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorScanDimOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_scan_dim_contiguous_f64(
+                ScanOp::CumSum,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            let out_shape = meta.shape().to_vec();
+            (
+                requires_grad,
+                out_shape,
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::CumSum { input, dim },
+        });
+
+        Ok((
+            out,
+            TensorScanDimOperationEvent {
+                op: ScanOp::CumSum,
+                input,
+                out,
+                dim,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
+    pub fn cumprod(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        mode: ExecutionMode,
+    ) -> Result<(TensorNodeId, TensorScanDimOperationEvent), AutogradError> {
+        let (requires_grad, output_shape, output_dtype, output_device, outcome) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad;
+            let meta = input_node.tensor.meta().clone();
+            let outcome = dispatch_tensor_scan_dim_contiguous_f64(
+                ScanOp::CumProd,
+                mode,
+                input_node.tensor.storage(),
+                &meta,
+                dim,
+                requires_grad,
+            )
+            .map_err(AutogradError::Dispatch)?;
+            let out_shape = meta.shape().to_vec();
+            (
+                requires_grad,
+                out_shape,
+                meta.dtype(),
+                meta.device(),
+                outcome,
+            )
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                outcome.values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::CumProd { input, dim },
+        });
+
+        Ok((
+            out,
+            TensorScanDimOperationEvent {
+                op: ScanOp::CumProd,
+                input,
+                out,
+                dim,
+                decision: outcome.decision,
+            },
+        ))
+    }
+
     pub fn softmax(
         &mut self,
         input: TensorNodeId,
@@ -5841,7 +5974,10 @@ impl TensorTape {
     ) -> Result<Vec<TensorNodeId>, AutogradError> {
         if chunks == 0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                ft_kernel_cpu::KernelError::InvalidDimension { dim: chunks, ndim: 1 }
+                ft_kernel_cpu::KernelError::InvalidDimension {
+                    dim: chunks,
+                    ndim: 1,
+                },
             )));
         }
         let dim_size = {
@@ -6275,7 +6411,15 @@ impl TensorTape {
                     let relu_contrib = incoming
                         .iter()
                         .zip(input_values.iter())
-                        .map(|(grad, val)| if val.is_nan() { f64::NAN } else if *val > 0.0 { *grad } else { 0.0 })
+                        .map(|(grad, val)| {
+                            if val.is_nan() {
+                                f64::NAN
+                            } else if *val > 0.0 {
+                                *grad
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect::<Vec<_>>();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &relu_contrib)?;
 
@@ -6627,7 +6771,15 @@ impl TensorTape {
                     let contrib: Vec<f64> = incoming
                         .iter()
                         .zip(input_values.iter())
-                        .map(|(g, x)| g * if x.is_nan() { f64::NAN } else if *x >= 0.0 { 1.0 } else { 0.01 })
+                        .map(|(g, x)| {
+                            g * if x.is_nan() {
+                                f64::NAN
+                            } else if *x >= 0.0 {
+                                1.0
+                            } else {
+                                0.01
+                            }
+                        })
                         .collect();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -6645,7 +6797,15 @@ impl TensorTape {
                         .iter()
                         .zip(input_values.iter())
                         .zip(output_values.iter())
-                        .map(|((g, x), y)| g * if x.is_nan() { f64::NAN } else if *x > 0.0 { 1.0 } else { y + 1.0 })
+                        .map(|((g, x), y)| {
+                            g * if x.is_nan() {
+                                f64::NAN
+                            } else if *x > 0.0 {
+                                1.0
+                            } else {
+                                y + 1.0
+                            }
+                        })
                         .collect();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -6726,12 +6886,32 @@ impl TensorTape {
                     let lhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if a < b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| {
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else if a < b {
+                                *grad
+                            } else if a == b {
+                                *grad * 0.5
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect();
                     let rhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if b < a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| {
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else if b < a {
+                                *grad
+                            } else if a == b {
+                                *grad * 0.5
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect();
                     Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
                     Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
@@ -6753,12 +6933,32 @@ impl TensorTape {
                     let lhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if a > b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| {
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else if a > b {
+                                *grad
+                            } else if a == b {
+                                *grad * 0.5
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect();
                     let rhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if b > a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| {
+                            if a.is_nan() || b.is_nan() {
+                                f64::NAN
+                            } else if b > a {
+                                *grad
+                            } else if a == b {
+                                *grad * 0.5
+                            } else {
+                                0.0
+                            }
+                        })
                         .collect();
                     Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
                     Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
@@ -7055,6 +7255,93 @@ impl TensorTape {
                         node: node_id,
                         incoming_grad_len: incoming.len(),
                         rule: "d(std_dim(x))/dx_i=(x_i-mean)/((n-1)*std)",
+                    });
+                }
+                TensorNodeOp::CumSum { input, dim } => {
+                    // Backward of cumsum is reverse cumsum of the incoming gradient
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let dim_size = shape[dim];
+                    let outer_size: usize = shape[..dim].iter().product();
+                    let inner_size: usize = shape[dim + 1..].iter().product();
+                    let input_numel: usize = shape.iter().product();
+                    let mut cumsum_grad = vec![0.0; input_numel];
+
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let mut acc = 0.0;
+                            for d in (0..dim_size).rev() {
+                                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                                acc += incoming[idx];
+                                cumsum_grad[idx] = acc;
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &cumsum_grad)?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(cumsum(x))/dx = reverse_cumsum(grad)",
+                    });
+                }
+                TensorNodeOp::CumProd { input, dim } => {
+                    // Backward of cumprod uses: grad_input[i] = sum_{j>=i} grad_output[j] * output[j] / input[i]
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let dim_size = shape[dim];
+                    let outer_size: usize = shape[..dim].iter().product();
+                    let inner_size: usize = shape[dim + 1..].iter().product();
+                    let input_numel: usize = shape.iter().product();
+                    let input_values = self.nodes[input.0].tensor.contiguous_values()?;
+                    let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
+                    let mut cumprod_grad = vec![0.0; input_numel];
+
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let mut acc = 0.0;
+                            for d in (0..dim_size).rev() {
+                                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                                acc += incoming[idx] * output_values[idx];
+                                let inp = input_values[idx];
+                                if inp.abs() > f64::EPSILON {
+                                    cumprod_grad[idx] = acc / inp;
+                                } else {
+                                    // Handle zero input: compute gradient by direct summation
+                                    let mut sum = 0.0;
+                                    for j in d..dim_size {
+                                        let j_idx =
+                                            outer * dim_size * inner_size + j * inner_size + inner;
+                                        let mut prod = 1.0;
+                                        for k in d..=j {
+                                            if k != d {
+                                                let k_idx = outer * dim_size * inner_size
+                                                    + k * inner_size
+                                                    + inner;
+                                                prod *= input_values[k_idx];
+                                            }
+                                        }
+                                        if d > 0 {
+                                            let prev_idx = outer * dim_size * inner_size
+                                                + (d - 1) * inner_size
+                                                + inner;
+                                            prod *= output_values[prev_idx];
+                                        }
+                                        sum += incoming[j_idx] * prod;
+                                    }
+                                    cumprod_grad[idx] = sum;
+                                }
+                            }
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &cumprod_grad)?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(cumprod(x))/dx = reverse_cumsum(grad*output)/input",
                     });
                 }
                 TensorNodeOp::Softmax { input, dim } => {
@@ -7595,6 +7882,8 @@ impl TensorTape {
                 | TensorNodeOp::ProdDim { input, .. }
                 | TensorNodeOp::VarDim { input, .. }
                 | TensorNodeOp::StdDim { input, .. }
+                | TensorNodeOp::CumSum { input, .. }
+                | TensorNodeOp::CumProd { input, .. }
                 | TensorNodeOp::Softmax { input, .. }
                 | TensorNodeOp::LogSoftmax { input, .. }
                 | TensorNodeOp::Reshape { input, .. }
@@ -7687,6 +7976,8 @@ impl TensorTape {
                 | TensorNodeOp::ProdDim { input, .. }
                 | TensorNodeOp::VarDim { input, .. }
                 | TensorNodeOp::StdDim { input, .. }
+                | TensorNodeOp::CumSum { input, .. }
+                | TensorNodeOp::CumProd { input, .. }
                 | TensorNodeOp::Softmax { input, .. }
                 | TensorNodeOp::LogSoftmax { input, .. }
                 | TensorNodeOp::Reshape { input, .. }
