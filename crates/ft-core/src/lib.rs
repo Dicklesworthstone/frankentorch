@@ -224,13 +224,34 @@ impl TensorMeta {
 
     #[must_use]
     pub fn fingerprint64(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = DetHasher::new();
         self.shape.hash(&mut hasher);
         self.strides.hash(&mut hasher);
         self.storage_offset.hash(&mut hasher);
         self.dtype.hash(&mut hasher);
         self.device.hash(&mut hasher);
         hasher.finish()
+    }
+}
+
+struct DetHasher(u64);
+
+impl DetHasher {
+    fn new() -> Self {
+        Self(0xcbf2_9ce4_8422_2325)
+    }
+}
+
+impl Hasher for DetHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+
+    fn write(&mut self, bytes: &[u8]) {
+        for &byte in bytes {
+            self.0 ^= u64::from(byte);
+            self.0 = self.0.wrapping_mul(0x0000_0100_0000_01b3);
+        }
     }
 }
 
@@ -390,7 +411,7 @@ impl ScalarTensor {
 
     #[must_use]
     pub fn evidence_fingerprint64(&self) -> u64 {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        let mut hasher = DetHasher::new();
         self.id.hash(&mut hasher);
         self.storage_id.hash(&mut hasher);
         self.version.hash(&mut hasher);

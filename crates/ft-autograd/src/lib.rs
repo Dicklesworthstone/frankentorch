@@ -2234,7 +2234,9 @@ impl Tape {
                 }
                 NodeOp::Abs { input } => {
                     let input_value = self.nodes[input.0].tensor.value();
-                    let sign = if input_value > 0.0 {
+                    let sign = if input_value.is_nan() {
+                        f64::NAN
+                    } else if input_value > 0.0 {
                         1.0
                     } else if input_value < 0.0 {
                         -1.0
@@ -2277,7 +2279,7 @@ impl Tape {
                 }
                 NodeOp::Relu { input } => {
                     let input_value = self.nodes[input.0].tensor.value();
-                    grads[input.0] += if input_value > 0.0 { incoming } else { 0.0 };
+                    grads[input.0] += if input_value.is_nan() { f64::NAN } else if input_value > 0.0 { incoming } else { 0.0 };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -2540,7 +2542,7 @@ impl Tape {
                 }
                 NodeOp::LeakyRelu { input } => {
                     let x = self.nodes[input.0].tensor.value();
-                    grads[input.0] += incoming * if x >= 0.0 { 1.0 } else { 0.01 };
+                    grads[input.0] += incoming * if x.is_nan() { f64::NAN } else if x >= 0.0 { 1.0 } else { 0.01 };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(BackwardStep {
@@ -2553,7 +2555,7 @@ impl Tape {
                     let x = self.nodes[input.0].tensor.value();
                     let output_value = self.nodes[node_id.0].tensor.value();
                     // d/dx elu(x) = 1 if x > 0, else output + alpha (alpha=1.0)
-                    grads[input.0] += incoming * if x > 0.0 { 1.0 } else { output_value + 1.0 };
+                    grads[input.0] += incoming * if x.is_nan() { f64::NAN } else if x > 0.0 { 1.0 } else { output_value + 1.0 };
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(BackwardStep {
@@ -2605,7 +2607,10 @@ impl Tape {
                 NodeOp::Min { lhs, rhs } => {
                     let lhs_val = self.nodes[lhs.0].tensor.value();
                     let rhs_val = self.nodes[rhs.0].tensor.value();
-                    if lhs_val < rhs_val {
+                    if lhs_val.is_nan() || rhs_val.is_nan() {
+                        grads[lhs.0] += f64::NAN;
+                        grads[rhs.0] += f64::NAN;
+                    } else if lhs_val < rhs_val {
                         grads[lhs.0] += incoming;
                     } else if lhs_val > rhs_val {
                         grads[rhs.0] += incoming;
@@ -2626,7 +2631,10 @@ impl Tape {
                 NodeOp::Max { lhs, rhs } => {
                     let lhs_val = self.nodes[lhs.0].tensor.value();
                     let rhs_val = self.nodes[rhs.0].tensor.value();
-                    if lhs_val > rhs_val {
+                    if lhs_val.is_nan() || rhs_val.is_nan() {
+                        grads[lhs.0] += f64::NAN;
+                        grads[rhs.0] += f64::NAN;
+                    } else if lhs_val > rhs_val {
                         grads[lhs.0] += incoming;
                     } else if lhs_val < rhs_val {
                         grads[rhs.0] += incoming;
@@ -2650,7 +2658,9 @@ impl Tape {
                     max_val,
                 } => {
                     let input_value = self.nodes[input.0].tensor.value();
-                    grads[input.0] += if input_value >= min_val && input_value <= max_val {
+                    grads[input.0] += if input_value.is_nan() {
+                        f64::NAN
+                    } else if input_value >= min_val && input_value <= max_val {
                         incoming
                     } else {
                         0.0
@@ -6198,7 +6208,9 @@ impl TensorTape {
                         .iter()
                         .zip(input_values.iter())
                         .map(|(grad, value)| {
-                            let sign = if *value > 0.0 {
+                            let sign = if value.is_nan() {
+                                f64::NAN
+                            } else if *value > 0.0 {
                                 1.0
                             } else if *value < 0.0 {
                                 -1.0
@@ -6263,7 +6275,7 @@ impl TensorTape {
                     let relu_contrib = incoming
                         .iter()
                         .zip(input_values.iter())
-                        .map(|(grad, val)| if *val > 0.0 { *grad } else { 0.0 })
+                        .map(|(grad, val)| if val.is_nan() { f64::NAN } else if *val > 0.0 { *grad } else { 0.0 })
                         .collect::<Vec<_>>();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &relu_contrib)?;
 
@@ -6615,7 +6627,7 @@ impl TensorTape {
                     let contrib: Vec<f64> = incoming
                         .iter()
                         .zip(input_values.iter())
-                        .map(|(g, x)| g * if *x >= 0.0 { 1.0 } else { 0.01 })
+                        .map(|(g, x)| g * if x.is_nan() { f64::NAN } else if *x >= 0.0 { 1.0 } else { 0.01 })
                         .collect();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -6633,7 +6645,7 @@ impl TensorTape {
                         .iter()
                         .zip(input_values.iter())
                         .zip(output_values.iter())
-                        .map(|((g, x), y)| g * if *x > 0.0 { 1.0 } else { y + 1.0 })
+                        .map(|((g, x), y)| g * if x.is_nan() { f64::NAN } else if *x > 0.0 { 1.0 } else { y + 1.0 })
                         .collect();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -6714,12 +6726,12 @@ impl TensorTape {
                     let lhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a < b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if a < b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     let rhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if b < a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if b < a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
                     Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
@@ -6741,12 +6753,12 @@ impl TensorTape {
                     let lhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if a > b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if a > b { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     let rhs_contrib: Vec<f64> = incoming
                         .iter()
                         .zip(lhs_values.iter().zip(rhs_values.iter()))
-                        .map(|(grad, (a, b))| if b > a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
+                        .map(|(grad, (a, b))| if a.is_nan() || b.is_nan() { f64::NAN } else if b > a { *grad } else if a == b { *grad * 0.5 } else { 0.0 })
                         .collect();
                     Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &lhs_contrib)?;
                     Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &rhs_contrib)?;
@@ -6772,7 +6784,9 @@ impl TensorTape {
                         .iter()
                         .zip(input_values.iter())
                         .map(|(grad, x)| {
-                            if *x >= min_val && *x <= max_val {
+                            if x.is_nan() {
+                                f64::NAN
+                            } else if *x >= min_val && *x <= max_val {
                                 *grad
                             } else {
                                 0.0
