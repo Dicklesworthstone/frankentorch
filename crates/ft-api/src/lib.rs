@@ -445,7 +445,10 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let meta = self.tensor_tape.tensor_meta(other)?.clone();
         let shape = meta.shape().to_vec();
-        self.rand(shape, requires_grad)
+        let numel = shape.iter().product::<usize>();
+        let values: Vec<f64> = (0..numel).map(|_| self.rng.next_f64()).collect();
+        let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
+        Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
     }
 
     /// Create a tensor with the same shape as `other`, filled with standard normal random values.
@@ -456,7 +459,10 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let meta = self.tensor_tape.tensor_meta(other)?.clone();
         let shape = meta.shape().to_vec();
-        self.randn(shape, requires_grad)
+        let numel = shape.iter().product::<usize>();
+        let values: Vec<f64> = (0..numel).map(|_| self.rng.next_normal()).collect();
+        let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
+        Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
     }
 
     pub fn tensor_add(

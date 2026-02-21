@@ -7415,8 +7415,12 @@ impl TensorTape {
 
                     for outer in 0..outer_size {
                         for (r, &idx_f) in indices.iter().enumerate() {
-                            let idx = idx_f as usize;
-                            if idx < dim_size {
+                            let mut idx_i = idx_f as isize;
+                            if idx_i < 0 {
+                                idx_i += dim_size as isize;
+                            }
+                            if idx_i >= 0 && idx_i < dim_size as isize {
+                                let idx = idx_i as usize;
                                 for inner in 0..inner_size {
                                     let grad_pos =
                                         outer * num_indices * inner_size + r * inner_size + inner;
@@ -7456,8 +7460,12 @@ impl TensorTape {
                             for inner in 0..inner_size {
                                 let idx_pos =
                                     outer * idx_dim_size * inner_size + r * inner_size + inner;
-                                let selected = index[idx_pos] as usize;
-                                if selected < dim_size {
+                                let mut selected_i = index[idx_pos] as isize;
+                                if selected_i < 0 {
+                                    selected_i += dim_size as isize;
+                                }
+                                if selected_i >= 0 && selected_i < dim_size as isize {
+                                    let selected = selected_i as usize;
                                     let orig_pos = outer * dim_size * inner_size
                                         + selected * inner_size
                                         + inner;
