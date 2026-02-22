@@ -6,11 +6,12 @@ use ft_core::{Device, ExecutionMode, ScalarTensor, TensorMeta};
 use ft_kernel_cpu::{
     KernelError, abs_scalar, abs_tensor_contiguous_f64, acos_scalar, acos_tensor_contiguous_f64,
     add_scalar, add_tensor_contiguous_f64, asin_scalar, asin_tensor_contiguous_f64, atan_scalar,
-    atan_tensor_contiguous_f64, cat_tensor_contiguous_f64, ceil_scalar, ceil_tensor_contiguous_f64,
-    clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar, cos_tensor_contiguous_f64, cosh_scalar,
-    cosh_tensor_contiguous_f64, cumprod_tensor_contiguous_f64, cumsum_tensor_contiguous_f64,
-    div_scalar, div_tensor_contiguous_f64, elu_scalar, elu_tensor_contiguous_f64, eq_scalar,
-    eq_tensor_contiguous_f64, exp_scalar, exp_tensor_contiguous_f64, expm1_scalar,
+    atan_tensor_contiguous_f64, bmm_tensor_contiguous_f64, cat_tensor_contiguous_f64, ceil_scalar,
+    ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar,
+    cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64,
+    cumprod_tensor_contiguous_f64, cumsum_tensor_contiguous_f64, div_scalar,
+    div_tensor_contiguous_f64, dot_tensor_contiguous_f64, elu_scalar, elu_tensor_contiguous_f64,
+    eq_scalar, eq_tensor_contiguous_f64, exp_scalar, exp_tensor_contiguous_f64, expm1_scalar,
     expm1_tensor_contiguous_f64, floor_scalar, floor_tensor_contiguous_f64, frac_scalar,
     frac_tensor_contiguous_f64, ge_scalar, ge_tensor_contiguous_f64, gelu_scalar,
     gelu_tensor_contiguous_f64, gt_scalar, gt_tensor_contiguous_f64, le_scalar,
@@ -21,16 +22,17 @@ use ft_kernel_cpu::{
     max_scalar, max_tensor_contiguous_f64, mean_dim_tensor_contiguous_f64,
     mean_tensor_contiguous_f64, min_scalar, min_tensor_contiguous_f64, mul_scalar,
     mul_tensor_contiguous_f64, ne_scalar, ne_tensor_contiguous_f64, neg_scalar,
-    neg_tensor_contiguous_f64, pow_scalar, pow_tensor_contiguous_f64,
+    neg_tensor_contiguous_f64, outer_tensor_contiguous_f64, pow_scalar, pow_tensor_contiguous_f64,
     prod_dim_tensor_contiguous_f64, reciprocal_scalar, reciprocal_tensor_contiguous_f64,
     relu_scalar, relu_tensor_contiguous_f64, round_scalar, round_tensor_contiguous_f64,
     sigmoid_scalar, sigmoid_tensor_contiguous_f64, sign_scalar, sign_tensor_contiguous_f64,
     silu_scalar, silu_tensor_contiguous_f64, sin_scalar, sin_tensor_contiguous_f64, sinh_scalar,
-    sinh_tensor_contiguous_f64, softmax_dim_tensor_contiguous_f64, sqrt_scalar,
-    sqrt_tensor_contiguous_f64, stack_tensor_contiguous_f64, std_dim_tensor_contiguous_f64,
-    sub_scalar, sub_tensor_contiguous_f64, sum_dim_tensor_contiguous_f64,
-    sum_tensor_contiguous_f64, tan_scalar, tan_tensor_contiguous_f64, tanh_scalar,
-    tanh_tensor_contiguous_f64, trunc_scalar, trunc_tensor_contiguous_f64,
+    sinh_tensor_contiguous_f64, softmax_dim_tensor_contiguous_f64, sort_tensor_contiguous_f64,
+    sqrt_scalar, sqrt_tensor_contiguous_f64, stack_tensor_contiguous_f64,
+    std_dim_tensor_contiguous_f64, sub_scalar, sub_tensor_contiguous_f64,
+    sum_dim_tensor_contiguous_f64, sum_tensor_contiguous_f64, tan_scalar,
+    tan_tensor_contiguous_f64, tanh_scalar, tanh_tensor_contiguous_f64, topk_tensor_contiguous_f64,
+    trace_tensor_contiguous_f64, trunc_scalar, trunc_tensor_contiguous_f64,
     var_dim_tensor_contiguous_f64,
 };
 
@@ -43,6 +45,9 @@ pub enum BinaryOp {
     MatMul,
     Min,
     Max,
+    Dot,
+    Outer,
+    Bmm,
 }
 
 impl BinaryOp {
@@ -56,6 +61,9 @@ impl BinaryOp {
             "matmul" => Some(Self::MatMul),
             "min" => Some(Self::Min),
             "max" => Some(Self::Max),
+            "dot" => Some(Self::Dot),
+            "outer" => Some(Self::Outer),
+            "bmm" => Some(Self::Bmm),
             _ => None,
         }
     }
@@ -143,6 +151,7 @@ pub enum ReductionOp {
     Prod,
     Var,
     Std,
+    Trace,
 }
 
 impl ReductionOp {
@@ -154,6 +163,7 @@ impl ReductionOp {
             "prod" => Some(Self::Prod),
             "var" => Some(Self::Var),
             "std" => Some(Self::Std),
+            "trace" => Some(Self::Trace),
             _ => None,
         }
     }
@@ -985,9 +995,12 @@ pub fn dispatch_scalar_binary_with_keyset(
         (DispatchKey::AutogradCPU, BinaryOp::Mul) => {
             (mul_scalar(lhs, rhs)?, "autograd_cpu::mul_scalar")
         }
-        (DispatchKey::AutogradCPU, BinaryOp::MatMul) => {
+        (DispatchKey::AutogradCPU, BinaryOp::MatMul)
+        | (DispatchKey::AutogradCPU, BinaryOp::Dot)
+        | (DispatchKey::AutogradCPU, BinaryOp::Outer)
+        | (DispatchKey::AutogradCPU, BinaryOp::Bmm) => {
             return Err(DispatchKeyError::IncompatibleSet {
-                reason: "matmul is unsupported for scalar tensors",
+                reason: "matmul/dot/outer/bmm is unsupported for scalar tensors",
             }
             .into());
         }
@@ -1001,9 +1014,12 @@ pub fn dispatch_scalar_binary_with_keyset(
         (DispatchKey::CPU, BinaryOp::Sub) => (sub_scalar(lhs, rhs)?, "cpu::sub_scalar"),
         (DispatchKey::CPU, BinaryOp::Div) => (div_scalar(lhs, rhs)?, "cpu::div_scalar"),
         (DispatchKey::CPU, BinaryOp::Mul) => (mul_scalar(lhs, rhs)?, "cpu::mul_scalar"),
-        (DispatchKey::CPU, BinaryOp::MatMul) => {
+        (DispatchKey::CPU, BinaryOp::MatMul)
+        | (DispatchKey::CPU, BinaryOp::Dot)
+        | (DispatchKey::CPU, BinaryOp::Outer)
+        | (DispatchKey::CPU, BinaryOp::Bmm) => {
             return Err(DispatchKeyError::IncompatibleSet {
-                reason: "matmul is unsupported for scalar tensors",
+                reason: "matmul/dot/outer/bmm is unsupported for scalar tensors",
             }
             .into());
         }
@@ -1098,6 +1114,18 @@ pub fn dispatch_tensor_binary_contiguous_f64_with_keyset(
             max_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
             "autograd_cpu::max_tensor_contiguous_f64",
         ),
+        (DispatchKey::AutogradCPU, BinaryOp::Dot) => (
+            vec![dot_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?],
+            "autograd_cpu::dot_tensor_contiguous_f64",
+        ),
+        (DispatchKey::AutogradCPU, BinaryOp::Outer) => (
+            outer_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+            "autograd_cpu::outer_tensor_contiguous_f64",
+        ),
+        (DispatchKey::AutogradCPU, BinaryOp::Bmm) => (
+            bmm_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+            "autograd_cpu::bmm_tensor_contiguous_f64",
+        ),
         (DispatchKey::CPU, BinaryOp::Add) => (
             add_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
             "cpu::add_tensor_contiguous_f64",
@@ -1125,6 +1153,18 @@ pub fn dispatch_tensor_binary_contiguous_f64_with_keyset(
         (DispatchKey::CPU, BinaryOp::Max) => (
             max_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
             "cpu::max_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, BinaryOp::Dot) => (
+            vec![dot_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?],
+            "cpu::dot_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, BinaryOp::Outer) => (
+            outer_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+            "cpu::outer_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, BinaryOp::Bmm) => (
+            bmm_tensor_contiguous_f64(lhs, rhs, lhs_meta, rhs_meta)?,
+            "cpu::bmm_tensor_contiguous_f64",
         ),
         _ => {
             return Err(DispatchKeyError::IncompatibleSet {
@@ -1618,6 +1658,14 @@ pub fn dispatch_tensor_reduction_contiguous_f64(
         (DispatchKey::CPU, ReductionOp::Mean) => (
             mean_tensor_contiguous_f64(input, meta)?,
             "cpu::mean_tensor_contiguous_f64",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Trace) => (
+            trace_tensor_contiguous_f64(input, meta)?,
+            "autograd_cpu::trace_tensor_contiguous_f64",
+        ),
+        (DispatchKey::CPU, ReductionOp::Trace) => (
+            trace_tensor_contiguous_f64(input, meta)?,
+            "cpu::trace_tensor_contiguous_f64",
         ),
         _ => {
             return Err(DispatchKeyError::IncompatibleSet {
@@ -2288,6 +2336,145 @@ pub fn dispatch_tensor_clamp_contiguous_f64(
             kernel,
             min_val,
             max_val,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+// --- Sort dispatch ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct SortDispatchDecision {
+    pub dim: usize,
+    pub descending: bool,
+    pub mode: ExecutionMode,
+    pub kernel: &'static str,
+    pub selected_key: DispatchKey,
+    pub backend_key: DispatchKey,
+    pub keyset_bits: u64,
+    pub fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorSortDispatchOutcome {
+    pub values: Vec<f64>,
+    pub indices: Vec<usize>,
+    pub decision: SortDispatchDecision,
+}
+
+pub fn dispatch_tensor_sort_contiguous_f64(
+    mode: ExecutionMode,
+    input: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+    descending: bool,
+    requires_grad: bool,
+) -> Result<TensorSortDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let ((values, indices), kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            sort_tensor_contiguous_f64(input, meta, dim, descending)?,
+            "autograd_cpu::sort_tensor_contiguous_f64",
+        ),
+        DispatchKey::CPU => (
+            sort_tensor_contiguous_f64(input, meta, dim, descending)?,
+            "cpu::sort_tensor_contiguous_f64",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor sort op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorSortDispatchOutcome {
+        values,
+        indices,
+        decision: SortDispatchDecision {
+            dim,
+            descending,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+// --- TopK dispatch ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopKDispatchDecision {
+    pub k: usize,
+    pub dim: usize,
+    pub largest: bool,
+    pub sorted: bool,
+    pub mode: ExecutionMode,
+    pub kernel: &'static str,
+    pub selected_key: DispatchKey,
+    pub backend_key: DispatchKey,
+    pub keyset_bits: u64,
+    pub fallback_used: bool,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorTopKDispatchOutcome {
+    pub values: Vec<f64>,
+    pub indices: Vec<usize>,
+    pub decision: TopKDispatchDecision,
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_topk_contiguous_f64(
+    mode: ExecutionMode,
+    input: &[f64],
+    meta: &TensorMeta,
+    k: usize,
+    dim: usize,
+    largest: bool,
+    sorted: bool,
+    requires_grad: bool,
+) -> Result<TensorTopKDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let ((values, indices), kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            topk_tensor_contiguous_f64(input, meta, k, dim, largest, sorted)?,
+            "autograd_cpu::topk_tensor_contiguous_f64",
+        ),
+        DispatchKey::CPU => (
+            topk_tensor_contiguous_f64(input, meta, k, dim, largest, sorted)?,
+            "cpu::topk_tensor_contiguous_f64",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor topk op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorTopKDispatchOutcome {
+        values,
+        indices,
+        decision: TopKDispatchDecision {
+            k,
+            dim,
+            largest,
+            sorted,
+            mode,
+            kernel,
             selected_key,
             backend_key,
             keyset_bits: keyset.bits(),

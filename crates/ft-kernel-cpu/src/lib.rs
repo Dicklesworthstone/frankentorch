@@ -1063,6 +1063,139 @@ pub fn matmul_tensor_contiguous_f64(
     Ok(out)
 }
 
+pub fn dot_tensor_contiguous_f64(
+    lhs: &[f64],
+    rhs: &[f64],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<f64, KernelError> {
+    ensure_dtype_device_and_layout(lhs_meta, rhs_meta)?;
+    if lhs_meta.shape().len() != 1 || rhs_meta.shape().len() != 1 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    if lhs_meta.shape()[0] != rhs_meta.shape()[0] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    ensure_storage_len(lhs, lhs_meta, "lhs")?;
+    ensure_storage_len(rhs, rhs_meta, "rhs")?;
+
+    let n = lhs_meta.shape()[0];
+    let lhs_start = lhs_meta.storage_offset();
+    let rhs_start = rhs_meta.storage_offset();
+    let mut acc = 0.0;
+    for i in 0..n {
+        acc += lhs[lhs_start + i] * rhs[rhs_start + i];
+    }
+    Ok(acc)
+}
+
+pub fn outer_tensor_contiguous_f64(
+    lhs: &[f64],
+    rhs: &[f64],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_dtype_device_and_layout(lhs_meta, rhs_meta)?;
+    if lhs_meta.shape().len() != 1 || rhs_meta.shape().len() != 1 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    ensure_storage_len(lhs, lhs_meta, "lhs")?;
+    ensure_storage_len(rhs, rhs_meta, "rhs")?;
+
+    let m = lhs_meta.shape()[0];
+    let n = rhs_meta.shape()[0];
+    let lhs_start = lhs_meta.storage_offset();
+    let rhs_start = rhs_meta.storage_offset();
+    let mut out = vec![0.0; m.saturating_mul(n)];
+
+    for i in 0..m {
+        for j in 0..n {
+            out[i * n + j] = lhs[lhs_start + i] * rhs[rhs_start + j];
+        }
+    }
+    Ok(out)
+}
+
+pub fn bmm_tensor_contiguous_f64(
+    lhs: &[f64],
+    rhs: &[f64],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_dtype_device_and_layout(lhs_meta, rhs_meta)?;
+    if lhs_meta.shape().len() != 3 || rhs_meta.shape().len() != 3 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    let batch = lhs_meta.shape()[0];
+    let m = lhs_meta.shape()[1];
+    let k = lhs_meta.shape()[2];
+    let rhs_batch = rhs_meta.shape()[0];
+    let rhs_k = rhs_meta.shape()[1];
+    let n = rhs_meta.shape()[2];
+    if batch != rhs_batch || k != rhs_k {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    ensure_storage_len(lhs, lhs_meta, "lhs")?;
+    ensure_storage_len(rhs, rhs_meta, "rhs")?;
+
+    let lhs_start = lhs_meta.storage_offset();
+    let rhs_start = rhs_meta.storage_offset();
+    let lhs_batch_stride = m * k;
+    let rhs_batch_stride = k * n;
+    let out_batch_stride = m * n;
+    let mut out = vec![0.0; batch * out_batch_stride];
+
+    for b in 0..batch {
+        let lhs_base = lhs_start + b * lhs_batch_stride;
+        let rhs_base = rhs_start + b * rhs_batch_stride;
+        let out_base = b * out_batch_stride;
+        for row in 0..m {
+            for col in 0..n {
+                let mut acc = 0.0;
+                for inner in 0..k {
+                    acc += lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
+                }
+                out[out_base + row * n + col] = acc;
+            }
+        }
+    }
+    Ok(out)
+}
+
+pub fn trace_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f64, KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    if meta.shape().len() != 2 {
+        return Err(KernelError::InvalidDimension {
+            dim: meta.shape().len(),
+            ndim: 2,
+        });
+    }
+    let rows = meta.shape()[0];
+    let cols = meta.shape()[1];
+    let diag_len = rows.min(cols);
+    let offset = meta.storage_offset();
+    let mut acc = 0.0;
+    for i in 0..diag_len {
+        acc += input[offset + i * cols + i];
+    }
+    Ok(acc)
+}
+
 pub fn prod_dim_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
@@ -1856,6 +1989,46 @@ pub fn masked_fill_tensor_contiguous_f64(
     Ok(output)
 }
 
+/// Conditional selection: `torch.where(condition, x, y)`.
+///
+/// Selects elements from `x` where `condition != 0.0` and from `y` otherwise.
+/// All three tensors must have the same shape.
+pub fn where_tensor_contiguous_f64(
+    condition: &[f64],
+    x: &[f64],
+    y: &[f64],
+    meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(x, meta)?;
+    let numel = meta.numel();
+    let offset = meta.storage_offset();
+    if condition.len() < offset + numel {
+        return Err(KernelError::ShapeMismatch {
+            lhs: meta.shape().to_vec(),
+            rhs: vec![condition.len()],
+        });
+    }
+    if y.len() < offset + numel {
+        return Err(KernelError::ShapeMismatch {
+            lhs: meta.shape().to_vec(),
+            rhs: vec![y.len()],
+        });
+    }
+
+    let cond = &condition[offset..offset + numel];
+    let x_data = &x[offset..offset + numel];
+    let y_data = &y[offset..offset + numel];
+
+    let output = cond
+        .iter()
+        .zip(x_data.iter())
+        .zip(y_data.iter())
+        .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+        .collect();
+
+    Ok(output)
+}
+
 /// Cumulative sum along a given dimension.
 ///
 /// For a 1-D input [a, b, c] with dim=0, returns [a, a+b, a+b+c].
@@ -2035,6 +2208,130 @@ pub fn cumprod_backward_tensor_contiguous_f64(
     }
 
     Ok(grad_input)
+}
+
+/// Sort a contiguous f64 tensor along the given dimension.
+///
+/// Returns `(sorted_values, indices)` where `indices[i]` is the original position
+/// of `sorted_values[i]` along the sorted dimension.
+///
+/// `descending = true` sorts from largest to smallest.
+pub fn sort_tensor_contiguous_f64(
+    input: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+    descending: bool,
+) -> Result<(Vec<f64>, Vec<usize>), KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let offset = meta.storage_offset();
+    let dim_size = shape[dim];
+    let outer_size: usize = shape[..dim].iter().product();
+    let inner_size: usize = shape[dim + 1..].iter().product();
+    let numel = outer_size * dim_size * inner_size;
+    let data = &input[offset..];
+
+    let mut sorted_values = vec![0.0; numel];
+    let mut indices = vec![0usize; numel];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            let mut lane: Vec<(usize, f64)> = (0..dim_size)
+                .map(|d| {
+                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                    (d, data[idx])
+                })
+                .collect();
+
+            if descending {
+                lane.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                lane.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+
+            for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
+                let out_idx = outer * dim_size * inner_size + out_d * inner_size + inner;
+                sorted_values[out_idx] = val;
+                indices[out_idx] = orig_d;
+            }
+        }
+    }
+
+    Ok((sorted_values, indices))
+}
+
+/// Return the k largest (or smallest) elements along the given dimension.
+///
+/// Returns `(values, indices)` of shape `[..., k, ...]` where the dim-th
+/// dimension is replaced by k. `largest = true` returns the k largest elements.
+pub fn topk_tensor_contiguous_f64(
+    input: &[f64],
+    meta: &TensorMeta,
+    k: usize,
+    dim: usize,
+    largest: bool,
+    sorted: bool,
+) -> Result<(Vec<f64>, Vec<usize>), KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let dim_size = shape[dim];
+    if k > dim_size {
+        return Err(KernelError::InvalidDimension {
+            dim: k,
+            ndim: dim_size,
+        });
+    }
+    let offset = meta.storage_offset();
+    let outer_size: usize = shape[..dim].iter().product();
+    let inner_size: usize = shape[dim + 1..].iter().product();
+    let out_numel = outer_size * k * inner_size;
+    let data = &input[offset..];
+
+    let mut out_values = vec![0.0; out_numel];
+    let mut out_indices = vec![0usize; out_numel];
+
+    for outer in 0..outer_size {
+        for inner in 0..inner_size {
+            let mut lane: Vec<(usize, f64)> = (0..dim_size)
+                .map(|d| {
+                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                    (d, data[idx])
+                })
+                .collect();
+
+            if largest {
+                lane.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+            } else {
+                lane.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+            }
+
+            let top = &lane[..k];
+
+            let mut selected: Vec<(usize, f64)> = top.to_vec();
+            if sorted {
+                // Already sorted by value from the full sort above
+            } else {
+                // Return in original index order
+                selected.sort_by_key(|(orig_idx, _)| *orig_idx);
+            }
+
+            for (out_d, (orig_d, val)) in selected.into_iter().enumerate() {
+                let out_idx = outer * k * inner_size + out_d * inner_size + inner;
+                out_values[out_idx] = val;
+                out_indices[out_idx] = orig_d;
+            }
+        }
+    }
+
+    Ok((out_values, out_indices))
 }
 
 #[cfg(test)]
@@ -4026,5 +4323,210 @@ mod tests {
         assert!((out[1] - (-0.01)).abs() < 1e-10);
         assert_eq!(out[2], 0.0);
         assert!((out[3] - (-0.05)).abs() < 1e-10);
+    }
+
+    // ---- cumsum ----
+
+    #[test]
+    fn cumsum_1d() {
+        let meta = TensorMeta::from_shape(vec![5], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0];
+        let out =
+            super::cumsum_tensor_contiguous_f64(&input, &meta, 0).expect("cumsum should succeed");
+        assert_eq!(out, vec![1.0, 3.0, 6.0, 10.0, 15.0]);
+    }
+
+    #[test]
+    fn cumsum_2d_dim0() {
+        let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out =
+            super::cumsum_tensor_contiguous_f64(&input, &meta, 0).expect("cumsum should succeed");
+        // dim0: accumulate rows: [1,2,3] -> [1,2,3], [1+4,2+5,3+6] = [5,7,9]
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn cumsum_2d_dim1() {
+        let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out =
+            super::cumsum_tensor_contiguous_f64(&input, &meta, 1).expect("cumsum should succeed");
+        // dim1: accumulate within rows: [1,1+2,1+2+3] [4,4+5,4+5+6] = [1,3,6,4,9,15]
+        assert_eq!(out, vec![1.0, 3.0, 6.0, 4.0, 9.0, 15.0]);
+    }
+
+    #[test]
+    fn cumsum_invalid_dim() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0];
+        let result = super::cumsum_tensor_contiguous_f64(&input, &meta, 1);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn cumsum_backward_is_reverse_cumsum() {
+        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
+        let grad_output = vec![1.0, 1.0, 1.0, 1.0];
+        let grad_input = super::cumsum_backward_tensor_contiguous_f64(&grad_output, &meta, 0)
+            .expect("cumsum backward should succeed");
+        // Reverse cumsum of [1,1,1,1] = [4,3,2,1]
+        assert_eq!(grad_input, vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    // ---- cumprod ----
+
+    #[test]
+    fn cumprod_1d() {
+        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
+        let input = vec![2.0, 3.0, 4.0, 5.0];
+        let out =
+            super::cumprod_tensor_contiguous_f64(&input, &meta, 0).expect("cumprod should succeed");
+        assert_eq!(out, vec![2.0, 6.0, 24.0, 120.0]);
+    }
+
+    #[test]
+    fn cumprod_2d_dim0() {
+        let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out =
+            super::cumprod_tensor_contiguous_f64(&input, &meta, 0).expect("cumprod should succeed");
+        // dim0: [1,2,3] -> [1,2,3], [1*4,2*5,3*6] = [4,10,18]
+        assert_eq!(out, vec![1.0, 2.0, 3.0, 4.0, 10.0, 18.0]);
+    }
+
+    #[test]
+    fn cumprod_2d_dim1() {
+        let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let out =
+            super::cumprod_tensor_contiguous_f64(&input, &meta, 1).expect("cumprod should succeed");
+        // dim1: [1,1*2,1*2*3] [4,4*5,4*5*6] = [1,2,6,4,20,120]
+        assert_eq!(out, vec![1.0, 2.0, 6.0, 4.0, 20.0, 120.0]);
+    }
+
+    #[test]
+    fn cumprod_invalid_dim() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0];
+        let result = super::cumprod_tensor_contiguous_f64(&input, &meta, 1);
+        assert!(result.is_err());
+    }
+
+    // ---- where ----
+
+    #[test]
+    fn where_selects_by_condition() {
+        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
+        let cond = vec![1.0, 0.0, 1.0, 0.0];
+        let x = vec![10.0, 20.0, 30.0, 40.0];
+        let y = vec![-1.0, -2.0, -3.0, -4.0];
+        let out =
+            super::where_tensor_contiguous_f64(&cond, &x, &y, &meta).expect("where should succeed");
+        assert_eq!(out, vec![10.0, -2.0, 30.0, -4.0]);
+    }
+
+    #[test]
+    fn where_all_true() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let cond = vec![1.0, 1.0, 1.0];
+        let x = vec![10.0, 20.0, 30.0];
+        let y = vec![-1.0, -2.0, -3.0];
+        let out =
+            super::where_tensor_contiguous_f64(&cond, &x, &y, &meta).expect("where should succeed");
+        assert_eq!(out, vec![10.0, 20.0, 30.0]);
+    }
+
+    #[test]
+    fn where_all_false() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let cond = vec![0.0, 0.0, 0.0];
+        let x = vec![10.0, 20.0, 30.0];
+        let y = vec![-1.0, -2.0, -3.0];
+        let out =
+            super::where_tensor_contiguous_f64(&cond, &x, &y, &meta).expect("where should succeed");
+        assert_eq!(out, vec![-1.0, -2.0, -3.0]);
+    }
+
+    // ---- sort ----
+
+    #[test]
+    fn sort_1d_ascending() {
+        let meta = TensorMeta::from_shape(vec![5], DType::F64, Device::Cpu);
+        let input = vec![3.0, 1.0, 4.0, 1.0, 5.0];
+        let (vals, idxs) =
+            super::sort_tensor_contiguous_f64(&input, &meta, 0, false).expect("sort should work");
+        assert_eq!(vals, vec![1.0, 1.0, 3.0, 4.0, 5.0]);
+        assert_eq!(idxs, vec![1, 3, 0, 2, 4]);
+    }
+
+    #[test]
+    fn sort_1d_descending() {
+        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
+        let input = vec![2.0, 5.0, 1.0, 3.0];
+        let (vals, idxs) =
+            super::sort_tensor_contiguous_f64(&input, &meta, 0, true).expect("sort should work");
+        assert_eq!(vals, vec![5.0, 3.0, 2.0, 1.0]);
+        assert_eq!(idxs, vec![1, 3, 0, 2]);
+    }
+
+    #[test]
+    fn sort_2d_along_dim1() {
+        let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let input = vec![3.0, 1.0, 2.0, 6.0, 4.0, 5.0];
+        let (vals, idxs) =
+            super::sort_tensor_contiguous_f64(&input, &meta, 1, false).expect("sort should work");
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(idxs, vec![1, 2, 0, 1, 2, 0]);
+    }
+
+    #[test]
+    fn sort_invalid_dim() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0];
+        let result = super::sort_tensor_contiguous_f64(&input, &meta, 1, false);
+        assert!(result.is_err());
+    }
+
+    // ---- topk ----
+
+    #[test]
+    fn topk_largest_sorted() {
+        let meta = TensorMeta::from_shape(vec![5], DType::F64, Device::Cpu);
+        let input = vec![3.0, 1.0, 4.0, 1.0, 5.0];
+        let (vals, idxs) =
+            super::topk_tensor_contiguous_f64(&input, &meta, 3, 0, true, true).expect("topk");
+        assert_eq!(vals, vec![5.0, 4.0, 3.0]);
+        assert_eq!(idxs, vec![4, 2, 0]);
+    }
+
+    #[test]
+    fn topk_smallest_sorted() {
+        let meta = TensorMeta::from_shape(vec![5], DType::F64, Device::Cpu);
+        let input = vec![3.0, 1.0, 4.0, 1.0, 5.0];
+        let (vals, idxs) =
+            super::topk_tensor_contiguous_f64(&input, &meta, 2, 0, false, true).expect("topk");
+        assert_eq!(vals, vec![1.0, 1.0]);
+        assert_eq!(idxs, vec![1, 3]);
+    }
+
+    #[test]
+    fn topk_2d_along_dim1() {
+        let meta = TensorMeta::from_shape(vec![2, 4], DType::F64, Device::Cpu);
+        let input = vec![4.0, 2.0, 3.0, 1.0, 8.0, 6.0, 7.0, 5.0];
+        let (vals, idxs) =
+            super::topk_tensor_contiguous_f64(&input, &meta, 2, 1, true, true).expect("topk");
+        // First row top-2: 4.0 (idx 0), 3.0 (idx 2)
+        // Second row top-2: 8.0 (idx 0), 7.0 (idx 2)
+        assert_eq!(vals, vec![4.0, 3.0, 8.0, 7.0]);
+        assert_eq!(idxs, vec![0, 2, 0, 2]);
+    }
+
+    #[test]
+    fn topk_k_exceeds_dim_returns_error() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0];
+        let result = super::topk_tensor_contiguous_f64(&input, &meta, 5, 0, true, true);
+        assert!(result.is_err());
     }
 }
