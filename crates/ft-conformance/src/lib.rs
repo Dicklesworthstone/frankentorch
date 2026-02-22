@@ -1940,40 +1940,42 @@ pub fn run_differential_conformance(
                 }),
             }
 
-            let swapped_case = DispatchCase {
-                name: format!("{}__swapped_args", case.name),
-                op: case.op.clone(),
-                lhs: case.rhs,
-                rhs: case.lhs,
-                lhs_dtype: case.rhs_dtype.clone(),
-                rhs_dtype: case.lhs_dtype.clone(),
-                lhs_device: case.rhs_device.clone(),
-                rhs_device: case.lhs_device.clone(),
-                requires_grad: case.requires_grad,
-                keyset: None,
-                strict: case.strict.clone(),
-                hardened: case.hardened.clone(),
-                tolerance: case.tolerance,
-                contract_ids: case.contract_ids.clone(),
-                e2e_scenarios: case.e2e_scenarios.clone(),
-            };
-            let swapped_local_output = evaluate_dispatch_output(&swapped_case, mode)?;
-            checks.push(compare_abs_tol(
-                &allowlist,
-                "dispatch_key",
-                "FT-P2C-002",
-                mode,
-                case.name.as_str(),
-                "metamorphic_commutative_local",
-                "dispatch.metamorphic_commutative_local_mismatch",
-                swapped_local_output,
-                local_output,
-                case.tolerance.unwrap_or(1e-12),
-                vec![
-                    "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
-                    "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
-                ],
-            ));
+            if case.op == "add" || case.op == "mul" {
+                let swapped_case = DispatchCase {
+                    name: format!("{}__swapped_args", case.name),
+                    op: case.op.clone(),
+                    lhs: case.rhs,
+                    rhs: case.lhs,
+                    lhs_dtype: case.rhs_dtype.clone(),
+                    rhs_dtype: case.lhs_dtype.clone(),
+                    lhs_device: case.rhs_device.clone(),
+                    rhs_device: case.lhs_device.clone(),
+                    requires_grad: case.requires_grad,
+                    keyset: None,
+                    strict: case.strict.clone(),
+                    hardened: case.hardened.clone(),
+                    tolerance: case.tolerance,
+                    contract_ids: case.contract_ids.clone(),
+                    e2e_scenarios: case.e2e_scenarios.clone(),
+                };
+                let swapped_local_output = evaluate_dispatch_output(&swapped_case, mode)?;
+                checks.push(compare_abs_tol(
+                    &allowlist,
+                    "dispatch_key",
+                    "FT-P2C-002",
+                    mode,
+                    case.name.as_str(),
+                    "metamorphic_commutative_local",
+                    "dispatch.metamorphic_commutative_local_mismatch",
+                    swapped_local_output,
+                    local_output,
+                    case.tolerance.unwrap_or(1e-12),
+                    vec![
+                        "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                        "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+                    ],
+                ));
+            }
         }
 
         let malformed_dispatch_key_rejected =
