@@ -6596,8 +6596,11 @@ impl TensorTape {
                 let old_coord = isize::try_from(coords[dim]).map_err(|_| {
                     Self::shape_overflow_error("roll coordinate exceeds isize range")
                 })?;
-                let new_coord = ((old_coord + shift) % dim_size_i + dim_size_i) as usize % dim_size;
-                coords[dim] = new_coord;
+                let shifted_coord = (old_coord + shift).rem_euclid(dim_size_i);
+                let new_coord = usize::try_from(shifted_coord).map_err(|_| {
+                    Self::shape_overflow_error("roll coordinate conversion overflow")
+                })?;
+                coords[dim] = new_coord % dim_size;
 
                 let mut dst_flat = 0;
                 for d in 0..ndim {
@@ -6869,13 +6872,28 @@ impl TensorTape {
                     let lhs_shape = self.nodes[lhs.0].tensor.meta().shape();
                     let rhs_shape = self.nodes[rhs.0].tensor.meta().shape();
                     let (m, k, n) = Self::matmul_dims(lhs_shape, rhs_shape)?;
+                    let lhs_numel = Self::checked_mul_usize(
+                        m,
+                        k,
+                        "matmul backward lhs shape multiplication overflow",
+                    )?;
+                    let rhs_numel = Self::checked_mul_usize(
+                        k,
+                        n,
+                        "matmul backward rhs shape multiplication overflow",
+                    )?;
+                    let out_numel = Self::checked_mul_usize(
+                        m,
+                        n,
+                        "matmul backward output shape multiplication overflow",
+                    )?;
 
-                    Self::ensure_tensor_len(lhs, lhs_values.len(), m.saturating_mul(k))?;
-                    Self::ensure_tensor_len(rhs, rhs_values.len(), k.saturating_mul(n))?;
-                    Self::ensure_tensor_len(node_id, incoming.len(), m.saturating_mul(n))?;
+                    Self::ensure_tensor_len(lhs, lhs_values.len(), lhs_numel)?;
+                    Self::ensure_tensor_len(rhs, rhs_values.len(), rhs_numel)?;
+                    Self::ensure_tensor_len(node_id, incoming.len(), out_numel)?;
 
-                    let mut lhs_contrib = vec![0.0; m.saturating_mul(k)];
-                    let mut rhs_contrib = vec![0.0; k.saturating_mul(n)];
+                    let mut lhs_contrib = vec![0.0; lhs_numel];
+                    let mut rhs_contrib = vec![0.0; rhs_numel];
 
                     for row in 0..m {
                         for inner in 0..k {
@@ -6916,6 +6934,8 @@ impl TensorTape {
                 TensorNodeOp::Dot { lhs, rhs } => {
                     let lhs_values = self.nodes[lhs.0].tensor.contiguous_values()?;
                     let rhs_values = self.nodes[rhs.0].tensor.contiguous_values()?;
+                    Self::ensure_tensor_len(node_id, 1, incoming.len())?;
+                    Self::ensure_tensor_len(lhs, lhs_values.len(), rhs_values.len())?;
                     let grad_out = incoming[0];
 
                     let lhs_contrib: Vec<f64> = rhs_values.iter().map(|&v| grad_out * v).collect();
@@ -6938,8 +6958,13 @@ impl TensorTape {
                     let rhs_values = self.nodes[rhs.0].tensor.contiguous_values()?;
                     let m = lhs_values.len();
                     let n = rhs_values.len();
+                    let out_numel = Self::checked_mul_usize(
+                        m,
+                        n,
+                        "outer backward shape multiplication overflow",
+                    )?;
 
-                    Self::ensure_tensor_len(node_id, incoming.len(), m.saturating_mul(n))?;
+                    Self::ensure_tensor_len(node_id, incoming.len(), out_numel)?;
 
                     let mut lhs_contrib = vec![0.0; m];
                     let mut rhs_contrib = vec![0.0; n];
@@ -6977,17 +7002,53 @@ impl TensorTape {
                     let rhs_values = self.nodes[rhs.0].tensor.contiguous_values()?;
                     let lhs_shape = self.nodes[lhs.0].tensor.meta().shape();
                     let rhs_shape = self.nodes[rhs.0].tensor.meta().shape();
+                    if lhs_shape.len() != 3 || rhs_shape.len() != 3 {
+                        return Err(AutogradError::Dispatch(
+                            DispatchKeyError::IncompatibleSet {
+                                reason: "bmm backward expected rank-3 operands",
+                            }
+                            .into(),
+                        ));
+                    }
                     let batch = lhs_shape[0];
                     let m = lhs_shape[1];
                     let k = lhs_shape[2];
+                    if rhs_shape[0] != batch || rhs_shape[1] != k {
+                        return Err(AutogradError::Dispatch(
+                            DispatchKeyError::IncompatibleSet {
+                                reason: "bmm backward received incompatible operand shapes",
+                            }
+                            .into(),
+                        ));
+                    }
                     let n = rhs_shape[2];
+                    let lhs_batch_stride =
+                        Self::checked_mul_usize(m, k, "bmm backward lhs batch stride overflow")?;
+                    let rhs_batch_stride =
+                        Self::checked_mul_usize(k, n, "bmm backward rhs batch stride overflow")?;
+                    let out_batch_stride =
+                        Self::checked_mul_usize(m, n, "bmm backward output batch stride overflow")?;
+                    let lhs_numel = Self::checked_mul_usize(
+                        batch,
+                        lhs_batch_stride,
+                        "bmm backward lhs shape multiplication overflow",
+                    )?;
+                    let rhs_numel = Self::checked_mul_usize(
+                        batch,
+                        rhs_batch_stride,
+                        "bmm backward rhs shape multiplication overflow",
+                    )?;
+                    let out_numel = Self::checked_mul_usize(
+                        batch,
+                        out_batch_stride,
+                        "bmm backward output shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(lhs, lhs_values.len(), lhs_numel)?;
+                    Self::ensure_tensor_len(rhs, rhs_values.len(), rhs_numel)?;
+                    Self::ensure_tensor_len(node_id, incoming.len(), out_numel)?;
 
-                    let lhs_batch_stride = m * k;
-                    let rhs_batch_stride = k * n;
-                    let out_batch_stride = m * n;
-
-                    let mut lhs_contrib = vec![0.0; batch * lhs_batch_stride];
-                    let mut rhs_contrib = vec![0.0; batch * rhs_batch_stride];
+                    let mut lhs_contrib = vec![0.0; lhs_numel];
+                    let mut rhs_contrib = vec![0.0; rhs_numel];
 
                     for b in 0..batch {
                         let lhs_base = b * lhs_batch_stride;
@@ -8685,6 +8746,7 @@ impl TensorTape {
                             if !selected_f.is_finite()
                                 || selected_f < 0.0
                                 || selected_f.fract().abs() > f64::EPSILON
+                                || selected_f > usize::MAX as f64
                             {
                                 return Err(AutogradError::Dispatch(
                                     DispatchKeyError::IncompatibleSet {
@@ -8730,11 +8792,6 @@ impl TensorTape {
                         "index_select backward shape volume overflow",
                     )?;
                     let dim_size = input_shape[dim];
-                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
-                        Self::shape_overflow_error(
-                            "index_select backward dimension size exceeds isize range",
-                        )
-                    })?;
                     let num_indices = indices.len();
                     let expected_incoming = Self::checked_mul_usize(
                         Self::checked_mul_usize(
@@ -8758,20 +8815,13 @@ impl TensorTape {
                                     .into(),
                                 ));
                             }
-                            let mut idx_i = idx_f as isize;
-                            if idx_i < 0 {
-                                idx_i += dim_size_i;
-                            }
-                            if idx_i < 0 || idx_i >= dim_size_i {
-                                return Err(AutogradError::Dispatch(
-                                    DispatchKeyError::IncompatibleSet {
-                                        reason:
-                                            "index_select backward received out-of-bounds index value",
-                                    }
-                                    .into(),
-                                ));
-                            }
-                            let idx = idx_i as usize;
+                            let idx = Self::normalize_wrapped_index_float(
+                                idx_f,
+                                dim_size,
+                                "index_select backward received invalid index value",
+                                "index_select backward received out-of-bounds index value",
+                                "index_select backward index conversion overflow",
+                            )?;
                             for inner in 0..inner_size {
                                 let grad_pos =
                                     outer * num_indices * inner_size + r * inner_size + inner;
@@ -8803,11 +8853,6 @@ impl TensorTape {
                         "gather backward input shape volume overflow",
                     )?;
                     let dim_size = input_shape[dim];
-                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
-                        Self::shape_overflow_error(
-                            "gather backward dimension size exceeds isize range",
-                        )
-                    })?;
                     let idx_dim_size = index_shape[dim];
                     let (outer_size, inner_size, index_numel) = Self::checked_dim_loop_sizes(
                         index_shape,
@@ -8834,20 +8879,13 @@ impl TensorTape {
                                         .into(),
                                     ));
                                 }
-                                let mut selected_i = selected_f as isize;
-                                if selected_i < 0 {
-                                    selected_i += dim_size_i;
-                                }
-                                if selected_i < 0 || selected_i >= dim_size_i {
-                                    return Err(AutogradError::Dispatch(
-                                        DispatchKeyError::IncompatibleSet {
-                                            reason:
-                                                "gather backward received out-of-bounds index value",
-                                        }
-                                        .into(),
-                                    ));
-                                }
-                                let selected = selected_i as usize;
+                                let selected = Self::normalize_wrapped_index_float(
+                                    selected_f,
+                                    dim_size,
+                                    "gather backward received invalid index value",
+                                    "gather backward received out-of-bounds index value",
+                                    "gather backward index conversion overflow",
+                                )?;
                                 let orig_pos =
                                     outer * dim_size * inner_size + selected * inner_size + inner;
                                 contrib[orig_pos] += incoming[idx_pos];
@@ -8879,11 +8917,6 @@ impl TensorTape {
                     )?;
                     Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
                     let dim_size = input_shape[dim];
-                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
-                        Self::shape_overflow_error(
-                            "scatter backward dimension size exceeds isize range",
-                        )
-                    })?;
                     let idx_dim_size = index_shape[dim];
                     let (outer_size, inner_size, index_numel) = Self::checked_dim_loop_sizes(
                         index_shape,
@@ -8908,20 +8941,13 @@ impl TensorTape {
                                         .into(),
                                     ));
                                 }
-                                let mut selected_i = selected_f as isize;
-                                if selected_i < 0 {
-                                    selected_i += dim_size_i;
-                                }
-                                if selected_i < 0 || selected_i >= dim_size_i {
-                                    return Err(AutogradError::Dispatch(
-                                        DispatchKeyError::IncompatibleSet {
-                                            reason:
-                                                "scatter backward received out-of-bounds index value",
-                                        }
-                                        .into(),
-                                    ));
-                                }
-                                let selected = selected_i as usize;
+                                let selected = Self::normalize_wrapped_index_float(
+                                    selected_f,
+                                    dim_size,
+                                    "scatter backward received invalid index value",
+                                    "scatter backward received out-of-bounds index value",
+                                    "scatter backward index conversion overflow",
+                                )?;
                                 let orig_pos =
                                     outer * dim_size * inner_size + selected * inner_size + inner;
                                 contrib[orig_pos] = 0.0;
@@ -9049,9 +9075,13 @@ impl TensorTape {
                                     "roll backward coordinate exceeds isize range",
                                 )
                             })?;
-                            let new_coord =
-                                ((old_coord - shift) % dim_size_i + dim_size_i) as usize % dim_size;
-                            coords[dim] = new_coord;
+                            let shifted_coord = (old_coord - shift).rem_euclid(dim_size_i);
+                            let new_coord = usize::try_from(shifted_coord).map_err(|_| {
+                                Self::shape_overflow_error(
+                                    "roll backward coordinate conversion overflow",
+                                )
+                            })?;
+                            coords[dim] = new_coord % dim_size;
                             let mut dst_flat = 0;
                             for d in 0..ndim {
                                 dst_flat += coords[d] * strides[d];
@@ -9385,6 +9415,45 @@ impl TensorTape {
     ) -> Result<usize, AutogradError> {
         lhs.checked_mul(rhs)
             .ok_or_else(|| Self::shape_overflow_error(overflow_reason))
+    }
+
+    fn normalize_wrapped_index_float(
+        idx_f: f64,
+        dim_size: usize,
+        invalid_reason: &'static str,
+        oob_reason: &'static str,
+        overflow_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        if !idx_f.is_finite() || idx_f.fract().abs() > f64::EPSILON {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                }
+                .into(),
+            ));
+        }
+        if idx_f < isize::MIN as f64 || idx_f > isize::MAX as f64 {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                }
+                .into(),
+            ));
+        }
+
+        let dim_size_i =
+            isize::try_from(dim_size).map_err(|_| Self::shape_overflow_error(overflow_reason))?;
+        let mut idx_i = idx_f as isize;
+        if idx_i < 0 {
+            idx_i += dim_size_i;
+        }
+        if idx_i < 0 || idx_i >= dim_size_i {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet { reason: oob_reason }.into(),
+            ));
+        }
+
+        usize::try_from(idx_i).map_err(|_| Self::shape_overflow_error(overflow_reason))
     }
 
     fn shape_overflow_error(reason: &'static str) -> AutogradError {
@@ -9972,6 +10041,91 @@ mod tests {
     }
 
     #[test]
+    fn tensor_backward_dot_rejects_incoming_gradient_len_mismatch() {
+        let mut tape = TensorTape::new();
+        let lhs = tape
+            .leaf(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("lhs leaf should build");
+        let rhs = tape
+            .leaf(vec![4.0, 5.0, 6.0], vec![3], true)
+            .expect("rhs leaf should build");
+        let (out, _) = tape
+            .dot(lhs, rhs, ExecutionMode::Strict)
+            .expect("dot should succeed");
+        tape.nodes[out.0].tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu),
+            vec![1.0, 2.0],
+        )
+        .expect("replacement tensor should build");
+
+        let err = tape
+            .backward(out)
+            .expect_err("incoming gradient shape mismatch should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorGradientShapeMismatch { node, expected: 1, actual: 2 }
+            if node == out
+        ));
+    }
+
+    #[test]
+    fn tensor_backward_bmm_rejects_incoming_gradient_len_mismatch() {
+        let mut tape = TensorTape::new();
+        let lhs = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![1, 2, 2], true)
+            .expect("lhs leaf should build");
+        let rhs = tape
+            .leaf(vec![5.0, 6.0, 7.0, 8.0], vec![1, 2, 2], true)
+            .expect("rhs leaf should build");
+        let (out, _) = tape
+            .bmm(lhs, rhs, ExecutionMode::Strict)
+            .expect("bmm should succeed");
+        tape.nodes[out.0].tensor = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![1, 1, 2], DType::F64, Device::Cpu),
+            vec![1.0, 2.0],
+        )
+        .expect("replacement tensor should build");
+
+        let err = tape
+            .backward(out)
+            .expect_err("incoming gradient shape mismatch should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorGradientShapeMismatch { .. }
+        ));
+    }
+
+    #[test]
+    fn tensor_backward_index_select_rejects_huge_index_value() {
+        let mut tape = TensorTape::new();
+        let input = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("input leaf should build");
+        let out = tape
+            .index_select(input, 0, &[0.0, 1.0])
+            .expect("index_select should succeed");
+        assert!(matches!(
+            tape.nodes[out.0].op,
+            TensorNodeOp::IndexSelect { .. }
+        ));
+        if let TensorNodeOp::IndexSelect { indices, .. } = &mut tape.nodes[out.0].op {
+            indices[0] = 1.0e300;
+        }
+
+        let err = tape
+            .backward(out)
+            .expect_err("huge index should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_select backward received invalid index value"
+                }
+            ))
+        ));
+    }
+
+    #[test]
     fn tensor_dependency_snapshot_preserves_initial_pending_counts() {
         let mut tape = TensorTape::new();
         let x = tape
@@ -10070,9 +10224,11 @@ mod tests {
             .expect_err("shape mismatch must fail closed");
         assert!(matches!(
             err,
-            AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
-                reason: "where requires condition, x, and y to have the same shape"
-            }))
+            AutogradError::Dispatch(DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "where requires condition, x, and y to have the same shape"
+                }
+            ))
         ));
     }
 

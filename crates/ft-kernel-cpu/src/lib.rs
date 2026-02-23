@@ -28,6 +28,9 @@ pub enum KernelError {
         dim: usize,
         ndim: usize,
     },
+    ShapeOverflow {
+        context: &'static str,
+    },
 }
 
 impl fmt::Display for KernelError {
@@ -60,6 +63,9 @@ impl fmt::Display for KernelError {
                 f,
                 "invalid reduction dimension {dim} for tensor with {ndim} dimensions"
             ),
+            Self::ShapeOverflow { context } => {
+                write!(f, "shape arithmetic overflow: {context}")
+            }
         }
     }
 }
@@ -444,6 +450,35 @@ fn ensure_unary_layout_and_storage(buffer: &[f64], meta: &TensorMeta) -> Result<
     ensure_storage_len(buffer, meta, "input")
 }
 
+fn checked_shape_numel(shape: &[usize], context: &'static str) -> Result<usize, KernelError> {
+    let mut product = 1usize;
+    for dim in shape.iter().copied() {
+        if dim == 0 {
+            return Ok(0);
+        }
+        product = product
+            .checked_mul(dim)
+            .ok_or(KernelError::ShapeOverflow { context })?;
+    }
+    Ok(product)
+}
+
+fn checked_mul(lhs: usize, rhs: usize, context: &'static str) -> Result<usize, KernelError> {
+    lhs.checked_mul(rhs)
+        .ok_or(KernelError::ShapeOverflow { context })
+}
+
+fn checked_dim_loop_sizes(
+    shape: &[usize],
+    dim: usize,
+    context: &'static str,
+) -> Result<(usize, usize, usize), KernelError> {
+    let outer_size = checked_shape_numel(&shape[..dim], context)?;
+    let inner_size = checked_shape_numel(&shape[dim + 1..], context)?;
+    let total_size = checked_shape_numel(shape, context)?;
+    Ok((outer_size, inner_size, total_size))
+}
+
 fn unary_contiguous_f64<F>(input: &[f64], meta: &TensorMeta, op: F) -> Result<Vec<f64>, KernelError>
 where
     F: Fn(f64) -> f64,
@@ -461,7 +496,11 @@ where
     Ok(window.iter().map(|value| op(*value)).collect())
 }
 
-fn broadcast_strides(input_shape: &[usize], target_shape: &[usize]) -> Vec<usize> {
+fn broadcast_strides(
+    input_shape: &[usize],
+    target_shape: &[usize],
+    context: &'static str,
+) -> Result<Vec<usize>, KernelError> {
     let ndim = input_shape.len();
     debug_assert_eq!(ndim, target_shape.len());
 
@@ -473,10 +512,12 @@ fn broadcast_strides(input_shape: &[usize], target_shape: &[usize]) -> Vec<usize
         } else {
             running_stride
         };
-        running_stride *= input_shape[d];
+        running_stride = running_stride
+            .checked_mul(input_shape[d])
+            .ok_or(KernelError::ShapeOverflow { context })?;
     }
 
-    strides
+    Ok(strides)
 }
 
 pub fn reduce_sum_for_broadcast(
@@ -503,7 +544,7 @@ pub fn reduce_sum_for_broadcast(
         }
     }
 
-    let expanded_numel: usize = expanded_shape.iter().product();
+    let expanded_numel = checked_shape_numel(expanded_shape, "broadcast reduction expanded shape")?;
     if expanded_grad.len() != expanded_numel {
         return Err(KernelError::ShapeMismatch {
             lhs: vec![expanded_grad.len()],
@@ -511,12 +552,13 @@ pub fn reduce_sum_for_broadcast(
         });
     }
 
-    let original_numel: usize = original_shape.iter().product();
+    let original_numel = checked_shape_numel(original_shape, "broadcast reduction original shape")?;
     if original_numel == 0 {
         return Ok(Vec::new());
     }
 
-    let original_strides = broadcast_strides(original_shape, expanded_shape);
+    let original_strides =
+        broadcast_strides(original_shape, expanded_shape, "broadcast strides overflow")?;
     let mut reduced = vec![0.0; original_numel];
     let mut coords = vec![0usize; ndim];
 
@@ -969,9 +1011,13 @@ pub fn sum_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "sum_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "sum_dim shape multiplication overflow",
+    )?;
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
 
@@ -1000,10 +1046,15 @@ pub fn mean_dim_tensor_contiguous_f64(
         return Err(KernelError::InvalidDimension { dim, ndim });
     }
     let reduce_size = shape[dim];
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "mean_dim shape volume overflow")?;
     if reduce_size == 0 {
-        let outer_size: usize = shape[..dim].iter().product();
-        let inner_size: usize = shape[dim + 1..].iter().product();
-        return Ok(vec![f64::NAN; outer_size * inner_size]);
+        let out_numel = checked_mul(
+            outer_size,
+            inner_size,
+            "mean_dim shape multiplication overflow",
+        )?;
+        return Ok(vec![f64::NAN; out_numel]);
     }
     let mut output = sum_dim_tensor_contiguous_f64(input, meta, dim)?;
     let scale = 1.0 / reduce_size as f64;
@@ -1057,13 +1108,16 @@ pub fn matmul_tensor_contiguous_f64(
 ) -> Result<Vec<f64>, KernelError> {
     ensure_dtype_device_and_layout(lhs_meta, rhs_meta)?;
     let (m, k, n) = matmul_dims(lhs_meta, rhs_meta)?;
+    checked_mul(m, k, "matmul lhs shape multiplication overflow")?;
+    checked_mul(k, n, "matmul rhs shape multiplication overflow")?;
+    let out_numel = checked_mul(m, n, "matmul output shape multiplication overflow")?;
 
     ensure_storage_len(lhs, lhs_meta, "lhs")?;
     ensure_storage_len(rhs, rhs_meta, "rhs")?;
 
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    let mut out = vec![0.0; m.saturating_mul(n)];
+    let mut out = vec![0.0; out_numel];
 
     for row in 0..m {
         let out_row_base = row * n;
@@ -1127,14 +1181,14 @@ pub fn outer_tensor_contiguous_f64(
             rhs: rhs_meta.shape().to_vec(),
         });
     }
-    ensure_storage_len(lhs, lhs_meta, "lhs")?;
-    ensure_storage_len(rhs, rhs_meta, "rhs")?;
-
     let m = lhs_meta.shape()[0];
     let n = rhs_meta.shape()[0];
+    let out_numel = checked_mul(m, n, "outer output shape multiplication overflow")?;
+    ensure_storage_len(lhs, lhs_meta, "lhs")?;
+    ensure_storage_len(rhs, rhs_meta, "rhs")?;
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    let mut out = vec![0.0; m.saturating_mul(n)];
+    let mut out = vec![0.0; out_numel];
 
     for i in 0..m {
         for j in 0..n {
@@ -1169,15 +1223,30 @@ pub fn bmm_tensor_contiguous_f64(
             rhs: rhs_meta.shape().to_vec(),
         });
     }
+    let lhs_batch_stride = checked_mul(m, k, "bmm lhs batch stride overflow")?;
+    let rhs_batch_stride = checked_mul(k, n, "bmm rhs batch stride overflow")?;
+    let out_batch_stride = checked_mul(m, n, "bmm output batch stride overflow")?;
+    checked_mul(
+        batch,
+        lhs_batch_stride,
+        "bmm lhs shape multiplication overflow",
+    )?;
+    checked_mul(
+        batch,
+        rhs_batch_stride,
+        "bmm rhs shape multiplication overflow",
+    )?;
+    let out_numel = checked_mul(
+        batch,
+        out_batch_stride,
+        "bmm output shape multiplication overflow",
+    )?;
     ensure_storage_len(lhs, lhs_meta, "lhs")?;
     ensure_storage_len(rhs, rhs_meta, "rhs")?;
 
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    let lhs_batch_stride = m * k;
-    let rhs_batch_stride = k * n;
-    let out_batch_stride = m * n;
-    let mut out = vec![0.0; batch * out_batch_stride];
+    let mut out = vec![0.0; out_numel];
 
     for b in 0..batch {
         let lhs_base = lhs_start + b * lhs_batch_stride;
@@ -1228,9 +1297,13 @@ pub fn prod_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "prod_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "prod_dim shape multiplication overflow",
+    )?;
     let mut output = vec![1.0; out_numel];
     let data = &input[offset..];
 
@@ -1260,9 +1333,13 @@ pub fn var_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "var_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "var_dim shape multiplication overflow",
+    )?;
     let data = &input[offset..];
 
     if reduce_size < 2 {
@@ -1318,9 +1395,8 @@ pub fn softmax_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel: usize = shape.iter().product();
+    let (outer_size, inner_size, numel) =
+        checked_dim_loop_sizes(shape, dim, "softmax shape volume overflow")?;
     let mut output = vec![0.0; numel];
     let data = &input[offset..];
 
@@ -1366,9 +1442,8 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel: usize = shape.iter().product();
+    let (outer_size, inner_size, numel) =
+        checked_dim_loop_sizes(shape, dim, "log_softmax shape volume overflow")?;
     let mut output = vec![0.0; numel];
     let data = &input[offset..];
 
@@ -1413,9 +1488,13 @@ pub fn argmax_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "argmax shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "argmax shape multiplication overflow",
+    )?;
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
 
@@ -1454,9 +1533,13 @@ pub fn argmin_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "argmin shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "argmin shape multiplication overflow",
+    )?;
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
 
@@ -1495,9 +1578,13 @@ pub fn max_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "max_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "max_dim shape multiplication overflow",
+    )?;
     let mut values = vec![f64::NEG_INFINITY; out_numel];
     let mut indices = vec![0.0; out_numel];
     let data = &input[offset..];
@@ -1536,9 +1623,13 @@ pub fn min_dim_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let reduce_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "min_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "min_dim shape multiplication overflow",
+    )?;
     let mut values = vec![f64::INFINITY; out_numel];
     let mut indices = vec![0.0; out_numel];
     let data = &input[offset..];
@@ -1599,10 +1690,18 @@ pub fn cat_tensor_contiguous_f64(
         }
     }
 
-    let outer_size: usize = first_shape[..dim].iter().product();
-    let inner_size: usize = first_shape[dim + 1..].iter().product();
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(first_shape, dim, "cat shape volume overflow")?;
     let total_cat_size: usize = inputs.iter().map(|(_, m)| m.shape()[dim]).sum();
-    let out_numel = outer_size * total_cat_size * inner_size;
+    let out_numel = checked_mul(
+        checked_mul(
+            outer_size,
+            total_cat_size,
+            "cat shape multiplication overflow",
+        )?,
+        inner_size,
+        "cat shape multiplication overflow",
+    )?;
     let mut output = Vec::with_capacity(out_numel);
 
     for outer in 0..outer_size {
@@ -1653,9 +1752,17 @@ pub fn stack_tensor_contiguous_f64(
     }
 
     let num_inputs = inputs.len();
-    let outer_size: usize = first_shape[..dim].iter().product();
-    let inner_size: usize = first_shape[dim..].iter().product();
-    let out_numel = outer_size * num_inputs * inner_size;
+    let outer_size = checked_shape_numel(&first_shape[..dim], "stack outer shape overflow")?;
+    let inner_size = checked_shape_numel(&first_shape[dim..], "stack inner shape overflow")?;
+    let out_numel = checked_mul(
+        checked_mul(
+            outer_size,
+            num_inputs,
+            "stack shape multiplication overflow",
+        )?,
+        inner_size,
+        "stack shape multiplication overflow",
+    )?;
     let mut output = Vec::with_capacity(out_numel);
 
     for outer in 0..outer_size {
@@ -1705,10 +1812,14 @@ pub fn narrow_tensor_contiguous_f64(
         return Ok(Vec::new());
     }
 
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "narrow shape volume overflow")?;
     let dim_size = shape[dim];
-    let out_numel = outer_size * length * inner_size;
+    let out_numel = checked_mul(
+        checked_mul(outer_size, length, "narrow shape multiplication overflow")?,
+        inner_size,
+        "narrow shape multiplication overflow",
+    )?;
     let offset = meta.storage_offset();
     let data = &input[offset..];
     let mut output = Vec::with_capacity(out_numel);
@@ -1738,6 +1849,13 @@ fn normalize_wrapped_index_value(idx_f: f64, dim_size: usize) -> Result<usize, K
         ndim: dim_size,
     })?;
 
+    if idx_f < isize::MIN as f64 || idx_f > isize::MAX as f64 {
+        return Err(KernelError::InvalidDimension {
+            dim: dim_size,
+            ndim: dim_size,
+        });
+    }
+
     let mut idx_i = idx_f as isize;
     if idx_i < 0 {
         idx_i += dim_size_i;
@@ -1749,7 +1867,10 @@ fn normalize_wrapped_index_value(idx_f: f64, dim_size: usize) -> Result<usize, K
         });
     }
 
-    Ok(idx_i as usize)
+    usize::try_from(idx_i).map_err(|_| KernelError::InvalidDimension {
+        dim: dim_size,
+        ndim: dim_size,
+    })
 }
 
 /// Expands singleton dimensions of a contiguous tensor to a target shape.
@@ -1781,12 +1902,12 @@ pub fn expand_tensor_contiguous_f64(
         }
     }
 
-    let out_numel: usize = target_shape.iter().product();
+    let out_numel = checked_shape_numel(target_shape, "expand output shape volume overflow")?;
     if out_numel == 0 {
         return Ok(Vec::new());
     }
 
-    let input_strides = broadcast_strides(shape, target_shape);
+    let input_strides = broadcast_strides(shape, target_shape, "expand input strides overflow")?;
     let offset = meta.storage_offset();
     let mut output = Vec::with_capacity(out_numel);
     let mut coords = vec![0usize; ndim];
@@ -1830,10 +1951,18 @@ pub fn index_select_tensor_contiguous_f64(
     }
 
     let dim_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "index_select shape volume overflow")?;
     let num_indices = indices.len();
-    let out_numel = outer_size * num_indices * inner_size;
+    let out_numel = checked_mul(
+        checked_mul(
+            outer_size,
+            num_indices,
+            "index_select shape multiplication overflow",
+        )?,
+        inner_size,
+        "index_select shape multiplication overflow",
+    )?;
     let offset = meta.storage_offset();
     let data = &input[offset..];
     let mut output = Vec::with_capacity(out_numel);
@@ -1889,9 +2018,8 @@ pub fn gather_tensor_contiguous_f64(
 
     let dim_size = shape[dim];
     let idx_dim_size = idx_shape[dim];
-    let outer_size: usize = idx_shape[..dim].iter().product();
-    let inner_size: usize = idx_shape[dim + 1..].iter().product();
-    let out_numel: usize = idx_shape.iter().product();
+    let (outer_size, inner_size, out_numel) =
+        checked_dim_loop_sizes(idx_shape, dim, "gather index shape volume overflow")?;
     let offset = meta.storage_offset();
     let data = &input[offset..];
     let idx_offset = index_meta.storage_offset();
@@ -1949,7 +2077,7 @@ pub fn scatter_tensor_contiguous_f64(
             });
         }
     }
-    let src_numel: usize = idx_shape.iter().product();
+    let src_numel = checked_shape_numel(idx_shape, "scatter index shape volume overflow")?;
     if src.len() < src_numel {
         return Err(KernelError::InsufficientStorage {
             side: "src",
@@ -1960,8 +2088,8 @@ pub fn scatter_tensor_contiguous_f64(
 
     let dim_size = shape[dim];
     let idx_dim_size = idx_shape[dim];
-    let outer_size: usize = idx_shape[..dim].iter().product();
-    let inner_size: usize = idx_shape[dim + 1..].iter().product();
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(idx_shape, dim, "scatter index shape volume overflow")?;
     let offset = meta.storage_offset();
     let numel = meta.numel();
     let mut output = input[offset..offset + numel].to_vec();
@@ -1993,18 +2121,18 @@ pub fn masked_fill_tensor_contiguous_f64(
 ) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(input, meta)?;
     let numel = meta.numel();
-    if mask.len() < numel {
+    let offset = meta.storage_offset();
+    if mask.len() < offset + numel {
         return Err(KernelError::ShapeMismatch {
             lhs: meta.shape().to_vec(),
             rhs: vec![mask.len()],
         });
     }
 
-    let offset = meta.storage_offset();
     let data = &input[offset..offset + numel];
     let output = data
         .iter()
-        .zip(mask[..numel].iter())
+        .zip(mask[offset..offset + numel].iter())
         .map(|(&d, &m)| if m != 0.0 { value } else { d })
         .collect();
 
@@ -2069,9 +2197,13 @@ pub fn cumsum_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let dim_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel = outer_size * dim_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "cumsum shape volume overflow")?;
+    let numel = checked_mul(
+        checked_mul(outer_size, dim_size, "cumsum shape multiplication overflow")?,
+        inner_size,
+        "cumsum shape multiplication overflow",
+    )?;
     let mut output = vec![0.0; numel];
     let data = &input[offset..];
 
@@ -2105,9 +2237,17 @@ pub fn cumsum_backward_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let dim_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel = outer_size * dim_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "cumsum backward shape volume overflow")?;
+    let numel = checked_mul(
+        checked_mul(
+            outer_size,
+            dim_size,
+            "cumsum backward shape multiplication overflow",
+        )?,
+        inner_size,
+        "cumsum backward shape multiplication overflow",
+    )?;
     let mut grad_input = vec![0.0; numel];
     let data = &grad_output[offset..];
 
@@ -2142,9 +2282,17 @@ pub fn cumprod_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let dim_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel = outer_size * dim_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "cumprod shape volume overflow")?;
+    let numel = checked_mul(
+        checked_mul(
+            outer_size,
+            dim_size,
+            "cumprod shape multiplication overflow",
+        )?,
+        inner_size,
+        "cumprod shape multiplication overflow",
+    )?;
     let mut output = vec![0.0; numel];
     let data = &input[offset..];
 
@@ -2183,9 +2331,17 @@ pub fn cumprod_backward_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let dim_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel = outer_size * dim_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "cumprod backward shape volume overflow")?;
+    let numel = checked_mul(
+        checked_mul(
+            outer_size,
+            dim_size,
+            "cumprod backward shape multiplication overflow",
+        )?,
+        inner_size,
+        "cumprod backward shape multiplication overflow",
+    )?;
     let mut grad_input = vec![0.0; numel];
     let in_data = &input[offset..];
     let out_data = &output[offset..];
@@ -2252,9 +2408,13 @@ pub fn sort_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let dim_size = shape[dim];
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let numel = outer_size * dim_size * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "sort shape volume overflow")?;
+    let numel = checked_mul(
+        checked_mul(outer_size, dim_size, "sort shape multiplication overflow")?,
+        inner_size,
+        "sort shape multiplication overflow",
+    )?;
     let data = &input[offset..];
 
     let mut sorted_values = vec![0.0; numel];
@@ -2312,9 +2472,13 @@ pub fn topk_tensor_contiguous_f64(
         });
     }
     let offset = meta.storage_offset();
-    let outer_size: usize = shape[..dim].iter().product();
-    let inner_size: usize = shape[dim + 1..].iter().product();
-    let out_numel = outer_size * k * inner_size;
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "topk shape volume overflow")?;
+    let out_numel = checked_mul(
+        checked_mul(outer_size, k, "topk shape multiplication overflow")?,
+        inner_size,
+        "topk shape multiplication overflow",
+    )?;
     let data = &input[offset..];
 
     let mut out_values = vec![0.0; out_numel];
@@ -2365,33 +2529,33 @@ mod tests {
         acos_tensor_contiguous_f64, add_scalar, add_tensor_contiguous_f64,
         argmax_dim_tensor_contiguous_f64, argmin_dim_tensor_contiguous_f64, asin_scalar,
         asin_tensor_contiguous_f64, atan_scalar, atan_tensor_contiguous_f64,
-        cat_tensor_contiguous_f64, ceil_scalar, ceil_tensor_contiguous_f64, clamp_scalar,
-        clamp_tensor_contiguous_f64, cos_scalar, cos_tensor_contiguous_f64, cosh_scalar,
-        cosh_tensor_contiguous_f64, div_scalar, div_tensor_contiguous_f64, eq_scalar,
-        eq_tensor_contiguous_f64, exp_scalar, exp_tensor_contiguous_f64,
-        expand_tensor_contiguous_f64, expm1_scalar, expm1_tensor_contiguous_f64, floor_scalar,
-        floor_tensor_contiguous_f64, gather_tensor_contiguous_f64, ge_scalar,
-        ge_tensor_contiguous_f64, gelu_scalar, gelu_tensor_contiguous_f64, gt_scalar,
-        gt_tensor_contiguous_f64, index_select_tensor_contiguous_f64, le_scalar,
-        le_tensor_contiguous_f64, leaky_relu_scalar, leaky_relu_tensor_contiguous_f64, log_scalar,
-        log_softmax_dim_tensor_contiguous_f64, log_tensor_contiguous_f64, log1p_scalar,
-        log1p_tensor_contiguous_f64, log2_scalar, log2_tensor_contiguous_f64, log10_scalar,
-        log10_tensor_contiguous_f64, lt_scalar, lt_tensor_contiguous_f64,
-        masked_fill_tensor_contiguous_f64, matmul_tensor_contiguous_f64,
+        bmm_tensor_contiguous_f64, cat_tensor_contiguous_f64, ceil_scalar,
+        ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar,
+        cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64, div_scalar,
+        div_tensor_contiguous_f64, eq_scalar, eq_tensor_contiguous_f64, exp_scalar,
+        exp_tensor_contiguous_f64, expand_tensor_contiguous_f64, expm1_scalar,
+        expm1_tensor_contiguous_f64, floor_scalar, floor_tensor_contiguous_f64,
+        gather_tensor_contiguous_f64, ge_scalar, ge_tensor_contiguous_f64, gelu_scalar,
+        gelu_tensor_contiguous_f64, gt_scalar, gt_tensor_contiguous_f64,
+        index_select_tensor_contiguous_f64, le_scalar, le_tensor_contiguous_f64, leaky_relu_scalar,
+        leaky_relu_tensor_contiguous_f64, log_scalar, log_softmax_dim_tensor_contiguous_f64,
+        log_tensor_contiguous_f64, log1p_scalar, log1p_tensor_contiguous_f64, log2_scalar,
+        log2_tensor_contiguous_f64, log10_scalar, log10_tensor_contiguous_f64, lt_scalar,
+        lt_tensor_contiguous_f64, masked_fill_tensor_contiguous_f64, matmul_tensor_contiguous_f64,
         max_dim_tensor_contiguous_f64, max_scalar, max_tensor_contiguous_f64,
         mean_dim_tensor_contiguous_f64, mean_tensor_contiguous_f64, min_dim_tensor_contiguous_f64,
         min_scalar, min_tensor_contiguous_f64, mul_scalar, mul_tensor_contiguous_f64,
         narrow_tensor_contiguous_f64, ne_scalar, ne_tensor_contiguous_f64, neg_scalar,
-        neg_tensor_contiguous_f64, pow_scalar, pow_tensor_contiguous_f64,
-        prod_dim_tensor_contiguous_f64, reciprocal_scalar, reciprocal_tensor_contiguous_f64,
-        relu_scalar, relu_tensor_contiguous_f64, scatter_tensor_contiguous_f64, sigmoid_scalar,
-        sigmoid_tensor_contiguous_f64, sign_scalar, sign_tensor_contiguous_f64, silu_scalar,
-        silu_tensor_contiguous_f64, sinh_scalar, sinh_tensor_contiguous_f64,
-        softmax_dim_tensor_contiguous_f64, sqrt_scalar, sqrt_tensor_contiguous_f64,
-        stack_tensor_contiguous_f64, std_dim_tensor_contiguous_f64, sub_scalar,
-        sub_tensor_contiguous_f64, sum_dim_tensor_contiguous_f64, sum_tensor_contiguous_f64,
-        tanh_scalar, tanh_tensor_contiguous_f64, trunc_scalar, trunc_tensor_contiguous_f64,
-        var_dim_tensor_contiguous_f64,
+        neg_tensor_contiguous_f64, outer_tensor_contiguous_f64, pow_scalar,
+        pow_tensor_contiguous_f64, prod_dim_tensor_contiguous_f64, reciprocal_scalar,
+        reciprocal_tensor_contiguous_f64, relu_scalar, relu_tensor_contiguous_f64,
+        scatter_tensor_contiguous_f64, sigmoid_scalar, sigmoid_tensor_contiguous_f64, sign_scalar,
+        sign_tensor_contiguous_f64, silu_scalar, silu_tensor_contiguous_f64, sinh_scalar,
+        sinh_tensor_contiguous_f64, softmax_dim_tensor_contiguous_f64, sqrt_scalar,
+        sqrt_tensor_contiguous_f64, stack_tensor_contiguous_f64, std_dim_tensor_contiguous_f64,
+        sub_scalar, sub_tensor_contiguous_f64, sum_dim_tensor_contiguous_f64,
+        sum_tensor_contiguous_f64, tanh_scalar, tanh_tensor_contiguous_f64, trunc_scalar,
+        trunc_tensor_contiguous_f64, var_dim_tensor_contiguous_f64,
     };
 
     #[test]
@@ -2957,6 +3121,46 @@ mod tests {
         let err = matmul_tensor_contiguous_f64(&lhs, &rhs, &lhs_meta, &rhs_meta)
             .expect_err("inner-dimension mismatch must fail closed");
         assert!(matches!(err, KernelError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn matmul_tensor_contiguous_rejects_output_shape_overflow() {
+        let lhs_meta = TensorMeta::from_shape(vec![usize::MAX, 1], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![1, 2], DType::F64, Device::Cpu);
+        let err = matmul_tensor_contiguous_f64(&[], &[], &lhs_meta, &rhs_meta)
+            .expect_err("output shape multiplication overflow must fail closed");
+        assert!(matches!(
+            err,
+            KernelError::ShapeOverflow {
+                context: "matmul output shape multiplication overflow"
+            }
+        ));
+    }
+
+    #[test]
+    fn outer_tensor_contiguous_rejects_output_shape_overflow() {
+        let lhs_meta = TensorMeta::from_shape(vec![usize::MAX], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let err = outer_tensor_contiguous_f64(&[], &[], &lhs_meta, &rhs_meta)
+            .expect_err("output shape multiplication overflow must fail closed");
+        assert!(
+            matches!(err, KernelError::ShapeOverflow { .. }),
+            "unexpected error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn bmm_tensor_contiguous_rejects_output_shape_overflow() {
+        let lhs_meta = TensorMeta::from_shape(vec![1, usize::MAX, 1], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![1, 1, 2], DType::F64, Device::Cpu);
+        let err = bmm_tensor_contiguous_f64(&[], &[], &lhs_meta, &rhs_meta)
+            .expect_err("output shape multiplication overflow must fail closed");
+        assert!(matches!(
+            err,
+            KernelError::ShapeOverflow {
+                context: "bmm output batch stride overflow"
+            }
+        ));
     }
 
     #[test]
@@ -3931,6 +4135,14 @@ mod tests {
         let meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
         let input = vec![1.0, 2.0, 3.0, 4.0];
         let result = index_select_tensor_contiguous_f64(&input, &meta, 0, &[f64::NAN]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn index_select_huge_index_returns_error() {
+        let meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let result = index_select_tensor_contiguous_f64(&input, &meta, 0, &[1.0e300]);
         assert!(result.is_err());
     }
 
