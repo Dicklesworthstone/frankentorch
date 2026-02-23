@@ -1273,16 +1273,19 @@ impl FrankenTorchSession {
             )));
         };
 
-        let dim_size_f = dim_size as f64;
+        let dim_size_i = isize::try_from(dim_size).map_err(|_| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index operation dimension is out of range for platform isize",
+                },
+            ))
+        })?;
         for &idx in index_values {
-            if !idx.is_finite() || idx.fract().abs() > f64::EPSILON {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "index tensors must contain finite integer values",
-                    },
-                )));
-            }
-            if idx < -dim_size_f || idx >= dim_size_f {
+            let idx_i = Self::exact_integer_index_to_isize(
+                idx,
+                "index tensors must contain finite integer values",
+            )?;
+            if idx_i < -dim_size_i || idx_i >= dim_size_i {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
                         reason: "index tensor value out of bounds for input dimension",
@@ -1731,6 +1734,64 @@ impl FrankenTorchSession {
                 },
             ))
         })
+    }
+
+    fn exact_integer_index_to_isize(
+        value: f64,
+        invalid_reason: &'static str,
+    ) -> Result<isize, AutogradError> {
+        if !value.is_finite() || value.trunc() != value {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                },
+            )));
+        }
+        if value < isize::MIN as f64 || value > isize::MAX as f64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                },
+            )));
+        }
+        let converted = value as isize;
+        if converted as f64 != value {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                },
+            )));
+        }
+        Ok(converted)
+    }
+
+    fn exact_nonnegative_index_to_usize(
+        value: f64,
+        invalid_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        if !value.is_finite() || value < 0.0 || value.trunc() != value {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                },
+            )));
+        }
+        if value > usize::MAX as f64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                },
+            )));
+        }
+        let converted = value as usize;
+        if converted as f64 != value {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: invalid_reason,
+                },
+            )));
+        }
+        Ok(converted)
     }
 
     fn validate_tensor_in_place_binary_compatibility(
@@ -2401,15 +2462,10 @@ impl FrankenTorchSession {
 
         // Validate target indices
         for &target in &target_vals {
-            if !target.is_finite() || target < 0.0 || target.fract().abs() > f64::EPSILON {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "nll_loss targets must be finite non-negative integer indices",
-                    },
-                )));
-            }
-
-            let cls = target as usize;
+            let cls = Self::exact_nonnegative_index_to_usize(
+                target,
+                "nll_loss targets must be finite non-negative integer indices",
+            )?;
             if cls >= num_classes {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -5641,6 +5697,19 @@ mod tests {
     }
 
     #[test]
+    fn session_tensor_index_select_rejects_tiny_fractional_indices() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("x");
+        let indices = session
+            .tensor_variable(vec![1e-20], vec![1], false)
+            .expect("indices");
+        let result = session.tensor_index_select(x, 0, indices);
+        assert!(result.is_err());
+    }
+
+    #[test]
     fn session_tensor_index_select_backward_scatter_add() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -6809,6 +6878,19 @@ mod tests {
             .expect("log_probs");
         let targets = session
             .tensor_variable(vec![1.5, 0.0], vec![2], false)
+            .expect("targets");
+        let result = session.nll_loss(log_probs, targets);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn session_nll_loss_rejects_tiny_fractional_targets() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let log_probs = session
+            .tensor_variable(vec![-2.0, -0.5, -1.5, -0.3, -2.0, -1.0], vec![2, 3], false)
+            .expect("log_probs");
+        let targets = session
+            .tensor_variable(vec![1e-20, 0.0], vec![2], false)
             .expect("targets");
         let result = session.nll_loss(log_probs, targets);
         assert!(result.is_err());
