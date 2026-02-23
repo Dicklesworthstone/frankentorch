@@ -6765,6 +6765,22 @@ mod tests {
         assert_eq!(y_grad, &[0.0, 1.0, 0.0]);
     }
 
+    #[test]
+    fn session_tensor_where_rejects_shape_mismatch() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let cond = session
+            .tensor_variable(vec![1.0, 0.0], vec![2], false)
+            .expect("cond");
+        let x = session
+            .tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false)
+            .expect("x");
+        let y = session
+            .tensor_variable(vec![-1.0, -2.0, -3.0], vec![3], false)
+            .expect("y");
+        let result = session.tensor_where(cond, x, y);
+        assert!(result.is_err());
+    }
+
     // ---- nll_loss ----
 
     #[test]

@@ -5558,15 +5558,44 @@ impl TensorTape {
             let cond_node = self.node(condition)?;
             let x_node = self.node(x)?;
             let y_node = self.node(y)?;
-            let meta = x_node.tensor.meta().clone();
+            let cond_meta = cond_node.tensor.meta();
+            let x_meta = x_node.tensor.meta();
+            let y_meta = y_node.tensor.meta();
+            if cond_meta.shape() != x_meta.shape() || y_meta.shape() != x_meta.shape() {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "where requires condition, x, and y to have the same shape",
+                    }
+                    .into(),
+                ));
+            }
+            if cond_meta.dtype() != x_meta.dtype() || y_meta.dtype() != x_meta.dtype() {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "where requires condition, x, and y to have matching dtypes",
+                    }
+                    .into(),
+                ));
+            }
+            if cond_meta.device() != x_meta.device() || y_meta.device() != x_meta.device() {
+                return Err(AutogradError::Dispatch(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "where requires condition, x, and y to be on the same device",
+                    }
+                    .into(),
+                ));
+            }
             let requires_grad = x_node.requires_grad || y_node.requires_grad;
-            let values = where_tensor_contiguous_f64(
-                cond_node.tensor.storage(),
-                x_node.tensor.storage(),
-                y_node.tensor.storage(),
-                &meta,
-            )
-            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let cond_values = cond_node.tensor.contiguous_values()?;
+            let x_values = x_node.tensor.contiguous_values()?;
+            let y_values = y_node.tensor.contiguous_values()?;
+            let meta = ft_core::TensorMeta::from_shape(
+                x_meta.shape().to_vec(),
+                x_meta.dtype(),
+                x_meta.device(),
+            );
+            let values = where_tensor_contiguous_f64(cond_values, x_values, y_values, &meta)
+                .map_err(|e| AutogradError::Dispatch(e.into()))?;
             let output_shape = meta.shape().to_vec();
             (
                 values,
@@ -6551,6 +6580,8 @@ impl TensorTape {
         let strides = ft_core::contiguous_strides(&shape);
         let ndim = shape.len();
         let dim_size = shape[dim];
+        let dim_size_i = isize::try_from(dim_size)
+            .map_err(|_| Self::shape_overflow_error("roll dimension size exceeds isize range"))?;
         let mut result = vec![0.0; numel];
 
         if dim_size > 0 {
@@ -6562,10 +6593,10 @@ impl TensorTape {
                     remaining %= strides[d];
                 }
 
-                let old_coord = coords[dim] as isize;
-                let new_coord = ((old_coord + shift) % dim_size as isize + dim_size as isize)
-                    as usize
-                    % dim_size;
+                let old_coord = isize::try_from(coords[dim]).map_err(|_| {
+                    Self::shape_overflow_error("roll coordinate exceeds isize range")
+                })?;
+                let new_coord = ((old_coord + shift) % dim_size_i + dim_size_i) as usize % dim_size;
                 coords[dim] = new_coord;
 
                 let mut dst_flat = 0;
@@ -7739,9 +7770,17 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     let reduce_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "sum_dim backward shape volume overflow",
+                    )?;
+                    let expected_incoming = Self::checked_mul_usize(
+                        outer_size,
+                        inner_size,
+                        "sum_dim backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let mut sum_dim_contrib = vec![0.0; input_numel];
 
                     for outer in 0..outer_size {
@@ -7770,9 +7809,17 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     let reduce_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "mean_dim backward shape volume overflow",
+                    )?;
+                    let expected_incoming = Self::checked_mul_usize(
+                        outer_size,
+                        inner_size,
+                        "mean_dim backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let scale = if reduce_size > 0 {
                         1.0 / reduce_size as f64
                     } else {
@@ -7810,9 +7857,17 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     let reduce_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "prod_dim backward shape volume overflow",
+                    )?;
+                    let expected_incoming = Self::checked_mul_usize(
+                        outer_size,
+                        inner_size,
+                        "prod_dim backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let input_values = self.nodes[input.0].tensor.contiguous_values()?;
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
                     let mut prod_dim_contrib = vec![0.0; input_numel];
@@ -7867,9 +7922,17 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     let reduce_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "var_dim backward shape volume overflow",
+                    )?;
+                    let expected_incoming = Self::checked_mul_usize(
+                        outer_size,
+                        inner_size,
+                        "var_dim backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let input_values = self.nodes[input.0].tensor.contiguous_values()?;
                     let correction = if reduce_size > 1 {
                         (reduce_size - 1) as f64
@@ -7911,9 +7974,17 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     let reduce_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "std_dim backward shape volume overflow",
+                    )?;
+                    let expected_incoming = Self::checked_mul_usize(
+                        outer_size,
+                        inner_size,
+                        "std_dim backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let input_values = self.nodes[input.0].tensor.contiguous_values()?;
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
                     let correction = if reduce_size > 1 {
@@ -7960,9 +8031,12 @@ impl TensorTape {
                     // Backward of cumsum is reverse cumsum of the incoming gradient
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let dim_size = shape[dim];
-                    let outer_size: usize = shape[..dim].iter().product();
-                    let inner_size: usize = shape[dim + 1..].iter().product();
-                    let input_numel: usize = shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        shape.as_slice(),
+                        dim,
+                        "cumsum backward shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
                     let mut cumsum_grad = vec![0.0; input_numel];
 
                     for outer in 0..outer_size {
@@ -7989,9 +8063,12 @@ impl TensorTape {
                     // Backward of cumprod uses: grad_input[i] = sum_{j>=i} grad_output[j] * output[j] / input[i]
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let dim_size = shape[dim];
-                    let outer_size: usize = shape[..dim].iter().product();
-                    let inner_size: usize = shape[dim + 1..].iter().product();
-                    let input_numel: usize = shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        shape.as_slice(),
+                        dim,
+                        "cumprod backward shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
                     let input_values = self.nodes[input.0].tensor.contiguous_values()?;
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
                     let mut cumprod_grad = vec![0.0; input_numel];
@@ -8047,6 +8124,7 @@ impl TensorTape {
                     // Gradient flows to x where condition is true, to y where condition is false
                     let cond_vals = self.nodes[condition.0].tensor.contiguous_values()?;
                     let numel = incoming.len();
+                    Self::ensure_tensor_len(condition, numel, cond_vals.len())?;
 
                     let mut x_grad = vec![0.0; numel];
                     let mut y_grad = vec![0.0; numel];
@@ -8086,12 +8164,14 @@ impl TensorTape {
                         )));
                     }
                     // Scatter incoming gradient back to original positions
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "sort backward shape volume overflow",
+                    )?;
                     Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
                     Self::ensure_tensor_len(node_id, input_numel, indices.len())?;
                     let dim_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
                     let mut grad_input = vec![0.0; input_numel];
 
                     for outer in 0..outer_size {
@@ -8138,9 +8218,11 @@ impl TensorTape {
                         )));
                     }
                     // Scatter incoming gradient back to original positions
-                    let input_numel: usize = input_shape.iter().product();
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "topk backward shape volume overflow",
+                    )?;
                     let input_dim_size = input_shape[dim];
                     if k > input_dim_size {
                         return Err(AutogradError::Dispatch(DispatchError::Kernel(
@@ -8150,7 +8232,15 @@ impl TensorTape {
                             },
                         )));
                     }
-                    let expected_out_numel = outer_size * k * inner_size;
+                    let expected_out_numel = Self::checked_mul_usize(
+                        Self::checked_mul_usize(
+                            outer_size,
+                            k,
+                            "topk backward shape multiplication overflow",
+                        )?,
+                        inner_size,
+                        "topk backward shape multiplication overflow",
+                    )?;
                     Self::ensure_tensor_len(node_id, expected_out_numel, incoming.len())?;
                     Self::ensure_tensor_len(node_id, expected_out_numel, indices.len())?;
                     let mut grad_input = vec![0.0; input_numel];
@@ -8189,9 +8279,13 @@ impl TensorTape {
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let reduce_size = shape[dim];
-                    let outer_size: usize = shape[..dim].iter().product();
-                    let inner_size: usize = shape[dim + 1..].iter().product();
-                    let input_numel: usize = shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        shape.as_slice(),
+                        dim,
+                        "softmax backward shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
+                    Self::ensure_tensor_len(node_id, input_numel, output_values.len())?;
                     let mut softmax_contrib = vec![0.0; input_numel];
 
                     // grad_input_i = output_i * (grad_i - sum_j(grad_j * output_j))
@@ -8222,9 +8316,13 @@ impl TensorTape {
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values()?;
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let reduce_size = shape[dim];
-                    let outer_size: usize = shape[..dim].iter().product();
-                    let inner_size: usize = shape[dim + 1..].iter().product();
-                    let input_numel: usize = shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        shape.as_slice(),
+                        dim,
+                        "log_softmax backward shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
+                    Self::ensure_tensor_len(node_id, input_numel, output_values.len())?;
                     let mut logsoftmax_contrib = vec![0.0; input_numel];
 
                     // grad_input_i = grad_i - exp(output_i) * sum_j(grad_j)
@@ -8264,13 +8362,25 @@ impl TensorTape {
                 } => {
                     // Split gradient along the cat dimension
                     let shape = self.nodes[node_id.0].tensor.meta().shape().to_vec();
-                    let outer_size: usize = shape[..dim].iter().product();
-                    let inner_size: usize = shape[dim + 1..].iter().product();
+                    let (outer_size, inner_size, output_numel) = Self::checked_dim_loop_sizes(
+                        shape.as_slice(),
+                        dim,
+                        "cat backward shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, output_numel, incoming.len())?;
 
                     let mut offset = 0;
                     for (i, &input_id) in inputs.iter().enumerate() {
                         let cat_size = input_dim_sizes[i];
-                        let input_numel = cat_size * outer_size * inner_size;
+                        let input_numel = Self::checked_mul_usize(
+                            Self::checked_mul_usize(
+                                cat_size,
+                                outer_size,
+                                "cat backward shape multiplication overflow",
+                            )?,
+                            inner_size,
+                            "cat backward shape multiplication overflow",
+                        )?;
                         let mut contrib = vec![0.0; input_numel];
                         for outer in 0..outer_size {
                             for r in 0..cat_size {
@@ -8302,12 +8412,20 @@ impl TensorTape {
                 TensorNodeOp::Stack { ref inputs, dim } => {
                     // Slice gradient along the stacked dimension
                     let shape = self.nodes[node_id.0].tensor.meta().shape().to_vec();
-                    let outer_size: usize = shape[..dim].iter().product();
-                    let inner_size: usize = shape[dim + 1..].iter().product();
+                    let (outer_size, inner_size, output_numel) = Self::checked_dim_loop_sizes(
+                        shape.as_slice(),
+                        dim,
+                        "stack backward shape volume overflow",
+                    )?;
                     let num_inputs = inputs.len();
+                    Self::ensure_tensor_len(node_id, output_numel, incoming.len())?;
 
                     for (i, &input_id) in inputs.iter().enumerate() {
-                        let input_numel = outer_size * inner_size;
+                        let input_numel = Self::checked_mul_usize(
+                            outer_size,
+                            inner_size,
+                            "stack backward shape multiplication overflow",
+                        )?;
                         let mut contrib = vec![0.0; input_numel];
                         for outer in 0..outer_size {
                             for inner in 0..inner_size {
@@ -8386,12 +8504,24 @@ impl TensorTape {
                 } => {
                     // Backward: place the gradient into a zero tensor at the original
                     // positions, effectively zero-padding back to the original shape.
-                    let orig_numel: usize = original_shape.iter().product();
+                    let (outer_size, inner_size, orig_numel) = Self::checked_dim_loop_sizes(
+                        original_shape,
+                        dim,
+                        "narrow backward shape volume overflow",
+                    )?;
                     let mut contrib = vec![0.0; orig_numel];
                     let output_shape = self.nodes[node_id.0].tensor.meta().shape();
                     let length = output_shape[dim];
-                    let outer_size: usize = original_shape[..dim].iter().product();
-                    let inner_size: usize = original_shape[dim + 1..].iter().product();
+                    let expected_incoming = Self::checked_mul_usize(
+                        Self::checked_mul_usize(
+                            outer_size,
+                            length,
+                            "narrow backward shape multiplication overflow",
+                        )?,
+                        inner_size,
+                        "narrow backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let orig_dim_size = original_shape[dim];
 
                     for outer in 0..outer_size {
@@ -8423,8 +8553,15 @@ impl TensorTape {
                     // we reduce (sum) the gradient back along those dims.
                     let output_shape = self.nodes[node_id.0].tensor.meta().shape().to_vec();
                     let ndim = output_shape.len();
-                    let orig_numel: usize = original_shape.iter().product::<usize>();
-                    let out_numel: usize = output_shape.iter().product::<usize>();
+                    let orig_numel = Self::checked_shape_numel(
+                        original_shape,
+                        "expand backward input shape volume overflow",
+                    )?;
+                    let out_numel = Self::checked_shape_numel(
+                        output_shape.as_slice(),
+                        "expand backward output shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, out_numel, incoming.len())?;
                     let mut contrib = vec![0.0; orig_numel];
 
                     let grad_strides = ft_core::contiguous_strides(&output_shape);
@@ -8469,12 +8606,24 @@ impl TensorTape {
                 } => {
                     // Backward: place chunk gradient back into the original shape
                     // (same as narrow backward).
-                    let orig_numel: usize = original_shape.iter().product();
+                    let (outer_size, inner_size, orig_numel) = Self::checked_dim_loop_sizes(
+                        original_shape,
+                        dim,
+                        "split backward shape volume overflow",
+                    )?;
                     let mut contrib = vec![0.0; orig_numel];
                     let output_shape = self.nodes[node_id.0].tensor.meta().shape();
                     let length = output_shape[dim];
-                    let outer_size: usize = original_shape[..dim].iter().product();
-                    let inner_size: usize = original_shape[dim + 1..].iter().product();
+                    let expected_incoming = Self::checked_mul_usize(
+                        Self::checked_mul_usize(
+                            outer_size,
+                            length,
+                            "split backward shape multiplication overflow",
+                        )?,
+                        inner_size,
+                        "split backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let orig_dim_size = original_shape[dim];
 
                     for outer in 0..outer_size {
@@ -8514,10 +8663,19 @@ impl TensorTape {
                     } else {
                         "d(min_dim(x))/dx=scatter_grad_to_min_positions"
                     };
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "max/min backward shape volume overflow",
+                    )?;
                     let reduce_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
+                    let expected_out = Self::checked_mul_usize(
+                        outer_size,
+                        inner_size,
+                        "max/min backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_out, incoming.len())?;
+                    Self::ensure_tensor_len(node_id, expected_out, indices.len())?;
                     let mut contrib = vec![0.0; input_numel];
 
                     for outer in 0..outer_size {
@@ -8566,11 +8724,28 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     // Backward: scatter_add the gradient back to original positions.
-                    let input_numel: usize = input_shape.iter().product();
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "index_select backward shape volume overflow",
+                    )?;
                     let dim_size = input_shape[dim];
-                    let outer_size: usize = input_shape[..dim].iter().product();
-                    let inner_size: usize = input_shape[dim + 1..].iter().product();
+                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
+                        Self::shape_overflow_error(
+                            "index_select backward dimension size exceeds isize range",
+                        )
+                    })?;
                     let num_indices = indices.len();
+                    let expected_incoming = Self::checked_mul_usize(
+                        Self::checked_mul_usize(
+                            outer_size,
+                            num_indices,
+                            "index_select backward shape multiplication overflow",
+                        )?,
+                        inner_size,
+                        "index_select backward shape multiplication overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
                     let mut contrib = vec![0.0; input_numel];
 
                     for outer in 0..outer_size {
@@ -8585,9 +8760,9 @@ impl TensorTape {
                             }
                             let mut idx_i = idx_f as isize;
                             if idx_i < 0 {
-                                idx_i += dim_size as isize;
+                                idx_i += dim_size_i;
                             }
-                            if idx_i < 0 || idx_i >= dim_size as isize {
+                            if idx_i < 0 || idx_i >= dim_size_i {
                                 return Err(AutogradError::Dispatch(
                                     DispatchKeyError::IncompatibleSet {
                                         reason:
@@ -8623,11 +8798,24 @@ impl TensorTape {
                     ref input_shape,
                 } => {
                     // Backward: scatter gradient using the same index to original positions.
-                    let input_numel: usize = input_shape.iter().product();
+                    let input_numel = Self::checked_shape_numel(
+                        input_shape,
+                        "gather backward input shape volume overflow",
+                    )?;
                     let dim_size = input_shape[dim];
+                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
+                        Self::shape_overflow_error(
+                            "gather backward dimension size exceeds isize range",
+                        )
+                    })?;
                     let idx_dim_size = index_shape[dim];
-                    let outer_size: usize = index_shape[..dim].iter().product();
-                    let inner_size: usize = index_shape[dim + 1..].iter().product();
+                    let (outer_size, inner_size, index_numel) = Self::checked_dim_loop_sizes(
+                        index_shape,
+                        dim,
+                        "gather backward index shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, index_numel, incoming.len())?;
+                    Self::ensure_tensor_len(node_id, index_numel, index.len())?;
                     let mut contrib = vec![0.0; input_numel];
 
                     for outer in 0..outer_size {
@@ -8648,9 +8836,9 @@ impl TensorTape {
                                 }
                                 let mut selected_i = selected_f as isize;
                                 if selected_i < 0 {
-                                    selected_i += dim_size as isize;
+                                    selected_i += dim_size_i;
                                 }
-                                if selected_i < 0 || selected_i >= dim_size as isize {
+                                if selected_i < 0 || selected_i >= dim_size_i {
                                     return Err(AutogradError::Dispatch(
                                         DispatchKeyError::IncompatibleSet {
                                             reason:
@@ -8685,10 +8873,24 @@ impl TensorTape {
                     // Backward: gradient passes through for non-overwritten positions;
                     // overwritten positions get zero gradient w.r.t. input.
                     let mut contrib = incoming.to_vec();
+                    let input_numel = Self::checked_shape_numel(
+                        input_shape,
+                        "scatter backward input shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
                     let dim_size = input_shape[dim];
+                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
+                        Self::shape_overflow_error(
+                            "scatter backward dimension size exceeds isize range",
+                        )
+                    })?;
                     let idx_dim_size = index_shape[dim];
-                    let outer_size: usize = index_shape[..dim].iter().product();
-                    let inner_size: usize = index_shape[dim + 1..].iter().product();
+                    let (outer_size, inner_size, index_numel) = Self::checked_dim_loop_sizes(
+                        index_shape,
+                        dim,
+                        "scatter backward index shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, index_numel, index.len())?;
 
                     for outer in 0..outer_size {
                         for r in 0..idx_dim_size {
@@ -8708,9 +8910,9 @@ impl TensorTape {
                                 }
                                 let mut selected_i = selected_f as isize;
                                 if selected_i < 0 {
-                                    selected_i += dim_size as isize;
+                                    selected_i += dim_size_i;
                                 }
-                                if selected_i < 0 || selected_i >= dim_size as isize {
+                                if selected_i < 0 || selected_i >= dim_size_i {
                                     return Err(AutogradError::Dispatch(
                                         DispatchKeyError::IncompatibleSet {
                                             reason:
@@ -8826,6 +9028,11 @@ impl TensorTape {
                     let strides = ft_core::contiguous_strides(output_shape);
                     let ndim = output_shape.len();
                     let dim_size = output_shape[dim];
+                    let dim_size_i = isize::try_from(dim_size).map_err(|_| {
+                        Self::shape_overflow_error(
+                            "roll backward dimension size exceeds isize range",
+                        )
+                    })?;
                     let numel = incoming.len();
                     let mut contrib = vec![0.0; numel];
 
@@ -8837,11 +9044,13 @@ impl TensorTape {
                                 coords[d] = remaining / strides[d];
                                 remaining %= strides[d];
                             }
-                            let old_coord = coords[dim] as isize;
-                            let new_coord = ((old_coord - shift) % dim_size as isize
-                                + dim_size as isize)
-                                as usize
-                                % dim_size;
+                            let old_coord = isize::try_from(coords[dim]).map_err(|_| {
+                                Self::shape_overflow_error(
+                                    "roll backward coordinate exceeds isize range",
+                                )
+                            })?;
+                            let new_coord =
+                                ((old_coord - shift) % dim_size_i + dim_size_i) as usize % dim_size;
                             coords[dim] = new_coord;
                             let mut dst_flat = 0;
                             for d in 0..ndim {
@@ -9156,6 +9365,17 @@ impl TensorTape {
             product = next;
         }
         Ok(product)
+    }
+
+    fn checked_dim_loop_sizes(
+        shape: &[usize],
+        dim: usize,
+        overflow_reason: &'static str,
+    ) -> Result<(usize, usize, usize), AutogradError> {
+        let outer_size = Self::checked_shape_numel(&shape[..dim], overflow_reason)?;
+        let inner_size = Self::checked_shape_numel(&shape[dim + 1..], overflow_reason)?;
+        let total_size = Self::checked_shape_numel(shape, overflow_reason)?;
+        Ok((outer_size, inner_size, total_size))
     }
 
     fn checked_mul_usize(
