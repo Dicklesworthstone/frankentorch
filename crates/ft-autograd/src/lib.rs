@@ -5489,7 +5489,13 @@ impl TensorTape {
             )
             .map_err(|e| AutogradError::Dispatch(e.into()))?;
             let input_shape = meta.shape().to_vec();
-            (values, input_shape, meta.dtype(), meta.device(), requires_grad)
+            (
+                values,
+                input_shape,
+                meta.dtype(),
+                meta.device(),
+                requires_grad,
+            )
         };
 
         let index_owned = index.to_vec();
@@ -9625,11 +9631,9 @@ mod tests {
         let (sorted, _, _) = tape
             .sort(input, 0, false, ExecutionMode::Strict)
             .expect("sort should succeed");
-        match &mut tape.nodes[sorted.0].op {
-            TensorNodeOp::Sort { indices, .. } => {
-                indices[0] = 3;
-            }
-            other => panic!("expected sort node, got {other:?}"),
+        assert!(matches!(tape.nodes[sorted.0].op, TensorNodeOp::Sort { .. }));
+        if let TensorNodeOp::Sort { indices, .. } = &mut tape.nodes[sorted.0].op {
+            indices[0] = 3;
         }
 
         let err = tape
@@ -9677,11 +9681,9 @@ mod tests {
         let (topk, _, _) = tape
             .topk(input, 2, 0, true, true, ExecutionMode::Strict)
             .expect("topk should succeed");
-        match &mut tape.nodes[topk.0].op {
-            TensorNodeOp::TopK { indices, .. } => {
-                indices.pop();
-            }
-            other => panic!("expected topk node, got {other:?}"),
+        assert!(matches!(tape.nodes[topk.0].op, TensorNodeOp::TopK { .. }));
+        if let TensorNodeOp::TopK { indices, .. } = &mut tape.nodes[topk.0].op {
+            indices.pop();
         }
 
         let err = tape
