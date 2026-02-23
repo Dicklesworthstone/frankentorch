@@ -10020,6 +10020,63 @@ mod tests {
     }
 
     #[test]
+    fn tensor_where_with_offset_views_uses_each_operand_layout() {
+        let mut tape = TensorTape::new();
+        let cond = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu),
+            vec![1.0, 0.0, 1.0],
+        )
+        .expect("cond should build");
+        let x = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu).with_storage_offset(2),
+            vec![0.0, 0.0, 10.0, 20.0, 30.0],
+        )
+        .expect("x offset view should build");
+        let y = DenseTensor::from_storage(
+            TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu).with_storage_offset(1),
+            vec![0.0, -1.0, -2.0, -3.0],
+        )
+        .expect("y offset view should build");
+
+        let cond_node = tape.leaf_tensor(cond, false);
+        let x_node = tape.leaf_tensor(x, false);
+        let y_node = tape.leaf_tensor(y, false);
+
+        let out_node = tape
+            .tensor_where(cond_node, x_node, y_node)
+            .expect("where should succeed with offset views");
+        let out = tape.tensor(out_node).expect("output should resolve");
+        assert_eq!(
+            out.dispatch_values().expect("where output values"),
+            &[10.0, -2.0, 30.0]
+        );
+    }
+
+    #[test]
+    fn tensor_where_rejects_shape_mismatch_fail_closed() {
+        let mut tape = TensorTape::new();
+        let cond = tape
+            .leaf(vec![1.0, 0.0], vec![2], false)
+            .expect("cond should build");
+        let x = tape
+            .leaf(vec![10.0, 20.0, 30.0], vec![3], false)
+            .expect("x should build");
+        let y = tape
+            .leaf(vec![-1.0, -2.0, -3.0], vec![3], false)
+            .expect("y should build");
+
+        let err = tape
+            .tensor_where(cond, x, y)
+            .expect_err("shape mismatch must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
+                reason: "where requires condition, x, and y to have the same shape"
+            }))
+        ));
+    }
+
+    #[test]
     fn dependency_scheduler_waits_for_all_children() {
         let mut tape = Tape::new();
         let x = tape.leaf(2.0, true);
