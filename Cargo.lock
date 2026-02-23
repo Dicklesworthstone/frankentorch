@@ -336,6 +336,7 @@ dependencies = [
  "ft-api",
  "ft-autograd",
  "ft-core",
+ "ft-dispatch",
  "ft-kernel-cpu",
 ]
 
@@ -346,6 +347,7 @@ dependencies = [
  "ft-api",
  "ft-autograd",
  "ft-core",
+ "ft-dispatch",
  "ft-nn",
 ]
 
