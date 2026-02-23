@@ -147,11 +147,11 @@ impl TensorMeta {
         if self.shape.is_empty() {
             return 1;
         }
+        if self.shape.iter().copied().any(|dim| dim == 0) {
+            return 0;
+        }
         let mut product = 1usize;
         for dim in self.shape.iter().copied() {
-            if dim == 0 {
-                return 0;
-            }
             let Some(next) = product.checked_mul(dim) else {
                 return usize::MAX;
             };
