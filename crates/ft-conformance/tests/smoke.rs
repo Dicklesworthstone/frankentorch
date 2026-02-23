@@ -234,12 +234,12 @@ fn tensor_session_fails_closed_on_device_mismatch() {
         .expect_err("device-mismatched tensor input must fail closed");
     let message = err.to_string();
     assert!(
-        message.contains("incompatible dispatch keyset"),
+        message.contains("device mismatch"),
         "unexpected error: {message}"
     );
     assert!(
-        message.contains("AutogradCPU requires CPU backend availability"),
-        "missing keyset incompatibility reason: {message}"
+        message.contains("lhs=Cuda, rhs=Cpu"),
+        "missing device mismatch payload: {message}"
     );
 }
 
