@@ -2,6 +2,17 @@
 
 use ft_api::FrankenTorchSession;
 use ft_autograd::{AutogradError, TensorBackwardReport, TensorNodeId};
+use ft_dispatch::{DispatchError, DispatchKeyError};
+
+fn adam_bias_correction(beta: f64, step: u64) -> f64 {
+    1.0 - beta.powf(step as f64)
+}
+
+fn optimizer_hparam_error(reason: &'static str) -> AutogradError {
+    AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
+        reason,
+    }))
+}
 
 /// Trait for parameter optimizers.
 pub trait Optimizer {
@@ -65,6 +76,28 @@ impl SGD {
         self.nesterov = nesterov;
         self
     }
+
+    fn validate_hyperparams(&self) -> Result<(), AutogradError> {
+        if !self.lr.is_finite() || self.lr < 0.0 {
+            return Err(optimizer_hparam_error(
+                "sgd requires a finite non-negative learning rate",
+            ));
+        }
+        if !self.momentum.is_finite() || self.momentum < 0.0 {
+            return Err(optimizer_hparam_error(
+                "sgd requires finite non-negative momentum",
+            ));
+        }
+        if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
+            return Err(optimizer_hparam_error(
+                "sgd requires finite non-negative weight_decay",
+            ));
+        }
+        if self.nesterov && self.momentum == 0.0 {
+            return Err(optimizer_hparam_error("sgd nesterov requires momentum > 0"));
+        }
+        Ok(())
+    }
 }
 
 impl Optimizer for SGD {
@@ -73,6 +106,7 @@ impl Optimizer for SGD {
         session: &mut FrankenTorchSession,
         report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
+        self.validate_hyperparams()?;
         for (i, &param) in self.params.iter().enumerate() {
             let grad = match session.tensor_gradient(report, param) {
                 Some(g) => g.to_vec(),
@@ -192,6 +226,29 @@ impl Adam {
         self.weight_decay = weight_decay;
         self
     }
+
+    fn validate_hyperparams(&self) -> Result<(), AutogradError> {
+        if !self.lr.is_finite() || self.lr < 0.0 {
+            return Err(optimizer_hparam_error(
+                "adam requires a finite non-negative learning rate",
+            ));
+        }
+        if !self.beta1.is_finite() || !self.beta2.is_finite() {
+            return Err(optimizer_hparam_error("adam betas must be finite"));
+        }
+        if !(0.0..1.0).contains(&self.beta1) || !(0.0..1.0).contains(&self.beta2) {
+            return Err(optimizer_hparam_error("adam betas must be in [0, 1)"));
+        }
+        if !self.eps.is_finite() || self.eps <= 0.0 {
+            return Err(optimizer_hparam_error("adam requires finite eps > 0"));
+        }
+        if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
+            return Err(optimizer_hparam_error(
+                "adam requires finite non-negative weight_decay",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Optimizer for Adam {
@@ -200,6 +257,7 @@ impl Optimizer for Adam {
         session: &mut FrankenTorchSession,
         report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
+        self.validate_hyperparams()?;
         self.step_count += 1;
         let t = self.step_count;
 
@@ -232,8 +290,8 @@ impl Optimizer for Adam {
             }
 
             // Bias-corrected estimates
-            let bias_correction1 = 1.0 - self.beta1.powi(t as i32);
-            let bias_correction2 = 1.0 - self.beta2.powi(t as i32);
+            let bias_correction1 = adam_bias_correction(self.beta1, t);
+            let bias_correction2 = adam_bias_correction(self.beta2, t);
 
             // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
             let update: Vec<f64> = m
@@ -316,6 +374,29 @@ impl AdamW {
         self.weight_decay = weight_decay;
         self
     }
+
+    fn validate_hyperparams(&self) -> Result<(), AutogradError> {
+        if !self.lr.is_finite() || self.lr < 0.0 {
+            return Err(optimizer_hparam_error(
+                "adamw requires a finite non-negative learning rate",
+            ));
+        }
+        if !self.beta1.is_finite() || !self.beta2.is_finite() {
+            return Err(optimizer_hparam_error("adamw betas must be finite"));
+        }
+        if !(0.0..1.0).contains(&self.beta1) || !(0.0..1.0).contains(&self.beta2) {
+            return Err(optimizer_hparam_error("adamw betas must be in [0, 1)"));
+        }
+        if !self.eps.is_finite() || self.eps <= 0.0 {
+            return Err(optimizer_hparam_error("adamw requires finite eps > 0"));
+        }
+        if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
+            return Err(optimizer_hparam_error(
+                "adamw requires finite non-negative weight_decay",
+            ));
+        }
+        Ok(())
+    }
 }
 
 impl Optimizer for AdamW {
@@ -324,6 +405,7 @@ impl Optimizer for AdamW {
         session: &mut FrankenTorchSession,
         report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
+        self.validate_hyperparams()?;
         self.step_count += 1;
         let t = self.step_count;
 
@@ -368,8 +450,8 @@ impl Optimizer for AdamW {
             }
 
             // Bias-corrected estimates
-            let bias_correction1 = 1.0 - self.beta1.powi(t as i32);
-            let bias_correction2 = 1.0 - self.beta2.powi(t as i32);
+            let bias_correction1 = adam_bias_correction(self.beta1, t);
+            let bias_correction2 = adam_bias_correction(self.beta2, t);
 
             // Compute Adam update: lr * m_hat / (sqrt(v_hat) + eps)
             let update: Vec<f64> = m
@@ -502,6 +584,54 @@ mod tests {
         optimizer
             .zero_grad(&mut session)
             .expect("zero_grad should succeed");
+    }
+
+    #[test]
+    fn sgd_rejects_negative_learning_rate() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = SGD::new(vec![x], -0.1);
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("negative lr must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "sgd requires a finite non-negative learning rate"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn sgd_nesterov_requires_positive_momentum() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = SGD::new(vec![x], 0.1).nesterov(true);
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("nesterov without momentum must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "sgd nesterov requires momentum > 0"
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -726,6 +856,80 @@ mod tests {
             x_val < 4.0,
             "Adam with large eps should still decrease x, got {}",
             x_val
+        );
+    }
+
+    #[test]
+    fn adam_rejects_invalid_betas() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = Adam::new(vec![x], 0.1).betas(1.0, 0.999);
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("invalid betas must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "adam betas must be in [0, 1)"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn adam_rejects_non_positive_eps() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = Adam::new(vec![x], 0.1).eps(0.0);
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("eps <= 0 must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "adam requires finite eps > 0"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn adam_large_step_count_still_updates_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = Adam::new(vec![x], 0.1);
+        optimizer.step_count = i32::MAX as u64;
+
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let x_before = session.tensor_values(x).expect("values")[0];
+        optimizer.step(&mut session, &report).expect("step");
+        let x_after = session.tensor_values(x).expect("values")[0];
+
+        assert!(x_after.is_finite(), "update produced non-finite parameter");
+        assert!(
+            x_after < x_before,
+            "Adam should still update for large step_count: before={}, after={}",
+            x_before,
+            x_after
         );
     }
 
@@ -1148,6 +1352,32 @@ mod tests {
     }
 
     #[test]
+    fn adamw_large_step_count_still_updates_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = AdamW::new(vec![x], 0.1);
+        optimizer.step_count = i32::MAX as u64;
+
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let x_before = session.tensor_values(x).expect("values")[0];
+        optimizer.step(&mut session, &report).expect("step");
+        let x_after = session.tensor_values(x).expect("values")[0];
+
+        assert!(x_after.is_finite(), "update produced non-finite parameter");
+        assert!(
+            x_after < x_before,
+            "AdamW should still update for large step_count: before={}, after={}",
+            x_before,
+            x_after
+        );
+    }
+
+    #[test]
     fn adamw_decoupled_weight_decay_differs_from_adam_l2() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
 
@@ -1269,6 +1499,30 @@ mod tests {
             "AdamW with custom betas should decrease x, got {}",
             x_val
         );
+    }
+
+    #[test]
+    fn adamw_rejects_negative_weight_decay() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = AdamW::new(vec![x], 0.1).weight_decay(-0.1);
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("negative weight decay must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "adamw requires finite non-negative weight_decay"
+                }
+            ))
+        ));
     }
 
     #[test]

@@ -8,6 +8,7 @@ license-file = "../../LICENSE"
 ft-core = { workspace = true }
 ft-api = { workspace = true }
 ft-autograd = { workspace = true }
+ft-dispatch = { workspace = true }
 
 [dev-dependencies]
 ft-nn = { workspace = true }
