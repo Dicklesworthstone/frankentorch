@@ -8,7 +8,7 @@ use ft_autograd::{
     TensorScanDimOperationEvent, TensorSortOperationEvent, TensorTape, TensorTopKOperationEvent,
     TensorUnaryOperationEvent, UnaryOperationEvent,
 };
-use ft_core::{DenseTensor, ExecutionMode, TensorMeta};
+use ft_core::{DenseTensor, ExecutionMode, TensorCompatError, TensorMeta};
 use ft_dispatch::{
     ComparisonDispatchDecision, ComparisonOp, dispatch_scalar_comparison,
     dispatch_tensor_comparison_contiguous_f64,
@@ -366,7 +366,8 @@ impl FrankenTorchSession {
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in zeros")?;
         self.tensor_tape
             .leaf(vec![0.0; numel], shape, requires_grad)
     }
@@ -376,7 +377,8 @@ impl FrankenTorchSession {
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in ones")?;
         self.tensor_tape
             .leaf(vec![1.0; numel], shape, requires_grad)
     }
@@ -387,7 +389,8 @@ impl FrankenTorchSession {
         fill_value: f64,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in full")?;
         self.tensor_tape
             .leaf(vec![fill_value; numel], shape, requires_grad)
     }
@@ -399,6 +402,13 @@ impl FrankenTorchSession {
         step: f64,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
+        if !start.is_finite() || !end.is_finite() || !step.is_finite() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "arange: start/end/step must be finite",
+                },
+            )));
+        }
         if step == 0.0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -411,12 +421,28 @@ impl FrankenTorchSession {
         if step > 0.0 {
             while current < end {
                 values.push(current);
-                current += step;
+                let next = current + step;
+                if next <= current {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "arange: step does not advance at current floating-point precision",
+                        },
+                    )));
+                }
+                current = next;
             }
         } else {
             while current > end {
                 values.push(current);
-                current += step;
+                let next = current + step;
+                if next >= current {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "arange: step does not advance at current floating-point precision",
+                        },
+                    )));
+                }
+                current = next;
             }
         }
         let n = values.len();
@@ -425,7 +451,8 @@ impl FrankenTorchSession {
 
     /// Create a 2-D identity matrix of size n x n.
     pub fn eye(&mut self, n: usize, requires_grad: bool) -> Result<TensorNodeId, AutogradError> {
-        let mut values = vec![0.0; n * n];
+        let numel = Self::checked_square_numel(n, "eye shape volume overflow")?;
+        let mut values = vec![0.0; numel];
         for i in 0..n {
             values[i * n + i] = 1.0;
         }
@@ -443,7 +470,9 @@ impl FrankenTorchSession {
             1 => {
                 // 1-D -> 2-D diagonal matrix: multiply input (broadcast) with identity mask
                 let n = shape[0];
-                let mut eye_data = vec![0.0; n * n];
+                let numel =
+                    Self::checked_square_numel(n, "diag shape volume overflow for matrix output")?;
+                let mut eye_data = vec![0.0; numel];
                 for i in 0..n {
                     eye_data[i * n + i] = 1.0;
                 }
@@ -491,7 +520,14 @@ impl FrankenTorchSession {
         }
         let m = shape[0];
         let n = shape[1];
-        let mut mask = vec![0.0; m * n];
+        let numel = m.checked_mul(n).ok_or({
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "triu shape volume overflow",
+                },
+            ))
+        })?;
+        let mut mask = vec![0.0; numel];
         for i in 0..m {
             for j in 0..n {
                 if j as i64 >= i as i64 + k {
@@ -517,7 +553,14 @@ impl FrankenTorchSession {
         }
         let m = shape[0];
         let n = shape[1];
-        let mut mask = vec![0.0; m * n];
+        let numel = m.checked_mul(n).ok_or({
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tril shape volume overflow",
+                },
+            ))
+        })?;
+        let mut mask = vec![0.0; numel];
         for i in 0..m {
             for j in 0..n {
                 if j as i64 <= i as i64 + k {
@@ -535,7 +578,8 @@ impl FrankenTorchSession {
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in rand")?;
         let values: Vec<f64> = (0..numel).map(|_| self.rng.next_f64()).collect();
         self.tensor_tape.leaf(values, shape, requires_grad)
     }
@@ -546,7 +590,8 @@ impl FrankenTorchSession {
         shape: Vec<usize>,
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in randn")?;
         let values: Vec<f64> = (0..numel).map(|_| self.rng.next_normal()).collect();
         self.tensor_tape.leaf(values, shape, requires_grad)
     }
@@ -559,7 +604,8 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let meta = self.tensor_tape.tensor_meta(other)?.clone();
         let shape = meta.shape().to_vec();
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in rand_like")?;
         let values: Vec<f64> = (0..numel).map(|_| self.rng.next_f64()).collect();
         let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
         Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
@@ -573,7 +619,10 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let meta = self.tensor_tape.tensor_meta(other)?.clone();
         let shape = meta.shape().to_vec();
-        let numel = shape.iter().product::<usize>();
+        let numel = Self::checked_shape_numel(
+            &shape,
+            "tensor factory shape volume overflow in randn_like",
+        )?;
         let values: Vec<f64> = (0..numel).map(|_| self.rng.next_normal()).collect();
         let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
         Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
@@ -608,7 +657,8 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let meta = self.tensor_tape.tensor_meta(other)?.clone();
         let shape = meta.shape().to_vec();
-        let numel = shape.iter().product::<usize>();
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in full_like")?;
         let values = vec![fill_value; numel];
         let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
         Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
@@ -665,7 +715,14 @@ impl FrankenTorchSession {
         shift: i64,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.tensor_tape.roll(input, shift as isize, dim)
+        let shift = isize::try_from(shift).map_err(|_| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_roll shift is out of range for platform isize",
+                },
+            ))
+        })?;
+        self.tensor_tape.roll(input, shift, dim)
     }
 
     pub fn tensor_add(
@@ -1433,16 +1490,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
-        let target_shape = self.tensor_shape(target)?;
-        let other_shape = self.tensor_shape(other)?;
-        if target_shape != other_shape {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                ft_kernel_cpu::KernelError::ShapeMismatch {
-                    lhs: target_shape,
-                    rhs: other_shape,
-                },
-            )));
-        }
+        self.validate_tensor_in_place_binary_compatibility(target, other)?;
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1450,7 +1498,9 @@ impl FrankenTorchSession {
             .zip(other_vals.iter())
             .map(|(a, b)| a - b)
             .collect();
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation("sub_", target, Some(format!("other={}", other.0)));
+        Ok(())
     }
 
     /// In-place addition: target = target + other.
@@ -1459,16 +1509,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
-        let target_shape = self.tensor_shape(target)?;
-        let other_shape = self.tensor_shape(other)?;
-        if target_shape != other_shape {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                ft_kernel_cpu::KernelError::ShapeMismatch {
-                    lhs: target_shape,
-                    rhs: other_shape,
-                },
-            )));
-        }
+        self.validate_tensor_in_place_binary_compatibility(target, other)?;
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1476,7 +1517,9 @@ impl FrankenTorchSession {
             .zip(other_vals.iter())
             .map(|(a, b)| a + b)
             .collect();
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation("add_", target, Some(format!("other={}", other.0)));
+        Ok(())
     }
 
     /// In-place multiplication: target = target * other.
@@ -1485,16 +1528,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
-        let target_shape = self.tensor_shape(target)?;
-        let other_shape = self.tensor_shape(other)?;
-        if target_shape != other_shape {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                ft_kernel_cpu::KernelError::ShapeMismatch {
-                    lhs: target_shape,
-                    rhs: other_shape,
-                },
-            )));
-        }
+        self.validate_tensor_in_place_binary_compatibility(target, other)?;
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1502,7 +1536,9 @@ impl FrankenTorchSession {
             .zip(other_vals.iter())
             .map(|(a, b)| a * b)
             .collect();
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation("mul_", target, Some(format!("other={}", other.0)));
+        Ok(())
     }
 
     /// In-place division: target = target / other.
@@ -1511,16 +1547,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
-        let target_shape = self.tensor_shape(target)?;
-        let other_shape = self.tensor_shape(other)?;
-        if target_shape != other_shape {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
-                ft_kernel_cpu::KernelError::ShapeMismatch {
-                    lhs: target_shape,
-                    rhs: other_shape,
-                },
-            )));
-        }
+        self.validate_tensor_in_place_binary_compatibility(target, other)?;
         let target_vals = self.tensor_tape.values(target)?;
         let other_vals = self.tensor_tape.values(other)?;
         let new_values: Vec<f64> = target_vals
@@ -1528,14 +1555,18 @@ impl FrankenTorchSession {
             .zip(other_vals.iter())
             .map(|(a, b)| a / b)
             .collect();
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation("div_", target, Some(format!("other={}", other.0)));
+        Ok(())
     }
 
     /// In-place zero: target = zeros.
     pub fn tensor_zero_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
         let target_vals = self.tensor_tape.values(target)?;
         let new_values = vec![0.0; target_vals.len()];
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation("zero_", target, None);
+        Ok(())
     }
 
     /// In-place fill: target = fill_value.
@@ -1546,7 +1577,13 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         let target_vals = self.tensor_tape.values(target)?;
         let new_values = vec![fill_value; target_vals.len()];
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation(
+            "fill_",
+            target,
+            Some(format!("fill_value={fill_value}")),
+        );
+        Ok(())
     }
 
     /// In-place scalar multiplication: target = target * scalar.
@@ -1557,7 +1594,13 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         let target_vals = self.tensor_tape.values(target)?;
         let new_values: Vec<f64> = target_vals.iter().map(|v| v * scalar).collect();
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation(
+            "mul_scalar_",
+            target,
+            Some(format!("scalar={scalar}")),
+        );
+        Ok(())
     }
 
     /// In-place scalar addition: target = target + scalar.
@@ -1568,7 +1611,13 @@ impl FrankenTorchSession {
     ) -> Result<(), AutogradError> {
         let target_vals = self.tensor_tape.values(target)?;
         let new_values: Vec<f64> = target_vals.iter().map(|v| v + scalar).collect();
-        self.tensor_tape.update_tensor_values(target, new_values)
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation(
+            "add_scalar_",
+            target,
+            Some(format!("scalar={scalar}")),
+        );
+        Ok(())
     }
 
     pub fn backward(&mut self, root: NodeId) -> Result<BackwardReport, AutogradError> {
@@ -1650,6 +1699,68 @@ impl FrankenTorchSession {
         self.runtime.ledger().len()
     }
 
+    fn checked_shape_numel(
+        shape: &[usize],
+        overflow_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        shape.iter().copied().try_fold(1usize, |acc, dim| {
+            acc.checked_mul(dim).ok_or({
+                AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: overflow_reason,
+                    },
+                ))
+            })
+        })
+    }
+
+    fn checked_square_numel(
+        n: usize,
+        overflow_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        n.checked_mul(n).ok_or({
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: overflow_reason,
+                },
+            ))
+        })
+    }
+
+    fn validate_tensor_in_place_binary_compatibility(
+        &self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        let target_meta = self.tensor_tape.tensor_meta(target)?;
+        let other_meta = self.tensor_tape.tensor_meta(other)?;
+        if target_meta.shape() != other_meta.shape() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: target_meta.shape().to_vec(),
+                    rhs: other_meta.shape().to_vec(),
+                },
+            )));
+        }
+        if target_meta.dtype() != other_meta.dtype() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::Incompatible(TensorCompatError::DTypeMismatch {
+                    lhs: target_meta.dtype(),
+                    rhs: other_meta.dtype(),
+                }),
+            )));
+        }
+        if target_meta.device() != other_meta.device() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::Incompatible(TensorCompatError::DeviceMismatch {
+                    lhs: target_meta.device(),
+                    rhs: other_meta.device(),
+                }),
+            )));
+        }
+        Ok(())
+    }
+
     fn record_operation(&mut self, event: &OperationEvent) {
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
@@ -1686,6 +1797,22 @@ impl FrankenTorchSession {
                 event.decision.fallback_used
             ),
         );
+    }
+
+    fn record_tensor_in_place_operation(
+        &mut self,
+        op: &'static str,
+        target: TensorNodeId,
+        extra: Option<String>,
+    ) {
+        let mut summary = format!("tensor_inplace_op={op} target={}", target.0);
+        if let Some(extra) = extra {
+            summary.push(' ');
+            summary.push_str(&extra);
+        }
+        self.runtime
+            .ledger_mut()
+            .record(EvidenceKind::Dispatch, summary);
     }
 
     fn record_unary_operation(&mut self, event: &UnaryOperationEvent) {
@@ -2255,7 +2382,9 @@ impl FrankenTorchSession {
         let batch_size = log_prob_shape[0];
         let num_classes = log_prob_shape[1];
 
-        if target_shape.len() != 1 || target_shape[0] != batch_size || target_vals.len() != batch_size
+        if target_shape.len() != 1
+            || target_shape[0] != batch_size
+            || target_vals.len() != batch_size
         {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -2680,12 +2809,12 @@ mod tests {
             .expect_err("device-mismatched tensor input must fail closed");
         let message = err.to_string();
         assert!(
-            message.contains("incompatible dispatch keyset"),
+            message.contains("device mismatch"),
             "unexpected error: {message}"
         );
         assert!(
-            message.contains("AutogradCPU requires CPU backend availability"),
-            "missing keyset incompatibility reason: {message}"
+            message.contains("lhs=Cuda, rhs=Cpu"),
+            "missing device mismatch payload: {message}"
         );
     }
 
@@ -3210,6 +3339,71 @@ mod tests {
             .expect("arange should succeed");
         let values = session.tensor_values(t).expect("values should succeed");
         assert_eq!(values, vec![5.0, 4.0, 3.0]);
+    }
+
+    #[test]
+    fn factory_arange_rejects_non_finite_inputs() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let err = session
+            .arange(0.0, 1.0, f64::NAN, false)
+            .expect_err("arange with NaN step must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "arange: start/end/step must be finite"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn factory_arange_rejects_non_advancing_step_at_precision_limit() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let start = 9_007_199_254_740_992.0; // 2^53
+        let err = session
+            .arange(start, start + 4.0, 1.0, false)
+            .expect_err("non-advancing step must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "arange: step does not advance at current floating-point precision"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn factory_zeros_rejects_shape_volume_overflow() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let err = session
+            .zeros(vec![usize::MAX, 2], false)
+            .expect_err("overflowing shape must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor factory shape volume overflow in zeros"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn factory_eye_rejects_shape_volume_overflow() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let err = session
+            .eye(usize::MAX, false)
+            .expect_err("overflowing eye shape must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "eye shape volume overflow"
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -5723,8 +5917,16 @@ mod tests {
         // d/dp BCE = -(t/p - (1-t)/(1-p)) / n
         // grad[0]: -(1/0.5 - 0) / 2 = -1.0
         // grad[1]: -(0 - 1/0.2) / 2 = 2.5
-        assert!((grad[0] - (-1.0)).abs() < 1e-12, "expected grad[0]=-1.0, got {}", grad[0]);
-        assert!((grad[1] - 2.5).abs() < 1e-12, "expected grad[1]=2.5, got {}", grad[1]);
+        assert!(
+            (grad[0] - (-1.0)).abs() < 1e-12,
+            "expected grad[0]=-1.0, got {}",
+            grad[0]
+        );
+        assert!(
+            (grad[1] - 2.5).abs() < 1e-12,
+            "expected grad[1]=2.5, got {}",
+            grad[1]
+        );
     }
 
     #[test]
@@ -5834,8 +6036,16 @@ mod tests {
         assert_eq!(grad.len(), 2);
         // Element 0: |diff|=0.3 < beta=1.0 (quadratic): grad = diff/beta/n = -0.3/1.0/2 = -0.15
         // Element 1: |diff|=5.0 >= beta=1.0 (linear): grad = sign(diff)/n = -1.0/2 = -0.5
-        assert!((grad[0] - (-0.15)).abs() < 1e-12, "expected grad[0]=-0.15, got {}", grad[0]);
-        assert!((grad[1] - (-0.5)).abs() < 1e-12, "expected grad[1]=-0.5, got {}", grad[1]);
+        assert!(
+            (grad[0] - (-0.15)).abs() < 1e-12,
+            "expected grad[0]=-0.15, got {}",
+            grad[0]
+        );
+        assert!(
+            (grad[1] - (-0.5)).abs() < 1e-12,
+            "expected grad[1]=-0.5, got {}",
+            grad[1]
+        );
     }
 
     #[test]
@@ -5866,6 +6076,53 @@ mod tests {
             .unwrap();
         s.tensor_add_(a, b).unwrap();
         assert_eq!(s.tensor_values(a).unwrap(), vec![11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn tensor_add_in_place_rejects_device_mismatch() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let target = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("target");
+        let other_meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cuda);
+        let other_dense =
+            DenseTensor::from_storage(other_meta, vec![10.0, 20.0, 30.0]).expect("other dense");
+        let other = s.tensor_variable_from_storage(other_dense, false);
+
+        let err = s
+            .tensor_add_(target, other)
+            .expect_err("device mismatch must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::Incompatible(
+                    ft_core::TensorCompatError::DeviceMismatch { .. }
+                )
+            ))
+        ));
+    }
+
+    #[test]
+    fn tensor_add_in_place_records_evidence() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let b = s
+            .tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false)
+            .unwrap();
+        let before = s.evidence_len();
+
+        s.tensor_add_(a, b).unwrap();
+
+        assert_eq!(s.evidence_len(), before + 1);
+        let last = s.evidence().last().expect("in-place op should be recorded");
+        assert_eq!(last.kind, EvidenceKind::Dispatch);
+        assert!(
+            last.summary.contains("tensor_inplace_op=add_"),
+            "unexpected summary: {}",
+            last.summary
+        );
     }
 
     #[test]
@@ -6266,7 +6523,11 @@ mod tests {
         // squeeze dim 0 (size 2, not singleton) should be a no-op
         let squeezed = session.tensor_squeeze(t, 0).expect("squeeze non-singleton");
         let shape = session.tensor_shape(squeezed).expect("shape");
-        assert_eq!(shape, vec![2, 3], "shape should be unchanged for non-singleton squeeze");
+        assert_eq!(
+            shape,
+            vec![2, 3],
+            "shape should be unchanged for non-singleton squeeze"
+        );
         let vals = session.tensor_values(squeezed).expect("vals");
         assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
     }
@@ -7275,6 +7536,26 @@ mod tests {
             session.tensor_values(r).expect("vals"),
             vec![3.0, 1.0, 2.0, 6.0, 4.0, 5.0]
         );
+    }
+
+    #[cfg(target_pointer_width = "32")]
+    #[test]
+    fn session_roll_rejects_shift_out_of_isize_range() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("t");
+        let err = session
+            .tensor_roll(t, i64::from(i32::MAX) + 1, 0)
+            .expect_err("shift larger than isize should fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_roll shift is out of range for platform isize"
+                }
+            ))
+        ));
     }
 
     // ---- flip backward ----
