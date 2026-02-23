@@ -3873,30 +3873,21 @@ mod tests {
     fn reduce_sum_for_broadcast_rejects_rank_mismatch() {
         let err = super::reduce_sum_for_broadcast(&[1.0, 2.0], &[2], &[1, 2])
             .expect_err("rank mismatch should fail");
-        assert!(matches!(
-            err,
-            super::KernelError::ShapeMismatch { .. }
-        ));
+        assert!(matches!(err, super::KernelError::ShapeMismatch { .. }));
     }
 
     #[test]
     fn reduce_sum_for_broadcast_rejects_invalid_broadcast_contract() {
         let err = super::reduce_sum_for_broadcast(&[1.0, 2.0, 3.0, 4.0], &[2, 2], &[2, 3])
             .expect_err("incompatible broadcast should fail");
-        assert!(matches!(
-            err,
-            super::KernelError::ShapeMismatch { .. }
-        ));
+        assert!(matches!(err, super::KernelError::ShapeMismatch { .. }));
     }
 
     #[test]
     fn reduce_sum_for_broadcast_rejects_gradient_len_mismatch() {
         let err = super::reduce_sum_for_broadcast(&[1.0, 2.0, 3.0], &[2, 2], &[1, 2])
             .expect_err("gradient shape mismatch should fail");
-        assert!(matches!(
-            err,
-            super::KernelError::ShapeMismatch { .. }
-        ));
+        assert!(matches!(err, super::KernelError::ShapeMismatch { .. }));
     }
 
     // ── index_select tests ─────────────────────────────────────────────
