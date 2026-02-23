@@ -2,7 +2,7 @@
 
 use std::{collections::BTreeMap, fmt};
 
-use ft_core::{Device, ExecutionMode, ScalarTensor, TensorMeta};
+use ft_core::{Device, ExecutionMode, ScalarTensor, TensorCompatError, TensorMeta};
 use ft_kernel_cpu::{
     KernelError, abs_scalar, abs_tensor_contiguous_f64, acos_scalar, acos_tensor_contiguous_f64,
     add_scalar, add_tensor_contiguous_f64, asin_scalar, asin_tensor_contiguous_f64, atan_scalar,
@@ -927,6 +927,26 @@ pub fn dispatch_keyset_for_tensor_meta(
     dispatch_keyset_for_device(lhs.device(), requires_grad)
 }
 
+fn ensure_tensor_meta_compatible(lhs: &TensorMeta, rhs: &TensorMeta) -> Result<(), DispatchError> {
+    if lhs.dtype() != rhs.dtype() {
+        return Err(DispatchError::Kernel(KernelError::Incompatible(
+            TensorCompatError::DTypeMismatch {
+                lhs: lhs.dtype(),
+                rhs: rhs.dtype(),
+            },
+        )));
+    }
+    if lhs.device() != rhs.device() {
+        return Err(DispatchError::Kernel(KernelError::Incompatible(
+            TensorCompatError::DeviceMismatch {
+                lhs: lhs.device(),
+                rhs: rhs.device(),
+            },
+        )));
+    }
+    Ok(())
+}
+
 fn resolve_dispatch_keys(
     mode: ExecutionMode,
     keyset: DispatchKeySet,
@@ -1067,6 +1087,7 @@ pub fn dispatch_tensor_binary_contiguous_f64(
     rhs_meta: &TensorMeta,
     requires_grad: bool,
 ) -> Result<TensorDispatchOutcome, DispatchError> {
+    ensure_tensor_meta_compatible(lhs_meta, rhs_meta)?;
     let keyset = dispatch_keyset_for_tensor_meta(lhs_meta, rhs_meta, requires_grad);
     dispatch_tensor_binary_contiguous_f64_with_keyset(
         op, mode, lhs, rhs, lhs_meta, rhs_meta, keyset,
@@ -1959,7 +1980,11 @@ pub fn dispatch_tensor_join_contiguous_f64(
         }
         .into());
     }
-    let keyset = dispatch_keyset_for_single_tensor_meta(inputs[0].1, requires_grad);
+    let first_meta = inputs[0].1;
+    for &(_, meta) in &inputs[1..] {
+        ensure_tensor_meta_compatible(first_meta, meta)?;
+    }
+    let keyset = dispatch_keyset_for_single_tensor_meta(first_meta, requires_grad);
     let (selected_key, backend_key, effective_key, fallback_used) =
         resolve_dispatch_keys(mode, keyset)?;
 
@@ -4379,6 +4404,56 @@ mod tests {
             ),
             "expected IncompatibleSet, got {err:?}"
         );
+    }
+
+    #[test]
+    fn dispatch_join_rejects_dtype_mismatch() {
+        let a = vec![1.0, 2.0];
+        let b = vec![3.0, 4.0];
+        let meta_a = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let meta_b = TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu);
+        let inputs: Vec<(&[f64], &TensorMeta)> = vec![(&a, &meta_a), (&b, &meta_b)];
+
+        let err = super::dispatch_tensor_join_contiguous_f64(
+            super::JoinOp::Cat,
+            ExecutionMode::Strict,
+            &inputs,
+            0,
+            false,
+        )
+        .expect_err("dtype mismatch should fail closed");
+
+        assert!(matches!(
+            err,
+            DispatchError::Kernel(KernelError::Incompatible(
+                TensorCompatError::DTypeMismatch { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn dispatch_join_rejects_device_mismatch() {
+        let a = vec![1.0, 2.0];
+        let b = vec![3.0, 4.0];
+        let meta_a = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let meta_b = TensorMeta::from_shape(vec![2], DType::F64, Device::Cuda);
+        let inputs: Vec<(&[f64], &TensorMeta)> = vec![(&a, &meta_a), (&b, &meta_b)];
+
+        let err = super::dispatch_tensor_join_contiguous_f64(
+            super::JoinOp::Cat,
+            ExecutionMode::Strict,
+            &inputs,
+            0,
+            false,
+        )
+        .expect_err("device mismatch should fail closed");
+
+        assert!(matches!(
+            err,
+            DispatchError::Kernel(KernelError::Incompatible(
+                TensorCompatError::DeviceMismatch { .. }
+            ))
+        ));
     }
 
     // ── bd-2rfh: dispatch_scalar_pow + dispatch_tensor_pow_contiguous_f64 ──
