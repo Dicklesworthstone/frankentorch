@@ -14,6 +14,47 @@ fn optimizer_hparam_error(reason: &'static str) -> AutogradError {
     }))
 }
 
+fn optimizer_state_error(reason: &'static str) -> AutogradError {
+    AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
+        reason,
+    }))
+}
+
+fn checked_next_step_count(
+    current: u64,
+    overflow_reason: &'static str,
+) -> Result<u64, AutogradError> {
+    current
+        .checked_add(1)
+        .ok_or_else(|| optimizer_state_error(overflow_reason))
+}
+
+fn ensure_grad_len_matches_param(
+    node: TensorNodeId,
+    expected: usize,
+    actual: usize,
+) -> Result<(), AutogradError> {
+    if expected != actual {
+        return Err(AutogradError::TensorGradientShapeMismatch {
+            node,
+            expected,
+            actual,
+        });
+    }
+    Ok(())
+}
+
+fn ensure_state_len(
+    expected: usize,
+    actual: usize,
+    mismatch_reason: &'static str,
+) -> Result<(), AutogradError> {
+    if expected != actual {
+        return Err(optimizer_state_error(mismatch_reason));
+    }
+    Ok(())
+}
+
 /// Trait for parameter optimizers.
 pub trait Optimizer {
     /// Perform a single optimization step using computed gradients.
@@ -114,6 +155,8 @@ impl Optimizer for SGD {
             };
 
             let param_values = session.tensor_values(param)?;
+            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
+            let param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -126,6 +169,11 @@ impl Optimizer for SGD {
             if self.momentum != 0.0 {
                 // Update velocity: v = momentum * v + grad
                 let vel = self.velocity[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
+                ensure_state_len(
+                    effective_grad.len(),
+                    vel.len(),
+                    "sgd optimizer state length mismatch with gradient length",
+                )?;
                 for (v, g) in vel.iter_mut().zip(effective_grad.iter()) {
                     *v = self.momentum * *v + g;
                 }
@@ -141,7 +189,7 @@ impl Optimizer for SGD {
                     // Apply: create update tensor and subtract
                     let update_node = session.tensor_variable(
                         update.iter().map(|u| self.lr * u).collect(),
-                        session.tensor_values_meta(param)?.1.shape().to_vec(),
+                        param_shape.clone(),
                         false,
                     )?;
                     session.tensor_sub_(param, update_node)?;
@@ -149,7 +197,7 @@ impl Optimizer for SGD {
                     // Standard momentum: param -= lr * velocity
                     let update_node = session.tensor_variable(
                         vel.iter().map(|v| self.lr * v).collect(),
-                        session.tensor_values_meta(param)?.1.shape().to_vec(),
+                        param_shape.clone(),
                         false,
                     )?;
                     session.tensor_sub_(param, update_node)?;
@@ -158,7 +206,7 @@ impl Optimizer for SGD {
                 // Vanilla SGD: param -= lr * grad
                 let update_node = session.tensor_variable(
                     effective_grad.iter().map(|g| self.lr * g).collect(),
-                    session.tensor_values_meta(param)?.1.shape().to_vec(),
+                    param_shape,
                     false,
                 )?;
                 session.tensor_sub_(param, update_node)?;
@@ -258,8 +306,8 @@ impl Optimizer for Adam {
         report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-        self.step_count += 1;
-        let t = self.step_count;
+        let t = checked_next_step_count(self.step_count, "adam step counter overflow")?;
+        self.step_count = t;
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad = match session.tensor_gradient(report, param) {
@@ -268,6 +316,8 @@ impl Optimizer for Adam {
             };
 
             let param_values = session.tensor_values(param)?;
+            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
+            let param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay
@@ -279,12 +329,22 @@ impl Optimizer for Adam {
 
             // Update biased first moment estimate: m = beta1 * m + (1 - beta1) * grad
             let m = self.m[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
+            ensure_state_len(
+                effective_grad.len(),
+                m.len(),
+                "adam first-moment state length mismatch with gradient length",
+            )?;
             for (m_val, g) in m.iter_mut().zip(effective_grad.iter()) {
                 *m_val = self.beta1 * *m_val + (1.0 - self.beta1) * g;
             }
 
             // Update biased second raw moment estimate: v = beta2 * v + (1 - beta2) * grad^2
             let v = self.v[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
+            ensure_state_len(
+                effective_grad.len(),
+                v.len(),
+                "adam second-moment state length mismatch with gradient length",
+            )?;
             for (v_val, g) in v.iter_mut().zip(effective_grad.iter()) {
                 *v_val = self.beta2 * *v_val + (1.0 - self.beta2) * g * g;
             }
@@ -304,8 +364,7 @@ impl Optimizer for Adam {
                 })
                 .collect();
 
-            let shape = session.tensor_values_meta(param)?.1.shape().to_vec();
-            let update_node = session.tensor_variable(update, shape, false)?;
+            let update_node = session.tensor_variable(update, param_shape, false)?;
             session.tensor_sub_(param, update_node)?;
         }
         Ok(())
@@ -406,8 +465,8 @@ impl Optimizer for AdamW {
         report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
-        self.step_count += 1;
-        let t = self.step_count;
+        let t = checked_next_step_count(self.step_count, "adamw step counter overflow")?;
+        self.step_count = t;
 
         for (i, &param) in self.params.iter().enumerate() {
             let grad = match session.tensor_gradient(report, param) {
@@ -415,36 +474,38 @@ impl Optimizer for AdamW {
                 None => continue,
             };
 
+            let param_values = session.tensor_values(param)?;
+            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
+            let param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
+
             // Decoupled weight decay: apply directly to parameters BEFORE Adam update
             if self.weight_decay != 0.0 {
-                let param_values = session.tensor_values(param)?;
-                let decayed: Vec<f64> = param_values
+                let delta: Vec<f64> = param_values
                     .iter()
-                    .map(|p| p * (1.0 - self.lr * self.weight_decay))
+                    .map(|p| p * self.lr * self.weight_decay)
                     .collect();
-                let shape = session.tensor_values_meta(param)?.1.shape().to_vec();
-                let decayed_node = session.tensor_variable(decayed, shape, false)?;
-                // Overwrite parameter with decayed values using in-place sub then add pattern
-                // Equivalent to: param = param * (1 - lr * wd)
-                let current = session.tensor_values(param)?;
-                let delta: Vec<f64> = current
-                    .iter()
-                    .zip(session.tensor_values(decayed_node)?.iter())
-                    .map(|(c, d)| c - d)
-                    .collect();
-                let shape = session.tensor_values_meta(param)?.1.shape().to_vec();
-                let delta_node = session.tensor_variable(delta, shape, false)?;
+                let delta_node = session.tensor_variable(delta, param_shape.clone(), false)?;
                 session.tensor_sub_(param, delta_node)?;
             }
 
             // Update biased first moment estimate: m = beta1 * m + (1 - beta1) * grad
             let m = self.m[i].get_or_insert_with(|| vec![0.0; grad.len()]);
+            ensure_state_len(
+                grad.len(),
+                m.len(),
+                "adamw first-moment state length mismatch with gradient length",
+            )?;
             for (m_val, g) in m.iter_mut().zip(grad.iter()) {
                 *m_val = self.beta1 * *m_val + (1.0 - self.beta1) * g;
             }
 
             // Update biased second raw moment estimate: v = beta2 * v + (1 - beta2) * grad^2
             let v = self.v[i].get_or_insert_with(|| vec![0.0; grad.len()]);
+            ensure_state_len(
+                grad.len(),
+                v.len(),
+                "adamw second-moment state length mismatch with gradient length",
+            )?;
             for (v_val, g) in v.iter_mut().zip(grad.iter()) {
                 *v_val = self.beta2 * *v_val + (1.0 - self.beta2) * g * g;
             }
@@ -464,8 +525,7 @@ impl Optimizer for AdamW {
                 })
                 .collect();
 
-            let shape = session.tensor_values_meta(param)?.1.shape().to_vec();
-            let update_node = session.tensor_variable(update, shape, false)?;
+            let update_node = session.tensor_variable(update, param_shape, false)?;
             session.tensor_sub_(param, update_node)?;
         }
         Ok(())
@@ -571,6 +631,34 @@ mod tests {
 
         let x_val_1 = session.tensor_values(x).expect("values")[0];
         assert!(x_val_1 < 4.0, "x should decrease after first step");
+    }
+
+    #[test]
+    fn sgd_rejects_mismatched_velocity_state_length() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("variable should succeed");
+        let mut optimizer = SGD::new(vec![x], 0.1).momentum(0.9);
+        optimizer.velocity[0] = Some(vec![0.0, 0.0]);
+
+        let loss = session.tensor_mul(x, x).expect("mul should succeed");
+        let loss_sum = session.tensor_sum(loss).expect("sum should succeed");
+        let report = session
+            .tensor_backward(loss_sum)
+            .expect("backward should succeed");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("mismatched state length must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "sgd optimizer state length mismatch with gradient length"
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -931,6 +1019,32 @@ mod tests {
             x_before,
             x_after
         );
+    }
+
+    #[test]
+    fn adam_rejects_step_counter_overflow() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = Adam::new(vec![x], 0.1);
+        optimizer.step_count = u64::MAX;
+
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("step counter overflow must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "adam step counter overflow"
+                }
+            ))
+        ));
     }
 
     #[test]
@@ -1375,6 +1489,32 @@ mod tests {
             x_before,
             x_after
         );
+    }
+
+    #[test]
+    fn adamw_rejects_step_counter_overflow() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = AdamW::new(vec![x], 0.1);
+        optimizer.step_count = u64::MAX;
+
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("step counter overflow must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "adamw step counter overflow"
+                }
+            ))
+        ));
     }
 
     #[test]
