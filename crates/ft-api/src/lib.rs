@@ -2794,6 +2794,41 @@ impl FrankenTorchSession {
         self.tensor_narrow(sorted, 0, median_idx, 1)
     }
 
+    // ── Similarity Functions ────────────────────────────────────────────
+
+    /// Cosine similarity between two tensors along a dimension.
+    ///
+    /// `cos_sim(x1, x2, dim) = sum(x1 * x2, dim) / max(norm(x1, dim) * norm(x2, dim), eps)`
+    ///
+    /// Returns a tensor with the specified dimension reduced.
+    /// `eps` prevents division by zero when one or both inputs have zero norm.
+    ///
+    /// Equivalent to PyTorch's `F.cosine_similarity(x1, x2, dim, eps)`.
+    pub fn cosine_similarity(
+        &mut self,
+        x1: TensorNodeId,
+        x2: TensorNodeId,
+        dim: usize,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // dot_product = sum(x1 * x2, dim)
+        let prod = self.tensor_mul(x1, x2)?;
+        let dot = self.tensor_sum_dim(prod, dim)?;
+
+        // norms = norm(x1, dim) * norm(x2, dim)
+        let norm1 = self.tensor_norm_dim(x1, 2.0, dim)?;
+        let norm2 = self.tensor_norm_dim(x2, 2.0, dim)?;
+        let norms = self.tensor_mul(norm1, norm2)?;
+
+        // Clamp norms below to eps to avoid division by zero
+        let norms_shape = self.tensor_shape(norms)?;
+        let eps_tensor = self.full(norms_shape, eps, false)?;
+        let denom = self.tensor_max(norms, eps_tensor)?;
+
+        // cos_sim = dot / denom
+        self.tensor_div(dot, denom)
+    }
+
     // ── Loss Functions ──────────────────────────────────────────────────
 
     /// Mean Squared Error loss: `mean((pred - target)^2)`
@@ -2917,6 +2952,117 @@ impl FrankenTorchSession {
         let huber = self.tensor_add(masked_quad, masked_lin)?;
 
         self.tensor_mean(huber)
+    }
+
+    /// Huber loss (robust regression loss).
+    ///
+    /// Behaves as L2 loss when the error is small (`|pred - target| <= delta`)
+    /// and as L1 loss when the error is large (`|pred - target| > delta`).
+    ///
+    /// When `|diff| <= delta`: loss = 0.5 * diff^2
+    /// When `|diff| > delta`:  loss = delta * (|diff| - 0.5 * delta)
+    ///
+    /// Returns the mean loss over all elements.
+    ///
+    /// Equivalent to PyTorch's `F.huber_loss(pred, target, delta=delta)`.
+    pub fn huber_loss(
+        &mut self,
+        pred: TensorNodeId,
+        target: TensorNodeId,
+        delta: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if delta <= 0.0 || !delta.is_finite() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "huber_loss requires finite delta > 0",
+                },
+            )));
+        }
+
+        let shape = self.tensor_shape(pred)?;
+
+        let diff = self.tensor_sub(pred, target)?;
+        let abs_diff = self.tensor_abs(diff)?;
+
+        // Quadratic branch: 0.5 * diff^2
+        let diff_sq = self.tensor_mul(diff, diff)?;
+        let half = self.full(shape.clone(), 0.5, false)?;
+        let quadratic = self.tensor_mul(diff_sq, half)?;
+
+        // Linear branch: delta * (|diff| - 0.5 * delta)
+        let half_delta = self.full(shape.clone(), 0.5 * delta, false)?;
+        let shifted = self.tensor_sub(abs_diff, half_delta)?;
+        let delta_tensor_for_linear = self.full(shape.clone(), delta, false)?;
+        let linear = self.tensor_mul(delta_tensor_for_linear, shifted)?;
+
+        // Mask: 1.0 where |diff| <= delta (i.e., delta >= |diff|)
+        let delta_tensor = self.full(shape.clone(), delta, false)?;
+        let in_quadratic = self.tensor_ge(delta_tensor, abs_diff)?;
+
+        // Blend: mask * quadratic + (1 - mask) * linear
+        let masked_quad = self.tensor_mul(in_quadratic, quadratic)?;
+        let ones = self.full(shape, 1.0, false)?;
+        let one_minus_mask = self.tensor_sub(ones, in_quadratic)?;
+        let masked_lin = self.tensor_mul(one_minus_mask, linear)?;
+        let result = self.tensor_add(masked_quad, masked_lin)?;
+
+        self.tensor_mean(result)
+    }
+
+    /// Cosine embedding loss for similarity learning.
+    ///
+    /// Measures whether two inputs are similar or dissimilar, using a target label:
+    /// - When `target[i] = 1.0`: loss = `1 - cos_sim(x1[i], x2[i])`
+    /// - When `target[i] = -1.0`: loss = `max(0, cos_sim(x1[i], x2[i]) - margin)`
+    ///
+    /// `x1` and `x2` must have shape `[batch, features]`. `target` must have shape
+    /// `[batch]` with values `1.0` or `-1.0`. Returns the mean loss.
+    ///
+    /// Equivalent to PyTorch's `F.cosine_embedding_loss(x1, x2, target, margin)`.
+    pub fn cosine_embedding_loss(
+        &mut self,
+        x1: TensorNodeId,
+        x2: TensorNodeId,
+        target: TensorNodeId,
+        margin: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let x1_shape = self.tensor_shape(x1)?;
+        if x1_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cosine_embedding_loss expects 2-D inputs [batch, features]",
+                },
+            )));
+        }
+
+        let batch_size = x1_shape[0];
+
+        // cos_sim along dim=1 (feature dimension) -> [batch]
+        let cos_sim = self.cosine_similarity(x1, x2, 1, 1e-8)?;
+
+        // Positive pairs (target=1): loss = 1 - cos_sim
+        let ones = self.full(vec![batch_size], 1.0, false)?;
+        let pos_loss = self.tensor_sub(ones, cos_sim)?;
+
+        // Negative pairs (target=-1): loss = max(0, cos_sim - margin)
+        let margin_t = self.full(vec![batch_size], margin, false)?;
+        let neg_diff = self.tensor_sub(cos_sim, margin_t)?;
+        let zeros = self.full(vec![batch_size], 0.0, false)?;
+        let neg_loss = self.tensor_max(neg_diff, zeros)?;
+
+        // Select based on target: mask = (target + 1) / 2 -> 1.0 for positive, 0.0 for negative
+        let target_vals = self.tensor_values(target)?;
+        let mask_vals: Vec<f64> = target_vals.iter().map(|t| (t + 1.0) / 2.0).collect();
+        let mask = self.tensor_variable(mask_vals, vec![batch_size], false)?;
+        let ones_for_inv = self.full(vec![batch_size], 1.0, false)?;
+        let inv_mask = self.tensor_sub(ones_for_inv, mask)?;
+
+        // result = mask * pos_loss + (1 - mask) * neg_loss
+        let weighted_pos = self.tensor_mul(mask, pos_loss)?;
+        let weighted_neg = self.tensor_mul(inv_mask, neg_loss)?;
+        let total = self.tensor_add(weighted_pos, weighted_neg)?;
+
+        self.tensor_mean(total)
     }
 
     /// Negative log likelihood loss.
@@ -6783,6 +6929,326 @@ mod tests {
         assert!(
             (vals[0] - 0.25).abs() < 1e-10,
             "expected 0.25, got {}",
+            vals[0]
+        );
+    }
+
+    // ── Huber loss tests ───────────────────────────────────────────────
+
+    #[test]
+    fn huber_loss_identical_tensors_returns_zero() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let target = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let loss = s.huber_loss(pred, target, 1.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            vals[0].abs() < 1e-12,
+            "huber_loss of identical tensors should be 0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn huber_loss_quadratic_region() {
+        // |diff| <= delta: loss = 0.5 * diff^2
+        // pred=[0.0], target=[0.3], diff=-0.3, 0.3 <= 1.0
+        // loss = 0.5 * 0.09 = 0.045
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let target = s.tensor_variable(vec![0.3], vec![1], false).unwrap();
+        let loss = s.huber_loss(pred, target, 1.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            (vals[0] - 0.045).abs() < 1e-10,
+            "expected 0.045, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn huber_loss_linear_region() {
+        // |diff| > delta: loss = delta * (|diff| - 0.5 * delta)
+        // pred=[0.0], target=[3.0], diff=-3.0, 3.0 > 1.0
+        // loss = 1.0 * (3.0 - 0.5) = 2.5
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let target = s.tensor_variable(vec![3.0], vec![1], false).unwrap();
+        let loss = s.huber_loss(pred, target, 1.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            (vals[0] - 2.5).abs() < 1e-10,
+            "expected 2.5, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn huber_loss_mixed_regions() {
+        // Two elements: one in quadratic, one in linear
+        // pred=[0.0, 0.0], target=[0.5, 5.0], delta=1.0
+        // elem 0: |diff|=0.5 <= 1.0, loss = 0.5 * 0.25 = 0.125
+        // elem 1: |diff|=5.0 > 1.0, loss = 1.0 * (5.0 - 0.5) = 4.5
+        // mean = (0.125 + 4.5) / 2 = 2.3125
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+        let target = s.tensor_variable(vec![0.5, 5.0], vec![2], false).unwrap();
+        let loss = s.huber_loss(pred, target, 1.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            (vals[0] - 2.3125).abs() < 1e-10,
+            "expected 2.3125, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn huber_loss_custom_delta() {
+        // delta=0.5, pred=[0.0], target=[2.0], |diff|=2.0 > 0.5
+        // loss = 0.5 * (2.0 - 0.25) = 0.875
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let target = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        let loss = s.huber_loss(pred, target, 0.5).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            (vals[0] - 0.875).abs() < 1e-10,
+            "expected 0.875, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn huber_loss_backward_produces_gradients() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![0.0, 0.0], vec![2], true).unwrap();
+        let target = s.tensor_variable(vec![0.5, 5.0], vec![2], false).unwrap();
+        let loss = s.huber_loss(pred, target, 1.0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, pred);
+        assert!(grad.is_some(), "huber_loss should produce gradients for pred");
+    }
+
+    #[test]
+    fn huber_loss_rejects_non_positive_delta() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pred = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let target = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        assert!(s.huber_loss(pred, target, 0.0).is_err());
+        assert!(s.huber_loss(pred, target, -1.0).is_err());
+    }
+
+    // ── Cosine similarity tests ────────────────────────────────────────
+
+    #[test]
+    fn cosine_similarity_identical_vectors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Two identical vectors: cos_sim = 1.0
+        let x1 = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let x2 = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let sim = s.cosine_similarity(x1, x2, 0, 1e-8).unwrap();
+        let vals = s.tensor_values(sim).unwrap();
+        assert!(
+            (vals[0] - 1.0).abs() < 1e-6,
+            "identical vectors should have cos_sim=1.0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_orthogonal_vectors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Orthogonal vectors: cos_sim = 0.0
+        let x1 = s.tensor_variable(vec![1.0, 0.0], vec![2], false).unwrap();
+        let x2 = s.tensor_variable(vec![0.0, 1.0], vec![2], false).unwrap();
+        let sim = s.cosine_similarity(x1, x2, 0, 1e-8).unwrap();
+        let vals = s.tensor_values(sim).unwrap();
+        assert!(
+            vals[0].abs() < 1e-6,
+            "orthogonal vectors should have cos_sim=0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_opposite_vectors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Opposite vectors: cos_sim = -1.0
+        let x1 = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let x2 = s.tensor_variable(vec![-1.0, -2.0, -3.0], vec![3], false).unwrap();
+        let sim = s.cosine_similarity(x1, x2, 0, 1e-8).unwrap();
+        let vals = s.tensor_values(sim).unwrap();
+        assert!(
+            (vals[0] + 1.0).abs() < 1e-6,
+            "opposite vectors should have cos_sim=-1.0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_batch_dim() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Batch of vectors: [2, 3] with similarity along dim=1
+        let x1 = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 0.0, 0.0, 1.0], vec![2, 3], false)
+            .unwrap();
+        let sim = s.cosine_similarity(x1, x2, 1, 1e-8).unwrap();
+        let vals = s.tensor_values(sim).unwrap();
+        // First pair: [1,0,0] vs [1,0,0] -> cos_sim=1.0
+        assert!(
+            (vals[0] - 1.0).abs() < 1e-6,
+            "parallel vectors should be 1.0, got {}",
+            vals[0]
+        );
+        // Second pair: [0,1,0] vs [0,0,1] -> cos_sim=0.0
+        assert!(
+            vals[1].abs() < 1e-6,
+            "orthogonal vectors should be 0.0, got {}",
+            vals[1]
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_backward_produces_gradients() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x1 = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true).unwrap();
+        let x2 = s.tensor_variable(vec![4.0, 5.0, 6.0], vec![3], true).unwrap();
+        let sim = s.cosine_similarity(x1, x2, 0, 1e-8).unwrap();
+        let loss = s.tensor_sum(sim).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+
+        assert!(
+            s.tensor_gradient(&report, x1).is_some(),
+            "cosine_similarity should produce gradients for x1"
+        );
+        assert!(
+            s.tensor_gradient(&report, x2).is_some(),
+            "cosine_similarity should produce gradients for x2"
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_zero_vector_with_eps() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Zero vector: eps prevents NaN
+        let x1 = s.tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false).unwrap();
+        let x2 = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let sim = s.cosine_similarity(x1, x2, 0, 1e-8).unwrap();
+        let vals = s.tensor_values(sim).unwrap();
+        // dot = 0, norms product is clamped to eps, result should be ~0
+        assert!(
+            vals[0].is_finite(),
+            "zero vector with eps should not produce NaN/Inf, got {}",
+            vals[0]
+        );
+    }
+
+    // ── Cosine embedding loss tests ────────────────────────────────────
+
+    #[test]
+    fn cosine_embedding_loss_similar_pair() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Two identical vectors with target=1 -> loss should be ~0
+        let x1 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        let target = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let loss = s.cosine_embedding_loss(x1, x2, target, 0.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            vals[0].abs() < 1e-4,
+            "identical vectors with target=1 should have ~0 loss, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_embedding_loss_dissimilar_pair() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Two identical vectors with target=-1 -> loss = max(0, cos_sim - margin) = max(0, 1.0) = 1.0
+        let x1 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        let target = s.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        let loss = s.cosine_embedding_loss(x1, x2, target, 0.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            (vals[0] - 1.0).abs() < 1e-4,
+            "identical vectors with target=-1 should have loss~1.0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_embedding_loss_margin() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Two orthogonal vectors with target=-1, margin=0 -> loss = max(0, 0-0) = 0
+        let x1 = s
+            .tensor_variable(vec![1.0, 0.0], vec![1, 2], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![0.0, 1.0], vec![1, 2], false)
+            .unwrap();
+        let target = s.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        let loss = s.cosine_embedding_loss(x1, x2, target, 0.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        assert!(
+            vals[0].abs() < 1e-4,
+            "orthogonal vectors with target=-1 should have ~0 loss, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_embedding_loss_backward_produces_gradients() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x1 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], true)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![4.0, 5.0, 6.0], vec![1, 3], true)
+            .unwrap();
+        let target = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let loss = s.cosine_embedding_loss(x1, x2, target, 0.0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        assert!(
+            s.tensor_gradient(&report, x1).is_some(),
+            "should produce gradients for x1"
+        );
+        assert!(
+            s.tensor_gradient(&report, x2).is_some(),
+            "should produce gradients for x2"
+        );
+    }
+
+    #[test]
+    fn cosine_embedding_loss_mixed_targets() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Batch of 2: first pair similar (target=1), second pair dissimilar (target=-1)
+        let x1 = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false)
+            .unwrap();
+        let target = s.tensor_variable(vec![1.0, -1.0], vec![2], false).unwrap();
+        let loss = s.cosine_embedding_loss(x1, x2, target, 0.0).unwrap();
+        let vals = s.tensor_values(loss).unwrap();
+        // pair 0: cos=1.0, target=1 -> loss=0
+        // pair 1: cos=1.0, target=-1 -> loss=max(0, 1.0-0)=1.0
+        // mean = 0.5
+        assert!(
+            (vals[0] - 0.5).abs() < 1e-4,
+            "mixed targets should give mean loss ~0.5, got {}",
             vals[0]
         );
     }

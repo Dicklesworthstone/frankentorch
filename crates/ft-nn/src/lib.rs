@@ -1447,6 +1447,244 @@ impl Module for Softplus {
     }
 }
 
+/// Group normalization (Wu & He, 2018).
+///
+/// Divides the channels into `num_groups` groups and normalizes within each group
+/// independently. This is more flexible than BatchNorm (which normalizes across
+/// the batch) and LayerNorm (which normalizes across all channels).
+///
+/// Input shape: `[N, C, *]` where `C` must be divisible by `num_groups` and `*`
+/// is zero or more spatial dimensions.
+///
+/// When `affine` is true (default), learnable `weight` (gamma) and `bias` (beta)
+/// parameters of shape `[C]` are applied after normalization.
+pub struct GroupNorm {
+    num_groups: usize,
+    num_channels: usize,
+    eps: f64,
+    weight: Option<TensorNodeId>,
+    bias: Option<TensorNodeId>,
+}
+
+impl GroupNorm {
+    /// Create a new GroupNorm module.
+    ///
+    /// * `num_groups` - number of groups to divide channels into
+    /// * `num_channels` - expected number of channels (C), must be divisible by num_groups
+    /// * `eps` - value added to variance for numerical stability (typically 1e-5)
+    /// * `affine` - if true, include learnable weight and bias parameters
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        num_groups: usize,
+        num_channels: usize,
+        eps: f64,
+        affine: bool,
+    ) -> Result<Self, AutogradError> {
+        if num_groups == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GroupNorm requires num_groups > 0",
+                },
+            )));
+        }
+        if num_channels == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GroupNorm requires num_channels > 0",
+                },
+            )));
+        }
+        if !num_channels.is_multiple_of(num_groups) {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GroupNorm requires num_channels divisible by num_groups",
+                },
+            )));
+        }
+
+        let (weight, bias) = if affine {
+            let w = session.tensor_variable(vec![1.0; num_channels], vec![num_channels], true)?;
+            let b = session.tensor_variable(vec![0.0; num_channels], vec![num_channels], true)?;
+            (Some(w), Some(b))
+        } else {
+            (None, None)
+        };
+
+        Ok(Self {
+            num_groups,
+            num_channels,
+            eps,
+            weight,
+            bias,
+        })
+    }
+}
+
+impl Module for GroupNorm {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(input)?;
+            meta.shape().to_vec()
+        };
+
+        if input_shape.len() < 2 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GroupNorm input must have at least 2 dimensions [N, C, ...]",
+                },
+            )));
+        }
+
+        let batch_size = input_shape[0];
+        let channels = input_shape[1];
+
+        if channels != self.num_channels {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GroupNorm input channels do not match num_channels",
+                },
+            )));
+        }
+
+        let channels_per_group = channels / self.num_groups;
+        // Compute spatial size (product of dims after N, C)
+        let spatial: usize = if input_shape.len() > 2 {
+            input_shape[2..].iter().product()
+        } else {
+            1
+        };
+        let group_numel = channels_per_group * spatial;
+
+        // Reshape to [N, num_groups, channels_per_group * spatial] for per-group normalization
+        let reshaped =
+            session.tensor_reshape(input, vec![batch_size, self.num_groups, group_numel])?;
+
+        // Compute mean per group: mean_dim along dim=2 -> [N, num_groups]
+        let mean = session.tensor_mean_dim(reshaped, 2)?;
+        // Expand mean back: [N, num_groups] -> [N, num_groups, 1] -> [N, num_groups, group_numel]
+        let mean_us = session.tensor_unsqueeze(mean, 2)?;
+        let mean_exp =
+            session.tensor_expand(mean_us, vec![batch_size, self.num_groups, group_numel])?;
+
+        // diff = x - mean
+        let diff = session.tensor_sub(reshaped, mean_exp)?;
+
+        // Variance per group: mean(diff^2, dim=2) -> [N, num_groups]
+        let diff_sq = session.tensor_mul(diff, diff)?;
+        let var = session.tensor_mean_dim(diff_sq, 2)?;
+        let var_us = session.tensor_unsqueeze(var, 2)?;
+        let var_exp =
+            session.tensor_expand(var_us, vec![batch_size, self.num_groups, group_numel])?;
+
+        // std = sqrt(var + eps)
+        let eps_t =
+            session.full(vec![batch_size, self.num_groups, group_numel], self.eps, false)?;
+        let var_eps = session.tensor_add(var_exp, eps_t)?;
+        let std = session.tensor_sqrt(var_eps)?;
+
+        // normalized = diff / std
+        let normalized = session.tensor_div(diff, std)?;
+
+        // Reshape back to original input shape
+        let normalized_orig = session.tensor_reshape(normalized, input_shape.clone())?;
+
+        // Apply affine transform if present
+        if let (Some(w), Some(b)) = (self.weight, self.bias) {
+            // weight and bias have shape [C]. We need to reshape them to be
+            // broadcastable with input [N, C, *].
+            // Target shape: [1, C, 1, 1, ...] with 1s for each spatial dim
+            let mut affine_shape = vec![1usize; input_shape.len()];
+            affine_shape[1] = channels;
+
+            let w_reshaped = session.tensor_reshape(w, affine_shape.clone())?;
+            let w_expanded = session.tensor_expand(w_reshaped, input_shape.clone())?;
+            let b_reshaped = session.tensor_reshape(b, affine_shape)?;
+            let b_expanded = session.tensor_expand(b_reshaped, input_shape)?;
+
+            let scaled = session.tensor_mul(w_expanded, normalized_orig)?;
+            session.tensor_add(scaled, b_expanded)
+        } else {
+            Ok(normalized_orig)
+        }
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        match (self.weight, self.bias) {
+            (Some(w), Some(b)) => vec![w, b],
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Instance normalization for 1D inputs (Ulyanov et al., 2016).
+///
+/// Normalizes each channel of each sample independently, equivalent to
+/// `GroupNorm` with `num_groups = num_channels`.
+///
+/// Input shape: `[N, C, L]` where `C` must equal `num_features`.
+///
+/// Widely used in style transfer and generative models where batch statistics
+/// are unreliable or undesirable.
+pub struct InstanceNorm1d {
+    inner: GroupNorm,
+}
+
+impl InstanceNorm1d {
+    /// Create a new InstanceNorm1d module.
+    ///
+    /// * `num_features` - number of channels (C)
+    /// * `eps` - value added to variance for numerical stability (typically 1e-5)
+    /// * `affine` - if true, include learnable weight and bias parameters
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        num_features: usize,
+        eps: f64,
+        affine: bool,
+    ) -> Result<Self, AutogradError> {
+        // InstanceNorm = GroupNorm where each channel is its own group
+        let inner = GroupNorm::new(session, num_features, num_features, eps, affine)?;
+        Ok(Self { inner })
+    }
+}
+
+impl Module for InstanceNorm1d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.inner.forward(session, input)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        self.inner.parameters()
+    }
+}
+
+/// Identity module that passes input through unchanged.
+///
+/// Useful as a placeholder in `Sequential` containers or for skip connections
+/// where a no-op branch is needed.
+pub struct Identity;
+
+impl Module for Identity {
+    fn forward(
+        &self,
+        _session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        Ok(input)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ft_api::FrankenTorchSession;
@@ -2716,5 +2954,214 @@ mod tests {
     fn mha_rejects_non_divisible_embed_dim() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         assert!(MultiheadAttention::new(&mut session, 5, 2).is_err());
+    }
+
+    #[test]
+    fn identity_passes_through_unchanged() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .expect("var");
+        let identity = Identity;
+        let y = identity.forward(&mut session, x).expect("forward");
+        // Identity returns the same node
+        assert_eq!(x, y);
+        assert!(identity.parameters().is_empty());
+    }
+
+    #[test]
+    fn identity_in_sequential() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .expect("var");
+        let mut seq = Sequential::new();
+        seq.push(Box::new(Identity));
+        seq.push(Box::new(Identity));
+        let y = seq.forward(&mut session, x).expect("forward");
+        assert_eq!(x, y);
+        assert!(seq.parameters().is_empty());
+    }
+
+    // ── GroupNorm tests ────────────────────────────────────────────────
+
+    #[test]
+    fn groupnorm_basic_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, true).expect("groupnorm");
+
+        // Input [N=1, C=4, L=3]
+        let x = session
+            .tensor_variable(vec![1.0; 12], vec![1, 4, 3], false)
+            .expect("var");
+        let y = gn.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(y).expect("meta");
+        assert_eq!(meta.shape(), &[1, 4, 3]);
+    }
+
+    #[test]
+    fn groupnorm_normalizes_within_groups() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 2 groups, 4 channels -> 2 channels per group
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, false).expect("groupnorm");
+
+        // Input [N=1, C=4]: group 0 = channels 0,1; group 1 = channels 2,3
+        // Constant input within each group should normalize to ~0
+        let x = session
+            .tensor_variable(vec![5.0, 5.0, 10.0, 10.0], vec![1, 4], false)
+            .expect("var");
+        let y = gn.forward(&mut session, x).expect("forward");
+        let vals = session.tensor_values(y).expect("vals");
+
+        // Within each group, all values are the same => mean = value, var = 0
+        // normalized = (val - mean) / sqrt(var + eps) ≈ 0
+        for v in &vals {
+            assert!(
+                v.abs() < 1e-2,
+                "constant group should normalize near 0, got {}",
+                v
+            );
+        }
+    }
+
+    #[test]
+    fn groupnorm_affine_has_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, true).expect("groupnorm");
+        assert_eq!(gn.parameters().len(), 2); // weight + bias
+    }
+
+    #[test]
+    fn groupnorm_no_affine_has_no_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, false).expect("groupnorm");
+        assert!(gn.parameters().is_empty());
+    }
+
+    #[test]
+    fn groupnorm_backward_produces_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, true).expect("groupnorm");
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![1, 4, 2], true)
+            .expect("var");
+        let y = gn.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let grad = session.tensor_gradient(&report, x);
+        assert!(grad.is_some(), "GroupNorm should produce gradients for input");
+    }
+
+    #[test]
+    fn groupnorm_rejects_non_divisible_channels() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 3 groups, 4 channels -> 4 % 3 != 0
+        assert!(GroupNorm::new(&mut session, 3, 4, 1e-5, true).is_err());
+    }
+
+    #[test]
+    fn groupnorm_rejects_wrong_input_channels() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, true).expect("groupnorm");
+
+        // Input has 6 channels but GroupNorm expects 4
+        let x = session
+            .tensor_variable(vec![1.0; 6], vec![1, 6], false)
+            .expect("var");
+        assert!(gn.forward(&mut session, x).is_err());
+    }
+
+    #[test]
+    fn groupnorm_rejects_1d_input() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, true).expect("groupnorm");
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
+            .expect("var");
+        assert!(gn.forward(&mut session, x).is_err());
+    }
+
+    #[test]
+    fn groupnorm_with_spatial_dims() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, true).expect("groupnorm");
+
+        // Input [N=2, C=4, H=3] with varying values
+        let data: Vec<f64> = (0..24).map(|i| i as f64).collect();
+        let x = session
+            .tensor_variable(data, vec![2, 4, 3], false)
+            .expect("var");
+        let y = gn.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(y).expect("meta");
+        assert_eq!(meta.shape(), &[2, 4, 3]);
+    }
+
+    // ── InstanceNorm1d tests ───────────────────────────────────────────
+
+    #[test]
+    fn instancenorm1d_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let inorm = InstanceNorm1d::new(&mut session, 4, 1e-5, true).expect("instancenorm");
+
+        // Input [N=2, C=4, L=3]
+        let data: Vec<f64> = (0..24).map(|i| i as f64).collect();
+        let x = session
+            .tensor_variable(data, vec![2, 4, 3], false)
+            .expect("var");
+        let y = inorm.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(y).expect("meta");
+        assert_eq!(meta.shape(), &[2, 4, 3]);
+    }
+
+    #[test]
+    fn instancenorm1d_normalizes_per_channel_per_sample() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let inorm = InstanceNorm1d::new(&mut session, 2, 1e-5, false).expect("instancenorm");
+
+        // Input [N=1, C=2, L=3]
+        // Channel 0: [1, 2, 3], Channel 1: [10, 10, 10]
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 10.0, 10.0, 10.0], vec![1, 2, 3], false)
+            .expect("var");
+        let y = inorm.forward(&mut session, x).expect("forward");
+        let vals = session.tensor_values(y).expect("vals");
+
+        // Channel 1 (constant) should normalize to ~0
+        assert!(vals[3].abs() < 1e-2, "constant channel should be ~0, got {}", vals[3]);
+        assert!(vals[4].abs() < 1e-2, "constant channel should be ~0, got {}", vals[4]);
+        assert!(vals[5].abs() < 1e-2, "constant channel should be ~0, got {}", vals[5]);
+    }
+
+    #[test]
+    fn instancenorm1d_affine_has_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let inorm = InstanceNorm1d::new(&mut session, 4, 1e-5, true).expect("instancenorm");
+        assert_eq!(inorm.parameters().len(), 2);
+    }
+
+    #[test]
+    fn instancenorm1d_no_affine_has_no_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let inorm = InstanceNorm1d::new(&mut session, 4, 1e-5, false).expect("instancenorm");
+        assert!(inorm.parameters().is_empty());
+    }
+
+    #[test]
+    fn instancenorm1d_backward_produces_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let inorm = InstanceNorm1d::new(&mut session, 2, 1e-5, true).expect("instancenorm");
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 2, 3], true)
+            .expect("var");
+        let y = inorm.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let grad = session.tensor_gradient(&report, x);
+        assert!(grad.is_some(), "InstanceNorm1d should produce gradients");
     }
 }
