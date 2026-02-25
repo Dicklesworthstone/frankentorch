@@ -26,12 +26,25 @@ perf.data
 perf.data.*
 frankentorch_illustration.png
 
+# macOS resource fork files
+._*
+
 # Ephemeral agent/runtime artifacts
 storage.sqlite3
 storage.sqlite3-*
+*.sqlite3.bak
 rustc-ice-*.txt
 a.out
 --graph-format.svg
+
+# Remote compilation helper artifacts
+.rch-target/
+.rch-deploy-root/
+rch-bin/
+rch-install/
+
+# Agent mail project identity
+.agent-mail-project-id
 target-codex*/
 target_*/
 
