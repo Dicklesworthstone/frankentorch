@@ -118,6 +118,12 @@ impl From<DenseTensorError> for StateDictError {
     }
 }
 
+fn gradient_utils_error(reason: &'static str) -> AutogradError {
+    AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
+        reason,
+    }))
+}
+
 #[derive(Debug, Clone)]
 struct RegisteredParameter {
     name: String,
@@ -538,6 +544,146 @@ pub fn module_load_state_dict(
         missing_keys,
         unexpected_keys,
     })
+}
+
+/// Clip accumulated gradients by total p-norm and return the pre-clip norm.
+pub fn clip_grad_norm_(
+    session: &mut FrankenTorchSession,
+    parameters: &[TensorNodeId],
+    max_norm: f64,
+    norm_type: f64,
+) -> Result<f64, AutogradError> {
+    if !max_norm.is_finite() || max_norm < 0.0 {
+        return Err(gradient_utils_error(
+            "clip_grad_norm_ requires finite non-negative max_norm",
+        ));
+    }
+    if !(norm_type.is_finite() && norm_type > 0.0) && !norm_type.is_infinite() {
+        return Err(gradient_utils_error(
+            "clip_grad_norm_ requires positive finite norm_type or +inf",
+        ));
+    }
+
+    let mut grads = Vec::new();
+    for &param in parameters {
+        if let Some(grad) = session.tensor_accumulated_gradient(param)? {
+            grads.push((param, grad));
+        }
+    }
+    if grads.is_empty() {
+        return Ok(0.0);
+    }
+
+    let total_norm = if norm_type.is_infinite() {
+        grads
+            .iter()
+            .flat_map(|(_, grad)| grad.iter())
+            .map(|value| value.abs())
+            .fold(0.0, f64::max)
+    } else {
+        let norm_acc: f64 = grads
+            .iter()
+            .flat_map(|(_, grad)| grad.iter())
+            .map(|value| value.abs().powf(norm_type))
+            .sum();
+        norm_acc.powf(1.0 / norm_type)
+    };
+
+    if total_norm > max_norm && total_norm > 0.0 {
+        let scale = if max_norm == 0.0 {
+            0.0
+        } else {
+            max_norm / total_norm
+        };
+        for (param, mut grad) in grads {
+            for value in &mut grad {
+                *value *= scale;
+            }
+            session.tensor_set_accumulated_gradient(param, grad)?;
+        }
+    }
+
+    Ok(total_norm)
+}
+
+/// Clip accumulated gradients element-wise into `[-clip_value, clip_value]`.
+pub fn clip_grad_value_(
+    session: &mut FrankenTorchSession,
+    parameters: &[TensorNodeId],
+    clip_value: f64,
+) -> Result<(), AutogradError> {
+    if !clip_value.is_finite() || clip_value < 0.0 {
+        return Err(gradient_utils_error(
+            "clip_grad_value_ requires finite non-negative clip_value",
+        ));
+    }
+    for &param in parameters {
+        let Some(mut grad) = session.tensor_accumulated_gradient(param)? else {
+            continue;
+        };
+        for value in &mut grad {
+            *value = value.clamp(-clip_value, clip_value);
+        }
+        session.tensor_set_accumulated_gradient(param, grad)?;
+    }
+    Ok(())
+}
+
+/// Flatten parameters into a single 1D tensor.
+pub fn parameters_to_vector(
+    session: &mut FrankenTorchSession,
+    parameters: &[TensorNodeId],
+) -> Result<TensorNodeId, AutogradError> {
+    let mut flattened = Vec::new();
+    for &parameter in parameters {
+        flattened.extend(session.tensor_values(parameter)?);
+    }
+    session.tensor_variable(flattened.clone(), vec![flattened.len()], false)
+}
+
+/// Copy values from a flat 1D tensor back into parameter tensors.
+pub fn vector_to_parameters(
+    session: &mut FrankenTorchSession,
+    vector: TensorNodeId,
+    parameters: &[TensorNodeId],
+) -> Result<(), AutogradError> {
+    let (flat_values, flat_meta) = session.tensor_values_meta(vector)?;
+    if flat_meta.shape().len() != 1 {
+        return Err(gradient_utils_error(
+            "vector_to_parameters requires a 1D source vector",
+        ));
+    }
+
+    let mut offset = 0usize;
+    for &parameter in parameters {
+        let (param_values, param_meta) = session.tensor_values_meta(parameter)?;
+        let len = param_values.len();
+        let Some(end) = offset.checked_add(len) else {
+            return Err(gradient_utils_error("vector_to_parameters offset overflow"));
+        };
+        if end > flat_values.len() {
+            return Err(gradient_utils_error(
+                "vector_to_parameters source vector is shorter than parameter footprint",
+            ));
+        }
+
+        let chunk_node = session.tensor_variable(
+            flat_values[offset..end].to_vec(),
+            param_meta.shape().to_vec(),
+            false,
+        )?;
+        session.tensor_zero_(parameter)?;
+        session.tensor_add_(parameter, chunk_node)?;
+        offset = end;
+    }
+
+    if offset != flat_values.len() {
+        return Err(gradient_utils_error(
+            "vector_to_parameters source vector has unused trailing values",
+        ));
+    }
+
+    Ok(())
 }
 
 /// Fully connected linear layer: output = input @ weight^T + bias.
@@ -8686,5 +8832,123 @@ mod tests {
             .load_state_dict(&mut session, &state, false)
             .expect_err("shape mismatch must fail");
         assert!(matches!(err, StateDictError::ShapeMismatch { key, .. } if key == "weight"));
+    }
+
+    #[test]
+    fn clip_grad_norm_scales_gradients_and_returns_preclip_norm() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![3.0, 4.0], vec![2], true)
+            .expect("x");
+        let y = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("y");
+
+        let x_sq = session.tensor_mul(x, x).expect("x*x");
+        let y_sq = session.tensor_mul(y, y).expect("y*y");
+        let x_loss = session.tensor_sum(x_sq).expect("sum x");
+        let y_loss = session.tensor_sum(y_sq).expect("sum y");
+        let total = session.tensor_add(x_loss, y_loss).expect("add");
+        let _ = session.tensor_backward(total).expect("backward");
+
+        let total_norm = clip_grad_norm_(&mut session, &[x, y], 5.0, 2.0).expect("clip grad norm");
+        let expected_before = (6.0f64 * 6.0 + 8.0 * 8.0 + 2.0 * 2.0).sqrt();
+        assert!((total_norm - expected_before).abs() < 1e-10);
+
+        let clipped_x = session
+            .tensor_accumulated_gradient(x)
+            .expect("x grad")
+            .expect("x grad exists");
+        let clipped_y = session
+            .tensor_accumulated_gradient(y)
+            .expect("y grad")
+            .expect("y grad exists");
+        let after_norm = clipped_x
+            .iter()
+            .chain(clipped_y.iter())
+            .map(|value| value * value)
+            .sum::<f64>()
+            .sqrt();
+        assert!((after_norm - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn clip_grad_norm_noop_when_below_threshold() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("x");
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss = session.tensor_sum(loss).expect("sum");
+        let _ = session.tensor_backward(loss).expect("backward");
+
+        let before = session
+            .tensor_accumulated_gradient(x)
+            .expect("grad")
+            .expect("grad exists");
+        let norm = clip_grad_norm_(&mut session, &[x], 10.0, 2.0).expect("clip");
+        let after = session
+            .tensor_accumulated_gradient(x)
+            .expect("grad")
+            .expect("grad exists");
+        assert!((norm - 2.0).abs() < 1e-10);
+        assert_eq!(before, after);
+    }
+
+    #[test]
+    fn clip_grad_value_clamps_gradient_elements() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![3], true)
+            .expect("x");
+        session
+            .tensor_set_accumulated_gradient(x, vec![3.0, -5.0, 0.5])
+            .expect("set gradient");
+
+        clip_grad_value_(&mut session, &[x], 1.5).expect("clip grad value");
+        let clipped = session
+            .tensor_accumulated_gradient(x)
+            .expect("grad")
+            .expect("grad exists");
+        assert_eq!(clipped, vec![1.5, -1.5, 0.5]);
+    }
+
+    #[test]
+    fn parameters_vector_roundtrip_restores_parameter_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let linear = Linear::new(&mut session, 3, 2, true).expect("linear");
+        let params = linear.parameters();
+
+        let mut original_values = Vec::new();
+        for &param in &params {
+            original_values.push(session.tensor_values(param).expect("param values"));
+        }
+
+        let vector = parameters_to_vector(&mut session, &params).expect("parameters_to_vector");
+
+        for &param in &params {
+            session.tensor_fill_(param, 0.0).expect("fill");
+        }
+
+        vector_to_parameters(&mut session, vector, &params).expect("vector_to_parameters");
+
+        for (idx, &param) in params.iter().enumerate() {
+            let restored = session.tensor_values(param).expect("restored");
+            assert_eq!(restored, original_values[idx]);
+        }
+    }
+
+    #[test]
+    fn vector_to_parameters_rejects_length_mismatch() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let linear = Linear::new(&mut session, 2, 1, true).expect("linear");
+        let params = linear.parameters();
+        let bad_vector = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .expect("bad vector");
+
+        let err = vector_to_parameters(&mut session, bad_vector, &params)
+            .expect_err("mismatched vector length must fail");
+        assert!(matches!(err, AutogradError::Dispatch(_)));
     }
 }

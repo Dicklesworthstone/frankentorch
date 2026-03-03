@@ -2187,6 +2187,15 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    pub fn tensor_set_accumulated_gradient(
+        &mut self,
+        node: TensorNodeId,
+        gradient: Vec<f64>,
+    ) -> Result<(), AutogradError> {
+        self.tensor_tape
+            .set_tensor_accumulated_gradient(node, gradient)
+    }
+
     #[must_use]
     pub fn evidence(&self) -> &[EvidenceEntry] {
         self.runtime.ledger().entries()

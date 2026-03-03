@@ -3887,6 +3887,17 @@ impl TensorTape {
         Ok(())
     }
 
+    pub fn set_tensor_accumulated_gradient(
+        &mut self,
+        node: TensorNodeId,
+        gradient: Vec<f64>,
+    ) -> Result<(), AutogradError> {
+        let expected = self.node(node)?.tensor.meta().numel();
+        Self::ensure_tensor_len(node, expected, gradient.len())?;
+        self.persistent_grads.insert(node.0, gradient);
+        Ok(())
+    }
+
     pub fn leaf_f32(
         &mut self,
         values: Vec<f32>,
