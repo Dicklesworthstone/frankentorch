@@ -87,6 +87,14 @@ pub trait Optimizer {
 
     /// Set the learning rate.
     fn set_lr(&mut self, lr: f64);
+
+    /// Return momentum if the optimizer exposes one.
+    fn get_momentum(&self) -> Option<f64> {
+        None
+    }
+
+    /// Set momentum for optimizers that expose it.
+    fn set_momentum(&mut self, _momentum: f64) {}
 }
 
 /// Stochastic Gradient Descent optimizer with optional momentum and weight decay.
@@ -168,6 +176,14 @@ impl Optimizer for SGD {
 
     fn set_lr(&mut self, lr: f64) {
         self.lr = lr;
+    }
+
+    fn get_momentum(&self) -> Option<f64> {
+        Some(self.momentum)
+    }
+
+    fn set_momentum(&mut self, momentum: f64) {
+        self.momentum = momentum;
     }
 
     fn step(
@@ -3076,6 +3092,333 @@ impl LRScheduler for ChainedScheduler {
         for (key, val) in &state.extra {
             if key == "base_lr" {
                 self.base_lr = *val;
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OneCycleAnnealStrategy {
+    Cos,
+    Linear,
+}
+
+/// OneCycleLR: warm up to `max_lr`, then anneal to a low final lr.
+///
+/// This scheduler is step-based (typically called once per optimizer step).
+pub struct OneCycleLR {
+    max_lr: f64,
+    total_steps: usize,
+    pct_start: f64,
+    anneal_strategy: OneCycleAnnealStrategy,
+    cycle_momentum: bool,
+    base_momentum: f64,
+    max_momentum: f64,
+    div_factor: f64,
+    final_div_factor: f64,
+    three_phase: bool,
+    last_epoch: i64,
+    last_lr: f64,
+    last_momentum: Option<f64>,
+    verbose: bool,
+}
+
+impl OneCycleLR {
+    /// Create a new `OneCycleLR` scheduler.
+    pub fn new(optimizer: &dyn Optimizer, max_lr: f64, total_steps: usize) -> Self {
+        let total_steps = total_steps.max(1);
+        let div_factor = 25.0;
+        let final_div_factor = 1e4;
+        let initial_lr = max_lr / div_factor;
+        Self {
+            max_lr,
+            total_steps,
+            pct_start: 0.3,
+            anneal_strategy: OneCycleAnnealStrategy::Cos,
+            cycle_momentum: true,
+            base_momentum: 0.85,
+            max_momentum: 0.95,
+            div_factor,
+            final_div_factor,
+            three_phase: false,
+            last_epoch: -1,
+            last_lr: optimizer.get_lr(),
+            last_momentum: optimizer.get_momentum(),
+            verbose: false,
+        }
+        .last_epoch(-1)
+        .with_initial_lr(initial_lr)
+    }
+
+    fn with_initial_lr(mut self, initial_lr: f64) -> Self {
+        self.last_lr = initial_lr;
+        self
+    }
+
+    #[must_use]
+    pub fn pct_start(mut self, pct_start: f64) -> Self {
+        self.pct_start = pct_start.clamp(0.0, 1.0);
+        self
+    }
+
+    #[must_use]
+    pub fn anneal_strategy_cos(mut self) -> Self {
+        self.anneal_strategy = OneCycleAnnealStrategy::Cos;
+        self
+    }
+
+    #[must_use]
+    pub fn anneal_strategy_linear(mut self) -> Self {
+        self.anneal_strategy = OneCycleAnnealStrategy::Linear;
+        self
+    }
+
+    #[must_use]
+    pub fn cycle_momentum(mut self, cycle_momentum: bool) -> Self {
+        self.cycle_momentum = cycle_momentum;
+        self
+    }
+
+    #[must_use]
+    pub fn base_momentum(mut self, base_momentum: f64) -> Self {
+        self.base_momentum = base_momentum;
+        self
+    }
+
+    #[must_use]
+    pub fn max_momentum(mut self, max_momentum: f64) -> Self {
+        self.max_momentum = max_momentum;
+        self
+    }
+
+    #[must_use]
+    pub fn div_factor(mut self, div_factor: f64) -> Self {
+        self.div_factor = div_factor.max(f64::EPSILON);
+        self
+    }
+
+    #[must_use]
+    pub fn final_div_factor(mut self, final_div_factor: f64) -> Self {
+        self.final_div_factor = final_div_factor.max(f64::EPSILON);
+        self
+    }
+
+    #[must_use]
+    pub fn three_phase(mut self, three_phase: bool) -> Self {
+        self.three_phase = three_phase;
+        self
+    }
+
+    #[must_use]
+    pub fn last_epoch(mut self, last_epoch: i64) -> Self {
+        self.last_epoch = last_epoch;
+        if last_epoch >= 0 {
+            let (lr, momentum) = self.compute_values_at_step(last_epoch as usize);
+            self.last_lr = lr;
+            self.last_momentum = momentum;
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    #[must_use]
+    pub fn get_last_momentum(&self) -> Option<f64> {
+        self.last_momentum
+    }
+
+    fn initial_lr(&self) -> f64 {
+        self.max_lr / self.div_factor
+    }
+
+    fn final_lr(&self) -> f64 {
+        self.initial_lr() / self.final_div_factor
+    }
+
+    fn phase_steps(&self) -> (usize, usize, usize) {
+        if self.total_steps == 0 {
+            return (0, 0, 0);
+        }
+
+        let mut phase1 = ((self.total_steps as f64) * self.pct_start).floor() as usize;
+        if self.pct_start > 0.0 {
+            phase1 = phase1.max(1);
+        }
+        phase1 = phase1.min(self.total_steps);
+
+        if self.three_phase {
+            let remaining = self.total_steps.saturating_sub(phase1);
+            let phase2 = remaining / 2;
+            let phase3 = remaining.saturating_sub(phase2);
+            (phase1, phase2, phase3)
+        } else {
+            let phase2 = self.total_steps.saturating_sub(phase1);
+            (phase1, phase2, 0)
+        }
+    }
+
+    fn anneal(&self, start: f64, end: f64, progress: f64) -> f64 {
+        let progress = progress.clamp(0.0, 1.0);
+        match self.anneal_strategy {
+            OneCycleAnnealStrategy::Linear => start + (end - start) * progress,
+            OneCycleAnnealStrategy::Cos => {
+                end + (start - end) * 0.5 * (1.0 + (std::f64::consts::PI * progress).cos())
+            }
+        }
+    }
+
+    fn compute_values_at_step(&self, step: usize) -> (f64, Option<f64>) {
+        let step = step.min(self.total_steps);
+        let (phase1, phase2, phase3) = self.phase_steps();
+        let initial_lr = self.initial_lr();
+        let final_lr = self.final_lr();
+
+        let (lr, momentum) = if step <= phase1 {
+            let progress = if phase1 == 0 {
+                1.0
+            } else {
+                step as f64 / phase1 as f64
+            };
+            (
+                self.anneal(initial_lr, self.max_lr, progress),
+                Some(self.anneal(self.max_momentum, self.base_momentum, progress)),
+            )
+        } else if step <= phase1 + phase2 {
+            let rel_step = step - phase1;
+            let progress = if phase2 == 0 {
+                1.0
+            } else {
+                rel_step as f64 / phase2 as f64
+            };
+            if self.three_phase {
+                (
+                    self.anneal(self.max_lr, initial_lr, progress),
+                    Some(self.anneal(self.base_momentum, self.max_momentum, progress)),
+                )
+            } else {
+                (
+                    self.anneal(self.max_lr, final_lr, progress),
+                    Some(self.anneal(self.base_momentum, self.max_momentum, progress)),
+                )
+            }
+        } else {
+            let rel_step = step - phase1 - phase2;
+            let progress = if phase3 == 0 {
+                1.0
+            } else {
+                rel_step as f64 / phase3 as f64
+            };
+            (
+                self.anneal(initial_lr, final_lr, progress),
+                Some(self.max_momentum),
+            )
+        };
+
+        let momentum = if self.cycle_momentum { momentum } else { None };
+        (lr, momentum)
+    }
+}
+
+impl LRScheduler for OneCycleLR {
+    fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
+        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = new_epoch;
+
+        let (new_lr, new_momentum) = self.compute_values_at_step(new_epoch.max(0) as usize);
+        let old_lr = self.last_lr;
+        self.last_lr = new_lr;
+        optimizer.set_lr(new_lr);
+
+        if let Some(momentum) = new_momentum {
+            optimizer.set_momentum(momentum);
+            self.last_momentum = Some(momentum);
+        } else {
+            self.last_momentum = optimizer.get_momentum();
+        }
+
+        if self.verbose && (new_lr - old_lr).abs() > f64::EPSILON {
+            eprintln!(
+                "OneCycleLR: adjusting learning rate from {old_lr:.6e} to {new_lr:.6e} at step {new_epoch}."
+            );
+        }
+    }
+
+    fn get_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn get_last_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn state_dict(&self) -> SchedulerState {
+        let momentum = self.last_momentum.unwrap_or(f64::NAN);
+        SchedulerState {
+            last_epoch: self.last_epoch,
+            last_lrs: vec![self.last_lr],
+            extra: vec![
+                ("max_lr".to_owned(), self.max_lr),
+                ("total_steps".to_owned(), self.total_steps as f64),
+                ("pct_start".to_owned(), self.pct_start),
+                (
+                    "anneal_strategy".to_owned(),
+                    if self.anneal_strategy == OneCycleAnnealStrategy::Cos {
+                        0.0
+                    } else {
+                        1.0
+                    },
+                ),
+                (
+                    "cycle_momentum".to_owned(),
+                    if self.cycle_momentum { 1.0 } else { 0.0 },
+                ),
+                ("base_momentum".to_owned(), self.base_momentum),
+                ("max_momentum".to_owned(), self.max_momentum),
+                ("div_factor".to_owned(), self.div_factor),
+                ("final_div_factor".to_owned(), self.final_div_factor),
+                (
+                    "three_phase".to_owned(),
+                    if self.three_phase { 1.0 } else { 0.0 },
+                ),
+                ("last_momentum".to_owned(), momentum),
+                ("verbose".to_owned(), if self.verbose { 1.0 } else { 0.0 }),
+            ],
+        }
+    }
+
+    fn load_state_dict(&mut self, state: SchedulerState) {
+        self.last_epoch = state.last_epoch;
+        if let Some(&lr) = state.last_lrs.first() {
+            self.last_lr = lr;
+        }
+
+        for (key, val) in &state.extra {
+            match key.as_str() {
+                "max_lr" => self.max_lr = *val,
+                "total_steps" => self.total_steps = (*val as usize).max(1),
+                "pct_start" => self.pct_start = val.clamp(0.0, 1.0),
+                "anneal_strategy" => {
+                    self.anneal_strategy = if *val >= 0.5 {
+                        OneCycleAnnealStrategy::Linear
+                    } else {
+                        OneCycleAnnealStrategy::Cos
+                    };
+                }
+                "cycle_momentum" => self.cycle_momentum = *val >= 0.5,
+                "base_momentum" => self.base_momentum = *val,
+                "max_momentum" => self.max_momentum = *val,
+                "div_factor" => self.div_factor = val.max(f64::EPSILON),
+                "final_div_factor" => self.final_div_factor = val.max(f64::EPSILON),
+                "three_phase" => self.three_phase = *val >= 0.5,
+                "last_momentum" => {
+                    self.last_momentum = if val.is_nan() { None } else { Some(*val) };
+                }
+                "verbose" => self.verbose = *val >= 0.5,
+                _ => {}
             }
         }
     }
@@ -6332,5 +6675,178 @@ mod tests {
         assert_eq!(chained2.state_dict(), state);
         assert_eq!(chained2.get_last_lr(), chained.get_last_lr());
         assert_eq!(chained2.get_lr(), chained.get_lr());
+    }
+
+    #[test]
+    fn one_cycle_lr_linear_phase_boundaries() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut scheduler = OneCycleLR::new(&opt, 1.0, 10)
+            .pct_start(0.3)
+            .anneal_strategy_linear();
+
+        scheduler.step(&mut opt, Some(0));
+        assert!((opt.get_lr() - 0.04).abs() < 1e-12);
+        scheduler.step(&mut opt, Some(3));
+        assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+        scheduler.step(&mut opt, Some(10));
+        assert!((opt.get_lr() - 4.0e-6).abs() < 1e-12);
+    }
+
+    #[test]
+    fn one_cycle_lr_cosine_and_linear_differ() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x1 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt1 = SGD::new(vec![x1], 1.0);
+        let mut cos = OneCycleLR::new(&opt1, 1.0, 20)
+            .pct_start(0.4)
+            .anneal_strategy_cos();
+        cos.step(&mut opt1, Some(9));
+        let cos_lr = opt1.get_lr();
+
+        let x2 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt2 = SGD::new(vec![x2], 1.0);
+        let mut lin = OneCycleLR::new(&opt2, 1.0, 20)
+            .pct_start(0.4)
+            .anneal_strategy_linear();
+        lin.step(&mut opt2, Some(9));
+        let lin_lr = opt2.get_lr();
+
+        assert!((cos_lr - lin_lr).abs() > 1e-6);
+    }
+
+    #[test]
+    fn one_cycle_lr_cycles_momentum_inversely() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0).momentum(0.95);
+        let mut scheduler = OneCycleLR::new(&opt, 1.0, 10)
+            .pct_start(0.5)
+            .anneal_strategy_linear()
+            .cycle_momentum(true)
+            .base_momentum(0.85)
+            .max_momentum(0.95);
+
+        scheduler.step(&mut opt, Some(0));
+        let lr0 = opt.get_lr();
+        let m0 = opt.get_momentum().expect("sgd exposes momentum");
+
+        scheduler.step(&mut opt, Some(5));
+        let lr_peak = opt.get_lr();
+        let m_low = opt.get_momentum().expect("sgd exposes momentum");
+
+        scheduler.step(&mut opt, Some(10));
+        let lr_end = opt.get_lr();
+        let m_end = opt.get_momentum().expect("sgd exposes momentum");
+
+        assert!(lr_peak > lr0);
+        assert!(m_low < m0);
+        assert!(lr_end < lr_peak);
+        assert!(m_end > m_low);
+    }
+
+    #[test]
+    fn one_cycle_lr_three_phase_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut scheduler = OneCycleLR::new(&opt, 1.0, 12)
+            .pct_start(0.25)
+            .three_phase(true)
+            .anneal_strategy_linear();
+
+        scheduler.step(&mut opt, Some(0));
+        let lr0 = opt.get_lr();
+        scheduler.step(&mut opt, Some(3));
+        let lr_max = opt.get_lr();
+        scheduler.step(&mut opt, Some(7));
+        let lr_mid = opt.get_lr();
+        scheduler.step(&mut opt, Some(12));
+        let lr_final = opt.get_lr();
+
+        assert!(lr_max > lr0);
+        assert!(lr_mid < lr_max);
+        assert!(lr_final < lr_mid);
+    }
+
+    #[test]
+    fn one_cycle_lr_state_dict_round_trip() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0).momentum(0.95);
+        let mut scheduler = OneCycleLR::new(&opt, 2.0, 30)
+            .pct_start(0.2)
+            .anneal_strategy_linear()
+            .cycle_momentum(true)
+            .base_momentum(0.8)
+            .max_momentum(0.95)
+            .div_factor(10.0)
+            .final_div_factor(100.0)
+            .three_phase(true);
+
+        scheduler.step(&mut opt, Some(11));
+        let state = scheduler.state_dict();
+
+        let mut scheduler2 = OneCycleLR::new(&opt, 1.0, 5);
+        scheduler2.load_state_dict(state.clone());
+
+        assert_eq!(scheduler2.state_dict(), state);
+        assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
+        assert_eq!(
+            scheduler2.get_last_momentum(),
+            scheduler.get_last_momentum()
+        );
+    }
+
+    #[test]
+    fn one_cycle_lr_edge_cases() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let x1 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt1 = SGD::new(vec![x1], 1.0);
+        let mut s1 = OneCycleLR::new(&opt1, 1.0, 1).pct_start(0.0);
+        s1.step(&mut opt1, Some(0));
+        assert!((opt1.get_lr() - 1.0).abs() < 1e-12);
+
+        let x2 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt2 = SGD::new(vec![x2], 1.0);
+        let mut s2 = OneCycleLR::new(&opt2, 1.0, 10).pct_start(1.0);
+        s2.step(&mut opt2, Some(10));
+        assert!((opt2.get_lr() - 1.0).abs() < 1e-12);
+
+        let x3 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt3 = SGD::new(vec![x3], 1.0);
+        let mut s3 = OneCycleLR::new(&opt3, 0.5, 10).div_factor(1.0);
+        s3.step(&mut opt3, Some(0));
+        assert!((opt3.get_lr() - 0.5).abs() < 1e-12);
+
+        let x4 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt4 = SGD::new(vec![x4], 1.0);
+        let mut s4 = OneCycleLR::new(&opt4, 1.0, 10).anneal_strategy_linear();
+        s4.step(&mut opt4, Some(10));
+        let lr_at_end = opt4.get_lr();
+        s4.step(&mut opt4, Some(100));
+        assert!((opt4.get_lr() - lr_at_end).abs() < 1e-12);
     }
 }

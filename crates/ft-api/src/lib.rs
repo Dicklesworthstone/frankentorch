@@ -533,6 +533,16 @@ impl FrankenTorchSession {
         self.tensor_tape.to_f64(input)
     }
 
+    /// PyTorch-style alias for casting a tensor to float32.
+    pub fn tensor_float(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_to_f32(input)
+    }
+
+    /// PyTorch-style alias for casting a tensor to float64.
+    pub fn tensor_double(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_to_f64(input)
+    }
+
     pub fn zeros_f32(
         &mut self,
         shape: Vec<usize>,
@@ -1474,6 +1484,81 @@ impl FrankenTorchSession {
         rhs: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_comparison(ComparisonOp::Ge, lhs, rhs)
+    }
+
+    /// Return `true` when tensors have identical shape and element values.
+    ///
+    /// NaN values are considered unequal (matching PyTorch `torch.equal`).
+    pub fn tensor_equal(
+        &self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<bool, AutogradError> {
+        let (lhs_values, lhs_meta) = self.tensor_values_meta(lhs)?;
+        let (rhs_values, rhs_meta) = self.tensor_values_meta(rhs)?;
+
+        if lhs_meta.shape() != rhs_meta.shape() || lhs_meta.dtype() != rhs_meta.dtype() {
+            return Ok(false);
+        }
+
+        for (l, r) in lhs_values.iter().zip(rhs_values.iter()) {
+            if l.is_nan() || r.is_nan() {
+                return Ok(false);
+            }
+            if l != r {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
+    /// Return `true` when tensors are elementwise close within tolerance.
+    ///
+    /// Uses: `|a - b| <= atol + rtol * |b|`.
+    pub fn tensor_allclose(
+        &self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        rtol: f64,
+        atol: f64,
+        equal_nan: bool,
+    ) -> Result<bool, AutogradError> {
+        if !rtol.is_finite() || !atol.is_finite() || rtol < 0.0 || atol < 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "allclose requires finite non-negative rtol and atol",
+                },
+            )));
+        }
+
+        let (lhs_values, lhs_meta) = self.tensor_values_meta(lhs)?;
+        let (rhs_values, rhs_meta) = self.tensor_values_meta(rhs)?;
+
+        if lhs_meta.shape() != rhs_meta.shape() || lhs_meta.dtype() != rhs_meta.dtype() {
+            return Ok(false);
+        }
+
+        for (l, r) in lhs_values.iter().zip(rhs_values.iter()) {
+            if l.is_nan() || r.is_nan() {
+                if equal_nan && l.is_nan() && r.is_nan() {
+                    continue;
+                }
+                return Ok(false);
+            }
+
+            if l.is_infinite() || r.is_infinite() {
+                if l == r {
+                    continue;
+                }
+                return Ok(false);
+            }
+
+            let tolerance = atol + rtol * r.abs();
+            if (l - r).abs() > tolerance {
+                return Ok(false);
+            }
+        }
+        Ok(true)
     }
 
     pub fn tensor_sum(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
@@ -4871,6 +4956,109 @@ mod tests {
             session.tensor_values(z).expect("values should resolve"),
             vec![1.0, 0.0, 1.0]
         );
+    }
+
+    #[test]
+    fn session_tensor_equal_returns_expected_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let b = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let c = session
+            .tensor_variable(vec![1.0, 2.0, 4.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let d = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .expect("tensor variable should succeed");
+
+        assert!(session.tensor_equal(a, b).expect("equal should succeed"));
+        assert!(!session.tensor_equal(a, c).expect("equal should succeed"));
+        assert!(!session.tensor_equal(a, d).expect("equal should succeed"));
+    }
+
+    #[test]
+    fn session_tensor_equal_treats_nan_as_unequal() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![f64::NAN, 1.0], vec![2], false)
+            .expect("tensor variable should succeed");
+        let b = session
+            .tensor_variable(vec![f64::NAN, 1.0], vec![2], false)
+            .expect("tensor variable should succeed");
+        assert!(!session.tensor_equal(a, b).expect("equal should succeed"));
+    }
+
+    #[test]
+    fn session_tensor_allclose_returns_expected_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let b = session
+            .tensor_variable(vec![1.0000001, 1.9999999, 3.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let c = session
+            .tensor_variable(vec![1.1, 2.0, 3.0], vec![3], false)
+            .expect("tensor variable should succeed");
+
+        assert!(
+            session
+                .tensor_allclose(a, b, 1e-5, 1e-8, false)
+                .expect("allclose should succeed")
+        );
+        assert!(
+            !session
+                .tensor_allclose(a, c, 1e-5, 1e-8, false)
+                .expect("allclose should succeed")
+        );
+    }
+
+    #[test]
+    fn session_tensor_allclose_nan_and_inf_handling() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![f64::NAN, f64::INFINITY, 1.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let b = session
+            .tensor_variable(vec![f64::NAN, f64::INFINITY, 1.0], vec![3], false)
+            .expect("tensor variable should succeed");
+        let c = session
+            .tensor_variable(vec![f64::NAN, f64::NEG_INFINITY, 1.0], vec![3], false)
+            .expect("tensor variable should succeed");
+
+        assert!(
+            !session
+                .tensor_allclose(a, b, 1e-5, 1e-8, false)
+                .expect("allclose should succeed")
+        );
+        assert!(
+            session
+                .tensor_allclose(a, b, 1e-5, 1e-8, true)
+                .expect("allclose should succeed")
+        );
+        assert!(
+            !session
+                .tensor_allclose(a, c, 1e-5, 1e-8, true)
+                .expect("allclose should succeed")
+        );
+    }
+
+    #[test]
+    fn session_tensor_allclose_rejects_invalid_tolerances() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .expect("tensor variable should succeed");
+        let b = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .expect("tensor variable should succeed");
+
+        assert!(session.tensor_allclose(a, b, -1.0, 0.0, false).is_err());
+        assert!(session.tensor_allclose(a, b, 0.0, -1.0, false).is_err());
+        assert!(session.tensor_allclose(a, b, f64::NAN, 0.0, false).is_err());
     }
 
     #[test]
@@ -11037,6 +11225,60 @@ mod tests {
         let c = session.tensor_to_f64(b).unwrap();
         assert_eq!(session.tensor_dtype(c).unwrap(), DType::F64);
         assert_eq!(session.tensor_values(c).unwrap(), vec![1.5, 2.5]);
+    }
+
+    #[test]
+    fn f32_float_and_double_aliases_work() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![1.25f64, -2.5, 3.75], vec![3], false)
+            .unwrap();
+        let b = session.tensor_float(a).unwrap();
+        assert_eq!(session.tensor_dtype(b).unwrap(), DType::F32);
+        assert_eq!(
+            session.tensor_values_f32(b).unwrap(),
+            vec![1.25f32, -2.5, 3.75]
+        );
+
+        let c = session.tensor_double(b).unwrap();
+        assert_eq!(session.tensor_dtype(c).unwrap(), DType::F64);
+        assert_eq!(session.tensor_values(c).unwrap(), vec![1.25f64, -2.5, 3.75]);
+    }
+
+    #[test]
+    fn f32_matmul_preserves_dtype_and_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lhs = session
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let rhs = session
+            .tensor_variable_f32(vec![7.0f32, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2], false)
+            .unwrap();
+
+        let out = session.tensor_matmul(lhs, rhs).unwrap();
+        assert_eq!(session.tensor_dtype(out).unwrap(), DType::F32);
+        assert_eq!(
+            session.tensor_values_f32(out).unwrap(),
+            vec![58.0f32, 64.0, 139.0, 154.0]
+        );
+    }
+
+    #[test]
+    fn f32_f64_matmul_promotes_to_f64() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lhs = session
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let rhs = session
+            .tensor_variable(vec![7.0f64, 8.0, 9.0, 10.0, 11.0, 12.0], vec![3, 2], false)
+            .unwrap();
+
+        let out = session.tensor_matmul(lhs, rhs).unwrap();
+        assert_eq!(session.tensor_dtype(out).unwrap(), DType::F64);
+        assert_eq!(
+            session.tensor_values(out).unwrap(),
+            vec![58.0, 64.0, 139.0, 154.0]
+        );
     }
 
     #[test]
