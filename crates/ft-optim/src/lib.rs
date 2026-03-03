@@ -2782,6 +2782,305 @@ impl LRScheduler for ReduceLROnPlateau {
     }
 }
 
+struct ShadowOptimizer {
+    lr: f64,
+}
+
+impl ShadowOptimizer {
+    fn new(lr: f64) -> Self {
+        Self { lr }
+    }
+}
+
+impl Optimizer for ShadowOptimizer {
+    fn step(
+        &mut self,
+        _session: &mut FrankenTorchSession,
+        _report: &TensorBackwardReport,
+    ) -> Result<(), AutogradError> {
+        Ok(())
+    }
+
+    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        Ok(())
+    }
+
+    fn get_lr(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+}
+
+/// LambdaLR: apply a user-provided multiplier function to the base lr.
+pub struct LambdaLR {
+    initial_lr: f64,
+    lr_lambda: Box<dyn Fn(i64) -> f64 + Send + Sync>,
+    last_epoch: i64,
+    last_lr: f64,
+    verbose: bool,
+}
+
+impl LambdaLR {
+    pub fn new<F>(optimizer: &dyn Optimizer, lr_lambda: F) -> Self
+    where
+        F: Fn(i64) -> f64 + Send + Sync + 'static,
+    {
+        let initial_lr = optimizer.get_lr();
+        Self {
+            initial_lr,
+            lr_lambda: Box::new(lr_lambda),
+            last_epoch: -1,
+            last_lr: initial_lr,
+            verbose: false,
+        }
+    }
+
+    #[must_use]
+    pub fn last_epoch(mut self, last_epoch: i64) -> Self {
+        self.last_epoch = last_epoch;
+        if last_epoch >= 0 {
+            self.last_lr = self.compute_lr_at_epoch(last_epoch);
+        }
+        self
+    }
+
+    #[must_use]
+    pub fn verbose(mut self, verbose: bool) -> Self {
+        self.verbose = verbose;
+        self
+    }
+
+    fn compute_lr_at_epoch(&self, epoch: i64) -> f64 {
+        if epoch < 0 {
+            return self.initial_lr;
+        }
+        let multiplier = (self.lr_lambda)(epoch).max(0.0);
+        self.initial_lr * multiplier
+    }
+}
+
+impl LRScheduler for LambdaLR {
+    fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
+        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = new_epoch;
+        let new_lr = self.compute_lr_at_epoch(new_epoch);
+        let old_lr = self.last_lr;
+        self.last_lr = new_lr;
+        optimizer.set_lr(new_lr);
+
+        if self.verbose && (new_lr - old_lr).abs() > f64::EPSILON {
+            eprintln!(
+                "LambdaLR: adjusting learning rate from {old_lr:.6e} to {new_lr:.6e} at epoch {new_epoch}."
+            );
+        }
+    }
+
+    fn get_lr(&self) -> Vec<f64> {
+        vec![self.compute_lr_at_epoch(self.last_epoch)]
+    }
+
+    fn get_last_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn state_dict(&self) -> SchedulerState {
+        SchedulerState {
+            last_epoch: self.last_epoch,
+            last_lrs: vec![self.last_lr],
+            extra: vec![("initial_lr".to_owned(), self.initial_lr)],
+        }
+    }
+
+    fn load_state_dict(&mut self, state: SchedulerState) {
+        self.last_epoch = state.last_epoch;
+        if let Some(&lr) = state.last_lrs.first() {
+            self.last_lr = lr;
+        }
+        for (key, val) in &state.extra {
+            if key == "initial_lr" {
+                self.initial_lr = *val;
+            }
+        }
+    }
+}
+
+/// SequentialLR: switch between schedulers at milestone epochs.
+pub struct SequentialLR {
+    schedulers: Vec<Box<dyn LRScheduler>>,
+    milestones: Vec<usize>,
+    last_epoch: i64,
+    last_lr: f64,
+}
+
+impl SequentialLR {
+    pub fn new(
+        optimizer: &dyn Optimizer,
+        schedulers: Vec<Box<dyn LRScheduler>>,
+        mut milestones: Vec<usize>,
+    ) -> Self {
+        assert!(
+            !schedulers.is_empty(),
+            "SequentialLR requires at least one scheduler"
+        );
+        milestones.sort_unstable();
+        Self {
+            schedulers,
+            milestones,
+            last_epoch: -1,
+            last_lr: optimizer.get_lr(),
+        }
+    }
+
+    fn active_index_and_local_epoch(&self, epoch: i64) -> (usize, i64) {
+        if epoch < 0 {
+            return (0, epoch);
+        }
+
+        let e = epoch as usize;
+        let index = self
+            .milestones
+            .partition_point(|&milestone| milestone <= e)
+            .min(self.schedulers.len().saturating_sub(1));
+        let phase_start = if index == 0 {
+            0
+        } else {
+            self.milestones[index - 1] as i64
+        };
+        (index, epoch - phase_start)
+    }
+}
+
+impl LRScheduler for SequentialLR {
+    fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
+        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = new_epoch;
+        let (index, local_epoch) = self.active_index_and_local_epoch(new_epoch);
+        self.schedulers[index].step(optimizer, Some(local_epoch));
+        self.last_lr = optimizer.get_lr();
+    }
+
+    fn get_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn get_last_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn state_dict(&self) -> SchedulerState {
+        SchedulerState {
+            last_epoch: self.last_epoch,
+            last_lrs: vec![self.last_lr],
+            extra: self
+                .milestones
+                .iter()
+                .enumerate()
+                .map(|(idx, milestone)| (format!("milestone_{idx}"), *milestone as f64))
+                .collect(),
+        }
+    }
+
+    fn load_state_dict(&mut self, state: SchedulerState) {
+        self.last_epoch = state.last_epoch;
+        if let Some(&lr) = state.last_lrs.first() {
+            self.last_lr = lr;
+        }
+        let mut indexed_milestones = Vec::new();
+        for (key, val) in &state.extra {
+            if let Some(index) = key
+                .strip_prefix("milestone_")
+                .and_then(|suffix| suffix.parse::<usize>().ok())
+            {
+                indexed_milestones.push((index, *val as usize));
+            }
+        }
+        if !indexed_milestones.is_empty() {
+            indexed_milestones.sort_by_key(|(index, _)| *index);
+            self.milestones = indexed_milestones
+                .into_iter()
+                .map(|(_, milestone)| milestone)
+                .collect();
+            self.milestones.sort_unstable();
+        }
+    }
+}
+
+/// ChainedScheduler: apply multiple schedulers multiplicatively.
+pub struct ChainedScheduler {
+    base_lr: f64,
+    schedulers: Vec<Box<dyn LRScheduler>>,
+    last_epoch: i64,
+    last_lr: f64,
+}
+
+impl ChainedScheduler {
+    pub fn new(optimizer: &dyn Optimizer, schedulers: Vec<Box<dyn LRScheduler>>) -> Self {
+        assert!(
+            !schedulers.is_empty(),
+            "ChainedScheduler requires at least one scheduler"
+        );
+        let base_lr = optimizer.get_lr();
+        Self {
+            base_lr,
+            schedulers,
+            last_epoch: -1,
+            last_lr: base_lr,
+        }
+    }
+}
+
+impl LRScheduler for ChainedScheduler {
+    fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
+        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = new_epoch;
+
+        let mut factor = 1.0;
+        for scheduler in &mut self.schedulers {
+            let mut shadow = ShadowOptimizer::new(self.base_lr);
+            scheduler.step(&mut shadow, Some(new_epoch));
+            let sched_lr = scheduler.get_last_lr()[0];
+            if self.base_lr.abs() > f64::EPSILON {
+                factor *= sched_lr / self.base_lr;
+            }
+        }
+
+        let new_lr = self.base_lr * factor;
+        optimizer.set_lr(new_lr);
+        self.last_lr = new_lr;
+    }
+
+    fn get_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn get_last_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn state_dict(&self) -> SchedulerState {
+        SchedulerState {
+            last_epoch: self.last_epoch,
+            last_lrs: vec![self.last_lr],
+            extra: vec![("base_lr".to_owned(), self.base_lr)],
+        }
+    }
+
+    fn load_state_dict(&mut self, state: SchedulerState) {
+        self.last_epoch = state.last_epoch;
+        if let Some(&lr) = state.last_lrs.first() {
+            self.last_lr = lr;
+        }
+        for (key, val) in &state.extra {
+            if key == "base_lr" {
+                self.base_lr = *val;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ft_api::FrankenTorchSession;
@@ -5844,5 +6143,194 @@ mod tests {
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
         assert_eq!(scheduler2.get_lr(), scheduler.get_lr());
+    }
+
+    #[test]
+    fn lambda_lr_linear_warmup_and_step_decay() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+
+        let mut warmup = LambdaLR::new(&opt, |epoch| ((epoch + 1) as f64 / 10.0).min(1.0));
+        warmup.step(&mut opt, Some(0));
+        assert!((opt.get_lr() - 0.1).abs() < 1e-12);
+        warmup.step(&mut opt, Some(9));
+        assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+
+        let mut step_decay = LambdaLR::new(&opt, |epoch| 0.1_f64.powi((epoch / 30) as i32));
+        step_decay.step(&mut opt, Some(0));
+        assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+        step_decay.step(&mut opt, Some(30));
+        assert!((opt.get_lr() - 0.1).abs() < 1e-12);
+        step_decay.step(&mut opt, Some(60));
+        assert!((opt.get_lr() - 0.01).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lambda_lr_negative_multiplier_is_clamped() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut scheduler = LambdaLR::new(&opt, |_epoch| -3.0);
+
+        scheduler.step(&mut opt, Some(0));
+        assert!((opt.get_lr() - 0.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn lambda_lr_state_dict_round_trip() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 0.9);
+        let mut scheduler = LambdaLR::new(&opt, |epoch| 1.0 / (epoch + 1) as f64);
+        scheduler.step(&mut opt, Some(3));
+        let state = scheduler.state_dict();
+
+        let mut scheduler2 = LambdaLR::new(&opt, |_epoch| 1.0);
+        scheduler2.load_state_dict(state.clone());
+        assert_eq!(scheduler2.state_dict(), state);
+        assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
+    }
+
+    #[test]
+    fn sequential_lr_milestone_transition_and_single_equivalence() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+
+        let mut seq = SequentialLR::new(
+            &opt,
+            vec![
+                Box::new(
+                    LinearLR::new(&opt)
+                        .start_factor(0.1)
+                        .end_factor(1.0)
+                        .total_iters(5),
+                ),
+                Box::new(CosineAnnealingLR::new(&opt, 10).eta_min(0.0)),
+            ],
+            vec![6],
+        );
+        seq.step(&mut opt, Some(5));
+        assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+        seq.step(&mut opt, Some(6));
+        assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+
+        let x2 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt2 = SGD::new(vec![x2], 0.8);
+        let mut seq_single =
+            SequentialLR::new(&opt2, vec![Box::new(StepLR::new(&opt2, 10))], vec![]);
+        let mut step = StepLR::new(&opt2, 10);
+        seq_single.step(&mut opt2, Some(10));
+        let seq_lr = opt2.get_lr();
+
+        let x3 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt3 = SGD::new(vec![x3], 0.8);
+        step.step(&mut opt3, Some(10));
+        assert!((seq_lr - opt3.get_lr()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn sequential_lr_state_dict_round_trip() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+
+        let mut scheduler = SequentialLR::new(
+            &opt,
+            vec![
+                Box::new(
+                    LinearLR::new(&opt)
+                        .start_factor(0.5)
+                        .end_factor(1.0)
+                        .total_iters(2),
+                ),
+                Box::new(ExponentialLR::new(&opt, 0.9)),
+            ],
+            vec![3],
+        );
+        scheduler.step(&mut opt, Some(4));
+        let state = scheduler.state_dict();
+
+        let mut scheduler2 = SequentialLR::new(&opt, vec![Box::new(StepLR::new(&opt, 1))], vec![]);
+        scheduler2.load_state_dict(state.clone());
+        assert_eq!(scheduler2.state_dict(), state);
+        assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
+        assert_eq!(scheduler2.get_lr(), scheduler.get_lr());
+    }
+
+    #[test]
+    fn chained_scheduler_multiplicative_and_single_equivalence() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+
+        let mut chained = ChainedScheduler::new(
+            &opt,
+            vec![
+                Box::new(StepLR::new(&opt, 1).gamma(0.1)),
+                Box::new(ExponentialLR::new(&opt, 0.5)),
+            ],
+        );
+        chained.step(&mut opt, Some(1));
+        assert!((opt.get_lr() - 0.05).abs() < 1e-12);
+
+        let x2 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt2 = SGD::new(vec![x2], 0.6);
+        let mut chain_single =
+            ChainedScheduler::new(&opt2, vec![Box::new(ExponentialLR::new(&opt2, 0.9))]);
+        let mut exp = ExponentialLR::new(&opt2, 0.9);
+        chain_single.step(&mut opt2, Some(4));
+        let chain_lr = opt2.get_lr();
+
+        let x3 = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt3 = SGD::new(vec![x3], 0.6);
+        exp.step(&mut opt3, Some(4));
+        assert!((chain_lr - opt3.get_lr()).abs() < 1e-12);
+    }
+
+    #[test]
+    fn chained_scheduler_state_dict_round_trip() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 0.7);
+        let mut chained = ChainedScheduler::new(
+            &opt,
+            vec![
+                Box::new(ExponentialLR::new(&opt, 0.95)),
+                Box::new(StepLR::new(&opt, 5).gamma(0.5)),
+            ],
+        );
+        chained.step(&mut opt, Some(5));
+        let state = chained.state_dict();
+
+        let mut chained2 =
+            ChainedScheduler::new(&opt, vec![Box::new(ExponentialLR::new(&opt, 1.0))]);
+        chained2.load_state_dict(state.clone());
+        assert_eq!(chained2.state_dict(), state);
+        assert_eq!(chained2.get_last_lr(), chained.get_last_lr());
+        assert_eq!(chained2.get_lr(), chained.get_lr());
     }
 }
