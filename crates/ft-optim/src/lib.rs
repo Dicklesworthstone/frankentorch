@@ -55,17 +55,31 @@ fn ensure_state_len(
     Ok(())
 }
 
+fn load_param_gradient(
+    session: &FrankenTorchSession,
+    param: TensorNodeId,
+) -> Result<Option<Vec<f64>>, AutogradError> {
+    session.tensor_accumulated_gradient(param)
+}
+
+fn zero_param_gradients(
+    session: &mut FrankenTorchSession,
+    params: &[TensorNodeId],
+) -> Result<(), AutogradError> {
+    session.tensor_zero_grads(params)
+}
+
 /// Trait for parameter optimizers.
 pub trait Optimizer {
-    /// Perform a single optimization step using computed gradients.
+    /// Perform a single optimization step using persistent gradients stored in
+    /// the session's autograd state.
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
         report: &TensorBackwardReport,
     ) -> Result<(), AutogradError>;
 
-    /// Zero out accumulated gradients (no-op for this implementation since
-    /// gradients are recomputed each backward pass, but included for API parity).
+    /// Zero out accumulated persistent gradients for this optimizer's parameter set.
     fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError>;
 
     /// Return the current learning rate.
@@ -159,12 +173,12 @@ impl Optimizer for SGD {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_gradient(report, param) {
-                Some(g) => g.to_vec(),
+            let grad = match load_param_gradient(session, param)? {
+                Some(g) => g,
                 None => continue,
             };
 
@@ -229,9 +243,8 @@ impl Optimizer for SGD {
         Ok(())
     }
 
-    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
-        // Gradients are recomputed each backward pass; this is a no-op.
-        Ok(())
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
     }
 }
 
@@ -325,15 +338,15 @@ impl Optimizer for Adam {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         let t = checked_next_step_count(self.step_count, "adam step counter overflow")?;
         self.step_count = t;
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_gradient(report, param) {
-                Some(g) => g.to_vec(),
+            let grad = match load_param_gradient(session, param)? {
+                Some(g) => g,
                 None => continue,
             };
 
@@ -392,8 +405,8 @@ impl Optimizer for Adam {
         Ok(())
     }
 
-    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
-        Ok(())
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
     }
 }
 
@@ -492,15 +505,15 @@ impl Optimizer for AdamW {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         let t = checked_next_step_count(self.step_count, "adamw step counter overflow")?;
         self.step_count = t;
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_gradient(report, param) {
-                Some(g) => g.to_vec(),
+            let grad = match load_param_gradient(session, param)? {
+                Some(g) => g,
                 None => continue,
             };
 
@@ -561,8 +574,8 @@ impl Optimizer for AdamW {
         Ok(())
     }
 
-    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
-        Ok(())
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
     }
 }
 
@@ -687,15 +700,15 @@ impl Optimizer for RMSprop {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         self.step_count =
             checked_next_step_count(self.step_count, "rmsprop step counter overflow")?;
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_gradient(report, param) {
-                Some(g) => g.to_vec(),
+            let grad = match load_param_gradient(session, param)? {
+                Some(g) => g,
                 None => continue,
             };
 
@@ -775,8 +788,8 @@ impl Optimizer for RMSprop {
         Ok(())
     }
 
-    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
-        Ok(())
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
     }
 }
 
@@ -883,7 +896,7 @@ impl Optimizer for Adagrad {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         self.step_count =
@@ -893,8 +906,8 @@ impl Optimizer for Adagrad {
         let clr = self.lr / (1.0 + (self.step_count.saturating_sub(1) as f64) * self.lr_decay);
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_gradient(report, param) {
-                Some(g) => g.to_vec(),
+            let grad = match load_param_gradient(session, param)? {
+                Some(g) => g,
                 None => continue,
             };
 
@@ -935,8 +948,8 @@ impl Optimizer for Adagrad {
         Ok(())
     }
 
-    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
-        Ok(())
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
     }
 }
 
@@ -1039,7 +1052,7 @@ impl Optimizer for RAdam {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        report: &TensorBackwardReport,
+        _report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         let t = checked_next_step_count(self.step_count, "radam step counter overflow")?;
@@ -1049,8 +1062,8 @@ impl Optimizer for RAdam {
         let rho_inf = 2.0 / (1.0 - self.beta2) - 1.0;
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match session.tensor_gradient(report, param) {
-                Some(g) => g.to_vec(),
+            let grad = match load_param_gradient(session, param)? {
+                Some(g) => g,
                 None => continue,
             };
 
@@ -1124,8 +1137,8 @@ impl Optimizer for RAdam {
         Ok(())
     }
 
-    fn zero_grad(&mut self, _session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
-        Ok(())
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
     }
 }
 
@@ -1423,16 +1436,154 @@ mod tests {
     }
 
     #[test]
-    fn zero_grad_is_noop() {
+    fn sgd_zero_grad_clears_persistent_gradients() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
             .expect("variable should succeed");
 
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
         let mut optimizer = SGD::new(vec![x], 0.1);
+        optimizer.step(&mut session, &report).expect("step");
+
+        let grad_before = session
+            .tensor_accumulated_gradient(x)
+            .expect("accumulated gradient lookup")
+            .expect("gradient should exist");
+        assert!(grad_before.iter().any(|value| value.abs() > 0.0));
+
         optimizer
             .zero_grad(&mut session)
             .expect("zero_grad should succeed");
+        let grad_after = session
+            .tensor_accumulated_gradient(x)
+            .expect("accumulated gradient lookup")
+            .expect("gradient entry should remain allocated");
+        assert!(
+            grad_after.iter().all(|value| value.abs() < 1e-12),
+            "expected zeroed gradient, got {:?}",
+            grad_after
+        );
+    }
+
+    #[test]
+    fn sgd_accumulates_gradients_across_backwards() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("variable should succeed");
+
+        for _ in 0..3 {
+            let loss = session.tensor_mul(x, x).expect("mul");
+            let loss_sum = session.tensor_sum(loss).expect("sum");
+            let _ = session.tensor_backward(loss_sum).expect("backward");
+        }
+
+        let grad = session
+            .tensor_accumulated_gradient(x)
+            .expect("accumulated gradient lookup")
+            .expect("gradient should exist");
+        assert!(
+            (grad[0] - 24.0).abs() < 1e-10,
+            "expected accumulated gradient 24.0, got {}",
+            grad[0]
+        );
+    }
+
+    #[test]
+    fn sgd_step_reads_persistent_gradients_not_report_payload() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![4.0], vec![1], true)
+            .expect("x var");
+        let y = session
+            .tensor_variable(vec![3.0], vec![1], true)
+            .expect("y var");
+
+        let mut optimizer = SGD::new(vec![x], 0.1);
+
+        let x_loss = session.tensor_mul(x, x).expect("mul");
+        let x_loss_sum = session.tensor_sum(x_loss).expect("sum");
+        let _x_report = session.tensor_backward(x_loss_sum).expect("x backward");
+
+        let y_loss = session.tensor_mul(y, y).expect("mul");
+        let y_loss_sum = session.tensor_sum(y_loss).expect("sum");
+        let unrelated_report = session.tensor_backward(y_loss_sum).expect("y backward");
+
+        optimizer
+            .step(&mut session, &unrelated_report)
+            .expect("step should use persistent gradient for x");
+
+        let x_val = session.tensor_values(x).expect("x values")[0];
+        assert!(
+            (x_val - 3.2).abs() < 1e-10,
+            "expected x to update from persistent grad to 3.2, got {}",
+            x_val
+        );
+    }
+
+    #[test]
+    fn sgd_microbatch_accumulation_matches_single_batch_step() {
+        let targets = [1.0, 2.0, 3.0, 4.0];
+
+        let mut full_session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let full_w = full_session
+            .tensor_variable(vec![2.0], vec![1], true)
+            .expect("full w");
+        let mut full_optimizer = SGD::new(vec![full_w], 0.05);
+
+        let mut total_loss = None;
+        for target_value in targets {
+            let target = full_session
+                .tensor_variable(vec![target_value], vec![1], false)
+                .expect("target");
+            let diff = full_session.tensor_sub(full_w, target).expect("sub");
+            let sq = full_session.tensor_mul(diff, diff).expect("mul");
+            let loss = full_session.tensor_sum(sq).expect("sum");
+            total_loss = Some(match total_loss {
+                Some(acc) => full_session.tensor_add(acc, loss).expect("add"),
+                None => loss,
+            });
+        }
+        let full_report = full_session
+            .tensor_backward(total_loss.expect("total loss"))
+            .expect("full backward");
+        full_optimizer
+            .step(&mut full_session, &full_report)
+            .expect("full step");
+        let full_value = full_session.tensor_values(full_w).expect("full value")[0];
+
+        let mut micro_session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let micro_w = micro_session
+            .tensor_variable(vec![2.0], vec![1], true)
+            .expect("micro w");
+        let mut micro_optimizer = SGD::new(vec![micro_w], 0.05);
+        let mut last_report = None;
+
+        for target_value in targets {
+            let target = micro_session
+                .tensor_variable(vec![target_value], vec![1], false)
+                .expect("target");
+            let diff = micro_session.tensor_sub(micro_w, target).expect("sub");
+            let sq = micro_session.tensor_mul(diff, diff).expect("mul");
+            let loss = micro_session.tensor_sum(sq).expect("sum");
+            last_report = Some(micro_session.tensor_backward(loss).expect("micro backward"));
+        }
+        let last_report = last_report.expect("at least one micro-batch");
+        micro_optimizer
+            .step(&mut micro_session, &last_report)
+            .expect("micro step");
+        let micro_value = micro_session.tensor_values(micro_w).expect("micro value")[0];
+
+        assert!(
+            (full_value - micro_value).abs() < 1e-10,
+            "expected microbatch and full-batch steps to match: full={}, micro={}",
+            full_value,
+            micro_value
+        );
     }
 
     #[test]
@@ -1560,6 +1711,7 @@ mod tests {
         let mut optimizer = SGD::new(vec![x], 0.1);
 
         for _ in 0..50 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
             let loss = session.tensor_mul(x, x).expect("mul");
             let loss_sum = session.tensor_sum(loss).expect("sum");
             let report = session.tensor_backward(loss_sum).expect("backward");
@@ -1620,6 +1772,7 @@ mod tests {
         let mut optimizer = Adam::new(vec![x], 0.5);
 
         for _ in 0..100 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
             let loss = session.tensor_mul(x, x).expect("mul");
             let loss_sum = session.tensor_sum(loss).expect("sum");
             let report = session.tensor_backward(loss_sum).expect("backward");
@@ -1840,16 +1993,27 @@ mod tests {
     }
 
     #[test]
-    fn adam_zero_grad_is_noop() {
+    fn adam_zero_grad_clears_persistent_gradients() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
             .expect("var");
 
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
         let mut optimizer = Adam::new(vec![x], 0.1);
+        optimizer.step(&mut session, &report).expect("step");
         optimizer
             .zero_grad(&mut session)
             .expect("adam zero_grad should succeed");
+
+        let grad_after = session
+            .tensor_accumulated_gradient(x)
+            .expect("accumulated gradient lookup")
+            .expect("gradient entry should remain allocated");
+        assert!(grad_after.iter().all(|value| value.abs() < 1e-12));
     }
 
     #[test]
@@ -2046,6 +2210,7 @@ mod tests {
         let initial_loss_val = session.tensor_values(initial_loss).expect("values")[0];
 
         for _ in 0..30 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
             let pred = linear.forward(&mut session, input).expect("forward");
             let loss = session.mse_loss(pred, target).expect("mse");
             let report = session.tensor_backward(loss).expect("backward");
@@ -2365,6 +2530,7 @@ mod tests {
         let mut optimizer = AdamW::new(vec![x], 0.5).weight_decay(0.01);
 
         for _ in 0..100 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
             let loss = session.tensor_mul(x, x).expect("mul");
             let loss_sum = session.tensor_sum(loss).expect("sum");
             let report = session.tensor_backward(loss_sum).expect("backward");
@@ -2453,16 +2619,27 @@ mod tests {
     }
 
     #[test]
-    fn adamw_zero_grad_is_noop() {
+    fn adamw_zero_grad_clears_persistent_gradients() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(vec![1.0], vec![1], true)
             .expect("var");
 
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
         let mut optimizer = AdamW::new(vec![x], 0.1);
+        optimizer.step(&mut session, &report).expect("step");
         optimizer
             .zero_grad(&mut session)
             .expect("adamw zero_grad should succeed");
+
+        let grad_after = session
+            .tensor_accumulated_gradient(x)
+            .expect("accumulated gradient lookup")
+            .expect("gradient entry should remain allocated");
+        assert!(grad_after.iter().all(|value| value.abs() < 1e-12));
     }
 
     #[test]
@@ -2487,6 +2664,7 @@ mod tests {
         let initial_loss_val = session.tensor_values(initial_loss).expect("values")[0];
 
         for _ in 0..30 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
             let pred = linear.forward(&mut session, input).expect("forward");
             let loss = session.mse_loss(pred, target).expect("mse");
             let report = session.tensor_backward(loss).expect("backward");

@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::cmp::Ordering;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
 
 use ft_core::{
@@ -3792,6 +3792,7 @@ impl Tape {
 #[derive(Debug, Clone)]
 pub struct TensorTape {
     nodes: Vec<TensorNode>,
+    persistent_grads: BTreeMap<usize, Vec<f64>>,
     consumed: bool,
     consumed_boundary: usize,
     grad_enabled: bool,
@@ -3801,6 +3802,7 @@ impl Default for TensorTape {
     fn default() -> Self {
         Self {
             nodes: Vec::new(),
+            persistent_grads: BTreeMap::new(),
             consumed: false,
             consumed_boundary: 0,
             grad_enabled: true,
@@ -3855,6 +3857,34 @@ impl TensorTape {
 
     pub fn tensor(&self, node: TensorNodeId) -> Result<&DenseTensor, AutogradError> {
         Ok(&self.node(node)?.tensor)
+    }
+
+    pub fn tensor_accumulated_gradient(
+        &self,
+        node: TensorNodeId,
+    ) -> Result<Option<&[f64]>, AutogradError> {
+        self.node(node)?;
+        Ok(self.persistent_grads.get(&node.0).map(Vec::as_slice))
+    }
+
+    pub fn tensor_accumulated_gradient_values(
+        &self,
+        node: TensorNodeId,
+    ) -> Result<Option<Vec<f64>>, AutogradError> {
+        Ok(self
+            .tensor_accumulated_gradient(node)?
+            .map(|gradient| gradient.to_vec()))
+    }
+
+    pub fn zero_tensor_accumulated_gradient(
+        &mut self,
+        node: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.node(node)?;
+        if let Some(grad) = self.persistent_grads.get_mut(&node.0) {
+            grad.fill(0.0);
+        }
+        Ok(())
     }
 
     pub fn leaf_f32(
@@ -11392,7 +11422,7 @@ impl TensorTape {
             }
         }
 
-        let gradients = grads
+        let gradients: Vec<Option<Vec<f64>>> = grads
             .iter()
             .enumerate()
             .map(|(idx, grad)| {
@@ -11414,6 +11444,8 @@ impl TensorTape {
             reentrant_guard_triggered,
             hardened_fallback_used,
         };
+
+        self.accumulate_persistent_gradients(&gradients)?;
 
         if !options.retain_graph {
             self.consumed = true;
@@ -11873,6 +11905,25 @@ impl TensorTape {
         Self::ensure_tensor_len(node, target.len(), contribution.len())?;
         for (target_value, value) in target.iter_mut().zip(contribution.iter()) {
             *target_value += value;
+        }
+        Ok(())
+    }
+
+    fn accumulate_persistent_gradients(
+        &mut self,
+        gradients: &[Option<Vec<f64>>],
+    ) -> Result<(), AutogradError> {
+        for (idx, gradient) in gradients.iter().enumerate() {
+            let Some(gradient) = gradient.as_deref() else {
+                continue;
+            };
+            let node = TensorNodeId(idx);
+            match self.persistent_grads.get_mut(&idx) {
+                Some(existing) => Self::accumulate_tensor_gradient(node, existing, gradient)?,
+                None => {
+                    self.persistent_grads.insert(idx, gradient.to_vec());
+                }
+            }
         }
         Ok(())
     }

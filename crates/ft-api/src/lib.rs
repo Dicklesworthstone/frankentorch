@@ -2169,6 +2169,24 @@ impl FrankenTorchSession {
         report.gradient(node)
     }
 
+    pub fn tensor_accumulated_gradient(
+        &self,
+        node: TensorNodeId,
+    ) -> Result<Option<Vec<f64>>, AutogradError> {
+        self.tensor_tape.tensor_accumulated_gradient_values(node)
+    }
+
+    pub fn tensor_zero_grad(&mut self, node: TensorNodeId) -> Result<(), AutogradError> {
+        self.tensor_tape.zero_tensor_accumulated_gradient(node)
+    }
+
+    pub fn tensor_zero_grads(&mut self, nodes: &[TensorNodeId]) -> Result<(), AutogradError> {
+        for node in nodes {
+            self.tensor_tape.zero_tensor_accumulated_gradient(*node)?;
+        }
+        Ok(())
+    }
+
     #[must_use]
     pub fn evidence(&self) -> &[EvidenceEntry] {
         self.runtime.ledger().entries()
