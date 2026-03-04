@@ -31,6 +31,9 @@ pub enum KernelError {
     ShapeOverflow {
         context: &'static str,
     },
+    SingularMatrix {
+        size: usize,
+    },
 }
 
 impl fmt::Display for KernelError {
@@ -65,6 +68,9 @@ impl fmt::Display for KernelError {
             ),
             Self::ShapeOverflow { context } => {
                 write!(f, "shape arithmetic overflow: {context}")
+            }
+            Self::SingularMatrix { size } => {
+                write!(f, "singular matrix: size={size}x{size}")
             }
         }
     }
@@ -3254,6 +3260,42 @@ pub fn lu_solve_contiguous_f64(
     }
 
     Ok(x)
+}
+
+/// Compute matrix inverse for a contiguous square f64 matrix.
+///
+/// Uses LU factorization with partial pivoting and solves against the identity.
+pub fn inv_tensor_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![shape.len()],
+        });
+    }
+    let n = shape[0];
+    if n != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![n],
+            rhs: vec![shape[1]],
+        });
+    }
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let factor = lu_factor_contiguous_f64(data, meta)?;
+    if (0..n).any(|i| factor.lu[i * n + i].abs() < f64::EPSILON * 1e3) {
+        return Err(KernelError::SingularMatrix { size: n });
+    }
+
+    let mut identity = vec![0.0; n * n];
+    for i in 0..n {
+        identity[i * n + i] = 1.0;
+    }
+    let identity_meta = TensorMeta::from_shape(vec![n, n], meta.dtype(), meta.device());
+    lu_solve_contiguous_f64(&factor, &identity, &identity_meta)
 }
 
 /// Result of QR decomposition.
@@ -7841,6 +7883,83 @@ mod tests {
         assert_eq!(result.n, 0);
         assert!(result.lu.is_empty());
         assert!(result.pivots.is_empty());
+    }
+
+    #[test]
+    fn inv_identity_3x3() {
+        let meta = TensorMeta::from_shape(vec![3, 3], DType::F64, Device::Cpu);
+        #[rustfmt::skip]
+        let a = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        let inv = super::inv_tensor_contiguous_f64(&a, &meta).expect("inverse should succeed");
+        assert_mat_approx_eq(&inv, &a, 1e-12, "inv(I) should equal I");
+    }
+
+    #[test]
+    fn inv_known_2x2() {
+        let meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
+        #[rustfmt::skip]
+        let a = vec![
+            4.0, 7.0,
+            2.0, 6.0,
+        ];
+        #[rustfmt::skip]
+        let expected = vec![
+            0.6, -0.7,
+            -0.2, 0.4,
+        ];
+        let inv = super::inv_tensor_contiguous_f64(&a, &meta).expect("inverse should succeed");
+        assert_mat_approx_eq(&inv, &expected, 1e-10, "known 2x2 inverse");
+    }
+
+    #[test]
+    fn inv_round_trip_matches_identity() {
+        let meta = TensorMeta::from_shape(vec![3, 3], DType::F64, Device::Cpu);
+        #[rustfmt::skip]
+        let a = vec![
+            3.0, 0.0, 2.0,
+            2.0, 0.0, -2.0,
+            0.0, 1.0, 1.0,
+        ];
+        let inv = super::inv_tensor_contiguous_f64(&a, &meta).expect("inverse should succeed");
+        let left = mat_mul_nn(&a, &inv, 3);
+        let right = mat_mul_nn(&inv, &a, 3);
+        #[rustfmt::skip]
+        let identity = vec![
+            1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        assert_mat_approx_eq(&left, &identity, 1e-10, "A @ inv(A) should equal I");
+        assert_mat_approx_eq(&right, &identity, 1e-10, "inv(A) @ A should equal I");
+    }
+
+    #[test]
+    fn inv_singular_matrix_returns_error() {
+        let meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
+        #[rustfmt::skip]
+        let a = vec![
+            1.0, 2.0,
+            2.0, 4.0,
+        ];
+        let err =
+            super::inv_tensor_contiguous_f64(&a, &meta).expect_err("singular inverse must fail");
+        assert!(matches!(
+            err,
+            super::KernelError::SingularMatrix { size: 2 }
+        ));
+    }
+
+    #[test]
+    fn inv_requires_square_matrix() {
+        let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let err = super::inv_tensor_contiguous_f64(&a, &meta)
+            .expect_err("non-square inverse should fail");
+        assert!(matches!(err, super::KernelError::ShapeMismatch { .. }));
     }
 
     // ---- QR Decomposition tests (bd-2drq.4) ----
