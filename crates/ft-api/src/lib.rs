@@ -2127,6 +2127,7 @@ impl FrankenTorchSession {
 
     /// In-place zero: target = zeros.
     pub fn tensor_zero_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
         let target_vals = self.tensor_tape.values(target)?;
         let new_values = vec![0.0; target_vals.len()];
         self.tensor_tape.update_tensor_values(target, new_values)?;
@@ -2140,6 +2141,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         fill_value: f64,
     ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
         let target_vals = self.tensor_tape.values(target)?;
         let new_values = vec![fill_value; target_vals.len()];
         self.tensor_tape.update_tensor_values(target, new_values)?;
@@ -2157,6 +2159,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         scalar: f64,
     ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
         let target_vals = self.tensor_tape.values(target)?;
         let new_values: Vec<f64> = target_vals.iter().map(|v| v * scalar).collect();
         self.tensor_tape.update_tensor_values(target, new_values)?;
@@ -2174,6 +2177,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         scalar: f64,
     ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
         let target_vals = self.tensor_tape.values(target)?;
         let new_values: Vec<f64> = target_vals.iter().map(|v| v + scalar).collect();
         self.tensor_tape.update_tensor_values(target, new_values)?;
@@ -2183,6 +2187,79 @@ impl FrankenTorchSession {
             Some(format!("scalar={scalar}")),
         );
         Ok(())
+    }
+
+    pub fn tensor_neg_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("neg_", target, None, |v| -v)
+    }
+
+    pub fn tensor_abs_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("abs_", target, None, f64::abs)
+    }
+
+    pub fn tensor_exp_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("exp_", target, None, f64::exp)
+    }
+
+    pub fn tensor_log_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("log_", target, None, f64::ln)
+    }
+
+    pub fn tensor_relu_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("relu_", target, None, |v| if v > 0.0 { v } else { 0.0 })
+    }
+
+    pub fn tensor_sigmoid_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("sigmoid_", target, None, |v| 1.0 / (1.0 + (-v).exp()))
+    }
+
+    pub fn tensor_tanh_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("tanh_", target, None, f64::tanh)
+    }
+
+    pub fn tensor_sin_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("sin_", target, None, f64::sin)
+    }
+
+    pub fn tensor_cos_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("cos_", target, None, f64::cos)
+    }
+
+    pub fn tensor_sqrt_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("sqrt_", target, None, f64::sqrt)
+    }
+
+    pub fn tensor_floor_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("floor_", target, None, f64::floor)
+    }
+
+    pub fn tensor_ceil_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("ceil_", target, None, f64::ceil)
+    }
+
+    pub fn tensor_round_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("round_", target, None, f64::round)
+    }
+
+    pub fn tensor_clamp_(
+        &mut self,
+        target: TensorNodeId,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<(), AutogradError> {
+        if min_val > max_val {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_clamp_ requires min_val <= max_val",
+                },
+            )));
+        }
+        self.apply_tensor_unary_in_place(
+            "clamp_",
+            target,
+            Some(format!("min={min_val} max={max_val}")),
+            |v| v.clamp(min_val, max_val),
+        )
     }
 
     pub fn backward(&mut self, root: NodeId) -> Result<BackwardReport, AutogradError> {
@@ -2388,6 +2465,7 @@ impl FrankenTorchSession {
         target: TensorNodeId,
         other: TensorNodeId,
     ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
         let target_meta = self.tensor_tape.tensor_meta(target)?;
         let other_meta = self.tensor_tape.tensor_meta(other)?;
         if target_meta.shape() != other_meta.shape() {
@@ -2414,6 +2492,37 @@ impl FrankenTorchSession {
                 }),
             )));
         }
+        Ok(())
+    }
+
+    fn validate_tensor_in_place_target(&self, target: TensorNodeId) -> Result<(), AutogradError> {
+        if self.tensor_tape.tensor_is_leaf(target)?
+            && self.tensor_tape.tensor_requires_grad(target)?
+        {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "in-place mutation on leaf tensors that require grad is forbidden",
+                },
+            )));
+        }
+        Ok(())
+    }
+
+    fn apply_tensor_unary_in_place<F>(
+        &mut self,
+        op: &'static str,
+        target: TensorNodeId,
+        extra: Option<String>,
+        transform: F,
+    ) -> Result<(), AutogradError>
+    where
+        F: Fn(f64) -> f64,
+    {
+        self.validate_tensor_in_place_target(target)?;
+        let target_vals = self.tensor_tape.values(target)?;
+        let new_values: Vec<f64> = target_vals.into_iter().map(transform).collect();
+        self.tensor_tape.update_tensor_values(target, new_values)?;
+        self.record_tensor_in_place_operation(op, target, extra);
         Ok(())
     }
 
@@ -8107,6 +8216,188 @@ mod tests {
             .unwrap();
         s.tensor_sub_(a, b).unwrap();
         assert_eq!(s.tensor_values(a).unwrap(), vec![9.0, 18.0, 27.0]);
+    }
+
+    fn assert_tensor_unary_in_place_matches_out_of_place(
+        values: &[f64],
+        apply_out_of_place: impl Fn(
+            &mut FrankenTorchSession,
+            ft_autograd::TensorNodeId,
+        ) -> Result<ft_autograd::TensorNodeId, AutogradError>,
+        apply_in_place: impl Fn(
+            &mut FrankenTorchSession,
+            ft_autograd::TensorNodeId,
+        ) -> Result<(), AutogradError>,
+    ) {
+        let shape = vec![values.len()];
+
+        let mut s_out = FrankenTorchSession::new(ExecutionMode::Strict);
+        let out_input = s_out
+            .tensor_variable(values.to_vec(), shape.clone(), false)
+            .expect("out-of-place input");
+        let out_node = apply_out_of_place(&mut s_out, out_input).expect("out-of-place op");
+        let expected = s_out.tensor_values(out_node).expect("out-of-place values");
+
+        let mut s_in = FrankenTorchSession::new(ExecutionMode::Strict);
+        let in_target = s_in
+            .tensor_variable(values.to_vec(), shape, false)
+            .expect("in-place target");
+        apply_in_place(&mut s_in, in_target).expect("in-place op");
+        let actual = s_in.tensor_values(in_target).expect("in-place values");
+
+        assert_eq!(actual.len(), expected.len());
+        for (idx, (lhs, rhs)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (lhs - rhs).abs() <= 1e-12,
+                "mismatch at index {idx}: in-place={lhs} out-of-place={rhs}"
+            );
+        }
+    }
+
+    #[test]
+    fn tensor_unary_in_place_matches_out_of_place_variants() {
+        type TId = ft_autograd::TensorNodeId;
+
+        let signed = vec![-1.5, -0.25, 0.0, 0.25, 1.5];
+        let positive = vec![0.25, 0.5, 1.0, 2.0, 3.5];
+
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_relu(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_relu_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_sigmoid(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_sigmoid_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_tanh(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_tanh_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_abs(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_abs_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_neg(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_neg_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_exp(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_exp_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_floor(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_floor_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_ceil(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_ceil_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_round(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_round_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_sin(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_sin_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_cos(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_cos_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &positive,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_log(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_log_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &positive,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_sqrt(t),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_sqrt_(t),
+        );
+        assert_tensor_unary_in_place_matches_out_of_place(
+            &signed,
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_clamp(t, -0.3, 0.9),
+            |s: &mut FrankenTorchSession, t: TId| s.tensor_clamp_(t, -0.3, 0.9),
+        );
+    }
+
+    #[test]
+    fn tensor_unary_in_place_rejects_leaf_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, -2.0, 3.0], vec![3], true)
+            .expect("leaf");
+
+        let err = s
+            .tensor_relu_(x)
+            .expect_err("in-place relu on leaf requires_grad tensor must fail");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn tensor_existing_in_place_ops_reject_leaf_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("leaf");
+
+        let err = s
+            .tensor_add_scalar_(x, 1.0)
+            .expect_err("existing in-place ops should enforce the same guard");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { .. }
+            ))
+        ));
+    }
+
+    #[test]
+    fn tensor_unary_in_place_bumps_version_counter() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, -2.0, 3.0], vec![3], false)
+            .expect("leaf");
+        let before = s.tensor_tape.tensor(x).expect("tensor").version();
+
+        s.tensor_abs_(x).expect("in-place abs should succeed");
+
+        let after = s.tensor_tape.tensor(x).expect("tensor").version();
+        assert_eq!(after, before + 1);
+    }
+
+    #[test]
+    fn tensor_unary_in_place_ops_chain_correctly() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![-4.0, -1.0, 0.0, 1.0, 4.0], vec![5], false)
+            .expect("leaf");
+
+        s.tensor_relu_(x).expect("relu_");
+        s.tensor_sqrt_(x).expect("sqrt_");
+        s.tensor_add_scalar_(x, 1.0).expect("add_scalar_");
+
+        assert_eq!(
+            s.tensor_values(x).expect("values"),
+            vec![1.0, 1.0, 1.0, 2.0, 3.0]
+        );
     }
 
     #[test]
