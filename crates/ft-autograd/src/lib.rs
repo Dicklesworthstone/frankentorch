@@ -3,6 +3,7 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, BinaryHeap};
 use std::fmt;
+use std::sync::Arc;
 
 use ft_core::{
     DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, TensorMeta,
@@ -36,6 +37,24 @@ pub struct NodeId(pub usize);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TensorNodeId(pub usize);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct TensorHookHandle {
+    node: TensorNodeId,
+    id: u64,
+}
+
+impl TensorHookHandle {
+    #[must_use]
+    pub const fn node(self) -> TensorNodeId {
+        self.node
+    }
+
+    #[must_use]
+    pub const fn id(self) -> u64 {
+        self.id
+    }
+}
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum NodeOp {
@@ -1040,6 +1059,13 @@ pub enum AutogradError {
         expected: usize,
         actual: usize,
     },
+    TensorRequiresGradNonLeaf {
+        node: TensorNodeId,
+    },
+    TensorRequiresGradNonFloating {
+        node: TensorNodeId,
+        dtype: DType,
+    },
     TensorMatMulShapeMismatch {
         lhs: Vec<usize>,
         rhs: Vec<usize>,
@@ -1090,6 +1116,16 @@ impl fmt::Display for AutogradError {
                 "tensor gradient shape mismatch at node {}: expected={expected}, actual={actual}",
                 node.0
             ),
+            Self::TensorRequiresGradNonLeaf { node } => write!(
+                f,
+                "requires_grad_ can only be called on leaf tensors (node {})",
+                node.0
+            ),
+            Self::TensorRequiresGradNonFloating { node, dtype } => write!(
+                f,
+                "requires_grad_ expects floating-point dtype at node {} but found {dtype:?}",
+                node.0
+            ),
             Self::TensorMatMulShapeMismatch { lhs, rhs } => {
                 write!(f, "tensor matmul shape mismatch: lhs={lhs:?}, rhs={rhs:?}")
             }
@@ -1114,6 +1150,23 @@ impl std::error::Error for AutogradError {}
 impl From<DenseTensorError> for AutogradError {
     fn from(value: DenseTensorError) -> Self {
         Self::DenseTensor(value)
+    }
+}
+
+type TensorGradHook =
+    dyn Fn(&[f64]) -> Result<Option<Vec<f64>>, AutogradError> + Send + Sync + 'static;
+
+#[derive(Clone)]
+struct TensorHookRegistration {
+    id: u64,
+    callback: Arc<TensorGradHook>,
+}
+
+impl fmt::Debug for TensorHookRegistration {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TensorHookRegistration")
+            .field("id", &self.id)
+            .finish_non_exhaustive()
     }
 }
 
@@ -3793,6 +3846,8 @@ impl Tape {
 pub struct TensorTape {
     nodes: Vec<TensorNode>,
     persistent_grads: BTreeMap<usize, Vec<f64>>,
+    tensor_hooks: BTreeMap<usize, Vec<TensorHookRegistration>>,
+    next_tensor_hook_id: u64,
     consumed: bool,
     consumed_boundary: usize,
     grad_enabled: bool,
@@ -3803,6 +3858,8 @@ impl Default for TensorTape {
         Self {
             nodes: Vec::new(),
             persistent_grads: BTreeMap::new(),
+            tensor_hooks: BTreeMap::new(),
+            next_tensor_hook_id: 1,
             consumed: false,
             consumed_boundary: 0,
             grad_enabled: true,
@@ -3828,6 +3885,98 @@ impl TensorTape {
 
     pub fn set_grad_enabled(&mut self, enabled: bool) {
         self.grad_enabled = enabled;
+    }
+
+    pub fn tensor_requires_grad(&self, id: TensorNodeId) -> Result<bool, AutogradError> {
+        Ok(self.node(id)?.requires_grad)
+    }
+
+    pub fn tensor_is_leaf(&self, id: TensorNodeId) -> Result<bool, AutogradError> {
+        Ok(matches!(self.node(id)?.op, TensorNodeOp::Leaf))
+    }
+
+    pub fn tensor_grad_fn(&self, id: TensorNodeId) -> Result<Option<String>, AutogradError> {
+        let node = self.node(id)?;
+        if matches!(node.op, TensorNodeOp::Leaf) {
+            return Ok(None);
+        }
+        let debug = format!("{:?}", node.op);
+        let label = debug
+            .split([' ', '{'])
+            .next()
+            .unwrap_or(debug.as_str())
+            .to_string();
+        Ok(Some(label))
+    }
+
+    pub fn set_tensor_requires_grad(
+        &mut self,
+        id: TensorNodeId,
+        requires_grad: bool,
+    ) -> Result<(), AutogradError> {
+        let node = self.node_mut(id)?;
+        if !matches!(node.op, TensorNodeOp::Leaf) {
+            return Err(AutogradError::TensorRequiresGradNonLeaf { node: id });
+        }
+        if requires_grad && !node.tensor.meta().dtype().is_floating_point() {
+            return Err(AutogradError::TensorRequiresGradNonFloating {
+                node: id,
+                dtype: node.tensor.meta().dtype(),
+            });
+        }
+        node.requires_grad = requires_grad;
+        if !requires_grad {
+            self.persistent_grads.remove(&id.0);
+        }
+        Ok(())
+    }
+
+    pub fn detach_tensor_in_place(&mut self, id: TensorNodeId) -> Result<(), AutogradError> {
+        let node = self.node_mut(id)?;
+        node.requires_grad = false;
+        node.op = TensorNodeOp::Leaf;
+        self.persistent_grads.remove(&id.0);
+        Ok(())
+    }
+
+    pub fn register_tensor_hook<F>(
+        &mut self,
+        id: TensorNodeId,
+        hook: F,
+    ) -> Result<TensorHookHandle, AutogradError>
+    where
+        F: Fn(&[f64]) -> Result<Option<Vec<f64>>, AutogradError> + Send + Sync + 'static,
+    {
+        self.node(id)?;
+        let hook_id = self.next_tensor_hook_id;
+        self.next_tensor_hook_id = self.next_tensor_hook_id.wrapping_add(1);
+        self.tensor_hooks
+            .entry(id.0)
+            .or_default()
+            .push(TensorHookRegistration {
+                id: hook_id,
+                callback: Arc::new(hook),
+            });
+        Ok(TensorHookHandle {
+            node: id,
+            id: hook_id,
+        })
+    }
+
+    pub fn remove_tensor_hook(&mut self, handle: TensorHookHandle) -> Result<bool, AutogradError> {
+        self.node(handle.node)?;
+        let mut removed = false;
+        let mut clear_bucket = false;
+        if let Some(entries) = self.tensor_hooks.get_mut(&handle.node.0) {
+            let before = entries.len();
+            entries.retain(|entry| entry.id != handle.id);
+            removed = entries.len() != before;
+            clear_bucket = entries.is_empty();
+        }
+        if clear_bucket {
+            self.tensor_hooks.remove(&handle.node.0);
+        }
+        Ok(removed)
     }
 
     pub fn leaf(
@@ -8549,7 +8698,8 @@ impl TensorTape {
         let mut execution_order = Vec::with_capacity(self.nodes.len());
 
         while let Some(node_id) = queue.pop() {
-            let incoming = grads[node_id.0].clone();
+            let incoming = self.apply_tensor_hooks(node_id, &grads[node_id.0])?;
+            grads[node_id.0] = incoming.clone();
             execution_order.push(node_id);
 
             match self.nodes[node_id.0].op {
@@ -11920,6 +12070,24 @@ impl TensorTape {
         Ok(())
     }
 
+    fn apply_tensor_hooks(
+        &self,
+        node: TensorNodeId,
+        incoming: &[f64],
+    ) -> Result<Vec<f64>, AutogradError> {
+        let Some(hooks) = self.tensor_hooks.get(&node.0) else {
+            return Ok(incoming.to_vec());
+        };
+        let mut current = incoming.to_vec();
+        for hook in hooks {
+            if let Some(updated) = (hook.callback)(current.as_slice())? {
+                Self::ensure_tensor_len(node, current.len(), updated.len())?;
+                current = updated;
+            }
+        }
+        Ok(current)
+    }
+
     fn accumulate_persistent_gradients(
         &mut self,
         gradients: &[Option<Vec<f64>>],
@@ -11972,6 +12140,7 @@ impl TensorTape {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::sync::{Arc, Mutex};
 
     use ft_core::{DType, DenseTensor, DenseTensorError, Device, ExecutionMode, TensorMeta};
     use ft_dispatch::DispatchError;
@@ -11979,7 +12148,7 @@ mod tests {
 
     use super::{
         AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
-        TensorNode, TensorNodeId, TensorNodeOp, TensorTape,
+        TensorHookHandle, TensorNode, TensorNodeId, TensorNodeOp, TensorTape,
     };
 
     fn as_u64(value: usize) -> u64 {
@@ -15808,5 +15977,201 @@ mod tests {
         // Cast is identity for gradients, sum gradient is all 1s
         let grad = report.gradient(a).unwrap();
         assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn tensor_requires_grad_and_grad_fn_introspection() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        assert!(tape.tensor_requires_grad(x).expect("requires_grad"));
+        assert!(tape.tensor_is_leaf(x).expect("is_leaf"));
+        assert!(tape.tensor_grad_fn(x).expect("grad_fn").is_none());
+
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+        assert!(tape.tensor_requires_grad(y).expect("requires_grad"));
+        assert!(!tape.tensor_is_leaf(y).expect("is_leaf"));
+        assert_eq!(
+            tape.tensor_grad_fn(y).expect("grad_fn"),
+            Some("Neg".to_string())
+        );
+    }
+
+    #[test]
+    fn tensor_requires_grad_toggle_on_leaf_roundtrip() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], false).expect("x");
+        assert!(!tape.tensor_requires_grad(x).expect("requires_grad"));
+
+        tape.set_tensor_requires_grad(x, true)
+            .expect("set requires_grad true");
+        assert!(tape.tensor_requires_grad(x).expect("requires_grad"));
+
+        tape.set_tensor_requires_grad(x, false)
+            .expect("set requires_grad false");
+        assert!(!tape.tensor_requires_grad(x).expect("requires_grad"));
+    }
+
+    #[test]
+    fn tensor_requires_grad_toggle_rejects_non_leaf() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+
+        let err = tape
+            .set_tensor_requires_grad(y, false)
+            .expect_err("non-leaf requires_grad_ must fail");
+        assert!(matches!(
+            err,
+            AutogradError::TensorRequiresGradNonLeaf { .. }
+        ));
+    }
+
+    #[test]
+    fn tensor_detach_in_place_turns_non_leaf_into_leaf() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+
+        assert!(!tape.tensor_is_leaf(y).expect("is_leaf"));
+        assert!(tape.tensor_requires_grad(y).expect("requires_grad"));
+
+        tape.detach_tensor_in_place(y).expect("detach_");
+
+        assert!(tape.tensor_is_leaf(y).expect("is_leaf"));
+        assert!(!tape.tensor_requires_grad(y).expect("requires_grad"));
+        assert!(tape.tensor_grad_fn(y).expect("grad_fn").is_none());
+
+        let (z, _) = tape.add(x, y, ExecutionMode::Strict).expect("add");
+        let report = tape.backward(z).expect("backward");
+        assert!(report.gradient(x).is_some(), "x should keep gradient flow");
+        assert!(
+            report.gradient(y).is_none(),
+            "detached node should not receive gradients"
+        );
+    }
+
+    #[test]
+    fn tensor_detach_in_place_on_leaf_is_noop() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], false).expect("x");
+        tape.detach_tensor_in_place(x).expect("detach leaf");
+        assert!(tape.tensor_is_leaf(x).expect("is_leaf"));
+        assert!(!tape.tensor_requires_grad(x).expect("requires_grad"));
+        assert!(tape.tensor_grad_fn(x).expect("grad_fn").is_none());
+    }
+
+    #[test]
+    fn tensor_register_hook_modifies_gradient() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+        tape.register_tensor_hook(y, |grad| {
+            Ok(Some(
+                grad.iter().map(|value| value * 2.0).collect::<Vec<_>>(),
+            ))
+        })
+        .expect("register hook");
+
+        let report = tape.backward(y).expect("backward");
+        assert_eq!(report.gradient(y).expect("grad y"), &[2.0, 2.0]);
+        assert_eq!(report.gradient(x).expect("grad x"), &[-2.0, -2.0]);
+    }
+
+    #[test]
+    fn tensor_register_hook_chains_in_registration_order() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let order_first = Arc::clone(&order);
+        tape.register_tensor_hook(y, move |grad| {
+            order_first.lock().expect("order lock").push("first");
+            Ok(Some(
+                grad.iter().map(|value| value + 1.0).collect::<Vec<_>>(),
+            ))
+        })
+        .expect("register first");
+        let order_second = Arc::clone(&order);
+        tape.register_tensor_hook(y, move |grad| {
+            order_second.lock().expect("order lock").push("second");
+            Ok(Some(
+                grad.iter().map(|value| value * 2.0).collect::<Vec<_>>(),
+            ))
+        })
+        .expect("register second");
+
+        let report = tape.backward(y).expect("backward");
+        assert_eq!(report.gradient(y).expect("grad y"), &[4.0, 4.0]);
+        assert_eq!(report.gradient(x).expect("grad x"), &[-4.0, -4.0]);
+        let order_values = order.lock().expect("order lock");
+        assert_eq!(order_values.as_slice(), &["first", "second"]);
+    }
+
+    #[test]
+    fn tensor_remove_hook_disables_callback() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+
+        let handle: TensorHookHandle = tape
+            .register_tensor_hook(y, |grad| {
+                Ok(Some(
+                    grad.iter().map(|value| value * 3.0).collect::<Vec<_>>(),
+                ))
+            })
+            .expect("register hook");
+        assert!(tape.remove_tensor_hook(handle).expect("remove hook"));
+        assert!(
+            !tape
+                .remove_tensor_hook(handle)
+                .expect("second remove is no-op")
+        );
+
+        let report = tape.backward(y).expect("backward");
+        assert_eq!(report.gradient(y).expect("grad y"), &[1.0, 1.0]);
+        assert_eq!(report.gradient(x).expect("grad x"), &[-1.0, -1.0]);
+    }
+
+    #[test]
+    fn tensor_register_hook_none_is_observation_only() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+        tape.register_tensor_hook(y, |_grad| Ok(None))
+            .expect("register hook");
+
+        let report = tape.backward(y).expect("backward");
+        assert_eq!(report.gradient(y).expect("grad y"), &[1.0, 1.0]);
+        assert_eq!(report.gradient(x).expect("grad x"), &[-1.0, -1.0]);
+    }
+
+    #[test]
+    fn tensor_register_hook_error_propagates() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+        tape.register_tensor_hook(y, |_grad| Err(AutogradError::TensorGraphConsumed))
+            .expect("register hook");
+
+        let err = tape.backward(y).expect_err("hook error should propagate");
+        assert!(matches!(err, AutogradError::TensorGraphConsumed));
+    }
+
+    #[test]
+    fn tensor_register_hook_rejects_shape_mismatch() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let (y, _) = tape.neg(x, ExecutionMode::Strict).expect("neg");
+        tape.register_tensor_hook(y, |_grad| Ok(Some(vec![1.0])))
+            .expect("register hook");
+
+        let err = tape
+            .backward(y)
+            .expect_err("hook shape mismatch must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::TensorGradientShapeMismatch { .. }
+        ));
     }
 }

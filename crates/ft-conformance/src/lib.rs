@@ -3514,28 +3514,73 @@ fn run_dispatch_case(
         ExecutionMode::Strict => &case.strict,
         ExecutionMode::Hardened => &case.hardened,
     };
-
-    let op = parse_binary_op(&case.op)?;
-    let lhs_dtype = case
-        .lhs_dtype
-        .as_deref()
-        .map_or(Ok(DType::F64), parse_dtype)?;
-    let rhs_dtype = case
-        .rhs_dtype
-        .as_deref()
-        .map_or(Ok(DType::F64), parse_dtype)?;
-    let lhs_device = case
-        .lhs_device
-        .as_deref()
-        .map_or(Ok(Device::Cpu), parse_device)?;
-    let rhs_device = case
-        .rhs_device
-        .as_deref()
-        .map_or(Ok(Device::Cpu), parse_device)?;
-    let lhs = ScalarTensor::new(case.lhs, lhs_dtype, lhs_device);
-    let rhs = ScalarTensor::new(case.rhs, rhs_dtype, rhs_device);
-
     let expected_error = expectation.expect_error.unwrap_or(false);
+    let setup = (|| -> Result<_, String> {
+        let op = parse_binary_op(&case.op)?;
+        let lhs_dtype = case
+            .lhs_dtype
+            .as_deref()
+            .map_or(Ok(DType::F64), parse_dtype)?;
+        let rhs_dtype = case
+            .rhs_dtype
+            .as_deref()
+            .map_or(Ok(DType::F64), parse_dtype)?;
+        let lhs_device = case
+            .lhs_device
+            .as_deref()
+            .map_or(Ok(Device::Cpu), parse_device)?;
+        let rhs_device = case
+            .rhs_device
+            .as_deref()
+            .map_or(Ok(Device::Cpu), parse_device)?;
+        let lhs = ScalarTensor::new(case.lhs, lhs_dtype, lhs_device);
+        let rhs = ScalarTensor::new(case.rhs, rhs_dtype, rhs_device);
+        Ok((op, lhs_dtype, rhs_dtype, lhs_device, rhs_device, lhs, rhs))
+    })();
+
+    let (op, lhs_dtype, rhs_dtype, lhs_device, rhs_device, lhs, rhs) = match setup {
+        Ok(values) => values,
+        Err(error) if expected_error => {
+            return Ok(DispatchCaseReport {
+                name: case.name.clone(),
+                mode,
+                output_ok: true,
+                selected_key_ok: true,
+                backend_key_ok: true,
+                kernel_ok: true,
+                fallback_ok: true,
+                error_ok: true,
+                forensic_log: StructuredCaseLog::new(
+                    "dispatch_key",
+                    "dispatch_key_cases.json",
+                    "FT-P2C-002",
+                    case.name.as_str(),
+                    mode,
+                    vec![
+                        "crates/ft-conformance/fixtures/dispatch_key_cases.json".to_string(),
+                        "artifacts/phase2c/FT-P2C-002/parity_report.json".to_string(),
+                    ],
+                    format!(
+                        "cargo test -p ft-conformance strict_dispatch_conformance_is_green -- --nocapture # mode={}",
+                        mode_label(mode)
+                    ),
+                    "pass",
+                    "expected_setup_error_observed",
+                )
+                .with_extra_fields(dispatch_setup_error_forensic_fields(
+                    case,
+                    error.to_string(),
+                )),
+            });
+        }
+        Err(error) => {
+            return Err(format!(
+                "dispatch case '{}' setup failed: {error}",
+                case.name
+            ));
+        }
+    };
+
     let result = if let Some(keys) = &case.keyset {
         match parse_keyset(keys) {
             Ok(keyset) => dispatch_scalar_binary_with_keyset(op, mode, &lhs, &rhs, keyset)
@@ -5786,6 +5831,34 @@ fn dispatch_forensic_fields(
     fields
 }
 
+fn dispatch_setup_error_forensic_fields(
+    case: &DispatchCase,
+    error_message: String,
+) -> BTreeMap<String, Value> {
+    let mut fields = BTreeMap::new();
+    fields.insert("contract_ids".to_string(), json!(case.contract_ids));
+    fields.insert(
+        "downstream_e2e_scenarios".to_string(),
+        json!(case.e2e_scenarios),
+    );
+    fields.insert("op".to_string(), json!(case.op));
+    fields.insert("lhs".to_string(), json!(case.lhs));
+    fields.insert("rhs".to_string(), json!(case.rhs));
+    fields.insert("lhs_dtype".to_string(), json!(case.lhs_dtype));
+    fields.insert("rhs_dtype".to_string(), json!(case.rhs_dtype));
+    fields.insert("lhs_device".to_string(), json!(case.lhs_device));
+    fields.insert("rhs_device".to_string(), json!(case.rhs_device));
+    fields.insert("input_shape".to_string(), json!([[], []]));
+    fields.insert("output_shape".to_string(), Value::Null);
+    fields.insert("dispatch_key".to_string(), Value::Null);
+    fields.insert("selected_kernel".to_string(), Value::Null);
+    fields.insert("backend_key".to_string(), Value::Null);
+    fields.insert("broadcast_applied".to_string(), json!(false));
+    fields.insert("fallback_path".to_string(), json!(false));
+    fields.insert("error_message".to_string(), json!(error_message));
+    fields
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_error_forensic_fields(
     case: &DispatchCase,
@@ -6715,6 +6788,113 @@ mod tests {
         );
         assert_eq!(report.cases_total, cases.len());
         assert_eq!(report.cases_passed, report.cases_total);
+    }
+
+    #[test]
+    fn device_guard_dispatch_fixture_has_ft_p2c_007_coverage() {
+        let cfg = HarnessConfig::default_paths();
+        let fixture: DispatchFixtureFile =
+            load_fixture(&cfg.fixture_root.join("dispatch_key_cases.json"))
+                .expect("dispatch fixture should parse");
+
+        let device_guard_cases: Vec<_> = fixture
+            .cases
+            .iter()
+            .filter(|case| {
+                case.contract_ids
+                    .iter()
+                    .any(|id| id == "INV-DTYPE-DEVICE-COMPAT")
+            })
+            .collect();
+
+        assert!(
+            device_guard_cases.len() >= 10,
+            "expected >=10 INV-DTYPE-DEVICE-COMPAT cases for FT-P2C-007, found {}",
+            device_guard_cases.len()
+        );
+
+        assert!(
+            device_guard_cases.iter().any(|case| {
+                !case.strict.expect_error.unwrap_or(false)
+                    && case
+                        .lhs_device
+                        .as_deref()
+                        .is_some_and(|device| matches!(device, "Cpu" | "CPU"))
+                    && case
+                        .rhs_device
+                        .as_deref()
+                        .is_some_and(|device| matches!(device, "Cpu" | "CPU"))
+            }),
+            "expected at least one explicit cpu->cpu pass case"
+        );
+
+        assert!(
+            device_guard_cases.iter().any(|case| {
+                case.strict.expect_error.unwrap_or(false)
+                    && case
+                        .lhs_device
+                        .as_deref()
+                        .is_some_and(|lhs| case.rhs_device.as_deref().is_some_and(|rhs| lhs != rhs))
+            }),
+            "expected at least one mixed-device fail-closed case"
+        );
+
+        let recognized = |raw: &str| matches!(raw, "Cpu" | "CPU" | "Cuda" | "CUDA");
+        assert!(
+            device_guard_cases.iter().any(|case| {
+                case.strict.expect_error.unwrap_or(false)
+                    && (case
+                        .lhs_device
+                        .as_deref()
+                        .is_some_and(|device| !recognized(device))
+                        || case
+                            .rhs_device
+                            .as_deref()
+                            .is_some_and(|device| !recognized(device)))
+            }),
+            "expected at least one unknown-device fail-closed case"
+        );
+    }
+
+    #[test]
+    fn device_guard_dispatch_cases_are_green_in_both_modes() {
+        let cfg = HarnessConfig::default_paths();
+        let fixture: DispatchFixtureFile =
+            load_fixture(&cfg.fixture_root.join("dispatch_key_cases.json"))
+                .expect("dispatch fixture should parse");
+
+        let device_guard_case_names: BTreeSet<String> = fixture
+            .cases
+            .iter()
+            .filter(|case| {
+                case.contract_ids
+                    .iter()
+                    .any(|id| id == "INV-DTYPE-DEVICE-COMPAT")
+            })
+            .map(|case| case.name.clone())
+            .collect();
+
+        for mode in [ExecutionMode::Strict, ExecutionMode::Hardened] {
+            let (_, reports) =
+                run_dispatch_conformance(&cfg, mode).expect("dispatch conformance should run");
+            let mut seen = BTreeSet::new();
+
+            for report in reports {
+                if device_guard_case_names.contains(report.name.as_str()) {
+                    assert!(
+                        report.passed(),
+                        "device guard case failed in {mode:?}: {report:?}"
+                    );
+                    seen.insert(report.name);
+                }
+            }
+
+            assert_eq!(
+                seen.len(),
+                device_guard_case_names.len(),
+                "mode {mode:?} did not execute all expected device guard cases"
+            );
+        }
     }
 
     #[test]

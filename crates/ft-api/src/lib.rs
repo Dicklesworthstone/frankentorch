@@ -3,7 +3,7 @@
 use ft_autograd::{
     AutogradError, BackwardOptions, BackwardReport, ClampOperationEvent, NodeId, OperationEvent,
     PowOperationEvent, Tape, TensorAddmmOperationEvent, TensorAddmvOperationEvent,
-    TensorBackwardReport, TensorClampOperationEvent, TensorJoinOperationEvent,
+    TensorBackwardReport, TensorClampOperationEvent, TensorHookHandle, TensorJoinOperationEvent,
     TensorLerpOperationEvent, TensorNodeId, TensorNormDimOperationEvent, TensorNormOperationEvent,
     TensorNormalizeDimOperationEvent, TensorOperationEvent, TensorPowOperationEvent,
     TensorReductionDimOperationEvent, TensorReductionOperationEvent, TensorScanDimOperationEvent,
@@ -2959,6 +2959,53 @@ impl FrankenTorchSession {
         Ok(tensor.meta().numel())
     }
 
+    /// Return whether this tensor currently tracks gradients.
+    pub fn tensor_requires_grad(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        self.tensor_tape.tensor_requires_grad(node)
+    }
+
+    /// Return whether this tensor is a leaf (user-created or detached in-place).
+    pub fn tensor_is_leaf(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        self.tensor_tape.tensor_is_leaf(node)
+    }
+
+    /// Return the gradient function name for non-leaf tensors.
+    pub fn tensor_grad_fn(&self, node: TensorNodeId) -> Result<Option<String>, AutogradError> {
+        self.tensor_tape.tensor_grad_fn(node)
+    }
+
+    /// In-place toggle for gradient tracking on leaf tensors.
+    pub fn tensor_requires_grad_(
+        &mut self,
+        node: TensorNodeId,
+        requires_grad: bool,
+    ) -> Result<(), AutogradError> {
+        self.tensor_tape
+            .set_tensor_requires_grad(node, requires_grad)
+    }
+
+    /// In-place detach from the computation graph.
+    pub fn tensor_detach_(&mut self, node: TensorNodeId) -> Result<(), AutogradError> {
+        self.tensor_tape.detach_tensor_in_place(node)
+    }
+
+    /// Register a callback invoked when this tensor's gradient is computed during backward.
+    pub fn tensor_register_hook<F>(
+        &mut self,
+        node: TensorNodeId,
+        hook: F,
+    ) -> Result<TensorHookHandle, AutogradError>
+    where
+        F: Fn(&[f64]) -> Result<Option<Vec<f64>>, AutogradError> + Send + Sync + 'static,
+    {
+        self.tensor_tape.register_tensor_hook(node, hook)
+    }
+
+    /// Remove a previously registered tensor hook.
+    pub fn tensor_remove_hook(&mut self, handle: TensorHookHandle) -> Result<bool, AutogradError> {
+        self.tensor_tape.remove_tensor_hook(handle)
+    }
+
     /// Extract a single scalar value from a 0-d or 1-element tensor.
     pub fn tensor_item(&self, node: TensorNodeId) -> Result<f64, AutogradError> {
         let values = self.tensor_tape.values(node)?;
@@ -3732,6 +3779,8 @@ pub use ft_autograd::{
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use ft_autograd::{AutogradError, BackwardOptions, ReentrantPolicy};
     use ft_core::{DType, DenseTensor, Device, ExecutionMode, TensorMeta};
     use ft_runtime::EvidenceKind;
@@ -9112,6 +9161,306 @@ mod tests {
             report.gradient(d).is_none(),
             "detached tensor should not have gradient"
         );
+    }
+
+    #[test]
+    fn session_tensor_requires_grad_toggle_on_leaf_round_trips() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("leaf");
+
+        assert!(!session.tensor_requires_grad(t).expect("requires_grad"));
+        assert!(session.tensor_is_leaf(t).expect("is_leaf"));
+        assert!(session.tensor_grad_fn(t).expect("grad_fn").is_none());
+
+        session
+            .tensor_requires_grad_(t, true)
+            .expect("enable requires_grad on leaf");
+        assert!(session.tensor_requires_grad(t).expect("requires_grad"));
+
+        session
+            .tensor_requires_grad_(t, false)
+            .expect("disable requires_grad on leaf");
+        assert!(!session.tensor_requires_grad(t).expect("requires_grad"));
+    }
+
+    #[test]
+    fn session_tensor_requires_grad_on_non_leaf_errors() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("t");
+        let ones = session.full(vec![3], 1.0, false).expect("ones");
+        let y = session.tensor_mul(t, ones).expect("mul");
+
+        let err = session
+            .tensor_requires_grad_(y, false)
+            .expect_err("non-leaf requires_grad_ should fail");
+        assert!(matches!(
+            err,
+            AutogradError::TensorRequiresGradNonLeaf { .. }
+        ));
+    }
+
+    #[test]
+    fn session_tensor_detach_in_place_turns_non_leaf_into_leaf() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("t");
+        let ones = session.full(vec![3], 1.0, false).expect("ones");
+        let y = session.tensor_mul(t, ones).expect("mul");
+
+        assert!(session.tensor_requires_grad(y).expect("requires_grad"));
+        assert!(!session.tensor_is_leaf(y).expect("is_leaf"));
+        assert_eq!(
+            session.tensor_grad_fn(y).expect("grad_fn"),
+            Some("Mul".to_string())
+        );
+
+        session.tensor_detach_(y).expect("detach_");
+
+        assert!(!session.tensor_requires_grad(y).expect("requires_grad"));
+        assert!(session.tensor_is_leaf(y).expect("is_leaf"));
+        assert!(session.tensor_grad_fn(y).expect("grad_fn").is_none());
+
+        let added = session.tensor_add(t, y).expect("add");
+        let sum = session.tensor_sum(added).expect("sum");
+        let report = session.tensor_backward(sum).expect("backward");
+        assert!(report.gradient(t).is_some(), "direct path must keep grad");
+        assert!(
+            report.gradient(y).is_none(),
+            "detached node must not receive grad"
+        );
+    }
+
+    #[test]
+    fn session_tensor_freeze_unfreeze_controls_gradient_flow() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("t");
+        let ones = session.full(vec![3], 1.0, false).expect("ones");
+
+        session.tensor_requires_grad_(t, false).expect("freeze");
+        let frozen_out = session.tensor_mul(t, ones).expect("mul frozen");
+        let frozen_sum = session.tensor_sum(frozen_out).expect("sum frozen");
+        let frozen_err = session
+            .tensor_backward(frozen_sum)
+            .expect_err("frozen tensor graph should reject backward root");
+        assert!(matches!(
+            frozen_err,
+            AutogradError::TensorRootDoesNotRequireGrad { .. }
+        ));
+
+        session.tensor_requires_grad_(t, true).expect("unfreeze");
+        let ones2 = session.full(vec![3], 1.0, false).expect("ones2");
+        let active_out = session.tensor_mul(t, ones2).expect("mul active");
+        let active_sum = session.tensor_sum(active_out).expect("sum active");
+        let active_report = session.tensor_backward(active_sum).expect("backward");
+        assert!(
+            active_report.gradient(t).is_some(),
+            "unfrozen tensor should receive gradient"
+        );
+    }
+
+    #[test]
+    fn session_tensor_detach_in_place_on_leaf_is_noop() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("leaf");
+        session.tensor_detach_(t).expect("detach_ leaf");
+        assert!(session.tensor_is_leaf(t).expect("is_leaf"));
+        assert!(!session.tensor_requires_grad(t).expect("requires_grad"));
+        assert!(session.tensor_grad_fn(t).expect("grad_fn").is_none());
+    }
+
+    #[test]
+    fn session_tensor_requires_grad_toggle_works_inside_no_grad_scope() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("leaf");
+        session.no_grad_enter();
+        session
+            .tensor_requires_grad_(t, true)
+            .expect("requires_grad_ in no_grad");
+        session.no_grad_exit();
+        assert!(
+            session.tensor_requires_grad(t).expect("requires_grad"),
+            "explicit requires_grad_ toggle should persist after no_grad scope exits"
+        );
+    }
+
+    #[test]
+    fn session_tensor_register_hook_modifies_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("t");
+        let neg = session.tensor_neg(t).expect("neg");
+
+        session
+            .tensor_register_hook(neg, |grad| {
+                Ok(Some(
+                    grad.iter().map(|value| value * 2.0).collect::<Vec<_>>(),
+                ))
+            })
+            .expect("register hook");
+
+        let loss = session.tensor_sum(neg).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        assert_eq!(report.gradient(neg).expect("neg grad"), &[2.0, 2.0, 2.0]);
+        assert_eq!(report.gradient(t).expect("t grad"), &[-2.0, -2.0, -2.0]);
+    }
+
+    #[test]
+    fn session_tensor_register_hook_remove_stops_callback() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("t");
+        let neg = session.tensor_neg(t).expect("neg");
+
+        let handle = session
+            .tensor_register_hook(neg, |grad| {
+                Ok(Some(
+                    grad.iter().map(|value| value * 4.0).collect::<Vec<_>>(),
+                ))
+            })
+            .expect("register hook");
+        assert!(session.tensor_remove_hook(handle).expect("remove hook"));
+
+        let loss = session.tensor_sum(neg).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        assert_eq!(report.gradient(neg).expect("neg grad"), &[1.0, 1.0, 1.0]);
+        assert_eq!(report.gradient(t).expect("t grad"), &[-1.0, -1.0, -1.0]);
+    }
+
+    #[test]
+    fn session_tensor_register_hook_order_and_error() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], true)
+            .expect("t");
+        let neg = session.tensor_neg(t).expect("neg");
+
+        let order = Arc::new(Mutex::new(Vec::<&'static str>::new()));
+        let order_first = Arc::clone(&order);
+        session
+            .tensor_register_hook(neg, move |grad| {
+                order_first.lock().expect("order lock").push("first");
+                Ok(Some(
+                    grad.iter().map(|value| value + 1.0).collect::<Vec<_>>(),
+                ))
+            })
+            .expect("register first");
+        let order_second = Arc::clone(&order);
+        session
+            .tensor_register_hook(neg, move |grad| {
+                order_second.lock().expect("order lock").push("second");
+                Ok(Some(
+                    grad.iter().map(|value| value * 2.0).collect::<Vec<_>>(),
+                ))
+            })
+            .expect("register second");
+
+        let loss = session.tensor_sum(neg).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        assert_eq!(report.gradient(t).expect("t grad"), &[-4.0, -4.0]);
+        let order_values = order.lock().expect("order lock");
+        assert_eq!(order_values.as_slice(), &["first", "second"]);
+
+        let mut session_err = FrankenTorchSession::new(ExecutionMode::Strict);
+        let u = session_err
+            .tensor_variable(vec![1.0, 2.0], vec![2], true)
+            .expect("u");
+        let neg_u = session_err.tensor_neg(u).expect("neg_u");
+        session_err
+            .tensor_register_hook(neg_u, |_grad| Err(AutogradError::TensorGraphConsumed))
+            .expect("register error hook");
+        let loss_u = session_err.tensor_sum(neg_u).expect("sum_u");
+        let err = session_err
+            .tensor_backward(loss_u)
+            .expect_err("hook error should propagate");
+        assert!(matches!(err, AutogradError::TensorGraphConsumed));
+    }
+
+    #[test]
+    fn session_tensor_register_hook_supports_gradient_reversal() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("t");
+        let neg = session.tensor_neg(t).expect("neg");
+        session
+            .tensor_register_hook(neg, |grad| {
+                Ok(Some(grad.iter().map(|value| -*value).collect::<Vec<_>>()))
+            })
+            .expect("register reversal hook");
+
+        let loss = session.tensor_sum(neg).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        assert_eq!(report.gradient(neg).expect("neg grad"), &[-1.0, -1.0, -1.0]);
+        assert_eq!(report.gradient(t).expect("t grad"), &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn session_tensor_register_hook_supports_gradient_clipping() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = session
+            .tensor_variable(vec![2.0, -3.0, 0.5], vec![3], true)
+            .expect("t");
+        session
+            .tensor_register_hook(t, |grad| {
+                Ok(Some(
+                    grad.iter().map(|value| value.clamp(-1.0, 1.0)).collect(),
+                ))
+            })
+            .expect("register clipping hook");
+
+        let squared = session.tensor_mul(t, t).expect("square");
+        let loss = session.tensor_sum(squared).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        assert_eq!(report.gradient(t).expect("t grad"), &[1.0, -1.0, 1.0]);
+    }
+
+    #[test]
+    fn session_tensor_register_hook_supports_multiple_tensors_in_same_graph() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session
+            .tensor_variable(vec![2.0, 3.0], vec![2], true)
+            .expect("a");
+        let b = session
+            .tensor_variable(vec![5.0, 7.0], vec![2], true)
+            .expect("b");
+        let fire_count = Arc::new(Mutex::new(0usize));
+
+        let count_a = Arc::clone(&fire_count);
+        session
+            .tensor_register_hook(a, move |grad| {
+                *count_a.lock().expect("count lock") += 1;
+                Ok(Some(vec![0.0; grad.len()]))
+            })
+            .expect("register hook a");
+
+        let count_b = Arc::clone(&fire_count);
+        session
+            .tensor_register_hook(b, move |grad| {
+                *count_b.lock().expect("count lock") += 1;
+                Ok(Some(grad.iter().map(|value| value * 2.0).collect()))
+            })
+            .expect("register hook b");
+
+        let prod = session.tensor_mul(a, b).expect("mul");
+        let loss = session.tensor_sum(prod).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert_eq!(report.gradient(a).expect("a grad"), &[0.0, 0.0]);
+        assert_eq!(report.gradient(b).expect("b grad"), &[4.0, 6.0]);
+        assert_eq!(*fire_count.lock().expect("count lock"), 2);
     }
 
     // ---- tensor creation ----
