@@ -235,6 +235,584 @@
         "ft_p2c_008/nn_state/strict:adversarial_state_payload",
         "ft_p2c_008/nn_state/hardened:adversarial_state_payload"
       ]
+    },
+    {
+      "name": "register_buffer_accepts_valid_nested_name",
+      "operation": "register_buffer",
+      "module_path": "root.encoder",
+      "state_key": "encoder_block_0.running_mean",
+      "state_key_kind": "buffer",
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_register_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_register_ok"
+      },
+      "contract_ids": ["MODULE-REGISTER-001"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:register_buffer_valid",
+        "ft_p2c_008/nn_state/hardened:register_buffer_valid"
+      ]
+    },
+    {
+      "name": "register_parameter_rejects_double_dot_segment",
+      "operation": "register_parameter",
+      "module_path": "root",
+      "state_key": "encoder..weight",
+      "state_key_kind": "parameter",
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_register_rejected"
+      },
+      "hardened": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_register_rejected"
+      },
+      "contract_ids": ["MODULE-REGISTER-001", "MODULE-ADVERSARIAL-009"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:register_invalid_double_dot",
+        "ft_p2c_008/nn_state/hardened:register_invalid_double_dot"
+      ]
+    },
+    {
+      "name": "register_buffer_rejects_trailing_dot_name",
+      "operation": "register_buffer",
+      "module_path": "root",
+      "state_key": "running_var.",
+      "state_key_kind": "buffer",
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_register_rejected"
+      },
+      "hardened": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_register_rejected"
+      },
+      "contract_ids": ["MODULE-REGISTER-001", "MODULE-ADVERSARIAL-009"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:register_invalid_trailing_dot",
+        "ft_p2c_008/nn_state/hardened:register_invalid_trailing_dot"
+      ]
+    },
+    {
+      "name": "state_export_dedupes_duplicate_parameter_keys",
+      "operation": "state_export",
+      "module_path": "root.block",
+      "state_key_kind": "state_dict",
+      "parameter_keys": [
+        "encoder.weight",
+        "encoder.weight",
+        "decoder.weight"
+      ],
+      "persistent_buffer_keys": [
+        "encoder.running_mean"
+      ],
+      "non_persistent_buffer_keys": [
+        "encoder.tmp",
+        "encoder.tmp"
+      ],
+      "expected_state_keys": [
+        "decoder.weight",
+        "encoder.running_mean",
+        "encoder.weight"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-STATE-002"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:state_export_dedupe",
+        "ft_p2c_008/nn_state/hardened:state_export_dedupe"
+      ]
+    },
+    {
+      "name": "state_export_ignores_non_persistent_buffers",
+      "operation": "state_export",
+      "module_path": "root",
+      "state_key_kind": "buffer",
+      "parameter_keys": [
+        "head.weight"
+      ],
+      "persistent_buffer_keys": [],
+      "non_persistent_buffer_keys": [
+        "head.scratch",
+        "head.dropout_mask"
+      ],
+      "expected_state_keys": [
+        "head.weight"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-STATE-002", "MODULE-TRANSFER-008"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:state_export_non_persistent_filtered",
+        "ft_p2c_008/nn_state/hardened:state_export_non_persistent_filtered"
+      ]
+    },
+    {
+      "name": "state_export_sorted_keys_across_nested_modules",
+      "operation": "state_export",
+      "module_path": "root.deep",
+      "state_key_kind": "state_dict",
+      "parameter_keys": [
+        "layer2.bias",
+        "layer1.weight",
+        "layer2.weight"
+      ],
+      "persistent_buffer_keys": [
+        "layer1.running_var"
+      ],
+      "non_persistent_buffer_keys": [
+        "layer1.tmp"
+      ],
+      "expected_state_keys": [
+        "layer1.running_var",
+        "layer1.weight",
+        "layer2.bias",
+        "layer2.weight"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-STATE-002", "MODULE-TRAVERSAL-003"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:state_export_sorted_nested",
+        "ft_p2c_008/nn_state/hardened:state_export_sorted_nested"
+      ]
+    },
+    {
+      "name": "mode_transition_default_initial_state_idempotent",
+      "operation": "mode_transition",
+      "module_path": "root",
+      "state_key_kind": "training_mode",
+      "training_transitions": [],
+      "expected_training_flag": true,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "contract_ids": ["MODULE-MODE-004"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:mode_default_idempotent",
+        "ft_p2c_008/nn_state/hardened:mode_default_idempotent"
+      ]
+    },
+    {
+      "name": "mode_transition_roundtrip_to_train_mode",
+      "operation": "mode_transition",
+      "module_path": "root.decoder",
+      "state_key_kind": "training_mode",
+      "initial_training": true,
+      "training_transitions": [
+        false,
+        true
+      ],
+      "expected_training_flag": true,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "contract_ids": ["MODULE-MODE-004"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:mode_roundtrip_train",
+        "ft_p2c_008/nn_state/hardened:mode_roundtrip_train"
+      ]
+    },
+    {
+      "name": "mode_transition_multiple_toggles_end_eval",
+      "operation": "mode_transition",
+      "module_path": "root.encoder",
+      "state_key_kind": "training_mode",
+      "initial_training": true,
+      "training_transitions": [
+        false,
+        true,
+        false,
+        false
+      ],
+      "expected_training_flag": false,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_mode_transition_ok"
+      },
+      "contract_ids": ["MODULE-MODE-004"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:mode_multi_toggle_eval",
+        "ft_p2c_008/nn_state/hardened:mode_multi_toggle_eval"
+      ]
+    },
+    {
+      "name": "load_state_strict_rejects_missing_only",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "missing_keys": [
+        "encoder.layer0.weight"
+      ],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_load_hardened_allowlisted"
+      },
+      "contract_ids": ["MODULE-LOAD-STRICT-005"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:load_missing_only",
+        "ft_p2c_008/nn_state/hardened:load_missing_only"
+      ]
+    },
+    {
+      "name": "load_state_hardened_allows_unexpected_only",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "unexpected_keys": [
+        "head.extra_bias"
+      ],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_load_hardened_allowlisted"
+      },
+      "contract_ids": ["MODULE-LOAD-STRICT-005"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:load_unexpected_only",
+        "ft_p2c_008/nn_state/hardened:load_unexpected_only"
+      ]
+    },
+    {
+      "name": "load_state_clean_payload_passes_both_modes",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "missing_keys": [],
+      "unexpected_keys": [],
+      "incompatible_shapes": [],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_load_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_load_ok"
+      },
+      "contract_ids": ["MODULE-LOAD-STRICT-005"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:load_clean_payload",
+        "ft_p2c_008/nn_state/hardened:load_clean_payload"
+      ]
+    },
+    {
+      "name": "prefix_normalization_noop_when_disabled",
+      "operation": "prefix_normalization",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "prefix_keys": [
+        "module.encoder.weight",
+        "module.encoder.bias"
+      ],
+      "expected_canonical_keys": [
+        "module.encoder.bias",
+        "module.encoder.weight"
+      ],
+      "allow_prefix_normalization": false,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": false
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": false
+      },
+      "contract_ids": ["MODULE-PREFIX-006"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:prefix_disabled_noop",
+        "ft_p2c_008/nn_state/hardened:prefix_disabled_noop"
+      ]
+    },
+    {
+      "name": "prefix_normalization_applies_when_enabled_mixed_inputs",
+      "operation": "prefix_normalization",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "prefix_keys": [
+        "module.encoder.weight",
+        "decoder.bias",
+        "module.decoder.bias"
+      ],
+      "expected_canonical_keys": [
+        "decoder.bias",
+        "encoder.weight"
+      ],
+      "allow_prefix_normalization": true,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": true
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": true
+      },
+      "contract_ids": ["MODULE-PREFIX-006"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:prefix_enabled_mixed",
+        "ft_p2c_008/nn_state/hardened:prefix_enabled_mixed"
+      ]
+    },
+    {
+      "name": "prefix_normalization_dedupes_after_strip",
+      "operation": "prefix_normalization",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "prefix_keys": [
+        "module.head.weight",
+        "head.weight",
+        "module.head.weight"
+      ],
+      "expected_canonical_keys": [
+        "head.weight"
+      ],
+      "allow_prefix_normalization": true,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": true
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": true
+      },
+      "contract_ids": ["MODULE-PREFIX-006"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:prefix_dedupe_after_strip",
+        "ft_p2c_008/nn_state/hardened:prefix_dedupe_after_strip"
+      ]
+    },
+    {
+      "name": "prefix_normalization_unprefixed_keys_remain_unchanged",
+      "operation": "prefix_normalization",
+      "module_path": "root",
+      "state_key_kind": "state_dict",
+      "prefix_keys": [
+        "encoder.weight",
+        "decoder.bias"
+      ],
+      "expected_canonical_keys": [
+        "decoder.bias",
+        "encoder.weight"
+      ],
+      "allow_prefix_normalization": true,
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": false
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_prefix_normalization_ok",
+        "expect_prefix_normalization_applied": false
+      },
+      "contract_ids": ["MODULE-PREFIX-006"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:prefix_enabled_unprefixed_passthrough",
+        "ft_p2c_008/nn_state/hardened:prefix_enabled_unprefixed_passthrough"
+      ]
+    },
+    {
+      "name": "hook_trace_detects_out_of_order_sequence",
+      "operation": "hook_trace",
+      "module_path": "root",
+      "state_key_kind": "hook_trace",
+      "hook_trace": [
+        "state_dict_post_hook",
+        "state_dict_pre_hook",
+        "load_pre_hook",
+        "load_post_hook"
+      ],
+      "expected_hook_trace": [
+        "state_dict_pre_hook",
+        "state_dict_post_hook",
+        "load_pre_hook",
+        "load_post_hook"
+      ],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_hook_trace_mismatch"
+      },
+      "hardened": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_hook_trace_mismatch"
+      },
+      "contract_ids": ["MODULE-HOOKS-007", "MODULE-ADVERSARIAL-009"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:hook_out_of_order",
+        "ft_p2c_008/nn_state/hardened:hook_out_of_order"
+      ]
+    },
+    {
+      "name": "hook_trace_accepts_empty_sequence",
+      "operation": "hook_trace",
+      "module_path": "root",
+      "state_key_kind": "hook_trace",
+      "hook_trace": [],
+      "expected_hook_trace": [],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_hook_trace_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_hook_trace_ok"
+      },
+      "contract_ids": ["MODULE-HOOKS-007"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:hook_empty_trace",
+        "ft_p2c_008/nn_state/hardened:hook_empty_trace"
+      ]
+    },
+    {
+      "name": "hook_trace_allows_repeated_phases",
+      "operation": "hook_trace",
+      "module_path": "root",
+      "state_key_kind": "hook_trace",
+      "hook_trace": [
+        "state_dict_pre_hook",
+        "state_dict_post_hook",
+        "state_dict_post_hook",
+        "load_pre_hook",
+        "load_post_hook"
+      ],
+      "expected_hook_trace": [
+        "state_dict_pre_hook",
+        "state_dict_post_hook",
+        "state_dict_post_hook",
+        "load_pre_hook",
+        "load_post_hook"
+      ],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_hook_trace_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_hook_trace_ok"
+      },
+      "contract_ids": ["MODULE-HOOKS-007"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:hook_repeated_phases",
+        "ft_p2c_008/nn_state/hardened:hook_repeated_phases"
+      ]
+    },
+    {
+      "name": "register_parameter_accepts_numeric_segment",
+      "operation": "register_parameter",
+      "module_path": "root.seq",
+      "state_key": "layers.0.weight",
+      "state_key_kind": "parameter",
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_register_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_register_ok"
+      },
+      "contract_ids": ["MODULE-REGISTER-001", "MODULE-TRAVERSAL-003"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:register_numeric_segment",
+        "ft_p2c_008/nn_state/hardened:register_numeric_segment"
+      ]
+    },
+    {
+      "name": "load_state_missing_unexpected_with_assign_flag_split",
+      "operation": "load_state",
+      "module_path": "root",
+      "state_key_kind": "assign",
+      "assign_flag": true,
+      "missing_keys": [
+        "trunk.weight"
+      ],
+      "unexpected_keys": [
+        "aux.bias"
+      ],
+      "strict": {
+        "expect_pass": false,
+        "expected_reason_code": "nn_state_load_missing_or_unexpected_rejected"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_load_hardened_allowlisted"
+      },
+      "contract_ids": ["MODULE-LOAD-STRICT-005", "MODULE-TRANSFER-008"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:load_assign_missing_unexpected",
+        "ft_p2c_008/nn_state/hardened:load_assign_missing_unexpected"
+      ]
+    },
+    {
+      "name": "state_export_handles_empty_payload",
+      "operation": "state_export",
+      "module_path": "root.empty",
+      "state_key_kind": "state_dict",
+      "parameter_keys": [],
+      "persistent_buffer_keys": [],
+      "non_persistent_buffer_keys": [
+        "scratch"
+      ],
+      "expected_state_keys": [],
+      "strict": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "hardened": {
+        "expect_pass": true,
+        "expected_reason_code": "nn_state_state_export_ok"
+      },
+      "contract_ids": ["MODULE-STATE-002"],
+      "e2e_scenarios": [
+        "ft_p2c_008/nn_state/strict:state_export_empty_payload",
+        "ft_p2c_008/nn_state/hardened:state_export_empty_payload"
+      ]
     }
   ]
 }
