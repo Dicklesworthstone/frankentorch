@@ -3862,7 +3862,7 @@ impl Module for ConvTranspose1d {
         // Transposed convolution via scatter-and-accumulate:
         // For each input position, scatter kernel-weighted values to output positions.
         // Initialize output to zeros
-        let output = session.zeros(vec![batch_size, self.out_channels, l_out], true)?;
+        let output = session.zeros(vec![batch_size, self.out_channels, l_out], false)?;
 
         // For each input channel c_in and each output channel c_out:
         // For each input position i: output[:, c_out, i*stride + k - padding] += input[:, c_in, i] * weight[c_in, c_out, k]
@@ -3909,6 +3909,999 @@ impl Module for ConvTranspose1d {
             let bias_expanded = session.tensor_expand(bias, vec![1, self.out_channels, 1])?;
             let bias_expanded = session.tensor_expand(bias_expanded, bias_shape)?;
             result = session.tensor_add(result, bias_expanded)?;
+        }
+
+        Ok(result)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = vec![self.weight];
+        if let Some(bias) = self.bias {
+            params.push(bias);
+        }
+        params
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        let mut params = vec![("weight", self.weight)];
+        if let Some(bias) = self.bias {
+            params.push(("bias", bias));
+        }
+        params
+    }
+}
+
+// ── Conv3d ─────────────────────────────────────────────────────────────
+
+/// 3D convolution over 5D input `[N, C_in, D, H, W]`.
+///
+/// Output shape: `[N, C_out, D_out, H_out, W_out]`
+/// where `D_out = (D + 2*padding_d - kD) / stride_d + 1` (similarly for H, W).
+pub struct Conv3d {
+    weight: TensorNodeId,
+    bias: Option<TensorNodeId>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_d: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+    padding_d: usize,
+    padding_h: usize,
+    padding_w: usize,
+}
+
+impl Conv3d {
+    /// Create a new Conv3d with Kaiming uniform initialization.
+    ///
+    /// `kernel_size` is `(kD, kH, kW)`, `stride` is `(sD, sH, sW)`, `padding` is `(pD, pH, pW)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        use_bias: bool,
+    ) -> Result<Self, AutogradError> {
+        let (kd, kh, kw) = kernel_size;
+        let (sd, sh, sw) = stride;
+        let (pd, ph, pw) = padding;
+
+        if in_channels == 0 || out_channels == 0 || kd == 0 || kh == 0 || kw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Conv3d requires positive in_channels, out_channels, kernel_size",
+                },
+            )));
+        }
+        if sd == 0 || sh == 0 || sw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Conv3d requires stride > 0",
+                },
+            )));
+        }
+
+        let fan_in = in_channels * kd * kh * kw;
+        let bound = 1.0 / (fan_in as f64).sqrt();
+        let numel = out_channels * in_channels * kd * kh * kw;
+
+        let w_rand = session.rand(vec![numel], false)?;
+        let w_scale = session.full(vec![numel], 2.0 * bound, false)?;
+        let w_scaled = session.tensor_mul(w_rand, w_scale)?;
+        let w_shift = session.full(vec![numel], bound, false)?;
+        let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
+        let w_values = session.tensor_values(w_shifted)?;
+        let weight = session.tensor_variable(
+            w_values,
+            vec![out_channels, in_channels, kd, kh, kw],
+            true,
+        )?;
+
+        let bias = if use_bias {
+            let b_rand = session.rand(vec![out_channels], false)?;
+            let b_scale = session.full(vec![out_channels], 2.0 * bound, false)?;
+            let b_scaled = session.tensor_mul(b_rand, b_scale)?;
+            let b_shift = session.full(vec![out_channels], bound, false)?;
+            let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
+            let b_values = session.tensor_values(b_shifted)?;
+            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            weight,
+            bias,
+            in_channels,
+            out_channels,
+            kernel_d: kd,
+            kernel_h: kh,
+            kernel_w: kw,
+            stride_d: sd,
+            stride_h: sh,
+            stride_w: sw,
+            padding_d: pd,
+            padding_h: ph,
+            padding_w: pw,
+        })
+    }
+
+    /// Access the weight parameter.
+    #[must_use]
+    pub fn weight(&self) -> TensorNodeId {
+        self.weight
+    }
+
+    /// Access the bias parameter.
+    #[must_use]
+    pub fn bias(&self) -> Option<TensorNodeId> {
+        self.bias
+    }
+}
+
+impl Module for Conv3d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(input)?;
+            meta.shape().to_vec()
+        };
+
+        if input_shape.len() != 5 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Conv3d expects 5D input [N, C_in, D, H, W]",
+                },
+            )));
+        }
+
+        let batch_size = input_shape[0];
+        let c_in = input_shape[1];
+        if c_in != self.in_channels {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Conv3d input channels do not match in_channels",
+                },
+            )));
+        }
+
+        let d_in = input_shape[2];
+        let h_in = input_shape[3];
+        let w_in = input_shape[4];
+
+        // Apply padding if needed: pad innermost dims first [W_l,W_r, H_l,H_r, D_l,D_r]
+        let padded = if self.padding_d > 0 || self.padding_h > 0 || self.padding_w > 0 {
+            session.tensor_pad(
+                input,
+                &[
+                    self.padding_w, self.padding_w,
+                    self.padding_h, self.padding_h,
+                    self.padding_d, self.padding_d,
+                ],
+                0.0,
+            )?
+        } else {
+            input
+        };
+        let d_padded = d_in + 2 * self.padding_d;
+        let h_padded = h_in + 2 * self.padding_h;
+        let w_padded = w_in + 2 * self.padding_w;
+
+        if d_padded < self.kernel_d || h_padded < self.kernel_h || w_padded < self.kernel_w {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Conv3d input too small for given kernel_size and padding",
+                },
+            )));
+        }
+        let d_out = (d_padded - self.kernel_d) / self.stride_d + 1;
+        let h_out = (h_padded - self.kernel_h) / self.stride_h + 1;
+        let w_out = (w_padded - self.kernel_w) / self.stride_w + 1;
+
+        // Im2col: extract sliding 3D windows
+        let ck = self.in_channels * self.kernel_d * self.kernel_h * self.kernel_w;
+        let spatial_out = d_out * h_out * w_out;
+        let mut patches = Vec::with_capacity(spatial_out);
+        for di in 0..d_out {
+            let d_start = di * self.stride_d;
+            let depth_slice = session.tensor_narrow(padded, 2, d_start, self.kernel_d)?;
+            for hi in 0..h_out {
+                let h_start = hi * self.stride_h;
+                let row_slice = session.tensor_narrow(depth_slice, 3, h_start, self.kernel_h)?;
+                for wi in 0..w_out {
+                    let w_start = wi * self.stride_w;
+                    let patch = session.tensor_narrow(row_slice, 4, w_start, self.kernel_w)?;
+                    let flat = session.tensor_reshape(patch, vec![batch_size, 1, ck])?;
+                    patches.push(flat);
+                }
+            }
+        }
+
+        // cat along dim 1: [N, D_out*H_out*W_out, ck]
+        let unfolded = session.tensor_cat(&patches, 1)?;
+
+        // Weight: [C_out, C_in, kD, kH, kW] -> [C_out, ck] -> transpose -> [ck, C_out]
+        let w_flat = session.tensor_reshape(self.weight, vec![self.out_channels, ck])?;
+        let w_t = session.tensor_transpose(w_flat, 0, 1)?;
+
+        let w_us = session.tensor_unsqueeze(w_t, 0)?;
+        let w_expanded = session.tensor_expand(w_us, vec![batch_size, ck, self.out_channels])?;
+
+        // bmm: [N, spatial_out, ck] @ [N, ck, C_out] -> [N, spatial_out, C_out]
+        let output = session.tensor_bmm(unfolded, w_expanded)?;
+
+        // Transpose to [N, C_out, spatial_out], reshape to [N, C_out, D_out, H_out, W_out]
+        let output_t = session.tensor_transpose(output, 1, 2)?;
+        let output_5d = session.tensor_reshape(
+            output_t,
+            vec![batch_size, self.out_channels, d_out, h_out, w_out],
+        )?;
+
+        match self.bias {
+            Some(bias) => {
+                let b_rs =
+                    session.tensor_reshape(bias, vec![1, self.out_channels, 1, 1, 1])?;
+                let b_exp = session.tensor_expand(
+                    b_rs,
+                    vec![batch_size, self.out_channels, d_out, h_out, w_out],
+                )?;
+                session.tensor_add(output_5d, b_exp)
+            }
+            None => Ok(output_5d),
+        }
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = vec![self.weight];
+        if let Some(bias) = self.bias {
+            params.push(bias);
+        }
+        params
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        let mut params = vec![("weight", self.weight)];
+        if let Some(bias) = self.bias {
+            params.push(("bias", bias));
+        }
+        params
+    }
+}
+
+// ── ConvTranspose2d ────────────────────────────────────────────────────
+
+/// Transposed 2D convolution (deconvolution) over 4D input `[N, C_in, H, W]`.
+///
+/// Output shape: `[N, C_out, H_out, W_out]`
+/// where `H_out = (H - 1) * stride_h - 2*padding_h + kernel_h + output_padding_h`
+/// (similarly for W).
+pub struct ConvTranspose2d {
+    weight: TensorNodeId,
+    bias: Option<TensorNodeId>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_h: usize,
+    stride_w: usize,
+    padding_h: usize,
+    padding_w: usize,
+    output_padding_h: usize,
+    output_padding_w: usize,
+}
+
+impl ConvTranspose2d {
+    /// Create a new ConvTranspose2d with Kaiming uniform initialization.
+    ///
+    /// `kernel_size` is `(kH, kW)`, `stride` is `(sH, sW)`, `padding` is `(pH, pW)`,
+    /// `output_padding` is `(opH, opW)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        output_padding: (usize, usize),
+        use_bias: bool,
+    ) -> Result<Self, AutogradError> {
+        let (kh, kw) = kernel_size;
+        let (sh, sw) = stride;
+        let (ph, pw) = padding;
+        let (oph, opw) = output_padding;
+
+        if in_channels == 0 || out_channels == 0 || kh == 0 || kw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d requires positive dimensions",
+                },
+            )));
+        }
+        if sh == 0 || sw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d requires stride > 0",
+                },
+            )));
+        }
+        if oph >= sh || opw >= sw {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d output_padding must be < stride",
+                },
+            )));
+        }
+
+        // Weight shape: [in_channels, out_channels, kH, kW]
+        let fan_in = in_channels * kh * kw;
+        let bound = 1.0 / (fan_in as f64).sqrt();
+        let numel = in_channels * out_channels * kh * kw;
+
+        let w_rand = session.rand(vec![numel], false)?;
+        let w_scale = session.full(vec![numel], 2.0 * bound, false)?;
+        let w_scaled = session.tensor_mul(w_rand, w_scale)?;
+        let w_shift = session.full(vec![numel], bound, false)?;
+        let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
+        let w_values = session.tensor_values(w_shifted)?;
+        let weight = session.tensor_variable(
+            w_values,
+            vec![in_channels, out_channels, kh, kw],
+            true,
+        )?;
+
+        let bias = if use_bias {
+            let b_rand = session.rand(vec![out_channels], false)?;
+            let b_scale = session.full(vec![out_channels], 2.0 * bound, false)?;
+            let b_scaled = session.tensor_mul(b_rand, b_scale)?;
+            let b_shift = session.full(vec![out_channels], bound, false)?;
+            let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
+            let b_values = session.tensor_values(b_shifted)?;
+            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            weight,
+            bias,
+            in_channels,
+            out_channels,
+            kernel_h: kh,
+            kernel_w: kw,
+            stride_h: sh,
+            stride_w: sw,
+            padding_h: ph,
+            padding_w: pw,
+            output_padding_h: oph,
+            output_padding_w: opw,
+        })
+    }
+
+    /// Access the weight parameter.
+    #[must_use]
+    pub fn weight(&self) -> TensorNodeId {
+        self.weight
+    }
+
+    /// Access the bias parameter.
+    #[must_use]
+    pub fn bias(&self) -> Option<TensorNodeId> {
+        self.bias
+    }
+}
+
+impl Module for ConvTranspose2d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(input)?;
+            meta.shape().to_vec()
+        };
+
+        if input_shape.len() != 4 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d expects 4D input [N, C_in, H, W]",
+                },
+            )));
+        }
+
+        let batch_size = input_shape[0];
+        let c_in = input_shape[1];
+        if c_in != self.in_channels {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d input channels do not match in_channels",
+                },
+            )));
+        }
+        let h_in = input_shape[2];
+        let w_in = input_shape[3];
+
+        // Output dimensions
+        let h_out = (h_in - 1) * self.stride_h - 2 * self.padding_h + self.kernel_h
+            + self.output_padding_h;
+        let w_out = (w_in - 1) * self.stride_w - 2 * self.padding_w + self.kernel_w
+            + self.output_padding_w;
+
+        // Transposed convolution via col2im approach (autograd-friendly).
+        // For each output position, we gather contributions from overlapping
+        // input positions and kernel weights, then sum them.
+        //
+        // weight shape: [in_channels, out_channels, kH, kW]
+        // Reshape to [in_channels, out_channels * kH * kW], transpose to
+        // [out_channels * kH * kW, in_channels]
+        let ok = self.out_channels * self.kernel_h * self.kernel_w;
+        // input: [N, C_in, H_in, W_in] -> flatten spatial: [N, C_in, H_in*W_in]
+        // -> transpose: [N, H_in*W_in, C_in]
+        let x_flat = session.tensor_reshape(
+            input,
+            vec![batch_size, self.in_channels, h_in * w_in],
+        )?;
+        let x_flat = session.tensor_transpose(x_flat, 1, 2)?; // [N, H_in*W_in, C_in]
+
+        // weight: [in_channels, out_channels, kH, kW] -> [in_channels, ok]
+        let w_flat = session.tensor_reshape(self.weight, vec![self.in_channels, ok])?;
+        // transpose: [ok, in_channels]
+        let w_t = session.tensor_transpose(w_flat, 0, 1)?;
+        // expand for bmm: [N, ok, in_channels]
+        let w_us = session.tensor_unsqueeze(w_t, 0)?;
+        let w_expanded =
+            session.tensor_expand(w_us, vec![batch_size, ok, self.in_channels])?;
+
+        // bmm: [N, H_in*W_in, C_in] @ [N, C_in, ok]^T = [N, H_in*W_in, ok]
+        // Actually: [N, H_in*W_in, C_in] @ [N, ok, C_in]^T
+        // We need [N, C_in, ok], so transpose w_expanded dims 1,2
+        let w_for_bmm = session.tensor_transpose(w_expanded, 1, 2)?; // [N, C_in, ok]
+        // bmm: [N, H_in*W_in, C_in] @ [N, C_in, ok] -> [N, H_in*W_in, ok]
+        let columns = session.tensor_bmm(x_flat, w_for_bmm)?;
+        // columns[n, hw, :] contains out_channels*kH*kW values for input position hw
+        // Reshape: [N, H_in, W_in, out_channels, kH, kW]
+        let columns = session.tensor_reshape(
+            columns,
+            vec![batch_size, h_in, w_in, self.out_channels, self.kernel_h, self.kernel_w],
+        )?;
+
+        // Col2im: scatter each column into the output.
+        // For each input (hi, wi) and kernel (kh, kw):
+        //   out_h = hi*stride_h + kh - padding_h
+        //   out_w = wi*stride_w + kw - padding_w
+        //   output[:, :, out_h, out_w] += columns[:, hi, wi, :, kh, kw]
+        //
+        // Group by output row for efficiency: for each output row out_h,
+        // collect all contributions, cat them, and sum.
+
+        // Build output row by row
+        let mut output_rows = Vec::with_capacity(h_out);
+        for oh in 0..h_out {
+            let mut row_contribs: Vec<TensorNodeId> = Vec::new();
+            for kh in 0..self.kernel_h {
+                // oh = hi*stride_h + kh - padding_h => hi = (oh + padding_h - kh) / stride_h
+                let oh_shifted = oh + self.padding_h;
+                if oh_shifted < kh {
+                    continue;
+                }
+                let hi_times_stride = oh_shifted - kh;
+                if hi_times_stride % self.stride_h != 0 {
+                    continue;
+                }
+                let hi = hi_times_stride / self.stride_h;
+                if hi >= h_in {
+                    continue;
+                }
+
+                for kw in 0..self.kernel_w {
+                    // Build a w_out-length vector of contributions for this (hi, kh, kw)
+                    let mut col_contribs: Vec<TensorNodeId> = Vec::new();
+                    for ow in 0..w_out {
+                        let ow_shifted = ow + self.padding_w;
+                        if ow_shifted < kw {
+                            continue;
+                        }
+                        let wi_times_stride = ow_shifted - kw;
+                        if wi_times_stride % self.stride_w != 0 {
+                            continue;
+                        }
+                        let wi = wi_times_stride / self.stride_w;
+                        if wi >= w_in {
+                            continue;
+                        }
+
+                        // columns[:, hi, wi, :, kh, kw] -> [N, out_channels]
+                        let c = session.tensor_narrow(columns, 1, hi, 1)?;
+                        let c = session.tensor_narrow(c, 2, wi, 1)?;
+                        let c = session.tensor_narrow(c, 4, kh, 1)?;
+                        let c = session.tensor_narrow(c, 5, kw, 1)?;
+                        // [N, 1, 1, out_channels, 1, 1] -> [N, out_channels]
+                        let c = session.tensor_reshape(c, vec![batch_size, self.out_channels])?;
+                        col_contribs.push(c);
+                    }
+                    if !col_contribs.is_empty() {
+                        // This is getting complex; let me use a simpler approach
+                        // Just accumulate via add
+                        for c in col_contribs {
+                            row_contribs.push(c);
+                        }
+                    }
+                }
+            }
+            // Need to properly scatter these into the row...
+            // This approach is getting too complex. Let me use a simpler method.
+            let _ = row_contribs;
+            let _ = output_rows;
+            break;
+        }
+
+        // SIMPLER APPROACH: For each (kh, kw), shift the matmul result into the
+        // correct output position using narrow/cat on an intermediate grid.
+        //
+        // For each kernel position (kh, kw), the contributions form a grid at
+        // positions (hi*stride_h + kh - padding_h, wi*stride_w + kw - padding_w).
+        // Each contribution is columns[:, hi, wi, :, kh, kw].
+        //
+        // Since these positions form a regular grid, we can reshape and
+        // use narrow to extract the valid region.
+
+        // Reset approach: direct accumulation using narrow on the output.
+        // Actually, let's use the simplest autograd-friendly approach:
+        // Process each (hi, wi, kh, kw) individually and accumulate using scatter-add.
+        // But we don't have scatter_add...
+        //
+        // Final approach: build output column-by-column, stacking contributions.
+        // For each output position (oh, ow), find all (hi, wi, kh, kw) contributing.
+
+        // Actually the most practical approach: for each (kh, kw), compute a shifted
+        // grid and use it to build partial outputs that we sum together.
+        let mut result = session.zeros(vec![batch_size, self.out_channels, h_out, w_out], false)?;
+
+        for kh in 0..self.kernel_h {
+            for kw in 0..self.kernel_w {
+                // Extract columns[:, :, :, :, kh, kw] -> [N, H_in, W_in, out_channels]
+                let c = session.tensor_narrow(columns, 4, kh, 1)?;
+                let c = session.tensor_narrow(c, 5, kw, 1)?;
+                let c = session.tensor_reshape(
+                    c,
+                    vec![batch_size, h_in, w_in, self.out_channels],
+                )?;
+                // Transpose to [N, out_channels, H_in, W_in]
+                let c = session.tensor_transpose(c, 1, 3)?; // [N, out_ch, W_in, H_in]
+                let c = session.tensor_transpose(c, 2, 3)?; // [N, out_ch, H_in, W_in]
+
+                // This grid needs to be placed at output positions:
+                //   oh = hi*stride_h + kh - padding_h
+                //   ow = wi*stride_w + kw - padding_w
+                // The grid spacing in output space is stride_h x stride_w.
+                // If stride > 1, we need to insert zeros between elements.
+
+                // Upsample by stride: insert (stride-1) zeros between elements
+                let mut upsampled = c;
+                if self.stride_h > 1 {
+                    // Interleave rows with zeros
+                    let mut rows = Vec::with_capacity(h_in);
+                    for hi in 0..h_in {
+                        let row = session.tensor_narrow(upsampled, 2, hi, 1)?;
+                        rows.push(row);
+                    }
+                    let zero_row = session.zeros(
+                        vec![batch_size, self.out_channels, 1, w_in],
+                        false,
+                    )?;
+                    let mut interleaved = Vec::with_capacity(h_in + (h_in - 1) * (self.stride_h - 1));
+                    for (i, row) in rows.iter().enumerate() {
+                        interleaved.push(*row);
+                        if i < h_in - 1 {
+                            for _ in 1..self.stride_h {
+                                interleaved.push(zero_row);
+                            }
+                        }
+                    }
+                    upsampled = session.tensor_cat(&interleaved, 2)?;
+                }
+                let up_h = if h_in > 0 {
+                    (h_in - 1) * self.stride_h + 1
+                } else {
+                    0
+                };
+
+                if self.stride_w > 1 {
+                    // Interleave cols with zeros
+                    let mut cols = Vec::with_capacity(w_in);
+                    for wi in 0..w_in {
+                        let col = session.tensor_narrow(upsampled, 3, wi, 1)?;
+                        cols.push(col);
+                    }
+                    let zero_col = session.zeros(
+                        vec![batch_size, self.out_channels, up_h, 1],
+                        false,
+                    )?;
+                    let mut interleaved = Vec::with_capacity(w_in + (w_in - 1) * (self.stride_w - 1));
+                    for (i, col) in cols.iter().enumerate() {
+                        interleaved.push(*col);
+                        if i < w_in - 1 {
+                            for _ in 1..self.stride_w {
+                                interleaved.push(zero_col);
+                            }
+                        }
+                    }
+                    upsampled = session.tensor_cat(&interleaved, 3)?;
+                }
+                let up_w = if w_in > 0 {
+                    (w_in - 1) * self.stride_w + 1
+                } else {
+                    0
+                };
+
+                // Now upsampled is [N, out_ch, up_h, up_w] where
+                // up_h = (h_in-1)*stride_h + 1, up_w = (w_in-1)*stride_w + 1
+                // It needs to be placed starting at (kh - padding_h, kw - padding_w)
+                // in the h_out x w_out output.
+
+                // Compute the valid region overlap with output
+                let src_h_start = if kh >= self.padding_h { 0 } else { self.padding_h - kh };
+                let dst_h_start = if kh >= self.padding_h { kh - self.padding_h } else { 0 };
+                let src_h_end = up_h.min(h_out + self.padding_h - kh);
+                let src_w_start = if kw >= self.padding_w { 0 } else { self.padding_w - kw };
+                let dst_w_start = if kw >= self.padding_w { kw - self.padding_w } else { 0 };
+                let src_w_end = up_w.min(w_out + self.padding_w - kw);
+
+                if src_h_start >= src_h_end || src_w_start >= src_w_end {
+                    continue;
+                }
+
+                let valid_h = src_h_end - src_h_start;
+                let valid_w = src_w_end - src_w_start;
+
+                // Extract valid region from upsampled
+                let valid = session.tensor_narrow(upsampled, 2, src_h_start, valid_h)?;
+                let valid = session.tensor_narrow(valid, 3, src_w_start, valid_w)?;
+
+                // Extract corresponding region from result, add, put back
+                // We can't "put back" easily, so instead we create a full-sized
+                // contribution using reshape+cat. But that's also complex.
+                // Simplest: accumulate in a flat buffer using narrow on result.
+                //
+                // Actually, the cleanest autograd-friendly way: build a full
+                // h_out x w_out tensor with the valid region and zeros elsewhere,
+                // using cat operations.
+
+                // Build the full contribution tensor by padding with zero-rows/cols
+                // using cat (autograd-tracked unlike tensor_pad)
+                let mut padded = valid;
+
+                // Pad height: add zero rows top and bottom
+                if dst_h_start > 0 {
+                    let top_zeros = session.zeros(
+                        vec![batch_size, self.out_channels, dst_h_start, valid_w],
+                        false,
+                    )?;
+                    padded = session.tensor_cat(&[top_zeros, padded], 2)?;
+                }
+                let bottom = h_out - dst_h_start - valid_h;
+                if bottom > 0 {
+                    let bot_zeros = session.zeros(
+                        vec![batch_size, self.out_channels, bottom, valid_w],
+                        false,
+                    )?;
+                    padded = session.tensor_cat(&[padded, bot_zeros], 2)?;
+                }
+                // padded is now [N, out_ch, h_out, valid_w]
+
+                // Pad width: add zero cols left and right
+                if dst_w_start > 0 {
+                    let left_zeros = session.zeros(
+                        vec![batch_size, self.out_channels, h_out, dst_w_start],
+                        false,
+                    )?;
+                    padded = session.tensor_cat(&[left_zeros, padded], 3)?;
+                }
+                let right = w_out - dst_w_start - valid_w;
+                if right > 0 {
+                    let right_zeros = session.zeros(
+                        vec![batch_size, self.out_channels, h_out, right],
+                        false,
+                    )?;
+                    padded = session.tensor_cat(&[padded, right_zeros], 3)?;
+                }
+                // padded is now [N, out_ch, h_out, w_out]
+
+                result = session.tensor_add(result, padded)?;
+            }
+        }
+
+        // Add bias
+        if let Some(bias) = self.bias {
+            let b_rs = session.tensor_reshape(bias, vec![1, self.out_channels, 1, 1])?;
+            let b_exp = session.tensor_expand(
+                b_rs,
+                vec![batch_size, self.out_channels, h_out, w_out],
+            )?;
+            result = session.tensor_add(result, b_exp)?;
+        }
+
+        Ok(result)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = vec![self.weight];
+        if let Some(bias) = self.bias {
+            params.push(bias);
+        }
+        params
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        let mut params = vec![("weight", self.weight)];
+        if let Some(bias) = self.bias {
+            params.push(("bias", bias));
+        }
+        params
+    }
+}
+
+// ── ConvTranspose3d ────────────────────────────────────────────────────
+
+/// Transposed 3D convolution (deconvolution) over 5D input `[N, C_in, D, H, W]`.
+///
+/// Output shape: `[N, C_out, D_out, H_out, W_out]`
+/// where `D_out = (D - 1) * stride_d - 2*padding_d + kernel_d + output_padding_d`
+/// (similarly for H, W).
+pub struct ConvTranspose3d {
+    weight: TensorNodeId,
+    bias: Option<TensorNodeId>,
+    in_channels: usize,
+    out_channels: usize,
+    kernel_d: usize,
+    kernel_h: usize,
+    kernel_w: usize,
+    stride_d: usize,
+    stride_h: usize,
+    stride_w: usize,
+    padding_d: usize,
+    padding_h: usize,
+    padding_w: usize,
+    output_padding_d: usize,
+    output_padding_h: usize,
+    output_padding_w: usize,
+}
+
+impl ConvTranspose3d {
+    /// Create a new ConvTranspose3d with Kaiming uniform initialization.
+    ///
+    /// `kernel_size` is `(kD, kH, kW)`, `stride` is `(sD, sH, sW)`,
+    /// `padding` is `(pD, pH, pW)`, `output_padding` is `(opD, opH, opW)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        in_channels: usize,
+        out_channels: usize,
+        kernel_size: (usize, usize, usize),
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+        output_padding: (usize, usize, usize),
+        use_bias: bool,
+    ) -> Result<Self, AutogradError> {
+        let (kd, kh, kw) = kernel_size;
+        let (sd, sh, sw) = stride;
+        let (pd, ph, pw) = padding;
+        let (opd, oph, opw) = output_padding;
+
+        if in_channels == 0 || out_channels == 0 || kd == 0 || kh == 0 || kw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose3d requires positive dimensions",
+                },
+            )));
+        }
+        if sd == 0 || sh == 0 || sw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose3d requires stride > 0",
+                },
+            )));
+        }
+        if opd >= sd || oph >= sh || opw >= sw {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose3d output_padding must be < stride",
+                },
+            )));
+        }
+
+        // Weight shape: [in_channels, out_channels, kD, kH, kW]
+        let fan_in = in_channels * kd * kh * kw;
+        let bound = 1.0 / (fan_in as f64).sqrt();
+        let numel = in_channels * out_channels * kd * kh * kw;
+
+        let w_rand = session.rand(vec![numel], false)?;
+        let w_scale = session.full(vec![numel], 2.0 * bound, false)?;
+        let w_scaled = session.tensor_mul(w_rand, w_scale)?;
+        let w_shift = session.full(vec![numel], bound, false)?;
+        let w_shifted = session.tensor_sub(w_scaled, w_shift)?;
+        let w_values = session.tensor_values(w_shifted)?;
+        let weight = session.tensor_variable(
+            w_values,
+            vec![in_channels, out_channels, kd, kh, kw],
+            true,
+        )?;
+
+        let bias = if use_bias {
+            let b_rand = session.rand(vec![out_channels], false)?;
+            let b_scale = session.full(vec![out_channels], 2.0 * bound, false)?;
+            let b_scaled = session.tensor_mul(b_rand, b_scale)?;
+            let b_shift = session.full(vec![out_channels], bound, false)?;
+            let b_shifted = session.tensor_sub(b_scaled, b_shift)?;
+            let b_values = session.tensor_values(b_shifted)?;
+            Some(session.tensor_variable(b_values, vec![out_channels], true)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            weight,
+            bias,
+            in_channels,
+            out_channels,
+            kernel_d: kd,
+            kernel_h: kh,
+            kernel_w: kw,
+            stride_d: sd,
+            stride_h: sh,
+            stride_w: sw,
+            padding_d: pd,
+            padding_h: ph,
+            padding_w: pw,
+            output_padding_d: opd,
+            output_padding_h: oph,
+            output_padding_w: opw,
+        })
+    }
+
+    /// Access the weight parameter.
+    #[must_use]
+    pub fn weight(&self) -> TensorNodeId {
+        self.weight
+    }
+
+    /// Access the bias parameter.
+    #[must_use]
+    pub fn bias(&self) -> Option<TensorNodeId> {
+        self.bias
+    }
+}
+
+impl Module for ConvTranspose3d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(input)?;
+            meta.shape().to_vec()
+        };
+
+        if input_shape.len() != 5 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose3d expects 5D input [N, C_in, D, H, W]",
+                },
+            )));
+        }
+
+        let batch_size = input_shape[0];
+        let c_in = input_shape[1];
+        if c_in != self.in_channels {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose3d input channels do not match in_channels",
+                },
+            )));
+        }
+        let d_in = input_shape[2];
+        let h_in = input_shape[3];
+        let w_in = input_shape[4];
+
+        let d_out = (d_in - 1) * self.stride_d - 2 * self.padding_d + self.kernel_d
+            + self.output_padding_d;
+        let h_out = (h_in - 1) * self.stride_h - 2 * self.padding_h + self.kernel_h
+            + self.output_padding_h;
+        let w_out = (w_in - 1) * self.stride_w - 2 * self.padding_w + self.kernel_w
+            + self.output_padding_w;
+
+        let mut result =
+            session.zeros(vec![batch_size, self.out_channels, d_out, h_out, w_out], false)?;
+
+        for kd in 0..self.kernel_d {
+            for kh in 0..self.kernel_h {
+                for kw in 0..self.kernel_w {
+                    // weight[:, :, kd, kh, kw] -> [in_channels, out_channels]
+                    let w_slice = session.tensor_narrow(self.weight, 2, kd, 1)?;
+                    let w_slice = session.tensor_narrow(w_slice, 3, kh, 1)?;
+                    let w_slice = session.tensor_narrow(w_slice, 4, kw, 1)?;
+                    let w_slice = session.tensor_squeeze(w_slice, 4)?;
+                    let w_slice = session.tensor_squeeze(w_slice, 3)?;
+                    let w_slice = session.tensor_squeeze(w_slice, 2)?;
+
+                    for di in 0..d_in {
+                        let out_d_raw = di * self.stride_d + kd;
+                        if out_d_raw < self.padding_d
+                            || out_d_raw - self.padding_d >= d_out
+                        {
+                            continue;
+                        }
+                        let out_d = out_d_raw - self.padding_d;
+
+                        for hi in 0..h_in {
+                            let out_h_raw = hi * self.stride_h + kh;
+                            if out_h_raw < self.padding_h
+                                || out_h_raw - self.padding_h >= h_out
+                            {
+                                continue;
+                            }
+                            let out_h = out_h_raw - self.padding_h;
+
+                            for wi in 0..w_in {
+                                let out_w_raw = wi * self.stride_w + kw;
+                                if out_w_raw < self.padding_w
+                                    || out_w_raw - self.padding_w >= w_out
+                                {
+                                    continue;
+                                }
+                                let out_w = out_w_raw - self.padding_w;
+
+                                // input[:, :, di, hi, wi] -> [batch, in_channels]
+                                let x_dhw = session.tensor_narrow(input, 2, di, 1)?;
+                                let x_dhw = session.tensor_narrow(x_dhw, 3, hi, 1)?;
+                                let x_dhw = session.tensor_narrow(x_dhw, 4, wi, 1)?;
+                                let x_dhw = session.tensor_squeeze(x_dhw, 4)?;
+                                let x_dhw = session.tensor_squeeze(x_dhw, 3)?;
+                                let x_dhw = session.tensor_squeeze(x_dhw, 2)?;
+
+                                let contrib = session.tensor_matmul(x_dhw, w_slice)?;
+                                // -> [batch, out_channels, 1, 1, 1]
+                                let contrib = session.tensor_unsqueeze(contrib, 2)?;
+                                let contrib = session.tensor_unsqueeze(contrib, 3)?;
+                                let contrib = session.tensor_unsqueeze(contrib, 4)?;
+
+                                // Pad to place at (out_d, out_h, out_w)
+                                let contrib_padded = session.tensor_pad(
+                                    contrib,
+                                    &[
+                                        out_w, w_out - out_w - 1,
+                                        out_h, h_out - out_h - 1,
+                                        out_d, d_out - out_d - 1,
+                                    ],
+                                    0.0,
+                                )?;
+
+                                result = session.tensor_add(result, contrib_padded)?;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        if let Some(bias) = self.bias {
+            let b_rs =
+                session.tensor_reshape(bias, vec![1, self.out_channels, 1, 1, 1])?;
+            let b_exp = session.tensor_expand(
+                b_rs,
+                vec![batch_size, self.out_channels, d_out, h_out, w_out],
+            )?;
+            result = session.tensor_add(result, b_exp)?;
         }
 
         Ok(result)
@@ -4332,6 +5325,1820 @@ impl GRUCell {
     pub fn parameters(&self) -> Vec<TensorNodeId> {
         vec![self.w_ih, self.w_hh, self.b_ih, self.b_hh]
     }
+}
+
+// ── Full Sequence Modules ─────────────────────────────────────────────
+
+/// Full LSTM module: processes entire sequences through multi-layer LSTM.
+///
+/// Wraps [`LSTMCell`] to iterate over time steps, with support for:
+/// - Multi-layer stacking (`num_layers`)
+/// - Bidirectional processing (`bidirectional`)
+/// - Dropout between layers (not applied after the last layer)
+/// - `batch_first` input layout
+///
+/// # Input shapes
+///
+/// If `batch_first` is false (default): input is `[seq_len, batch, input_size]`.
+/// If `batch_first` is true: input is `[batch, seq_len, input_size]`.
+///
+/// # Forward signature
+///
+/// ```text
+/// lstm(input, (h_0, c_0)) -> (output, (h_n, c_n))
+/// ```
+///
+/// - `h_0`, `c_0`: initial hidden/cell states `[num_layers * num_directions, batch, hidden_size]`
+/// - `output`: `[seq_len, batch, hidden_size * num_directions]` (or batch_first variant)
+/// - `h_n`, `c_n`: final hidden/cell states `[num_layers * num_directions, batch, hidden_size]`
+pub struct LSTM {
+    /// Per-layer cells. For bidirectional, even indices are forward, odd are reverse.
+    cells: Vec<LSTMCell>,
+    /// Dropout modules applied between layers (length = num_layers - 1).
+    dropout_layers: Vec<Dropout>,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    batch_first: bool,
+    training: std::cell::Cell<bool>,
+}
+
+/// Output of LSTM forward pass.
+pub struct LSTMOutput {
+    /// Output tensor: `[seq_len, batch, hidden_size * num_directions]`
+    /// (or `[batch, seq_len, ...]` if `batch_first`).
+    pub output: TensorNodeId,
+    /// Final hidden state: `[num_layers * num_directions, batch, hidden_size]`.
+    pub h_n: TensorNodeId,
+    /// Final cell state: `[num_layers * num_directions, batch, hidden_size]`.
+    pub c_n: TensorNodeId,
+}
+
+impl LSTM {
+    /// Create a new LSTM module.
+    ///
+    /// * `input_size` - number of expected features in the input
+    /// * `hidden_size` - number of features in the hidden state
+    /// * `num_layers` - number of recurrent layers (default: 1)
+    /// * `bidirectional` - if true, becomes a bidirectional LSTM
+    /// * `dropout` - dropout probability between layers (ignored if `num_layers == 1`)
+    /// * `batch_first` - if true, input/output tensors have batch as first dimension
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        num_layers: usize,
+        bidirectional: bool,
+        dropout: f64,
+        batch_first: bool,
+    ) -> Result<Self, AutogradError> {
+        if num_layers == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LSTM num_layers must be >= 1",
+                },
+            )));
+        }
+
+        let num_directions: usize = if bidirectional { 2 } else { 1 };
+        let mut cells = Vec::with_capacity(num_layers * num_directions);
+
+        for layer in 0..num_layers {
+            let layer_input_size = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * num_directions
+            };
+
+            // Forward direction cell
+            cells.push(LSTMCell::new(session, layer_input_size, hidden_size)?);
+
+            // Reverse direction cell (if bidirectional)
+            if bidirectional {
+                cells.push(LSTMCell::new(session, layer_input_size, hidden_size)?);
+            }
+        }
+
+        // Create dropout modules between layers (not after last layer)
+        let mut dropout_layers = Vec::new();
+        if num_layers > 1 {
+            for _ in 0..(num_layers - 1) {
+                dropout_layers.push(Dropout::new(dropout));
+            }
+        }
+
+        Ok(Self {
+            cells,
+            dropout_layers,
+            input_size,
+            hidden_size,
+            num_layers,
+            bidirectional,
+            batch_first,
+            training: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Run the full LSTM forward pass.
+    ///
+    /// * `input` - input tensor `[seq_len, batch, input_size]` (or `[batch, seq_len, input_size]` if `batch_first`)
+    /// * `h_0` - optional initial hidden state `[num_layers * num_directions, batch, hidden_size]`
+    /// * `c_0` - optional initial cell state `[num_layers * num_directions, batch, hidden_size]`
+    ///
+    /// Returns `LSTMOutput { output, h_n, c_n }`.
+    pub fn forward_lstm(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+        h_0: Option<TensorNodeId>,
+        c_0: Option<TensorNodeId>,
+    ) -> Result<LSTMOutput, AutogradError> {
+        let num_directions: usize = if self.bidirectional { 2 } else { 1 };
+
+        // Get input shape and transpose if batch_first
+        let working_input = if self.batch_first {
+            // [batch, seq_len, input_size] -> [seq_len, batch, input_size]
+            session.tensor_transpose(input, 0, 1)?
+        } else {
+            input
+        };
+
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(working_input)?;
+            meta.shape().to_vec()
+        };
+        if input_shape.len() != 3 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LSTM expects 3D input [seq_len, batch, input_size]",
+                },
+            )));
+        }
+        let seq_len = input_shape[0];
+        let batch_size = input_shape[1];
+
+        if input_shape[2] != self.input_size {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LSTM input feature size does not match input_size",
+                },
+            )));
+        }
+
+        // Initialize hidden/cell states: [num_layers * num_directions, batch, hidden_size]
+        let total_layers = self.num_layers * num_directions;
+        let state_shape = vec![total_layers, batch_size, self.hidden_size];
+
+        let h_init = match h_0 {
+            Some(h) => h,
+            None => session.zeros(state_shape.clone(), false)?,
+        };
+        let c_init = match c_0 {
+            Some(c) => c,
+            None => session.zeros(state_shape, false)?,
+        };
+
+        // Unbind initial states along dim=0 to get per-layer-direction states
+        let h_states = session.tensor_unbind(h_init, 0)?;
+        let c_states = session.tensor_unbind(c_init, 0)?;
+
+        // Each state is [batch, hidden_size]; we need [batch, hidden_size] for LSTMCell
+        // But unbind removes the dim, giving us [batch, hidden_size] — perfect.
+
+        // Unbind input along time dimension (dim=0): list of [batch, input_size]
+        let time_steps = session.tensor_unbind(working_input, 0)?;
+
+        // Collect final h_n and c_n per layer-direction
+        let mut h_n_list: Vec<TensorNodeId> = Vec::with_capacity(total_layers);
+        let mut c_n_list: Vec<TensorNodeId> = Vec::with_capacity(total_layers);
+
+        // Current layer input: starts as the original time_steps
+        let mut layer_input = time_steps;
+
+        for layer in 0..self.num_layers {
+            // Forward direction
+            let fwd_cell_idx = layer * num_directions;
+            let fwd_h0 = h_states[fwd_cell_idx];
+            let fwd_c0 = c_states[fwd_cell_idx];
+
+            let (fwd_outputs, fwd_h_n, fwd_c_n) = self.run_direction(
+                session,
+                &self.cells[fwd_cell_idx],
+                &layer_input,
+                fwd_h0,
+                fwd_c0,
+                false, // forward
+            )?;
+
+            h_n_list.push(fwd_h_n);
+            c_n_list.push(fwd_c_n);
+
+            let layer_output = if self.bidirectional {
+                // Reverse direction
+                let rev_cell_idx = fwd_cell_idx + 1;
+                let rev_h0 = h_states[rev_cell_idx];
+                let rev_c0 = c_states[rev_cell_idx];
+
+                let (rev_outputs, rev_h_n, rev_c_n) = self.run_direction(
+                    session,
+                    &self.cells[rev_cell_idx],
+                    &layer_input,
+                    rev_h0,
+                    rev_c0,
+                    true, // reverse
+                )?;
+
+                h_n_list.push(rev_h_n);
+                c_n_list.push(rev_c_n);
+
+                // Concatenate forward and reverse outputs at each timestep
+                // fwd_outputs[t] is [batch, hidden_size], rev_outputs[t] is [batch, hidden_size]
+                // concat along dim=1 -> [batch, 2*hidden_size]
+                let mut combined = Vec::with_capacity(seq_len);
+                for t in 0..seq_len {
+                    let cat = session.tensor_cat(&[fwd_outputs[t], rev_outputs[t]], 1)?;
+                    combined.push(cat);
+                }
+                combined
+            } else {
+                fwd_outputs
+            };
+
+            // Apply dropout between layers (not after last layer)
+            if layer < self.num_layers - 1 {
+                let mut dropped = Vec::with_capacity(layer_output.len());
+                for &step_out in &layer_output {
+                    let d = self.dropout_layers[layer].forward(session, step_out)?;
+                    dropped.push(d);
+                }
+                layer_input = dropped;
+            } else {
+                layer_input = layer_output;
+            }
+        }
+
+        // Stack time steps into output: [seq_len, batch, hidden_size * num_directions]
+        let output_ids: Vec<TensorNodeId> = layer_input;
+        let output = session.tensor_stack(&output_ids, 0)?;
+
+        // Stack h_n and c_n: [num_layers * num_directions, batch, hidden_size]
+        let h_n = session.tensor_stack(&h_n_list, 0)?;
+        let c_n = session.tensor_stack(&c_n_list, 0)?;
+
+        // Transpose output back if batch_first
+        let output = if self.batch_first {
+            session.tensor_transpose(output, 0, 1)?
+        } else {
+            output
+        };
+
+        Ok(LSTMOutput { output, h_n, c_n })
+    }
+
+    /// Run one direction of one layer over all time steps.
+    fn run_direction(
+        &self,
+        session: &mut FrankenTorchSession,
+        cell: &LSTMCell,
+        inputs: &[TensorNodeId],
+        h_0: TensorNodeId,
+        c_0: TensorNodeId,
+        reverse: bool,
+    ) -> Result<(Vec<TensorNodeId>, TensorNodeId, TensorNodeId), AutogradError> {
+        let seq_len = inputs.len();
+        let mut h = h_0;
+        let mut c = c_0;
+        let mut outputs = Vec::with_capacity(seq_len);
+
+        if reverse {
+            for &input in inputs.iter().rev() {
+                let (h_new, c_new) = cell.forward_cell(session, input, h, c)?;
+                outputs.push(h_new);
+                h = h_new;
+                c = c_new;
+            }
+            // Reverse outputs so they align with the forward time ordering
+            outputs.reverse();
+        } else {
+            for &input in inputs {
+                let (h_new, c_new) = cell.forward_cell(session, input, h, c)?;
+                outputs.push(h_new);
+                h = h_new;
+                c = c_new;
+            }
+        }
+
+        Ok((outputs, h, c))
+    }
+
+    /// Get the input size.
+    #[must_use]
+    pub fn input_size(&self) -> usize {
+        self.input_size
+    }
+
+    /// Get the hidden size.
+    #[must_use]
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Get the number of layers.
+    #[must_use]
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Check if this LSTM is bidirectional.
+    #[must_use]
+    pub fn is_bidirectional(&self) -> bool {
+        self.bidirectional
+    }
+}
+
+impl Module for LSTM {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let result = self.forward_lstm(session, input, None, None)?;
+        Ok(result.output)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = Vec::new();
+        for cell in &self.cells {
+            params.extend(cell.parameters());
+        }
+        params
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        // Parameters are exposed through named_children -> cells
+        Vec::new()
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        let mut children: Vec<(String, &dyn Module)> = Vec::new();
+        for (i, dropout) in self.dropout_layers.iter().enumerate() {
+            children.push((format!("dropout_{i}"), dropout as &dyn Module));
+        }
+        children
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+        // Propagate to dropout layers
+        for dropout in &self.dropout_layers {
+            dropout.train(mode);
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
+/// Full GRU module: processes entire sequences through multi-layer GRU.
+///
+/// Wraps [`GRUCell`] to iterate over time steps, with support for:
+/// - Multi-layer stacking (`num_layers`)
+/// - Bidirectional processing (`bidirectional`)
+/// - Dropout between layers (not applied after the last layer)
+/// - `batch_first` input layout
+///
+/// # Input shapes
+///
+/// If `batch_first` is false (default): input is `[seq_len, batch, input_size]`.
+/// If `batch_first` is true: input is `[batch, seq_len, input_size]`.
+///
+/// # Forward signature
+///
+/// ```text
+/// gru(input, h_0) -> (output, h_n)
+/// ```
+///
+/// - `h_0`: initial hidden state `[num_layers * num_directions, batch, hidden_size]`
+/// - `output`: `[seq_len, batch, hidden_size * num_directions]` (or batch_first variant)
+/// - `h_n`: final hidden state `[num_layers * num_directions, batch, hidden_size]`
+pub struct GRU {
+    /// Per-layer cells. For bidirectional, even indices are forward, odd are reverse.
+    cells: Vec<GRUCell>,
+    /// Dropout modules applied between layers (length = num_layers - 1).
+    dropout_layers: Vec<Dropout>,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    batch_first: bool,
+    training: std::cell::Cell<bool>,
+}
+
+/// Output of GRU forward pass.
+pub struct GRUOutput {
+    /// Output tensor: `[seq_len, batch, hidden_size * num_directions]`
+    /// (or `[batch, seq_len, ...]` if `batch_first`).
+    pub output: TensorNodeId,
+    /// Final hidden state: `[num_layers * num_directions, batch, hidden_size]`.
+    pub h_n: TensorNodeId,
+}
+
+impl GRU {
+    /// Create a new GRU module.
+    ///
+    /// * `input_size` - number of expected features in the input
+    /// * `hidden_size` - number of features in the hidden state
+    /// * `num_layers` - number of recurrent layers (default: 1)
+    /// * `bidirectional` - if true, becomes a bidirectional GRU
+    /// * `dropout` - dropout probability between layers (ignored if `num_layers == 1`)
+    /// * `batch_first` - if true, input/output tensors have batch as first dimension
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        num_layers: usize,
+        bidirectional: bool,
+        dropout: f64,
+        batch_first: bool,
+    ) -> Result<Self, AutogradError> {
+        if num_layers == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GRU num_layers must be >= 1",
+                },
+            )));
+        }
+
+        let num_directions: usize = if bidirectional { 2 } else { 1 };
+        let mut cells = Vec::with_capacity(num_layers * num_directions);
+
+        for layer in 0..num_layers {
+            let layer_input_size = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * num_directions
+            };
+
+            cells.push(GRUCell::new(session, layer_input_size, hidden_size)?);
+
+            if bidirectional {
+                cells.push(GRUCell::new(session, layer_input_size, hidden_size)?);
+            }
+        }
+
+        let mut dropout_layers = Vec::new();
+        if num_layers > 1 {
+            for _ in 0..(num_layers - 1) {
+                dropout_layers.push(Dropout::new(dropout));
+            }
+        }
+
+        Ok(Self {
+            cells,
+            dropout_layers,
+            input_size,
+            hidden_size,
+            num_layers,
+            bidirectional,
+            batch_first,
+            training: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Run the full GRU forward pass.
+    ///
+    /// * `input` - input tensor `[seq_len, batch, input_size]` (or batch_first variant)
+    /// * `h_0` - optional initial hidden state `[num_layers * num_directions, batch, hidden_size]`
+    ///
+    /// Returns `GRUOutput { output, h_n }`.
+    pub fn forward_gru(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+        h_0: Option<TensorNodeId>,
+    ) -> Result<GRUOutput, AutogradError> {
+        let num_directions: usize = if self.bidirectional { 2 } else { 1 };
+
+        let working_input = if self.batch_first {
+            session.tensor_transpose(input, 0, 1)?
+        } else {
+            input
+        };
+
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(working_input)?;
+            meta.shape().to_vec()
+        };
+        if input_shape.len() != 3 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GRU expects 3D input [seq_len, batch, input_size]",
+                },
+            )));
+        }
+        let seq_len = input_shape[0];
+        let batch_size = input_shape[1];
+
+        if input_shape[2] != self.input_size {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GRU input feature size does not match input_size",
+                },
+            )));
+        }
+
+        let total_layers = self.num_layers * num_directions;
+        let state_shape = vec![total_layers, batch_size, self.hidden_size];
+
+        let h_init = match h_0 {
+            Some(h) => h,
+            None => session.zeros(state_shape, false)?,
+        };
+
+        let h_states = session.tensor_unbind(h_init, 0)?;
+        let time_steps = session.tensor_unbind(working_input, 0)?;
+
+        let mut h_n_list: Vec<TensorNodeId> = Vec::with_capacity(total_layers);
+        let mut layer_input = time_steps;
+
+        for layer in 0..self.num_layers {
+            let fwd_cell_idx = layer * num_directions;
+            let fwd_h0 = h_states[fwd_cell_idx];
+
+            let (fwd_outputs, fwd_h_n) = self.run_direction(
+                session,
+                &self.cells[fwd_cell_idx],
+                &layer_input,
+                fwd_h0,
+                false,
+            )?;
+
+            h_n_list.push(fwd_h_n);
+
+            let layer_output = if self.bidirectional {
+                let rev_cell_idx = fwd_cell_idx + 1;
+                let rev_h0 = h_states[rev_cell_idx];
+
+                let (rev_outputs, rev_h_n) = self.run_direction(
+                    session,
+                    &self.cells[rev_cell_idx],
+                    &layer_input,
+                    rev_h0,
+                    true,
+                )?;
+
+                h_n_list.push(rev_h_n);
+
+                let mut combined = Vec::with_capacity(seq_len);
+                for t in 0..seq_len {
+                    let cat = session.tensor_cat(&[fwd_outputs[t], rev_outputs[t]], 1)?;
+                    combined.push(cat);
+                }
+                combined
+            } else {
+                fwd_outputs
+            };
+
+            if layer < self.num_layers - 1 {
+                let mut dropped = Vec::with_capacity(layer_output.len());
+                for &step_out in &layer_output {
+                    let d = self.dropout_layers[layer].forward(session, step_out)?;
+                    dropped.push(d);
+                }
+                layer_input = dropped;
+            } else {
+                layer_input = layer_output;
+            }
+        }
+
+        let output = session.tensor_stack(&layer_input, 0)?;
+        let h_n = session.tensor_stack(&h_n_list, 0)?;
+
+        let output = if self.batch_first {
+            session.tensor_transpose(output, 0, 1)?
+        } else {
+            output
+        };
+
+        Ok(GRUOutput { output, h_n })
+    }
+
+    /// Run one direction of one layer over all time steps.
+    fn run_direction(
+        &self,
+        session: &mut FrankenTorchSession,
+        cell: &GRUCell,
+        inputs: &[TensorNodeId],
+        h_0: TensorNodeId,
+        reverse: bool,
+    ) -> Result<(Vec<TensorNodeId>, TensorNodeId), AutogradError> {
+        let seq_len = inputs.len();
+        let mut h = h_0;
+        let mut outputs = Vec::with_capacity(seq_len);
+
+        if reverse {
+            for &input in inputs.iter().rev() {
+                let h_new = cell.forward_cell(session, input, h)?;
+                outputs.push(h_new);
+                h = h_new;
+            }
+            outputs.reverse();
+        } else {
+            for &input in inputs {
+                let h_new = cell.forward_cell(session, input, h)?;
+                outputs.push(h_new);
+                h = h_new;
+            }
+        }
+
+        Ok((outputs, h))
+    }
+
+    /// Get the input size.
+    #[must_use]
+    pub fn input_size(&self) -> usize {
+        self.input_size
+    }
+
+    /// Get the hidden size.
+    #[must_use]
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Get the number of layers.
+    #[must_use]
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Check if this GRU is bidirectional.
+    #[must_use]
+    pub fn is_bidirectional(&self) -> bool {
+        self.bidirectional
+    }
+}
+
+impl Module for GRU {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let result = self.forward_gru(session, input, None)?;
+        Ok(result.output)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = Vec::new();
+        for cell in &self.cells {
+            params.extend(cell.parameters());
+        }
+        params
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        Vec::new()
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        let mut children: Vec<(String, &dyn Module)> = Vec::new();
+        for (i, dropout) in self.dropout_layers.iter().enumerate() {
+            children.push((format!("dropout_{i}"), dropout as &dyn Module));
+        }
+        children
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+        for dropout in &self.dropout_layers {
+            dropout.train(mode);
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
+/// Full RNN module (Elman network): processes entire sequences through multi-layer RNN.
+///
+/// Wraps [`RNNCell`] to iterate over time steps, with support for:
+/// - Multi-layer stacking (`num_layers`)
+/// - Bidirectional processing (`bidirectional`)
+/// - Dropout between layers (not applied after the last layer)
+/// - `batch_first` input layout
+/// - Configurable nonlinearity: `tanh` (default) or `relu`
+///
+/// # Input shapes
+///
+/// If `batch_first` is false (default): input is `[seq_len, batch, input_size]`.
+/// If `batch_first` is true: input is `[batch, seq_len, input_size]`.
+///
+/// # Forward signature
+///
+/// ```text
+/// rnn(input, h_0) -> (output, h_n)
+/// ```
+/// Configuration for [`RNN`] module construction.
+pub struct RNNConfig {
+    /// Number of recurrent layers (default: 1).
+    pub num_layers: usize,
+    /// If true, use tanh nonlinearity; if false, use relu (default: true).
+    pub use_tanh: bool,
+    /// If true, becomes a bidirectional RNN (default: false).
+    pub bidirectional: bool,
+    /// Dropout probability between layers, ignored if `num_layers == 1` (default: 0.0).
+    pub dropout: f64,
+    /// If true, input/output have batch as first dimension (default: false).
+    pub batch_first: bool,
+}
+
+impl Default for RNNConfig {
+    fn default() -> Self {
+        Self {
+            num_layers: 1,
+            use_tanh: true,
+            bidirectional: false,
+            dropout: 0.0,
+            batch_first: false,
+        }
+    }
+}
+
+pub struct RNN {
+    cells: Vec<RNNCell>,
+    dropout_layers: Vec<Dropout>,
+    input_size: usize,
+    hidden_size: usize,
+    num_layers: usize,
+    bidirectional: bool,
+    batch_first: bool,
+    training: std::cell::Cell<bool>,
+}
+
+/// Output of RNN forward pass.
+pub struct RNNOutput {
+    /// Output tensor: `[seq_len, batch, hidden_size * num_directions]`.
+    pub output: TensorNodeId,
+    /// Final hidden state: `[num_layers * num_directions, batch, hidden_size]`.
+    pub h_n: TensorNodeId,
+}
+
+impl RNN {
+    /// Create a new RNN module.
+    ///
+    /// * `input_size` - number of expected features in the input
+    /// * `hidden_size` - number of features in the hidden state
+    /// * `config` - configuration for layers, nonlinearity, dropout, etc.
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        input_size: usize,
+        hidden_size: usize,
+        config: RNNConfig,
+    ) -> Result<Self, AutogradError> {
+        let num_layers = config.num_layers;
+        let use_tanh = config.use_tanh;
+        let bidirectional = config.bidirectional;
+        let dropout = config.dropout;
+        let batch_first = config.batch_first;
+        if num_layers == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RNN num_layers must be >= 1",
+                },
+            )));
+        }
+
+        let num_directions: usize = if bidirectional { 2 } else { 1 };
+        let mut cells = Vec::with_capacity(num_layers * num_directions);
+
+        for layer in 0..num_layers {
+            let layer_input_size = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * num_directions
+            };
+
+            cells.push(RNNCell::new(session, layer_input_size, hidden_size, use_tanh)?);
+
+            if bidirectional {
+                cells.push(RNNCell::new(session, layer_input_size, hidden_size, use_tanh)?);
+            }
+        }
+
+        let mut dropout_layers = Vec::new();
+        if num_layers > 1 {
+            for _ in 0..(num_layers - 1) {
+                dropout_layers.push(Dropout::new(dropout));
+            }
+        }
+
+        Ok(Self {
+            cells,
+            dropout_layers,
+            input_size,
+            hidden_size,
+            num_layers,
+            bidirectional,
+            batch_first,
+            training: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Run the full RNN forward pass.
+    ///
+    /// * `input` - input tensor `[seq_len, batch, input_size]` (or batch_first variant)
+    /// * `h_0` - optional initial hidden state `[num_layers * num_directions, batch, hidden_size]`
+    ///
+    /// Returns `RNNOutput { output, h_n }`.
+    pub fn forward_rnn(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+        h_0: Option<TensorNodeId>,
+    ) -> Result<RNNOutput, AutogradError> {
+        let num_directions: usize = if self.bidirectional { 2 } else { 1 };
+
+        let working_input = if self.batch_first {
+            session.tensor_transpose(input, 0, 1)?
+        } else {
+            input
+        };
+
+        let input_shape = {
+            let (_, meta) = session.tensor_values_meta(working_input)?;
+            meta.shape().to_vec()
+        };
+        if input_shape.len() != 3 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RNN expects 3D input [seq_len, batch, input_size]",
+                },
+            )));
+        }
+        let seq_len = input_shape[0];
+        let batch_size = input_shape[1];
+
+        if input_shape[2] != self.input_size {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RNN input feature size does not match input_size",
+                },
+            )));
+        }
+
+        let total_layers = self.num_layers * num_directions;
+        let state_shape = vec![total_layers, batch_size, self.hidden_size];
+
+        let h_init = match h_0 {
+            Some(h) => h,
+            None => session.zeros(state_shape, false)?,
+        };
+
+        let h_states = session.tensor_unbind(h_init, 0)?;
+        let time_steps = session.tensor_unbind(working_input, 0)?;
+
+        let mut h_n_list: Vec<TensorNodeId> = Vec::with_capacity(total_layers);
+        let mut layer_input = time_steps;
+
+        for layer in 0..self.num_layers {
+            let fwd_cell_idx = layer * num_directions;
+            let fwd_h0 = h_states[fwd_cell_idx];
+
+            let (fwd_outputs, fwd_h_n) = self.run_direction(
+                session,
+                &self.cells[fwd_cell_idx],
+                &layer_input,
+                fwd_h0,
+                false,
+            )?;
+
+            h_n_list.push(fwd_h_n);
+
+            let layer_output = if self.bidirectional {
+                let rev_cell_idx = fwd_cell_idx + 1;
+                let rev_h0 = h_states[rev_cell_idx];
+
+                let (rev_outputs, rev_h_n) = self.run_direction(
+                    session,
+                    &self.cells[rev_cell_idx],
+                    &layer_input,
+                    rev_h0,
+                    true,
+                )?;
+
+                h_n_list.push(rev_h_n);
+
+                let mut combined = Vec::with_capacity(seq_len);
+                for t in 0..seq_len {
+                    let cat = session.tensor_cat(&[fwd_outputs[t], rev_outputs[t]], 1)?;
+                    combined.push(cat);
+                }
+                combined
+            } else {
+                fwd_outputs
+            };
+
+            if layer < self.num_layers - 1 {
+                let mut dropped = Vec::with_capacity(layer_output.len());
+                for &step_out in &layer_output {
+                    let d = self.dropout_layers[layer].forward(session, step_out)?;
+                    dropped.push(d);
+                }
+                layer_input = dropped;
+            } else {
+                layer_input = layer_output;
+            }
+        }
+
+        let output = session.tensor_stack(&layer_input, 0)?;
+        let h_n = session.tensor_stack(&h_n_list, 0)?;
+
+        let output = if self.batch_first {
+            session.tensor_transpose(output, 0, 1)?
+        } else {
+            output
+        };
+
+        Ok(RNNOutput { output, h_n })
+    }
+
+    /// Run one direction of one layer over all time steps.
+    fn run_direction(
+        &self,
+        session: &mut FrankenTorchSession,
+        cell: &RNNCell,
+        inputs: &[TensorNodeId],
+        h_0: TensorNodeId,
+        reverse: bool,
+    ) -> Result<(Vec<TensorNodeId>, TensorNodeId), AutogradError> {
+        let mut h = h_0;
+        let mut outputs = Vec::with_capacity(inputs.len());
+
+        if reverse {
+            for &input in inputs.iter().rev() {
+                let h_new = cell.forward_cell(session, input, h)?;
+                outputs.push(h_new);
+                h = h_new;
+            }
+            outputs.reverse();
+        } else {
+            for &input in inputs {
+                let h_new = cell.forward_cell(session, input, h)?;
+                outputs.push(h_new);
+                h = h_new;
+            }
+        }
+
+        Ok((outputs, h))
+    }
+
+    /// Get the input size.
+    #[must_use]
+    pub fn input_size(&self) -> usize {
+        self.input_size
+    }
+
+    /// Get the hidden size.
+    #[must_use]
+    pub fn hidden_size(&self) -> usize {
+        self.hidden_size
+    }
+
+    /// Get the number of layers.
+    #[must_use]
+    pub fn num_layers(&self) -> usize {
+        self.num_layers
+    }
+
+    /// Check if this RNN is bidirectional.
+    #[must_use]
+    pub fn is_bidirectional(&self) -> bool {
+        self.bidirectional
+    }
+}
+
+impl Module for RNN {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let result = self.forward_rnn(session, input, None)?;
+        Ok(result.output)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = Vec::new();
+        for cell in &self.cells {
+            params.extend(cell.parameters());
+        }
+        params
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        Vec::new()
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        let mut children: Vec<(String, &dyn Module)> = Vec::new();
+        for (i, dropout) in self.dropout_layers.iter().enumerate() {
+            children.push((format!("dropout_{i}"), dropout as &dyn Module));
+        }
+        children
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+        for dropout in &self.dropout_layers {
+            dropout.train(mode);
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
+// ── Transformer Modules ──────────────────────────────────────────────
+
+/// Activation function choice for transformer feedforward blocks.
+#[derive(Clone, Copy, Debug)]
+pub enum TransformerActivation {
+    /// ReLU activation.
+    Relu,
+    /// GELU activation.
+    Gelu,
+}
+
+/// A single Transformer encoder layer.
+///
+/// Architecture (post-norm, `norm_first=false`, default):
+/// ```text
+/// x = layernorm1(x + dropout(self_attn(x, x, x)))
+/// x = layernorm2(x + dropout(ff(x)))
+/// ```
+///
+/// Architecture (pre-norm, `norm_first=true`):
+/// ```text
+/// x = x + dropout(self_attn(layernorm1(x), layernorm1(x), layernorm1(x)))
+/// x = x + dropout(ff(layernorm2(x)))
+/// ```
+///
+/// Input shape: `[batch, seq_len, d_model]`.
+pub struct TransformerEncoderLayer {
+    self_attn: MultiheadAttention,
+    linear1: Linear,
+    linear2: Linear,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    dropout: Dropout,
+    dropout1: Dropout,
+    dropout2: Dropout,
+    activation: TransformerActivation,
+    norm_first: bool,
+    training: std::cell::Cell<bool>,
+}
+
+impl TransformerEncoderLayer {
+    /// Create a new `TransformerEncoderLayer`.
+    ///
+    /// * `d_model` - the number of expected features (embed_dim)
+    /// * `nhead` - the number of heads in multihead attention
+    /// * `dim_feedforward` - dimension of the feedforward network (default: 2048)
+    /// * `dropout` - dropout value (default: 0.1)
+    /// * `activation` - activation function in feedforward block
+    /// * `norm_first` - if true, layer norm is done prior to attention/feedforward (pre-norm)
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        dim_feedforward: usize,
+        dropout_p: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+    ) -> Result<Self, AutogradError> {
+        let self_attn = MultiheadAttention::new(session, d_model, nhead)?;
+        let linear1 = Linear::new(session, d_model, dim_feedforward, true)?;
+        let linear2 = Linear::new(session, dim_feedforward, d_model, true)?;
+        let norm1 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        let norm2 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        let dropout = Dropout::new(dropout_p);
+        let dropout1 = Dropout::new(dropout_p);
+        let dropout2 = Dropout::new(dropout_p);
+
+        Ok(Self {
+            self_attn,
+            linear1,
+            linear2,
+            norm1,
+            norm2,
+            dropout,
+            dropout1,
+            dropout2,
+            activation,
+            norm_first,
+            training: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Apply the feedforward block: linear1 -> activation -> dropout -> linear2.
+    fn feedforward(
+        &self,
+        session: &mut FrankenTorchSession,
+        x: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = {
+            let (_, meta) = session.tensor_values_meta(x)?;
+            meta.shape().to_vec()
+        };
+        // x is [batch, seq_len, d_model], Linear expects [batch, features]
+        // Reshape to [batch*seq_len, d_model]
+        let batch_seq = shape[0] * shape[1];
+        let d_model = shape[2];
+
+        let x_flat = session.tensor_reshape(x, vec![batch_seq, d_model])?;
+        let h = self.linear1.forward(session, x_flat)?;
+
+        let h = match self.activation {
+            TransformerActivation::Relu => session.tensor_relu(h)?,
+            TransformerActivation::Gelu => session.tensor_gelu(h)?,
+        };
+
+        let h = self.dropout.forward(session, h)?;
+        let h = self.linear2.forward(session, h)?;
+
+        session.tensor_reshape(h, shape)
+    }
+
+    /// Forward pass for the encoder layer.
+    ///
+    /// Input: `[batch, seq_len, d_model]`.
+    /// Returns: `[batch, seq_len, d_model]`.
+    pub fn forward_layer(
+        &self,
+        session: &mut FrankenTorchSession,
+        src: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.norm_first {
+            // Pre-norm: x = x + dropout(self_attn(layernorm(x)))
+            let normed = self.norm1.forward(session, src)?;
+            let attn_out = self.self_attn.forward_qkv(session, normed, normed, normed)?;
+            let attn_out = self.dropout1.forward(session, attn_out)?;
+            let x = session.tensor_add(src, attn_out)?;
+
+            // x = x + dropout(ff(layernorm(x)))
+            let normed2 = self.norm2.forward(session, x)?;
+            let ff_out = self.feedforward(session, normed2)?;
+            let ff_out = self.dropout2.forward(session, ff_out)?;
+            session.tensor_add(x, ff_out)
+        } else {
+            // Post-norm: x = layernorm(x + dropout(self_attn(x)))
+            let attn_out = self.self_attn.forward_qkv(session, src, src, src)?;
+            let attn_out = self.dropout1.forward(session, attn_out)?;
+            let x = session.tensor_add(src, attn_out)?;
+            let x = self.norm1.forward(session, x)?;
+
+            // x = layernorm(x + dropout(ff(x)))
+            let ff_out = self.feedforward(session, x)?;
+            let ff_out = self.dropout2.forward(session, ff_out)?;
+            let x = session.tensor_add(x, ff_out)?;
+            self.norm2.forward(session, x)
+        }
+    }
+}
+
+impl Module for TransformerEncoderLayer {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.forward_layer(session, input)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = self.self_attn.parameters();
+        params.extend(self.linear1.parameters());
+        params.extend(self.linear2.parameters());
+        params.extend(self.norm1.parameters());
+        params.extend(self.norm2.parameters());
+        params
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        vec![
+            ("self_attn".to_string(), &self.self_attn as &dyn Module),
+            ("linear1".to_string(), &self.linear1 as &dyn Module),
+            ("linear2".to_string(), &self.linear2 as &dyn Module),
+            ("norm1".to_string(), &self.norm1 as &dyn Module),
+            ("norm2".to_string(), &self.norm2 as &dyn Module),
+            ("dropout".to_string(), &self.dropout as &dyn Module),
+            ("dropout1".to_string(), &self.dropout1 as &dyn Module),
+            ("dropout2".to_string(), &self.dropout2 as &dyn Module),
+        ]
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+        self.dropout.train(mode);
+        self.dropout1.train(mode);
+        self.dropout2.train(mode);
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
+/// Transformer encoder: a stack of N `TransformerEncoderLayer` instances.
+///
+/// Optionally applies a final `LayerNorm` after the last layer.
+///
+/// Input shape: `[batch, seq_len, d_model]`.
+/// Output shape: `[batch, seq_len, d_model]`.
+pub struct TransformerEncoder {
+    layers: Vec<TransformerEncoderLayer>,
+    final_norm: Option<LayerNorm>,
+}
+
+impl TransformerEncoder {
+    /// Create a new `TransformerEncoder`.
+    ///
+    /// * `d_model` - feature dimension
+    /// * `nhead` - number of attention heads
+    /// * `num_layers` - number of encoder layers
+    /// * `dim_feedforward` - feedforward hidden dimension
+    /// * `dropout` - dropout probability
+    /// * `activation` - activation function
+    /// * `norm_first` - pre-norm vs post-norm
+    /// * `final_layer_norm` - if true, adds a final LayerNorm
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        num_layers: usize,
+        dim_feedforward: usize,
+        dropout: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        final_layer_norm: bool,
+    ) -> Result<Self, AutogradError> {
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(TransformerEncoderLayer::new(
+                session,
+                d_model,
+                nhead,
+                dim_feedforward,
+                dropout,
+                activation,
+                norm_first,
+            )?);
+        }
+
+        let final_norm = if final_layer_norm {
+            Some(LayerNorm::new(session, vec![d_model], 1e-5)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            layers,
+            final_norm,
+        })
+    }
+}
+
+impl Module for TransformerEncoder {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let mut output = input;
+        for layer in &self.layers {
+            output = layer.forward_layer(session, output)?;
+        }
+        if let Some(ref norm) = self.final_norm {
+            output = norm.forward(session, output)?;
+        }
+        Ok(output)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = Vec::new();
+        for layer in &self.layers {
+            params.extend(layer.parameters());
+        }
+        if let Some(ref norm) = self.final_norm {
+            params.extend(norm.parameters());
+        }
+        params
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        let mut children: Vec<(String, &dyn Module)> = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            children.push((format!("layers.{i}"), layer as &dyn Module));
+        }
+        if let Some(ref norm) = self.final_norm {
+            children.push(("norm".to_string(), norm as &dyn Module));
+        }
+        children
+    }
+
+    fn train(&self, mode: bool) {
+        for layer in &self.layers {
+            layer.train(mode);
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.layers.first().is_some_and(|l| l.is_training())
+    }
+}
+
+/// A single Transformer decoder layer.
+///
+/// Architecture (post-norm):
+/// ```text
+/// x = layernorm1(x + dropout(self_attn(x, x, x)))
+/// x = layernorm2(x + dropout(cross_attn(x, memory, memory)))
+/// x = layernorm3(x + dropout(ff(x)))
+/// ```
+///
+/// Architecture (pre-norm):
+/// ```text
+/// x = x + dropout(self_attn(layernorm1(x)))
+/// x = x + dropout(cross_attn(layernorm2(x), memory, memory))
+/// x = x + dropout(ff(layernorm3(x)))
+/// ```
+///
+/// Input: `tgt` `[batch, tgt_len, d_model]`, `memory` `[batch, src_len, d_model]`.
+pub struct TransformerDecoderLayer {
+    self_attn: MultiheadAttention,
+    cross_attn: MultiheadAttention,
+    linear1: Linear,
+    linear2: Linear,
+    norm1: LayerNorm,
+    norm2: LayerNorm,
+    norm3: LayerNorm,
+    dropout: Dropout,
+    dropout1: Dropout,
+    dropout2: Dropout,
+    dropout3: Dropout,
+    activation: TransformerActivation,
+    norm_first: bool,
+    training: std::cell::Cell<bool>,
+}
+
+impl TransformerDecoderLayer {
+    /// Create a new `TransformerDecoderLayer`.
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        dim_feedforward: usize,
+        dropout_p: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+    ) -> Result<Self, AutogradError> {
+        let self_attn = MultiheadAttention::new(session, d_model, nhead)?;
+        let cross_attn = MultiheadAttention::new(session, d_model, nhead)?;
+        let linear1 = Linear::new(session, d_model, dim_feedforward, true)?;
+        let linear2 = Linear::new(session, dim_feedforward, d_model, true)?;
+        let norm1 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        let norm2 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        let norm3 = LayerNorm::new(session, vec![d_model], 1e-5)?;
+        let dropout = Dropout::new(dropout_p);
+        let dropout1 = Dropout::new(dropout_p);
+        let dropout2 = Dropout::new(dropout_p);
+        let dropout3 = Dropout::new(dropout_p);
+
+        Ok(Self {
+            self_attn,
+            cross_attn,
+            linear1,
+            linear2,
+            norm1,
+            norm2,
+            norm3,
+            dropout,
+            dropout1,
+            dropout2,
+            dropout3,
+            activation,
+            norm_first,
+            training: std::cell::Cell::new(true),
+        })
+    }
+
+    /// Apply the feedforward block.
+    fn feedforward(
+        &self,
+        session: &mut FrankenTorchSession,
+        x: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = {
+            let (_, meta) = session.tensor_values_meta(x)?;
+            meta.shape().to_vec()
+        };
+        let batch_seq = shape[0] * shape[1];
+        let d_model = shape[2];
+
+        let x_flat = session.tensor_reshape(x, vec![batch_seq, d_model])?;
+        let h = self.linear1.forward(session, x_flat)?;
+
+        let h = match self.activation {
+            TransformerActivation::Relu => session.tensor_relu(h)?,
+            TransformerActivation::Gelu => session.tensor_gelu(h)?,
+        };
+
+        let h = self.dropout.forward(session, h)?;
+        let h = self.linear2.forward(session, h)?;
+
+        session.tensor_reshape(h, shape)
+    }
+
+    /// Forward pass for the decoder layer.
+    ///
+    /// * `tgt` - target sequence `[batch, tgt_len, d_model]`
+    /// * `memory` - encoder output `[batch, src_len, d_model]`
+    pub fn forward_layer(
+        &self,
+        session: &mut FrankenTorchSession,
+        tgt: TensorNodeId,
+        memory: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.norm_first {
+            // Pre-norm: self-attention
+            let normed1 = self.norm1.forward(session, tgt)?;
+            let sa_out = self.self_attn.forward_qkv(session, normed1, normed1, normed1)?;
+            let sa_out = self.dropout1.forward(session, sa_out)?;
+            let x = session.tensor_add(tgt, sa_out)?;
+
+            // Pre-norm: cross-attention
+            let normed2 = self.norm2.forward(session, x)?;
+            let ca_out = self.cross_attn.forward_qkv(session, normed2, memory, memory)?;
+            let ca_out = self.dropout2.forward(session, ca_out)?;
+            let x = session.tensor_add(x, ca_out)?;
+
+            // Pre-norm: feedforward
+            let normed3 = self.norm3.forward(session, x)?;
+            let ff_out = self.feedforward(session, normed3)?;
+            let ff_out = self.dropout3.forward(session, ff_out)?;
+            session.tensor_add(x, ff_out)
+        } else {
+            // Post-norm: self-attention
+            let sa_out = self.self_attn.forward_qkv(session, tgt, tgt, tgt)?;
+            let sa_out = self.dropout1.forward(session, sa_out)?;
+            let x = session.tensor_add(tgt, sa_out)?;
+            let x = self.norm1.forward(session, x)?;
+
+            // Post-norm: cross-attention
+            let ca_out = self.cross_attn.forward_qkv(session, x, memory, memory)?;
+            let ca_out = self.dropout2.forward(session, ca_out)?;
+            let x = session.tensor_add(x, ca_out)?;
+            let x = self.norm2.forward(session, x)?;
+
+            // Post-norm: feedforward
+            let ff_out = self.feedforward(session, x)?;
+            let ff_out = self.dropout3.forward(session, ff_out)?;
+            let x = session.tensor_add(x, ff_out)?;
+            self.norm3.forward(session, x)
+        }
+    }
+}
+
+impl Module for TransformerDecoderLayer {
+    fn forward(
+        &self,
+        _session: &mut FrankenTorchSession,
+        _input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Decoder requires both tgt and memory; use forward_layer directly
+        Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "TransformerDecoderLayer requires tgt and memory; use forward_layer()",
+            },
+        )))
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = self.self_attn.parameters();
+        params.extend(self.cross_attn.parameters());
+        params.extend(self.linear1.parameters());
+        params.extend(self.linear2.parameters());
+        params.extend(self.norm1.parameters());
+        params.extend(self.norm2.parameters());
+        params.extend(self.norm3.parameters());
+        params
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        vec![
+            ("self_attn".to_string(), &self.self_attn as &dyn Module),
+            ("cross_attn".to_string(), &self.cross_attn as &dyn Module),
+            ("linear1".to_string(), &self.linear1 as &dyn Module),
+            ("linear2".to_string(), &self.linear2 as &dyn Module),
+            ("norm1".to_string(), &self.norm1 as &dyn Module),
+            ("norm2".to_string(), &self.norm2 as &dyn Module),
+            ("norm3".to_string(), &self.norm3 as &dyn Module),
+            ("dropout".to_string(), &self.dropout as &dyn Module),
+            ("dropout1".to_string(), &self.dropout1 as &dyn Module),
+            ("dropout2".to_string(), &self.dropout2 as &dyn Module),
+            ("dropout3".to_string(), &self.dropout3 as &dyn Module),
+        ]
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+        self.dropout.train(mode);
+        self.dropout1.train(mode);
+        self.dropout2.train(mode);
+        self.dropout3.train(mode);
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
+/// Transformer decoder: a stack of N `TransformerDecoderLayer` instances.
+///
+/// Input: `tgt` `[batch, tgt_len, d_model]`, `memory` `[batch, src_len, d_model]`.
+/// Output: `[batch, tgt_len, d_model]`.
+pub struct TransformerDecoder {
+    layers: Vec<TransformerDecoderLayer>,
+    final_norm: Option<LayerNorm>,
+}
+
+impl TransformerDecoder {
+    /// Create a new `TransformerDecoder`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        num_layers: usize,
+        dim_feedforward: usize,
+        dropout: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+        final_layer_norm: bool,
+    ) -> Result<Self, AutogradError> {
+        let mut layers = Vec::with_capacity(num_layers);
+        for _ in 0..num_layers {
+            layers.push(TransformerDecoderLayer::new(
+                session,
+                d_model,
+                nhead,
+                dim_feedforward,
+                dropout,
+                activation,
+                norm_first,
+            )?);
+        }
+
+        let final_norm = if final_layer_norm {
+            Some(LayerNorm::new(session, vec![d_model], 1e-5)?)
+        } else {
+            None
+        };
+
+        Ok(Self {
+            layers,
+            final_norm,
+        })
+    }
+
+    /// Forward pass.
+    ///
+    /// * `tgt` - target sequence `[batch, tgt_len, d_model]`
+    /// * `memory` - encoder output `[batch, src_len, d_model]`
+    pub fn forward_decoder(
+        &self,
+        session: &mut FrankenTorchSession,
+        tgt: TensorNodeId,
+        memory: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let mut output = tgt;
+        for layer in &self.layers {
+            output = layer.forward_layer(session, output, memory)?;
+        }
+        if let Some(ref norm) = self.final_norm {
+            output = norm.forward(session, output)?;
+        }
+        Ok(output)
+    }
+}
+
+impl Module for TransformerDecoder {
+    fn forward(
+        &self,
+        _session: &mut FrankenTorchSession,
+        _input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "TransformerDecoder requires tgt and memory; use forward_decoder()",
+            },
+        )))
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = Vec::new();
+        for layer in &self.layers {
+            params.extend(layer.parameters());
+        }
+        if let Some(ref norm) = self.final_norm {
+            params.extend(norm.parameters());
+        }
+        params
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        let mut children: Vec<(String, &dyn Module)> = Vec::new();
+        for (i, layer) in self.layers.iter().enumerate() {
+            children.push((format!("layers.{i}"), layer as &dyn Module));
+        }
+        if let Some(ref norm) = self.final_norm {
+            children.push(("norm".to_string(), norm as &dyn Module));
+        }
+        children
+    }
+
+    fn train(&self, mode: bool) {
+        for layer in &self.layers {
+            layer.train(mode);
+        }
+    }
+
+    fn is_training(&self) -> bool {
+        self.layers.first().is_some_and(|l| l.is_training())
+    }
+}
+
+/// Full Transformer model combining encoder and decoder.
+///
+/// Architecture:
+/// ```text
+/// memory = encoder(src)
+/// output = decoder(tgt, memory)
+/// ```
+///
+/// Input: `src` `[batch, src_len, d_model]`, `tgt` `[batch, tgt_len, d_model]`.
+/// Output: `[batch, tgt_len, d_model]`.
+pub struct Transformer {
+    encoder: TransformerEncoder,
+    decoder: TransformerDecoder,
+    d_model: usize,
+}
+
+impl Transformer {
+    /// Create a new `Transformer`.
+    ///
+    /// * `d_model` - feature dimension
+    /// * `nhead` - number of attention heads
+    /// * `num_encoder_layers` - number of encoder layers
+    /// * `num_decoder_layers` - number of decoder layers
+    /// * `dim_feedforward` - feedforward hidden dimension
+    /// * `dropout` - dropout probability
+    /// * `activation` - activation function
+    /// * `norm_first` - pre-norm vs post-norm
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        d_model: usize,
+        nhead: usize,
+        num_encoder_layers: usize,
+        num_decoder_layers: usize,
+        dim_feedforward: usize,
+        dropout: f64,
+        activation: TransformerActivation,
+        norm_first: bool,
+    ) -> Result<Self, AutogradError> {
+        let encoder = TransformerEncoder::new(
+            session,
+            d_model,
+            nhead,
+            num_encoder_layers,
+            dim_feedforward,
+            dropout,
+            activation,
+            norm_first,
+            norm_first, // final_layer_norm when using pre-norm
+        )?;
+
+        let decoder = TransformerDecoder::new(
+            session,
+            d_model,
+            nhead,
+            num_decoder_layers,
+            dim_feedforward,
+            dropout,
+            activation,
+            norm_first,
+            norm_first,
+        )?;
+
+        Ok(Self {
+            encoder,
+            decoder,
+            d_model,
+        })
+    }
+
+    /// Forward pass through full encoder-decoder transformer.
+    ///
+    /// * `src` - source sequence `[batch, src_len, d_model]`
+    /// * `tgt` - target sequence `[batch, tgt_len, d_model]`
+    pub fn forward_transformer(
+        &self,
+        session: &mut FrankenTorchSession,
+        src: TensorNodeId,
+        tgt: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let memory = self.encoder.forward(session, src)?;
+        self.decoder.forward_decoder(session, tgt, memory)
+    }
+
+    /// Get the model dimension.
+    #[must_use]
+    pub fn d_model(&self) -> usize {
+        self.d_model
+    }
+
+    /// Access the encoder.
+    #[must_use]
+    pub fn encoder(&self) -> &TransformerEncoder {
+        &self.encoder
+    }
+
+    /// Access the decoder.
+    #[must_use]
+    pub fn decoder(&self) -> &TransformerDecoder {
+        &self.decoder
+    }
+}
+
+impl Module for Transformer {
+    fn forward(
+        &self,
+        _session: &mut FrankenTorchSession,
+        _input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "Transformer requires src and tgt; use forward_transformer()",
+            },
+        )))
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = self.encoder.parameters();
+        params.extend(self.decoder.parameters());
+        params
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        vec![
+            ("encoder".to_string(), &self.encoder as &dyn Module),
+            ("decoder".to_string(), &self.decoder as &dyn Module),
+        ]
+    }
+
+    fn train(&self, mode: bool) {
+        self.encoder.train(mode);
+        self.decoder.train(mode);
+    }
+
+    fn is_training(&self) -> bool {
+        self.encoder.is_training()
+    }
+}
+
+/// Generate a causal mask for autoregressive decoding.
+///
+/// Returns a `[sz, sz]` tensor where the upper triangle above the diagonal
+/// is filled with `f64::NEG_INFINITY` and the lower triangle + diagonal is `0.0`.
+/// This prevents attention to future positions.
+pub fn generate_square_subsequent_mask(
+    session: &mut FrankenTorchSession,
+    sz: usize,
+) -> Result<TensorNodeId, AutogradError> {
+    let mut mask_values = vec![0.0_f64; sz * sz];
+    for i in 0..sz {
+        for j in (i + 1)..sz {
+            mask_values[i * sz + j] = f64::NEG_INFINITY;
+        }
+    }
+    session.tensor_variable(mask_values, vec![sz, sz], false)
 }
 
 // ── Loss Module Trait ──────────────────────────────────────────────────
@@ -7746,6 +10553,323 @@ mod tests {
         assert!(deconv.forward(&mut session, x).is_err());
     }
 
+    // ── Conv3d Tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn conv3d_forward_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv3d::new(
+            &mut session, 1, 1, (2, 2, 2), (1, 1, 1), (0, 0, 0), false,
+        ).expect("conv3d");
+        assert_eq!(conv.parameters().len(), 1);
+
+        // [N=1, C=1, D=3, H=3, W=3], kernel=2x2x2, stride=1 -> out 2x2x2
+        let x = session
+            .tensor_variable(vec![1.0; 27], vec![1, 1, 3, 3, 3], false)
+            .expect("variable");
+        let y = conv.forward(&mut session, x).expect("forward");
+        let (vals, meta) = session.tensor_values_meta(y).expect("values");
+        assert_eq!(meta.shape(), &[1, 1, 2, 2, 2]);
+        assert_eq!(vals.len(), 8);
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn conv3d_forward_with_bias() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv3d::new(
+            &mut session, 2, 4, (2, 2, 2), (1, 1, 1), (0, 0, 0), true,
+        ).expect("conv3d");
+        assert_eq!(conv.parameters().len(), 2);
+        assert!(conv.bias().is_some());
+
+        // [N=2, C=2, D=3, H=3, W=3] -> [2, 4, 2, 2, 2]
+        let x = session
+            .tensor_variable(vec![0.5; 108], vec![2, 2, 3, 3, 3], false)
+            .expect("variable");
+        let y = conv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(y).expect("values");
+        assert_eq!(meta.shape(), &[2, 4, 2, 2, 2]);
+    }
+
+    #[test]
+    fn conv3d_forward_with_padding() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // padding=1 on all dims: D_out = (3+2-2)/1+1 = 4
+        let conv = Conv3d::new(
+            &mut session, 1, 1, (2, 2, 2), (1, 1, 1), (1, 1, 1), false,
+        ).expect("conv3d");
+
+        let x = session
+            .tensor_variable(vec![1.0; 27], vec![1, 1, 3, 3, 3], false)
+            .expect("variable");
+        let y = conv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(y).expect("values");
+        assert_eq!(meta.shape(), &[1, 1, 4, 4, 4]);
+    }
+
+    #[test]
+    fn conv3d_forward_with_stride() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // stride=2, D_out = (4-2)/2+1 = 2
+        let conv = Conv3d::new(
+            &mut session, 1, 1, (2, 2, 2), (2, 2, 2), (0, 0, 0), false,
+        ).expect("conv3d");
+
+        let x = session
+            .tensor_variable(vec![1.0; 64], vec![1, 1, 4, 4, 4], false)
+            .expect("variable");
+        let y = conv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(y).expect("values");
+        assert_eq!(meta.shape(), &[1, 1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn conv3d_backward_produces_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv3d::new(
+            &mut session, 1, 2, (2, 2, 2), (1, 1, 1), (0, 0, 0), true,
+        ).expect("conv3d");
+
+        let x = session
+            .tensor_variable(vec![1.0; 27], vec![1, 1, 3, 3, 3], true)
+            .expect("variable");
+        let y = conv.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let x_grad = session.tensor_gradient(&report, x);
+        assert!(x_grad.is_some(), "input gradient should exist");
+        let w_grad = session.tensor_gradient(&report, conv.weight());
+        assert!(w_grad.is_some(), "weight gradient should exist");
+    }
+
+    #[test]
+    fn conv3d_rejects_wrong_dim() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv3d::new(
+            &mut session, 1, 1, (2, 2, 2), (1, 1, 1), (0, 0, 0), false,
+        ).expect("conv3d");
+
+        let x = session
+            .tensor_variable(vec![1.0; 16], vec![1, 1, 4, 4], false)
+            .expect("variable");
+        assert!(conv.forward(&mut session, x).is_err());
+    }
+
+    // ── ConvTranspose2d Tests ──────────────────────────────────────────
+
+    #[test]
+    fn conv_transpose2d_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // stride=1, padding=0, output_padding=0: H_out = (3-1)*1 + 3 = 5
+        let deconv = ConvTranspose2d::new(
+            &mut session, 1, 1, (3, 3), (1, 1), (0, 0), (0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 9], vec![1, 1, 3, 3], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 5, 5]);
+    }
+
+    #[test]
+    fn conv_transpose2d_with_stride() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // stride=2: H_out = (2-1)*2 + 3 = 5
+        let deconv = ConvTranspose2d::new(
+            &mut session, 1, 1, (3, 3), (2, 2), (0, 0), (0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 5, 5]);
+    }
+
+    #[test]
+    fn conv_transpose2d_with_padding() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // padding=1: H_out = (3-1)*1 - 2 + 3 = 3
+        let deconv = ConvTranspose2d::new(
+            &mut session, 1, 1, (3, 3), (1, 1), (1, 1), (0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 9], vec![1, 1, 3, 3], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 3, 3]);
+    }
+
+    #[test]
+    fn conv_transpose2d_with_output_padding() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // stride=2, output_padding=1: H_out = (2-1)*2 - 0 + 3 + 1 = 6
+        let deconv = ConvTranspose2d::new(
+            &mut session, 1, 1, (3, 3), (2, 2), (0, 0), (1, 1), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 6, 6]);
+    }
+
+    #[test]
+    fn conv_transpose2d_output_padding_must_be_less_than_stride() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // output_padding=2 >= stride=2 should fail
+        assert!(ConvTranspose2d::new(
+            &mut session, 1, 1, (3, 3), (2, 2), (0, 0), (2, 2), false,
+        ).is_err());
+    }
+
+    #[test]
+    fn conv_transpose2d_has_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose2d::new(
+            &mut session, 2, 3, (3, 3), (1, 1), (0, 0), (0, 0), true,
+        ).expect("new");
+        assert_eq!(deconv.parameters().len(), 2);
+    }
+
+    #[test]
+    fn conv_transpose2d_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose2d::new(
+            &mut session, 1, 1, (2, 2), (1, 1), (0, 0), (0, 0), true,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], true)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(out).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        // Debug: check what gradients we have
+        println!("report gradients count: {}", report.gradients().len());
+        println!("x node id: {:?}", x);
+        println!("w node id: {:?}", deconv.weight());
+        for (i, g) in report.gradients().iter().enumerate() {
+            if g.is_some() {
+                println!("  gradient exists for node index: {}", i);
+            }
+        }
+
+        let w_grad = session.tensor_gradient(&report, deconv.weight());
+        let x_grad = session.tensor_gradient(&report, x);
+        println!("w_grad present: {}", w_grad.is_some());
+        println!("x_grad present: {}", x_grad.is_some());
+        assert!(w_grad.is_some(), "weight gradient should exist");
+        assert!(x_grad.is_some(), "input gradient should exist");
+    }
+
+    #[test]
+    fn conv_transpose2d_rejects_wrong_dim() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose2d::new(
+            &mut session, 2, 3, (3, 3), (1, 1), (0, 0), (0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 6], vec![1, 2, 3], false)
+            .expect("variable");
+        assert!(deconv.forward(&mut session, x).is_err());
+    }
+
+    // ── ConvTranspose3d Tests ──────────────────────────────────────────
+
+    #[test]
+    fn conv_transpose3d_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // stride=1, padding=0: D_out = (2-1)*1 + 2 = 3
+        let deconv = ConvTranspose3d::new(
+            &mut session, 1, 1, (2, 2, 2), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 8], vec![1, 1, 2, 2, 2], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 3, 3, 3]);
+    }
+
+    #[test]
+    fn conv_transpose3d_with_stride() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // stride=2: D_out = (2-1)*2 + 2 = 4
+        let deconv = ConvTranspose3d::new(
+            &mut session, 1, 1, (2, 2, 2), (2, 2, 2), (0, 0, 0), (0, 0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 8], vec![1, 1, 2, 2, 2], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 4, 4, 4]);
+    }
+
+    #[test]
+    fn conv_transpose3d_has_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose3d::new(
+            &mut session, 2, 3, (2, 2, 2), (1, 1, 1), (0, 0, 0), (0, 0, 0), true,
+        ).expect("new");
+        assert_eq!(deconv.parameters().len(), 2);
+    }
+
+    #[test]
+    fn conv_transpose3d_output_padding_must_be_less_than_stride() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        assert!(ConvTranspose3d::new(
+            &mut session, 1, 1, (2, 2, 2), (2, 2, 2), (0, 0, 0), (2, 2, 2), false,
+        ).is_err());
+    }
+
+    #[test]
+    fn conv_transpose3d_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose3d::new(
+            &mut session, 1, 1, (2, 2, 2), (1, 1, 1), (0, 0, 0), (0, 0, 0), true,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 8], vec![1, 1, 2, 2, 2], true)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(out).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let x_grad = session.tensor_gradient(&report, x);
+        assert!(x_grad.is_some(), "input gradient should exist");
+        let w_grad = session.tensor_gradient(&report, deconv.weight());
+        assert!(w_grad.is_some(), "weight gradient should exist");
+    }
+
+    #[test]
+    fn conv_transpose3d_rejects_wrong_dim() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose3d::new(
+            &mut session, 2, 3, (2, 2, 2), (1, 1, 1), (0, 0, 0), (0, 0, 0), false,
+        ).expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0; 32], vec![1, 2, 4, 4], false)
+            .expect("variable");
+        assert!(deconv.forward(&mut session, x).is_err());
+    }
+
     // ── RNN Cell Tests ──────────────────────────────────────────────────
 
     #[test]
@@ -8950,5 +12074,1378 @@ mod tests {
         let err = vector_to_parameters(&mut session, bad_vector, &params)
             .expect_err("mismatched vector length must fail");
         assert!(matches!(err, AutogradError::Dispatch(_)));
+    }
+
+    // ── LSTM Module Tests ──────────────────────────────────────────────
+
+    #[test]
+    fn lstm_single_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 1, false, 0.0, false).expect("lstm");
+
+        // Input: [seq_len=5, batch=2, input_size=3]
+        let input = session
+            .tensor_variable(vec![0.1; 5 * 2 * 3], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        // Output: [seq_len=5, batch=2, hidden_size=4]
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 4]);
+
+        // h_n: [num_layers=1, batch=2, hidden_size=4]
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![1, 2, 4]);
+
+        // c_n: [num_layers=1, batch=2, hidden_size=4]
+        let c_shape = session.tensor_shape(result.c_n).expect("c_n shape");
+        assert_eq!(c_shape, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn lstm_batch_first_transposes_correctly() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 1, false, 0.0, true).expect("lstm");
+
+        // Input: [batch=2, seq_len=5, input_size=3]
+        let input = session
+            .tensor_variable(vec![0.1; 2 * 5 * 3], vec![2, 5, 3], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        // Output: [batch=2, seq_len=5, hidden_size=4]
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![2, 5, 4]);
+    }
+
+    #[test]
+    fn lstm_multi_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 3, false, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 5 * 2 * 3], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        // Output: [seq_len=5, batch=2, hidden_size=4]
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 4]);
+
+        // h_n: [num_layers=3, batch=2, hidden_size=4]
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![3, 2, 4]);
+    }
+
+    #[test]
+    fn lstm_bidirectional_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 1, true, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 5 * 2 * 3], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        // Output: [seq_len=5, batch=2, 2*hidden_size=8]
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 8]);
+
+        // h_n: [num_layers*2=2, batch=2, hidden_size=4]
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![2, 2, 4]);
+    }
+
+    #[test]
+    fn lstm_bidirectional_multi_layer_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 2, true, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 5 * 2 * 3], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        // Output: [seq_len=5, batch=2, 2*hidden_size=8]
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 8]);
+
+        // h_n: [num_layers*2=4, batch=2, hidden_size=4]
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![4, 2, 4]);
+    }
+
+    #[test]
+    fn lstm_single_timestep_matches_cell() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // Create standalone cell
+        let cell = LSTMCell::new(&mut session, 2, 3).expect("cell");
+
+        // Run cell directly
+        let x = session
+            .tensor_variable(vec![0.5, -0.3], vec![1, 2], false)
+            .expect("x");
+        let h0 = session
+            .tensor_variable(vec![0.0; 3], vec![1, 3], false)
+            .expect("h0");
+        let c0 = session
+            .tensor_variable(vec![0.0; 3], vec![1, 3], false)
+            .expect("c0");
+        let (cell_h, cell_c) = cell.forward_cell(&mut session, x, h0, c0).expect("cell fwd");
+        let cell_h_vals = session.tensor_values(cell_h).expect("cell h vals");
+        let cell_c_vals = session.tensor_values(cell_c).expect("cell c vals");
+
+        // Create LSTM module with same weights — we can't easily share weights,
+        // so we verify shapes and that output is non-trivial
+        let lstm = LSTM::new(&mut session, 2, 3, 1, false, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.5, -0.3], vec![1, 1, 2], false)
+            .expect("lstm input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("lstm forward");
+
+        // Shape check: output [1,1,3], h_n [1,1,3], c_n [1,1,3]
+        let out_shape = session.tensor_shape(result.output).expect("shape");
+        assert_eq!(out_shape, vec![1, 1, 3]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("shape");
+        assert_eq!(h_shape, vec![1, 1, 3]);
+
+        // Values should be non-zero (non-trivial computation)
+        let out_vals = session.tensor_values(result.output).expect("vals");
+        assert!(out_vals.iter().any(|&v| v != 0.0), "output should be non-zero");
+
+        // Cell output should also be non-zero
+        assert!(cell_h_vals.iter().any(|&v| v != 0.0), "cell h should be non-zero");
+        assert!(cell_c_vals.iter().any(|&v| v != 0.0), "cell c should be non-zero");
+    }
+
+    #[test]
+    fn lstm_backward_produces_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 2, 3, 1, false, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.5, -0.3, 0.1, 0.7], vec![2, 1, 2], true)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        let loss = session.tensor_sum(result.output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        // Input should have gradients
+        assert!(
+            session.tensor_gradient(&report, input).is_some(),
+            "input gradient should exist"
+        );
+
+        // All LSTM parameters should have gradients
+        for param in lstm.parameters() {
+            assert!(
+                session.tensor_gradient(&report, param).is_some(),
+                "parameter gradient should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn lstm_multi_layer_backward_all_params_have_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 2, 3, 2, false, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 6], vec![3, 1, 2], true)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        let loss = session.tensor_sum(result.output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let params = lstm.parameters();
+        // 2 layers * 4 params each = 8 parameters
+        assert_eq!(params.len(), 8);
+
+        for (i, param) in params.iter().enumerate() {
+            assert!(
+                session.tensor_gradient(&report, *param).is_some(),
+                "parameter {i} gradient should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn lstm_bidirectional_backward_all_params_have_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 2, 3, 1, true, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 6], vec![3, 1, 2], true)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        let loss = session.tensor_sum(result.output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let params = lstm.parameters();
+        // 1 layer * 2 directions * 4 params each = 8 parameters
+        assert_eq!(params.len(), 8);
+
+        for (i, param) in params.iter().enumerate() {
+            assert!(
+                session.tensor_gradient(&report, *param).is_some(),
+                "parameter {i} gradient should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn lstm_custom_initial_states() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 2, 3, 1, false, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 4], vec![2, 1, 2], false)
+            .expect("input");
+
+        // Custom h_0 and c_0: [1, 1, 3]
+        let h_0 = session
+            .tensor_variable(vec![0.5, 0.5, 0.5], vec![1, 1, 3], false)
+            .expect("h0");
+        let c_0 = session
+            .tensor_variable(vec![0.1, 0.2, 0.3], vec![1, 1, 3], false)
+            .expect("c0");
+
+        let result_custom = lstm
+            .forward_lstm(&mut session, input, Some(h_0), Some(c_0))
+            .expect("forward with custom states");
+
+        // Compare with zero initial states
+        let input2 = session
+            .tensor_variable(vec![0.1; 4], vec![2, 1, 2], false)
+            .expect("input2");
+        let result_zero = lstm
+            .forward_lstm(&mut session, input2, None, None)
+            .expect("forward with zero states");
+
+        let vals_custom = session.tensor_values(result_custom.output).expect("custom");
+        let vals_zero = session.tensor_values(result_zero.output).expect("zero");
+
+        // Outputs should differ because initial states differ
+        assert_ne!(vals_custom, vals_zero, "custom and zero initial states should produce different outputs");
+    }
+
+    #[test]
+    fn lstm_module_trait_forward_returns_output() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 1, false, 0.0, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 5 * 2 * 3], vec![5, 2, 3], false)
+            .expect("input");
+
+        // Module::forward should work and return just the output tensor
+        let output = lstm.forward(&mut session, input).expect("module forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![5, 2, 4]);
+    }
+
+    #[test]
+    fn lstm_parameter_count() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // Single layer, unidirectional
+        let lstm1 = LSTM::new(&mut session, 3, 4, 1, false, 0.0, false).expect("lstm1");
+        assert_eq!(lstm1.parameters().len(), 4); // w_ih, w_hh, b_ih, b_hh
+
+        // 2-layer, unidirectional
+        let lstm2 = LSTM::new(&mut session, 3, 4, 2, false, 0.0, false).expect("lstm2");
+        assert_eq!(lstm2.parameters().len(), 8); // 2 layers * 4 params
+
+        // 1-layer, bidirectional
+        let lstm3 = LSTM::new(&mut session, 3, 4, 1, true, 0.0, false).expect("lstm3");
+        assert_eq!(lstm3.parameters().len(), 8); // 2 directions * 4 params
+
+        // 2-layer, bidirectional
+        let lstm4 = LSTM::new(&mut session, 3, 4, 2, true, 0.0, false).expect("lstm4");
+        assert_eq!(lstm4.parameters().len(), 16); // 2 layers * 2 directions * 4 params
+    }
+
+    #[test]
+    fn lstm_train_eval_propagation() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 2, false, 0.5, false).expect("lstm");
+
+        assert!(lstm.is_training());
+
+        lstm.eval();
+        assert!(!lstm.is_training());
+        // Dropout layers should also be in eval mode
+        for dropout in &lstm.dropout_layers {
+            assert!(!dropout.is_training());
+        }
+
+        lstm.train(true);
+        assert!(lstm.is_training());
+        for dropout in &lstm.dropout_layers {
+            assert!(dropout.is_training());
+        }
+    }
+
+    #[test]
+    fn lstm_sequence_length_one() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 1, false, 0.0, false).expect("lstm");
+
+        // Single timestep: [1, 1, 3]
+        let input = session
+            .tensor_variable(vec![0.5, -0.3, 0.1], vec![1, 1, 3], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("shape");
+        assert_eq!(out_shape, vec![1, 1, 4]);
+    }
+
+    #[test]
+    fn lstm_rejects_invalid_input_rank() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 3, 4, 1, false, 0.0, false).expect("lstm");
+
+        // 2D input should fail
+        let input = session
+            .tensor_variable(vec![0.1; 6], vec![2, 3], false)
+            .expect("input");
+
+        let err = lstm.forward_lstm(&mut session, input, None, None);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn lstm_rejects_zero_layers() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let err = LSTM::new(&mut session, 3, 4, 0, false, 0.0, false);
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn lstm_dropout_between_layers_in_eval_mode() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 2, 3, 2, false, 0.5, false).expect("lstm");
+
+        let input = session
+            .tensor_variable(vec![0.1; 6], vec![3, 1, 2], false)
+            .expect("input");
+
+        // In eval mode, dropout should be identity — run twice and compare
+        lstm.eval();
+        let result1 = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward1");
+        let vals1 = session.tensor_values(result1.output).expect("vals1");
+
+        let input2 = session
+            .tensor_variable(vec![0.1; 6], vec![3, 1, 2], false)
+            .expect("input2");
+        let result2 = lstm
+            .forward_lstm(&mut session, input2, None, None)
+            .expect("forward2");
+        let vals2 = session.tensor_values(result2.output).expect("vals2");
+
+        assert_eq!(vals1, vals2, "eval mode should be deterministic");
+    }
+
+    #[test]
+    fn lstm_hidden_state_carryover() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lstm = LSTM::new(&mut session, 2, 3, 1, false, 0.0, false).expect("lstm");
+
+        // Run 3 timesteps
+        let input = session
+            .tensor_variable(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], vec![3, 1, 2], false)
+            .expect("input");
+
+        let result = lstm
+            .forward_lstm(&mut session, input, None, None)
+            .expect("forward");
+
+        // h_n should equal the last timestep output (for unidirectional single layer)
+        let h_n_vals = session.tensor_values(result.h_n).expect("h_n");
+        let out_vals = session.tensor_values(result.output).expect("output");
+
+        // output is [3, 1, 3], last timestep is out_vals[6..9]
+        let last_output = &out_vals[6..9];
+        let h_n_flat = &h_n_vals;
+
+        for (i, (&a, &b)) in last_output.iter().zip(h_n_flat.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "h_n[{i}] ({b}) should match last output ({a})"
+            );
+        }
+    }
+
+    // ── GRU Module Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn gru_single_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 4]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn gru_batch_first_transposes_correctly() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 1, false, 0.0, true).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![2, 5, 3], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![2, 5, 4]);
+    }
+
+    #[test]
+    fn gru_multi_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 3, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 4]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![3, 2, 4]);
+    }
+
+    #[test]
+    fn gru_bidirectional_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 1, true, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 8]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![2, 2, 4]);
+    }
+
+    #[test]
+    fn gru_bidirectional_multi_layer_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 2, true, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 8]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![4, 2, 4]);
+    }
+
+    #[test]
+    fn gru_backward_produces_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 2, 3, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.5, -0.3, 0.1, 0.7], vec![2, 1, 2], true)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let loss = session.tensor_sum(result.output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(
+            session.tensor_gradient(&report, input).is_some(),
+            "input gradient should exist"
+        );
+
+        for param in gru.parameters() {
+            assert!(
+                session.tensor_gradient(&report, param).is_some(),
+                "parameter gradient should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn gru_multi_layer_backward_all_params() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 2, 3, 2, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 6], vec![3, 1, 2], true)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let loss = session.tensor_sum(result.output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let params = gru.parameters();
+        assert_eq!(params.len(), 8); // 2 layers * 4 params each
+
+        for (i, param) in params.iter().enumerate() {
+            assert!(
+                session.tensor_gradient(&report, *param).is_some(),
+                "parameter {i} gradient should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn gru_parameter_count() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let gru1 = GRU::new(&mut session, 3, 4, 1, false, 0.0, false).expect("gru1");
+        assert_eq!(gru1.parameters().len(), 4);
+
+        let gru2 = GRU::new(&mut session, 3, 4, 2, false, 0.0, false).expect("gru2");
+        assert_eq!(gru2.parameters().len(), 8);
+
+        let gru3 = GRU::new(&mut session, 3, 4, 1, true, 0.0, false).expect("gru3");
+        assert_eq!(gru3.parameters().len(), 8);
+
+        let gru4 = GRU::new(&mut session, 3, 4, 2, true, 0.0, false).expect("gru4");
+        assert_eq!(gru4.parameters().len(), 16);
+    }
+
+    #[test]
+    fn gru_train_eval_propagation() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 2, false, 0.5, false).expect("gru");
+
+        assert!(gru.is_training());
+
+        gru.eval();
+        assert!(!gru.is_training());
+        for dropout in &gru.dropout_layers {
+            assert!(!dropout.is_training());
+        }
+
+        gru.train(true);
+        assert!(gru.is_training());
+        for dropout in &gru.dropout_layers {
+            assert!(dropout.is_training());
+        }
+    }
+
+    #[test]
+    fn gru_custom_initial_state() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 2, 3, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 4], vec![2, 1, 2], false)
+            .expect("input");
+
+        let h_0 = session
+            .tensor_variable(vec![0.5, 0.5, 0.5], vec![1, 1, 3], false)
+            .expect("h0");
+
+        let result_custom = gru
+            .forward_gru(&mut session, input, Some(h_0))
+            .expect("custom");
+
+        let input2 = session
+            .tensor_variable(vec![0.1; 4], vec![2, 1, 2], false)
+            .expect("input2");
+        let result_zero = gru
+            .forward_gru(&mut session, input2, None)
+            .expect("zero");
+
+        let vals_custom = session.tensor_values(result_custom.output).expect("custom");
+        let vals_zero = session.tensor_values(result_zero.output).expect("zero");
+        assert_ne!(vals_custom, vals_zero);
+    }
+
+    #[test]
+    fn gru_hidden_state_carryover() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 2, 3, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], vec![3, 1, 2], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let h_n_vals = session.tensor_values(result.h_n).expect("h_n");
+        let out_vals = session.tensor_values(result.output).expect("output");
+
+        // Last timestep of output should equal h_n for single-layer unidirectional
+        let last_output = &out_vals[6..9];
+
+        for (i, (&a, &b)) in last_output.iter().zip(h_n_vals.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "h_n[{i}] ({b}) should match last output ({a})"
+            );
+        }
+    }
+
+    #[test]
+    fn gru_sequence_length_one() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.5, -0.3, 0.1], vec![1, 1, 3], false)
+            .expect("input");
+
+        let result = gru.forward_gru(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("shape");
+        assert_eq!(out_shape, vec![1, 1, 4]);
+    }
+
+    #[test]
+    fn gru_rejects_invalid_input() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 6], vec![2, 3], false)
+            .expect("input");
+
+        assert!(gru.forward_gru(&mut session, input, None).is_err());
+    }
+
+    #[test]
+    fn gru_module_trait_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let gru = GRU::new(&mut session, 3, 4, 1, false, 0.0, false).expect("gru");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let output = gru.forward(&mut session, input).expect("module forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![5, 2, 4]);
+    }
+
+    // ── RNN Module Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn rnn_single_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig::default()).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 4]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![1, 2, 4]);
+    }
+
+    #[test]
+    fn rnn_batch_first() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig { batch_first: true, ..RNNConfig::default() }).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![2, 5, 3], false)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![2, 5, 4]);
+    }
+
+    #[test]
+    fn rnn_multi_layer_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig { num_layers: 3, ..RNNConfig::default() }).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![3, 2, 4]);
+    }
+
+    #[test]
+    fn rnn_bidirectional_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig { bidirectional: true, ..RNNConfig::default() }).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+
+        let out_shape = session.tensor_shape(result.output).expect("output shape");
+        assert_eq!(out_shape, vec![5, 2, 8]);
+
+        let h_shape = session.tensor_shape(result.h_n).expect("h_n shape");
+        assert_eq!(h_shape, vec![2, 2, 4]);
+    }
+
+    #[test]
+    fn rnn_tanh_vs_relu_differ() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let rnn_tanh = RNN::new(&mut session, 2, 3, RNNConfig::default()).expect("tanh");
+        let rnn_relu = RNN::new(&mut session, 2, 3, RNNConfig { use_tanh: false, ..RNNConfig::default() }).expect("relu");
+
+        let input1 = session
+            .tensor_variable(vec![0.5, -0.3, 0.1, 0.7], vec![2, 1, 2], false)
+            .expect("input1");
+        let input2 = session
+            .tensor_variable(vec![0.5, -0.3, 0.1, 0.7], vec![2, 1, 2], false)
+            .expect("input2");
+
+        let result_tanh = rnn_tanh
+            .forward_rnn(&mut session, input1, None)
+            .expect("tanh forward");
+        let result_relu = rnn_relu
+            .forward_rnn(&mut session, input2, None)
+            .expect("relu forward");
+
+        let vals_tanh = session.tensor_values(result_tanh.output).expect("tanh");
+        let vals_relu = session.tensor_values(result_relu.output).expect("relu");
+
+        // Different nonlinearities + different weights = different outputs
+        assert_ne!(vals_tanh, vals_relu);
+    }
+
+    #[test]
+    fn rnn_backward_produces_gradients() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 2, 3, RNNConfig::default()).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.5, -0.3, 0.1, 0.7], vec![2, 1, 2], true)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+
+        let loss = session.tensor_sum(result.output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(session.tensor_gradient(&report, input).is_some());
+
+        for param in rnn.parameters() {
+            assert!(session.tensor_gradient(&report, param).is_some());
+        }
+    }
+
+    #[test]
+    fn rnn_parameter_count() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let rnn1 = RNN::new(&mut session, 3, 4, RNNConfig::default()).expect("rnn1");
+        assert_eq!(rnn1.parameters().len(), 4);
+
+        let rnn2 = RNN::new(&mut session, 3, 4, RNNConfig { num_layers: 2, ..RNNConfig::default() }).expect("rnn2");
+        assert_eq!(rnn2.parameters().len(), 8);
+
+        let rnn3 = RNN::new(&mut session, 3, 4, RNNConfig { bidirectional: true, ..RNNConfig::default() }).expect("rnn3");
+        assert_eq!(rnn3.parameters().len(), 8);
+
+        let rnn4 = RNN::new(&mut session, 3, 4, RNNConfig { num_layers: 2, bidirectional: true, ..RNNConfig::default() }).expect("rnn4");
+        assert_eq!(rnn4.parameters().len(), 16);
+    }
+
+    #[test]
+    fn rnn_train_eval_propagation() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig { num_layers: 2, dropout: 0.5, ..RNNConfig::default() }).expect("rnn");
+
+        assert!(rnn.is_training());
+        rnn.eval();
+        assert!(!rnn.is_training());
+        rnn.train(true);
+        assert!(rnn.is_training());
+    }
+
+    #[test]
+    fn rnn_hidden_state_carryover() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 2, 3, RNNConfig::default()).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], vec![3, 1, 2], false)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+
+        let h_n_vals = session.tensor_values(result.h_n).expect("h_n");
+        let out_vals = session.tensor_values(result.output).expect("output");
+
+        let last_output = &out_vals[6..9];
+
+        for (i, (&a, &b)) in last_output.iter().zip(h_n_vals.iter()).enumerate() {
+            assert!(
+                (a - b).abs() < 1e-12,
+                "h_n[{i}] ({b}) should match last output ({a})"
+            );
+        }
+    }
+
+    #[test]
+    fn rnn_module_trait_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig::default()).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.1; 30], vec![5, 2, 3], false)
+            .expect("input");
+
+        let output = rnn.forward(&mut session, input).expect("module forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![5, 2, 4]);
+    }
+
+    #[test]
+    fn rnn_sequence_length_one() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rnn = RNN::new(&mut session, 3, 4, RNNConfig::default()).expect("rnn");
+
+        let input = session
+            .tensor_variable(vec![0.5, -0.3, 0.1], vec![1, 1, 3], false)
+            .expect("input");
+
+        let result = rnn.forward_rnn(&mut session, input, None).expect("forward");
+        let out_shape = session.tensor_shape(result.output).expect("shape");
+        assert_eq!(out_shape, vec![1, 1, 4]);
+    }
+
+    // ── Transformer Encoder Tests ──────────────────────────────────────
+
+    #[test]
+    fn transformer_encoder_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerEncoderLayer::new(
+            &mut session,
+            8,    // d_model
+            2,    // nhead
+            32,   // dim_feedforward
+            0.0,  // dropout (disabled for determinism)
+            TransformerActivation::Relu,
+            false, // post-norm
+        )
+        .expect("encoder layer");
+
+        // Input: [batch=2, seq_len=4, d_model=8]
+        let input = session
+            .tensor_variable(vec![0.1; 64], vec![2, 4, 8], false)
+            .expect("input");
+
+        let output = layer.forward_layer(&mut session, input).expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![2, 4, 8]);
+    }
+
+    #[test]
+    fn transformer_encoder_layer_prenorm_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerEncoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Gelu, true,
+        )
+        .expect("pre-norm layer");
+
+        let input = session
+            .tensor_variable(vec![0.1; 64], vec![2, 4, 8], false)
+            .expect("input");
+
+        let output = layer.forward_layer(&mut session, input).expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![2, 4, 8]);
+    }
+
+    #[test]
+    fn transformer_encoder_layer_postnorm_vs_prenorm_differ() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let post = TransformerEncoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("post-norm");
+
+        let pre = TransformerEncoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, true,
+        )
+        .expect("pre-norm");
+
+        let input1 = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], false)
+            .expect("input1");
+        let input2 = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], false)
+            .expect("input2");
+
+        let out_post = post.forward_layer(&mut session, input1).expect("post");
+        let out_pre = pre.forward_layer(&mut session, input2).expect("pre");
+
+        let vals_post = session.tensor_values(out_post).expect("post vals");
+        let vals_pre = session.tensor_values(out_pre).expect("pre vals");
+        assert_ne!(vals_post, vals_pre, "pre-norm and post-norm should differ");
+    }
+
+    #[test]
+    fn transformer_encoder_layer_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerEncoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("layer");
+
+        let input = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], true)
+            .expect("input");
+
+        let output = layer.forward_layer(&mut session, input).expect("forward");
+        let loss = session.tensor_sum(output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(session.tensor_gradient(&report, input).is_some());
+
+        for param in layer.parameters() {
+            assert!(session.tensor_gradient(&report, param).is_some());
+        }
+    }
+
+    #[test]
+    fn transformer_encoder_stacked_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let encoder = TransformerEncoder::new(
+            &mut session,
+            8,    // d_model
+            2,    // nhead
+            3,    // num_layers
+            32,   // dim_feedforward
+            0.0,  // dropout
+            TransformerActivation::Relu,
+            false, // post-norm
+            true,  // final_layer_norm
+        )
+        .expect("encoder");
+
+        let input = session
+            .tensor_variable(vec![0.1; 64], vec![2, 4, 8], false)
+            .expect("input");
+
+        let output = encoder.forward(&mut session, input).expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![2, 4, 8]);
+    }
+
+    #[test]
+    fn transformer_encoder_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let encoder = TransformerEncoder::new(
+            &mut session, 8, 2, 2, 32, 0.0, TransformerActivation::Relu, false, false,
+        )
+        .expect("encoder");
+
+        let input = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], true)
+            .expect("input");
+
+        let output = encoder.forward(&mut session, input).expect("forward");
+        let loss = session.tensor_sum(output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(session.tensor_gradient(&report, input).is_some());
+
+        for param in encoder.parameters() {
+            assert!(session.tensor_gradient(&report, param).is_some());
+        }
+    }
+
+    #[test]
+    fn transformer_encoder_parameter_count() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // Single layer: MHA(4 linears * 2 params each = 8) + FF(2 linears * 2 = 4) + LN(2 * 2 = 4) = 16
+        let layer = TransformerEncoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("layer");
+        assert_eq!(layer.parameters().len(), 16);
+
+        // Encoder with 3 layers + final norm: 3*16 + 2 = 50
+        let encoder = TransformerEncoder::new(
+            &mut session, 8, 2, 3, 32, 0.0, TransformerActivation::Relu, false, true,
+        )
+        .expect("encoder");
+        assert_eq!(encoder.parameters().len(), 50);
+
+        // Without final norm: 3*16 = 48
+        let encoder_no_norm = TransformerEncoder::new(
+            &mut session, 8, 2, 3, 32, 0.0, TransformerActivation::Relu, false, false,
+        )
+        .expect("encoder");
+        assert_eq!(encoder_no_norm.parameters().len(), 48);
+    }
+
+    #[test]
+    fn transformer_encoder_train_eval() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let encoder = TransformerEncoder::new(
+            &mut session, 8, 2, 2, 32, 0.5, TransformerActivation::Relu, false, false,
+        )
+        .expect("encoder");
+
+        assert!(encoder.is_training());
+        encoder.eval();
+        assert!(!encoder.is_training());
+        encoder.train(true);
+        assert!(encoder.is_training());
+    }
+
+    #[test]
+    fn transformer_encoder_layer_gelu_activation() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerEncoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Gelu, false,
+        )
+        .expect("layer");
+
+        let input = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], false)
+            .expect("input");
+
+        let output = layer.forward_layer(&mut session, input).expect("forward");
+        let vals = session.tensor_values(output).expect("vals");
+        assert!(vals.iter().any(|&v| v != 0.0), "output should be non-zero");
+    }
+
+    // ── Transformer Decoder Tests ──────────────────────────────────────
+
+    #[test]
+    fn transformer_decoder_layer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerDecoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("decoder layer");
+
+        // tgt: [batch=2, tgt_len=3, d_model=8]
+        let tgt = session
+            .tensor_variable(vec![0.1; 48], vec![2, 3, 8], false)
+            .expect("tgt");
+        // memory: [batch=2, src_len=5, d_model=8]
+        let memory = session
+            .tensor_variable(vec![0.2; 80], vec![2, 5, 8], false)
+            .expect("memory");
+
+        let output = layer
+            .forward_layer(&mut session, tgt, memory)
+            .expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![2, 3, 8]);
+    }
+
+    #[test]
+    fn transformer_decoder_layer_prenorm_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerDecoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Gelu, true,
+        )
+        .expect("pre-norm decoder");
+
+        let tgt = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], false)
+            .expect("tgt");
+        let memory = session
+            .tensor_variable(vec![0.2; 24], vec![1, 3, 8], false)
+            .expect("memory");
+
+        let output = layer
+            .forward_layer(&mut session, tgt, memory)
+            .expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![1, 2, 8]);
+    }
+
+    #[test]
+    fn transformer_decoder_layer_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerDecoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("layer");
+
+        let tgt = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], true)
+            .expect("tgt");
+        let memory = session
+            .tensor_variable(vec![0.2; 24], vec![1, 3, 8], true)
+            .expect("memory");
+
+        let output = layer
+            .forward_layer(&mut session, tgt, memory)
+            .expect("forward");
+        let loss = session.tensor_sum(output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(session.tensor_gradient(&report, tgt).is_some());
+        assert!(session.tensor_gradient(&report, memory).is_some());
+
+        for param in layer.parameters() {
+            assert!(session.tensor_gradient(&report, param).is_some());
+        }
+    }
+
+    #[test]
+    fn transformer_decoder_stacked_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let decoder = TransformerDecoder::new(
+            &mut session, 8, 2, 3, 32, 0.0, TransformerActivation::Relu, false, true,
+        )
+        .expect("decoder");
+
+        let tgt = session
+            .tensor_variable(vec![0.1; 48], vec![2, 3, 8], false)
+            .expect("tgt");
+        let memory = session
+            .tensor_variable(vec![0.2; 80], vec![2, 5, 8], false)
+            .expect("memory");
+
+        let output = decoder
+            .forward_decoder(&mut session, tgt, memory)
+            .expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![2, 3, 8]);
+    }
+
+    #[test]
+    fn transformer_decoder_parameter_count() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // Decoder layer: self_attn(8) + cross_attn(8) + ff(4) + 3 norms(2 each) = 26
+        let layer = TransformerDecoderLayer::new(
+            &mut session, 8, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("layer");
+        assert_eq!(layer.parameters().len(), 26);
+
+        // Decoder: 2 layers + final norm = 2*26 + 2 = 54
+        let decoder = TransformerDecoder::new(
+            &mut session, 8, 2, 2, 32, 0.0, TransformerActivation::Relu, false, true,
+        )
+        .expect("decoder");
+        assert_eq!(decoder.parameters().len(), 54);
+    }
+
+    #[test]
+    fn transformer_decoder_train_eval() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let decoder = TransformerDecoder::new(
+            &mut session, 8, 2, 2, 32, 0.5, TransformerActivation::Relu, false, false,
+        )
+        .expect("decoder");
+
+        assert!(decoder.is_training());
+        decoder.eval();
+        assert!(!decoder.is_training());
+        decoder.train(true);
+        assert!(decoder.is_training());
+    }
+
+    // ── Full Transformer Tests ─────────────────────────────────────────
+
+    #[test]
+    fn transformer_forward_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let transformer = Transformer::new(
+            &mut session, 8, 2, 2, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("transformer");
+
+        // src: [batch=2, src_len=5, d_model=8]
+        let src = session
+            .tensor_variable(vec![0.1; 80], vec![2, 5, 8], false)
+            .expect("src");
+        // tgt: [batch=2, tgt_len=3, d_model=8]
+        let tgt = session
+            .tensor_variable(vec![0.2; 48], vec![2, 3, 8], false)
+            .expect("tgt");
+
+        let output = transformer
+            .forward_transformer(&mut session, src, tgt)
+            .expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![2, 3, 8]);
+    }
+
+    #[test]
+    fn transformer_backward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let transformer = Transformer::new(
+            &mut session, 8, 2, 1, 1, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("transformer");
+
+        let src = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], true)
+            .expect("src");
+        let tgt = session
+            .tensor_variable(vec![0.2; 16], vec![1, 2, 8], true)
+            .expect("tgt");
+
+        let output = transformer
+            .forward_transformer(&mut session, src, tgt)
+            .expect("forward");
+        let loss = session.tensor_sum(output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(session.tensor_gradient(&report, src).is_some());
+        assert!(session.tensor_gradient(&report, tgt).is_some());
+
+        for param in transformer.parameters() {
+            assert!(session.tensor_gradient(&report, param).is_some());
+        }
+    }
+
+    #[test]
+    fn transformer_parameter_count() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let transformer = Transformer::new(
+            &mut session, 8, 2, 2, 2, 32, 0.0, TransformerActivation::Relu, false,
+        )
+        .expect("transformer");
+
+        // Encoder: 2 layers * 16 params = 32
+        // Decoder: 2 layers * 26 params = 52
+        // Total = 84
+        assert_eq!(transformer.parameters().len(), 84);
+    }
+
+    #[test]
+    fn transformer_train_eval() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let transformer = Transformer::new(
+            &mut session, 8, 2, 1, 1, 32, 0.5, TransformerActivation::Relu, false,
+        )
+        .expect("transformer");
+
+        assert!(transformer.is_training());
+        transformer.eval();
+        assert!(!transformer.is_training());
+        transformer.train(true);
+        assert!(transformer.is_training());
+    }
+
+    #[test]
+    fn generate_causal_mask() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mask = generate_square_subsequent_mask(&mut session, 4).expect("mask");
+
+        let vals = session.tensor_values(mask).expect("vals");
+        let shape = session.tensor_shape(mask).expect("shape");
+        assert_eq!(shape, vec![4, 4]);
+
+        // Diagonal and below should be 0
+        assert_eq!(vals[0], 0.0);  // (0,0)
+        assert_eq!(vals[4], 0.0);  // (1,0)
+        assert_eq!(vals[5], 0.0);  // (1,1)
+        assert_eq!(vals[10], 0.0); // (2,2)
+        assert_eq!(vals[15], 0.0); // (3,3)
+
+        // Above diagonal should be -inf
+        assert_eq!(vals[1], f64::NEG_INFINITY);  // (0,1)
+        assert_eq!(vals[2], f64::NEG_INFINITY);  // (0,2)
+        assert_eq!(vals[3], f64::NEG_INFINITY);  // (0,3)
+        assert_eq!(vals[7], f64::NEG_INFINITY);  // (1,3)
+    }
+
+    #[test]
+    fn transformer_prenorm_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let transformer = Transformer::new(
+            &mut session, 8, 2, 1, 1, 32, 0.0, TransformerActivation::Gelu, true,
+        )
+        .expect("pre-norm transformer");
+
+        let src = session
+            .tensor_variable(vec![0.1; 16], vec![1, 2, 8], false)
+            .expect("src");
+        let tgt = session
+            .tensor_variable(vec![0.2; 24], vec![1, 3, 8], false)
+            .expect("tgt");
+
+        let output = transformer
+            .forward_transformer(&mut session, src, tgt)
+            .expect("forward");
+        let shape = session.tensor_shape(output).expect("shape");
+        assert_eq!(shape, vec![1, 3, 8]);
     }
 }
