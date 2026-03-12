@@ -15190,4 +15190,307 @@ mod tests {
         let shape = session.tensor_shape(output).expect("shape");
         assert_eq!(shape, vec![1, 3, 8]);
     }
+
+    // ── Pooling Variant Tests ────────────────────────────────────────────
+
+    #[test]
+    fn avgpool2d_basic_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4, 4] input
+        #[rustfmt::skip]
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let input = session.tensor_variable(data, vec![1, 1, 4, 4], false).unwrap();
+        let pool = AvgPool2d::new((2, 2), (2, 2), (0, 0), false, true);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // top-left: mean(1,2,5,6) = 3.5
+        assert!((vals[0] - 3.5).abs() < 1e-10);
+        // top-right: mean(3,4,7,8) = 5.5
+        assert!((vals[1] - 5.5).abs() < 1e-10);
+        // bottom-left: mean(9,10,13,14) = 11.5
+        assert!((vals[2] - 11.5).abs() < 1e-10);
+        // bottom-right: mean(11,12,15,16) = 13.5
+        assert!((vals[3] - 13.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn avgpool2d_with_padding() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 3, 3] with padding=1, kernel=3, stride=1 => output [1, 1, 3, 3]
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let input = session.tensor_variable(data, vec![1, 1, 3, 3], false).unwrap();
+        let pool = AvgPool2d::new((3, 3), (1, 1), (1, 1), false, true);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 3, 3]);
+        let vals = session.tensor_values(output).unwrap();
+        // Center: mean of all 9 / 9 = 5.0
+        assert!((vals[4] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn avgpool2d_stride_1() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 3, 3] kernel=2, stride=1 => [1, 1, 2, 2]
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let input = session.tensor_variable(data, vec![1, 1, 3, 3], false).unwrap();
+        let pool = AvgPool2d::new((2, 2), (1, 1), (0, 0), false, true);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // (0,0): mean(1,2,4,5)=3.0
+        assert!((vals[0] - 3.0).abs() < 1e-10);
+        // (0,1): mean(2,3,5,6)=4.0
+        assert!((vals[1] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn avgpool3d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2, 2, 2] kernel=(2,2,2), stride=(1,1,1) => [1,1,1,1,1]
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+        let input = session.tensor_variable(data, vec![1, 1, 2, 2, 2], false).unwrap();
+        let pool = AvgPool3d::new((2, 2, 2), (1, 1, 1));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 1, 1, 1]);
+        let vals = session.tensor_values(output).unwrap();
+        // mean of all 8: (1+2+3+4+5+6+7+8)/8 = 4.5
+        assert!((vals[0] - 4.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn maxpool3d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4, 4, 4] kernel=(2,2,2), stride=(2,2,2) => [1,1,2,2,2]
+        let data: Vec<f64> = (1..=64).map(|x| x as f64).collect();
+        let input = session.tensor_variable(data, vec![1, 1, 4, 4, 4], false).unwrap();
+        let pool = MaxPool3d::new((2, 2, 2), (2, 2, 2));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // First element: max of cube [1..8 region] = max within first 2x2x2 block
+        // Indices: (0,0,0),(0,0,1),(0,1,0),(0,1,1),(1,0,0),(1,0,1),(1,1,0),(1,1,1)
+        // In row-major 4x4x4: 1,2,5,6,17,18,21,22 -> max=22
+        assert!((vals[0] - 22.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn maxpool3d_wrong_dim() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session.tensor_variable(vec![1.0; 16], vec![1, 1, 4, 4], false).unwrap();
+        let pool = MaxPool3d::new((2, 2, 2), (2, 2, 2));
+        assert!(pool.forward(&mut session, input).is_err());
+    }
+
+    #[test]
+    fn adaptive_avg_pool1d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 6] -> output_size=2 => [1, 1, 2]
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let input = session.tensor_variable(data, vec![1, 1, 6], false).unwrap();
+        let pool = AdaptiveAvgPool1d::new(2);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // First bin: mean(1,2,3) = 2.0
+        assert!((vals[0] - 2.0).abs() < 1e-10);
+        // Second bin: mean(4,5,6) = 5.0
+        assert!((vals[1] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_avg_pool1d_identity() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data = vec![1.0, 2.0, 3.0];
+        let input = session.tensor_variable(data.clone(), vec![1, 1, 3], false).unwrap();
+        let pool = AdaptiveAvgPool1d::new(3);
+        let output = pool.forward(&mut session, input).unwrap();
+        // output_size == input_size => identity
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn adaptive_avg_pool3d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4, 4, 4] -> (1, 1, 1) => global average
+        let data: Vec<f64> = (1..=64).map(|x| x as f64).collect();
+        let input = session.tensor_variable(data, vec![1, 1, 4, 4, 4], false).unwrap();
+        let pool = AdaptiveAvgPool3d::new((1, 1, 1));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 1, 1, 1]);
+        let vals = session.tensor_values(output).unwrap();
+        // mean(1..64) = 32.5
+        assert!((vals[0] - 32.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_max_pool1d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
+        let input = session.tensor_variable(data, vec![1, 1, 6], false).unwrap();
+        let pool = AdaptiveMaxPool1d::new(2);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // First bin [1,5,3]: max=5
+        assert!((vals[0] - 5.0).abs() < 1e-10);
+        // Second bin [4,2,6]: max=6
+        assert!((vals[1] - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_max_pool2d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4, 4] -> (2, 2)
+        #[rustfmt::skip]
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let input = session.tensor_variable(data, vec![1, 1, 4, 4], false).unwrap();
+        let pool = AdaptiveMaxPool2d::new((2, 2));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // top-left quad: max(1,2,5,6)=6
+        assert!((vals[0] - 6.0).abs() < 1e-10);
+        // top-right quad: max(3,4,7,8)=8
+        assert!((vals[1] - 8.0).abs() < 1e-10);
+        // bottom-left quad: max(9,10,13,14)=14
+        assert!((vals[2] - 14.0).abs() < 1e-10);
+        // bottom-right quad: max(11,12,15,16)=16
+        assert!((vals[3] - 16.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_max_pool3d_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4, 4, 4] -> (1, 1, 1) => global max
+        let data: Vec<f64> = (1..=64).map(|x| x as f64).collect();
+        let input = session.tensor_variable(data, vec![1, 1, 4, 4, 4], false).unwrap();
+        let pool = AdaptiveMaxPool3d::new((1, 1, 1));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 1, 1, 1]);
+        let vals = session.tensor_values(output).unwrap();
+        assert!((vals[0] - 64.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_max_pool2d_to_1x1() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [2, 3, 4, 4] -> (1, 1) => global max per channel per batch
+        let data: Vec<f64> = (0..96).map(|x| x as f64).collect();
+        let input = session.tensor_variable(data, vec![2, 3, 4, 4], false).unwrap();
+        let pool = AdaptiveMaxPool2d::new((1, 1));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![2, 3, 1, 1]);
+        let vals = session.tensor_values(output).unwrap();
+        // batch 0, channel 0: max of 0..15 = 15
+        assert!((vals[0] - 15.0).abs() < 1e-10);
+        // batch 0, channel 1: max of 16..31 = 31
+        assert!((vals[1] - 31.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn maxunpool1d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // pooled [1, 1, 2], indices=[1, 3] => scatter into length 4
+        let pooled = session.tensor_variable(vec![5.0, 8.0], vec![1, 1, 2], false).unwrap();
+        let unpool = MaxUnpool1d::new(2, 2);
+        let output = unpool.forward_with_indices(&mut session, pooled, &[1, 3], 4).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 4]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![0.0, 5.0, 0.0, 8.0]);
+    }
+
+    #[test]
+    fn maxunpool2d_inverts_maxpool() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 4x4 input -> MaxPool2d(2,2) -> 2x2 output, then MaxUnpool2d -> 4x4
+        #[rustfmt::skip]
+        let data = vec![
+            1.0, 2.0, 3.0, 4.0,
+            5.0, 6.0, 7.0, 8.0,
+            9.0, 10.0, 11.0, 12.0,
+            13.0, 14.0, 15.0, 16.0,
+        ];
+        let input = session.tensor_variable(data, vec![1, 1, 4, 4], false).unwrap();
+        let pool = MaxPool2d::new((2, 2), (2, 2));
+        let pooled = pool.forward(&mut session, input).unwrap();
+        let pool_vals = session.tensor_values(pooled).unwrap();
+        // Pooled: [6, 8, 14, 16]
+        assert!((pool_vals[0] - 6.0).abs() < 1e-10);
+
+        let unpool = MaxUnpool2d::new((2, 2), (2, 2));
+        // indices: 6 is at (1,1)=5, 8 is at (1,3)=7, 14 is at (3,1)=13, 16 is at (3,3)=15
+        let output = unpool.forward_with_indices(
+            &mut session, pooled, &[5, 7, 13, 15], (4, 4),
+        ).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4]);
+        let vals = session.tensor_values(output).unwrap();
+        // Position 5 should have 6.0, position 7 should have 8.0, etc.
+        assert!((vals[5] - 6.0).abs() < 1e-10);
+        assert!((vals[7] - 8.0).abs() < 1e-10);
+        assert!((vals[13] - 14.0).abs() < 1e-10);
+        assert!((vals[15] - 16.0).abs() < 1e-10);
+        // Other positions should be 0
+        assert_eq!(vals[0], 0.0);
+        assert_eq!(vals[1], 0.0);
+    }
+
+    #[test]
+    fn maxunpool3d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 1, 1, 2] with indices pointing into 1x1x4 output space
+        let pooled = session.tensor_variable(vec![5.0, 9.0], vec![1, 1, 1, 1, 2], false).unwrap();
+        let unpool = MaxUnpool3d::new((1, 1, 2), (1, 1, 2));
+        let output = unpool.forward_with_indices(
+            &mut session, pooled, &[1, 3], (1, 1, 4),
+        ).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 1, 1, 4]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![0.0, 5.0, 0.0, 9.0]);
+    }
+
+    #[test]
+    fn pooling_no_parameters() {
+        // All pooling modules should have zero parameters
+        let pool1 = AvgPool2d::new((2, 2), (2, 2), (0, 0), false, true);
+        assert!(pool1.parameters().is_empty());
+        let pool2 = AvgPool3d::new((2, 2, 2), (2, 2, 2));
+        assert!(pool2.parameters().is_empty());
+        let pool3 = MaxPool3d::new((2, 2, 2), (2, 2, 2));
+        assert!(pool3.parameters().is_empty());
+        let pool4 = AdaptiveAvgPool1d::new(3);
+        assert!(pool4.parameters().is_empty());
+        let pool5 = AdaptiveAvgPool3d::new((1, 1, 1));
+        assert!(pool5.parameters().is_empty());
+        let pool6 = AdaptiveMaxPool1d::new(3);
+        assert!(pool6.parameters().is_empty());
+        let pool7 = AdaptiveMaxPool2d::new((1, 1));
+        assert!(pool7.parameters().is_empty());
+        let pool8 = AdaptiveMaxPool3d::new((1, 1, 1));
+        assert!(pool8.parameters().is_empty());
+    }
 }
