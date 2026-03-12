@@ -534,11 +534,13 @@ pub fn module_load_state_dict(
         updates.push((*target_node, source_tensor.clone()));
     }
 
+    session.no_grad_enter();
     for (target_node, source_tensor) in updates {
         let source_node = session.tensor_variable_from_storage(source_tensor, false);
         session.tensor_zero_(target_node)?;
         session.tensor_add_(target_node, source_node)?;
     }
+    session.no_grad_exit();
 
     Ok(LoadStateDictReport {
         missing_keys,
@@ -655,13 +657,16 @@ pub fn vector_to_parameters(
     }
 
     let mut offset = 0usize;
+    session.no_grad_enter();
     for &parameter in parameters {
         let (param_values, param_meta) = session.tensor_values_meta(parameter)?;
         let len = param_values.len();
         let Some(end) = offset.checked_add(len) else {
+            session.no_grad_exit();
             return Err(gradient_utils_error("vector_to_parameters offset overflow"));
         };
         if end > flat_values.len() {
+            session.no_grad_exit();
             return Err(gradient_utils_error(
                 "vector_to_parameters source vector is shorter than parameter footprint",
             ));
@@ -676,6 +681,7 @@ pub fn vector_to_parameters(
         session.tensor_add_(parameter, chunk_node)?;
         offset = end;
     }
+    session.no_grad_exit();
 
     if offset != flat_values.len() {
         return Err(gradient_utils_error(
@@ -14931,12 +14937,14 @@ mod tests {
         let linear = Linear::new(&mut session, 3, 2, true).expect("linear");
         let original = linear.state_dict(&session).expect("state_dict");
 
+        session.no_grad_enter();
         session
             .tensor_fill_(linear.weight(), 123.0)
             .expect("fill weight");
         session
             .tensor_fill_(linear.bias().expect("bias"), -42.0)
             .expect("fill bias");
+        session.no_grad_exit();
 
         let report = linear
             .load_state_dict(&mut session, &original, true)
@@ -14991,12 +14999,14 @@ mod tests {
         state.remove("bias");
         state.insert("unexpected.key".to_string(), extra);
 
+        session.no_grad_enter();
         session
             .tensor_fill_(linear.weight(), 999.0)
             .expect("fill weight");
         session
             .tensor_fill_(linear.bias().expect("bias"), -777.0)
             .expect("fill bias");
+        session.no_grad_exit();
 
         let report = linear
             .load_state_dict(&mut session, &state, false)
@@ -15130,9 +15140,11 @@ mod tests {
 
         let vector = parameters_to_vector(&mut session, &params).expect("parameters_to_vector");
 
+        session.no_grad_enter();
         for &param in &params {
             session.tensor_fill_(param, 0.0).expect("fill");
         }
+        session.no_grad_exit();
 
         vector_to_parameters(&mut session, vector, &params).expect("vector_to_parameters");
 

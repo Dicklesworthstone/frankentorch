@@ -3387,7 +3387,8 @@ impl FrankenTorchSession {
     }
 
     fn validate_tensor_in_place_target(&self, target: TensorNodeId) -> Result<(), AutogradError> {
-        if self.tensor_tape.tensor_is_leaf(target)?
+        if self.is_grad_enabled()
+            && self.tensor_tape.tensor_is_leaf(target)?
             && self.tensor_tape.tensor_requires_grad(target)?
         {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -4822,69 +4823,7 @@ impl FrankenTorchSession {
         padding: &[usize],
         value: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        if !padding.len().is_multiple_of(2) {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "padding must have even number of elements",
-                },
-            )));
-        }
-
-        let (input_vals, input_meta) = self.tensor_values_meta(input)?;
-        let input_shape = input_meta.shape().to_vec();
-        let ndim = input_shape.len();
-        let num_pad_dims = padding.len() / 2;
-
-        if num_pad_dims > ndim {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "padding specifies more dimensions than input has",
-                },
-            )));
-        }
-
-        // Build output shape: pad innermost dimensions first
-        let mut out_shape = input_shape.clone();
-        for i in 0..num_pad_dims {
-            let dim = ndim - 1 - i;
-            let pad_before = padding[i * 2];
-            let pad_after = padding[i * 2 + 1];
-            out_shape[dim] = input_shape[dim] + pad_before + pad_after;
-        }
-
-        let out_numel: usize = out_shape.iter().product();
-        let mut output = vec![value; out_numel];
-
-        // Compute strides for input and output
-        let in_strides = Self::compute_strides(&input_shape);
-        let out_strides = Self::compute_strides(&out_shape);
-
-        // Build per-dimension pad_before offsets
-        let mut pad_before = vec![0usize; ndim];
-        for i in 0..num_pad_dims {
-            let dim = ndim - 1 - i;
-            pad_before[dim] = padding[i * 2];
-        }
-
-        // Copy input values into padded output
-        let in_numel: usize = input_shape.iter().product();
-        let mut coords = vec![0usize; ndim];
-        for (flat_in, &val) in input_vals.iter().enumerate().take(in_numel) {
-            // Compute input coordinates
-            let mut rem = flat_in;
-            for d in 0..ndim {
-                coords[d] = rem / in_strides[d];
-                rem %= in_strides[d];
-            }
-            // Compute output flat index
-            let mut flat_out = 0;
-            for d in 0..ndim {
-                flat_out += (coords[d] + pad_before[d]) * out_strides[d];
-            }
-            output[flat_out] = val;
-        }
-
-        self.tensor_tape.leaf(output, out_shape, false)
+        self.tensor_tape.pad(input, padding, value)
     }
 
     // -------------------------------------------------------------------
@@ -5736,6 +5675,7 @@ mod tests {
                     current_reentrant_depth: 2,
                     policy: ReentrantPolicy::HardenedBoundedFallback,
                     retain_graph: false,
+                    create_graph: false,
                 },
             )
             .expect("hardened fallback should succeed");
@@ -5762,6 +5702,7 @@ mod tests {
                     current_reentrant_depth: 2,
                     policy: ReentrantPolicy::HardenedBoundedFallback,
                     retain_graph: false,
+                    create_graph: false,
                 },
             )
             .expect("hardened tensor fallback should succeed");
@@ -16258,5 +16199,260 @@ mod tests {
         let result = s.tensor_bucketize(input, boundaries, false).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert_eq!(vals, vec![0.0, 0.0]);
+    }
+
+    // ---- create_graph integration tests (bd-3dpn.3) ----
+
+    #[test]
+    fn create_graph_second_derivative_x_cubed_via_session() {
+        // f(x) = x^3, f'(x) = 3x^2, f''(x) = 6x
+        // At x=2: f'(2) = 12, f''(2) = 12
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let x2 = s.tensor_mul(x, x).unwrap();
+        let x3 = s.tensor_mul(x2, x).unwrap();
+
+        let report1 = s
+            .tensor_backward_with_options(
+                x3,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+
+        let grad = s.tensor_gradient(&report1, x).expect("first grad");
+        assert!((grad[0] - 12.0).abs() < 1e-10);
+
+        let dx_node = report1.gradient_node(x).expect("gradient node");
+        let report2 = s
+            .tensor_backward_with_options(dx_node, BackwardOptions::strict_default())
+            .unwrap();
+
+        let grad2 = s.tensor_gradient(&report2, x).expect("second grad");
+        assert!(
+            (grad2[0] - 12.0).abs() < 1e-10,
+            "f''(2) should be 12, got {}",
+            grad2[0]
+        );
+    }
+
+    #[test]
+    fn create_graph_hessian_vector_product() {
+        // f(x,y) = x^2*y + y^3
+        // grad_f = [2xy, x^2 + 3y^2]
+        // Hessian = [[2y, 2x], [2x, 6y]]
+        // At (x,y) = (1,2):
+        //   grad_f = [4, 13]
+        //   H = [[4, 2], [2, 12]]
+        //   Hvp with v = [1, 0]: H*v = [4, 2]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let y = s.tensor_variable(vec![2.0], vec![1], true).unwrap();
+
+        // x^2
+        let x2 = s.tensor_mul(x, x).unwrap();
+        // x^2 * y
+        let x2y = s.tensor_mul(x2, y).unwrap();
+        // y^2
+        let y2 = s.tensor_mul(y, y).unwrap();
+        // y^3
+        let y3 = s.tensor_mul(y2, y).unwrap();
+        // f = x^2*y + y^3
+        let f = s.tensor_add(x2y, y3).unwrap();
+
+        let report1 = s
+            .tensor_backward_with_options(
+                f,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+
+        let grad_x = s.tensor_gradient(&report1, x).expect("grad_x");
+        let grad_y = s.tensor_gradient(&report1, y).expect("grad_y");
+        assert!((grad_x[0] - 4.0).abs() < 1e-10, "df/dx at (1,2) = 4");
+        assert!((grad_y[0] - 13.0).abs() < 1e-10, "df/dy at (1,2) = 13");
+
+        // Hessian-vector product: backward through grad_x to get H[0,:]*v
+        // where v = [1, 1, ...] (implicit seed)
+        let dx_node = report1.gradient_node(x).expect("dx node");
+        let report_hvp = s
+            .tensor_backward_with_options(dx_node, BackwardOptions::strict_default())
+            .unwrap();
+
+        let hx_x = s.tensor_gradient(&report_hvp, x).expect("d²f/dx²");
+        let hx_y = s.tensor_gradient(&report_hvp, y).expect("d²f/dxdy");
+        // H[0,0] = 2y = 4, H[0,1] = 2x = 2
+        assert!(
+            (hx_x[0] - 4.0).abs() < 1e-10,
+            "d²f/dx² = 2y = 4, got {}",
+            hx_x[0]
+        );
+        assert!(
+            (hx_y[0] - 2.0).abs() < 1e-10,
+            "d²f/dxdy = 2x = 2, got {}",
+            hx_y[0]
+        );
+    }
+
+    #[test]
+    fn create_graph_gradient_penalty_wgan_gp_style() {
+        // WGAN-GP: penalty = ||grad_D(x)||^2
+        // D(x) = sum(x^2) for simplicity
+        // grad_D = 2x, penalty = sum((2x)^2) = 4*sum(x^2)
+        // d(penalty)/dx = 8x
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 3.0], vec![2], true).unwrap();
+        let x2 = s.tensor_mul(x, x).unwrap();
+        let d_out = s.tensor_sum(x2).unwrap();
+
+        let report1 = s
+            .tensor_backward_with_options(
+                d_out,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+
+        let dx = report1.gradient_node(x).expect("gradient node");
+        // Compute ||grad||^2 = sum(grad^2)
+        let grad_sq = s.tensor_mul(dx, dx).unwrap();
+        let penalty = s.tensor_sum(grad_sq).unwrap();
+
+        let report2 = s
+            .tensor_backward_with_options(penalty, BackwardOptions::strict_default())
+            .unwrap();
+
+        let d_penalty = s.tensor_gradient(&report2, x).expect("penalty grad");
+        // d(penalty)/dx = 8x = [8, 24]
+        assert!(
+            (d_penalty[0] - 8.0).abs() < 1e-6,
+            "d(penalty)/dx[0] = 8, got {}",
+            d_penalty[0]
+        );
+        assert!(
+            (d_penalty[1] - 24.0).abs() < 1e-6,
+            "d(penalty)/dx[1] = 24, got {}",
+            d_penalty[1]
+        );
+    }
+
+    #[test]
+    fn create_graph_physics_informed_double_backward() {
+        // PDE residual: d²u/dx² for u(x) = sin(x)
+        // u'(x) = cos(x), u''(x) = -sin(x)
+        // At x = 0.5: u''(0.5) = -sin(0.5)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.5], vec![1], true).unwrap();
+        let u = s.tensor_sin(x).unwrap();
+
+        let report1 = s
+            .tensor_backward_with_options(
+                u,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .unwrap();
+
+        let du_dx = report1.gradient_node(x).expect("du/dx node");
+        let report2 = s
+            .tensor_backward_with_options(du_dx, BackwardOptions::strict_default())
+            .unwrap();
+
+        let d2u_dx2 = s.tensor_gradient(&report2, x).expect("d²u/dx²");
+        let expected = -(0.5_f64).sin();
+        assert!(
+            (d2u_dx2[0] - expected).abs() < 1e-10,
+            "d²sin(x)/dx² = -sin(x) = {}, got {}",
+            expected,
+            d2u_dx2[0]
+        );
+    }
+
+    // ── F32 typed dispatch via session API ─────────────────────────────
+
+    #[test]
+    fn f32_session_sum_mean_pow_preserve_dtype() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0], vec![4], false)
+            .unwrap();
+
+        let sum_id = s.tensor_sum(x).unwrap();
+        assert_eq!(s.tensor_dtype(sum_id).unwrap(), DType::F32);
+        assert_eq!(s.tensor_values_f32(sum_id).unwrap(), vec![10.0f32]);
+
+        let mean_id = s.tensor_mean(x).unwrap();
+        assert_eq!(s.tensor_dtype(mean_id).unwrap(), DType::F32);
+        assert_eq!(s.tensor_values_f32(mean_id).unwrap(), vec![2.5f32]);
+
+        let pow_id = s.tensor_pow(x, 2.0).unwrap();
+        assert_eq!(s.tensor_dtype(pow_id).unwrap(), DType::F32);
+        assert_eq!(
+            s.tensor_values_f32(pow_id).unwrap(),
+            vec![1.0f32, 4.0, 9.0, 16.0]
+        );
+    }
+
+    #[test]
+    fn f32_session_backward_through_typed_reduction() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        // loss = sum(x^2) → dloss/dx = 2x
+        let x2 = s.tensor_pow(x, 2.0).unwrap();
+        let loss = s.tensor_sum(x2).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, x).unwrap();
+        assert!((grad[0] - 2.0).abs() < 1e-4);
+        assert!((grad[1] - 4.0).abs() < 1e-4);
+        assert!((grad[2] - 6.0).abs() < 1e-4);
+    }
+
+    #[test]
+    fn f32_session_training_loop_sgd() {
+        // Train w to fit y=3 from x=1 (y = w*x), all in f32
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut w = s
+            .tensor_variable_f32(vec![0.5f32], vec![1], true)
+            .unwrap();
+
+        for _ in 0..500 {
+            let x = s
+                .tensor_variable_f32(vec![1.0f32], vec![1], false)
+                .unwrap();
+            let target = s
+                .tensor_variable_f32(vec![3.0f32], vec![1], false)
+                .unwrap();
+
+            let pred = s.tensor_mul(w, x).unwrap();
+            let diff = s.tensor_sub(pred, target).unwrap();
+            let loss = s.tensor_pow(diff, 2.0).unwrap();
+            let loss_s = s.tensor_sum(loss).unwrap();
+
+            let report = s.tensor_backward(loss_s).unwrap();
+            let gw = s.tensor_gradient(&report, w).unwrap()[0];
+
+            let w_val = s.tensor_values_f32(w).unwrap()[0] as f64 - 0.01 * gw;
+            s = FrankenTorchSession::new(ExecutionMode::Strict);
+            w = s
+                .tensor_variable_f32(vec![w_val as f32], vec![1], true)
+                .unwrap();
+        }
+
+        let w_final = s.tensor_values_f32(w).unwrap()[0];
+        assert!(
+            (w_final - 3.0).abs() < 0.1,
+            "w should converge to ~3.0, got {w_final}"
+        );
     }
 }

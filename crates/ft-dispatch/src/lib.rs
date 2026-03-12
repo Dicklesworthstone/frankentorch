@@ -20,7 +20,9 @@ use ft_kernel_cpu::{
     // --- f32 binary tensor ops ---
     add_tensor_contiguous_f32,
     add_tensor_contiguous_f64,
+    addmm_tensor_contiguous_f32,
     addmm_tensor_contiguous_f64,
+    addmv_tensor_contiguous_f32,
     addmv_tensor_contiguous_f64,
     asin_scalar,
     asin_tensor_contiguous_f32,
@@ -33,11 +35,13 @@ use ft_kernel_cpu::{
     atan2_tensor_contiguous_f64,
     bmm_tensor_contiguous_f32,
     bmm_tensor_contiguous_f64,
+    cat_tensor_contiguous_f32,
     cat_tensor_contiguous_f64,
     ceil_scalar,
     ceil_tensor_contiguous_f32,
     ceil_tensor_contiguous_f64,
     clamp_scalar,
+    clamp_tensor_contiguous_f32,
     clamp_tensor_contiguous_f64,
     cos_scalar,
     cos_tensor_contiguous_f32,
@@ -45,7 +49,9 @@ use ft_kernel_cpu::{
     cosh_scalar,
     cosh_tensor_contiguous_f32,
     cosh_tensor_contiguous_f64,
+    cumprod_tensor_contiguous_f32,
     cumprod_tensor_contiguous_f64,
+    cumsum_tensor_contiguous_f32,
     cumsum_tensor_contiguous_f64,
     div_scalar,
     div_tensor_contiguous_f32,
@@ -108,8 +114,10 @@ use ft_kernel_cpu::{
     leaky_relu_scalar,
     leaky_relu_tensor_contiguous_f32,
     leaky_relu_tensor_contiguous_f64,
+    lerp_tensor_contiguous_f32,
     lerp_tensor_contiguous_f64,
     log_scalar,
+    log_softmax_dim_tensor_contiguous_f32,
     log_softmax_dim_tensor_contiguous_f64,
     log_tensor_contiguous_f32,
     log_tensor_contiguous_f64,
@@ -129,7 +137,9 @@ use ft_kernel_cpu::{
     max_scalar,
     max_tensor_contiguous_f32,
     max_tensor_contiguous_f64,
+    mean_dim_tensor_contiguous_f32,
     mean_dim_tensor_contiguous_f64,
+    mean_tensor_contiguous_f32,
     mean_tensor_contiguous_f64,
     min_scalar,
     min_tensor_contiguous_f32,
@@ -145,12 +155,16 @@ use ft_kernel_cpu::{
     neg_scalar,
     neg_tensor_contiguous_f32,
     neg_tensor_contiguous_f64,
+    norm_dim_tensor_contiguous_f32,
     norm_dim_tensor_contiguous_f64,
+    norm_tensor_contiguous_f32,
     norm_tensor_contiguous_f64,
     outer_tensor_contiguous_f32,
     outer_tensor_contiguous_f64,
     pow_scalar,
+    pow_tensor_contiguous_f32,
     pow_tensor_contiguous_f64,
+    prod_dim_tensor_contiguous_f32,
     prod_dim_tensor_contiguous_f64,
     reciprocal_scalar,
     reciprocal_tensor_contiguous_f32,
@@ -182,10 +196,12 @@ use ft_kernel_cpu::{
     sinh_scalar,
     sinh_tensor_contiguous_f32,
     sinh_tensor_contiguous_f64,
+    softmax_dim_tensor_contiguous_f32,
     softmax_dim_tensor_contiguous_f64,
     softplus_scalar,
     softplus_tensor_contiguous_f32,
     softplus_tensor_contiguous_f64,
+    sort_tensor_contiguous_f32,
     sort_tensor_contiguous_f64,
     sqrt_scalar,
     sqrt_tensor_contiguous_f32,
@@ -193,12 +209,16 @@ use ft_kernel_cpu::{
     square_scalar,
     square_tensor_contiguous_f32,
     square_tensor_contiguous_f64,
+    stack_tensor_contiguous_f32,
     stack_tensor_contiguous_f64,
+    std_dim_tensor_contiguous_f32,
     std_dim_tensor_contiguous_f64,
     sub_scalar,
     sub_tensor_contiguous_f32,
     sub_tensor_contiguous_f64,
+    sum_dim_tensor_contiguous_f32,
     sum_dim_tensor_contiguous_f64,
+    sum_tensor_contiguous_f32,
     sum_tensor_contiguous_f64,
     tan_scalar,
     tan_tensor_contiguous_f32,
@@ -206,11 +226,14 @@ use ft_kernel_cpu::{
     tanh_scalar,
     tanh_tensor_contiguous_f32,
     tanh_tensor_contiguous_f64,
+    topk_tensor_contiguous_f32,
     topk_tensor_contiguous_f64,
+    trace_tensor_contiguous_f32,
     trace_tensor_contiguous_f64,
     trunc_scalar,
     trunc_tensor_contiguous_f32,
     trunc_tensor_contiguous_f64,
+    var_dim_tensor_contiguous_f32,
     var_dim_tensor_contiguous_f64,
 };
 
@@ -3847,6 +3870,1505 @@ pub fn dispatch_tensor_binary_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+    }
+}
+
+// --- Typed outcome structs for additional ops ---
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedReductionOutcome {
+    pub storage: TensorStorage,
+    pub decision: ReductionDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedReductionDimOutcome {
+    pub storage: TensorStorage,
+    pub decision: ReductionDimDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedPowOutcome {
+    pub storage: TensorStorage,
+    pub decision: PowDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedClampOutcome {
+    pub storage: TensorStorage,
+    pub decision: ClampDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedNormOutcome {
+    pub storage: TensorStorage,
+    pub decision: NormDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedNormDimOutcome {
+    pub storage: TensorStorage,
+    pub decision: NormDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedScanDimOutcome {
+    pub storage: TensorStorage,
+    pub decision: ScanDimDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedNormalizeDimOutcome {
+    pub storage: TensorStorage,
+    pub decision: NormalizeDimDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedSortOutcome {
+    pub storage: TensorStorage,
+    pub indices: Vec<usize>,
+    pub decision: SortDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedTopKOutcome {
+    pub storage: TensorStorage,
+    pub indices: Vec<usize>,
+    pub decision: TopKDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedJoinOutcome {
+    pub storage: TensorStorage,
+    pub decision: JoinDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedLerpOutcome {
+    pub storage: TensorStorage,
+    pub decision: LerpDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedAddmmOutcome {
+    pub storage: TensorStorage,
+    pub decision: AddmmDispatchDecision,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TypedAddmvOutcome {
+    pub storage: TensorStorage,
+    pub decision: AddmmDispatchDecision,
+}
+
+// --- f32 dispatch functions for ops that previously only had f64 variants ---
+
+pub fn dispatch_tensor_reduction_contiguous_f32(
+    op: ReductionOp,
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    requires_grad: bool,
+) -> Result<TensorReductionDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (value, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, ReductionOp::Sum) => (
+            f64::from(sum_tensor_contiguous_f32(input, meta)?),
+            "autograd_cpu::sum_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Mean) => (
+            f64::from(mean_tensor_contiguous_f32(input, meta)?),
+            "autograd_cpu::mean_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Sum) => (
+            f64::from(sum_tensor_contiguous_f32(input, meta)?),
+            "cpu::sum_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Mean) => (
+            f64::from(mean_tensor_contiguous_f32(input, meta)?),
+            "cpu::mean_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Trace) => (
+            f64::from(trace_tensor_contiguous_f32(input, meta)?),
+            "autograd_cpu::trace_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Trace) => (
+            f64::from(trace_tensor_contiguous_f32(input, meta)?),
+            "cpu::trace_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason:
+                    "resolved dispatch key is unsupported for contiguous tensor reduction f32 ops",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorReductionDispatchOutcome {
+        value,
+        decision: ReductionDispatchDecision {
+            op,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_reduction_dim_contiguous_f32(
+    op: ReductionOp,
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TensorReductionDimDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, ReductionOp::Sum) => (
+            sum_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::sum_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Mean) => (
+            mean_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::mean_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Sum) => (
+            sum_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::sum_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Mean) => (
+            mean_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::mean_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Prod) => (
+            prod_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::prod_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Prod) => (
+            prod_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::prod_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Var) => (
+            var_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::var_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Var) => (
+            var_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::var_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Std) => (
+            std_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::std_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Std) => (
+            std_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::std_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor dim reduction f32 ops",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorReductionDimDispatchOutcome {
+        values,
+        decision: ReductionDimDispatchDecision {
+            op,
+            dim,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_pow_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    exponent: f64,
+    requires_grad: bool,
+) -> Result<TensorPowDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            pow_tensor_contiguous_f32(input, meta, exponent as f32)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::pow_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            pow_tensor_contiguous_f32(input, meta, exponent as f32)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::pow_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor pow f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorPowDispatchOutcome {
+        values,
+        decision: PowDispatchDecision {
+            mode,
+            kernel,
+            exponent,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_clamp_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    min_val: f64,
+    max_val: f64,
+    requires_grad: bool,
+) -> Result<TensorClampDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            clamp_tensor_contiguous_f32(input, meta, min_val as f32, max_val as f32)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::clamp_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            clamp_tensor_contiguous_f32(input, meta, min_val as f32, max_val as f32)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::clamp_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor clamp f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorClampDispatchOutcome {
+        values,
+        decision: ClampDispatchDecision {
+            mode,
+            kernel,
+            min_val,
+            max_val,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_norm_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    p: f64,
+    requires_grad: bool,
+) -> Result<TensorNormDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (value, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            f64::from(norm_tensor_contiguous_f32(input, meta, p as f32)?),
+            "autograd_cpu::norm_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            f64::from(norm_tensor_contiguous_f32(input, meta, p as f32)?),
+            "cpu::norm_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor norm f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorNormDispatchOutcome {
+        value,
+        decision: NormDispatchDecision {
+            mode,
+            kernel,
+            p,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_norm_dim_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    p: f64,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TensorNormDimDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            norm_dim_tensor_contiguous_f32(input, meta, p as f32, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::norm_dim_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            norm_dim_tensor_contiguous_f32(input, meta, p as f32, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::norm_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason:
+                    "resolved dispatch key is unsupported for contiguous tensor norm dim f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorNormDimDispatchOutcome {
+        values,
+        decision: NormDispatchDecision {
+            mode,
+            kernel,
+            p,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_scan_dim_contiguous_f32(
+    op: ScanOp,
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TensorScanDimDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, ScanOp::CumSum) => (
+            cumsum_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::cumsum_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ScanOp::CumSum) => (
+            cumsum_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::cumsum_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ScanOp::CumProd) => (
+            cumprod_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::cumprod_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ScanOp::CumProd) => (
+            cumprod_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::cumprod_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason:
+                    "resolved dispatch key is unsupported for contiguous tensor scan f32 ops",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorScanDimDispatchOutcome {
+        values,
+        decision: ScanDimDispatchDecision {
+            op,
+            dim,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_normalize_dim_contiguous_f32(
+    op: NormalizeOp,
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TensorNormalizeDimDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, NormalizeOp::Softmax) => (
+            softmax_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::softmax_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, NormalizeOp::LogSoftmax) => (
+            log_softmax_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::log_softmax_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, NormalizeOp::Softmax) => (
+            softmax_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::softmax_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, NormalizeOp::LogSoftmax) => (
+            log_softmax_dim_tensor_contiguous_f32(input, meta, dim)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::log_softmax_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor normalize dim f32 ops",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorNormalizeDimDispatchOutcome {
+        values,
+        decision: NormalizeDimDispatchDecision {
+            op,
+            dim,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_sort_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    descending: bool,
+    requires_grad: bool,
+) -> Result<TensorSortDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let ((values_f32, indices), kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            sort_tensor_contiguous_f32(input, meta, dim, descending)?,
+            "autograd_cpu::sort_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            sort_tensor_contiguous_f32(input, meta, dim, descending)?,
+            "cpu::sort_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor sort f32 op",
+            }
+            .into());
+        }
+    };
+
+    let values: Vec<f64> = values_f32.into_iter().map(f64::from).collect();
+
+    Ok(TensorSortDispatchOutcome {
+        values,
+        indices,
+        decision: SortDispatchDecision {
+            dim,
+            descending,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_topk_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    k: usize,
+    dim: usize,
+    largest: bool,
+    sorted: bool,
+    requires_grad: bool,
+) -> Result<TensorTopKDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let ((values_f32, indices), kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            topk_tensor_contiguous_f32(input, meta, k, dim, largest, sorted)?,
+            "autograd_cpu::topk_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            topk_tensor_contiguous_f32(input, meta, k, dim, largest, sorted)?,
+            "cpu::topk_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor topk f32 op",
+            }
+            .into());
+        }
+    };
+
+    let values: Vec<f64> = values_f32.into_iter().map(f64::from).collect();
+
+    Ok(TensorTopKDispatchOutcome {
+        values,
+        indices,
+        decision: TopKDispatchDecision {
+            k,
+            dim,
+            largest,
+            sorted,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_join_contiguous_f32(
+    op: JoinOp,
+    mode: ExecutionMode,
+    inputs: &[(&[f32], &TensorMeta)],
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TensorJoinDispatchOutcome, DispatchError> {
+    if inputs.is_empty() {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "join op requires at least one input",
+        }
+        .into());
+    }
+    let first_meta = inputs[0].1;
+    for &(_, meta) in &inputs[1..] {
+        ensure_tensor_meta_compatible(first_meta, meta)?;
+    }
+    let keyset = dispatch_keyset_for_single_tensor_meta(first_meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values_f32, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, JoinOp::Cat) => (
+            cat_tensor_contiguous_f32(inputs, dim)?,
+            "autograd_cpu::cat_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, JoinOp::Stack) => (
+            stack_tensor_contiguous_f32(inputs, dim)?,
+            "autograd_cpu::stack_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, JoinOp::Cat) => (
+            cat_tensor_contiguous_f32(inputs, dim)?,
+            "cpu::cat_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, JoinOp::Stack) => (
+            stack_tensor_contiguous_f32(inputs, dim)?,
+            "cpu::stack_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor join f32 ops",
+            }
+            .into());
+        }
+    };
+
+    let values: Vec<f64> = values_f32.into_iter().map(f64::from).collect();
+
+    Ok(TensorJoinDispatchOutcome {
+        values,
+        decision: JoinDispatchDecision {
+            op,
+            dim,
+            num_inputs: inputs.len(),
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+pub fn dispatch_tensor_lerp_contiguous_f32(
+    mode: ExecutionMode,
+    start: &[f32],
+    end: &[f32],
+    weight: f64,
+    meta: &TensorMeta,
+    requires_grad: bool,
+) -> Result<TensorLerpDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            lerp_tensor_contiguous_f32(start, end, weight as f32, meta)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "autograd_cpu::lerp_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            lerp_tensor_contiguous_f32(start, end, weight as f32, meta)?
+                .into_iter()
+                .map(f64::from)
+                .collect::<Vec<_>>(),
+            "cpu::lerp_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor lerp f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorLerpDispatchOutcome {
+        values,
+        decision: LerpDispatchDecision {
+            mode,
+            kernel,
+            weight,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_addmm_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    mat1: &[f32],
+    mat2: &[f32],
+    input_meta: &TensorMeta,
+    mat1_meta: &TensorMeta,
+    mat2_meta: &TensorMeta,
+    beta: f64,
+    alpha: f64,
+    requires_grad: bool,
+) -> Result<TensorAddmmDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(mat1_meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            addmm_tensor_contiguous_f32(
+                input,
+                mat1,
+                mat2,
+                input_meta,
+                mat1_meta,
+                mat2_meta,
+                beta as f32,
+                alpha as f32,
+            )?
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>(),
+            "autograd_cpu::addmm_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            addmm_tensor_contiguous_f32(
+                input,
+                mat1,
+                mat2,
+                input_meta,
+                mat1_meta,
+                mat2_meta,
+                beta as f32,
+                alpha as f32,
+            )?
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>(),
+            "cpu::addmm_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor addmm f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorAddmmDispatchOutcome {
+        values,
+        decision: AddmmDispatchDecision {
+            mode,
+            kernel,
+            beta,
+            alpha,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_addmv_contiguous_f32(
+    mode: ExecutionMode,
+    input: &[f32],
+    mat: &[f32],
+    vec_data: &[f32],
+    input_meta: &TensorMeta,
+    mat_meta: &TensorMeta,
+    vec_meta: &TensorMeta,
+    beta: f64,
+    alpha: f64,
+    requires_grad: bool,
+) -> Result<TensorAddmvDispatchOutcome, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(mat_meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            addmv_tensor_contiguous_f32(
+                input,
+                mat,
+                vec_data,
+                input_meta,
+                mat_meta,
+                vec_meta,
+                beta as f32,
+                alpha as f32,
+            )?
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>(),
+            "autograd_cpu::addmv_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            addmv_tensor_contiguous_f32(
+                input,
+                mat,
+                vec_data,
+                input_meta,
+                mat_meta,
+                vec_meta,
+                beta as f32,
+                alpha as f32,
+            )?
+            .into_iter()
+            .map(f64::from)
+            .collect::<Vec<_>>(),
+            "cpu::addmv_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor addmv f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorAddmvDispatchOutcome {
+        values,
+        decision: AddmmDispatchDecision {
+            mode,
+            kernel,
+            beta,
+            alpha,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+// --- Typed dispatch wrappers for additional ops (f32/f64 routing) ---
+
+pub fn dispatch_tensor_reduction_contiguous_typed(
+    op: ReductionOp,
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    requires_grad: bool,
+) -> Result<TypedReductionOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome =
+                dispatch_tensor_reduction_contiguous_f64(op, mode, data, meta, requires_grad)?;
+            Ok(TypedReductionOutcome {
+                storage: TensorStorage::F64(vec![outcome.value]),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome =
+                dispatch_tensor_reduction_contiguous_f32(op, mode, data, meta, requires_grad)?;
+            Ok(TypedReductionOutcome {
+                storage: TensorStorage::F32(vec![outcome.value as f32]),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_reduction_dim_contiguous_typed(
+    op: ReductionOp,
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TypedReductionDimOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome = dispatch_tensor_reduction_dim_contiguous_f64(
+                op, mode, data, meta, dim, requires_grad,
+            )?;
+            Ok(TypedReductionDimOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome = dispatch_tensor_reduction_dim_contiguous_f32(
+                op, mode, data, meta, dim, requires_grad,
+            )?;
+            Ok(TypedReductionDimOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_pow_contiguous_typed(
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    exponent: f64,
+    requires_grad: bool,
+) -> Result<TypedPowOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome =
+                dispatch_tensor_pow_contiguous_f64(mode, data, meta, exponent, requires_grad)?;
+            Ok(TypedPowOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome =
+                dispatch_tensor_pow_contiguous_f32(mode, data, meta, exponent, requires_grad)?;
+            Ok(TypedPowOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_clamp_contiguous_typed(
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    min_val: f64,
+    max_val: f64,
+    requires_grad: bool,
+) -> Result<TypedClampOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome = dispatch_tensor_clamp_contiguous_f64(
+                mode, data, meta, min_val, max_val, requires_grad,
+            )?;
+            Ok(TypedClampOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome = dispatch_tensor_clamp_contiguous_f32(
+                mode, data, meta, min_val, max_val, requires_grad,
+            )?;
+            Ok(TypedClampOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_norm_contiguous_typed(
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    p: f64,
+    requires_grad: bool,
+) -> Result<TypedNormOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome =
+                dispatch_tensor_norm_contiguous_f64(mode, data, meta, p, requires_grad)?;
+            Ok(TypedNormOutcome {
+                storage: TensorStorage::F64(vec![outcome.value]),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome =
+                dispatch_tensor_norm_contiguous_f32(mode, data, meta, p, requires_grad)?;
+            Ok(TypedNormOutcome {
+                storage: TensorStorage::F32(vec![outcome.value as f32]),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_norm_dim_contiguous_typed(
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    p: f64,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TypedNormDimOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome =
+                dispatch_tensor_norm_dim_contiguous_f64(mode, data, meta, p, dim, requires_grad)?;
+            Ok(TypedNormDimOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome =
+                dispatch_tensor_norm_dim_contiguous_f32(mode, data, meta, p, dim, requires_grad)?;
+            Ok(TypedNormDimOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_scan_dim_contiguous_typed(
+    op: ScanOp,
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TypedScanDimOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome =
+                dispatch_tensor_scan_dim_contiguous_f64(op, mode, data, meta, dim, requires_grad)?;
+            Ok(TypedScanDimOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome =
+                dispatch_tensor_scan_dim_contiguous_f32(op, mode, data, meta, dim, requires_grad)?;
+            Ok(TypedScanDimOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_normalize_dim_contiguous_typed(
+    op: NormalizeOp,
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TypedNormalizeDimOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome = dispatch_tensor_normalize_dim_contiguous_f64(
+                op, mode, data, meta, dim, requires_grad,
+            )?;
+            Ok(TypedNormalizeDimOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome = dispatch_tensor_normalize_dim_contiguous_f32(
+                op, mode, data, meta, dim, requires_grad,
+            )?;
+            Ok(TypedNormalizeDimOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_sort_contiguous_typed(
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    dim: usize,
+    descending: bool,
+    requires_grad: bool,
+) -> Result<TypedSortOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome = dispatch_tensor_sort_contiguous_f64(
+                mode, data, meta, dim, descending, requires_grad,
+            )?;
+            Ok(TypedSortOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                indices: outcome.indices,
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome = dispatch_tensor_sort_contiguous_f32(
+                mode, data, meta, dim, descending, requires_grad,
+            )?;
+            Ok(TypedSortOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                indices: outcome.indices,
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_topk_contiguous_typed(
+    mode: ExecutionMode,
+    storage: &TensorStorage,
+    meta: &TensorMeta,
+    k: usize,
+    dim: usize,
+    largest: bool,
+    sorted: bool,
+    requires_grad: bool,
+) -> Result<TypedTopKOutcome, DispatchError> {
+    match storage {
+        TensorStorage::F64(data) => {
+            let outcome = dispatch_tensor_topk_contiguous_f64(
+                mode, data, meta, k, dim, largest, sorted, requires_grad,
+            )?;
+            Ok(TypedTopKOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                indices: outcome.indices,
+                decision: outcome.decision,
+            })
+        }
+        TensorStorage::F32(data) => {
+            let outcome = dispatch_tensor_topk_contiguous_f32(
+                mode, data, meta, k, dim, largest, sorted, requires_grad,
+            )?;
+            Ok(TypedTopKOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                indices: outcome.indices,
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+pub fn dispatch_tensor_join_contiguous_typed(
+    op: JoinOp,
+    mode: ExecutionMode,
+    inputs: &[(&TensorStorage, &TensorMeta)],
+    dim: usize,
+    requires_grad: bool,
+) -> Result<TypedJoinOutcome, DispatchError> {
+    if inputs.is_empty() {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "join op requires at least one input",
+        }
+        .into());
+    }
+
+    // Check if any input is F64; if so, promote all to F64.
+    let any_f64 = inputs
+        .iter()
+        .any(|(s, _)| matches!(s, TensorStorage::F64(_)));
+
+    if any_f64 {
+        // Promote all inputs to f64.
+        let promoted: Vec<(Vec<f64>, &TensorMeta)> = inputs
+            .iter()
+            .map(|(storage, meta)| {
+                let data: Vec<f64> = match storage {
+                    TensorStorage::F64(d) => d.clone(),
+                    TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+                };
+                (data, *meta)
+            })
+            .collect();
+        let refs: Vec<(&[f64], &TensorMeta)> = promoted
+            .iter()
+            .map(|(d, m)| (d.as_slice(), *m))
+            .collect();
+        let outcome =
+            dispatch_tensor_join_contiguous_f64(op, mode, &refs, dim, requires_grad)?;
+        Ok(TypedJoinOutcome {
+            storage: TensorStorage::F64(outcome.values),
+            decision: outcome.decision,
+        })
+    } else {
+        // All f32.
+        let f32_inputs: Vec<(Vec<f32>, &TensorMeta)> = inputs
+            .iter()
+            .map(|(storage, meta)| {
+                let data: Vec<f32> = match storage {
+                    TensorStorage::F32(d) => d.clone(),
+                    TensorStorage::F64(d) => d.iter().map(|&v| v as f32).collect(),
+                };
+                (data, *meta)
+            })
+            .collect();
+        let refs: Vec<(&[f32], &TensorMeta)> = f32_inputs
+            .iter()
+            .map(|(d, m)| (d.as_slice(), *m))
+            .collect();
+        let outcome =
+            dispatch_tensor_join_contiguous_f32(op, mode, &refs, dim, requires_grad)?;
+        Ok(TypedJoinOutcome {
+            storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+            decision: outcome.decision,
+        })
+    }
+}
+
+pub fn dispatch_tensor_lerp_contiguous_typed(
+    mode: ExecutionMode,
+    start_storage: &TensorStorage,
+    end_storage: &TensorStorage,
+    weight: f64,
+    meta: &TensorMeta,
+    requires_grad: bool,
+) -> Result<TypedLerpOutcome, DispatchError> {
+    match (start_storage, end_storage) {
+        (TensorStorage::F64(start), TensorStorage::F64(end)) => {
+            let outcome =
+                dispatch_tensor_lerp_contiguous_f64(mode, start, end, weight, meta, requires_grad)?;
+            Ok(TypedLerpOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        (TensorStorage::F32(start), TensorStorage::F32(end)) => {
+            let outcome =
+                dispatch_tensor_lerp_contiguous_f32(mode, start, end, weight, meta, requires_grad)?;
+            Ok(TypedLerpOutcome {
+                storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+                decision: outcome.decision,
+            })
+        }
+        // Mixed dtypes: promote f32 to f64
+        (TensorStorage::F64(start), TensorStorage::F32(end_f32)) => {
+            let end: Vec<f64> = end_f32.iter().map(|&v| f64::from(v)).collect();
+            let outcome =
+                dispatch_tensor_lerp_contiguous_f64(mode, start, &end, weight, meta, requires_grad)?;
+            Ok(TypedLerpOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+        (TensorStorage::F32(start_f32), TensorStorage::F64(end)) => {
+            let start: Vec<f64> = start_f32.iter().map(|&v| f64::from(v)).collect();
+            let outcome =
+                dispatch_tensor_lerp_contiguous_f64(mode, &start, end, weight, meta, requires_grad)?;
+            Ok(TypedLerpOutcome {
+                storage: TensorStorage::F64(outcome.values),
+                decision: outcome.decision,
+            })
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_addmm_contiguous_typed(
+    mode: ExecutionMode,
+    input_storage: &TensorStorage,
+    mat1_storage: &TensorStorage,
+    mat2_storage: &TensorStorage,
+    input_meta: &TensorMeta,
+    mat1_meta: &TensorMeta,
+    mat2_meta: &TensorMeta,
+    beta: f64,
+    alpha: f64,
+    requires_grad: bool,
+) -> Result<TypedAddmmOutcome, DispatchError> {
+    // If any tensor is F64, promote all to F64.
+    let any_f64 = matches!(input_storage, TensorStorage::F64(_))
+        || matches!(mat1_storage, TensorStorage::F64(_))
+        || matches!(mat2_storage, TensorStorage::F64(_));
+
+    if any_f64 {
+        let input_f64: Vec<f64> = match input_storage {
+            TensorStorage::F64(d) => d.clone(),
+            TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+        };
+        let mat1_f64: Vec<f64> = match mat1_storage {
+            TensorStorage::F64(d) => d.clone(),
+            TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+        };
+        let mat2_f64: Vec<f64> = match mat2_storage {
+            TensorStorage::F64(d) => d.clone(),
+            TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+        };
+        let outcome = dispatch_tensor_addmm_contiguous_f64(
+            mode,
+            &input_f64,
+            &mat1_f64,
+            &mat2_f64,
+            input_meta,
+            mat1_meta,
+            mat2_meta,
+            beta,
+            alpha,
+            requires_grad,
+        )?;
+        Ok(TypedAddmmOutcome {
+            storage: TensorStorage::F64(outcome.values),
+            decision: outcome.decision,
+        })
+    } else {
+        let input_f32 = match input_storage {
+            TensorStorage::F32(d) => d.as_slice(),
+            TensorStorage::F64(_) => unreachable!(),
+        };
+        let mat1_f32 = match mat1_storage {
+            TensorStorage::F32(d) => d.as_slice(),
+            TensorStorage::F64(_) => unreachable!(),
+        };
+        let mat2_f32 = match mat2_storage {
+            TensorStorage::F32(d) => d.as_slice(),
+            TensorStorage::F64(_) => unreachable!(),
+        };
+        let outcome = dispatch_tensor_addmm_contiguous_f32(
+            mode,
+            input_f32,
+            mat1_f32,
+            mat2_f32,
+            input_meta,
+            mat1_meta,
+            mat2_meta,
+            beta,
+            alpha,
+            requires_grad,
+        )?;
+        Ok(TypedAddmmOutcome {
+            storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+            decision: outcome.decision,
+        })
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn dispatch_tensor_addmv_contiguous_typed(
+    mode: ExecutionMode,
+    input_storage: &TensorStorage,
+    mat_storage: &TensorStorage,
+    vec_storage: &TensorStorage,
+    input_meta: &TensorMeta,
+    mat_meta: &TensorMeta,
+    vec_meta: &TensorMeta,
+    beta: f64,
+    alpha: f64,
+    requires_grad: bool,
+) -> Result<TypedAddmvOutcome, DispatchError> {
+    // If any tensor is F64, promote all to F64.
+    let any_f64 = matches!(input_storage, TensorStorage::F64(_))
+        || matches!(mat_storage, TensorStorage::F64(_))
+        || matches!(vec_storage, TensorStorage::F64(_));
+
+    if any_f64 {
+        let input_f64: Vec<f64> = match input_storage {
+            TensorStorage::F64(d) => d.clone(),
+            TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+        };
+        let mat_f64: Vec<f64> = match mat_storage {
+            TensorStorage::F64(d) => d.clone(),
+            TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+        };
+        let vec_f64: Vec<f64> = match vec_storage {
+            TensorStorage::F64(d) => d.clone(),
+            TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
+        };
+        let outcome = dispatch_tensor_addmv_contiguous_f64(
+            mode,
+            &input_f64,
+            &mat_f64,
+            &vec_f64,
+            input_meta,
+            mat_meta,
+            vec_meta,
+            beta,
+            alpha,
+            requires_grad,
+        )?;
+        Ok(TypedAddmvOutcome {
+            storage: TensorStorage::F64(outcome.values),
+            decision: outcome.decision,
+        })
+    } else {
+        let input_f32 = match input_storage {
+            TensorStorage::F32(d) => d.as_slice(),
+            TensorStorage::F64(_) => unreachable!(),
+        };
+        let mat_f32 = match mat_storage {
+            TensorStorage::F32(d) => d.as_slice(),
+            TensorStorage::F64(_) => unreachable!(),
+        };
+        let vec_f32 = match vec_storage {
+            TensorStorage::F32(d) => d.as_slice(),
+            TensorStorage::F64(_) => unreachable!(),
+        };
+        let outcome = dispatch_tensor_addmv_contiguous_f32(
+            mode,
+            input_f32,
+            mat_f32,
+            vec_f32,
+            input_meta,
+            mat_meta,
+            vec_meta,
+            beta,
+            alpha,
+            requires_grad,
+        )?;
+        Ok(TypedAddmvOutcome {
+            storage: TensorStorage::F32(outcome.values.iter().map(|&v| v as f32).collect()),
+            decision: outcome.decision,
+        })
     }
 }
 
