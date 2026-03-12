@@ -9398,6 +9398,22 @@ impl CTCLoss {
                     let input_len = il_data[b] as usize;
                     let target_len = tl_data[b] as usize;
 
+                    // Validate lengths are within tensor bounds
+                    if input_len > t_max {
+                        return Err(AutogradError::Dispatch(DispatchError::Key(
+                            DispatchKeyError::IncompatibleSet {
+                                reason: "CTCLoss: input_lengths[b] exceeds T dimension of log_probs",
+                            },
+                        )));
+                    }
+                    if target_len > s_max {
+                        return Err(AutogradError::Dispatch(DispatchError::Key(
+                            DispatchKeyError::IncompatibleSet {
+                                reason: "CTCLoss: target_lengths[b] exceeds S dimension of targets",
+                            },
+                        )));
+                    }
+
                     if target_len == 0 {
                         // Empty target: loss = -sum of log P(blank) at each timestep
                         let mut loss = 0.0;
@@ -9413,7 +9429,15 @@ impl CTCLoss {
                     let lattice_len = 2 * target_len + 1;
                     let mut labels = vec![blank; lattice_len];
                     for i in 0..target_len {
-                        labels[2 * i + 1] = tgt_data[b * s_max + i] as usize;
+                        let label = tgt_data[b * s_max + i] as usize;
+                        if label >= num_classes {
+                            return Err(AutogradError::Dispatch(DispatchError::Key(
+                                DispatchKeyError::IncompatibleSet {
+                                    reason: "CTCLoss: target label >= num_classes",
+                                },
+                            )));
+                        }
+                        labels[2 * i + 1] = label;
                     }
 
                     // Check feasibility: input must be long enough

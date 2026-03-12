@@ -477,7 +477,7 @@ fn bounded(input: &str, max_len: usize) -> String {
 // ── Tensor State Dict Save/Load ─────────────────────────────────────────
 
 use std::collections::BTreeMap;
-use std::io::{Read, Write};
+use std::io::Write;
 use std::path::Path;
 
 use ft_core::{DType, DenseTensor, DenseTensorError, Device, TensorMeta};

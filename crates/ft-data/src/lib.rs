@@ -497,7 +497,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
 
     /// Number of batches in one epoch.
     pub fn num_batches(&self) -> usize {
-        let n = self.dataset.len();
+        let n = self.indices.len();
         if n == 0 || self.config.batch_size == 0 {
             return 0;
         }
@@ -516,7 +516,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
         &mut self,
         session: &mut FrankenTorchSession,
     ) -> Result<Option<Batch>, AutogradError> {
-        let n = self.dataset.len();
+        let n = self.indices.len();
         if self.position >= n {
             return Ok(None);
         }
@@ -570,11 +570,11 @@ fn collate(
     let mut batch_tensors = Vec::with_capacity(num_tensors);
 
     for tensor_idx in 0..num_tensors {
-        let (ref name, ref first_values, ref first_shape) = samples[0].tensors[tensor_idx];
+        let (ref name, _, ref first_shape) = samples[0].tensors[tensor_idx];
 
         // Validate all samples have matching shapes for this tensor
         let sample_numel: usize = first_shape.iter().product();
-        for (s_idx, sample) in samples.iter().enumerate().skip(1) {
+        for sample in samples.iter().skip(1) {
             if sample.tensors.len() != num_tensors {
                 return Err(AutogradError::Dispatch(
                     ft_dispatch::DispatchError::Key(
@@ -590,16 +590,6 @@ fn collate(
                     ft_dispatch::DispatchError::Key(
                         ft_dispatch::DispatchKeyError::IncompatibleSet {
                             reason: "DataLoader: tensor shapes differ across samples in batch",
-                        },
-                    ),
-                ));
-            }
-            let s_numel: usize = s_shape.iter().product();
-            if s_numel != sample_numel {
-                return Err(AutogradError::Dispatch(
-                    ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "DataLoader: tensor numel mismatch across samples",
                         },
                     ),
                 ));
