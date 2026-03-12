@@ -517,7 +517,7 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
         session: &mut FrankenTorchSession,
     ) -> Result<Option<Batch>, AutogradError> {
         let n = self.indices.len();
-        if self.position >= n {
+        if self.position >= n || self.config.batch_size == 0 {
             return Ok(None);
         }
 
