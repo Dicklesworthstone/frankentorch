@@ -4235,6 +4235,23 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// Cast a tensor to the given dtype. Currently supports F32↔F64 casts.
+    /// Returns the input unchanged if already the target dtype.
+    /// Returns an error for non-floating-point target dtypes.
+    pub fn to_dtype(
+        &mut self,
+        input: TensorNodeId,
+        dtype: DType,
+    ) -> Result<TensorNodeId, AutogradError> {
+        match dtype {
+            DType::F32 => self.to_f32(input),
+            DType::F64 => self.to_f64(input),
+            other => Err(AutogradError::DenseTensor(
+                ft_core::DenseTensorError::UnsupportedDType(other),
+            )),
+        }
+    }
+
     pub fn add(
         &mut self,
         lhs: TensorNodeId,
@@ -18423,5 +18440,63 @@ mod tests {
                 panic!("f32 sum should produce F32 storage, not F64");
             }
         }
+    }
+
+    // ── to_dtype tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn to_dtype_f64_to_f32() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.5, 2.5, 3.5], vec![3], false).unwrap();
+        let b = tape.to_dtype(a, DType::F32).unwrap();
+        assert_eq!(tape.dtype(b).unwrap(), DType::F32);
+        assert_eq!(tape.values_f32(b).unwrap(), vec![1.5f32, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn to_dtype_f32_to_f64() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf_f32(vec![1.0f32, 2.0], vec![2], false).unwrap();
+        let b = tape.to_dtype(a, DType::F64).unwrap();
+        assert_eq!(tape.dtype(b).unwrap(), DType::F64);
+        assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0]);
+    }
+
+    #[test]
+    fn to_dtype_noop_same_type() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0], vec![2], false).unwrap();
+        let b = tape.to_dtype(a, DType::F64).unwrap();
+        assert_eq!(a, b); // no-op returns same node
+    }
+
+    #[test]
+    fn to_dtype_rejects_non_float_target() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0], vec![2], false).unwrap();
+        let err = tape.to_dtype(a, DType::I64).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AutogradError::DenseTensor(ft_core::DenseTensorError::UnsupportedDType(DType::I64))
+            ),
+            "expected UnsupportedDType(I64), got {err:?}"
+        );
+    }
+
+    #[test]
+    fn to_dtype_rejects_bool_target() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0], vec![2], false).unwrap();
+        let err = tape.to_dtype(a, DType::Bool).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                AutogradError::DenseTensor(ft_core::DenseTensorError::UnsupportedDType(
+                    DType::Bool
+                ))
+            ),
+            "expected UnsupportedDType(Bool), got {err:?}"
+        );
     }
 }

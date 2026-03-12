@@ -543,6 +543,16 @@ impl FrankenTorchSession {
         self.tensor_to_f64(input)
     }
 
+    /// Cast a tensor to the given dtype.
+    /// Currently supports F32↔F64 casts. Returns unchanged if already target dtype.
+    pub fn tensor_to_dtype(
+        &mut self,
+        input: TensorNodeId,
+        dtype: DType,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_tape.to_dtype(input, dtype)
+    }
+
     pub fn zeros_f32(
         &mut self,
         shape: Vec<usize>,
@@ -16454,5 +16464,82 @@ mod tests {
             (w_final - 3.0).abs() < 0.1,
             "w should converge to ~3.0, got {w_final}"
         );
+    }
+
+    // ── DType promotion and casting tests ──────────────────────────────
+
+    #[test]
+    fn promote_types_via_session_api() {
+        // Verify promote_types is accessible and correct from API level
+        assert_eq!(DType::F32.promote_types(DType::F64), DType::F64);
+        assert_eq!(DType::I32.promote_types(DType::F32), DType::F32);
+        assert_eq!(DType::Bool.promote_types(DType::I64), DType::I64);
+        assert_eq!(DType::I64.promote_types(DType::F32), DType::F32);
+    }
+
+    #[test]
+    fn tensor_to_dtype_f64_to_f32_via_session() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.5, 2.5, 3.5], vec![3], false)
+            .unwrap();
+        assert_eq!(s.tensor_dtype(a).unwrap(), DType::F64);
+
+        let b = s.tensor_to_dtype(a, DType::F32).unwrap();
+        assert_eq!(s.tensor_dtype(b).unwrap(), DType::F32);
+        assert_eq!(s.tensor_values_f32(b).unwrap(), vec![1.5f32, 2.5, 3.5]);
+    }
+
+    #[test]
+    fn tensor_to_dtype_noop_same_type() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let b = s.tensor_to_dtype(a, DType::F64).unwrap();
+        assert_eq!(a, b);
+    }
+
+    #[test]
+    fn tensor_to_dtype_rejects_int_target() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        assert!(s.tensor_to_dtype(a, DType::I32).is_err());
+        assert!(s.tensor_to_dtype(a, DType::I64).is_err());
+        assert!(s.tensor_to_dtype(a, DType::Bool).is_err());
+    }
+
+    #[test]
+    fn mixed_f32_f64_binary_op_promotes_to_f64() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let b = s
+            .tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false)
+            .unwrap();
+        let c = s.tensor_add(a, b).unwrap();
+        assert_eq!(s.tensor_dtype(c).unwrap(), DType::F64);
+        assert_eq!(s.tensor_values(c).unwrap(), vec![11.0, 22.0, 33.0]);
+    }
+
+    #[test]
+    fn existing_f64_tests_still_pass_after_promotion_changes() {
+        // Verify backward compatibility: pure f64 ops work unchanged
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        let y = s
+            .tensor_variable(vec![4.0, 5.0, 6.0], vec![3], true)
+            .unwrap();
+        let z = s.tensor_add(x, y).unwrap();
+        assert_eq!(s.tensor_dtype(z).unwrap(), DType::F64);
+        assert_eq!(s.tensor_values(z).unwrap(), vec![5.0, 7.0, 9.0]);
+        let sum = s.tensor_sum(z).unwrap();
+        let report = s.tensor_backward(sum).unwrap();
+        assert_eq!(s.tensor_gradient(&report, x).unwrap(), &[1.0, 1.0, 1.0]);
     }
 }

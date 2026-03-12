@@ -56,6 +56,30 @@ impl DType {
             _ => None,
         }
     }
+
+    /// Promote two dtypes following PyTorch's promotion hierarchy:
+    /// Bool → I32 → I64 → F32 → F64.
+    ///
+    /// Any pair of dtypes returns the wider type in this hierarchy.
+    /// Int + Float always promotes to the float type (or wider float).
+    /// This matches PyTorch's `torch.promote_types()`.
+    #[must_use]
+    pub fn promote_types(self, other: Self) -> Self {
+        if self == other {
+            return self;
+        }
+        // Assign a rank following PyTorch's promotion hierarchy.
+        let rank = |d: Self| -> u8 {
+            match d {
+                Self::Bool => 0,
+                Self::I32 => 1,
+                Self::I64 => 2,
+                Self::F32 => 3,
+                Self::F64 => 4,
+            }
+        };
+        if rank(self) >= rank(other) { self } else { other }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -2209,5 +2233,93 @@ mod tests {
             err,
             DenseTensorError::UnsupportedDType(DType::I64)
         ));
+    }
+
+    // ── promote_types tests ───────────────────────────────────────────
+
+    #[test]
+    fn promote_types_same_dtype_is_identity() {
+        for dtype in [DType::Bool, DType::I32, DType::I64, DType::F32, DType::F64] {
+            assert_eq!(dtype.promote_types(dtype), dtype);
+        }
+    }
+
+    #[test]
+    fn promote_types_is_symmetric() {
+        let dtypes = [DType::Bool, DType::I32, DType::I64, DType::F32, DType::F64];
+        for &a in &dtypes {
+            for &b in &dtypes {
+                assert_eq!(
+                    a.promote_types(b),
+                    b.promote_types(a),
+                    "promote_types({a:?}, {b:?}) != promote_types({b:?}, {a:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn promote_types_bool_with_integers() {
+        assert_eq!(DType::Bool.promote_types(DType::I32), DType::I32);
+        assert_eq!(DType::Bool.promote_types(DType::I64), DType::I64);
+    }
+
+    #[test]
+    fn promote_types_bool_with_floats() {
+        assert_eq!(DType::Bool.promote_types(DType::F32), DType::F32);
+        assert_eq!(DType::Bool.promote_types(DType::F64), DType::F64);
+    }
+
+    #[test]
+    fn promote_types_int_with_int() {
+        assert_eq!(DType::I32.promote_types(DType::I64), DType::I64);
+    }
+
+    #[test]
+    fn promote_types_int_with_float() {
+        // Int + Float → Float (matching PyTorch: int64 + float32 → float32)
+        assert_eq!(DType::I32.promote_types(DType::F32), DType::F32);
+        assert_eq!(DType::I32.promote_types(DType::F64), DType::F64);
+        assert_eq!(DType::I64.promote_types(DType::F32), DType::F32);
+        assert_eq!(DType::I64.promote_types(DType::F64), DType::F64);
+    }
+
+    #[test]
+    fn promote_types_float_with_float() {
+        assert_eq!(DType::F32.promote_types(DType::F64), DType::F64);
+    }
+
+    #[test]
+    fn promote_types_full_table() {
+        // Exhaustive: every pair produces expected result
+        let expected: &[(DType, DType, DType)] = &[
+            (DType::Bool, DType::Bool, DType::Bool),
+            (DType::Bool, DType::I32, DType::I32),
+            (DType::Bool, DType::I64, DType::I64),
+            (DType::Bool, DType::F32, DType::F32),
+            (DType::Bool, DType::F64, DType::F64),
+            (DType::I32, DType::I32, DType::I32),
+            (DType::I32, DType::I64, DType::I64),
+            (DType::I32, DType::F32, DType::F32),
+            (DType::I32, DType::F64, DType::F64),
+            (DType::I64, DType::I64, DType::I64),
+            (DType::I64, DType::F32, DType::F32),
+            (DType::I64, DType::F64, DType::F64),
+            (DType::F32, DType::F32, DType::F32),
+            (DType::F32, DType::F64, DType::F64),
+            (DType::F64, DType::F64, DType::F64),
+        ];
+        for &(a, b, result) in expected {
+            assert_eq!(
+                a.promote_types(b),
+                result,
+                "promote_types({a:?}, {b:?}) should be {result:?}"
+            );
+            assert_eq!(
+                b.promote_types(a),
+                result,
+                "promote_types({b:?}, {a:?}) should be {result:?} (symmetry)"
+            );
+        }
     }
 }
