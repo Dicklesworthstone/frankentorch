@@ -1,14 +1,14 @@
 #![forbid(unsafe_code)]
 
 use ft_autograd::{
-    AutogradError, BackwardOptions, BackwardReport, ClampOperationEvent, NodeId, OperationEvent,
-    PowOperationEvent, Tape, TensorAddmmOperationEvent, TensorAddmvOperationEvent,
-    TensorBackwardReport, TensorClampOperationEvent, TensorHookHandle, TensorJoinOperationEvent,
-    TensorLerpOperationEvent, TensorNodeId, TensorNormDimOperationEvent, TensorNormOperationEvent,
-    TensorNormalizeDimOperationEvent, TensorOperationEvent, TensorPowOperationEvent,
-    TensorReductionDimOperationEvent, TensorReductionOperationEvent, TensorScanDimOperationEvent,
-    TensorSortOperationEvent, TensorTape, TensorTopKOperationEvent, TensorUnaryOperationEvent,
-    UnaryOperationEvent,
+    AutogradError, BackwardOptions, BackwardReport, ClampOperationEvent, FunctionCtx, NodeId,
+    OperationEvent, PowOperationEvent, Tape, TensorAddmmOperationEvent,
+    TensorAddmvOperationEvent, TensorBackwardReport, TensorClampOperationEvent,
+    TensorHookHandle, TensorJoinOperationEvent, TensorLerpOperationEvent, TensorNodeId,
+    TensorNormDimOperationEvent, TensorNormOperationEvent, TensorNormalizeDimOperationEvent,
+    TensorOperationEvent, TensorPowOperationEvent, TensorReductionDimOperationEvent,
+    TensorReductionOperationEvent, TensorScanDimOperationEvent, TensorSortOperationEvent,
+    TensorTape, TensorTopKOperationEvent, TensorUnaryOperationEvent, UnaryOperationEvent,
 };
 use ft_core::{DType, DenseTensor, ExecutionMode, TensorCompatError, TensorMeta};
 use ft_dispatch::{
@@ -1202,6 +1202,463 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Einstein summation.
+    ///
+    /// Supports 1- and 2-operand equations via compact index notation.
+    /// Decomposes into permute/reshape/matmul/sum operations for backward compatibility.
+    ///
+    /// Examples:
+    /// - `"ij,jk->ik"` — matrix multiply
+    /// - `"ii->"` — trace
+    /// - `"ij->ji"` — transpose
+    /// - `"i,j->ij"` — outer product
+    /// - `"i,i->"` — dot product
+    /// - `"bij,bjk->bik"` — batch matmul
+    pub fn tensor_einsum(
+        &mut self,
+        equation: &str,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let make_err = |reason: &'static str| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+            ))
+        };
+
+        // Parse equation: "subscripts -> output" or just "subscripts" (implicit output)
+        let (input_part, output_part) = if let Some(pos) = equation.find("->") {
+            (&equation[..pos], Some(&equation[pos + 2..]))
+        } else {
+            (equation, None)
+        };
+
+        let input_subs: Vec<&str> = input_part.split(',').collect();
+        if input_subs.len() != tensors.len() {
+            return Err(make_err("einsum: number of subscripts must match number of tensors"));
+        }
+
+        // Validate characters: only lowercase ASCII letters
+        for ch in equation.chars() {
+            if ch != ',' && ch != '-' && ch != '>' && ch != ' ' && !ch.is_ascii_lowercase() {
+                return Err(make_err("einsum: only lowercase ASCII letters allowed in subscripts"));
+            }
+        }
+
+        // Parse subscripts into index lists
+        let input_indices: Vec<Vec<char>> = input_subs
+            .iter()
+            .map(|s| s.chars().filter(|c| c.is_ascii_lowercase()).collect())
+            .collect();
+
+        // Validate shapes match subscripts
+        for (i, indices) in input_indices.iter().enumerate() {
+            let shape = self.tensor_shape(tensors[i])?;
+            if shape.len() != indices.len() {
+                return Err(make_err("einsum: subscript length must match tensor ndim"));
+            }
+        }
+
+        // Build dimension size map
+        let mut dim_sizes: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+        for (i, indices) in input_indices.iter().enumerate() {
+            let shape = self.tensor_shape(tensors[i])?;
+            for (d, &idx) in indices.iter().enumerate() {
+                if let Some(&existing) = dim_sizes.get(&idx) {
+                    if existing != shape[d] {
+                        return Err(make_err(
+                            "einsum: dimension size mismatch for repeated index",
+                        ));
+                    }
+                } else {
+                    dim_sizes.insert(idx, shape[d]);
+                }
+            }
+        }
+
+        // Determine output indices
+        let output_indices: Vec<char> = if let Some(out) = output_part {
+            out.chars().filter(|c| c.is_ascii_lowercase()).collect()
+        } else {
+            // Implicit: sorted unique indices that appear exactly once across all inputs
+            let mut counts: std::collections::HashMap<char, usize> = std::collections::HashMap::new();
+            for indices in &input_indices {
+                for &ch in indices {
+                    *counts.entry(ch).or_insert(0) += 1;
+                }
+            }
+            let mut out: Vec<char> = counts
+                .into_iter()
+                .filter(|(_, count)| *count == 1)
+                .map(|(ch, _)| ch)
+                .collect();
+            out.sort();
+            out
+        };
+
+        // Handle based on number of operands
+        match tensors.len() {
+            1 => self.einsum_unary(&input_indices[0], &output_indices, tensors[0], &dim_sizes),
+            2 => self.einsum_binary(
+                &input_indices[0],
+                &input_indices[1],
+                &output_indices,
+                tensors[0],
+                tensors[1],
+                &dim_sizes,
+            ),
+            _ => {
+                // Multi-operand: pairwise reduction left-to-right
+                // Determine which indices to contract at each step
+                let mut current = tensors[0];
+                let mut current_indices = input_indices[0].clone();
+                for i in 1..tensors.len() {
+                    let rhs_indices = &input_indices[i];
+                    // For intermediate steps, keep all indices needed downstream
+                    let is_last = i == tensors.len() - 1;
+                    let intermediate_out: Vec<char> = if is_last {
+                        output_indices.clone()
+                    } else {
+                        // Keep indices that appear in remaining inputs or final output
+                        let mut needed: std::collections::HashSet<char> = output_indices.iter().copied().collect();
+                        for j in (i + 1)..tensors.len() {
+                            for &ch in &input_indices[j] {
+                                needed.insert(ch);
+                            }
+                        }
+                        let mut out: Vec<char> = current_indices
+                            .iter()
+                            .chain(rhs_indices.iter())
+                            .copied()
+                            .filter(|ch| needed.contains(ch))
+                            .collect();
+                        // Deduplicate while preserving order
+                        let mut seen = std::collections::HashSet::new();
+                        out.retain(|ch| seen.insert(*ch));
+                        out
+                    };
+                    current = self.einsum_binary(
+                        &current_indices,
+                        rhs_indices,
+                        &intermediate_out,
+                        current,
+                        tensors[i],
+                        &dim_sizes,
+                    )?;
+                    current_indices = intermediate_out;
+                }
+                Ok(current)
+            }
+        }
+    }
+
+    fn einsum_unary(
+        &mut self,
+        input_idx: &[char],
+        output_idx: &[char],
+        tensor: TensorNodeId,
+        dim_sizes: &std::collections::HashMap<char, usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let make_err = |reason: &'static str| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+            ))
+        };
+
+        // Check for trace pattern: repeated index in input
+        let mut repeated: Vec<char> = Vec::new();
+        {
+            let mut seen = std::collections::HashSet::new();
+            for &ch in input_idx {
+                if !seen.insert(ch) && !repeated.contains(&ch) {
+                    repeated.push(ch);
+                }
+            }
+        }
+
+        if !repeated.is_empty() {
+            // Trace-like: extract diagonal(s) then sum/permute
+            // For simplicity, handle the common case: "ii->" (trace) and "ii->i" (diagonal)
+            if input_idx.len() == 2 && repeated.len() == 1 {
+                let shape = self.tensor_shape(tensor)?;
+                if shape[0] != shape[1] {
+                    return Err(make_err("einsum: trace requires square matrix"));
+                }
+                if output_idx.is_empty() {
+                    // Trace: sum of diagonal
+                    return self.tensor_trace(tensor);
+                } else if output_idx.len() == 1 && output_idx[0] == repeated[0] {
+                    // Diagonal extraction
+                    let n = shape[0];
+                    let vals = self.tensor_values(tensor)?;
+                    let diag: Vec<f64> = (0..n).map(|i| vals[i * n + i]).collect();
+                    return self.tensor_variable(diag, vec![n], false);
+                }
+            }
+            return Err(make_err(
+                "einsum: unsupported repeated-index pattern for single operand",
+            ));
+        }
+
+        // No repeated indices: transpose + sum over contracted dims
+        // First, figure out which input dims map to which output dims
+        let contract_dims: Vec<usize> = input_idx
+            .iter()
+            .enumerate()
+            .filter(|(_, ch)| !output_idx.contains(ch))
+            .map(|(i, _)| i)
+            .collect();
+
+        let mut current = tensor;
+
+        if output_idx.is_empty() && contract_dims.len() == input_idx.len() {
+            // Sum all elements
+            let shape = self.tensor_shape(current)?;
+            let total: usize = shape.iter().product();
+            let flat = self.tensor_reshape(current, vec![total])?;
+            return self.tensor_sum_dim(flat, 0);
+        }
+
+        // Permute to bring output indices first, then contracted dims
+        let mut perm: Vec<usize> = Vec::with_capacity(input_idx.len());
+        for &out_ch in output_idx {
+            let pos = input_idx
+                .iter()
+                .position(|&ch| ch == out_ch)
+                .ok_or_else(|| make_err("einsum: output index not found in input"))?;
+            perm.push(pos);
+        }
+        for &cd in &contract_dims {
+            perm.push(cd);
+        }
+
+        if perm.len() == input_idx.len() {
+            // Check if permutation is identity
+            let is_identity = perm.iter().enumerate().all(|(i, &v)| v == i);
+            if !is_identity {
+                current = self.tensor_permute(current, perm)?;
+            }
+        }
+
+        // Sum over the trailing (contracted) dimensions from last to first
+        for _ in 0..contract_dims.len() {
+            let shape = self.tensor_shape(current)?;
+            let last_dim = shape.len() - 1;
+            current = self.tensor_sum_dim(current, last_dim)?;
+        }
+
+        // If output is scalar, ensure shape
+        if output_idx.is_empty() {
+            let shape = self.tensor_shape(current)?;
+            if shape != [1] {
+                current = self.tensor_reshape(current, vec![1])?;
+            }
+        }
+
+        Ok(current)
+    }
+
+    fn einsum_binary(
+        &mut self,
+        lhs_idx: &[char],
+        rhs_idx: &[char],
+        output_idx: &[char],
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        _dim_sizes: &std::collections::HashMap<char, usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Categorize indices:
+        // - batch: appear in both inputs AND in output
+        // - contract: appear in both inputs but NOT in output
+        // - free_lhs: appear only in lhs (and in output)
+        // - free_rhs: appear only in rhs (and in output)
+        let lhs_set: std::collections::HashSet<char> = lhs_idx.iter().copied().collect();
+        let rhs_set: std::collections::HashSet<char> = rhs_idx.iter().copied().collect();
+
+        let mut batch_chars: Vec<char> = Vec::new();
+        let mut contract_chars: Vec<char> = Vec::new();
+        let mut free_lhs_chars: Vec<char> = Vec::new();
+        let mut free_rhs_chars: Vec<char> = Vec::new();
+
+        // Process lhs indices in order
+        for &ch in lhs_idx {
+            if rhs_set.contains(&ch) {
+                if output_idx.contains(&ch) {
+                    if !batch_chars.contains(&ch) {
+                        batch_chars.push(ch);
+                    }
+                } else if !contract_chars.contains(&ch) {
+                    contract_chars.push(ch);
+                }
+            } else if !free_lhs_chars.contains(&ch) {
+                free_lhs_chars.push(ch);
+            }
+        }
+        for &ch in rhs_idx {
+            if !lhs_set.contains(&ch) && !free_rhs_chars.contains(&ch) {
+                free_rhs_chars.push(ch);
+            }
+        }
+
+        // Build permutation for lhs: [batch..., free_lhs..., contract...]
+        let lhs_perm: Vec<usize> = batch_chars
+            .iter()
+            .chain(free_lhs_chars.iter())
+            .chain(contract_chars.iter())
+            .map(|ch| lhs_idx.iter().position(|c| c == ch).unwrap())
+            .collect();
+
+        // Build permutation for rhs: [batch..., contract..., free_rhs...]
+        let rhs_perm: Vec<usize> = batch_chars
+            .iter()
+            .chain(contract_chars.iter())
+            .chain(free_rhs_chars.iter())
+            .map(|ch| rhs_idx.iter().position(|c| c == ch).unwrap())
+            .collect();
+
+        let lhs_shape = self.tensor_shape(lhs)?;
+        let rhs_shape = self.tensor_shape(rhs)?;
+
+        // Compute dimension sizes after permutation
+        let batch_size: usize = batch_chars
+            .iter()
+            .map(|ch| lhs_shape[lhs_idx.iter().position(|c| c == ch).unwrap()])
+            .product();
+        let free_lhs_size: usize = free_lhs_chars
+            .iter()
+            .map(|ch| lhs_shape[lhs_idx.iter().position(|c| c == ch).unwrap()])
+            .product();
+        let contract_size: usize = contract_chars
+            .iter()
+            .map(|ch| lhs_shape[lhs_idx.iter().position(|c| c == ch).unwrap()])
+            .product();
+        let free_rhs_size: usize = free_rhs_chars
+            .iter()
+            .map(|ch| rhs_shape[rhs_idx.iter().position(|c| c == ch).unwrap()])
+            .product();
+
+        // Permute tensors
+        let mut lhs_p = lhs;
+        if !lhs_perm.iter().enumerate().all(|(i, &v)| v == i) {
+            lhs_p = self.tensor_permute(lhs_p, lhs_perm)?;
+        }
+        let mut rhs_p = rhs;
+        if !rhs_perm.iter().enumerate().all(|(i, &v)| v == i) {
+            rhs_p = self.tensor_permute(rhs_p, rhs_perm)?;
+        }
+
+        // Handle the case where there are no contractions (element-wise or outer product)
+        if contract_chars.is_empty() && batch_chars.is_empty() {
+            // Outer product case: reshape lhs to [M, 1], rhs to [1, N], matmul
+            let m = free_lhs_size.max(1);
+            let n = free_rhs_size.max(1);
+            let lhs_2d = self.tensor_reshape(lhs_p, vec![m, 1])?;
+            let rhs_2d = self.tensor_reshape(rhs_p, vec![1, n])?;
+            let result = self.tensor_matmul(lhs_2d, rhs_2d)?;
+            // Reshape to output shape
+            let mut out_shape: Vec<usize> = Vec::new();
+            for &ch in output_idx {
+                if free_lhs_chars.contains(&ch) {
+                    out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                } else if free_rhs_chars.contains(&ch) {
+                    out_shape.push(rhs_shape[rhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                }
+            }
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            return self.tensor_reshape(result, out_shape);
+        }
+
+        if contract_chars.is_empty() {
+            // Batch + free only: element-wise multiply with broadcasting
+            let m = free_lhs_size.max(1);
+            let n = free_rhs_size.max(1);
+            let lhs_3d = self.tensor_reshape(lhs_p, vec![batch_size, m, 1])?;
+            let rhs_3d = self.tensor_reshape(rhs_p, vec![batch_size, 1, n])?;
+            let result = self.tensor_bmm(lhs_3d, rhs_3d)?;
+            let mut out_shape: Vec<usize> = Vec::new();
+            for &ch in output_idx {
+                if batch_chars.contains(&ch) {
+                    out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                } else if free_lhs_chars.contains(&ch) {
+                    out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                } else if free_rhs_chars.contains(&ch) {
+                    out_shape.push(rhs_shape[rhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                }
+            }
+            if out_shape.is_empty() {
+                out_shape.push(1);
+            }
+            return self.tensor_reshape(result, out_shape);
+        }
+
+        // General case with contraction
+        let m = free_lhs_size.max(1);
+        let k = contract_size.max(1);
+        let n = free_rhs_size.max(1);
+
+        let result = if batch_chars.is_empty() {
+            // No batch: 2D matmul [M, K] @ [K, N] -> [M, N]
+            let lhs_2d = self.tensor_reshape(lhs_p, vec![m, k])?;
+            let rhs_2d = self.tensor_reshape(rhs_p, vec![k, n])?;
+            self.tensor_matmul(lhs_2d, rhs_2d)?
+        } else {
+            // Batch: 3D bmm [B, M, K] @ [B, K, N] -> [B, M, N]
+            let b = batch_size;
+            let lhs_3d = self.tensor_reshape(lhs_p, vec![b, m, k])?;
+            let rhs_3d = self.tensor_reshape(rhs_p, vec![b, k, n])?;
+            self.tensor_bmm(lhs_3d, rhs_3d)?
+        };
+
+        // Reshape to output shape
+        let mut out_shape: Vec<usize> = Vec::new();
+        for &ch in output_idx {
+            if batch_chars.contains(&ch) {
+                out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+            } else if free_lhs_chars.contains(&ch) {
+                out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+            } else if free_rhs_chars.contains(&ch) {
+                out_shape.push(rhs_shape[rhs_idx.iter().position(|c| *c == ch).unwrap()]);
+            } else if contract_chars.contains(&ch) {
+                out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+            }
+        }
+
+        if out_shape.is_empty() {
+            // Scalar output: already [B, M, N] = [1, 1, 1]
+            let flat = self.tensor_reshape(result, vec![1])?;
+            return Ok(flat);
+        }
+
+        self.tensor_reshape(result, out_shape)
+    }
+
+    /// Apply a custom autograd function.
+    ///
+    /// `forward_fn` receives a `&mut FunctionCtx` and input data (values + shapes),
+    /// returns output (values, shape).
+    ///
+    /// `backward_fn` receives the saved context and incoming gradients,
+    /// returns one `Option<Vec<f64>>` per input.
+    pub fn tensor_apply_function<F, B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(
+            &mut FunctionCtx,
+            &[(&[f64], &[usize])],
+        ) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
+        B: Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.tensor_tape.apply_function(inputs, forward_fn, backward_fn)
+    }
+
     /// Cross product of two 3-element vectors.
     ///
     /// Both inputs must be 1D tensors of length 3.
@@ -2191,6 +2648,38 @@ impl FrankenTorchSession {
         let src_data = self.tensor_tape.values(src)?;
         self.tensor_tape
             .scatter(input, dim, &index_data, index_shape, &src_data)
+    }
+
+    pub fn tensor_scatter_add(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+        src: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let index_data = self.tensor_tape.values(index)?;
+        Self::validate_index_tensor_values(&input_shape, dim, &index_data)?;
+        let index_shape = self.tensor_tape.tensor(index)?.meta().shape().to_vec();
+        let src_data = self.tensor_tape.values(src)?;
+        self.tensor_tape
+            .scatter_add(input, dim, &index_data, index_shape, &src_data)
+    }
+
+    pub fn tensor_index_put(
+        &mut self,
+        input: TensorNodeId,
+        indices: &[TensorNodeId],
+        values: TensorNodeId,
+        accumulate: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let idx_data: Vec<Vec<f64>> = indices
+            .iter()
+            .map(|&idx| self.tensor_tape.values(idx))
+            .collect::<Result<_, _>>()?;
+        let vals_data = self.tensor_tape.values(values)?;
+        self.tensor_tape
+            .index_put(input, &idx_data, &vals_data, accumulate)
     }
 
     pub fn tensor_masked_fill(
@@ -4922,7 +5411,7 @@ impl FrankenTorchSession {
 
 pub use ft_autograd::{
     BackwardOptions as DacBackwardOptions, BackwardReport as DacBackwardReport,
-    NodeId as DacNodeId, ReentrantPolicy as DacReentrantPolicy,
+    FunctionCtx as DacFunctionCtx, NodeId as DacNodeId, ReentrantPolicy as DacReentrantPolicy,
     TensorBackwardReport as DacTensorBackwardReport, TensorNodeId as DacTensorNodeId,
 };
 
@@ -14762,5 +15251,486 @@ mod tests {
         for &v in &vals {
             assert_eq!(v, 0.0);
         }
+    }
+
+    // ── scatter_add tests ────────────────────────────────────────────────
+
+    #[test]
+    fn scatter_add_basic_accumulates() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // input: [0,0,0], src: [1,2,3], index: [0,1,0] => [1+3, 2, 0] = [4, 2, 0]
+        let input = s.tensor_variable(vec![0.0, 0.0, 0.0], vec![1, 3], false).unwrap();
+        let src = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false).unwrap();
+        let idx = s.tensor_variable(vec![0.0, 1.0, 0.0], vec![1, 3], false).unwrap();
+        let result = s.tensor_scatter_add(input, 1, idx, src).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 4.0).abs() < 1e-10);
+        assert!((vals[1] - 2.0).abs() < 1e-10);
+        assert!((vals[2] - 0.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scatter_add_multiple_to_same_position() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // All indices point to 0: input[0] += 1+2+3 = 6
+        let input = s.tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false).unwrap();
+        let src = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let idx = s.tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false).unwrap();
+        let result = s.tensor_scatter_add(input, 0, idx, src).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 16.0).abs() < 1e-10); // 10 + 1 + 2 + 3
+        assert!((vals[1] - 20.0).abs() < 1e-10);
+        assert!((vals[2] - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scatter_add_as_inverse_of_gather() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Gather: select elements then scatter_add back should recover sums
+        let src_data = vec![10.0, 20.0, 30.0, 40.0, 50.0];
+        let src = s.tensor_variable(src_data.clone(), vec![5], false).unwrap();
+        let idx = s.tensor_variable(vec![1.0, 3.0, 4.0], vec![3], false).unwrap();
+        let gathered = s.tensor_gather(src, 0, idx).unwrap();
+        let gathered_vals = s.tensor_values(gathered).unwrap();
+        assert!((gathered_vals[0] - 20.0).abs() < 1e-10);
+        assert!((gathered_vals[1] - 40.0).abs() < 1e-10);
+        assert!((gathered_vals[2] - 50.0).abs() < 1e-10);
+
+        // Scatter_add gathered values back
+        let zeros = s.tensor_variable(vec![0.0; 5], vec![5], false).unwrap();
+        let idx2 = s.tensor_variable(vec![1.0, 3.0, 4.0], vec![3], false).unwrap();
+        let result = s.tensor_scatter_add(zeros, 0, idx2, gathered).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[1] - 20.0).abs() < 1e-10);
+        assert!((vals[3] - 40.0).abs() < 1e-10);
+        assert!((vals[4] - 50.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scatter_add_2d_dim0() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 3x2 input, scatter along dim 0
+        let input = s.tensor_variable(vec![0.0; 6], vec![3, 2], false).unwrap();
+        let src = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        // row 0 of src -> row 2 of output, row 1 of src -> row 0
+        let idx = s.tensor_variable(vec![2.0, 2.0, 0.0, 0.0], vec![2, 2], false).unwrap();
+        let result = s.tensor_scatter_add(input, 0, idx, src).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // row 0: [0+3, 0+4] = [3, 4]
+        assert!((vals[0] - 3.0).abs() < 1e-10);
+        assert!((vals[1] - 4.0).abs() < 1e-10);
+        // row 2: [0+1, 0+2] = [1, 2]
+        assert!((vals[4] - 1.0).abs() < 1e-10);
+        assert!((vals[5] - 2.0).abs() < 1e-10);
+    }
+
+    // ── index_put tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn index_put_basic_overwrite() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 1D: put values at positions 1,3
+        let input = s.tensor_variable(vec![0.0; 5], vec![5], false).unwrap();
+        let idx = s.tensor_variable(vec![1.0, 3.0], vec![2], false).unwrap();
+        let values = s.tensor_variable(vec![10.0, 30.0], vec![2], false).unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![0.0, 10.0, 0.0, 30.0, 0.0]);
+    }
+
+    #[test]
+    fn index_put_accumulate() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Accumulate: add to existing values
+        let input = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], false).unwrap();
+        let idx = s.tensor_variable(vec![1.0, 1.0, 3.0], vec![3], false).unwrap();
+        let values = s.tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false).unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, true).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[1] - 32.0).abs() < 1e-10); // 2 + 10 + 20
+        assert!((vals[2] - 3.0).abs() < 1e-10);
+        assert!((vals[3] - 34.0).abs() < 1e-10); // 4 + 30
+        assert!((vals[4] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn index_put_2d_row_indexing() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 3x3 tensor, put rows at indices [0, 2]
+        let input = s.tensor_variable(vec![0.0; 9], vec![3, 3], false).unwrap();
+        let idx = s.tensor_variable(vec![0.0, 2.0], vec![2], false).unwrap();
+        let values = s.tensor_variable(vec![1.0, 2.0, 3.0, 7.0, 8.0, 9.0], vec![6], false).unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // row 0: [1, 2, 3], row 1: [0, 0, 0], row 2: [7, 8, 9]
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 0.0, 0.0, 0.0, 7.0, 8.0, 9.0]);
+    }
+
+    #[test]
+    fn index_put_2d_element_indexing() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 3x3 tensor, put individual elements via [row_indices, col_indices]
+        let input = s.tensor_variable(vec![0.0; 9], vec![3, 3], false).unwrap();
+        let row_idx = s.tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false).unwrap();
+        let col_idx = s.tensor_variable(vec![2.0, 1.0, 0.0], vec![3], false).unwrap();
+        let values = s.tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false).unwrap();
+        let result = s.tensor_index_put(input, &[row_idx, col_idx], values, false).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // (0,2)=10, (1,1)=20, (2,0)=30
+        assert!((vals[2] - 10.0).abs() < 1e-10);
+        assert!((vals[4] - 20.0).abs() < 1e-10);
+        assert!((vals[6] - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn index_put_scalar_broadcast() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Single value broadcast to all indexed positions
+        let input = s.tensor_variable(vec![0.0; 5], vec![5], false).unwrap();
+        let idx = s.tensor_variable(vec![1.0, 3.0, 4.0], vec![3], false).unwrap();
+        let values = s.tensor_variable(vec![99.0], vec![1], false).unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![0.0, 99.0, 0.0, 99.0, 99.0]);
+    }
+
+    #[test]
+    fn index_put_empty_preserves_input() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Empty indices: no-op (but we need at least 1 index tensor per our impl)
+        // Test with zero-length index
+        let input = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let idx = s.tensor_variable(vec![], vec![0], false).unwrap();
+        let values = s.tensor_variable(vec![], vec![0], false).unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    }
+
+    // ── einsum tests ─────────────────────────────────────────────────────
+
+    #[test]
+    fn einsum_matmul() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // ij,jk->ik is matrix multiply
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let b = s.tensor_variable(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], false).unwrap();
+        let result = s.tensor_einsum("ij,jk->ik", &[a, b]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![2, 2]);
+        let vals = s.tensor_values(result).unwrap();
+        // [1*5+2*7, 1*6+2*8, 3*5+4*7, 3*6+4*8] = [19, 22, 43, 50]
+        assert!((vals[0] - 19.0).abs() < 1e-10);
+        assert!((vals[1] - 22.0).abs() < 1e-10);
+        assert!((vals[2] - 43.0).abs() < 1e-10);
+        assert!((vals[3] - 50.0).abs() < 1e-10);
+
+        // Compare with direct matmul
+        let direct = s.tensor_matmul(a, b).unwrap();
+        let direct_vals = s.tensor_values(direct).unwrap();
+        assert_eq!(vals, direct_vals);
+    }
+
+    #[test]
+    fn einsum_trace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // ii-> is trace
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let result = s.tensor_einsum("ii->", &[a]).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // trace = 1 + 4 = 5
+        assert!((vals[0] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn einsum_transpose() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // ij->ji is transpose
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
+        let result = s.tensor_einsum("ij->ji", &[a]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![3, 2]);
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn einsum_outer_product() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // i,j->ij is outer product
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let b = s.tensor_variable(vec![4.0, 5.0], vec![2], false).unwrap();
+        let result = s.tensor_einsum("i,j->ij", &[a, b]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![3, 2]);
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![4.0, 5.0, 8.0, 10.0, 12.0, 15.0]);
+    }
+
+    #[test]
+    fn einsum_dot_product() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // i,i-> is dot product
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let b = s.tensor_variable(vec![4.0, 5.0, 6.0], vec![3], false).unwrap();
+        let result = s.tensor_einsum("i,i->", &[a, b]).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // 1*4 + 2*5 + 3*6 = 32
+        assert!((vals[0] - 32.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn einsum_batch_matmul() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // bij,bjk->bik is batch matmul
+        // batch=2, i=2, j=2, k=2
+        #[rustfmt::skip]
+        let a = s.tensor_variable(
+            vec![1.0, 0.0, 0.0, 1.0, // batch 0: identity
+                 2.0, 0.0, 0.0, 2.0], // batch 1: 2*identity
+            vec![2, 2, 2], false,
+        ).unwrap();
+        #[rustfmt::skip]
+        let b = s.tensor_variable(
+            vec![1.0, 2.0, 3.0, 4.0,  // batch 0
+                 5.0, 6.0, 7.0, 8.0], // batch 1
+            vec![2, 2, 2], false,
+        ).unwrap();
+        let result = s.tensor_einsum("bij,bjk->bik", &[a, b]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![2, 2, 2]);
+        let vals = s.tensor_values(result).unwrap();
+        // batch 0: identity * [[1,2],[3,4]] = [[1,2],[3,4]]
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[1] - 2.0).abs() < 1e-10);
+        // batch 1: 2*identity * [[5,6],[7,8]] = [[10,12],[14,16]]
+        assert!((vals[4] - 10.0).abs() < 1e-10);
+        assert!((vals[5] - 12.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn einsum_diagonal_extraction() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // ii->i is diagonal extraction
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], vec![3, 3], false).unwrap();
+        let result = s.tensor_einsum("ii->i", &[a]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![3]);
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![1.0, 5.0, 9.0]);
+    }
+
+    #[test]
+    fn einsum_implicit_output() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // No -> means implicit output: sorted unique non-contracted indices
+        // "ij,jk" implies "ij,jk->ik" (j contracted)
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let b = s.tensor_variable(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], false).unwrap();
+        let result = s.tensor_einsum("ij,jk", &[a, b]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![2, 2]);
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 19.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn einsum_invalid_equation_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0; 4], vec![2, 2], false).unwrap();
+        let b = s.tensor_variable(vec![1.0; 4], vec![2, 2], false).unwrap();
+        // Too many subscripts
+        assert!(s.tensor_einsum("ij,jk,kl->il", &[a, b]).is_err());
+        // Invalid characters
+        assert!(s.tensor_einsum("IJ,JK->IK", &[a, b]).is_err());
+    }
+
+    #[test]
+    fn einsum_vector_matrix_mul() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // i,ij->j is vector-matrix multiply
+        let v = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let m = s.tensor_variable(vec![3.0, 4.0, 5.0, 6.0], vec![2, 2], false).unwrap();
+        let result = s.tensor_einsum("i,ij->j", &[v, m]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![2]);
+        let vals = s.tensor_values(result).unwrap();
+        // 1*3+2*5=13, 1*4+2*6=16
+        assert!((vals[0] - 13.0).abs() < 1e-10);
+        assert!((vals[1] - 16.0).abs() < 1e-10);
+    }
+
+    // ---- Custom Autograd Function integration tests ----
+
+    #[test]
+    fn custom_function_identity_api() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true).unwrap();
+
+        let y = s
+            .tensor_apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .unwrap();
+
+        let vals = s.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+
+        let report = s.tensor_backward(y).unwrap();
+        let grad = report.gradient(x).expect("grad");
+        assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_relu_api() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![-1.0, 2.0, -3.0, 4.0], vec![4], true).unwrap();
+
+        let y = s
+            .tensor_apply_function(
+                &[x],
+                |ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                    let relu: Vec<f64> = vals.iter().map(|v| v.max(0.0)).collect();
+                    Ok((relu, shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let saved = &ctx.saved_tensors()[0];
+                    let grad: Vec<f64> = grad_outputs[0]
+                        .iter()
+                        .zip(saved.iter())
+                        .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
+                        .collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .unwrap();
+
+        let vals = s.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![0.0, 2.0, 0.0, 4.0]);
+
+        let report = s.tensor_backward(y).unwrap();
+        let grad = report.gradient(x).expect("grad");
+        assert_eq!(grad, &[0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_straight_through_estimator_api() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.3, 2.7, -0.5], vec![3], true).unwrap();
+
+        let y = s
+            .tensor_apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let rounded: Vec<f64> = vals.iter().map(|v| v.round()).collect();
+                    Ok((rounded, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .unwrap();
+
+        let vals = s.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![1.0, 3.0, -1.0]);
+
+        let report = s.tensor_backward(y).unwrap();
+        let grad = report.gradient(x).expect("grad");
+        assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_multi_input_mul_api() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+        let b = s.tensor_variable(vec![4.0, 5.0], vec![2], true).unwrap();
+
+        let y = s
+            .tensor_apply_function(
+                &[a, b],
+                |ctx, inputs| {
+                    let (a_vals, a_shape) = &inputs[0];
+                    let (b_vals, _) = &inputs[1];
+                    ctx.save_for_backward(a_vals.to_vec(), a_shape.to_vec());
+                    ctx.save_for_backward(b_vals.to_vec(), a_shape.to_vec());
+                    let product: Vec<f64> = a_vals.iter().zip(b_vals.iter()).map(|(x, y)| x * y).collect();
+                    Ok((product, a_shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let saved_a = &ctx.saved_tensors()[0];
+                    let saved_b = &ctx.saved_tensors()[1];
+                    let grad = grad_outputs[0];
+                    let grad_a: Vec<f64> = grad.iter().zip(saved_b.iter()).map(|(g, b)| g * b).collect();
+                    let grad_b: Vec<f64> = grad.iter().zip(saved_a.iter()).map(|(g, a)| g * a).collect();
+                    Ok(vec![Some(grad_a), Some(grad_b)])
+                },
+            )
+            .unwrap();
+
+        let vals = s.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![8.0, 15.0]);
+
+        let report = s.tensor_backward(y).unwrap();
+        assert_eq!(report.gradient(a).unwrap(), &[4.0, 5.0]);
+        assert_eq!(report.gradient(b).unwrap(), &[2.0, 3.0]);
+    }
+
+    #[test]
+    fn custom_function_none_gradient_api() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let b = s.tensor_variable(vec![3.0, 4.0], vec![2], true).unwrap();
+
+        let y = s
+            .tensor_apply_function(
+                &[a, b],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec()), None]),
+            )
+            .unwrap();
+
+        let report = s.tensor_backward(y).unwrap();
+        assert_eq!(report.gradient(a).unwrap(), &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_composed_with_standard_ops_api() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+
+        // Custom triple, then standard neg: result = -(3x)
+        let tripled = s
+            .tensor_apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let t: Vec<f64> = vals.iter().map(|v| v * 3.0).collect();
+                    Ok((t, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| {
+                    let grad: Vec<f64> = grad_outputs[0].iter().map(|g| g * 3.0).collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .unwrap();
+
+        let y = s.tensor_neg(tripled).unwrap();
+
+        let vals = s.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![-6.0, -9.0]);
+
+        let report = s.tensor_backward(y).unwrap();
+        assert_eq!(report.gradient(x).unwrap(), &[-3.0, -3.0]);
     }
 }

@@ -2622,6 +2622,164 @@ pub fn scatter_tensor_contiguous_f64(
     Ok(output)
 }
 
+/// Like `scatter_tensor_contiguous_f64` but **adds** `src` values instead of overwriting.
+///
+/// `output[index[i][j]][j] += src[i][j]` (for dim=0). Multiple indices pointing to the
+/// same location accumulate all contributions.
+pub fn scatter_add_tensor_contiguous_f64(
+    input: &[f64],
+    meta: &TensorMeta,
+    dim: usize,
+    index: &[f64],
+    index_meta: &TensorMeta,
+    src: &[f64],
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    ensure_unary_layout_and_storage(index, index_meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let idx_shape = index_meta.shape();
+    if idx_shape.len() != ndim {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: idx_shape.to_vec(),
+        });
+    }
+    for d in 0..ndim {
+        if d != dim && idx_shape[d] != shape[d] {
+            return Err(KernelError::ShapeMismatch {
+                lhs: shape.to_vec(),
+                rhs: idx_shape.to_vec(),
+            });
+        }
+    }
+    let src_numel = checked_shape_numel(idx_shape, "scatter_add index shape volume overflow")?;
+    if src.len() < src_numel {
+        return Err(KernelError::InsufficientStorage {
+            side: "src",
+            needed: src_numel,
+            available: src.len(),
+        });
+    }
+
+    let dim_size = shape[dim];
+    let idx_dim_size = idx_shape[dim];
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(idx_shape, dim, "scatter_add index shape volume overflow")?;
+    let offset = meta.storage_offset();
+    let numel = meta.numel();
+    let mut output = input[offset..offset + numel].to_vec();
+    let idx_offset = index_meta.storage_offset();
+    let index_data = &index[idx_offset..];
+
+    for outer in 0..outer_size {
+        for r in 0..idx_dim_size {
+            for inner in 0..inner_size {
+                let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
+                let selected = normalize_wrapped_index_value(index_data[idx_pos], dim_size)?;
+                let dst = outer * dim_size * inner_size + selected * inner_size + inner;
+                output[dst] += src[idx_pos];
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+/// Puts `values` at the positions specified by `indices` into a tensor.
+///
+/// `indices` is a list of 1D index tensors, one per indexed dimension (the leading dims).
+/// If `accumulate` is true, values are added; otherwise they overwrite.
+pub fn index_put_tensor_contiguous_f64(
+    input: &[f64],
+    meta: &TensorMeta,
+    indices: &[Vec<f64>],
+    values: &[f64],
+    accumulate: bool,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+
+    if indices.is_empty() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![0],
+        });
+    }
+
+    let num_indexed_dims = indices.len();
+    if num_indexed_dims > ndim {
+        return Err(KernelError::InvalidDimension {
+            dim: num_indexed_dims,
+            ndim,
+        });
+    }
+
+    // All index tensors must have the same length
+    let n_indices = indices[0].len();
+    for idx_tensor in &indices[1..] {
+        if idx_tensor.len() != n_indices {
+            return Err(KernelError::ShapeMismatch {
+                lhs: vec![n_indices],
+                rhs: vec![idx_tensor.len()],
+            });
+        }
+    }
+
+    // Compute the "suffix" size: product of non-indexed dimensions
+    let suffix_size: usize = shape[num_indexed_dims..].iter().product();
+
+    // values must have n_indices * suffix_size elements (or be broadcastable scalar)
+    let values_needed = n_indices * suffix_size;
+    let scalar_broadcast = values.len() == 1 && values_needed > 1;
+    if !scalar_broadcast && values.len() < values_needed {
+        return Err(KernelError::InsufficientStorage {
+            side: "values",
+            needed: values_needed,
+            available: values.len(),
+        });
+    }
+
+    let offset = meta.storage_offset();
+    let numel = meta.numel();
+    let mut output = input[offset..offset + numel].to_vec();
+
+    // Compute strides for the indexed dimensions
+    let mut indexed_strides = vec![0usize; num_indexed_dims];
+    for d in 0..num_indexed_dims {
+        indexed_strides[d] = shape[d + 1..].iter().product();
+    }
+
+    for i in 0..n_indices {
+        // Compute the base offset from the indices
+        let mut base = 0usize;
+        for d in 0..num_indexed_dims {
+            let idx = normalize_wrapped_index_value(indices[d][i], shape[d])?;
+            base += idx * indexed_strides[d];
+        }
+
+        // Write suffix_size values at that offset
+        for s in 0..suffix_size {
+            let val = if scalar_broadcast {
+                values[0]
+            } else {
+                values[i * suffix_size + s]
+            };
+            if accumulate {
+                output[base + s] += val;
+            } else {
+                output[base + s] = val;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 /// Fills positions in the tensor where `mask` is non-zero with the given
 /// `value`. `mask` is expected to contain 0.0 or 1.0 values (as produced by
 /// comparison ops) and must have the same number of elements as `input`.

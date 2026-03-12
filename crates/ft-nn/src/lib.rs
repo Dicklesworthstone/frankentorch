@@ -1562,6 +1562,178 @@ impl Module for Embedding {
     }
 }
 
+/// Embedding bag module that computes sums/means/maxes of bags of embeddings.
+///
+/// Unlike `Embedding`, this does not materialize intermediate per-element embeddings.
+/// Input is `(indices, offsets)` where offsets marks the boundaries of each bag.
+///
+/// Modes: `"sum"`, `"mean"`, `"max"`.
+pub struct EmbeddingBag {
+    weight: TensorNodeId,
+    num_embeddings: usize,
+    embedding_dim: usize,
+    mode: EmbeddingBagMode,
+    padding_idx: Option<usize>,
+}
+
+/// Reduction mode for EmbeddingBag.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EmbeddingBagMode {
+    Sum,
+    Mean,
+    Max,
+}
+
+impl EmbeddingBag {
+    /// Create a new EmbeddingBag with standard normal initialization.
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        num_embeddings: usize,
+        embedding_dim: usize,
+        mode: EmbeddingBagMode,
+        padding_idx: Option<usize>,
+    ) -> Result<Self, AutogradError> {
+        if num_embeddings == 0 || embedding_dim == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "EmbeddingBag requires num_embeddings > 0 and embedding_dim > 0",
+                },
+            )));
+        }
+
+        let weight_init = session.randn(vec![num_embeddings, embedding_dim], false)?;
+        let weight_values = session.tensor_values(weight_init)?;
+        let weight =
+            session.tensor_variable(weight_values, vec![num_embeddings, embedding_dim], true)?;
+
+        Ok(Self {
+            weight,
+            num_embeddings,
+            embedding_dim,
+            mode,
+            padding_idx,
+        })
+    }
+
+    /// Access the weight parameter.
+    #[must_use]
+    pub fn weight(&self) -> TensorNodeId {
+        self.weight
+    }
+
+    /// Forward pass with indices, offsets, and optional per-sample weights.
+    ///
+    /// `indices`: 1D tensor of embedding indices.
+    /// `offsets`: 1D tensor marking the start of each bag.
+    /// `per_sample_weights`: optional 1D tensor of weights (same length as indices).
+    ///
+    /// Returns tensor of shape `[num_bags, embedding_dim]`.
+    pub fn forward_with_offsets(
+        &self,
+        session: &mut FrankenTorchSession,
+        indices: TensorNodeId,
+        offsets: TensorNodeId,
+        per_sample_weights: Option<TensorNodeId>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let indices_vals = session.tensor_values(indices)?;
+        let offsets_vals = session.tensor_values(offsets)?;
+        let weight_vals = session.tensor_values(self.weight)?;
+        let psw = if let Some(w) = per_sample_weights {
+            Some(session.tensor_values(w)?)
+        } else {
+            None
+        };
+
+        let num_bags = offsets_vals.len();
+        let dim = self.embedding_dim;
+        let n_indices = indices_vals.len();
+        let mut output = vec![0.0f64; num_bags * dim];
+
+        for bag in 0..num_bags {
+            let start = offsets_vals[bag] as usize;
+            let end = if bag + 1 < num_bags {
+                offsets_vals[bag + 1] as usize
+            } else {
+                n_indices
+            };
+
+            if start >= end {
+                // Empty bag: leave as zeros
+                continue;
+            }
+
+            let bag_size = end - start;
+            let mut bag_result = vec![0.0f64; dim];
+
+            match self.mode {
+                EmbeddingBagMode::Sum | EmbeddingBagMode::Mean => {
+                    for i in start..end {
+                        let idx = indices_vals[i] as usize;
+                        if Some(idx) == self.padding_idx {
+                            continue;
+                        }
+                        let w = if let Some(ref psw) = psw { psw[i] } else { 1.0 };
+                        for d in 0..dim {
+                            bag_result[d] += w * weight_vals[idx * dim + d];
+                        }
+                    }
+                    if self.mode == EmbeddingBagMode::Mean && bag_size > 0 {
+                        for d in 0..dim {
+                            bag_result[d] /= bag_size as f64;
+                        }
+                    }
+                }
+                EmbeddingBagMode::Max => {
+                    // Initialize with -inf
+                    for d in 0..dim {
+                        bag_result[d] = f64::NEG_INFINITY;
+                    }
+                    for i in start..end {
+                        let idx = indices_vals[i] as usize;
+                        if Some(idx) == self.padding_idx {
+                            continue;
+                        }
+                        for d in 0..dim {
+                            let v = weight_vals[idx * dim + d];
+                            if v > bag_result[d] {
+                                bag_result[d] = v;
+                            }
+                        }
+                    }
+                    // If all were padding, replace -inf with 0
+                    for d in 0..dim {
+                        if bag_result[d] == f64::NEG_INFINITY {
+                            bag_result[d] = 0.0;
+                        }
+                    }
+                }
+            }
+
+            output[bag * dim..(bag + 1) * dim].copy_from_slice(&bag_result);
+        }
+
+        session.tensor_variable(output, vec![num_bags, dim], false)
+    }
+}
+
+impl Module for EmbeddingBag {
+    fn forward(
+        &self,
+        _session: &mut FrankenTorchSession,
+        _input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "EmbeddingBag requires forward_with_offsets, not forward",
+            },
+        )))
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        vec![self.weight]
+    }
+}
+
 /// Batch Normalization over a batch of 2D inputs `[N, C]`.
 ///
 /// Normalizes each feature across the batch dimension using batch statistics
@@ -2587,6 +2759,229 @@ impl Module for Softplus {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         session.tensor_softplus(input)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// PReLU (Parametric ReLU) activation module.
+///
+/// `f(x) = max(0, x) + a * min(0, x)` where `a` is a learnable parameter.
+/// When `num_parameters > 1`, a separate slope is learned per channel.
+pub struct PReLU {
+    weight: TensorNodeId,
+    num_parameters: usize,
+}
+
+impl PReLU {
+    /// Create a PReLU with the given number of parameters and initial slope.
+    ///
+    /// `num_parameters = 1`: single learnable slope for all channels.
+    /// `num_parameters = C`: one learnable slope per channel.
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        num_parameters: usize,
+        init: f64,
+    ) -> Result<Self, AutogradError> {
+        let weight = session.tensor_variable(vec![init; num_parameters], vec![num_parameters], true)?;
+        Ok(Self {
+            weight,
+            num_parameters,
+        })
+    }
+}
+
+impl Module for PReLU {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let input_vals = session.tensor_values(input)?;
+        let weight_vals = session.tensor_values(self.weight)?;
+
+        let numel = input_vals.len();
+        let mut output = Vec::with_capacity(numel);
+
+        if self.num_parameters == 1 {
+            let a = weight_vals[0];
+            for &x in &input_vals {
+                output.push(if x >= 0.0 { x } else { a * x });
+            }
+        } else {
+            // Multi-channel: weight[c] applies to channel c
+            // Determine channel dimension (dim 1 for multi-dim, or dim 0 for 1D)
+            let channels = if input_shape.len() >= 2 { input_shape[1] } else { input_shape[0] };
+            if channels != self.num_parameters {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "PReLU num_parameters must match channel count",
+                    },
+                )));
+            }
+            let spatial: usize = if input_shape.len() >= 2 {
+                input_shape[2..].iter().product()
+            } else {
+                1
+            };
+            let batch = if input_shape.len() >= 2 { input_shape[0] } else { 1 };
+
+            for b in 0..batch {
+                for c in 0..channels {
+                    let a = weight_vals[c];
+                    for s in 0..spatial {
+                        let idx = b * channels * spatial + c * spatial + s;
+                        let x = input_vals[idx];
+                        output.push(if x >= 0.0 { x } else { a * x });
+                    }
+                }
+            }
+        }
+
+        session.tensor_variable(output, input_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        vec![self.weight]
+    }
+}
+
+/// CELU (Continuously Differentiable ELU) activation module.
+///
+/// `f(x) = max(0, x) + min(0, alpha * (exp(x/alpha) - 1))`
+///
+/// Unlike standard ELU, CELU is continuously differentiable everywhere.
+pub struct CELU {
+    alpha: f64,
+}
+
+impl CELU {
+    /// Create a CELU module with the given alpha.
+    #[must_use]
+    pub fn new(alpha: f64) -> Self {
+        Self { alpha }
+    }
+}
+
+impl Module for CELU {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // CELU(x) = max(0, x) + min(0, alpha * (exp(x/alpha) - 1))
+        let input_shape = session.tensor_shape(input)?;
+        let input_vals = session.tensor_values(input)?;
+        let alpha = self.alpha;
+
+        let output: Vec<f64> = input_vals
+            .iter()
+            .map(|&x| {
+                if x >= 0.0 {
+                    x
+                } else {
+                    alpha * ((x / alpha).exp() - 1.0)
+                }
+            })
+            .collect();
+
+        session.tensor_variable(output, input_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// GLU (Gated Linear Unit) activation module.
+///
+/// Splits the input tensor along `dim` into two halves `a` and `b`,
+/// then computes `a * sigmoid(b)`.
+///
+/// Input size along `dim` must be even.
+pub struct GLU {
+    dim: usize,
+}
+
+impl GLU {
+    /// Create a GLU module that splits along the given dimension.
+    #[must_use]
+    pub fn new(dim: usize) -> Self {
+        Self { dim }
+    }
+}
+
+impl Module for GLU {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let dim = self.dim;
+
+        if dim >= input_shape.len() {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GLU: dim out of range",
+                },
+            )));
+        }
+
+        let dim_size = input_shape[dim];
+        if dim_size % 2 != 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "GLU: input size along dim must be even",
+                },
+            )));
+        }
+
+        let half = dim_size / 2;
+        // Split: narrow along dim for first half and second half
+        let a = session.tensor_narrow(input, dim, 0, half)?;
+        let b = session.tensor_narrow(input, dim, half, half)?;
+        let b_sig = session.tensor_sigmoid(b)?;
+        session.tensor_mul(a, b_sig)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Threshold activation module.
+///
+/// `f(x) = x if x > threshold, else value`
+pub struct Threshold {
+    threshold: f64,
+    value: f64,
+}
+
+impl Threshold {
+    /// Create a Threshold module.
+    #[must_use]
+    pub fn new(threshold: f64, value: f64) -> Self {
+        Self { threshold, value }
+    }
+}
+
+impl Module for Threshold {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let input_vals = session.tensor_values(input)?;
+        let output: Vec<f64> = input_vals
+            .iter()
+            .map(|&x| if x > self.threshold { x } else { self.value })
+            .collect();
+        session.tensor_variable(output, input_shape, false)
     }
 
     fn parameters(&self) -> Vec<TensorNodeId> {
@@ -9145,6 +9540,505 @@ impl Module for ZeroPad2d {
     }
 }
 
+/// Reflection padding for 1D inputs (3D tensors `[N, C, L]`).
+///
+/// Pads by reflecting at the boundary: `[a, b, c, d]` with pad=2 -> `[c, b, a, b, c, d, c, b]`.
+/// Padding must be less than the input size.
+pub struct ReflectionPad1d {
+    padding_left: usize,
+    padding_right: usize,
+}
+
+impl ReflectionPad1d {
+    #[must_use]
+    pub fn new(padding: (usize, usize)) -> Self {
+        Self {
+            padding_left: padding.0,
+            padding_right: padding.1,
+        }
+    }
+}
+
+impl Module for ReflectionPad1d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        let l = input_shape[ndim - 1];
+
+        if self.padding_left >= l || self.padding_right >= l {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReflectionPad1d: padding must be < input size",
+                },
+            )));
+        }
+
+        if self.padding_left == 0 && self.padding_right == 0 {
+            return Ok(input);
+        }
+
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 1].iter().product();
+        let new_l = l + self.padding_left + self.padding_right;
+        let mut output = Vec::with_capacity(batch_dims * new_l);
+
+        for b in 0..batch_dims {
+            let row = &vals[b * l..(b + 1) * l];
+            // Left reflection
+            for i in (0..self.padding_left).rev() {
+                output.push(row[i + 1]);
+            }
+            // Original
+            output.extend_from_slice(row);
+            // Right reflection
+            for i in 0..self.padding_right {
+                output.push(row[l - 2 - i]);
+            }
+        }
+
+        let mut new_shape = input_shape;
+        *new_shape.last_mut().unwrap() = new_l;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Reflection padding for 2D inputs (4D tensors `[N, C, H, W]`).
+pub struct ReflectionPad2d {
+    pad_left: usize,
+    pad_right: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+}
+
+impl ReflectionPad2d {
+    #[must_use]
+    pub fn new(padding: (usize, usize, usize, usize)) -> Self {
+        Self {
+            pad_left: padding.0,
+            pad_right: padding.1,
+            pad_top: padding.2,
+            pad_bottom: padding.3,
+        }
+    }
+}
+
+impl Module for ReflectionPad2d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        if ndim < 2 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReflectionPad2d requires at least 2D input",
+                },
+            )));
+        }
+
+        let h = input_shape[ndim - 2];
+        let w = input_shape[ndim - 1];
+
+        if self.pad_top >= h || self.pad_bottom >= h || self.pad_left >= w || self.pad_right >= w {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReflectionPad2d: padding must be < input size",
+                },
+            )));
+        }
+
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 2].iter().product();
+        let new_h = h + self.pad_top + self.pad_bottom;
+        let new_w = w + self.pad_left + self.pad_right;
+        let mut output = Vec::with_capacity(batch_dims * new_h * new_w);
+
+        for b in 0..batch_dims {
+            let plane = &vals[b * h * w..(b + 1) * h * w];
+            for row_out in 0..new_h {
+                let src_row = if row_out < self.pad_top {
+                    self.pad_top - row_out
+                } else if row_out >= self.pad_top + h {
+                    h - 2 - (row_out - self.pad_top - h)
+                } else {
+                    row_out - self.pad_top
+                };
+                let row_data = &plane[src_row * w..(src_row + 1) * w];
+                for col_out in 0..new_w {
+                    let src_col = if col_out < self.pad_left {
+                        self.pad_left - col_out
+                    } else if col_out >= self.pad_left + w {
+                        w - 2 - (col_out - self.pad_left - w)
+                    } else {
+                        col_out - self.pad_left
+                    };
+                    output.push(row_data[src_col]);
+                }
+            }
+        }
+
+        let mut new_shape = input_shape;
+        new_shape[ndim - 2] = new_h;
+        new_shape[ndim - 1] = new_w;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Replication padding for 1D inputs (3D tensors `[N, C, L]`).
+///
+/// Pads by replicating the edge value: `[a, b, c, d]` with pad=2 -> `[a, a, a, b, c, d, d, d]`.
+pub struct ReplicationPad1d {
+    padding_left: usize,
+    padding_right: usize,
+}
+
+impl ReplicationPad1d {
+    #[must_use]
+    pub fn new(padding: (usize, usize)) -> Self {
+        Self {
+            padding_left: padding.0,
+            padding_right: padding.1,
+        }
+    }
+}
+
+impl Module for ReplicationPad1d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        let l = input_shape[ndim - 1];
+
+        if self.padding_left == 0 && self.padding_right == 0 {
+            return Ok(input);
+        }
+
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 1].iter().product();
+        let new_l = l + self.padding_left + self.padding_right;
+        let mut output = Vec::with_capacity(batch_dims * new_l);
+
+        for b in 0..batch_dims {
+            let row = &vals[b * l..(b + 1) * l];
+            for _ in 0..self.padding_left {
+                output.push(row[0]);
+            }
+            output.extend_from_slice(row);
+            for _ in 0..self.padding_right {
+                output.push(row[l - 1]);
+            }
+        }
+
+        let mut new_shape = input_shape;
+        *new_shape.last_mut().unwrap() = new_l;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Replication padding for 2D inputs (4D tensors `[N, C, H, W]`).
+pub struct ReplicationPad2d {
+    pad_left: usize,
+    pad_right: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+}
+
+impl ReplicationPad2d {
+    #[must_use]
+    pub fn new(padding: (usize, usize, usize, usize)) -> Self {
+        Self {
+            pad_left: padding.0,
+            pad_right: padding.1,
+            pad_top: padding.2,
+            pad_bottom: padding.3,
+        }
+    }
+}
+
+impl Module for ReplicationPad2d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        if ndim < 2 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReplicationPad2d requires at least 2D input",
+                },
+            )));
+        }
+
+        let h = input_shape[ndim - 2];
+        let w = input_shape[ndim - 1];
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 2].iter().product();
+        let new_h = h + self.pad_top + self.pad_bottom;
+        let new_w = w + self.pad_left + self.pad_right;
+        let mut output = Vec::with_capacity(batch_dims * new_h * new_w);
+
+        for b in 0..batch_dims {
+            let plane = &vals[b * h * w..(b + 1) * h * w];
+            for row_out in 0..new_h {
+                let src_row = if row_out < self.pad_top {
+                    0
+                } else if row_out >= self.pad_top + h {
+                    h - 1
+                } else {
+                    row_out - self.pad_top
+                };
+                let row_data = &plane[src_row * w..(src_row + 1) * w];
+                for col_out in 0..new_w {
+                    let src_col = if col_out < self.pad_left {
+                        0
+                    } else if col_out >= self.pad_left + w {
+                        w - 1
+                    } else {
+                        col_out - self.pad_left
+                    };
+                    output.push(row_data[src_col]);
+                }
+            }
+        }
+
+        let mut new_shape = input_shape;
+        new_shape[ndim - 2] = new_h;
+        new_shape[ndim - 1] = new_w;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Replication padding for 3D inputs (5D tensors `[N, C, D, H, W]`).
+pub struct ReplicationPad3d {
+    pad_left: usize,
+    pad_right: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+    pad_front: usize,
+    pad_back: usize,
+}
+
+impl ReplicationPad3d {
+    #[must_use]
+    pub fn new(padding: (usize, usize, usize, usize, usize, usize)) -> Self {
+        Self {
+            pad_left: padding.0,
+            pad_right: padding.1,
+            pad_top: padding.2,
+            pad_bottom: padding.3,
+            pad_front: padding.4,
+            pad_back: padding.5,
+        }
+    }
+}
+
+impl Module for ReplicationPad3d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        if ndim < 3 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReplicationPad3d requires at least 3D input",
+                },
+            )));
+        }
+
+        let d = input_shape[ndim - 3];
+        let h = input_shape[ndim - 2];
+        let w = input_shape[ndim - 1];
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 3].iter().product();
+        let new_d = d + self.pad_front + self.pad_back;
+        let new_h = h + self.pad_top + self.pad_bottom;
+        let new_w = w + self.pad_left + self.pad_right;
+        let mut output = Vec::with_capacity(batch_dims * new_d * new_h * new_w);
+
+        for b in 0..batch_dims {
+            let vol = &vals[b * d * h * w..(b + 1) * d * h * w];
+            for di in 0..new_d {
+                let src_d = di.saturating_sub(self.pad_front).min(d - 1);
+                for ri in 0..new_h {
+                    let src_h = ri.saturating_sub(self.pad_top).min(h - 1);
+                    for ci in 0..new_w {
+                        let src_w = ci.saturating_sub(self.pad_left).min(w - 1);
+                        output.push(vol[src_d * h * w + src_h * w + src_w]);
+                    }
+                }
+            }
+        }
+
+        let mut new_shape = input_shape;
+        new_shape[ndim - 3] = new_d;
+        new_shape[ndim - 2] = new_h;
+        new_shape[ndim - 1] = new_w;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Circular padding for 1D inputs (3D tensors `[N, C, L]`).
+///
+/// Wraps around: `[a, b, c, d]` with pad=2 -> `[c, d, a, b, c, d, a, b]`.
+pub struct CircularPad1d {
+    padding_left: usize,
+    padding_right: usize,
+}
+
+impl CircularPad1d {
+    #[must_use]
+    pub fn new(padding: (usize, usize)) -> Self {
+        Self {
+            padding_left: padding.0,
+            padding_right: padding.1,
+        }
+    }
+}
+
+impl Module for CircularPad1d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        let l = input_shape[ndim - 1];
+
+        if self.padding_left == 0 && self.padding_right == 0 {
+            return Ok(input);
+        }
+
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 1].iter().product();
+        let new_l = l + self.padding_left + self.padding_right;
+        let mut output = Vec::with_capacity(batch_dims * new_l);
+
+        for b in 0..batch_dims {
+            let row = &vals[b * l..(b + 1) * l];
+            // Left circular: take from end
+            for i in 0..self.padding_left {
+                let src = ((l as isize - self.padding_left as isize + i as isize) % l as isize + l as isize) as usize % l;
+                output.push(row[src]);
+            }
+            output.extend_from_slice(row);
+            // Right circular: take from beginning
+            for i in 0..self.padding_right {
+                output.push(row[i % l]);
+            }
+        }
+
+        let mut new_shape = input_shape;
+        *new_shape.last_mut().unwrap() = new_l;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+/// Circular padding for 2D inputs (4D tensors `[N, C, H, W]`).
+pub struct CircularPad2d {
+    pad_left: usize,
+    pad_right: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+}
+
+impl CircularPad2d {
+    #[must_use]
+    pub fn new(padding: (usize, usize, usize, usize)) -> Self {
+        Self {
+            pad_left: padding.0,
+            pad_right: padding.1,
+            pad_top: padding.2,
+            pad_bottom: padding.3,
+        }
+    }
+}
+
+impl Module for CircularPad2d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        if ndim < 2 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "CircularPad2d requires at least 2D input",
+                },
+            )));
+        }
+
+        let h = input_shape[ndim - 2];
+        let w = input_shape[ndim - 1];
+        let vals = session.tensor_values(input)?;
+        let batch_dims: usize = input_shape[..ndim - 2].iter().product();
+        let new_h = h + self.pad_top + self.pad_bottom;
+        let new_w = w + self.pad_left + self.pad_right;
+        let mut output = Vec::with_capacity(batch_dims * new_h * new_w);
+
+        for b in 0..batch_dims {
+            let plane = &vals[b * h * w..(b + 1) * h * w];
+            for row_out in 0..new_h {
+                let src_row = ((row_out as isize - self.pad_top as isize) % h as isize + h as isize) as usize % h;
+                let row_data = &plane[src_row * w..(src_row + 1) * w];
+                for col_out in 0..new_w {
+                    let src_col = ((col_out as isize - self.pad_left as isize) % w as isize + w as isize) as usize % w;
+                    output.push(row_data[src_col]);
+                }
+            }
+        }
+
+        let mut new_shape = input_shape;
+        new_shape[ndim - 2] = new_h;
+        new_shape[ndim - 1] = new_w;
+        session.tensor_variable(output, new_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ft_api::FrankenTorchSession;
@@ -15492,5 +16386,421 @@ mod tests {
         assert!(pool7.parameters().is_empty());
         let pool8 = AdaptiveMaxPool3d::new((1, 1, 1));
         assert!(pool8.parameters().is_empty());
+    }
+
+    // ── Activation Module Tests ──────────────────────────────────────────
+
+    #[test]
+    fn prelu_default_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let prelu = PReLU::new(&mut session, 1, 0.25).unwrap();
+        let input = session.tensor_variable(vec![-2.0, -1.0, 0.0, 1.0, 2.0], vec![1, 5], false).unwrap();
+        let output = prelu.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        assert!((vals[0] - (-0.5)).abs() < 1e-10);  // -2 * 0.25
+        assert!((vals[1] - (-0.25)).abs() < 1e-10); // -1 * 0.25
+        assert!((vals[2] - 0.0).abs() < 1e-10);
+        assert!((vals[3] - 1.0).abs() < 1e-10);
+        assert!((vals[4] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn prelu_multichannel() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 2 channels, each with different slope
+        let prelu = PReLU::new(&mut session, 2, 0.1).unwrap();
+        // Set channel slopes to [0.1, 0.5] manually
+        let input = session.tensor_variable(
+            vec![-1.0, -1.0],  // [1, 2] shape: batch=1, channels=2
+            vec![1, 2], false,
+        ).unwrap();
+        let output = prelu.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // Both channels have slope 0.1 (init value)
+        assert!((vals[0] - (-0.1)).abs() < 1e-10);
+        assert!((vals[1] - (-0.1)).abs() < 1e-10);
+    }
+
+    #[test]
+    fn prelu_has_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let prelu = PReLU::new(&mut session, 3, 0.25).unwrap();
+        assert_eq!(prelu.parameters().len(), 1);
+    }
+
+    #[test]
+    fn celu_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let celu = CELU::new(1.0);
+        let input = session.tensor_variable(vec![-2.0, -1.0, 0.0, 1.0, 2.0], vec![5], false).unwrap();
+        let output = celu.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // For alpha=1.0, CELU == ELU
+        assert!((vals[0] - ((-2.0f64).exp() - 1.0)).abs() < 1e-10);
+        assert!((vals[1] - ((-1.0f64).exp() - 1.0)).abs() < 1e-10);
+        assert!((vals[2] - 0.0).abs() < 1e-10);
+        assert!((vals[3] - 1.0).abs() < 1e-10);
+        assert!((vals[4] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn celu_continuity_at_zero() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let celu = CELU::new(2.0);
+        // Values near zero should be continuous
+        let input = session.tensor_variable(
+            vec![-0.001, -0.0001, 0.0, 0.0001, 0.001],
+            vec![5], false,
+        ).unwrap();
+        let output = celu.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // All values should be close to 0
+        for &v in &vals {
+            assert!(v.abs() < 0.01);
+        }
+    }
+
+    #[test]
+    fn glu_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let glu = GLU::new(1);
+        // Input [1, 4] -> split into a=[1,2] and b=[1,2], output = a * sigmoid(b)
+        let input = session.tensor_variable(
+            vec![1.0, 2.0, 0.0, 0.0],
+            vec![1, 4], false,
+        ).unwrap();
+        let output = glu.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        // a = [1, 2], b = [0, 0], sigmoid(0) = 0.5
+        assert!((vals[0] - 0.5).abs() < 1e-10); // 1 * 0.5
+        assert!((vals[1] - 1.0).abs() < 1e-10); // 2 * 0.5
+    }
+
+    #[test]
+    fn glu_odd_size_errors() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let glu = GLU::new(0);
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        assert!(glu.forward(&mut session, input).is_err());
+    }
+
+    #[test]
+    fn threshold_forward() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let threshold = Threshold::new(0.5, -1.0);
+        let input = session.tensor_variable(
+            vec![-1.0, 0.0, 0.5, 0.6, 1.0, 2.0],
+            vec![6], false,
+        ).unwrap();
+        let output = threshold.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // Values <= 0.5 -> -1.0, values > 0.5 -> pass through
+        assert_eq!(vals[0], -1.0);
+        assert_eq!(vals[1], -1.0);
+        assert_eq!(vals[2], -1.0); // 0.5 is NOT > 0.5
+        assert!((vals[3] - 0.6).abs() < 1e-10);
+        assert!((vals[4] - 1.0).abs() < 1e-10);
+        assert!((vals[5] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn threshold_as_relu() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Threshold(0, 0) acts like ReLU
+        let threshold = Threshold::new(0.0, 0.0);
+        let input = session.tensor_variable(vec![-2.0, -1.0, 0.0, 1.0, 2.0], vec![5], false).unwrap();
+        let output = threshold.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn activation_no_parameters() {
+        assert!(CELU::new(1.0).parameters().is_empty());
+        assert!(GLU::new(0).parameters().is_empty());
+        assert!(Threshold::new(0.0, 0.0).parameters().is_empty());
+    }
+
+    // ── Padding Module Tests ─────────────────────────────────────────────
+
+    #[test]
+    fn reflection_pad1d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4] with pad=(2,2) -> [1, 1, 8]
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false).unwrap();
+        let pad = ReflectionPad1d::new((2, 2));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 8]);
+        let vals = session.tensor_values(output).unwrap();
+        // [3, 2, 1, 2, 3, 4, 3, 2]
+        assert_eq!(vals, vec![3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn reflection_pad1d_too_large_errors() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 1, 3], false).unwrap();
+        let pad = ReflectionPad1d::new((3, 0)); // pad >= input size
+        assert!(pad.forward(&mut session, input).is_err());
+    }
+
+    #[test]
+    fn reflection_pad2d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 3, 3] with pad=(1,1,1,1) -> [1, 1, 5, 5]
+        let input = session.tensor_variable(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+            vec![1, 1, 3, 3], false,
+        ).unwrap();
+        let pad = ReflectionPad2d::new((1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 5, 5]);
+        let vals = session.tensor_values(output).unwrap();
+        // Center should be original: row 1, col 1 = 1.0
+        assert!((vals[6] - 1.0).abs() < 1e-10); // (1,1) in 5x5
+        // Top-left corner: reflection of (1,1) = 5.0
+        assert!((vals[0] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn replication_pad1d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false).unwrap();
+        let pad = ReplicationPad1d::new((2, 3));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 9]);
+        let vals = session.tensor_values(output).unwrap();
+        // [1, 1, 1, 2, 3, 4, 4, 4, 4]
+        assert_eq!(vals, vec![1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn replication_pad2d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2, 2] with pad=(1,1,1,1) -> [1, 1, 4, 4]
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false).unwrap();
+        let pad = ReplicationPad2d::new((1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4]);
+        let vals = session.tensor_values(output).unwrap();
+        // Top-left corner should be input[0,0]=1.0
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        // Bottom-right corner should be input[1,1]=4.0
+        assert!((vals[15] - 4.0).abs() < 1e-10);
+        // Center 2x2 should be original
+        assert!((vals[5] - 1.0).abs() < 1e-10);
+        assert!((vals[6] - 2.0).abs() < 1e-10);
+        assert!((vals[9] - 3.0).abs() < 1e-10);
+        assert!((vals[10] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn replication_pad3d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2, 2, 2] with pad=(1,1,0,0,0,0) -> [1, 1, 2, 2, 4]
+        let input = session.tensor_variable(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+            vec![1, 1, 2, 2, 2], false,
+        ).unwrap();
+        let pad = ReplicationPad3d::new((1, 1, 0, 0, 0, 0));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2, 4]);
+        let vals = session.tensor_values(output).unwrap();
+        // First row: [1, 1, 2, 2]
+        assert_eq!(vals[0], 1.0);
+        assert_eq!(vals[1], 1.0);
+        assert_eq!(vals[2], 2.0);
+        assert_eq!(vals[3], 2.0);
+    }
+
+    #[test]
+    fn circular_pad1d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false).unwrap();
+        let pad = CircularPad1d::new((2, 2));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 8]);
+        let vals = session.tensor_values(output).unwrap();
+        // [3, 4, 1, 2, 3, 4, 1, 2]
+        assert_eq!(vals, vec![3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn circular_pad2d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2, 3] with pad=(1,1,1,1) -> [1, 1, 4, 5]
+        let input = session.tensor_variable(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![1, 1, 2, 3], false,
+        ).unwrap();
+        let pad = CircularPad2d::new((1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 5]);
+        let vals = session.tensor_values(output).unwrap();
+        // Center 2x3 should be original data
+        assert!((vals[6] - 1.0).abs() < 1e-10);  // row1, col1
+        assert!((vals[7] - 2.0).abs() < 1e-10);  // row1, col2
+        assert!((vals[8] - 3.0).abs() < 1e-10);  // row1, col3
+    }
+
+    #[test]
+    fn padding_zero_is_identity() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 1, 3], false).unwrap();
+        let pad = ReflectionPad1d::new((0, 0));
+        let output = pad.forward(&mut session, input).unwrap();
+        assert_eq!(output, input);
+    }
+
+    #[test]
+    fn padding_no_parameters() {
+        assert!(ReflectionPad1d::new((1, 1)).parameters().is_empty());
+        assert!(ReflectionPad2d::new((1, 1, 1, 1)).parameters().is_empty());
+        assert!(ReplicationPad1d::new((1, 1)).parameters().is_empty());
+        assert!(ReplicationPad2d::new((1, 1, 1, 1)).parameters().is_empty());
+        assert!(ReplicationPad3d::new((1, 1, 1, 1, 1, 1)).parameters().is_empty());
+        assert!(CircularPad1d::new((1, 1)).parameters().is_empty());
+        assert!(CircularPad2d::new((1, 1, 1, 1)).parameters().is_empty());
+    }
+
+    // ── EmbeddingBag Tests ───────────────────────────────────────────────
+
+    #[test]
+    fn embedding_bag_sum_mode() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 5, 3, EmbeddingBagMode::Sum, None).unwrap();
+
+        // Set weights to known values
+        let weight_vals: Vec<f64> = (0..15).map(|x| x as f64).collect();
+        let weight = session.tensor_variable(weight_vals, vec![5, 3], true).unwrap();
+        let eb = EmbeddingBag {
+            weight, num_embeddings: 5, embedding_dim: 3,
+            mode: EmbeddingBagMode::Sum, padding_idx: None,
+        };
+
+        // 2 bags: bag 0 = indices [0, 2], bag 1 = indices [1, 3, 4]
+        let indices = session.tensor_variable(vec![0.0, 2.0, 1.0, 3.0, 4.0], vec![5], false).unwrap();
+        let offsets = session.tensor_variable(vec![0.0, 2.0], vec![2], false).unwrap();
+
+        let output = eb.forward_with_offsets(&mut session, indices, offsets, None).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![2, 3]);
+        let vals = session.tensor_values(output).unwrap();
+        // bag 0: embed[0] + embed[2] = [0,1,2] + [6,7,8] = [6, 8, 10]
+        assert!((vals[0] - 6.0).abs() < 1e-10);
+        assert!((vals[1] - 8.0).abs() < 1e-10);
+        assert!((vals[2] - 10.0).abs() < 1e-10);
+        // bag 1: embed[1] + embed[3] + embed[4] = [3,4,5] + [9,10,11] + [12,13,14] = [24, 27, 30]
+        assert!((vals[3] - 24.0).abs() < 1e-10);
+        assert!((vals[4] - 27.0).abs() < 1e-10);
+        assert!((vals[5] - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn embedding_bag_mean_mode() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight_vals: Vec<f64> = (0..15).map(|x| x as f64).collect();
+        let weight = session.tensor_variable(weight_vals, vec![5, 3], true).unwrap();
+        let eb = EmbeddingBag {
+            weight, num_embeddings: 5, embedding_dim: 3,
+            mode: EmbeddingBagMode::Mean, padding_idx: None,
+        };
+
+        let indices = session.tensor_variable(vec![0.0, 2.0, 1.0, 3.0, 4.0], vec![5], false).unwrap();
+        let offsets = session.tensor_variable(vec![0.0, 2.0], vec![2], false).unwrap();
+
+        let output = eb.forward_with_offsets(&mut session, indices, offsets, None).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // bag 0: mean of [0,1,2] and [6,7,8] = [3, 4, 5]
+        assert!((vals[0] - 3.0).abs() < 1e-10);
+        assert!((vals[1] - 4.0).abs() < 1e-10);
+        assert!((vals[2] - 5.0).abs() < 1e-10);
+        // bag 1: mean of [3,4,5], [9,10,11], [12,13,14] = [8, 9, 10]
+        assert!((vals[3] - 8.0).abs() < 1e-10);
+        assert!((vals[4] - 9.0).abs() < 1e-10);
+        assert!((vals[5] - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn embedding_bag_max_mode() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight_vals = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0, 7.0, 1.0, 2.0];
+        let weight = session.tensor_variable(weight_vals, vec![3, 3], true).unwrap();
+        let eb = EmbeddingBag {
+            weight, num_embeddings: 3, embedding_dim: 3,
+            mode: EmbeddingBagMode::Max, padding_idx: None,
+        };
+
+        // 1 bag with all 3 embeddings
+        let indices = session.tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false).unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+
+        let output = eb.forward_with_offsets(&mut session, indices, offsets, None).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // max([1,5,3], [4,2,6], [7,1,2]) = [7, 5, 6]
+        assert!((vals[0] - 7.0).abs() < 1e-10);
+        assert!((vals[1] - 5.0).abs() < 1e-10);
+        assert!((vals[2] - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn embedding_bag_per_sample_weights() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight_vals: Vec<f64> = (0..6).map(|x| x as f64).collect();
+        let weight = session.tensor_variable(weight_vals, vec![3, 2], true).unwrap();
+        let eb = EmbeddingBag {
+            weight, num_embeddings: 3, embedding_dim: 2,
+            mode: EmbeddingBagMode::Sum, padding_idx: None,
+        };
+
+        let indices = session.tensor_variable(vec![0.0, 1.0], vec![2], false).unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let psw = session.tensor_variable(vec![2.0, 3.0], vec![2], false).unwrap();
+
+        let output = eb.forward_with_offsets(&mut session, indices, offsets, Some(psw)).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // 2*[0,1] + 3*[2,3] = [0,2] + [6,9] = [6, 11]
+        assert!((vals[0] - 6.0).abs() < 1e-10);
+        assert!((vals[1] - 11.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn embedding_bag_empty_bag() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight_vals: Vec<f64> = (0..6).map(|x| x as f64).collect();
+        let weight = session.tensor_variable(weight_vals, vec![3, 2], true).unwrap();
+        let eb = EmbeddingBag {
+            weight, num_embeddings: 3, embedding_dim: 2,
+            mode: EmbeddingBagMode::Sum, padding_idx: None,
+        };
+
+        // 2 bags: bag 0 is empty (offset 0 to 0), bag 1 has index 1
+        let indices = session.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let offsets = session.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+
+        let output = eb.forward_with_offsets(&mut session, indices, offsets, None).unwrap();
+        let vals = session.tensor_values(output).unwrap();
+        // bag 0: empty -> [0, 0]
+        assert_eq!(vals[0], 0.0);
+        assert_eq!(vals[1], 0.0);
+        // bag 1: embed[1] = [2, 3]
+        assert!((vals[2] - 2.0).abs() < 1e-10);
+        assert!((vals[3] - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn embedding_bag_has_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 10, 4, EmbeddingBagMode::Sum, None).unwrap();
+        assert_eq!(eb.parameters().len(), 1);
     }
 }

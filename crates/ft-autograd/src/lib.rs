@@ -28,8 +28,10 @@ use ft_dispatch::{
 use ft_kernel_cpu::{
     argmax_dim_tensor_contiguous_f64, argmin_dim_tensor_contiguous_f64,
     gather_tensor_contiguous_f64, index_select_tensor_contiguous_f64,
-    masked_fill_tensor_contiguous_f64, max_dim_tensor_contiguous_f64,
-    min_dim_tensor_contiguous_f64, scatter_tensor_contiguous_f64, where_tensor_contiguous_f64,
+    index_put_tensor_contiguous_f64, masked_fill_tensor_contiguous_f64,
+    max_dim_tensor_contiguous_f64, min_dim_tensor_contiguous_f64,
+    scatter_add_tensor_contiguous_f64, scatter_tensor_contiguous_f64,
+    where_tensor_contiguous_f64,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -578,6 +580,20 @@ enum TensorNodeOp {
         index_shape: Vec<usize>,
         input_shape: Vec<usize>,
     },
+    ScatterAdd {
+        input: TensorNodeId,
+        dim: usize,
+        index: Vec<f64>,
+        index_shape: Vec<usize>,
+        input_shape: Vec<usize>,
+    },
+    IndexPut {
+        input: TensorNodeId,
+        indices: Vec<Vec<f64>>,
+        input_shape: Vec<usize>,
+        accumulate: bool,
+        suffix_size: usize,
+    },
     Flip {
         input: TensorNodeId,
         dims: Vec<usize>,
@@ -616,6 +632,10 @@ enum TensorNodeOp {
     },
     CastF64 {
         input: TensorNodeId,
+    },
+    CustomFunction {
+        inputs: Vec<TensorNodeId>,
+        function_id: usize,
     },
 }
 
@@ -1166,6 +1186,70 @@ impl fmt::Debug for TensorHookRegistration {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("TensorHookRegistration")
             .field("id", &self.id)
+            .finish_non_exhaustive()
+    }
+}
+
+/// Context passed to custom autograd functions for saving tensors during forward
+/// and retrieving them during backward.
+#[derive(Debug, Clone)]
+pub struct FunctionCtx {
+    saved_tensors: Vec<Vec<f64>>,
+    saved_shapes: Vec<Vec<usize>>,
+    needs_input_grad: Vec<bool>,
+}
+
+impl FunctionCtx {
+    fn new(needs_input_grad: Vec<bool>) -> Self {
+        Self {
+            saved_tensors: Vec::new(),
+            saved_shapes: Vec::new(),
+            needs_input_grad,
+        }
+    }
+
+    /// Save tensor data for use in the backward pass.
+    pub fn save_for_backward(&mut self, values: Vec<f64>, shape: Vec<usize>) {
+        self.saved_tensors.push(values);
+        self.saved_shapes.push(shape);
+    }
+
+    /// Retrieve saved tensors during backward.
+    #[must_use]
+    pub fn saved_tensors(&self) -> &[Vec<f64>] {
+        &self.saved_tensors
+    }
+
+    /// Retrieve saved tensor shapes during backward.
+    #[must_use]
+    pub fn saved_shapes(&self) -> &[Vec<usize>] {
+        &self.saved_shapes
+    }
+
+    /// Check which inputs require gradient computation.
+    #[must_use]
+    pub fn needs_input_grad(&self) -> &[bool] {
+        &self.needs_input_grad
+    }
+}
+
+type AutogradFunctionBackward = dyn Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+    + Send
+    + Sync
+    + 'static;
+
+#[derive(Clone)]
+struct CustomFunctionRecord {
+    ctx: FunctionCtx,
+    backward_fn: Arc<AutogradFunctionBackward>,
+    input_numel: Vec<usize>,
+}
+
+impl fmt::Debug for CustomFunctionRecord {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("CustomFunctionRecord")
+            .field("ctx", &self.ctx)
+            .field("input_numel", &self.input_numel)
             .finish_non_exhaustive()
     }
 }
@@ -3851,6 +3935,8 @@ pub struct TensorTape {
     consumed: bool,
     consumed_boundary: usize,
     grad_enabled: bool,
+    custom_functions: BTreeMap<usize, CustomFunctionRecord>,
+    next_custom_function_id: usize,
 }
 
 impl Default for TensorTape {
@@ -3863,6 +3949,8 @@ impl Default for TensorTape {
             consumed: false,
             consumed_boundary: 0,
             grad_enabled: true,
+            custom_functions: BTreeMap::new(),
+            next_custom_function_id: 0,
         }
     }
 }
@@ -7247,6 +7335,197 @@ impl TensorTape {
                 index: index_owned,
                 index_shape,
                 input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    pub fn scatter_add(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: &[f64],
+        index_shape: Vec<usize>,
+        src: &[f64],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, input_shape, output_dtype, output_device, requires_grad) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad && self.grad_enabled;
+            let meta = input_node.tensor.meta().clone();
+            let idx_meta =
+                ft_core::TensorMeta::from_shape(index_shape.clone(), meta.dtype(), meta.device());
+            let values = scatter_add_tensor_contiguous_f64(
+                &input_node.tensor.contiguous_values_as_f64()?,
+                &meta,
+                dim,
+                index,
+                &idx_meta,
+                src,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let input_shape = meta.shape().to_vec();
+            (
+                values,
+                input_shape,
+                DType::F64,
+                meta.device(),
+                requires_grad,
+            )
+        };
+
+        let index_owned = index.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(input_shape.clone(), output_dtype, output_device),
+                values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::ScatterAdd {
+                input,
+                dim,
+                index: index_owned,
+                index_shape,
+                input_shape,
+            },
+        });
+        Ok(out)
+    }
+
+    pub fn index_put(
+        &mut self,
+        input: TensorNodeId,
+        indices: &[Vec<f64>],
+        values: &[f64],
+        accumulate: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (output_values, input_shape, output_dtype, output_device, requires_grad, suffix_size) = {
+            let input_node = self.node(input)?;
+            let requires_grad = input_node.requires_grad && self.grad_enabled;
+            let meta = input_node.tensor.meta().clone();
+            let input_data = input_node.tensor.contiguous_values_as_f64()?;
+            let output_values = index_put_tensor_contiguous_f64(
+                &input_data,
+                &meta,
+                indices,
+                values,
+                accumulate,
+            )
+            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let shape = meta.shape();
+            let num_indexed = indices.len();
+            let suffix: usize = shape[num_indexed..].iter().product();
+            let input_shape = shape.to_vec();
+            (
+                output_values,
+                input_shape,
+                DType::F64,
+                meta.device(),
+                requires_grad,
+                suffix,
+            )
+        };
+
+        let indices_owned: Vec<Vec<f64>> = indices.iter().map(|v| v.clone()).collect();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(
+                    input_shape.clone(),
+                    output_dtype,
+                    output_device,
+                ),
+                output_values,
+            )?,
+            requires_grad,
+            op: TensorNodeOp::IndexPut {
+                input,
+                indices: indices_owned,
+                input_shape,
+                accumulate,
+                suffix_size,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Apply a custom autograd function.
+    ///
+    /// The `forward_fn` receives a `&mut FunctionCtx` and the input tensor data
+    /// (values and shapes) and must return output tensor values and shape.
+    ///
+    /// The `backward_fn` receives the saved context and incoming gradient(s)
+    /// and must return one `Option<Vec<f64>>` per input (None for inputs that
+    /// don't need gradient).
+    pub fn apply_function<F, B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(
+            &mut FunctionCtx,
+            &[(&[f64], &[usize])],
+        ) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
+        B: Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut needs_input_grad = Vec::with_capacity(inputs.len());
+        let mut input_data: Vec<(Vec<f64>, Vec<usize>)> = Vec::with_capacity(inputs.len());
+        let mut input_numels: Vec<usize> = Vec::with_capacity(inputs.len());
+        let mut any_requires_grad = false;
+        let mut output_dtype = DType::F64;
+        let mut output_device = Device::Cpu;
+
+        for &input_id in inputs {
+            let node = self.node(input_id)?;
+            let rg = node.requires_grad && self.grad_enabled;
+            needs_input_grad.push(rg);
+            if rg {
+                any_requires_grad = true;
+            }
+            let vals = node.tensor.contiguous_values_as_f64()?;
+            let shape = node.tensor.meta().shape().to_vec();
+            input_numels.push(vals.len());
+            output_dtype = node.tensor.meta().dtype();
+            output_device = node.tensor.meta().device();
+            input_data.push((vals, shape));
+        }
+
+        let mut ctx = FunctionCtx::new(needs_input_grad);
+
+        let refs: Vec<(&[f64], &[usize])> = input_data
+            .iter()
+            .map(|(v, s)| (v.as_slice(), s.as_slice()))
+            .collect();
+        let (output_values, output_shape) = forward_fn(&mut ctx, &refs)?;
+
+        let function_id = self.next_custom_function_id;
+        self.next_custom_function_id += 1;
+
+        self.custom_functions.insert(
+            function_id,
+            CustomFunctionRecord {
+                ctx,
+                backward_fn: Arc::new(backward_fn),
+                input_numel: input_numels,
+            },
+        );
+
+        let inputs_owned = inputs.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                output_values,
+            )?,
+            requires_grad: any_requires_grad,
+            op: TensorNodeOp::CustomFunction {
+                inputs: inputs_owned,
+                function_id,
             },
         });
         Ok(out)
@@ -11283,6 +11562,86 @@ impl TensorTape {
                         rule: "d(scatter(x))/dx=mask_overwritten_to_zero",
                     });
                 }
+                TensorNodeOp::ScatterAdd {
+                    input,
+                    dim: _,
+                    ref index,
+                    ref index_shape,
+                    ref input_shape,
+                } => {
+                    // scatter_add adds src to positions, so gradient for input is
+                    // just the incoming gradient unchanged (the original values are
+                    // preserved, only additions are made).
+                    let input_numel = Self::checked_shape_numel(
+                        input_shape,
+                        "scatter_add backward input shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
+                    let _ = index;
+                    let _ = index_shape;
+
+                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &incoming)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(scatter_add(x))/dx=passthrough",
+                    });
+                }
+                TensorNodeOp::IndexPut {
+                    input,
+                    ref indices,
+                    ref input_shape,
+                    accumulate,
+                    suffix_size,
+                } => {
+                    // For non-accumulate: zero out positions that were overwritten
+                    // For accumulate: gradient passes through unchanged
+                    let input_numel = Self::checked_shape_numel(
+                        input_shape,
+                        "index_put backward input shape volume overflow",
+                    )?;
+                    Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
+
+                    if accumulate {
+                        Self::accumulate_tensor_gradient(input, &mut grads[input.0], &incoming)?;
+                    } else {
+                        let mut contrib = incoming.to_vec();
+                        let n_indices = indices[0].len();
+                        let num_indexed = indices.len();
+
+                        let mut indexed_strides = vec![0usize; num_indexed];
+                        for d in 0..num_indexed {
+                            indexed_strides[d] = input_shape[d + 1..].iter().product();
+                        }
+
+                        for i in 0..n_indices {
+                            let mut base = 0usize;
+                            for d in 0..num_indexed {
+                                let idx = Self::normalize_wrapped_index_float(
+                                    indices[d][i],
+                                    input_shape[d],
+                                    "index_put backward received invalid index value",
+                                    "index_put backward received out-of-bounds index value",
+                                    "index_put backward index conversion overflow",
+                                )?;
+                                base += idx * indexed_strides[d];
+                            }
+                            for s in 0..suffix_size {
+                                contrib[base + s] = 0.0;
+                            }
+                        }
+                        Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    }
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "d(index_put(x))/dx",
+                    });
+                }
                 TensorNodeOp::Flip { input, ref dims } => {
                     // flip is self-inverse: grad_input = flip(grad_out, dims)
                     let output_shape = self.nodes[node_id.0].tensor.meta().shape();
@@ -11580,6 +11939,44 @@ impl TensorTape {
                         rule: "d(cast)/d_input=grad (identity)",
                     });
                 }
+                TensorNodeOp::CustomFunction {
+                    ref inputs,
+                    function_id,
+                } => {
+                    let record = self
+                        .custom_functions
+                        .get(&function_id)
+                        .ok_or(AutogradError::UnknownTensorNode(node_id))?;
+                    let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
+                    let input_grads = (record.backward_fn)(&record.ctx, &grad_outputs)?;
+
+                    if input_grads.len() != inputs.len() {
+                        return Err(AutogradError::TensorGradientShapeMismatch {
+                            node: node_id,
+                            expected: inputs.len(),
+                            actual: input_grads.len(),
+                        });
+                    }
+
+                    let inputs_snapshot = inputs.clone();
+                    for (i, maybe_grad) in input_grads.into_iter().enumerate() {
+                        let input_id = inputs_snapshot[i];
+                        if let Some(grad) = maybe_grad {
+                            Self::accumulate_tensor_gradient(
+                                input_id,
+                                &mut grads[input_id.0],
+                                &grad,
+                            )?;
+                        }
+                        Self::complete_dependency(&mut pending, input_id, &mut queue)?;
+                    }
+
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: incoming.len(),
+                        rule: "custom autograd function backward",
+                    });
+                }
             }
         }
 
@@ -11720,6 +12117,8 @@ impl TensorTape {
                 | TensorNodeOp::IndexSelect { input, .. }
                 | TensorNodeOp::Gather { input, .. }
                 | TensorNodeOp::Scatter { input, .. }
+                | TensorNodeOp::ScatterAdd { input, .. }
+                | TensorNodeOp::IndexPut { input, .. }
                 | TensorNodeOp::Sort { input, .. }
                 | TensorNodeOp::TopK { input, .. }
                 | TensorNodeOp::Flip { input, .. }
@@ -11730,6 +12129,11 @@ impl TensorTape {
                     stack.push(input);
                 }
                 TensorNodeOp::Cat { ref inputs, .. } | TensorNodeOp::Stack { ref inputs, .. } => {
+                    for &id in inputs {
+                        stack.push(id);
+                    }
+                }
+                TensorNodeOp::CustomFunction { ref inputs, .. } => {
                     for &id in inputs {
                         stack.push(id);
                     }
@@ -11863,6 +12267,8 @@ impl TensorTape {
                 | TensorNodeOp::IndexSelect { input, .. }
                 | TensorNodeOp::Gather { input, .. }
                 | TensorNodeOp::Scatter { input, .. }
+                | TensorNodeOp::ScatterAdd { input, .. }
+                | TensorNodeOp::IndexPut { input, .. }
                 | TensorNodeOp::Sort { input, .. }
                 | TensorNodeOp::TopK { input, .. }
                 | TensorNodeOp::Flip { input, .. }
@@ -11873,6 +12279,11 @@ impl TensorTape {
                     pending[input.0] = pending[input.0].saturating_add(1);
                 }
                 TensorNodeOp::Cat { ref inputs, .. } | TensorNodeOp::Stack { ref inputs, .. } => {
+                    for &id in inputs {
+                        pending[id.0] = pending[id.0].saturating_add(1);
+                    }
+                }
+                TensorNodeOp::CustomFunction { ref inputs, .. } => {
                     for &id in inputs {
                         pending[id.0] = pending[id.0].saturating_add(1);
                     }
@@ -16173,5 +16584,352 @@ mod tests {
             err,
             AutogradError::TensorGradientShapeMismatch { .. }
         ));
+    }
+
+    // ---- CustomFunction / apply_function tests ----
+
+    #[test]
+    fn custom_function_identity_forward() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![3], true).expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .expect("identity function");
+
+        let vals = tape.values(y).expect("values");
+        assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn custom_function_identity_backward() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![3], true).expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .expect("identity function");
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_double_forward_backward() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0, 3.0, 5.0], vec![3], true).expect("x");
+
+        // f(x) = 2*x, df/dx = 2
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let doubled: Vec<f64> = vals.iter().map(|v| v * 2.0).collect();
+                    Ok((doubled, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| {
+                    let grad: Vec<f64> = grad_outputs[0].iter().map(|g| g * 2.0).collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("double function");
+
+        let vals = tape.values(y).expect("values");
+        assert_eq!(vals, vec![4.0, 6.0, 10.0]);
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn custom_function_save_for_backward() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0], vec![3], true).expect("x");
+
+        // Custom ReLU: forward = max(0, x), backward = grad * (x > 0)
+        let y = tape
+            .apply_function(
+                &[x],
+                |ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                    let relu: Vec<f64> = vals.iter().map(|v| v.max(0.0)).collect();
+                    Ok((relu, shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let saved = &ctx.saved_tensors()[0];
+                    let grad: Vec<f64> = grad_outputs[0]
+                        .iter()
+                        .zip(saved.iter())
+                        .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
+                        .collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("custom relu");
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        // All inputs > 0, so gradient = 1.0
+        assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_save_for_backward_with_negatives() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![-1.0, 2.0, -3.0, 4.0], vec![4], true)
+            .expect("x");
+
+        // Custom ReLU with negatives
+        let y = tape
+            .apply_function(
+                &[x],
+                |ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                    let relu: Vec<f64> = vals.iter().map(|v| v.max(0.0)).collect();
+                    Ok((relu, shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let saved = &ctx.saved_tensors()[0];
+                    let grad: Vec<f64> = grad_outputs[0]
+                        .iter()
+                        .zip(saved.iter())
+                        .map(|(g, &x)| if x > 0.0 { *g } else { 0.0 })
+                        .collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("custom relu");
+
+        let vals = tape.values(y).expect("values");
+        assert_eq!(vals, vec![0.0, 2.0, 0.0, 4.0]);
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_straight_through_estimator() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.3, 2.7, -0.5], vec![3], true)
+            .expect("x");
+
+        // STE: forward = round(x), backward = grad (straight-through)
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let rounded: Vec<f64> = vals.iter().map(|v| v.round()).collect();
+                    Ok((rounded, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .expect("STE");
+
+        let vals = tape.values(y).expect("values");
+        assert_eq!(vals, vec![1.0, 3.0, -1.0]);
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_multi_input() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![2.0, 3.0], vec![2], true).expect("a");
+        let b = tape.leaf(vec![4.0, 5.0], vec![2], true).expect("b");
+
+        // f(a, b) = a * b; grad_a = grad * b, grad_b = grad * a
+        let y = tape
+            .apply_function(
+                &[a, b],
+                |ctx, inputs| {
+                    let (a_vals, a_shape) = &inputs[0];
+                    let (b_vals, _b_shape) = &inputs[1];
+                    ctx.save_for_backward(a_vals.to_vec(), a_shape.to_vec());
+                    ctx.save_for_backward(b_vals.to_vec(), a_shape.to_vec());
+                    let product: Vec<f64> = a_vals
+                        .iter()
+                        .zip(b_vals.iter())
+                        .map(|(x, y)| x * y)
+                        .collect();
+                    Ok((product, a_shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let saved_a = &ctx.saved_tensors()[0];
+                    let saved_b = &ctx.saved_tensors()[1];
+                    let grad = grad_outputs[0];
+                    let grad_a: Vec<f64> =
+                        grad.iter().zip(saved_b.iter()).map(|(g, b)| g * b).collect();
+                    let grad_b: Vec<f64> =
+                        grad.iter().zip(saved_a.iter()).map(|(g, a)| g * a).collect();
+                    Ok(vec![Some(grad_a), Some(grad_b)])
+                },
+            )
+            .expect("mul function");
+
+        let vals = tape.values(y).expect("values");
+        assert_eq!(vals, vec![8.0, 15.0]);
+
+        let report = tape.backward(y).expect("backward");
+        let grad_a = report.gradient(a).expect("gradient a");
+        let grad_b = report.gradient(b).expect("gradient b");
+        // grad_a = grad * b = [1,1] * [4,5] = [4,5]
+        assert_eq!(grad_a, &[4.0, 5.0]);
+        // grad_b = grad * a = [1,1] * [2,3] = [2,3]
+        assert_eq!(grad_b, &[2.0, 3.0]);
+    }
+
+    #[test]
+    fn custom_function_none_gradient_for_input() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("a");
+        let b = tape.leaf(vec![3.0, 4.0], vec![2], true).expect("b");
+
+        // Function that only depends on first input, returns None for second
+        let y = tape
+            .apply_function(
+                &[a, b],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec()), None]),
+            )
+            .expect("partial grad function");
+
+        let report = tape.backward(y).expect("backward");
+        let grad_a = report.gradient(a).expect("gradient a");
+        assert_eq!(grad_a, &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_needs_input_grad() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0], vec![1], true).expect("a");
+        let b = tape.leaf(vec![2.0], vec![1], false).expect("b no grad");
+
+        let needs_grad_observed = Arc::new(Mutex::new(Vec::new()));
+        let needs_grad_clone = Arc::clone(&needs_grad_observed);
+
+        let y = tape
+            .apply_function(
+                &[a, b],
+                |ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                move |ctx, grad_outputs| {
+                    let mut lock = needs_grad_clone.lock().unwrap();
+                    *lock = ctx.needs_input_grad().to_vec();
+                    Ok(vec![Some(grad_outputs[0].to_vec()), None])
+                },
+            )
+            .expect("function");
+
+        let report = tape.backward(y).expect("backward");
+        let observed = needs_grad_observed.lock().unwrap();
+        assert_eq!(*observed, vec![true, false]);
+    }
+
+    #[test]
+    fn custom_function_composed_with_standard_ops() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0, 3.0], vec![2], true).expect("x");
+
+        // Custom: f(x) = x * 3, then standard neg
+        let tripled = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let tripled: Vec<f64> = vals.iter().map(|v| v * 3.0).collect();
+                    Ok((tripled, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| {
+                    let grad: Vec<f64> = grad_outputs[0].iter().map(|g| g * 3.0).collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("triple");
+
+        let (y, _) = tape.neg(tripled, ExecutionMode::Strict).expect("neg");
+
+        let vals = tape.values(y).expect("values");
+        assert_eq!(vals, vec![-6.0, -9.0]);
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient");
+        // d/dx(-3x) = -3
+        assert_eq!(grad, &[-3.0, -3.0]);
+    }
+
+    #[test]
+    fn custom_function_no_saved_tensors() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![5.0], vec![1], true).expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |ctx, inputs| {
+                    // Don't save anything
+                    assert!(ctx.saved_tensors().is_empty());
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    assert!(ctx.saved_tensors().is_empty());
+                    Ok(vec![Some(grad_outputs[0].to_vec())])
+                },
+            )
+            .expect("no-save function");
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient");
+        assert_eq!(grad, &[1.0]);
+    }
+
+    #[test]
+    fn custom_function_grad_fn_label() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0], vec![1], true).expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .expect("function");
+
+        let label = tape.tensor_grad_fn(y).expect("grad_fn").expect("Some");
+        assert_eq!(label, "CustomFunction");
     }
 }
