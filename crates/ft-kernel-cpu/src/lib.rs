@@ -2,7 +2,7 @@
 
 use std::fmt;
 
-use ft_core::{ScalarTensor, TensorCompatError, TensorMeta, ensure_compatible};
+use ft_core::{Complex128, ScalarTensor, TensorCompatError, TensorMeta, ensure_compatible};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelError {
@@ -6424,9 +6424,150 @@ pub fn masked_select_tensor_contiguous_f64(
     Ok(output)
 }
 
+// ── Complex tensor operations ─────────────────────────────────────────
+
+/// Extract the real part of each complex element.
+pub fn complex_real_contiguous(
+    input: &[Complex128],
+    meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    if !meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "input" });
+    }
+    Ok(input.iter().map(|z| z.re).collect())
+}
+
+/// Extract the imaginary part of each complex element.
+pub fn complex_imag_contiguous(
+    input: &[Complex128],
+    meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    if !meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "input" });
+    }
+    Ok(input.iter().map(|z| z.im).collect())
+}
+
+/// Conjugate each complex element: conj(a+bi) = a-bi.
+pub fn complex_conj_contiguous(
+    input: &[Complex128],
+    meta: &TensorMeta,
+) -> Result<Vec<Complex128>, KernelError> {
+    if !meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "input" });
+    }
+    Ok(input.iter().map(|z| z.conj()).collect())
+}
+
+/// Magnitude (absolute value) of each complex element: |a+bi| = sqrt(a^2+b^2).
+pub fn complex_abs_contiguous(
+    input: &[Complex128],
+    meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    if !meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "input" });
+    }
+    Ok(input.iter().map(|z| z.norm()).collect())
+}
+
+/// Phase angle of each complex element: angle(a+bi) = atan2(b, a).
+pub fn complex_angle_contiguous(
+    input: &[Complex128],
+    meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    if !meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "input" });
+    }
+    Ok(input.iter().map(|z| z.arg()).collect())
+}
+
+/// Element-wise complex addition.
+pub fn complex_add_contiguous(
+    lhs: &[Complex128],
+    rhs: &[Complex128],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<Complex128>, KernelError> {
+    if !lhs_meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "lhs" });
+    }
+    if !rhs_meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "rhs" });
+    }
+    if lhs_meta.shape() != rhs_meta.shape() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    Ok(lhs.iter().zip(rhs.iter()).map(|(a, b)| a + b).collect())
+}
+
+/// Element-wise complex multiplication.
+pub fn complex_mul_contiguous(
+    lhs: &[Complex128],
+    rhs: &[Complex128],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<Complex128>, KernelError> {
+    if !lhs_meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "lhs" });
+    }
+    if !rhs_meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "rhs" });
+    }
+    if lhs_meta.shape() != rhs_meta.shape() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    Ok(lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).collect())
+}
+
+/// Element-wise complex division.
+pub fn complex_div_contiguous(
+    lhs: &[Complex128],
+    rhs: &[Complex128],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<Complex128>, KernelError> {
+    if !lhs_meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "lhs" });
+    }
+    if !rhs_meta.is_contiguous() {
+        return Err(KernelError::UnsupportedLayout { side: "rhs" });
+    }
+    if lhs_meta.shape() != rhs_meta.shape() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    Ok(lhs.iter().zip(rhs.iter()).map(|(a, b)| a / b).collect())
+}
+
+/// Construct complex tensor from separate real and imaginary f64 arrays.
+pub fn complex_from_real_imag(
+    real: &[f64],
+    imag: &[f64],
+) -> Result<Vec<Complex128>, KernelError> {
+    if real.len() != imag.len() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![real.len()],
+            rhs: vec![imag.len()],
+        });
+    }
+    Ok(real
+        .iter()
+        .zip(imag.iter())
+        .map(|(&r, &i)| Complex128::new(r, i))
+        .collect())
+}
+
 #[cfg(test)]
 mod tests {
-    use ft_core::{DType, Device, ScalarTensor, TensorCompatError, TensorMeta};
+    use ft_core::{Complex128, DType, Device, ScalarTensor, TensorCompatError, TensorMeta};
 
     use super::{
         KernelError, abs_scalar, abs_tensor_contiguous_f64, acos_scalar,
@@ -9762,5 +9903,89 @@ mod tests {
                 );
             }
         }
+    }
+
+    // ── Complex kernel tests ────────────────────────────────────────
+
+    #[test]
+    fn complex_real_extracts_real_parts() {
+        let meta = TensorMeta::from_shape(vec![3], DType::Complex128, Device::Cpu);
+        let input = vec![
+            Complex128::new(1.0, 2.0),
+            Complex128::new(3.0, 4.0),
+            Complex128::new(-1.0, 0.5),
+        ];
+        let result = super::complex_real_contiguous(&input, &meta).unwrap();
+        assert_eq!(result, vec![1.0, 3.0, -1.0]);
+    }
+
+    #[test]
+    fn complex_imag_extracts_imaginary_parts() {
+        let meta = TensorMeta::from_shape(vec![3], DType::Complex128, Device::Cpu);
+        let input = vec![
+            Complex128::new(1.0, 2.0),
+            Complex128::new(3.0, 4.0),
+            Complex128::new(-1.0, 0.5),
+        ];
+        let result = super::complex_imag_contiguous(&input, &meta).unwrap();
+        assert_eq!(result, vec![2.0, 4.0, 0.5]);
+    }
+
+    #[test]
+    fn complex_conj_negates_imaginary() {
+        let meta = TensorMeta::from_shape(vec![2], DType::Complex128, Device::Cpu);
+        let input = vec![
+            Complex128::new(1.0, 2.0),
+            Complex128::new(-3.0, 4.0),
+        ];
+        let result = super::complex_conj_contiguous(&input, &meta).unwrap();
+        assert_eq!(result[0], Complex128::new(1.0, -2.0));
+        assert_eq!(result[1], Complex128::new(-3.0, -4.0));
+    }
+
+    #[test]
+    fn complex_abs_returns_magnitude() {
+        let meta = TensorMeta::from_shape(vec![2], DType::Complex128, Device::Cpu);
+        let input = vec![
+            Complex128::new(3.0, 4.0),  // |3+4i| = 5
+            Complex128::new(0.0, 1.0),  // |i| = 1
+        ];
+        let result = super::complex_abs_contiguous(&input, &meta).unwrap();
+        assert!((result[0] - 5.0).abs() < 1e-12);
+        assert!((result[1] - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn complex_angle_returns_phase() {
+        let meta = TensorMeta::from_shape(vec![3], DType::Complex128, Device::Cpu);
+        let input = vec![
+            Complex128::new(1.0, 0.0),   // angle = 0
+            Complex128::new(0.0, 1.0),   // angle = pi/2
+            Complex128::new(-1.0, 0.0),  // angle = pi
+        ];
+        let result = super::complex_angle_contiguous(&input, &meta).unwrap();
+        assert!(result[0].abs() < 1e-12);
+        assert!((result[1] - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert!((result[2] - std::f64::consts::PI).abs() < 1e-12);
+    }
+
+    #[test]
+    fn complex_mul_follows_algebra() {
+        // (1+2i) * (3+4i) = (1*3 - 2*4) + (1*4 + 2*3)i = -5 + 10i
+        let meta = TensorMeta::from_shape(vec![1], DType::Complex128, Device::Cpu);
+        let lhs = vec![Complex128::new(1.0, 2.0)];
+        let rhs = vec![Complex128::new(3.0, 4.0)];
+        let result = super::complex_mul_contiguous(&lhs, &rhs, &meta, &meta).unwrap();
+        assert_eq!(result[0], Complex128::new(-5.0, 10.0));
+    }
+
+    #[test]
+    fn complex_from_real_imag_constructs_correctly() {
+        let real = vec![1.0, 2.0, 3.0];
+        let imag = vec![4.0, 5.0, 6.0];
+        let result = super::complex_from_real_imag(&real, &imag).unwrap();
+        assert_eq!(result[0], Complex128::new(1.0, 4.0));
+        assert_eq!(result[1], Complex128::new(2.0, 5.0));
+        assert_eq!(result[2], Complex128::new(3.0, 6.0));
     }
 }

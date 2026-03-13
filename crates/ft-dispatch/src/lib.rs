@@ -3802,6 +3802,12 @@ pub fn dispatch_tensor_unary_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for unary dispatch",
+            }
+            .into())
+        }
     }
 }
 
@@ -4867,6 +4873,12 @@ pub fn dispatch_tensor_reduction_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for reduction dispatch",
+            }
+            .into())
+        }
     }
 }
 
@@ -4908,6 +4920,12 @@ pub fn dispatch_tensor_reduction_dim_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for reduction dim dispatch",
+            }
+            .into())
+        }
     }
 }
 
@@ -4944,6 +4962,12 @@ pub fn dispatch_tensor_pow_contiguous_typed(
                 storage: TensorStorage::F32(Arc::new(outcome.values.iter().map(|&v| v as f32).collect())),
                 decision: outcome.decision,
             })
+        }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for pow dispatch",
+            }
+            .into())
         }
     }
 }
@@ -4986,6 +5010,12 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for clamp dispatch",
+            }
+            .into())
+        }
     }
 }
 
@@ -5022,6 +5052,12 @@ pub fn dispatch_tensor_norm_contiguous_typed(
                 storage: TensorStorage::F32(Arc::new(vec![outcome.value as f32])),
                 decision: outcome.decision,
             })
+        }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for norm dispatch",
+            }
+            .into())
         }
     }
 }
@@ -5061,6 +5097,12 @@ pub fn dispatch_tensor_norm_dim_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for norm dim dispatch",
+            }
+            .into())
+        }
     }
 }
 
@@ -5098,6 +5140,12 @@ pub fn dispatch_tensor_scan_dim_contiguous_typed(
                 storage: TensorStorage::F32(Arc::new(outcome.values.iter().map(|&v| v as f32).collect())),
                 decision: outcome.decision,
             })
+        }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for scan dim dispatch",
+            }
+            .into())
         }
     }
 }
@@ -5139,6 +5187,12 @@ pub fn dispatch_tensor_normalize_dim_contiguous_typed(
                 storage: TensorStorage::F32(Arc::new(outcome.values.iter().map(|&v| v as f32).collect())),
                 decision: outcome.decision,
             })
+        }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for normalize dim dispatch",
+            }
+            .into())
         }
     }
 }
@@ -5183,6 +5237,12 @@ pub fn dispatch_tensor_sort_contiguous_typed(
                 indices: outcome.indices,
                 decision: outcome.decision,
             })
+        }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for sort dispatch",
+            }
+            .into())
         }
     }
 }
@@ -5231,6 +5291,12 @@ pub fn dispatch_tensor_topk_contiguous_typed(
                 decision: outcome.decision,
             })
         }
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+            Err(DispatchKeyError::IncompatibleSet {
+                reason: "complex dtypes are not supported for topk dispatch",
+            }
+            .into())
+        }
     }
 }
 
@@ -5244,6 +5310,19 @@ pub fn dispatch_tensor_join_contiguous_typed(
     if inputs.is_empty() {
         return Err(DispatchKeyError::IncompatibleSet {
             reason: "join op requires at least one input",
+        }
+        .into());
+    }
+
+    // Reject complex dtypes early.
+    if inputs.iter().any(|(s, _)| {
+        matches!(
+            s,
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+        )
+    }) {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "complex dtypes are not supported for join dispatch",
         }
         .into());
     }
@@ -5263,6 +5342,10 @@ pub fn dispatch_tensor_join_contiguous_typed(
                     TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
                     TensorStorage::F16(_) | TensorStorage::BF16(_) => {
                         storage.to_f64_vec()
+                    }
+                    // Complex rejected above; unreachable.
+                    TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                        unreachable!("complex dtypes rejected before join promotion")
                     }
                 };
                 (data, *meta)
@@ -5288,6 +5371,10 @@ pub fn dispatch_tensor_join_contiguous_typed(
                     TensorStorage::F64(d) => d.iter().map(|&v| v as f32).collect(),
                     TensorStorage::F16(_) | TensorStorage::BF16(_) => {
                         storage.to_f32_vec()
+                    }
+                    // Complex rejected above; unreachable.
+                    TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                        unreachable!("complex dtypes rejected before join promotion")
                     }
                 };
                 (data, *meta)
@@ -5380,6 +5467,23 @@ pub fn dispatch_tensor_addmm_contiguous_typed(
     alpha: f64,
     requires_grad: bool,
 ) -> Result<TypedAddmmOutcome, DispatchError> {
+    // Reject complex dtypes early.
+    if matches!(
+        input_storage,
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+    ) || matches!(
+        mat1_storage,
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+    ) || matches!(
+        mat2_storage,
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+    ) {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "complex dtypes are not supported for addmm dispatch",
+        }
+        .into());
+    }
+
     // If any tensor is F64, promote all to F64.
     let any_f64 = matches!(input_storage, TensorStorage::F64(_))
         || matches!(mat1_storage, TensorStorage::F64(_))
@@ -5390,16 +5494,25 @@ pub fn dispatch_tensor_addmm_contiguous_typed(
             TensorStorage::F64(d) => d.as_ref().clone(),
             TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
             TensorStorage::F16(_) | TensorStorage::BF16(_) => input_storage.to_f64_vec(),
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                unreachable!("complex dtypes rejected above")
+            }
         };
         let mat1_f64: Vec<f64> = match mat1_storage {
             TensorStorage::F64(d) => d.as_ref().clone(),
             TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
             TensorStorage::F16(_) | TensorStorage::BF16(_) => mat1_storage.to_f64_vec(),
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                unreachable!("complex dtypes rejected above")
+            }
         };
         let mat2_f64: Vec<f64> = match mat2_storage {
             TensorStorage::F64(d) => d.as_ref().clone(),
             TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
             TensorStorage::F16(_) | TensorStorage::BF16(_) => mat2_storage.to_f64_vec(),
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                unreachable!("complex dtypes rejected above")
+            }
         };
         let outcome = dispatch_tensor_addmm_contiguous_f64(
             mode,
@@ -5477,6 +5590,23 @@ pub fn dispatch_tensor_addmv_contiguous_typed(
     alpha: f64,
     requires_grad: bool,
 ) -> Result<TypedAddmvOutcome, DispatchError> {
+    // Reject complex dtypes early.
+    if matches!(
+        input_storage,
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+    ) || matches!(
+        mat_storage,
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+    ) || matches!(
+        vec_storage,
+        TensorStorage::Complex64(_) | TensorStorage::Complex128(_)
+    ) {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "complex dtypes are not supported for addmv dispatch",
+        }
+        .into());
+    }
+
     // If any tensor is F64, promote all to F64.
     let any_f64 = matches!(input_storage, TensorStorage::F64(_))
         || matches!(mat_storage, TensorStorage::F64(_))
@@ -5487,16 +5617,25 @@ pub fn dispatch_tensor_addmv_contiguous_typed(
             TensorStorage::F64(d) => d.as_ref().clone(),
             TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
             TensorStorage::F16(_) | TensorStorage::BF16(_) => input_storage.to_f64_vec(),
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                unreachable!("complex dtypes rejected above")
+            }
         };
         let mat_f64: Vec<f64> = match mat_storage {
             TensorStorage::F64(d) => d.as_ref().clone(),
             TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
             TensorStorage::F16(_) | TensorStorage::BF16(_) => mat_storage.to_f64_vec(),
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                unreachable!("complex dtypes rejected above")
+            }
         };
         let vec_f64: Vec<f64> = match vec_storage {
             TensorStorage::F64(d) => d.as_ref().clone(),
             TensorStorage::F32(d) => d.iter().map(|&v| f64::from(v)).collect(),
             TensorStorage::F16(_) | TensorStorage::BF16(_) => vec_storage.to_f64_vec(),
+            TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
+                unreachable!("complex dtypes rejected above")
+            }
         };
         let outcome = dispatch_tensor_addmv_contiguous_f64(
             mode,

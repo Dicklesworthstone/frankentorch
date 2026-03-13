@@ -6,6 +6,7 @@ license-file = "../../LICENSE"
 
 [dependencies]
 half = "2.4"
+num-complex = "0.4"
 
 [dev-dependencies]
 proptest = "1.6.0"

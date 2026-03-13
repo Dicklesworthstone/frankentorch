@@ -777,6 +777,9 @@ fn ft_dtype_to_st(dtype: DType) -> Result<StDtype, TensorIOError> {
         DType::I64 => Ok(StDtype::I64),
         DType::I32 => Ok(StDtype::I32),
         DType::Bool => Ok(StDtype::BOOL),
+        DType::Complex64 | DType::Complex128 => Err(TensorIOError::Corrupt {
+            reason: format!("complex dtypes ({dtype:?}) are not supported by SafeTensors"),
+        }),
     }
 }
 
@@ -827,6 +830,30 @@ impl st_tensor::View for TensorViewAdapter<'_> {
             }
             TensorStorage::BF16(v) => {
                 let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                Cow::Owned(bytes)
+            }
+            TensorStorage::Complex64(v) => {
+                let bytes: Vec<u8> = v
+                    .iter()
+                    .flat_map(|z| {
+                        let mut b = Vec::with_capacity(8);
+                        b.extend_from_slice(&z.re.to_le_bytes());
+                        b.extend_from_slice(&z.im.to_le_bytes());
+                        b
+                    })
+                    .collect();
+                Cow::Owned(bytes)
+            }
+            TensorStorage::Complex128(v) => {
+                let bytes: Vec<u8> = v
+                    .iter()
+                    .flat_map(|z| {
+                        let mut b = Vec::with_capacity(16);
+                        b.extend_from_slice(&z.re.to_le_bytes());
+                        b.extend_from_slice(&z.im.to_le_bytes());
+                        b
+                    })
+                    .collect();
                 Cow::Owned(bytes)
             }
         }

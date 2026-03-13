@@ -10,6 +10,10 @@ use std::sync::Arc;
 pub type Float16 = half::f16;
 pub type BFloat16 = half::bf16;
 
+/// Complex number types re-exported from the `num_complex` crate.
+pub type Complex64 = num_complex::Complex<f32>;
+pub type Complex128 = num_complex::Complex<f64>;
+
 static NEXT_TENSOR_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -22,6 +26,8 @@ pub enum DType {
     I64,
     I32,
     Bool,
+    Complex64,
+    Complex128,
 }
 
 impl DType {
@@ -29,7 +35,8 @@ impl DType {
     #[must_use]
     pub fn element_size(self) -> usize {
         match self {
-            Self::F64 | Self::I64 => 8,
+            Self::Complex128 => 16,
+            Self::F64 | Self::I64 | Self::Complex64 => 8,
             Self::F32 | Self::I32 => 4,
             Self::F16 | Self::BF16 => 2,
             Self::Bool => 1,
@@ -60,12 +67,36 @@ impl DType {
         matches!(self, Self::Bool)
     }
 
-    /// Promote two floating-point dtypes: F32+F64→F64, same→same.
+    /// Returns true for complex dtypes (Complex64 or Complex128).
+    #[must_use]
+    pub fn is_complex(self) -> bool {
+        matches!(self, Self::Complex64 | Self::Complex128)
+    }
+
+    /// Promote two floating-point or complex dtypes: F32+F64→F64, same→same.
     /// Half-precision types promote to F32. F16+BF16→F32.
-    /// Returns `None` for non-floating-point dtypes.
+    /// Complex types: Complex64+F32→Complex64, Complex64+F64→Complex128, etc.
+    /// Returns `None` for non-floating-point/non-complex dtypes.
     #[must_use]
     pub fn promote(self, other: Self) -> Option<Self> {
         match (self, other) {
+            // Complex + Complex
+            (Self::Complex128, Self::Complex128) => Some(Self::Complex128),
+            (Self::Complex64, Self::Complex64) => Some(Self::Complex64),
+            (Self::Complex128, Self::Complex64) | (Self::Complex64, Self::Complex128) => {
+                Some(Self::Complex128)
+            }
+            // Complex + real float → complex (widen component if needed)
+            (Self::Complex128, Self::F64 | Self::F32 | Self::F16 | Self::BF16)
+            | (Self::F64 | Self::F32 | Self::F16 | Self::BF16, Self::Complex128) => {
+                Some(Self::Complex128)
+            }
+            (Self::Complex64, Self::F64) | (Self::F64, Self::Complex64) => {
+                Some(Self::Complex128)
+            }
+            (Self::Complex64, Self::F32 | Self::F16 | Self::BF16)
+            | (Self::F32 | Self::F16 | Self::BF16, Self::Complex64) => Some(Self::Complex64),
+            // Real floats
             (Self::F64, Self::F64) => Some(Self::F64),
             (Self::F32, Self::F32) => Some(Self::F32),
             (Self::F64, Self::F32) | (Self::F32, Self::F64) => Some(Self::F64),
@@ -85,11 +116,12 @@ impl DType {
     }
 
     /// Promote two dtypes following PyTorch's promotion hierarchy:
-    /// Bool → I32 → I64 → F16/BF16 → F32 → F64.
+    /// Bool → I32 → I64 → F16/BF16 → F32 → F64 → Complex64 → Complex128.
     ///
     /// Any pair of dtypes returns the wider type in this hierarchy.
     /// Int + Float always promotes to the float type (or wider float).
     /// F16 + BF16 promotes to F32 (matching PyTorch semantics).
+    /// Real + Complex promotes to Complex (widening component type if needed).
     /// This matches PyTorch's `torch.promote_types()`.
     #[must_use]
     pub fn promote_types(self, other: Self) -> Self {
@@ -103,6 +135,13 @@ impl DType {
         ) {
             return Self::F32;
         }
+        // Special case: Complex64 + F64 → Complex128 (widen component)
+        if matches!(
+            (self, other),
+            (Self::Complex64, Self::F64) | (Self::F64, Self::Complex64)
+        ) {
+            return Self::Complex128;
+        }
         // Assign a rank following PyTorch's promotion hierarchy.
         let rank = |d: Self| -> u8 {
             match d {
@@ -112,6 +151,8 @@ impl DType {
                 Self::F16 | Self::BF16 => 3,
                 Self::F32 => 4,
                 Self::F64 => 5,
+                Self::Complex64 => 6,
+                Self::Complex128 => 7,
             }
         };
         if rank(self) >= rank(other) { self } else { other }
@@ -546,6 +587,8 @@ pub enum TensorStorage {
     F64(Arc<Vec<f64>>),
     F16(Arc<Vec<Float16>>),
     BF16(Arc<Vec<BFloat16>>),
+    Complex64(Arc<Vec<Complex64>>),
+    Complex128(Arc<Vec<Complex128>>),
 }
 
 impl TensorStorage {
@@ -556,6 +599,8 @@ impl TensorStorage {
             Self::F64(v) => v.len(),
             Self::F16(v) => v.len(),
             Self::BF16(v) => v.len(),
+            Self::Complex64(v) => v.len(),
+            Self::Complex128(v) => v.len(),
         }
     }
 
@@ -571,6 +616,8 @@ impl TensorStorage {
             Self::F64(_) => DType::F64,
             Self::F16(_) => DType::F16,
             Self::BF16(_) => DType::BF16,
+            Self::Complex64(_) => DType::Complex64,
+            Self::Complex128(_) => DType::Complex128,
         }
     }
 
@@ -606,7 +653,24 @@ impl TensorStorage {
         }
     }
 
+    #[must_use]
+    pub fn as_complex64(&self) -> Option<&[Complex64]> {
+        match self {
+            Self::Complex64(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_complex128(&self) -> Option<&[Complex128]> {
+        match self {
+            Self::Complex128(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
     /// Convert storage to f64 values, promoting from any float type.
+    /// Complex types extract the real part.
     #[must_use]
     pub fn to_f64_vec(&self) -> Vec<f64> {
         match self {
@@ -614,10 +678,13 @@ impl TensorStorage {
             Self::F32(v) => v.iter().map(|&x| f64::from(x)).collect(),
             Self::F16(v) => v.iter().map(|&x| f64::from(x.to_f32())).collect(),
             Self::BF16(v) => v.iter().map(|&x| f64::from(x.to_f32())).collect(),
+            Self::Complex64(v) => v.iter().map(|z| f64::from(z.re)).collect(),
+            Self::Complex128(v) => v.iter().map(|z| z.re).collect(),
         }
     }
 
     /// Convert storage to f32 values, promoting from half or demoting from f64.
+    /// Complex types extract the real part.
     #[must_use]
     pub fn to_f32_vec(&self) -> Vec<f32> {
         match self {
@@ -625,6 +692,8 @@ impl TensorStorage {
             Self::F64(v) => v.iter().map(|&x| x as f32).collect(),
             Self::F16(v) => v.iter().map(|&x| x.to_f32()).collect(),
             Self::BF16(v) => v.iter().map(|&x| x.to_f32()).collect(),
+            Self::Complex64(v) => v.iter().map(|z| z.re).collect(),
+            Self::Complex128(v) => v.iter().map(|z| z.re as f32).collect(),
         }
     }
 }
@@ -690,7 +759,7 @@ impl DenseTensor {
         if meta.dtype() != storage.dtype() {
             return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
         }
-        if !meta.dtype().is_floating_point() {
+        if !meta.dtype().is_floating_point() && !meta.dtype().is_complex() {
             return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
         }
 
@@ -835,9 +904,7 @@ impl DenseTensor {
         let end = Self::storage_span_required_len(&self.meta)?;
         match &self.storage {
             TensorStorage::F64(v) => Ok(&v[start..end]),
-            TensorStorage::F32(_) => Err(DenseTensorError::UnsupportedDType(DType::F32)),
-            TensorStorage::F16(_) => Err(DenseTensorError::UnsupportedDType(DType::F16)),
-            TensorStorage::BF16(_) => Err(DenseTensorError::UnsupportedDType(DType::BF16)),
+            _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
         }
     }
 
@@ -876,6 +943,12 @@ impl DenseTensor {
             }
             TensorStorage::BF16(v) => {
                 Ok(v[start..end].iter().map(|&x| f64::from(x.to_f32())).collect())
+            }
+            TensorStorage::Complex64(v) => {
+                Ok(v[start..end].iter().map(|z| f64::from(z.re)).collect())
+            }
+            TensorStorage::Complex128(v) => {
+                Ok(v[start..end].iter().map(|z| z.re).collect())
             }
         }
     }
@@ -917,16 +990,15 @@ impl DenseTensor {
         self.version
     }
 
-    /// Cast this tensor to a different floating-point dtype.
+    /// Cast this tensor to a different floating-point or complex dtype.
     pub fn to_dtype(&self, dtype: DType) -> Result<Self, DenseTensorError> {
-        if !dtype.is_floating_point() {
+        if !dtype.is_floating_point() && !dtype.is_complex() {
             return Err(DenseTensorError::UnsupportedDType(dtype));
         }
         if self.meta.dtype() == dtype {
             return Ok(self.clone());
         }
         let new_meta = self.meta.clone().with_dtype(dtype);
-        // First convert source to f32 values (common intermediate)
         let as_f32 = || -> Vec<f32> { self.storage.to_f32_vec() };
         let as_f64 = || -> Vec<f64> { self.storage.to_f64_vec() };
         let new_storage = match dtype {
@@ -939,6 +1011,20 @@ impl DenseTensor {
             DType::BF16 => {
                 let vals: Vec<BFloat16> = as_f32().into_iter().map(BFloat16::from_f32).collect();
                 TensorStorage::BF16(Arc::new(vals))
+            }
+            DType::Complex64 => {
+                let vals: Vec<Complex64> = as_f32()
+                    .into_iter()
+                    .map(|r| Complex64::new(r, 0.0))
+                    .collect();
+                TensorStorage::Complex64(Arc::new(vals))
+            }
+            DType::Complex128 => {
+                let vals: Vec<Complex128> = as_f64()
+                    .into_iter()
+                    .map(|r| Complex128::new(r, 0.0))
+                    .collect();
+                TensorStorage::Complex128(Arc::new(vals))
             }
             _ => return Err(DenseTensorError::UnsupportedDType(dtype)),
         };
@@ -2736,5 +2822,124 @@ mod tests {
         let tiny = Float16::from_f32(5.96e-8);
         let rt = tiny.to_f32();
         assert!(rt >= 0.0 && rt < 1e-5, "f16 subnormal should be small positive or zero");
+    }
+
+    // ── Complex dtype tests ─────────────────────────────────────────
+
+    #[test]
+    fn complex_dtype_element_sizes() {
+        assert_eq!(DType::Complex64.element_size(), 8);
+        assert_eq!(DType::Complex128.element_size(), 16);
+    }
+
+    #[test]
+    fn complex_dtype_predicates() {
+        assert!(DType::Complex64.is_complex());
+        assert!(DType::Complex128.is_complex());
+        assert!(!DType::F64.is_complex());
+        assert!(!DType::Complex64.is_floating_point());
+        assert!(!DType::Complex128.is_integer());
+        assert!(!DType::Complex64.is_bool());
+    }
+
+    #[test]
+    fn complex_promote_types_hierarchy() {
+        // Complex128 is the widest type
+        assert_eq!(DType::Complex128.promote_types(DType::Complex64), DType::Complex128);
+        assert_eq!(DType::Complex128.promote_types(DType::F64), DType::Complex128);
+        assert_eq!(DType::Complex128.promote_types(DType::F32), DType::Complex128);
+
+        // Complex64 + F64 widens to Complex128 (f64 component)
+        assert_eq!(DType::Complex64.promote_types(DType::F64), DType::Complex128);
+        assert_eq!(DType::F64.promote_types(DType::Complex64), DType::Complex128);
+
+        // Complex64 + F32 stays Complex64
+        assert_eq!(DType::Complex64.promote_types(DType::F32), DType::Complex64);
+
+        // Complex64 + integer → Complex64
+        assert_eq!(DType::Complex64.promote_types(DType::I32), DType::Complex64);
+        assert_eq!(DType::Complex64.promote_types(DType::Bool), DType::Complex64);
+    }
+
+    #[test]
+    fn complex_promote_float_function() {
+        // promote() handles complex types
+        assert_eq!(DType::Complex128.promote(DType::Complex64), Some(DType::Complex128));
+        assert_eq!(DType::Complex64.promote(DType::F64), Some(DType::Complex128));
+        assert_eq!(DType::Complex64.promote(DType::F32), Some(DType::Complex64));
+        assert_eq!(DType::Complex128.promote(DType::F64), Some(DType::Complex128));
+    }
+
+    #[test]
+    fn complex_storage_basic() {
+        use super::Complex128;
+
+        let vals = vec![
+            Complex128::new(1.0, 2.0),
+            Complex128::new(3.0, 4.0),
+        ];
+        let storage = TensorStorage::Complex128(Arc::new(vals));
+        assert_eq!(storage.len(), 2);
+        assert_eq!(storage.dtype(), DType::Complex128);
+
+        let slice = storage.as_complex128().unwrap();
+        assert_eq!(slice[0].re, 1.0);
+        assert_eq!(slice[0].im, 2.0);
+
+        // to_f64_vec extracts real parts
+        let f64s = storage.to_f64_vec();
+        assert_eq!(f64s, vec![1.0, 3.0]);
+    }
+
+    #[test]
+    fn complex64_storage_basic() {
+        use super::Complex64;
+
+        let vals = vec![
+            Complex64::new(1.0, -1.0),
+            Complex64::new(0.0, 5.0),
+        ];
+        let storage = TensorStorage::Complex64(Arc::new(vals));
+        assert_eq!(storage.len(), 2);
+        assert_eq!(storage.dtype(), DType::Complex64);
+
+        let slice = storage.as_complex64().unwrap();
+        assert_eq!(slice[1].im, 5.0);
+    }
+
+    #[test]
+    fn complex_dense_tensor_creation() {
+        use super::Complex128;
+
+        let vals = vec![
+            Complex128::new(1.0, 0.0),
+            Complex128::new(0.0, 1.0),
+            Complex128::new(-1.0, 0.0),
+        ];
+        let meta = TensorMeta::from_shape(vec![3], DType::Complex128, Device::Cpu);
+        let storage = TensorStorage::Complex128(Arc::new(vals));
+        let dt = DenseTensor::from_typed_storage(meta, storage);
+        assert!(dt.is_ok(), "complex tensor creation should succeed");
+
+        let t = dt.unwrap();
+        assert_eq!(t.meta().dtype(), DType::Complex128);
+        assert_eq!(t.meta().shape(), &[3]);
+    }
+
+    #[test]
+    fn complex_to_dtype_from_real() {
+        // Create an f64 tensor, cast to Complex128
+        let meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let storage = TensorStorage::F64(Arc::new(vec![3.0, 4.0]));
+        let dt = DenseTensor::from_typed_storage(meta, storage).unwrap();
+
+        let complex = dt.to_dtype(DType::Complex128).unwrap();
+        assert_eq!(complex.meta().dtype(), DType::Complex128);
+
+        let c_slice = complex.typed_storage().as_complex128().unwrap();
+        assert_eq!(c_slice[0].re, 3.0);
+        assert_eq!(c_slice[0].im, 0.0);
+        assert_eq!(c_slice[1].re, 4.0);
+        assert_eq!(c_slice[1].im, 0.0);
     }
 }
