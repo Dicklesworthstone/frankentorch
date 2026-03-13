@@ -17757,7 +17757,7 @@ mod tests {
         let y = tape
             .apply_function(
                 &[a, b],
-                |ctx, inputs| {
+                |_ctx, inputs| {
                     let (vals, shape) = &inputs[0];
                     Ok((vals.to_vec(), shape.to_vec()))
                 },
@@ -17769,7 +17769,7 @@ mod tests {
             )
             .expect("function");
 
-        let report = tape.backward(y).expect("backward");
+        let _report = tape.backward(y).expect("backward");
         let observed = needs_grad_observed.lock().unwrap();
         assert_eq!(*observed, vec![true, false]);
     }
@@ -18443,8 +18443,8 @@ mod tests {
                 assert_eq!(data.len(), 4);
                 assert_eq!(data.as_slice(), &[1.0f32, 2.0, 3.0, 4.0]);
             }
-            ft_core::TensorStorage::F64(_) => {
-                panic!("f32 leaf should produce F32 storage, not F64");
+            other => {
+                panic!("f32 leaf should produce F32 storage, got {:?}", other.dtype());
             }
         }
     }
@@ -18461,8 +18461,8 @@ mod tests {
             ft_core::TensorStorage::F32(data) => {
                 assert_eq!(data.as_slice(), &[6.0f32]);
             }
-            ft_core::TensorStorage::F64(_) => {
-                panic!("f32 sum should produce F32 storage, not F64");
+            other => {
+                panic!("f32 sum should produce F32 storage, got {:?}", other.dtype());
             }
         }
     }

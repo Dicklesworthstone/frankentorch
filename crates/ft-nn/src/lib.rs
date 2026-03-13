@@ -6042,66 +6042,7 @@ impl Module for ConvTranspose2d {
         // Group by output row for efficiency: for each output row out_h,
         // collect all contributions, cat them, and sum.
 
-        // Build output row by row
-        let mut output_rows: Vec<TensorNodeId> = Vec::with_capacity(h_out);
-        for oh in 0..h_out {
-            let mut row_contribs: Vec<TensorNodeId> = Vec::new();
-            for kh in 0..self.kernel_h {
-                // oh = hi*stride_h + kh - padding_h => hi = (oh + padding_h - kh) / stride_h
-                let oh_shifted = oh + self.padding_h;
-                if oh_shifted < kh {
-                    continue;
-                }
-                let hi_times_stride = oh_shifted - kh;
-                if hi_times_stride % self.stride_h != 0 {
-                    continue;
-                }
-                let hi = hi_times_stride / self.stride_h;
-                if hi >= h_in {
-                    continue;
-                }
-
-                for kw in 0..self.kernel_w {
-                    // Build a w_out-length vector of contributions for this (hi, kh, kw)
-                    let mut col_contribs: Vec<TensorNodeId> = Vec::new();
-                    for ow in 0..w_out {
-                        let ow_shifted = ow + self.padding_w;
-                        if ow_shifted < kw {
-                            continue;
-                        }
-                        let wi_times_stride = ow_shifted - kw;
-                        if wi_times_stride % self.stride_w != 0 {
-                            continue;
-                        }
-                        let wi = wi_times_stride / self.stride_w;
-                        if wi >= w_in {
-                            continue;
-                        }
-
-                        // columns[:, hi, wi, :, kh, kw] -> [N, out_channels]
-                        let c = session.tensor_narrow(columns, 1, hi, 1)?;
-                        let c = session.tensor_narrow(c, 2, wi, 1)?;
-                        let c = session.tensor_narrow(c, 4, kh, 1)?;
-                        let c = session.tensor_narrow(c, 5, kw, 1)?;
-                        // [N, 1, 1, out_channels, 1, 1] -> [N, out_channels]
-                        let c = session.tensor_reshape(c, vec![batch_size, self.out_channels])?;
-                        col_contribs.push(c);
-                    }
-                    if !col_contribs.is_empty() {
-                        // This is getting complex; let me use a simpler approach
-                        // Just accumulate via add
-                        for c in col_contribs {
-                            row_contribs.push(c);
-                        }
-                    }
-                }
-            }
-            // Need to properly scatter these into the row...
-            // This approach is getting too complex. Let me use a simpler method.
-            let _ = row_contribs;
-            let _ = output_rows;
-            break;
-        }
+        // (Row-by-row approach was too complex; using simpler kernel-position method below.)
 
         // SIMPLER APPROACH: For each (kh, kw), shift the matmul result into the
         // correct output position using narrow/cat on an intermediate grid.
@@ -9456,9 +9397,9 @@ impl CTCLoss {
                     let mut alpha = vec![vec![neg_inf; lattice_len]; input_len];
 
                     // t=0 initialization: can only be in state 0 (blank) or state 1 (first label)
-                    alpha[0][0] = lp_data[0 * batch_size * num_classes + b * num_classes + labels[0]];
+                    alpha[0][0] = lp_data[b * num_classes + labels[0]];
                     if lattice_len > 1 {
-                        alpha[0][1] = lp_data[0 * batch_size * num_classes + b * num_classes + labels[1]];
+                        alpha[0][1] = lp_data[b * num_classes + labels[1]];
                     }
 
                     // Forward recursion
@@ -9603,9 +9544,9 @@ impl CTCLoss {
 
                     // Forward pass (alpha)
                     let mut alpha = vec![vec![neg_inf; lattice_len]; input_len];
-                    alpha[0][0] = lp_data[0 * batch_size_b * num_classes_b + b * num_classes_b + labels[0]];
+                    alpha[0][0] = lp_data[b * num_classes_b + labels[0]];
                     if lattice_len > 1 {
-                        alpha[0][1] = lp_data[0 * batch_size_b * num_classes_b + b * num_classes_b + labels[1]];
+                        alpha[0][1] = lp_data[b * num_classes_b + labels[1]];
                     }
                     for t in 1..input_len {
                         let lp_offset = t * batch_size_b * num_classes_b + b * num_classes_b;
@@ -10873,7 +10814,7 @@ mod tests {
         // For label 1: -log(0.5) ≈ 0.693
         // For label 0: -log(1-0.5) ≈ 0.693
         // Mean ≈ 0.693
-        assert!((vals[0] - 0.6931).abs() < 0.01);
+        assert!((vals[0] - std::f64::consts::LN_2).abs() < 0.01);
     }
 
     #[test]

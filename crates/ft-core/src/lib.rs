@@ -5,6 +5,8 @@ use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
+pub use half::{bf16, f16};
+
 static NEXT_TENSOR_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
 
@@ -12,6 +14,8 @@ static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
 pub enum DType {
     F64,
     F32,
+    F16,
+    BF16,
     I64,
     I32,
     Bool,
@@ -24,6 +28,7 @@ impl DType {
         match self {
             Self::F64 | Self::I64 => 8,
             Self::F32 | Self::I32 => 4,
+            Self::F16 | Self::BF16 => 2,
             Self::Bool => 1,
         }
     }
@@ -31,7 +36,13 @@ impl DType {
     /// Returns true for floating-point dtypes.
     #[must_use]
     pub fn is_floating_point(self) -> bool {
-        matches!(self, Self::F64 | Self::F32)
+        matches!(self, Self::F64 | Self::F32 | Self::F16 | Self::BF16)
+    }
+
+    /// Returns true for half-precision floating-point dtypes (F16 or BF16).
+    #[must_use]
+    pub fn is_half(self) -> bool {
+        matches!(self, Self::F16 | Self::BF16)
     }
 
     /// Returns true for integer dtypes (not bool).
@@ -47,6 +58,7 @@ impl DType {
     }
 
     /// Promote two floating-point dtypes: F32+F64→F64, same→same.
+    /// Half-precision types promote to F32. F16+BF16→F32.
     /// Returns `None` for non-floating-point dtypes.
     #[must_use]
     pub fn promote(self, other: Self) -> Option<Self> {
@@ -54,20 +66,39 @@ impl DType {
             (Self::F64, Self::F64) => Some(Self::F64),
             (Self::F32, Self::F32) => Some(Self::F32),
             (Self::F64, Self::F32) | (Self::F32, Self::F64) => Some(Self::F64),
+            // Half-precision: same type stays, mixed half → F32
+            (Self::F16, Self::F16) => Some(Self::F16),
+            (Self::BF16, Self::BF16) => Some(Self::BF16),
+            (Self::F16, Self::BF16) | (Self::BF16, Self::F16) => Some(Self::F32),
+            // Half + wider float → wider float
+            (Self::F16 | Self::BF16, Self::F32) | (Self::F32, Self::F16 | Self::BF16) => {
+                Some(Self::F32)
+            }
+            (Self::F16 | Self::BF16, Self::F64) | (Self::F64, Self::F16 | Self::BF16) => {
+                Some(Self::F64)
+            }
             _ => None,
         }
     }
 
     /// Promote two dtypes following PyTorch's promotion hierarchy:
-    /// Bool → I32 → I64 → F32 → F64.
+    /// Bool → I32 → I64 → F16/BF16 → F32 → F64.
     ///
     /// Any pair of dtypes returns the wider type in this hierarchy.
     /// Int + Float always promotes to the float type (or wider float).
+    /// F16 + BF16 promotes to F32 (matching PyTorch semantics).
     /// This matches PyTorch's `torch.promote_types()`.
     #[must_use]
     pub fn promote_types(self, other: Self) -> Self {
         if self == other {
             return self;
+        }
+        // Special case: F16 + BF16 → F32 (PyTorch semantics)
+        if matches!(
+            (self, other),
+            (Self::F16, Self::BF16) | (Self::BF16, Self::F16)
+        ) {
+            return Self::F32;
         }
         // Assign a rank following PyTorch's promotion hierarchy.
         let rank = |d: Self| -> u8 {
@@ -75,8 +106,9 @@ impl DType {
                 Self::Bool => 0,
                 Self::I32 => 1,
                 Self::I64 => 2,
-                Self::F32 => 3,
-                Self::F64 => 4,
+                Self::F16 | Self::BF16 => 3,
+                Self::F32 => 4,
+                Self::F64 => 5,
             }
         };
         if rank(self) >= rank(other) { self } else { other }
@@ -509,6 +541,8 @@ impl ScalarTensor {
 pub enum TensorStorage {
     F32(Arc<Vec<f32>>),
     F64(Arc<Vec<f64>>),
+    F16(Arc<Vec<f16>>),
+    BF16(Arc<Vec<bf16>>),
 }
 
 impl TensorStorage {
@@ -517,6 +551,8 @@ impl TensorStorage {
         match self {
             Self::F32(v) => v.len(),
             Self::F64(v) => v.len(),
+            Self::F16(v) => v.len(),
+            Self::BF16(v) => v.len(),
         }
     }
 
@@ -530,6 +566,8 @@ impl TensorStorage {
         match self {
             Self::F32(_) => DType::F32,
             Self::F64(_) => DType::F64,
+            Self::F16(_) => DType::F16,
+            Self::BF16(_) => DType::BF16,
         }
     }
 
@@ -537,7 +575,7 @@ impl TensorStorage {
     pub fn as_f64(&self) -> Option<&[f64]> {
         match self {
             Self::F64(v) => Some(v.as_slice()),
-            Self::F32(_) => None,
+            _ => None,
         }
     }
 
@@ -545,23 +583,45 @@ impl TensorStorage {
     pub fn as_f32(&self) -> Option<&[f32]> {
         match self {
             Self::F32(v) => Some(v.as_slice()),
-            Self::F64(_) => None,
+            _ => None,
         }
     }
 
+    #[must_use]
+    pub fn as_f16(&self) -> Option<&[f16]> {
+        match self {
+            Self::F16(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    #[must_use]
+    pub fn as_bf16(&self) -> Option<&[bf16]> {
+        match self {
+            Self::BF16(v) => Some(v.as_slice()),
+            _ => None,
+        }
+    }
+
+    /// Convert storage to f64 values, promoting from any float type.
     #[must_use]
     pub fn to_f64_vec(&self) -> Vec<f64> {
         match self {
             Self::F64(v) => v.as_ref().clone(),
             Self::F32(v) => v.iter().map(|&x| f64::from(x)).collect(),
+            Self::F16(v) => v.iter().map(|&x| f64::from(x.to_f32())).collect(),
+            Self::BF16(v) => v.iter().map(|&x| f64::from(x.to_f32())).collect(),
         }
     }
 
+    /// Convert storage to f32 values, promoting from half or demoting from f64.
     #[must_use]
     pub fn to_f32_vec(&self) -> Vec<f32> {
         match self {
             Self::F32(v) => v.as_ref().clone(),
             Self::F64(v) => v.iter().map(|&x| x as f32).collect(),
+            Self::F16(v) => v.iter().map(|&x| x.to_f32()).collect(),
+            Self::BF16(v) => v.iter().map(|&x| x.to_f32()).collect(),
         }
     }
 }
@@ -662,6 +722,23 @@ impl DenseTensor {
         Self::from_typed_storage(meta, TensorStorage::F32(Arc::new(storage)))
     }
 
+    pub fn from_storage_f16(meta: TensorMeta, storage: Vec<f16>) -> Result<Self, DenseTensorError> {
+        if meta.dtype() != DType::F16 {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
+        }
+        Self::from_typed_storage(meta, TensorStorage::F16(Arc::new(storage)))
+    }
+
+    pub fn from_storage_bf16(
+        meta: TensorMeta,
+        storage: Vec<bf16>,
+    ) -> Result<Self, DenseTensorError> {
+        if meta.dtype() != DType::BF16 {
+            return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
+        }
+        Self::from_typed_storage(meta, TensorStorage::BF16(Arc::new(storage)))
+    }
+
     pub fn from_contiguous_values(
         values: Vec<f64>,
         shape: Vec<usize>,
@@ -678,6 +755,24 @@ impl DenseTensor {
     ) -> Result<Self, DenseTensorError> {
         let meta = TensorMeta::from_shape(shape, DType::F32, device);
         Self::from_storage_f32(meta, values)
+    }
+
+    pub fn from_contiguous_values_f16(
+        values: Vec<f16>,
+        shape: Vec<usize>,
+        device: Device,
+    ) -> Result<Self, DenseTensorError> {
+        let meta = TensorMeta::from_shape(shape, DType::F16, device);
+        Self::from_storage_f16(meta, values)
+    }
+
+    pub fn from_contiguous_values_bf16(
+        values: Vec<bf16>,
+        shape: Vec<usize>,
+        device: Device,
+    ) -> Result<Self, DenseTensorError> {
+        let meta = TensorMeta::from_shape(shape, DType::BF16, device);
+        Self::from_storage_bf16(meta, values)
     }
 
     fn contiguous_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError> {
@@ -738,6 +833,8 @@ impl DenseTensor {
         match &self.storage {
             TensorStorage::F64(v) => Ok(&v[start..end]),
             TensorStorage::F32(_) => Err(DenseTensorError::UnsupportedDType(DType::F32)),
+            TensorStorage::F16(_) => Err(DenseTensorError::UnsupportedDType(DType::F16)),
+            TensorStorage::BF16(_) => Err(DenseTensorError::UnsupportedDType(DType::BF16)),
         }
     }
 
@@ -756,11 +853,11 @@ impl DenseTensor {
         let end = Self::storage_span_required_len(&self.meta)?;
         match &self.storage {
             TensorStorage::F32(v) => Ok(&v[start..end]),
-            TensorStorage::F64(_) => Err(DenseTensorError::UnsupportedDType(DType::F64)),
+            _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
         }
     }
 
-    /// Returns contiguous values as f64, converting from f32 if needed.
+    /// Returns contiguous values as f64, converting from any float type.
     /// Used by backward pass to keep gradient computation in f64.
     pub fn contiguous_values_as_f64(&self) -> Result<Vec<f64>, DenseTensorError> {
         if !self.meta.is_contiguous() {
@@ -771,6 +868,12 @@ impl DenseTensor {
         match &self.storage {
             TensorStorage::F64(v) => Ok(v[start..end].to_vec()),
             TensorStorage::F32(v) => Ok(v[start..end].iter().map(|&x| f64::from(x)).collect()),
+            TensorStorage::F16(v) => {
+                Ok(v[start..end].iter().map(|&x| f64::from(x.to_f32())).collect())
+            }
+            TensorStorage::BF16(v) => {
+                Ok(v[start..end].iter().map(|&x| f64::from(x.to_f32())).collect())
+            }
         }
     }
 
@@ -779,13 +882,14 @@ impl DenseTensor {
         &self.storage
     }
 
-    /// Returns the raw f64 storage slice. Panics on f32 tensors.
+    /// Returns the raw f64 storage slice. Panics on non-f64 tensors.
     #[must_use]
     pub fn storage(&self) -> &[f64] {
         match &self.storage {
             TensorStorage::F64(v) => v.as_slice(),
-            TensorStorage::F32(_) => panic!(
-                "called storage() on f32 DenseTensor; use typed_storage() or contiguous_values_f32()"
+            other => panic!(
+                "called storage() on {:?} DenseTensor; use typed_storage() or contiguous_values_as_f64()",
+                other.dtype()
             ),
         }
     }
@@ -819,17 +923,23 @@ impl DenseTensor {
             return Ok(self.clone());
         }
         let new_meta = self.meta.clone().with_dtype(dtype);
-        match (&self.storage, dtype) {
-            (TensorStorage::F64(v), DType::F32) => {
-                let f32_vals: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-                Self::from_typed_storage(new_meta, TensorStorage::F32(Arc::new(f32_vals)))
+        // First convert source to f32 values (common intermediate)
+        let as_f32 = || -> Vec<f32> { self.storage.to_f32_vec() };
+        let as_f64 = || -> Vec<f64> { self.storage.to_f64_vec() };
+        let new_storage = match dtype {
+            DType::F64 => TensorStorage::F64(Arc::new(as_f64())),
+            DType::F32 => TensorStorage::F32(Arc::new(as_f32())),
+            DType::F16 => {
+                let vals: Vec<f16> = as_f32().into_iter().map(f16::from_f32).collect();
+                TensorStorage::F16(Arc::new(vals))
             }
-            (TensorStorage::F32(v), DType::F64) => {
-                let f64_vals: Vec<f64> = v.iter().map(|&x| f64::from(x)).collect();
-                Self::from_typed_storage(new_meta, TensorStorage::F64(Arc::new(f64_vals)))
+            DType::BF16 => {
+                let vals: Vec<bf16> = as_f32().into_iter().map(bf16::from_f32).collect();
+                TensorStorage::BF16(Arc::new(vals))
             }
-            _ => Ok(self.clone()),
-        }
+            _ => return Err(DenseTensorError::UnsupportedDType(dtype)),
+        };
+        Self::from_typed_storage(new_meta, new_storage)
     }
 
     /// Update the contiguous values in-place and bump the version counter.
@@ -853,8 +963,8 @@ impl DenseTensor {
                 }
                 slice.copy_from_slice(new_values);
             }
-            TensorStorage::F32(_) => {
-                return Err(DenseTensorError::UnsupportedDType(DType::F32));
+            _ => {
+                return Err(DenseTensorError::UnsupportedDType(self.meta.dtype()));
             }
         }
         self.version += 1;
@@ -883,8 +993,8 @@ impl DenseTensor {
                 }
                 slice.copy_from_slice(new_values);
             }
-            TensorStorage::F64(_) => {
-                return Err(DenseTensorError::UnsupportedDType(DType::F64));
+            _ => {
+                return Err(DenseTensorError::UnsupportedDType(self.meta.dtype()));
             }
         }
         self.version += 1;
