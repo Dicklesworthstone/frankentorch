@@ -1,0 +1,97 @@
+{
+  "cases": [
+    {
+      "name": "add_1d",
+      "op": "add_",
+      "target": [1.0, 2.0, 3.0],
+      "target_shape": [3],
+      "other": [4.0, 5.0, 6.0],
+      "other_shape": [3],
+      "expected_output": [5.0, 7.0, 9.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-001"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "sub_1d",
+      "op": "sub_",
+      "target": [10.0, 20.0, 30.0],
+      "target_shape": [3],
+      "other": [1.0, 2.0, 3.0],
+      "other_shape": [3],
+      "expected_output": [9.0, 18.0, 27.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-002"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "mul_1d",
+      "op": "mul_",
+      "target": [2.0, 3.0, 4.0],
+      "target_shape": [3],
+      "other": [3.0, 2.0, 1.0],
+      "other_shape": [3],
+      "expected_output": [6.0, 6.0, 4.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-003"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "div_1d",
+      "op": "div_",
+      "target": [10.0, 20.0, 30.0],
+      "target_shape": [3],
+      "other": [2.0, 4.0, 5.0],
+      "other_shape": [3],
+      "expected_output": [5.0, 5.0, 6.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-004"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "zero_1d",
+      "op": "zero_",
+      "target": [1.0, 2.0, 3.0],
+      "target_shape": [3],
+      "expected_output": [0.0, 0.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-005"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "fill_1d",
+      "op": "fill_",
+      "target": [1.0, 2.0, 3.0],
+      "target_shape": [3],
+      "fill_value": 7.0,
+      "expected_output": [7.0, 7.0, 7.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-006"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "neg_1d",
+      "op": "neg_",
+      "target": [1.0, -2.0, 3.0],
+      "target_shape": [3],
+      "expected_output": [-1.0, 2.0, -3.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-007"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "add_2d",
+      "op": "add_",
+      "target": [1.0, 2.0, 3.0, 4.0],
+      "target_shape": [2, 2],
+      "other": [5.0, 6.0, 7.0, 8.0],
+      "other_shape": [2, 2],
+      "expected_output": [6.0, 8.0, 10.0, 12.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-008"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    },
+    {
+      "name": "fill_negative",
+      "op": "fill_",
+      "target": [1.0, 2.0, 3.0, 4.0],
+      "target_shape": [4],
+      "fill_value": -99.0,
+      "expected_output": [-99.0, -99.0, -99.0, -99.0],
+      "contract_ids": ["CPU-KERNEL-INPLACE-009"],
+      "e2e_scenarios": ["cpu_kernel:inplace"]
+    }
+  ]
+}

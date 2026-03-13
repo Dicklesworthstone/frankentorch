@@ -1,0 +1,118 @@
+{
+  "cases": [
+    {
+      "name": "flip_1d",
+      "op": "flip",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0],
+      "input_shape": [5],
+      "dims": [0],
+      "expected_output": [5.0, 4.0, 3.0, 2.0, 1.0],
+      "expected_shape": [5],
+      "contract_ids": ["CPU-KERNEL-ADV-001"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "flip_2d_dim0",
+      "op": "flip",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "dims": [0],
+      "expected_output": [4.0, 5.0, 6.0, 1.0, 2.0, 3.0],
+      "expected_shape": [2, 3],
+      "contract_ids": ["CPU-KERNEL-ADV-002"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "flip_2d_dim1",
+      "op": "flip",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "dims": [1],
+      "expected_output": [3.0, 2.0, 1.0, 6.0, 5.0, 4.0],
+      "expected_shape": [2, 3],
+      "contract_ids": ["CPU-KERNEL-ADV-003"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "flip_2d_both_dims",
+      "op": "flip",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "dims": [0, 1],
+      "expected_output": [6.0, 5.0, 4.0, 3.0, 2.0, 1.0],
+      "expected_shape": [2, 3],
+      "contract_ids": ["CPU-KERNEL-ADV-004"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "roll_1d_positive",
+      "op": "roll",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0],
+      "input_shape": [5],
+      "shift": 2,
+      "roll_dim": 0,
+      "expected_output": [4.0, 5.0, 1.0, 2.0, 3.0],
+      "expected_shape": [5],
+      "contract_ids": ["CPU-KERNEL-ADV-005"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "roll_1d_negative",
+      "op": "roll",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0],
+      "input_shape": [5],
+      "shift": -1,
+      "roll_dim": 0,
+      "expected_output": [2.0, 3.0, 4.0, 5.0, 1.0],
+      "expected_shape": [5],
+      "contract_ids": ["CPU-KERNEL-ADV-006"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "repeat_1d",
+      "op": "repeat",
+      "input": [1.0, 2.0, 3.0],
+      "input_shape": [3],
+      "repeats": [3],
+      "expected_output": [1.0, 2.0, 3.0, 1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+      "expected_shape": [9],
+      "contract_ids": ["CPU-KERNEL-ADV-007"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "repeat_2d",
+      "op": "repeat",
+      "input": [1.0, 2.0, 3.0, 4.0],
+      "input_shape": [2, 2],
+      "repeats": [2, 3],
+      "expected_output": [1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0, 1.0, 2.0, 1.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 4.0, 3.0, 4.0],
+      "expected_shape": [4, 6],
+      "contract_ids": ["CPU-KERNEL-ADV-008"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "pad_1d",
+      "op": "pad",
+      "input": [1.0, 2.0, 3.0],
+      "input_shape": [3],
+      "padding": [1, 2],
+      "pad_value": 0.0,
+      "expected_output": [0.0, 1.0, 2.0, 3.0, 0.0, 0.0],
+      "expected_shape": [6],
+      "contract_ids": ["CPU-KERNEL-ADV-009"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "pad_1d_nonzero",
+      "op": "pad",
+      "input": [1.0, 2.0, 3.0],
+      "input_shape": [3],
+      "padding": [2, 1],
+      "pad_value": -1.0,
+      "expected_output": [-1.0, -1.0, 1.0, 2.0, 3.0, -1.0],
+      "expected_shape": [6],
+      "contract_ids": ["CPU-KERNEL-ADV-010"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    }
+  ]
+}
