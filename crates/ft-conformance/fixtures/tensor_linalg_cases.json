@@ -1,0 +1,107 @@
+{
+  "cases": [
+    {
+      "name": "det_2x2_identity",
+      "op": "det",
+      "input": [1.0, 0.0, 0.0, 1.0],
+      "shape": [2, 2],
+      "expected_scalar": 1.0,
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LINALG-001"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "det_2x2_general",
+      "op": "det",
+      "input": [3.0, 8.0, 4.0, 6.0],
+      "shape": [2, 2],
+      "expected_scalar": -14.0,
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-LINALG-002"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "det_3x3",
+      "op": "det",
+      "input": [6.0, 1.0, 1.0, 4.0, -2.0, 5.0, 2.0, 8.0, 7.0],
+      "shape": [3, 3],
+      "expected_scalar": -306.0,
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LINALG-003"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "inv_2x2_identity",
+      "op": "inv",
+      "input": [1.0, 0.0, 0.0, 1.0],
+      "shape": [2, 2],
+      "expected_output": [1.0, 0.0, 0.0, 1.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LINALG-004"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "inv_2x2_general",
+      "op": "inv",
+      "input": [4.0, 7.0, 2.0, 6.0],
+      "shape": [2, 2],
+      "expected_output": [0.6, -0.7, -0.2, 0.4],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-LINALG-005"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "matmul_2x2",
+      "op": "matmul",
+      "lhs": [1.0, 2.0, 3.0, 4.0],
+      "rhs": [5.0, 6.0, 7.0, 8.0],
+      "lhs_shape": [2, 2],
+      "rhs_shape": [2, 2],
+      "expected_output": [19.0, 22.0, 43.0, 50.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LINALG-006"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "matmul_2x3_3x2",
+      "op": "matmul",
+      "lhs": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "rhs": [7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+      "lhs_shape": [2, 3],
+      "rhs_shape": [3, 2],
+      "expected_output": [58.0, 64.0, 139.0, 154.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LINALG-007"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "dot_product",
+      "op": "dot",
+      "lhs": [1.0, 2.0, 3.0],
+      "rhs": [4.0, 5.0, 6.0],
+      "lhs_shape": [3],
+      "rhs_shape": [3],
+      "expected_scalar": 32.0,
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LINALG-008"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    },
+    {
+      "name": "outer_product",
+      "op": "outer",
+      "lhs": [1.0, 2.0, 3.0],
+      "rhs": [4.0, 5.0],
+      "lhs_shape": [3],
+      "rhs_shape": [2],
+      "expected_output": [4.0, 5.0, 8.0, 10.0, 12.0, 15.0],
+      "expected_shape": [3, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LINALG-009"],
+      "e2e_scenarios": ["cpu_kernel:linalg"]
+    }
+  ]
+}

@@ -1,0 +1,152 @@
+{
+  "cases": [
+    {
+      "name": "mse_loss_basic",
+      "op": "mse_loss",
+      "pred": [1.0, 2.0, 3.0],
+      "target": [1.5, 2.5, 3.5],
+      "shape": [3],
+      "expected_output": [0.25],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LOSS-001"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "mse_loss_zero",
+      "op": "mse_loss",
+      "pred": [1.0, 2.0, 3.0],
+      "target": [1.0, 2.0, 3.0],
+      "shape": [3],
+      "expected_output": [0.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LOSS-002"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "l1_loss_basic",
+      "op": "l1_loss",
+      "pred": [1.0, 2.0, 3.0],
+      "target": [1.5, 2.5, 3.5],
+      "shape": [3],
+      "expected_output": [0.5],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LOSS-003"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "l1_loss_zero",
+      "op": "l1_loss",
+      "pred": [1.0, 2.0, 3.0],
+      "target": [1.0, 2.0, 3.0],
+      "shape": [3],
+      "expected_output": [0.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LOSS-004"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "mse_loss_2d",
+      "op": "mse_loss",
+      "pred": [1.0, 2.0, 3.0, 4.0],
+      "target": [1.1, 2.2, 2.7, 4.4],
+      "shape": [2, 2],
+      "expected_output": [0.075],
+      "expected_shape": [1],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-LOSS-005"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "l1_loss_negative_diff",
+      "op": "l1_loss",
+      "pred": [3.0, 1.0],
+      "target": [1.0, 3.0],
+      "shape": [2],
+      "expected_output": [2.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-LOSS-006"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "bce_loss_basic",
+      "op": "bce_loss",
+      "pred": [0.7, 0.3, 0.8],
+      "target": [1.0, 0.0, 1.0],
+      "shape": [3],
+      "expected_output": [0.3121644797305582],
+      "expected_shape": [1],
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LOSS-007"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "bce_with_logits_loss_basic",
+      "op": "bce_with_logits_loss",
+      "pred": [1.0, -1.0, 0.0],
+      "target": [1.0, 0.0, 1.0],
+      "shape": [3],
+      "expected_output": [0.439890185198797],
+      "expected_shape": [1],
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LOSS-008"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "smooth_l1_loss_basic",
+      "op": "smooth_l1_loss",
+      "pred": [1.0, 5.0, 3.0],
+      "target": [1.5, 2.0, 2.7],
+      "shape": [3],
+      "beta": 1.0,
+      "expected_output": [0.89],
+      "expected_shape": [1],
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LOSS-009"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "smooth_l1_loss_custom_beta",
+      "op": "smooth_l1_loss",
+      "pred": [1.0, 5.0, 3.0],
+      "target": [1.5, 2.0, 2.7],
+      "shape": [3],
+      "beta": 2.0,
+      "expected_output": [0.695],
+      "expected_shape": [1],
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LOSS-010"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "huber_loss_basic",
+      "op": "huber_loss",
+      "pred": [1.0, 5.0, 3.0],
+      "target": [1.5, 2.0, 2.7],
+      "shape": [3],
+      "delta": 1.0,
+      "expected_output": [0.89],
+      "expected_shape": [1],
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LOSS-011"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    },
+    {
+      "name": "huber_loss_custom_delta",
+      "op": "huber_loss",
+      "pred": [1.0, 5.0, 3.0],
+      "target": [1.5, 2.0, 2.7],
+      "shape": [3],
+      "delta": 0.5,
+      "expected_output": [0.515],
+      "expected_shape": [1],
+      "tolerance": 1e-8,
+      "contract_ids": ["CPU-KERNEL-LOSS-012"],
+      "e2e_scenarios": ["cpu_kernel:loss"]
+    }
+  ]
+}

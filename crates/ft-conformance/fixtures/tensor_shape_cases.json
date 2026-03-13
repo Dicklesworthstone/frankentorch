@@ -1,0 +1,136 @@
+{
+  "cases": [
+    {
+      "name": "reshape_1d_to_2d",
+      "op": "reshape",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [6],
+      "params": {"new_shape": [2, 3]},
+      "expected_output": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "expected_shape": [2, 3],
+      "contract_ids": ["CPU-KERNEL-SHAPE-001"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "reshape_2d_to_1d",
+      "op": "reshape",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "params": {"new_shape": [6]},
+      "expected_output": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "expected_shape": [6],
+      "contract_ids": ["CPU-KERNEL-SHAPE-002"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "reshape_2d_to_3d",
+      "op": "reshape",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "params": {"new_shape": [2, 1, 3]},
+      "expected_output": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "expected_shape": [2, 1, 3],
+      "contract_ids": ["CPU-KERNEL-SHAPE-003"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "squeeze_dim1",
+      "op": "squeeze",
+      "input": [1.0, 2.0, 3.0],
+      "input_shape": [1, 3],
+      "params": {"dim": 0},
+      "expected_output": [1.0, 2.0, 3.0],
+      "expected_shape": [3],
+      "contract_ids": ["CPU-KERNEL-SHAPE-004"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "unsqueeze_dim0",
+      "op": "unsqueeze",
+      "input": [1.0, 2.0, 3.0],
+      "input_shape": [3],
+      "params": {"dim": 0},
+      "expected_output": [1.0, 2.0, 3.0],
+      "expected_shape": [1, 3],
+      "contract_ids": ["CPU-KERNEL-SHAPE-005"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "unsqueeze_dim1",
+      "op": "unsqueeze",
+      "input": [1.0, 2.0, 3.0],
+      "input_shape": [3],
+      "params": {"dim": 1},
+      "expected_output": [1.0, 2.0, 3.0],
+      "expected_shape": [3, 1],
+      "contract_ids": ["CPU-KERNEL-SHAPE-006"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "transpose_2d",
+      "op": "transpose",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "params": {"dim0": 0, "dim1": 1},
+      "expected_output": [1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
+      "expected_shape": [3, 2],
+      "contract_ids": ["CPU-KERNEL-SHAPE-007"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "permute_3d",
+      "op": "permute",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+      "input_shape": [2, 2, 2],
+      "params": {"dims": [2, 0, 1]},
+      "expected_output": [1.0, 3.0, 5.0, 7.0, 2.0, 4.0, 6.0, 8.0],
+      "expected_shape": [2, 2, 2],
+      "contract_ids": ["CPU-KERNEL-SHAPE-008"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "flatten_all",
+      "op": "flatten",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "params": {"start_dim": 0, "end_dim": 1},
+      "expected_output": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "expected_shape": [6],
+      "contract_ids": ["CPU-KERNEL-SHAPE-009"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "flatten_partial",
+      "op": "flatten",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+      "input_shape": [2, 2, 3],
+      "params": {"start_dim": 1, "end_dim": 2},
+      "expected_output": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0],
+      "expected_shape": [2, 6],
+      "contract_ids": ["CPU-KERNEL-SHAPE-010"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "narrow_dim0",
+      "op": "narrow",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "params": {"dim": 0, "start": 0, "length": 1},
+      "expected_output": [1.0, 2.0, 3.0],
+      "expected_shape": [1, 3],
+      "contract_ids": ["CPU-KERNEL-SHAPE-011"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    },
+    {
+      "name": "narrow_dim1",
+      "op": "narrow",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "input_shape": [2, 3],
+      "params": {"dim": 1, "start": 1, "length": 2},
+      "expected_output": [2.0, 3.0, 5.0, 6.0],
+      "expected_shape": [2, 2],
+      "contract_ids": ["CPU-KERNEL-SHAPE-012"],
+      "e2e_scenarios": ["cpu_kernel:shape"]
+    }
+  ]
+}

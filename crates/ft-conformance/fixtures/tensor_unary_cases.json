@@ -1,0 +1,323 @@
+{
+  "cases": [
+    {
+      "name": "tensor_sin_basic",
+      "op": "sin",
+      "input": [0.0, 1.5707963267948966, 3.141592653589793],
+      "shape": [3],
+      "expected_output": [0.0, 1.0, 1.2246467991473532e-16],
+      "expected_grad": [1.0, 6.123233995736766e-17, -1.0],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-001"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_cos_basic",
+      "op": "cos",
+      "input": [0.0, 1.5707963267948966, 3.141592653589793],
+      "shape": [3],
+      "expected_output": [1.0, 6.123233995736766e-17, -1.0],
+      "expected_grad": [0.0, -1.0, -1.2246467991473532e-16],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-002"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_exp_basic",
+      "op": "exp",
+      "input": [0.0, 1.0, -1.0],
+      "shape": [3],
+      "expected_output": [1.0, 2.718281828459045, 0.36787944117144233],
+      "expected_grad": [1.0, 2.718281828459045, 0.36787944117144233],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-003"],
+      "e2e_scenarios": ["cpu_kernel:unary_exp_log"]
+    },
+    {
+      "name": "tensor_log_basic",
+      "op": "log",
+      "input": [1.0, 2.718281828459045, 0.5],
+      "shape": [3],
+      "expected_output": [0.0, 1.0, -0.6931471805599453],
+      "expected_grad": [1.0, 0.36787944117144233, 2.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-004"],
+      "e2e_scenarios": ["cpu_kernel:unary_exp_log"]
+    },
+    {
+      "name": "tensor_sqrt_basic",
+      "op": "sqrt",
+      "input": [1.0, 4.0, 9.0],
+      "shape": [3],
+      "expected_output": [1.0, 2.0, 3.0],
+      "expected_grad": [0.5, 0.25, 0.16666666666666666],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-005"],
+      "e2e_scenarios": ["cpu_kernel:unary_math"]
+    },
+    {
+      "name": "tensor_abs_basic",
+      "op": "abs",
+      "input": [-3.0, 0.0, 2.0],
+      "shape": [3],
+      "expected_output": [3.0, 0.0, 2.0],
+      "expected_grad": [-1.0, 0.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-006"],
+      "e2e_scenarios": ["cpu_kernel:unary_math"]
+    },
+    {
+      "name": "tensor_neg_basic",
+      "op": "neg",
+      "input": [1.0, -2.0, 0.0],
+      "shape": [3],
+      "expected_output": [-1.0, 2.0, 0.0],
+      "expected_grad": [-1.0, -1.0, -1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-007"],
+      "e2e_scenarios": ["cpu_kernel:unary_math"]
+    },
+    {
+      "name": "tensor_relu_basic",
+      "op": "relu",
+      "input": [-2.0, 0.0, 3.0],
+      "shape": [3],
+      "expected_output": [0.0, 0.0, 3.0],
+      "expected_grad": [0.0, 0.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-008"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_sigmoid_basic",
+      "op": "sigmoid",
+      "input": [0.0, 1.0, -1.0],
+      "shape": [3],
+      "expected_output": [0.5, 0.7310585786300049, 0.2689414213699951],
+      "expected_grad": [0.25, 0.19661193324148185, 0.19661193324148185],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-009"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_tanh_basic",
+      "op": "tanh",
+      "input": [0.0, 1.0, -1.0],
+      "shape": [3],
+      "expected_output": [0.0, 0.7615941559557649, -0.7615941559557649],
+      "expected_grad": [1.0, 0.4199743416140261, 0.4199743416140261],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-010"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_floor_basic",
+      "op": "floor",
+      "input": [1.7, -0.3, 2.0],
+      "shape": [3],
+      "expected_output": [1.0, -1.0, 2.0],
+      "expected_grad": [0.0, 0.0, 0.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-011"],
+      "e2e_scenarios": ["cpu_kernel:unary_step"]
+    },
+    {
+      "name": "tensor_ceil_basic",
+      "op": "ceil",
+      "input": [1.2, -0.3, 2.0],
+      "shape": [3],
+      "expected_output": [2.0, 0.0, 2.0],
+      "expected_grad": [0.0, 0.0, 0.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-012"],
+      "e2e_scenarios": ["cpu_kernel:unary_step"]
+    },
+    {
+      "name": "tensor_round_basic",
+      "op": "round",
+      "input": [1.5, -0.5, 2.3],
+      "shape": [3],
+      "expected_output": [2.0, -1.0, 2.0],
+      "expected_grad": [0.0, 0.0, 0.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-013"],
+      "e2e_scenarios": ["cpu_kernel:unary_step"]
+    },
+    {
+      "name": "tensor_gelu_basic",
+      "op": "gelu",
+      "input": [-2.0, -0.5, 0.0, 0.5, 2.0],
+      "shape": [5],
+      "expected_output": [-0.04540230591222494, -0.15428599017485606, 0.0, 0.34571400982514394, 1.954597694087775],
+      "expected_grad": [-0.08609925662361825, 0.13263009646535762, 0.5, 0.8673699035346424, 1.0860992566236183],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-014"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_silu_basic",
+      "op": "silu",
+      "input": [-2.0, -0.5, 0.0, 0.5, 2.0],
+      "shape": [5],
+      "expected_output": [-0.2384058440442351, -0.1887703343990727, 0.0, 0.3112296656009273, 1.7615941559557646],
+      "expected_grad": [-0.09078424878489547, 0.2600388126973482, 0.5, 0.7399611873026518, 1.0907842487848955],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-015"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_leaky_relu_basic",
+      "op": "leaky_relu",
+      "input": [-2.0, -0.5, 0.0, 0.5, 2.0],
+      "shape": [5],
+      "expected_output": [-0.02, -0.005, 0.0, 0.5, 2.0],
+      "expected_grad": [0.01, 0.01, 1.0, 1.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-016"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_elu_basic",
+      "op": "elu",
+      "input": [-2.0, -0.5, 0.0, 0.5, 2.0],
+      "shape": [5],
+      "expected_output": [-0.8646647167633873, -0.3934693402873666, 0.0, 0.5, 2.0],
+      "expected_grad": [0.1353352832366127, 0.6065306597126334, 1.0, 1.0, 1.0],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-017"],
+      "e2e_scenarios": ["cpu_kernel:unary_activation"]
+    },
+    {
+      "name": "tensor_tan_basic",
+      "op": "tan",
+      "input": [0.0, 0.5, -0.5],
+      "shape": [3],
+      "expected_output": [0.0, 0.5463024898437905, -0.5463024898437905],
+      "expected_grad": [1.0, 1.2984464104095248, 1.2984464104095248],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-018"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_asin_basic",
+      "op": "asin",
+      "input": [0.0, 0.5, -0.5],
+      "shape": [3],
+      "expected_output": [0.0, 0.5235987755982989, -0.5235987755982989],
+      "expected_grad": [1.0, 1.1547005383792517, 1.1547005383792517],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-019"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_acos_basic",
+      "op": "acos",
+      "input": [0.0, 0.5, -0.5],
+      "shape": [3],
+      "expected_output": [1.5707963267948966, 1.0471975511965979, 2.0943951023931957],
+      "expected_grad": [-1.0, -1.1547005383792517, -1.1547005383792517],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-020"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_atan_basic",
+      "op": "atan",
+      "input": [0.0, 1.0, -1.0],
+      "shape": [3],
+      "expected_output": [0.0, 0.7853981633974483, -0.7853981633974483],
+      "expected_grad": [1.0, 0.5, 0.5],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-021"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_sinh_basic",
+      "op": "sinh",
+      "input": [0.0, 1.0, -1.0],
+      "shape": [3],
+      "expected_output": [0.0, 1.1752011936438014, -1.1752011936438014],
+      "expected_grad": [1.0, 1.5430806348152437, 1.5430806348152437],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-022"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_cosh_basic",
+      "op": "cosh",
+      "input": [0.0, 1.0, -1.0],
+      "shape": [3],
+      "expected_output": [1.0, 1.5430806348152437, 1.5430806348152437],
+      "expected_grad": [0.0, 1.1752011936438014, -1.1752011936438014],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-023"],
+      "e2e_scenarios": ["cpu_kernel:unary_trig"]
+    },
+    {
+      "name": "tensor_log2_basic",
+      "op": "log2",
+      "input": [1.0, 2.0, 4.0],
+      "shape": [3],
+      "expected_output": [0.0, 1.0, 2.0],
+      "expected_grad": [1.4426950408889634, 0.7213475204444817, 0.36067376022224085],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-024"],
+      "e2e_scenarios": ["cpu_kernel:unary_exp_log"]
+    },
+    {
+      "name": "tensor_log10_basic",
+      "op": "log10",
+      "input": [1.0, 10.0, 100.0],
+      "shape": [3],
+      "expected_output": [0.0, 1.0, 2.0],
+      "expected_grad": [0.43429448190325176, 0.043429448190325175, 0.004342944819032518],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-025"],
+      "e2e_scenarios": ["cpu_kernel:unary_exp_log"]
+    },
+    {
+      "name": "tensor_sign_basic",
+      "op": "sign",
+      "input": [-3.0, 0.0, 2.5],
+      "shape": [3],
+      "expected_output": [-1.0, 1.0, 1.0],
+      "expected_grad": [0.0, 0.0, 0.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-026"],
+      "e2e_scenarios": ["cpu_kernel:unary_step"]
+    },
+    {
+      "name": "tensor_rsqrt_basic",
+      "op": "rsqrt",
+      "input": [1.0, 4.0, 9.0],
+      "shape": [3],
+      "expected_output": [1.0, 0.5, 0.3333333333333333],
+      "expected_grad": [-0.5, -0.0625, -0.018518518518518517],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-027"],
+      "e2e_scenarios": ["cpu_kernel:unary_math"]
+    },
+    {
+      "name": "tensor_square_basic",
+      "op": "square",
+      "input": [-2.0, 0.0, 3.0],
+      "shape": [3],
+      "expected_output": [4.0, 0.0, 9.0],
+      "expected_grad": [-4.0, 0.0, 6.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-UNARY-028"],
+      "e2e_scenarios": ["cpu_kernel:unary_math"]
+    },
+    {
+      "name": "tensor_reciprocal_basic",
+      "op": "reciprocal",
+      "input": [1.0, 2.0, 0.5],
+      "shape": [3],
+      "expected_output": [1.0, 0.5, 2.0],
+      "expected_grad": [-1.0, -0.25, -4.0],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-UNARY-029"],
+      "e2e_scenarios": ["cpu_kernel:unary_math"]
+    }
+  ]
+}

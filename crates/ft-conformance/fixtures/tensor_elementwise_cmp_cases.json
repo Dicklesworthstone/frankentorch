@@ -1,0 +1,94 @@
+{
+  "cases": [
+    {
+      "name": "eq_basic",
+      "op": "eq",
+      "lhs": [1.0, 2.0, 3.0, 4.0],
+      "rhs": [1.0, 5.0, 3.0, 0.0],
+      "shape": [4],
+      "expected_output": [1.0, 0.0, 1.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-001"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "ne_basic",
+      "op": "ne",
+      "lhs": [1.0, 2.0, 3.0, 4.0],
+      "rhs": [1.0, 5.0, 3.0, 0.0],
+      "shape": [4],
+      "expected_output": [0.0, 1.0, 0.0, 1.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-002"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "lt_basic",
+      "op": "lt",
+      "lhs": [1.0, 5.0, 3.0, 4.0],
+      "rhs": [2.0, 3.0, 3.0, 5.0],
+      "shape": [4],
+      "expected_output": [1.0, 0.0, 0.0, 1.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-003"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "gt_basic",
+      "op": "gt",
+      "lhs": [1.0, 5.0, 3.0, 4.0],
+      "rhs": [2.0, 3.0, 3.0, 5.0],
+      "shape": [4],
+      "expected_output": [0.0, 1.0, 0.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-004"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "le_basic",
+      "op": "le",
+      "lhs": [1.0, 5.0, 3.0, 4.0],
+      "rhs": [2.0, 3.0, 3.0, 5.0],
+      "shape": [4],
+      "expected_output": [1.0, 0.0, 1.0, 1.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-005"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "ge_basic",
+      "op": "ge",
+      "lhs": [1.0, 5.0, 3.0, 4.0],
+      "rhs": [2.0, 3.0, 3.0, 5.0],
+      "shape": [4],
+      "expected_output": [0.0, 1.0, 1.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-006"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "eq_2d",
+      "op": "eq",
+      "lhs": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "rhs": [1.0, 0.0, 3.0, 0.0, 5.0, 0.0],
+      "shape": [2, 3],
+      "expected_output": [1.0, 0.0, 1.0, 0.0, 1.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-007"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "lt_negative_values",
+      "op": "lt",
+      "lhs": [-3.0, -1.0, 0.0, 2.0],
+      "rhs": [-2.0, 0.0, 0.0, 1.0],
+      "shape": [4],
+      "expected_output": [1.0, 1.0, 0.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-008"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    },
+    {
+      "name": "ge_all_equal",
+      "op": "ge",
+      "lhs": [3.0, 3.0, 3.0],
+      "rhs": [3.0, 3.0, 3.0],
+      "shape": [3],
+      "expected_output": [1.0, 1.0, 1.0],
+      "contract_ids": ["CPU-KERNEL-ELCMP-009"],
+      "e2e_scenarios": ["cpu_kernel:elementwise_cmp"]
+    }
+  ]
+}

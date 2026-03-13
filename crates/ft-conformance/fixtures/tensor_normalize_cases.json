@@ -1,0 +1,88 @@
+{
+  "cases": [
+    {
+      "name": "softmax_1d_dim0",
+      "op": "softmax",
+      "input": [1.0, 2.0, 3.0],
+      "shape": [3],
+      "dim": 0,
+      "expected_output": [0.09003057317038045, 0.24472847105479764, 0.6652409557748219],
+      "expected_shape": [3],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-001"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    },
+    {
+      "name": "softmax_2d_dim1",
+      "op": "softmax",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "dim": 1,
+      "expected_output": [0.09003057317038045, 0.24472847105479764, 0.6652409557748219, 0.09003057317038045, 0.24472847105479764, 0.6652409557748219],
+      "expected_shape": [2, 3],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-002"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    },
+    {
+      "name": "log_softmax_1d_dim0",
+      "op": "log_softmax",
+      "input": [1.0, 2.0, 3.0],
+      "shape": [3],
+      "dim": 0,
+      "expected_output": [-2.4076059644443806, -1.4076059644443804, -0.4076059644443803],
+      "expected_shape": [3],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-003"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    },
+    {
+      "name": "log_softmax_2d_dim1",
+      "op": "log_softmax",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "dim": 1,
+      "expected_output": [-2.4076059644443806, -1.4076059644443804, -0.4076059644443803, -2.4076059644443806, -1.4076059644443804, -0.4076059644443803],
+      "expected_shape": [2, 3],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-004"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    },
+    {
+      "name": "norm_l2_1d",
+      "op": "norm",
+      "input": [3.0, 4.0],
+      "shape": [2],
+      "p": 2.0,
+      "expected_output": [5.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-005"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    },
+    {
+      "name": "norm_l1_1d",
+      "op": "norm",
+      "input": [-3.0, 4.0],
+      "shape": [2],
+      "p": 1.0,
+      "expected_output": [7.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-006"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    },
+    {
+      "name": "cumsum_1d_dim0",
+      "op": "cumsum",
+      "input": [1.0, 2.0, 3.0, 4.0],
+      "shape": [4],
+      "dim": 0,
+      "expected_output": [1.0, 3.0, 6.0, 10.0],
+      "expected_shape": [4],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-NORMALIZE-007"],
+      "e2e_scenarios": ["cpu_kernel:normalize"]
+    }
+  ]
+}

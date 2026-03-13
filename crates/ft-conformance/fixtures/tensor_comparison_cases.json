@@ -1,0 +1,73 @@
+{
+  "cases": [
+    {
+      "name": "equal_identical_tensors",
+      "op": "equal",
+      "lhs": [1.0, 2.0, 3.0],
+      "rhs": [1.0, 2.0, 3.0],
+      "shape": [3],
+      "expected": true,
+      "contract_ids": ["CPU-KERNEL-CMP-001"],
+      "e2e_scenarios": ["cpu_kernel:tensor_comparison"]
+    },
+    {
+      "name": "equal_different_values",
+      "op": "equal",
+      "lhs": [1.0, 2.0, 3.0],
+      "rhs": [1.0, 2.0, 4.0],
+      "shape": [3],
+      "expected": false,
+      "contract_ids": ["CPU-KERNEL-CMP-002"],
+      "e2e_scenarios": ["cpu_kernel:tensor_comparison"]
+    },
+    {
+      "name": "equal_2d_identical",
+      "op": "equal",
+      "lhs": [1.0, 2.0, 3.0, 4.0],
+      "rhs": [1.0, 2.0, 3.0, 4.0],
+      "shape": [2, 2],
+      "expected": true,
+      "contract_ids": ["CPU-KERNEL-CMP-003"],
+      "e2e_scenarios": ["cpu_kernel:tensor_comparison"]
+    },
+    {
+      "name": "allclose_within_tolerance",
+      "op": "allclose",
+      "lhs": [1.0, 2.0, 3.0],
+      "rhs": [1.0000001, 2.0000001, 3.0000001],
+      "shape": [3],
+      "rtol": 1e-5,
+      "atol": 1e-8,
+      "equal_nan": false,
+      "expected": true,
+      "contract_ids": ["CPU-KERNEL-CMP-004"],
+      "e2e_scenarios": ["cpu_kernel:tensor_comparison"]
+    },
+    {
+      "name": "allclose_outside_tolerance",
+      "op": "allclose",
+      "lhs": [1.0, 2.0, 3.0],
+      "rhs": [1.1, 2.0, 3.0],
+      "shape": [3],
+      "rtol": 1e-5,
+      "atol": 1e-8,
+      "equal_nan": false,
+      "expected": false,
+      "contract_ids": ["CPU-KERNEL-CMP-005"],
+      "e2e_scenarios": ["cpu_kernel:tensor_comparison"]
+    },
+    {
+      "name": "allclose_exact_match",
+      "op": "allclose",
+      "lhs": [0.0, -1.5, 2.5],
+      "rhs": [0.0, -1.5, 2.5],
+      "shape": [3],
+      "rtol": 0.0,
+      "atol": 0.0,
+      "equal_nan": false,
+      "expected": true,
+      "contract_ids": ["CPU-KERNEL-CMP-006"],
+      "e2e_scenarios": ["cpu_kernel:tensor_comparison"]
+    }
+  ]
+}

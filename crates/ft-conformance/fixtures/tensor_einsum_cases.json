@@ -1,0 +1,104 @@
+{
+  "cases": [
+    {
+      "name": "einsum_trace",
+      "equation": "ii->",
+      "inputs": [
+        { "values": [1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0], "shape": [3, 3] }
+      ],
+      "expected_output": [6.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-001"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_transpose",
+      "equation": "ij->ji",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "shape": [2, 3] }
+      ],
+      "expected_output": [1.0, 4.0, 2.0, 5.0, 3.0, 6.0],
+      "expected_shape": [3, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-002"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_dot_product",
+      "equation": "i,i->",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0], "shape": [3] },
+        { "values": [4.0, 5.0, 6.0], "shape": [3] }
+      ],
+      "expected_output": [32.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-003"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_matmul",
+      "equation": "ij,jk->ik",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0, 4.0], "shape": [2, 2] },
+        { "values": [5.0, 6.0, 7.0, 8.0], "shape": [2, 2] }
+      ],
+      "expected_output": [19.0, 22.0, 43.0, 50.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-004"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_outer_product",
+      "equation": "i,j->ij",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0], "shape": [3] },
+        { "values": [4.0, 5.0], "shape": [2] }
+      ],
+      "expected_output": [4.0, 5.0, 8.0, 10.0, 12.0, 15.0],
+      "expected_shape": [3, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-005"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_element_wise_mul",
+      "equation": "ij,ij->ij",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0, 4.0], "shape": [2, 2] },
+        { "values": [5.0, 6.0, 7.0, 8.0], "shape": [2, 2] }
+      ],
+      "expected_output": [5.0, 12.0, 21.0, 32.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-006"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_sum_all",
+      "equation": "ij->",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "shape": [2, 3] }
+      ],
+      "expected_output": [21.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-007"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    },
+    {
+      "name": "einsum_row_sum",
+      "equation": "ij->i",
+      "inputs": [
+        { "values": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0], "shape": [2, 3] }
+      ],
+      "expected_output": [6.0, 15.0],
+      "expected_shape": [2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-EINSUM-008"],
+      "e2e_scenarios": ["cpu_kernel:einsum"]
+    }
+  ]
+}

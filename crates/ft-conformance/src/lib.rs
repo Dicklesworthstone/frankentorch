@@ -88,6 +88,179 @@ impl TensorBinaryCaseReport {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TensorUnaryCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub grad_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorUnaryCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.grad_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorComparisonCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub result_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorComparisonCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.result_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorSearchsortedCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorSearchsortedCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorFactoryCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorFactoryCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorEinsumCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorEinsumCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorReductionCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub grad_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorReductionCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok && self.grad_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorLossCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorLossCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorLinalgCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorLinalgCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorNormalizeCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorNormalizeCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorElementwiseCmpCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorElementwiseCmpCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorShapeCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorShapeCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct DispatchCaseReport {
     pub name: String,
     pub mode: ExecutionMode,
@@ -266,6 +439,26 @@ struct TensorBinaryFixtureFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct TensorUnaryFixtureFile {
+    cases: Vec<TensorUnaryCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorUnaryCase {
+    name: String,
+    op: String,
+    input: Vec<f64>,
+    shape: Vec<usize>,
+    expected_output: Vec<f64>,
+    expected_grad: Vec<f64>,
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct TensorBinaryCase {
     name: String,
     op: String,
@@ -276,6 +469,264 @@ struct TensorBinaryCase {
     expected_lhs_grad: Vec<f64>,
     expected_rhs_grad: Vec<f64>,
     tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorComparisonFixtureFile {
+    cases: Vec<TensorComparisonCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorComparisonCase {
+    name: String,
+    op: String,
+    lhs: Vec<f64>,
+    rhs: Vec<f64>,
+    shape: Vec<usize>,
+    expected: bool,
+    #[serde(default)]
+    rtol: Option<f64>,
+    #[serde(default)]
+    atol: Option<f64>,
+    #[serde(default)]
+    equal_nan: Option<bool>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorSearchsortedFixtureFile {
+    cases: Vec<TensorSearchsortedCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorSearchsortedCase {
+    name: String,
+    sorted_sequence: Vec<f64>,
+    seq_shape: Vec<usize>,
+    values: Vec<f64>,
+    val_shape: Vec<usize>,
+    right: bool,
+    expected_indices: Vec<f64>,
+    expected_shape: Vec<usize>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorFactoryFixtureFile {
+    cases: Vec<TensorFactoryCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorFactoryCase {
+    name: String,
+    op: String,
+    #[serde(default)]
+    shape: Option<Vec<usize>>,
+    #[serde(default)]
+    fill_value: Option<f64>,
+    #[serde(default)]
+    start: Option<f64>,
+    #[serde(default)]
+    end: Option<f64>,
+    #[serde(default)]
+    step: Option<f64>,
+    #[serde(default)]
+    steps: Option<usize>,
+    #[serde(default)]
+    base: Option<f64>,
+    #[serde(default)]
+    n: Option<usize>,
+    expected_output: Vec<f64>,
+    #[serde(default)]
+    expected_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorEinsumFixtureFile {
+    cases: Vec<TensorEinsumCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorEinsumInput {
+    values: Vec<f64>,
+    shape: Vec<usize>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorEinsumCase {
+    name: String,
+    equation: String,
+    inputs: Vec<TensorEinsumInput>,
+    expected_output: Vec<f64>,
+    expected_shape: Vec<usize>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorReductionFixtureFile {
+    cases: Vec<TensorReductionCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorReductionCase {
+    name: String,
+    op: String,
+    input: Vec<f64>,
+    shape: Vec<usize>,
+    #[serde(default)]
+    dim: Option<usize>,
+    expected_output: Vec<f64>,
+    expected_shape: Vec<usize>,
+    #[serde(default)]
+    expected_grad: Option<Vec<f64>>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorLossFixtureFile {
+    cases: Vec<TensorLossCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorLossCase {
+    name: String,
+    op: String,
+    pred: Vec<f64>,
+    target: Vec<f64>,
+    shape: Vec<usize>,
+    expected_output: Vec<f64>,
+    expected_shape: Vec<usize>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    beta: Option<f64>,
+    #[serde(default)]
+    delta: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorLinalgFixtureFile {
+    cases: Vec<TensorLinalgCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorLinalgCase {
+    name: String,
+    op: String,
+    #[serde(default)]
+    input: Option<Vec<f64>>,
+    #[serde(default)]
+    shape: Option<Vec<usize>>,
+    #[serde(default)]
+    lhs: Option<Vec<f64>>,
+    #[serde(default)]
+    rhs: Option<Vec<f64>>,
+    #[serde(default)]
+    lhs_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    rhs_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    expected_output: Option<Vec<f64>>,
+    #[serde(default)]
+    expected_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    expected_scalar: Option<f64>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorNormalizeFixtureFile {
+    cases: Vec<TensorNormalizeCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorNormalizeCase {
+    name: String,
+    op: String,
+    input: Vec<f64>,
+    shape: Vec<usize>,
+    #[serde(default)]
+    dim: Option<usize>,
+    #[serde(default)]
+    p: Option<f64>,
+    expected_output: Vec<f64>,
+    expected_shape: Vec<usize>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorElementwiseCmpFixtureFile {
+    cases: Vec<TensorElementwiseCmpCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorElementwiseCmpCase {
+    name: String,
+    op: String,
+    lhs: Vec<f64>,
+    rhs: Vec<f64>,
+    shape: Vec<usize>,
+    expected_output: Vec<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorShapeFixtureFile {
+    cases: Vec<TensorShapeCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorShapeCase {
+    name: String,
+    op: String,
+    input: Vec<f64>,
+    input_shape: Vec<usize>,
+    params: serde_json::Value,
+    expected_output: Vec<f64>,
+    expected_shape: Vec<usize>,
     #[serde(default)]
     contract_ids: Vec<String>,
     #[serde(default)]
@@ -734,6 +1185,303 @@ fn run_tensor_binary_conformance_with_fixture(
 
     let report = HarnessReport {
         suite: "tensor_binary",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_unary_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorUnaryCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_unary_cases.json");
+    let fixture: TensorUnaryFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_unary_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorUnaryCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_unary",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_comparison_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorComparisonCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_comparison_cases.json");
+    let fixture: TensorComparisonFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_comparison_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorComparisonCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_comparison",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_factory_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorFactoryCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_factory_cases.json");
+    let fixture: TensorFactoryFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_factory_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorFactoryCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_factory",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_einsum_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorEinsumCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_einsum_cases.json");
+    let fixture: TensorEinsumFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_einsum_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorEinsumCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_einsum",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_searchsorted_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorSearchsortedCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_searchsorted_cases.json");
+    let fixture: TensorSearchsortedFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_searchsorted_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorSearchsortedCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_searchsorted",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_reduction_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorReductionCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_reduction_cases.json");
+    let fixture: TensorReductionFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_reduction_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorReductionCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_reduction",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_loss_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorLossCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_loss_cases.json");
+    let fixture: TensorLossFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_loss_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorLossCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_loss",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_linalg_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorLinalgCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_linalg_cases.json");
+    let fixture: TensorLinalgFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_linalg_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorLinalgCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_linalg",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_normalize_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorNormalizeCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_normalize_cases.json");
+    let fixture: TensorNormalizeFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_normalize_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorNormalizeCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_normalize",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_elementwise_cmp_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorElementwiseCmpCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_elementwise_cmp_cases.json");
+    let fixture: TensorElementwiseCmpFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_elementwise_cmp_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorElementwiseCmpCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_elementwise_cmp",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_shape_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorShapeCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_shape_cases.json");
+    let fixture: TensorShapeFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        case_reports.push(run_tensor_shape_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorShapeCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_shape",
         oracle_present: config.oracle_root.exists(),
         fixture_count: 1,
         strict_mode: mode == ExecutionMode::Strict,
@@ -3338,6 +4086,1211 @@ fn run_tensor_binary_case(
             ],
             format!(
                 "cargo test -p ft-conformance strict_tensor_binary_conformance_is_green -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_unary_case(
+    case: &TensorUnaryCase,
+    mode: ExecutionMode,
+) -> Result<TensorUnaryCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let input = session
+        .tensor_variable(case.input.clone(), case.shape.clone(), true)
+        .map_err(|error| format!("input tensor build failed for '{}': {error}", case.name))?;
+
+    let out = match case.op.as_str() {
+        "sin" => session.tensor_sin(input),
+        "cos" => session.tensor_cos(input),
+        "exp" => session.tensor_exp(input),
+        "log" => session.tensor_log(input),
+        "sqrt" => session.tensor_sqrt(input),
+        "abs" => session.tensor_abs(input),
+        "neg" => session.tensor_neg(input),
+        "relu" => session.tensor_relu(input),
+        "sigmoid" => session.tensor_sigmoid(input),
+        "tanh" => session.tensor_tanh(input),
+        "floor" => session.tensor_floor(input),
+        "ceil" => session.tensor_ceil(input),
+        "round" => session.tensor_round(input),
+        "gelu" => session.tensor_gelu(input),
+        "silu" => session.tensor_silu(input),
+        "leaky_relu" => session.tensor_leaky_relu(input),
+        "elu" => session.tensor_elu(input),
+        "tan" => session.tensor_tan(input),
+        "asin" => session.tensor_asin(input),
+        "acos" => session.tensor_acos(input),
+        "atan" => session.tensor_atan(input),
+        "sinh" => session.tensor_sinh(input),
+        "cosh" => session.tensor_cosh(input),
+        "log2" => session.tensor_log2(input),
+        "log10" => session.tensor_log10(input),
+        "sign" => session.tensor_sign(input),
+        "rsqrt" => session.tensor_rsqrt(input),
+        "square" => session.tensor_square(input),
+        "reciprocal" => session.tensor_reciprocal(input),
+        _ => return Err(format!("unsupported tensor unary operation '{}'", case.op)),
+    }
+    .map_err(|error| format!("tensor unary '{}' failed: {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let backward = session
+        .tensor_backward(out)
+        .map_err(|error| format!("tensor backward failed for '{}': {error}", case.name))?;
+    let actual_grad = session
+        .tensor_gradient(&backward, input)
+        .ok_or_else(|| format!("missing input grad for '{}'", case.name))?
+        .to_vec();
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_output.as_slice(),
+        tolerance,
+    );
+    let grad_ok = vec_within(
+        actual_grad.as_slice(),
+        case.expected_grad.as_slice(),
+        tolerance,
+    );
+    let outcome = if output_ok && grad_ok {
+        "pass"
+    } else {
+        "fail"
+    };
+    let reason_code = if outcome == "pass" {
+        "tensor_unary_parity_ok"
+    } else {
+        "tensor_unary_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorUnaryCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        grad_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_unary",
+            "tensor_unary_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_unary_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_unary_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_comparison_case(
+    case: &TensorComparisonCase,
+    mode: ExecutionMode,
+) -> Result<TensorComparisonCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let lhs = session
+        .tensor_variable(case.lhs.clone(), case.shape.clone(), false)
+        .map_err(|error| format!("lhs tensor build failed for '{}': {error}", case.name))?;
+    let rhs = session
+        .tensor_variable(case.rhs.clone(), case.shape.clone(), false)
+        .map_err(|error| format!("rhs tensor build failed for '{}': {error}", case.name))?;
+
+    let actual_result = match case.op.as_str() {
+        "equal" => session
+            .tensor_equal(lhs, rhs)
+            .map_err(|error| format!("tensor_equal failed for '{}': {error}", case.name))?,
+        "allclose" => {
+            let rtol = case.rtol.unwrap_or(1e-5);
+            let atol = case.atol.unwrap_or(1e-8);
+            let equal_nan = case.equal_nan.unwrap_or(false);
+            session
+                .tensor_allclose(lhs, rhs, rtol, atol, equal_nan)
+                .map_err(|error| format!("tensor_allclose failed for '{}': {error}", case.name))?
+        }
+        _ => return Err(format!("unsupported comparison op '{}'", case.op)),
+    };
+
+    let result_ok = actual_result == case.expected;
+    let outcome = if result_ok { "pass" } else { "fail" };
+    let reason_code = if result_ok {
+        "tensor_comparison_parity_ok"
+    } else {
+        "tensor_comparison_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorComparisonCaseReport {
+        name: case.name.clone(),
+        mode,
+        result_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_comparison",
+            "tensor_comparison_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_comparison_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_comparison_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_factory_case(
+    case: &TensorFactoryCase,
+    mode: ExecutionMode,
+) -> Result<TensorFactoryCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+
+    let out = match case.op.as_str() {
+        "zeros" => {
+            let shape = case
+                .shape
+                .clone()
+                .ok_or_else(|| format!("missing shape for zeros in '{}'", case.name))?;
+            session.zeros(shape, false)
+        }
+        "ones" => {
+            let shape = case
+                .shape
+                .clone()
+                .ok_or_else(|| format!("missing shape for ones in '{}'", case.name))?;
+            session.ones(shape, false)
+        }
+        "full" => {
+            let shape = case
+                .shape
+                .clone()
+                .ok_or_else(|| format!("missing shape for full in '{}'", case.name))?;
+            let fill_value = case
+                .fill_value
+                .ok_or_else(|| format!("missing fill_value for full in '{}'", case.name))?;
+            session.full(shape, fill_value, false)
+        }
+        "arange" => {
+            let start = case
+                .start
+                .ok_or_else(|| format!("missing start for arange in '{}'", case.name))?;
+            let end = case
+                .end
+                .ok_or_else(|| format!("missing end for arange in '{}'", case.name))?;
+            let step = case
+                .step
+                .ok_or_else(|| format!("missing step for arange in '{}'", case.name))?;
+            session.arange(start, end, step, false)
+        }
+        "linspace" => {
+            let start = case
+                .start
+                .ok_or_else(|| format!("missing start for linspace in '{}'", case.name))?;
+            let end = case
+                .end
+                .ok_or_else(|| format!("missing end for linspace in '{}'", case.name))?;
+            let steps = case
+                .steps
+                .ok_or_else(|| format!("missing steps for linspace in '{}'", case.name))?;
+            session.linspace(start, end, steps, false)
+        }
+        "logspace" => {
+            let start = case
+                .start
+                .ok_or_else(|| format!("missing start for logspace in '{}'", case.name))?;
+            let end = case
+                .end
+                .ok_or_else(|| format!("missing end for logspace in '{}'", case.name))?;
+            let steps = case
+                .steps
+                .ok_or_else(|| format!("missing steps for logspace in '{}'", case.name))?;
+            let base = case.base.unwrap_or(10.0);
+            session.logspace(start, end, steps, base, false)
+        }
+        "eye" => {
+            let n = case
+                .n
+                .ok_or_else(|| format!("missing n for eye in '{}'", case.name))?;
+            session.eye(n, false)
+        }
+        _ => return Err(format!("unsupported factory op '{}'", case.op)),
+    }
+    .map_err(|error| format!("tensor factory '{}' failed: {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|error| format!("tensor shape read failed for '{}': {error}", case.name))?;
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_output.as_slice(),
+        tolerance,
+    );
+    let shape_ok = if let Some(ref expected_shape) = case.expected_shape {
+        actual_shape == *expected_shape
+    } else if let Some(ref shape) = case.shape {
+        actual_shape == *shape
+    } else {
+        true
+    };
+
+    let outcome = if output_ok && shape_ok {
+        "pass"
+    } else {
+        "fail"
+    };
+    let reason_code = if outcome == "pass" {
+        "tensor_factory_parity_ok"
+    } else {
+        "tensor_factory_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorFactoryCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_factory",
+            "tensor_factory_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_factory_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_factory_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_einsum_case(
+    case: &TensorEinsumCase,
+    mode: ExecutionMode,
+) -> Result<TensorEinsumCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+
+    let tensor_ids: Vec<_> = case
+        .inputs
+        .iter()
+        .enumerate()
+        .map(|(i, input)| {
+            session
+                .tensor_variable(input.values.clone(), input.shape.clone(), false)
+                .map_err(|error| {
+                    format!(
+                        "einsum input tensor {i} build failed for '{}': {error}",
+                        case.name
+                    )
+                })
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let out = session
+        .tensor_einsum(&case.equation, &tensor_ids)
+        .map_err(|error| format!("tensor_einsum failed for '{}': {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|error| format!("tensor shape read failed for '{}': {error}", case.name))?;
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_output.as_slice(),
+        tolerance,
+    );
+    let shape_ok = actual_shape == case.expected_shape;
+
+    let outcome = if output_ok && shape_ok {
+        "pass"
+    } else {
+        "fail"
+    };
+    let reason_code = if outcome == "pass" {
+        "tensor_einsum_parity_ok"
+    } else {
+        "tensor_einsum_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "equation".to_string(),
+        serde_json::Value::String(case.equation.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorEinsumCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_einsum",
+            "tensor_einsum_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_einsum_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_einsum_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_searchsorted_case(
+    case: &TensorSearchsortedCase,
+    mode: ExecutionMode,
+) -> Result<TensorSearchsortedCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+
+    let sorted_seq = session
+        .tensor_variable(case.sorted_sequence.clone(), case.seq_shape.clone(), false)
+        .map_err(|error| {
+            format!(
+                "sorted_sequence tensor build failed for '{}': {error}",
+                case.name
+            )
+        })?;
+    let values = session
+        .tensor_variable(case.values.clone(), case.val_shape.clone(), false)
+        .map_err(|error| format!("values tensor build failed for '{}': {error}", case.name))?;
+
+    let out = session
+        .tensor_searchsorted(sorted_seq, values, case.right)
+        .map_err(|error| format!("tensor_searchsorted failed for '{}': {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|error| format!("tensor shape read failed for '{}': {error}", case.name))?;
+
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_indices.as_slice(),
+        0.0, // indices must match exactly
+    );
+    let shape_ok = actual_shape == case.expected_shape;
+
+    let outcome = if output_ok && shape_ok {
+        "pass"
+    } else {
+        "fail"
+    };
+    let reason_code = if outcome == "pass" {
+        "tensor_searchsorted_parity_ok"
+    } else {
+        "tensor_searchsorted_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "right".to_string(),
+        serde_json::Value::Bool(case.right),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorSearchsortedCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok: output_ok && shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_searchsorted",
+            "tensor_searchsorted_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_searchsorted_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_searchsorted_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_reduction_case(
+    case: &TensorReductionCase,
+    mode: ExecutionMode,
+) -> Result<TensorReductionCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let has_grad = case.expected_grad.is_some();
+    let input = session
+        .tensor_variable(case.input.clone(), case.shape.clone(), has_grad)
+        .map_err(|error| format!("input tensor build failed for '{}': {error}", case.name))?;
+
+    let out = match case.op.as_str() {
+        "sum" => session.tensor_sum(input),
+        "mean" => session.tensor_mean(input),
+        "trace" => session.tensor_trace(input),
+        "sum_dim" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("missing dim for sum_dim in '{}'", case.name))?;
+            session.tensor_sum_dim(input, dim)
+        }
+        "mean_dim" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("missing dim for mean_dim in '{}'", case.name))?;
+            session.tensor_mean_dim(input, dim)
+        }
+        "prod_dim" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("missing dim for prod_dim in '{}'", case.name))?;
+            session.tensor_prod_dim(input, dim)
+        }
+        "var_dim" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("missing dim for var_dim in '{}'", case.name))?;
+            session.tensor_var_dim(input, dim)
+        }
+        "std_dim" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("missing dim for std_dim in '{}'", case.name))?;
+            session.tensor_std_dim(input, dim)
+        }
+        _ => return Err(format!("unsupported reduction op '{}'", case.op)),
+    }
+    .map_err(|error| format!("tensor reduction '{}' failed: {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|error| format!("tensor shape read failed for '{}': {error}", case.name))?;
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_output.as_slice(),
+        tolerance,
+    );
+    let shape_ok = actual_shape == case.expected_shape;
+
+    let grad_ok = if let Some(ref expected_grad) = case.expected_grad {
+        let backward = session
+            .tensor_backward(out)
+            .map_err(|error| format!("tensor backward failed for '{}': {error}", case.name))?;
+        let actual_grad = session
+            .tensor_gradient(&backward, input)
+            .ok_or_else(|| format!("missing input grad for '{}'", case.name))?
+            .to_vec();
+        vec_within(actual_grad.as_slice(), expected_grad.as_slice(), tolerance)
+    } else {
+        true
+    };
+
+    let passed = output_ok && shape_ok && grad_ok;
+    let outcome = if passed { "pass" } else { "fail" };
+    let reason_code = if passed {
+        "tensor_reduction_parity_ok"
+    } else {
+        "tensor_reduction_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorReductionCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        grad_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_reduction",
+            "tensor_reduction_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_reduction_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_reduction_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_loss_case(
+    case: &TensorLossCase,
+    mode: ExecutionMode,
+) -> Result<TensorLossCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let pred = session
+        .tensor_variable(case.pred.clone(), case.shape.clone(), false)
+        .map_err(|error| format!("pred tensor build failed for '{}': {error}", case.name))?;
+    let target = session
+        .tensor_variable(case.target.clone(), case.shape.clone(), false)
+        .map_err(|error| format!("target tensor build failed for '{}': {error}", case.name))?;
+
+    let out = match case.op.as_str() {
+        "mse_loss" => session.mse_loss(pred, target),
+        "l1_loss" => session.l1_loss(pred, target),
+        "bce_loss" => session.bce_loss(pred, target),
+        "bce_with_logits_loss" => session.bce_with_logits_loss(pred, target),
+        "smooth_l1_loss" => {
+            let beta = case.beta.unwrap_or(1.0);
+            session.smooth_l1_loss(pred, target, beta)
+        }
+        "huber_loss" => {
+            let delta = case.delta.unwrap_or(1.0);
+            session.huber_loss(pred, target, delta)
+        }
+        _ => return Err(format!("unsupported loss op '{}'", case.op)),
+    }
+    .map_err(|error| format!("loss '{}' failed: {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|error| format!("tensor shape read failed for '{}': {error}", case.name))?;
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_output.as_slice(),
+        tolerance,
+    );
+    let shape_ok = actual_shape == case.expected_shape;
+
+    let passed = output_ok && shape_ok;
+    let outcome = if passed { "pass" } else { "fail" };
+    let reason_code = if passed {
+        "tensor_loss_parity_ok"
+    } else {
+        "tensor_loss_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorLossCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_loss",
+            "tensor_loss_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_loss_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_loss_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_linalg_case(
+    case: &TensorLinalgCase,
+    mode: ExecutionMode,
+) -> Result<TensorLinalgCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+
+    let output_ok = match case.op.as_str() {
+        "det" => {
+            let input_data = case
+                .input
+                .as_ref()
+                .ok_or_else(|| format!("det case '{}' missing input", case.name))?;
+            let shape = case
+                .shape
+                .as_ref()
+                .ok_or_else(|| format!("det case '{}' missing shape", case.name))?;
+            let expected = case
+                .expected_scalar
+                .ok_or_else(|| format!("det case '{}' missing expected_scalar", case.name))?;
+            let t = session
+                .tensor_variable(input_data.clone(), shape.clone(), false)
+                .map_err(|e| format!("tensor build failed for '{}': {e}", case.name))?;
+            let actual = session
+                .tensor_linalg_det(t)
+                .map_err(|e| format!("det failed for '{}': {e}", case.name))?;
+            (actual - expected).abs() <= tolerance
+        }
+        "inv" => {
+            let input_data = case
+                .input
+                .as_ref()
+                .ok_or_else(|| format!("inv case '{}' missing input", case.name))?;
+            let shape = case
+                .shape
+                .as_ref()
+                .ok_or_else(|| format!("inv case '{}' missing shape", case.name))?;
+            let expected_output = case
+                .expected_output
+                .as_ref()
+                .ok_or_else(|| format!("inv case '{}' missing expected_output", case.name))?;
+            let expected_shape = case
+                .expected_shape
+                .as_ref()
+                .ok_or_else(|| format!("inv case '{}' missing expected_shape", case.name))?;
+            let t = session
+                .tensor_variable(input_data.clone(), shape.clone(), false)
+                .map_err(|e| format!("tensor build failed for '{}': {e}", case.name))?;
+            let out = session
+                .tensor_linalg_inv(t)
+                .map_err(|e| format!("inv failed for '{}': {e}", case.name))?;
+            let actual_values = session
+                .tensor_values(out)
+                .map_err(|e| format!("value read failed for '{}': {e}", case.name))?;
+            let actual_shape = session
+                .tensor_shape(out)
+                .map_err(|e| format!("shape read failed for '{}': {e}", case.name))?;
+            vec_within(&actual_values, expected_output, tolerance)
+                && actual_shape == *expected_shape
+        }
+        "matmul" | "dot" | "outer" => {
+            let lhs_data = case
+                .lhs
+                .as_ref()
+                .ok_or_else(|| format!("{} case '{}' missing lhs", case.op, case.name))?;
+            let rhs_data = case
+                .rhs
+                .as_ref()
+                .ok_or_else(|| format!("{} case '{}' missing rhs", case.op, case.name))?;
+            let lhs_shape = case
+                .lhs_shape
+                .as_ref()
+                .ok_or_else(|| format!("{} case '{}' missing lhs_shape", case.op, case.name))?;
+            let rhs_shape = case
+                .rhs_shape
+                .as_ref()
+                .ok_or_else(|| format!("{} case '{}' missing rhs_shape", case.op, case.name))?;
+            let lhs = session
+                .tensor_variable(lhs_data.clone(), lhs_shape.clone(), false)
+                .map_err(|e| format!("lhs tensor build failed for '{}': {e}", case.name))?;
+            let rhs = session
+                .tensor_variable(rhs_data.clone(), rhs_shape.clone(), false)
+                .map_err(|e| format!("rhs tensor build failed for '{}': {e}", case.name))?;
+
+            let out = match case.op.as_str() {
+                "matmul" => session.tensor_matmul(lhs, rhs),
+                "dot" => session.tensor_dot(lhs, rhs),
+                "outer" => session.tensor_outer(lhs, rhs),
+                _ => unreachable!(),
+            }
+            .map_err(|e| format!("{} failed for '{}': {e}", case.op, case.name))?;
+
+            if let Some(expected_scalar) = case.expected_scalar {
+                let actual_values = session
+                    .tensor_values(out)
+                    .map_err(|e| format!("value read failed for '{}': {e}", case.name))?;
+                actual_values.len() == 1
+                    && (actual_values[0] - expected_scalar).abs() <= tolerance
+            } else {
+                let expected_output = case.expected_output.as_ref().ok_or_else(|| {
+                    format!(
+                        "{} case '{}' missing expected_output or expected_scalar",
+                        case.op, case.name
+                    )
+                })?;
+                let expected_shape = case.expected_shape.as_ref().ok_or_else(|| {
+                    format!("{} case '{}' missing expected_shape", case.op, case.name)
+                })?;
+                let actual_values = session
+                    .tensor_values(out)
+                    .map_err(|e| format!("value read failed for '{}': {e}", case.name))?;
+                let actual_shape = session
+                    .tensor_shape(out)
+                    .map_err(|e| format!("shape read failed for '{}': {e}", case.name))?;
+                vec_within(&actual_values, expected_output, tolerance)
+                    && actual_shape == *expected_shape
+            }
+        }
+        _ => return Err(format!("unsupported linalg op '{}'", case.op)),
+    };
+
+    let passed = output_ok;
+    let outcome = if passed { "pass" } else { "fail" };
+    let reason_code = if passed {
+        "tensor_linalg_parity_ok"
+    } else {
+        "tensor_linalg_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorLinalgCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_linalg",
+            "tensor_linalg_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_linalg_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_linalg_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_normalize_case(
+    case: &TensorNormalizeCase,
+    mode: ExecutionMode,
+) -> Result<TensorNormalizeCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let input = session
+        .tensor_variable(case.input.clone(), case.shape.clone(), false)
+        .map_err(|e| format!("input tensor build failed for '{}': {e}", case.name))?;
+
+    let out = match case.op.as_str() {
+        "softmax" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("softmax case '{}' missing dim", case.name))?;
+            session.tensor_softmax(input, dim)
+        }
+        "log_softmax" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("log_softmax case '{}' missing dim", case.name))?;
+            session.tensor_log_softmax(input, dim)
+        }
+        "norm" => {
+            let p = case
+                .p
+                .ok_or_else(|| format!("norm case '{}' missing p", case.name))?;
+            session.tensor_norm(input, p)
+        }
+        "cumsum" => {
+            let dim = case
+                .dim
+                .ok_or_else(|| format!("cumsum case '{}' missing dim", case.name))?;
+            session.tensor_cumsum(input, dim)
+        }
+        _ => return Err(format!("unsupported normalize op '{}'", case.op)),
+    }
+    .map_err(|e| format!("{} failed for '{}': {e}", case.op, case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|e| format!("value read failed for '{}': {e}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|e| format!("shape read failed for '{}': {e}", case.name))?;
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(&actual_output, &case.expected_output, tolerance);
+    let shape_ok = actual_shape == case.expected_shape;
+
+    let passed = output_ok && shape_ok;
+    let outcome = if passed { "pass" } else { "fail" };
+    let reason_code = if passed {
+        "tensor_normalize_parity_ok"
+    } else {
+        "tensor_normalize_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorNormalizeCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_normalize",
+            "tensor_normalize_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_normalize_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_normalize_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_elementwise_cmp_case(
+    case: &TensorElementwiseCmpCase,
+    mode: ExecutionMode,
+) -> Result<TensorElementwiseCmpCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let lhs = session
+        .tensor_variable(case.lhs.clone(), case.shape.clone(), false)
+        .map_err(|e| format!("lhs tensor build failed for '{}': {e}", case.name))?;
+    let rhs = session
+        .tensor_variable(case.rhs.clone(), case.shape.clone(), false)
+        .map_err(|e| format!("rhs tensor build failed for '{}': {e}", case.name))?;
+
+    let out = match case.op.as_str() {
+        "eq" => session.tensor_eq(lhs, rhs),
+        "ne" => session.tensor_ne(lhs, rhs),
+        "lt" => session.tensor_lt(lhs, rhs),
+        "gt" => session.tensor_gt(lhs, rhs),
+        "le" => session.tensor_le(lhs, rhs),
+        "ge" => session.tensor_ge(lhs, rhs),
+        _ => return Err(format!("unsupported elementwise cmp op '{}'", case.op)),
+    }
+    .map_err(|e| format!("{} failed for '{}': {e}", case.op, case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|e| format!("value read failed for '{}': {e}", case.name))?;
+
+    let output_ok = actual_output == case.expected_output;
+
+    let outcome = if output_ok { "pass" } else { "fail" };
+    let reason_code = if output_ok {
+        "tensor_elementwise_cmp_parity_ok"
+    } else {
+        "tensor_elementwise_cmp_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorElementwiseCmpCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_elementwise_cmp",
+            "tensor_elementwise_cmp_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_elementwise_cmp_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_elementwise_cmp_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_shape_case(
+    case: &TensorShapeCase,
+    mode: ExecutionMode,
+) -> Result<TensorShapeCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let input = session
+        .tensor_variable(case.input.clone(), case.input_shape.clone(), false)
+        .map_err(|e| format!("input tensor build failed for '{}': {e}", case.name))?;
+
+    let out = match case.op.as_str() {
+        "reshape" => {
+            let new_shape: Vec<usize> = serde_json::from_value(
+                case.params.get("new_shape").cloned().ok_or_else(|| {
+                    format!("reshape case '{}' missing new_shape param", case.name)
+                })?,
+            )
+            .map_err(|e| format!("invalid new_shape for '{}': {e}", case.name))?;
+            session.tensor_reshape(input, new_shape)
+        }
+        "squeeze" => {
+            let dim: usize = serde_json::from_value(
+                case.params
+                    .get("dim")
+                    .cloned()
+                    .ok_or_else(|| format!("squeeze case '{}' missing dim param", case.name))?,
+            )
+            .map_err(|e| format!("invalid dim for '{}': {e}", case.name))?;
+            session.tensor_squeeze(input, dim)
+        }
+        "unsqueeze" => {
+            let dim: usize = serde_json::from_value(
+                case.params
+                    .get("dim")
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("unsqueeze case '{}' missing dim param", case.name)
+                    })?,
+            )
+            .map_err(|e| format!("invalid dim for '{}': {e}", case.name))?;
+            session.tensor_unsqueeze(input, dim)
+        }
+        "transpose" => {
+            let dim0: usize = serde_json::from_value(
+                case.params
+                    .get("dim0")
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("transpose case '{}' missing dim0 param", case.name)
+                    })?,
+            )
+            .map_err(|e| format!("invalid dim0 for '{}': {e}", case.name))?;
+            let dim1: usize = serde_json::from_value(
+                case.params
+                    .get("dim1")
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("transpose case '{}' missing dim1 param", case.name)
+                    })?,
+            )
+            .map_err(|e| format!("invalid dim1 for '{}': {e}", case.name))?;
+            session.tensor_transpose(input, dim0, dim1)
+        }
+        "permute" => {
+            let dims: Vec<usize> = serde_json::from_value(
+                case.params
+                    .get("dims")
+                    .cloned()
+                    .ok_or_else(|| {
+                        format!("permute case '{}' missing dims param", case.name)
+                    })?,
+            )
+            .map_err(|e| format!("invalid dims for '{}': {e}", case.name))?;
+            session.tensor_permute(input, dims)
+        }
+        "flatten" => {
+            let start_dim: usize = serde_json::from_value(
+                case.params.get("start_dim").cloned().ok_or_else(|| {
+                    format!("flatten case '{}' missing start_dim param", case.name)
+                })?,
+            )
+            .map_err(|e| format!("invalid start_dim for '{}': {e}", case.name))?;
+            let end_dim: usize = serde_json::from_value(
+                case.params.get("end_dim").cloned().ok_or_else(|| {
+                    format!("flatten case '{}' missing end_dim param", case.name)
+                })?,
+            )
+            .map_err(|e| format!("invalid end_dim for '{}': {e}", case.name))?;
+            session.tensor_flatten(input, start_dim, end_dim)
+        }
+        "narrow" => {
+            let dim: usize = serde_json::from_value(
+                case.params
+                    .get("dim")
+                    .cloned()
+                    .ok_or_else(|| format!("narrow case '{}' missing dim param", case.name))?,
+            )
+            .map_err(|e| format!("invalid dim for '{}': {e}", case.name))?;
+            let start: usize = serde_json::from_value(
+                case.params
+                    .get("start")
+                    .cloned()
+                    .ok_or_else(|| format!("narrow case '{}' missing start param", case.name))?,
+            )
+            .map_err(|e| format!("invalid start for '{}': {e}", case.name))?;
+            let length: usize = serde_json::from_value(
+                case.params.get("length").cloned().ok_or_else(|| {
+                    format!("narrow case '{}' missing length param", case.name)
+                })?,
+            )
+            .map_err(|e| format!("invalid length for '{}': {e}", case.name))?;
+            session.tensor_narrow(input, dim, start, length)
+        }
+        _ => return Err(format!("unsupported shape op '{}'", case.op)),
+    }
+    .map_err(|e| format!("{} failed for '{}': {e}", case.op, case.name))?;
+
+    let actual_output = session
+        .tensor_values(out)
+        .map_err(|e| format!("value read failed for '{}': {e}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(out)
+        .map_err(|e| format!("shape read failed for '{}': {e}", case.name))?;
+
+    let output_ok = actual_output == case.expected_output;
+    let shape_ok = actual_shape == case.expected_shape;
+
+    let passed = output_ok && shape_ok;
+    let outcome = if passed { "pass" } else { "fail" };
+    let reason_code = if passed {
+        "tensor_shape_parity_ok"
+    } else {
+        "tensor_shape_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert(
+        "op".to_string(),
+        serde_json::Value::String(case.op.clone()),
+    );
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorShapeCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_shape",
+            "tensor_shape_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_shape_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_shape_conformance -- --nocapture # mode={}",
                 mode_label(mode)
             ),
             outcome,

@@ -1,0 +1,126 @@
+{
+  "cases": [
+    {
+      "name": "sum_1d",
+      "op": "sum",
+      "input": [1.0, 2.0, 3.0, 4.0],
+      "shape": [4],
+      "expected_output": [10.0],
+      "expected_shape": [1],
+      "expected_grad": [1.0, 1.0, 1.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-001"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "sum_2d",
+      "op": "sum",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "expected_output": [21.0],
+      "expected_shape": [1],
+      "expected_grad": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-002"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "mean_1d",
+      "op": "mean",
+      "input": [2.0, 4.0, 6.0, 8.0],
+      "shape": [4],
+      "expected_output": [5.0],
+      "expected_shape": [1],
+      "expected_grad": [0.25, 0.25, 0.25, 0.25],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-003"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "sum_dim0_2d",
+      "op": "sum_dim",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "dim": 0,
+      "expected_output": [5.0, 7.0, 9.0],
+      "expected_shape": [3],
+      "expected_grad": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-004"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "sum_dim1_2d",
+      "op": "sum_dim",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "dim": 1,
+      "expected_output": [6.0, 15.0],
+      "expected_shape": [2],
+      "expected_grad": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-005"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "mean_dim0_2d",
+      "op": "mean_dim",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "dim": 0,
+      "expected_output": [2.5, 3.5, 4.5],
+      "expected_shape": [3],
+      "expected_grad": [0.5, 0.5, 0.5, 0.5, 0.5, 0.5],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-006"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "prod_dim0_2d",
+      "op": "prod_dim",
+      "input": [1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+      "shape": [2, 3],
+      "dim": 0,
+      "expected_output": [4.0, 10.0, 18.0],
+      "expected_shape": [3],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-007"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "trace_3x3",
+      "op": "trace",
+      "input": [1.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 3.0],
+      "shape": [3, 3],
+      "expected_output": [6.0],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-REDUCE-008"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "var_dim0_2d",
+      "op": "var_dim",
+      "input": [1.0, 2.0, 3.0, 4.0],
+      "shape": [2, 2],
+      "dim": 0,
+      "expected_output": [2.0, 2.0],
+      "expected_shape": [2],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-REDUCE-009"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    },
+    {
+      "name": "std_dim0_2d",
+      "op": "std_dim",
+      "input": [1.0, 2.0, 3.0, 4.0],
+      "shape": [2, 2],
+      "dim": 0,
+      "expected_output": [1.4142135623730951, 1.4142135623730951],
+      "expected_shape": [2],
+      "tolerance": 1e-10,
+      "contract_ids": ["CPU-KERNEL-REDUCE-010"],
+      "e2e_scenarios": ["cpu_kernel:reduction"]
+    }
+  ]
+}

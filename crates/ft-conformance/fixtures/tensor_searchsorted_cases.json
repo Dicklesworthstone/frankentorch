@@ -1,0 +1,64 @@
+{
+  "cases": [
+    {
+      "name": "searchsorted_left_basic",
+      "sorted_sequence": [1.0, 3.0, 5.0, 7.0, 9.0],
+      "seq_shape": [5],
+      "values": [2.0, 4.0, 6.0],
+      "val_shape": [3],
+      "right": false,
+      "expected_indices": [1.0, 2.0, 3.0],
+      "expected_shape": [3],
+      "contract_ids": ["CPU-KERNEL-SEARCH-001"],
+      "e2e_scenarios": ["cpu_kernel:searchsorted"]
+    },
+    {
+      "name": "searchsorted_right_basic",
+      "sorted_sequence": [1.0, 3.0, 5.0, 7.0, 9.0],
+      "seq_shape": [5],
+      "values": [3.0, 5.0, 7.0],
+      "val_shape": [3],
+      "right": true,
+      "expected_indices": [2.0, 3.0, 4.0],
+      "expected_shape": [3],
+      "contract_ids": ["CPU-KERNEL-SEARCH-002"],
+      "e2e_scenarios": ["cpu_kernel:searchsorted"]
+    },
+    {
+      "name": "searchsorted_left_exact_match",
+      "sorted_sequence": [1.0, 3.0, 5.0, 7.0, 9.0],
+      "seq_shape": [5],
+      "values": [1.0, 5.0, 9.0],
+      "val_shape": [3],
+      "right": false,
+      "expected_indices": [0.0, 2.0, 4.0],
+      "expected_shape": [3],
+      "contract_ids": ["CPU-KERNEL-SEARCH-003"],
+      "e2e_scenarios": ["cpu_kernel:searchsorted"]
+    },
+    {
+      "name": "searchsorted_left_boundary",
+      "sorted_sequence": [1.0, 3.0, 5.0],
+      "seq_shape": [3],
+      "values": [0.0, 6.0],
+      "val_shape": [2],
+      "right": false,
+      "expected_indices": [0.0, 3.0],
+      "expected_shape": [2],
+      "contract_ids": ["CPU-KERNEL-SEARCH-004"],
+      "e2e_scenarios": ["cpu_kernel:searchsorted"]
+    },
+    {
+      "name": "bucketize_basic",
+      "sorted_sequence": [0.0, 1.0, 5.0, 10.0],
+      "seq_shape": [4],
+      "values": [-1.0, 0.5, 3.0, 7.0, 15.0],
+      "val_shape": [5],
+      "right": false,
+      "expected_indices": [0.0, 1.0, 2.0, 3.0, 4.0],
+      "expected_shape": [5],
+      "contract_ids": ["CPU-KERNEL-SEARCH-005"],
+      "e2e_scenarios": ["cpu_kernel:bucketize"]
+    }
+  ]
+}
