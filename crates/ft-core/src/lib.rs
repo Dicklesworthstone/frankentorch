@@ -1218,6 +1218,8 @@ mod tests {
 
     use proptest::prelude::*;
 
+    use std::sync::Arc;
+
     use super::{
         DType, DenseBoolTensor, DenseI32Tensor, DenseI64Tensor, DenseTensor, DenseTensorError,
         Device, ScalarTensor, TensorMeta, TensorMetaError, TensorStorage, contiguous_strides,

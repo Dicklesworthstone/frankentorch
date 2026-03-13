@@ -18441,7 +18441,7 @@ mod tests {
         match tensor.typed_storage() {
             ft_core::TensorStorage::F32(data) => {
                 assert_eq!(data.len(), 4);
-                assert_eq!(data, &[1.0f32, 2.0, 3.0, 4.0]);
+                assert_eq!(data.as_slice(), &[1.0f32, 2.0, 3.0, 4.0]);
             }
             ft_core::TensorStorage::F64(_) => {
                 panic!("f32 leaf should produce F32 storage, not F64");
@@ -18459,7 +18459,7 @@ mod tests {
         let tensor = tape.tensor(s).unwrap();
         match tensor.typed_storage() {
             ft_core::TensorStorage::F32(data) => {
-                assert_eq!(data, &[6.0f32]);
+                assert_eq!(data.as_slice(), &[6.0f32]);
             }
             ft_core::TensorStorage::F64(_) => {
                 panic!("f32 sum should produce F32 storage, not F64");
@@ -18533,7 +18533,7 @@ mod tests {
         let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
         let b = tape.view(a, vec![2, 2]).unwrap();
         assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
-        assert_eq!(tape.shape(b).unwrap(), &[2, 2]);
+        assert_eq!(tape.tensor(b).unwrap().meta().shape(), &[2, 2]);
     }
 
     #[test]
@@ -18542,7 +18542,7 @@ mod tests {
         let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
         let b = tape.view(a, vec![6]).unwrap();
         assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(tape.shape(b).unwrap(), &[6]);
+        assert_eq!(tape.tensor(b).unwrap().meta().shape(), &[6]);
     }
 
     #[test]
@@ -18551,7 +18551,7 @@ mod tests {
         let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6], false).unwrap();
         let b = tape.view(a, vec![2, 3]).unwrap();
         assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
-        assert_eq!(tape.shape(b).unwrap(), &[2, 3]);
+        assert_eq!(tape.tensor(b).unwrap().meta().shape(), &[2, 3]);
     }
 
     #[test]
