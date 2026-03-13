@@ -16542,4 +16542,45 @@ mod tests {
         let report = s.tensor_backward(sum).unwrap();
         assert_eq!(s.tensor_gradient(&report, x).unwrap(), &[1.0, 1.0, 1.0]);
     }
+
+    // ── tensor.view() zero-copy tests ──────────────────────────────────
+
+    #[test]
+    fn tensor_view_zero_copy_reshape() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let v = s.tensor_view(x, vec![3, 2]).unwrap();
+        assert_eq!(s.tensor_shape(v).unwrap(), &[3, 2]);
+        assert_eq!(
+            s.tensor_values(v).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn tensor_view_backward_through_view() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let v = s.tensor_view(x, vec![2, 2]).unwrap();
+        // sum(view(x)) → gradient flows back correctly
+        let sum = s.tensor_sum(v).unwrap();
+        let report = s.tensor_backward(sum).unwrap();
+        assert_eq!(
+            s.tensor_gradient(&report, x).unwrap(),
+            &[1.0, 1.0, 1.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn tensor_view_numel_mismatch_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        assert!(s.tensor_view(x, vec![2, 2]).is_err());
+    }
 }

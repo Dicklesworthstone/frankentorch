@@ -514,6 +514,10 @@ enum TensorNodeOp {
         input: TensorNodeId,
         original_shape: Vec<usize>,
     },
+    View {
+        input: TensorNodeId,
+        original_shape: Vec<usize>,
+    },
     Squeeze {
         input: TensorNodeId,
         dim: usize,
@@ -4197,7 +4201,7 @@ impl TensorTape {
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(
                 TensorMeta::from_shape(meta.shape().to_vec(), DType::F32, meta.device()),
-                TensorStorage::F32(f32_values),
+                TensorStorage::F32(Arc::new(f32_values)),
             )?,
             requires_grad,
             op: TensorNodeOp::CastF32 { input },
@@ -4226,7 +4230,7 @@ impl TensorTape {
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(
                 TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
-                TensorStorage::F64(f64_values),
+                TensorStorage::F64(Arc::new(f64_values)),
             )?,
             requires_grad,
             op: TensorNodeOp::CastF64 { input },
@@ -8066,12 +8070,30 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// Zero-copy reshape that shares storage with the input tensor.
+    /// Only works for contiguous tensors. Use reshape() for non-contiguous.
     pub fn view(
         &mut self,
         input: TensorNodeId,
         new_shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.reshape(input, new_shape)
+        let (requires_grad, view_tensor, original_shape) = {
+            let input_node = self.node(input)?;
+            let original_shape = input_node.tensor.meta().shape().to_vec();
+            let view_tensor = input_node.tensor.view(new_shape)?;
+            (input_node.requires_grad, view_tensor, original_shape)
+        };
+
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: view_tensor,
+            requires_grad,
+            op: TensorNodeOp::View {
+                input,
+                original_shape,
+            },
+        });
+        Ok(out)
     }
 
     pub fn transpose(
@@ -11249,6 +11271,7 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Reshape { input, .. }
+                | TensorNodeOp::View { input, .. }
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. } => {
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &incoming)?;
@@ -12993,6 +13016,7 @@ impl TensorTape {
                 | TensorNodeOp::Softmax { input, .. }
                 | TensorNodeOp::LogSoftmax { input, .. }
                 | TensorNodeOp::Reshape { input, .. }
+                | TensorNodeOp::View { input, .. }
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. }
                 | TensorNodeOp::Transpose { input, .. }
@@ -13144,6 +13168,7 @@ impl TensorTape {
                 | TensorNodeOp::Softmax { input, .. }
                 | TensorNodeOp::LogSoftmax { input, .. }
                 | TensorNodeOp::Reshape { input, .. }
+                | TensorNodeOp::View { input, .. }
                 | TensorNodeOp::Squeeze { input, .. }
                 | TensorNodeOp::Unsqueeze { input, .. }
                 | TensorNodeOp::Transpose { input, .. }
@@ -18498,5 +18523,87 @@ mod tests {
             ),
             "expected UnsupportedDType(Bool), got {err:?}"
         );
+    }
+
+    // ── view() zero-copy tests ─────────────────────────────────────────
+
+    #[test]
+    fn view_same_shape_returns_same_data() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let b = tape.view(a, vec![2, 2]).unwrap();
+        assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(tape.shape(b).unwrap(), &[2, 2]);
+    }
+
+    #[test]
+    fn view_flatten() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
+        let b = tape.view(a, vec![6]).unwrap();
+        assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(tape.shape(b).unwrap(), &[6]);
+    }
+
+    #[test]
+    fn view_unflatten() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6], false).unwrap();
+        let b = tape.view(a, vec![2, 3]).unwrap();
+        assert_eq!(tape.values(b).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+        assert_eq!(tape.shape(b).unwrap(), &[2, 3]);
+    }
+
+    #[test]
+    fn view_shares_storage() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        let b = tape.view(a, vec![2, 2]).unwrap();
+        // Both should share the same storage_id
+        let tensor_a = tape.tensor(a).unwrap();
+        let tensor_b = tape.tensor(b).unwrap();
+        assert!(tensor_a.shares_storage_with(tensor_b));
+    }
+
+    #[test]
+    fn view_backward_gradient_correct() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![4], true).unwrap();
+        let v = tape.view(x, vec![2, 2]).unwrap();
+        let (s, _) = tape.sum(v, ExecutionMode::Strict).unwrap();
+        let report = tape.backward(s).unwrap();
+        let grad = report.gradient(x).unwrap();
+        assert_eq!(grad, &[1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn view_wrong_numel_errors() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        assert!(tape.view(a, vec![2, 2]).is_err());
+    }
+
+    #[test]
+    fn view_of_view_shares_storage() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![6], false).unwrap();
+        let b = tape.view(a, vec![2, 3]).unwrap();
+        let c = tape.view(b, vec![3, 2]).unwrap();
+        let tensor_a = tape.tensor(a).unwrap();
+        let tensor_c = tape.tensor(c).unwrap();
+        assert!(tensor_a.shares_storage_with(tensor_c));
+        assert_eq!(tape.values(c).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn view_f32_shares_storage() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf_f32(vec![1.0f32, 2.0, 3.0], vec![3], false).unwrap();
+        let b = tape.view(a, vec![1, 3]).unwrap();
+        assert_eq!(tape.dtype(b).unwrap(), DType::F32);
+        assert_eq!(tape.values_f32(b).unwrap(), vec![1.0f32, 2.0, 3.0]);
+        let tensor_a = tape.tensor(a).unwrap();
+        let tensor_b = tape.tensor(b).unwrap();
+        assert!(tensor_a.shares_storage_with(tensor_b));
     }
 }

@@ -3,6 +3,7 @@
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 
 static NEXT_TENSOR_ID: AtomicU64 = AtomicU64::new(1);
 static NEXT_STORAGE_ID: AtomicU64 = AtomicU64::new(1);
@@ -506,8 +507,8 @@ impl ScalarTensor {
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum TensorStorage {
-    F32(Vec<f32>),
-    F64(Vec<f64>),
+    F32(Arc<Vec<f32>>),
+    F64(Arc<Vec<f64>>),
 }
 
 impl TensorStorage {
@@ -551,7 +552,7 @@ impl TensorStorage {
     #[must_use]
     pub fn to_f64_vec(&self) -> Vec<f64> {
         match self {
-            Self::F64(v) => v.clone(),
+            Self::F64(v) => v.as_ref().clone(),
             Self::F32(v) => v.iter().map(|&x| f64::from(x)).collect(),
         }
     }
@@ -559,7 +560,7 @@ impl TensorStorage {
     #[must_use]
     pub fn to_f32_vec(&self) -> Vec<f32> {
         match self {
-            Self::F32(v) => v.clone(),
+            Self::F32(v) => v.as_ref().clone(),
             Self::F64(v) => v.iter().map(|&x| x as f32).collect(),
         }
     }
@@ -651,14 +652,14 @@ impl DenseTensor {
         if meta.dtype() != DType::F64 {
             return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
         }
-        Self::from_typed_storage(meta, TensorStorage::F64(storage))
+        Self::from_typed_storage(meta, TensorStorage::F64(Arc::new(storage)))
     }
 
     pub fn from_storage_f32(meta: TensorMeta, storage: Vec<f32>) -> Result<Self, DenseTensorError> {
         if meta.dtype() != DType::F32 {
             return Err(DenseTensorError::UnsupportedDType(meta.dtype()));
         }
-        Self::from_typed_storage(meta, TensorStorage::F32(storage))
+        Self::from_typed_storage(meta, TensorStorage::F32(Arc::new(storage)))
     }
 
     pub fn from_contiguous_values(
@@ -821,11 +822,11 @@ impl DenseTensor {
         match (&self.storage, dtype) {
             (TensorStorage::F64(v), DType::F32) => {
                 let f32_vals: Vec<f32> = v.iter().map(|&x| x as f32).collect();
-                Self::from_typed_storage(new_meta, TensorStorage::F32(f32_vals))
+                Self::from_typed_storage(new_meta, TensorStorage::F32(Arc::new(f32_vals)))
             }
             (TensorStorage::F32(v), DType::F64) => {
                 let f64_vals: Vec<f64> = v.iter().map(|&x| f64::from(x)).collect();
-                Self::from_typed_storage(new_meta, TensorStorage::F64(f64_vals))
+                Self::from_typed_storage(new_meta, TensorStorage::F64(Arc::new(f64_vals)))
             }
             _ => Ok(self.clone()),
         }
@@ -842,7 +843,8 @@ impl DenseTensor {
         let end = Self::contiguous_required_len(&self.meta)?;
         match &mut self.storage {
             TensorStorage::F64(v) => {
-                let slice = &mut v[start..end];
+                let buf = Arc::make_mut(v);
+                let slice = &mut buf[start..end];
                 if new_values.len() != slice.len() {
                     return Err(DenseTensorError::InsufficientStorage {
                         needed: slice.len(),
@@ -871,7 +873,8 @@ impl DenseTensor {
         let end = Self::contiguous_required_len(&self.meta)?;
         match &mut self.storage {
             TensorStorage::F32(v) => {
-                let slice = &mut v[start..end];
+                let buf = Arc::make_mut(v);
+                let slice = &mut buf[start..end];
                 if new_values.len() != slice.len() {
                     return Err(DenseTensorError::InsufficientStorage {
                         needed: slice.len(),
@@ -886,6 +889,37 @@ impl DenseTensor {
         }
         self.version += 1;
         Ok(())
+    }
+
+    /// Create a view of this tensor with a new shape.
+    /// The view shares the same underlying storage (zero-copy).
+    /// Only works for contiguous tensors where the new shape has the same numel.
+    pub fn view(&self, new_shape: Vec<usize>) -> Result<Self, DenseTensorError> {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let new_numel: usize = new_shape.iter().product();
+        if new_numel != self.meta.numel() {
+            return Err(DenseTensorError::InsufficientStorage {
+                needed: new_numel,
+                actual: self.meta.numel(),
+            });
+        }
+        let new_meta =
+            TensorMeta::from_shape(new_shape, self.meta.dtype(), self.meta.device());
+        Ok(Self {
+            id: NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed),
+            storage_id: self.storage_id, // same storage
+            meta: new_meta,
+            storage: self.storage.clone(), // Arc clone = cheap refcount bump
+            version: self.version,
+        })
+    }
+
+    /// Returns true if this tensor shares storage with another.
+    #[must_use]
+    pub fn shares_storage_with(&self, other: &Self) -> bool {
+        self.storage_id == other.storage_id
     }
 }
 
@@ -2066,7 +2100,7 @@ mod tests {
 
     #[test]
     fn tensor_storage_f32_basic_ops() {
-        let s = TensorStorage::F32(vec![1.0f32, 2.0, 3.0]);
+        let s = TensorStorage::F32(Arc::new(vec![1.0f32, 2.0, 3.0]));
         assert_eq!(s.len(), 3);
         assert!(!s.is_empty());
         assert_eq!(s.dtype(), DType::F32);
@@ -2077,7 +2111,7 @@ mod tests {
 
     #[test]
     fn tensor_storage_f64_basic_ops() {
-        let s = TensorStorage::F64(vec![1.0, 2.0]);
+        let s = TensorStorage::F64(Arc::new(vec![1.0, 2.0]));
         assert_eq!(s.len(), 2);
         assert_eq!(s.dtype(), DType::F64);
         assert!(s.as_f64().is_some());
@@ -2086,21 +2120,21 @@ mod tests {
 
     #[test]
     fn tensor_storage_empty() {
-        let s = TensorStorage::F32(Vec::new());
+        let s = TensorStorage::F32(Arc::new(Vec::new()));
         assert!(s.is_empty());
         assert_eq!(s.len(), 0);
     }
 
     #[test]
     fn tensor_storage_to_f64_vec_from_f32() {
-        let s = TensorStorage::F32(vec![1.5f32, 2.5]);
+        let s = TensorStorage::F32(Arc::new(vec![1.5f32, 2.5]));
         let v = s.to_f64_vec();
         assert_eq!(v, vec![1.5f64, 2.5]);
     }
 
     #[test]
     fn tensor_storage_to_f32_vec_from_f64() {
-        let s = TensorStorage::F64(vec![1.5, 2.5]);
+        let s = TensorStorage::F64(Arc::new(vec![1.5, 2.5]));
         let v = s.to_f32_vec();
         assert_eq!(v, vec![1.5f32, 2.5]);
     }
@@ -2218,7 +2252,7 @@ mod tests {
     #[test]
     fn dense_tensor_from_typed_storage_f32() {
         let meta = TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu);
-        let storage = TensorStorage::F32(vec![1.0f32, 2.0]);
+        let storage = TensorStorage::F32(Arc::new(vec![1.0f32, 2.0]));
         let dt = DenseTensor::from_typed_storage(meta, storage).expect("create from typed storage");
         assert_eq!(dt.meta().dtype(), DType::F32);
     }
@@ -2226,7 +2260,7 @@ mod tests {
     #[test]
     fn dense_tensor_from_typed_storage_rejects_non_float() {
         let meta = TensorMeta::from_shape(vec![2], DType::I64, Device::Cpu);
-        let storage = TensorStorage::F64(vec![1.0, 2.0]);
+        let storage = TensorStorage::F64(Arc::new(vec![1.0, 2.0]));
         let err = DenseTensor::from_typed_storage(meta, storage)
             .expect_err("non-float dtype should be rejected");
         assert!(matches!(
