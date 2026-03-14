@@ -83,6 +83,7 @@
       "dim": 0,
       "expected_output": [4.0, 10.0, 18.0],
       "expected_shape": [3],
+      "expected_grad": [4.0, 5.0, 6.0, 1.0, 2.0, 3.0],
       "tolerance": 1e-12,
       "contract_ids": ["CPU-KERNEL-REDUCE-007"],
       "e2e_scenarios": ["cpu_kernel:reduction"]
@@ -94,6 +95,7 @@
       "shape": [3, 3],
       "expected_output": [6.0],
       "expected_shape": [1],
+      "expected_grad": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0],
       "tolerance": 1e-12,
       "contract_ids": ["CPU-KERNEL-REDUCE-008"],
       "e2e_scenarios": ["cpu_kernel:reduction"]
@@ -106,6 +108,7 @@
       "dim": 0,
       "expected_output": [2.0, 2.0],
       "expected_shape": [2],
+      "expected_grad": [-2.0, -2.0, 2.0, 2.0],
       "tolerance": 1e-10,
       "contract_ids": ["CPU-KERNEL-REDUCE-009"],
       "e2e_scenarios": ["cpu_kernel:reduction"]
@@ -118,6 +121,7 @@
       "dim": 0,
       "expected_output": [1.4142135623730951, 1.4142135623730951],
       "expected_shape": [2],
+      "expected_grad": [-0.7071067811865476, -0.7071067811865476, 0.7071067811865476, 0.7071067811865476],
       "tolerance": 1e-10,
       "contract_ids": ["CPU-KERNEL-REDUCE-010"],
       "e2e_scenarios": ["cpu_kernel:reduction"]

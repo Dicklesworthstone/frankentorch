@@ -219,13 +219,14 @@ pub struct TensorNormalizeCaseReport {
     pub mode: ExecutionMode,
     pub output_ok: bool,
     pub shape_ok: bool,
+    pub grad_ok: bool,
     pub forensic_log: StructuredCaseLog,
 }
 
 impl TensorNormalizeCaseReport {
     #[must_use]
     pub fn passed(&self) -> bool {
-        self.output_ok && self.shape_ok
+        self.output_ok && self.shape_ok && self.grad_ok
     }
 }
 
@@ -784,6 +785,8 @@ struct TensorNormalizeCase {
     p: Option<f64>,
     expected_output: Vec<f64>,
     expected_shape: Vec<usize>,
+    #[serde(default)]
+    expected_grad: Option<Vec<f64>>,
     #[serde(default)]
     tolerance: Option<f64>,
     #[serde(default)]
@@ -4471,6 +4474,9 @@ fn run_tensor_binary_case(
         "div" => session.tensor_div(lhs, rhs),
         "mul" => session.tensor_mul(lhs, rhs),
         "matmul" => session.tensor_matmul(lhs, rhs),
+        "dot" => session.tensor_dot(lhs, rhs),
+        "min" => session.tensor_min(lhs, rhs),
+        "max" => session.tensor_max(lhs, rhs),
         _ => return Err(format!("unsupported tensor operation '{}'", case.op)),
     }
     .map_err(|error| format!("tensor operation '{}' failed: {error}", case.name))?;
@@ -5432,8 +5438,9 @@ fn run_tensor_normalize_case(
     mode: ExecutionMode,
 ) -> Result<TensorNormalizeCaseReport, String> {
     let mut session = FrankenTorchSession::new(mode);
+    let has_grad = case.expected_grad.is_some();
     let input = session
-        .tensor_variable(case.input.clone(), case.shape.clone(), false)
+        .tensor_variable(case.input.clone(), case.shape.clone(), has_grad)
         .map_err(|e| format!("input tensor build failed for '{}': {e}", case.name))?;
 
     let out = match case.op.as_str() {
@@ -5476,7 +5483,20 @@ fn run_tensor_normalize_case(
     let output_ok = vec_within(&actual_output, &case.expected_output, tolerance);
     let shape_ok = actual_shape == case.expected_shape;
 
-    let passed = output_ok && shape_ok;
+    let grad_ok = if let Some(ref expected_grad) = case.expected_grad {
+        let backward = session
+            .tensor_backward(out)
+            .map_err(|e| format!("backward failed for '{}': {e}", case.name))?;
+        let actual_grad = session
+            .tensor_gradient(&backward, input)
+            .ok_or_else(|| format!("missing input grad for '{}'", case.name))?
+            .to_vec();
+        vec_within(actual_grad.as_slice(), expected_grad.as_slice(), tolerance)
+    } else {
+        true
+    };
+
+    let passed = output_ok && shape_ok && grad_ok;
     let outcome = if passed { "pass" } else { "fail" };
     let reason_code = if passed {
         "tensor_normalize_parity_ok"
@@ -5499,6 +5519,7 @@ fn run_tensor_normalize_case(
         mode,
         output_ok,
         shape_ok,
+        grad_ok,
         forensic_log: StructuredCaseLog::new(
             "tensor_normalize",
             "tensor_normalize_cases.json",

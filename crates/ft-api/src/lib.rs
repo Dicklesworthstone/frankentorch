@@ -1520,12 +1520,27 @@ impl FrankenTorchSession {
             }
         }
 
+        // Helpers to locate a subscript char's axis in the original index lists.
+        // These chars are categorized FROM lhs_idx/rhs_idx, so lookups always succeed.
+        let lhs_pos = |ch: &char| -> usize {
+            lhs_idx
+                .iter()
+                .position(|c| c == ch)
+                .expect("einsum: subscript char must exist in lhs indices")
+        };
+        let rhs_pos = |ch: &char| -> usize {
+            rhs_idx
+                .iter()
+                .position(|c| c == ch)
+                .expect("einsum: subscript char must exist in rhs indices")
+        };
+
         // Build permutation for lhs: [batch..., free_lhs..., contract...]
         let lhs_perm: Vec<usize> = batch_chars
             .iter()
             .chain(free_lhs_chars.iter())
             .chain(contract_chars.iter())
-            .map(|ch| lhs_idx.iter().position(|c| c == ch).unwrap())
+            .map(&lhs_pos)
             .collect();
 
         // Build permutation for rhs: [batch..., contract..., free_rhs...]
@@ -1533,7 +1548,7 @@ impl FrankenTorchSession {
             .iter()
             .chain(contract_chars.iter())
             .chain(free_rhs_chars.iter())
-            .map(|ch| rhs_idx.iter().position(|c| c == ch).unwrap())
+            .map(&rhs_pos)
             .collect();
 
         let lhs_shape = self.tensor_shape(lhs)?;
@@ -1542,19 +1557,19 @@ impl FrankenTorchSession {
         // Compute dimension sizes after permutation
         let batch_size: usize = batch_chars
             .iter()
-            .map(|ch| lhs_shape[lhs_idx.iter().position(|c| c == ch).unwrap()])
+            .map(|ch| lhs_shape[lhs_pos(ch)])
             .product();
         let free_lhs_size: usize = free_lhs_chars
             .iter()
-            .map(|ch| lhs_shape[lhs_idx.iter().position(|c| c == ch).unwrap()])
+            .map(|ch| lhs_shape[lhs_pos(ch)])
             .product();
         let contract_size: usize = contract_chars
             .iter()
-            .map(|ch| lhs_shape[lhs_idx.iter().position(|c| c == ch).unwrap()])
+            .map(|ch| lhs_shape[lhs_pos(ch)])
             .product();
         let free_rhs_size: usize = free_rhs_chars
             .iter()
-            .map(|ch| rhs_shape[rhs_idx.iter().position(|c| c == ch).unwrap()])
+            .map(|ch| rhs_shape[rhs_pos(ch)])
             .product();
 
         // Permute tensors
@@ -1579,9 +1594,9 @@ impl FrankenTorchSession {
             let mut out_shape: Vec<usize> = Vec::new();
             for &ch in output_idx {
                 if free_lhs_chars.contains(&ch) {
-                    out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                    out_shape.push(lhs_shape[lhs_pos(&ch)]);
                 } else if free_rhs_chars.contains(&ch) {
-                    out_shape.push(rhs_shape[rhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                    out_shape.push(rhs_shape[rhs_pos(&ch)]);
                 }
             }
             if out_shape.is_empty() {
@@ -1600,11 +1615,11 @@ impl FrankenTorchSession {
             let mut out_shape: Vec<usize> = Vec::new();
             for &ch in output_idx {
                 if batch_chars.contains(&ch) {
-                    out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                    out_shape.push(lhs_shape[lhs_pos(&ch)]);
                 } else if free_lhs_chars.contains(&ch) {
-                    out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                    out_shape.push(lhs_shape[lhs_pos(&ch)]);
                 } else if free_rhs_chars.contains(&ch) {
-                    out_shape.push(rhs_shape[rhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                    out_shape.push(rhs_shape[rhs_pos(&ch)]);
                 }
             }
             if out_shape.is_empty() {
@@ -1635,13 +1650,13 @@ impl FrankenTorchSession {
         let mut out_shape: Vec<usize> = Vec::new();
         for &ch in output_idx {
             if batch_chars.contains(&ch) {
-                out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                out_shape.push(lhs_shape[lhs_pos(&ch)]);
             } else if free_lhs_chars.contains(&ch) {
-                out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                out_shape.push(lhs_shape[lhs_pos(&ch)]);
             } else if free_rhs_chars.contains(&ch) {
-                out_shape.push(rhs_shape[rhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                out_shape.push(rhs_shape[rhs_pos(&ch)]);
             } else if contract_chars.contains(&ch) {
-                out_shape.push(lhs_shape[lhs_idx.iter().position(|c| *c == ch).unwrap()]);
+                out_shape.push(lhs_shape[lhs_pos(&ch)]);
             }
         }
 
@@ -1805,7 +1820,7 @@ impl FrankenTorchSession {
         if sorted {
             // Sort unique values and remap inverse indices
             let mut order: Vec<usize> = (0..unique_vals.len()).collect();
-            order.sort_by(|&a, &b| unique_vals[a].partial_cmp(&unique_vals[b]).unwrap());
+            order.sort_by(|&a, &b| unique_vals[a].total_cmp(&unique_vals[b]));
             let mut remap = vec![0usize; unique_vals.len()];
             for (new_idx, &old_idx) in order.iter().enumerate() {
                 remap[old_idx] = new_idx;
