@@ -1576,7 +1576,6 @@ impl Module for Embedding {
 /// Modes: `"sum"`, `"mean"`, `"max"`.
 pub struct EmbeddingBag {
     weight: TensorNodeId,
-    #[allow(dead_code)]
     num_embeddings: usize,
     embedding_dim: usize,
     mode: EmbeddingBagMode,
@@ -1626,6 +1625,24 @@ impl EmbeddingBag {
     #[must_use]
     pub fn weight(&self) -> TensorNodeId {
         self.weight
+    }
+
+    /// Number of embeddings in the lookup table.
+    #[must_use]
+    pub fn num_embeddings(&self) -> usize {
+        self.num_embeddings
+    }
+
+    /// Dimension of each embedding vector.
+    #[must_use]
+    pub fn embedding_dim(&self) -> usize {
+        self.embedding_dim
+    }
+
+    /// Reduction mode (Sum, Mean, or Max).
+    #[must_use]
+    pub fn mode(&self) -> EmbeddingBagMode {
+        self.mode
     }
 
     /// Forward pass with indices, offsets, and optional per-sample weights.
@@ -4570,9 +4587,7 @@ impl Module for AdaptiveMaxPool3d {
 /// Input: `[N, C, L_pooled]`. Indices: flat vector of original positions.
 /// Output: `[N, C, output_size]`.
 pub struct MaxUnpool1d {
-    #[allow(dead_code)]
     kernel_size: usize,
-    #[allow(dead_code)]
     stride: usize,
 }
 
@@ -4585,6 +4600,18 @@ impl MaxUnpool1d {
             kernel_size,
             stride: effective_stride,
         }
+    }
+
+    /// Kernel size used for unpooling.
+    #[must_use]
+    pub fn kernel_size(&self) -> usize {
+        self.kernel_size
+    }
+
+    /// Stride used for unpooling.
+    #[must_use]
+    pub fn stride(&self) -> usize {
+        self.stride
     }
 
     /// Unpool using the given indices and output size.
@@ -4648,13 +4675,9 @@ impl MaxUnpool1d {
 /// Indices: flat vector mapping each pooled element to position in the unpooled spatial plane.
 /// Output: `[N, C, H_out, W_out]`.
 pub struct MaxUnpool2d {
-    #[allow(dead_code)]
     kernel_h: usize,
-    #[allow(dead_code)]
     kernel_w: usize,
-    #[allow(dead_code)]
     stride_h: usize,
-    #[allow(dead_code)]
     stride_w: usize,
 }
 
@@ -4670,6 +4693,18 @@ impl MaxUnpool2d {
             stride_h: if sh == 0 { kh } else { sh },
             stride_w: if sw == 0 { kw } else { sw },
         }
+    }
+
+    /// Kernel size as `(height, width)`.
+    #[must_use]
+    pub fn kernel_size(&self) -> (usize, usize) {
+        (self.kernel_h, self.kernel_w)
+    }
+
+    /// Stride as `(height, width)`.
+    #[must_use]
+    pub fn stride(&self) -> (usize, usize) {
+        (self.stride_h, self.stride_w)
     }
 
     /// Unpool using the given 2D indices and output size.
@@ -4739,17 +4774,11 @@ impl MaxUnpool2d {
 /// Input: `[N, C, D_pooled, H_pooled, W_pooled]`.
 /// Output: `[N, C, D_out, H_out, W_out]`.
 pub struct MaxUnpool3d {
-    #[allow(dead_code)]
     kernel_d: usize,
-    #[allow(dead_code)]
     kernel_h: usize,
-    #[allow(dead_code)]
     kernel_w: usize,
-    #[allow(dead_code)]
     stride_d: usize,
-    #[allow(dead_code)]
     stride_h: usize,
-    #[allow(dead_code)]
     stride_w: usize,
 }
 
@@ -4767,6 +4796,18 @@ impl MaxUnpool3d {
             stride_h: if sh == 0 { kh } else { sh },
             stride_w: if sw == 0 { kw } else { sw },
         }
+    }
+
+    /// Kernel size as `(depth, height, width)`.
+    #[must_use]
+    pub fn kernel_size(&self) -> (usize, usize, usize) {
+        (self.kernel_d, self.kernel_h, self.kernel_w)
+    }
+
+    /// Stride as `(depth, height, width)`.
+    #[must_use]
+    pub fn stride(&self) -> (usize, usize, usize) {
+        (self.stride_d, self.stride_h, self.stride_w)
     }
 
     /// Unpool using the given 3D indices and output size.
