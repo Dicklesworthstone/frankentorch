@@ -129,13 +129,13 @@ We do not care about backwards compatibility—we're in early development with n
 
 ```bash
 # Check for compiler errors and warnings (workspace-wide)
-cargo check --workspace --all-targets
+rch exec -- cargo check --workspace --all-targets
 
 # Check for clippy lints (pedantic + nursery are enabled)
-cargo clippy --workspace --all-targets -- -D warnings
+rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 
 # Verify formatting
-cargo fmt --check
+rch exec -- cargo fmt --check
 ```
 
 If you see errors, **carefully understand and resolve each issue**. Read sufficient context to fix them the RIGHT way.
@@ -157,24 +157,27 @@ Cross-component integration tests live in the `ft-conformance` crate.
 
 ```bash
 # Run all tests across the workspace
-cargo test --workspace
+rch exec -- cargo test --workspace
 
 # Run with output
-cargo test --workspace -- --nocapture
+rch exec -- cargo test --workspace -- --nocapture
 
 # Run tests for a specific crate
-cargo test -p ft-core
-cargo test -p ft-dispatch
-cargo test -p ft-kernel-cpu
-cargo test -p ft-autograd
-cargo test -p ft-device
-cargo test -p ft-serialize
-cargo test -p ft-api
-cargo test -p ft-conformance
-cargo test -p ft-runtime
+rch exec -- cargo test -p ft-core
+rch exec -- cargo test -p ft-dispatch
+rch exec -- cargo test -p ft-kernel-cpu
+rch exec -- cargo test -p ft-autograd
+rch exec -- cargo test -p ft-device
+rch exec -- cargo test -p ft-serialize
+rch exec -- cargo test -p ft-api
+rch exec -- cargo test -p ft-conformance
+rch exec -- cargo test -p ft-runtime
+rch exec -- cargo test -p ft-nn
+rch exec -- cargo test -p ft-optim
+rch exec -- cargo test -p ft-data
 
 # Run tests with all features enabled
-cargo test --workspace --all-features
+rch exec -- cargo test --workspace --all-features
 ```
 
 ### Test Categories
@@ -190,6 +193,9 @@ cargo test --workspace --all-features
 | `ft-api` | Public tensor API surface, operator coverage |
 | `ft-conformance` | Cross-component integration, differential testing against PyTorch oracle |
 | `ft-runtime` | Async integration, TUI integration (feature-gated) |
+| `ft-nn` | Module/layer semantics, parameter traversal, pooling/normalization/dropout behavior |
+| `ft-optim` | Optimizer update rules, state handling, and decoupled weight decay contracts |
+| `ft-data` | Dataset/dataloader behavior, batching, and deterministic sample ordering |
 
 ---
 
@@ -213,17 +219,23 @@ If you aren't 100% sure how to use a third-party library, **SEARCH ONLINE** to f
 
 ### Legacy Behavioral Oracle
 
-- `/dp/frankentorch/legacy_pytorch_code/pytorch`
+- Typical local checkout when present: `/dp/frankentorch/legacy_pytorch_code/pytorch`
 - Upstream: https://github.com/pytorch/pytorch
 
-The PyTorch codebase serves as the behavioral oracle for conformance testing. FrankenTorch must preserve PyTorch-observable tensor semantics, autograd contracts, and scoped optimizer behaviors.
+The PyTorch codebase serves as the behavioral oracle for conformance testing. Some local worktrees may omit the mirrored checkout, but FrankenTorch must still preserve PyTorch-observable tensor semantics, autograd contracts, and scoped optimizer behaviors.
 
 ### Architecture
 
 ```
-Tensor API (ft-api) → Dispatcher (ft-dispatch) → CPU Kernels (ft-kernel-cpu)
-                                                         ↓
-                                              Autograd Engine (ft-autograd)
+Public Session/API (ft-api)
+        ↓
+Autograd Tape + DAC Evidence (ft-autograd, ft-runtime)
+        ↓
+Dispatch + Schema Routing (ft-dispatch)
+        ↓
+CPU Kernel Execution (ft-kernel-cpu)
+        ↓
+Higher-Level Stacks (ft-nn, ft-optim, ft-data)
 ```
 
 ### Workspace Structure
@@ -240,8 +252,11 @@ frankentorch/
 │   ├── ft-serialize/              # Tensor serialization (serde, async via asupersync)
 │   ├── ft-api/                    # Public tensor API facade
 │   ├── ft-conformance/            # Conformance tests against PyTorch oracle
-│   └── ft-runtime/                # Runtime integration (asupersync, frankentui — feature-gated)
-├── legacy_pytorch_code/           # PyTorch source (behavioral oracle)
+│   ├── ft-runtime/                # Runtime/DAC evidence integration (feature-gated)
+│   ├── ft-nn/                     # Neural network modules and layers
+│   ├── ft-optim/                  # Optimizers and update rules
+│   └── ft-data/                   # Dataset and dataloader primitives
+├── legacy_pytorch_code/           # Optional local PyTorch oracle mirror (may be absent)
 └── artifacts/                     # Build and conformance artifacts
 ```
 

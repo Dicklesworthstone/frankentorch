@@ -3663,6 +3663,109 @@ impl Module for GroupNorm {
 /// Normalizes each channel of each sample independently, equivalent to
 /// `GroupNorm` with `num_groups = num_channels`.
 ///
+/// Root Mean Square Layer Normalization.
+///
+/// Equivalent to `torch.nn.RMSNorm(normalized_shape, eps=1e-5)`.
+/// Unlike LayerNorm, RMSNorm does not center (subtract mean); it only
+/// normalizes by the root mean square: `x * rsqrt(mean(x^2) + eps) * weight`.
+///
+/// Standard in modern LLM architectures: LLaMA, Mistral, Qwen, DeepSeek.
+pub struct RMSNorm {
+    normalized_shape: Vec<usize>,
+    eps: f64,
+    weight: TensorNodeId,
+}
+
+impl RMSNorm {
+    /// Create a new RMSNorm module.
+    ///
+    /// `normalized_shape` is the shape of the last dimensions to normalize over.
+    /// For a typical LLM with hidden_size=D, use `vec![D]`.
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        normalized_shape: Vec<usize>,
+        eps: f64,
+    ) -> Result<Self, AutogradError> {
+        let total: usize = normalized_shape.iter().product();
+        let weight = session.tensor_variable(vec![1.0; total], normalized_shape.clone(), true)?;
+        Ok(Self {
+            normalized_shape,
+            eps,
+            weight,
+        })
+    }
+
+    /// Access the weight parameter.
+    #[must_use]
+    pub fn weight(&self) -> TensorNodeId {
+        self.weight
+    }
+}
+
+impl Module for RMSNorm {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = session.tensor_values(input)?;
+        let input_shape = session.tensor_shape(input)?;
+
+        let norm_dims: usize = self.normalized_shape.iter().product();
+        let ndim = input_shape.len();
+        let norm_ndim = self.normalized_shape.len();
+
+        if ndim < norm_ndim {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RMSNorm: input has fewer dimensions than normalized_shape",
+                },
+            )));
+        }
+
+        // Check trailing dimensions match
+        for (i, &ns) in self.normalized_shape.iter().enumerate() {
+            if input_shape[ndim - norm_ndim + i] != ns {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "RMSNorm: input trailing dims don't match normalized_shape",
+                    },
+                )));
+            }
+        }
+
+        let w_vals = session.tensor_values(self.weight)?;
+        let batch_dims: usize = input_shape[..ndim - norm_ndim].iter().product();
+
+        let mut result = vec![0.0f64; vals.len()];
+
+        for b in 0..batch_dims {
+            let offset = b * norm_dims;
+            // Compute RMS
+            let mut sum_sq = 0.0f64;
+            for i in 0..norm_dims {
+                sum_sq += vals[offset + i] * vals[offset + i];
+            }
+            let rms = (sum_sq / norm_dims as f64 + self.eps).sqrt();
+
+            // Normalize and scale
+            for i in 0..norm_dims {
+                result[offset + i] = vals[offset + i] / rms * w_vals[i];
+            }
+        }
+
+        session.tensor_variable(result, input_shape, false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        vec![self.weight]
+    }
+
+    fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
+        vec![("weight", self.weight)]
+    }
+}
+
 /// Input shape: `[N, C, L]` where `C` must equal `num_features`.
 ///
 /// Widely used in style transfer and generative models where batch statistics
@@ -15835,6 +15938,64 @@ mod tests {
         let gn = GroupNorm::new(&mut session, 2, 4, 1e-5, false).expect("gn");
         let params = gn.named_parameters_own();
         assert!(params.is_empty());
+    }
+
+    // ── RMSNorm Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn rmsnorm_unit_weight_normalizes() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rn = RMSNorm::new(&mut session, vec![4], 1e-5).unwrap();
+        let input = session
+            .tensor_variable(vec![2.0, 4.0, 6.0, 8.0], vec![1, 4], false)
+            .unwrap();
+        let out = rn.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(out).unwrap();
+        // RMS = sqrt((4+16+36+64)/4 + 1e-5) = sqrt(30.00001) ≈ 5.4772
+        let rms = (30.0f64 + 1e-5).sqrt();
+        assert!((vals[0] - 2.0 / rms).abs() < 1e-6);
+        assert!((vals[1] - 4.0 / rms).abs() < 1e-6);
+        assert!((vals[2] - 6.0 / rms).abs() < 1e-6);
+        assert!((vals[3] - 8.0 / rms).abs() < 1e-6);
+    }
+
+    #[test]
+    fn rmsnorm_batched() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rn = RMSNorm::new(&mut session, vec![2], 1e-5).unwrap();
+        // Batch of 3, each with 2 features
+        let input = session
+            .tensor_variable(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0], vec![3, 2], false)
+            .unwrap();
+        let out = rn.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![3, 2]);
+        let vals = session.tensor_values(out).unwrap();
+        // Each pair [x, x] → RMS=sqrt(x^2+eps), normalized = x/RMS ≈ 1.0
+        for &v in &vals {
+            assert!((v - 1.0).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn rmsnorm_parameters() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rn = RMSNorm::new(&mut session, vec![8], 1e-5).unwrap();
+        assert_eq!(rn.parameters().len(), 1);
+        let named = rn.named_parameters_own();
+        assert_eq!(named.len(), 1);
+        assert_eq!(named[0].0, "weight");
+    }
+
+    #[test]
+    fn rmsnorm_rejects_wrong_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rn = RMSNorm::new(&mut session, vec![4], 1e-5).unwrap();
+        // Input last dim = 3, but normalized_shape = [4]
+        let input = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        assert!(rn.forward(&mut session, input).is_err());
     }
 
     #[test]
