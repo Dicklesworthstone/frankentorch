@@ -3964,19 +3964,7 @@ impl Module for AvgPool2d {
                     let shaped = session.tensor_reshape(avg, vec![n, c, 1])?;
                     patches.push(shaped);
                 } else {
-                    // Divide by actual number of non-padded elements
-                    // Compute how many real (non-pad) elements are in this window
-                    let real_h_start = h_start.max(self.padding_h) - self.padding_h;
-                    let real_h_end = (h_end.min(h_in + self.padding_h)).min(h_in + self.padding_h);
-                    let real_h_end_clamped = real_h_end.min(self.padding_h + h_in);
-                    let real_h_start_clamped = real_h_start.max(0);
-                    let rh = if real_h_end_clamped > real_h_start_clamped + self.padding_h {
-                        real_h_end_clamped - real_h_start_clamped
-                    } else {
-                        kh_actual
-                    };
-                    let _ = rh;
-                    // Simpler: count_include_pad=false means divide by actual patch size
+                    // count_include_pad=false divides by the materialized patch size only.
                     let sum = session.tensor_sum_dim(flat, 1)?;
                     let divisor = session.full(vec![nc], (kh_actual * kw_actual) as f64, false)?;
                     let avg = session.tensor_div(sum, divisor)?;

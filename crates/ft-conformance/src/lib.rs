@@ -1035,6 +1035,74 @@ struct TensorJoinCase {
     e2e_scenarios: Vec<String>,
 }
 
+trait FixtureMetadata {
+    fn contract_ids(&self) -> &[String];
+    fn e2e_scenarios(&self) -> &[String];
+}
+
+macro_rules! impl_fixture_metadata {
+    ($($ty:ty),+ $(,)?) => {
+        $(
+            impl FixtureMetadata for $ty {
+                fn contract_ids(&self) -> &[String] {
+                    &self.contract_ids
+                }
+
+                fn e2e_scenarios(&self) -> &[String] {
+                    &self.e2e_scenarios
+                }
+            }
+        )+
+    };
+}
+
+impl_fixture_metadata!(
+    TensorUnaryCase,
+    TensorComparisonCase,
+    TensorSearchsortedCase,
+    TensorFactoryCase,
+    TensorEinsumCase,
+    TensorReductionCase,
+    TensorLossCase,
+    TensorLinalgCase,
+    TensorNormalizeCase,
+    TensorElementwiseCmpCase,
+    TensorShapeCase,
+    TensorInplaceCase,
+    TensorAdvancedCase,
+    TensorSortCase,
+    TensorIndexingCase,
+    TensorScanCase,
+    TensorJoinCase,
+);
+
+fn validate_fixture_metadata(
+    case_name: &str,
+    metadata: &impl FixtureMetadata,
+) -> Result<(), String> {
+    if metadata
+        .contract_ids()
+        .iter()
+        .any(|contract_id| contract_id.trim().is_empty())
+    {
+        return Err(format!(
+            "fixture case '{case_name}' contains an empty contract id"
+        ));
+    }
+
+    if metadata
+        .e2e_scenarios()
+        .iter()
+        .any(|scenario| scenario.trim().is_empty())
+    {
+        return Err(format!(
+            "fixture case '{case_name}' contains an empty e2e scenario id"
+        ));
+    }
+
+    Ok(())
+}
+
 #[derive(Debug, Clone, Deserialize)]
 struct TensorMetaFixtureFile {
     cases: Vec<TensorMetaCase>,
@@ -1506,6 +1574,7 @@ pub fn run_tensor_unary_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_unary_case(case, mode)?);
     }
 
@@ -1533,6 +1602,7 @@ pub fn run_tensor_comparison_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_comparison_case(case, mode)?);
     }
 
@@ -1560,6 +1630,7 @@ pub fn run_tensor_factory_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_factory_case(case, mode)?);
     }
 
@@ -1587,6 +1658,7 @@ pub fn run_tensor_einsum_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_einsum_case(case, mode)?);
     }
 
@@ -1614,6 +1686,7 @@ pub fn run_tensor_searchsorted_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_searchsorted_case(case, mode)?);
     }
 
@@ -1644,6 +1717,7 @@ pub fn run_tensor_reduction_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_reduction_case(case, mode)?);
     }
 
@@ -1671,6 +1745,7 @@ pub fn run_tensor_loss_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_loss_case(case, mode)?);
     }
 
@@ -1698,6 +1773,7 @@ pub fn run_tensor_linalg_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_linalg_case(case, mode)?);
     }
 
@@ -1725,6 +1801,7 @@ pub fn run_tensor_normalize_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_normalize_case(case, mode)?);
     }
 
@@ -1754,6 +1831,7 @@ pub fn run_tensor_elementwise_cmp_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_elementwise_cmp_case(case, mode)?);
     }
 
@@ -1784,6 +1862,7 @@ pub fn run_tensor_shape_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_shape_case(case, mode)?);
     }
 
@@ -1811,6 +1890,7 @@ pub fn run_tensor_inplace_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_inplace_case(case, mode)?);
     }
 
@@ -1838,6 +1918,7 @@ pub fn run_tensor_advanced_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_advanced_case(case, mode)?);
     }
 
@@ -1865,6 +1946,7 @@ pub fn run_tensor_sort_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_sort_case(case, mode)?);
     }
 
@@ -1892,6 +1974,7 @@ pub fn run_tensor_indexing_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_indexing_case(case, mode)?);
     }
 
@@ -1919,6 +2002,7 @@ pub fn run_tensor_scan_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_scan_case(case, mode)?);
     }
 
@@ -1946,6 +2030,7 @@ pub fn run_tensor_join_conformance(
 
     let mut case_reports = Vec::with_capacity(fixture.cases.len());
     for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
         case_reports.push(run_tensor_join_case(case, mode)?);
     }
 
