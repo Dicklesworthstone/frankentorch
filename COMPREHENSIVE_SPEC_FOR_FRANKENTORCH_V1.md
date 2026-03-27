@@ -236,16 +236,18 @@ Mitigations:
 
 | Crate | Primary Responsibility | Explicit Non-Goal | Invariants | Mandatory Tests |
 |---|---|---|---|---|
-| ft-types | dtype/device/layout metadata model | autograd execution | metadata validity and versioning | metadata fixture matrix |
-| ft-tensor | tensor storage/view/index semantics | optimizer logic | alias/version consistency and shape safety | view/in-place property tests |
+| ft-core | dtype/device/layout metadata model and tensor value/storage substrate | autograd execution | metadata validity and versioning | metadata fixture matrix |
+| ft-device | device identity and transition safety | autograd execution | device compatibility and guard invariants | device guard and transition tests |
 | ft-dispatch | op registration and dispatch key routing | model serialization | deterministic dispatch resolution | dispatch key regression suite |
+| ft-kernel-cpu | core eager CPU kernels | policy/risk logic | kernel outputs satisfy tolerance contracts | kernel parity + tolerance tests |
 | ft-autograd | graph capture + backward execution | parser/IO | gradient accumulation and graph ordering contracts | gradient check suite |
-| ft-ops | core kernels | policy/risk logic | kernel outputs satisfy tolerance contracts | kernel parity + tolerance tests |
+| ft-api | public session-facing tensor API | low-level kernel internals | session-visible semantics stay mode-consistent | API-level functional/integration tests |
 | ft-nn | module stack | backend kernels | parameter and module state determinism | module fixture tests |
 | ft-optim | optimizer updates | tensor storage internals | update equations and state transitions deterministic | SGD/Adam parity tests |
+| ft-data | dataset/dataloader primitives | autograd scheduling | deterministic sample and batch ordering | data pipeline behavior tests |
 | ft-serialize | checkpoints/state dict paths | training execution | serialization round-trip parity | checkpoint fixtures |
+| ft-runtime | evidence ledger and runtime mode policy | production math kernels | strict/hardened mode and durability metadata stay coherent | runtime/evidence tests |
 | ft-conformance | PyTorch differential harness | production dispatch | comparator policy explicit by op/dtype | differential harness tests |
-| frankentorch | integration + mode policy | low-level kernels | strict/hardened mode and evidence ledger available | integration startup tests |
 
 ## 15. Conformance Matrix
 

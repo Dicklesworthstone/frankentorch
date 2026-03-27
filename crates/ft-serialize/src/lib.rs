@@ -886,11 +886,10 @@ pub fn save_safetensors<P: AsRef<Path>>(
         })
         .collect::<Result<Vec<_>, TensorIOError>>()?;
 
-    let data = st_tensor::serialize(views.into_iter(), metadata.cloned()).map_err(|e| {
-        TensorIOError::Corrupt {
+    let data =
+        st_tensor::serialize(views, metadata.cloned()).map_err(|e| TensorIOError::Corrupt {
             reason: format!("safetensors serialization failed: {e}"),
-        }
-    })?;
+        })?;
 
     std::fs::write(&path, data).map_err(|e| io_err(&path_str, e))?;
 

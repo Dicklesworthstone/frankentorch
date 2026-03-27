@@ -18,7 +18,7 @@ This document defines exhaustive legacy extraction for FrankenTorch. Phase-2 is 
 ## 1. Source-of-Truth Crosswalk
 
 Legacy corpus:
-- `/data/projects/frankentorch/legacy_pytorch_code/pytorch`
+- typical local mirror when present: `/data/projects/frankentorch/legacy_pytorch_code/pytorch`
 - Upstream oracle: `pytorch/pytorch`
 
 Project contracts:

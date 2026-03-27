@@ -14,7 +14,7 @@ This pass is the topology/cartography closure for bead `bd-3v0.23.2`:
 
 Scope:
 - active Rust workspace in this repo (`Cargo.toml:1`)
-- legacy PyTorch oracle topology used for parity extraction (`legacy_pytorch_code/pytorch`)
+- legacy PyTorch oracle topology used for parity extraction (typically mirrored locally at `legacy_pytorch_code/pytorch`)
 - conformance/evidence/artifact plumbing that ties them together
 
 Method:
@@ -65,6 +65,9 @@ Workspace members:
 - `ft-api`
 - `ft-conformance`
 - `ft-runtime`
+- `ft-nn`
+- `ft-optim`
+- `ft-data`
 
 Source anchor:
 - `Cargo.toml:3`
@@ -79,6 +82,9 @@ Source anchor:
 | `ft-api` | User-facing composition layer | session facade binding `Tape` + runtime ledger, operation/backward API | low-level keyset math, checkpoint codecs | `crates/ft-api/src/lib.rs:8`, `crates/ft-api/src/lib.rs:57`, `crates/ft-api/src/lib.rs:93` |
 | `ft-device` | Device boundary guard | device consistency checks and guard contract | dispatch fallback decisions, artifact/fixture handling | `crates/ft-device/src/lib.rs:25`, `crates/ft-device/src/lib.rs:52` |
 | `ft-serialize` | Snapshot/durability codec | checkpoint envelope encode/decode, strict/hardened decode policy, RaptorQ sidecar/proof generation | autograd scheduler logic, dispatch key policy | `crates/ft-serialize/src/lib.rs:114`, `crates/ft-serialize/src/lib.rs:128`, `crates/ft-serialize/src/lib.rs:148` |
+| `ft-nn` | Module/layer stack | parameter registries, module traversal, layer forward contracts, state-dict-facing module semantics | fixture orchestration, low-level dispatch key policy | `crates/ft-nn/src/lib.rs:181`, `crates/ft-nn/src/lib.rs:306`, `crates/ft-nn/src/lib.rs:784` |
+| `ft-optim` | Optimizer state/update layer | SGD/Adam-style update rules, optimizer state transitions, decoupled weight decay behavior | tensor metadata storage model, fixture parsing | `crates/ft-optim/src/lib.rs:86`, `crates/ft-optim/src/lib.rs:114`, `crates/ft-optim/src/lib.rs:427` |
+| `ft-data` | Dataset/input pipeline | dataset trait, batching, iteration order, sample collation primitives | autograd scheduling, dispatch fallback decisions | `crates/ft-data/src/lib.rs:8`, `crates/ft-data/src/lib.rs:44`, `crates/ft-data/src/lib.rs:190` |
 | `ft-conformance` | Differential and evidence harness | fixture loading, local-vs-legacy differential checks, e2e forensics JSONL, packet artifact validation | core tensor semantics themselves, kernel execution internals | `crates/ft-conformance/src/lib.rs:28`, `crates/ft-conformance/src/lib.rs:610`, `crates/ft-conformance/src/bin/validate_phase2c_artifacts.rs:75` |
 
 ### 2.2 Dependency direction (implemented, not aspirational)
@@ -89,10 +95,13 @@ Observed internal dependency graph (from `cargo metadata`):
 - `ft-dispatch -> ft-core, ft-kernel-cpu`
 - `ft-autograd -> ft-core, ft-dispatch`
 - `ft-runtime -> ft-core` (+ optional `asupersync`, `ftui`)
-- `ft-api -> ft-autograd, ft-core, ft-runtime`
+- `ft-api -> ft-autograd, ft-core, ft-dispatch, ft-kernel-cpu, ft-runtime`
 - `ft-device -> ft-core`
-- `ft-serialize -> asupersync, serde, serde_json`
-- `ft-conformance -> ft-api, ft-core, ft-autograd, ft-dispatch, ft-serialize`
+- `ft-serialize -> ft-core` (+ `asupersync`, `serde`, `serde_json`, `safetensors`)
+- `ft-nn -> ft-api, ft-autograd, ft-core, ft-dispatch, ft-kernel-cpu`
+- `ft-optim -> ft-api, ft-autograd, ft-core, ft-dispatch`
+- `ft-data -> ft-api, ft-autograd, ft-core, ft-dispatch`
+- `ft-conformance -> ft-api, ft-core, ft-autograd, ft-dispatch, ft-optim, ft-runtime, ft-serialize`
 
 Source anchors:
 - `Cargo.toml:20`
@@ -111,7 +120,7 @@ L2: graph/runtime composition
 - `ft-autograd`, `ft-runtime`
 
 L3: public API
-- `ft-api`
+- `ft-api`, `ft-nn`, `ft-optim`, `ft-data`
 
 L4: verification/evidence tooling
 - `ft-conformance` + `ft-conformance` bins

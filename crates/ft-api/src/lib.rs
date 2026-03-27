@@ -916,6 +916,122 @@ impl FrankenTorchSession {
         Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
     }
 
+    /// Create a tensor filled with random integers in `[low, high)`.
+    ///
+    /// Equivalent to `torch.randint(low, high, size)`.
+    pub fn randint(
+        &mut self,
+        low: i64,
+        high: i64,
+        shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if high <= low {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "randint: high must be greater than low",
+                },
+            )));
+        }
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in randint")?;
+        let range = (high - low) as f64;
+        let values: Vec<f64> = (0..numel)
+            .map(|_| (self.rng.next_f64() * range).floor() + low as f64)
+            .collect();
+        self.tensor_tape.leaf(values, shape, false)
+    }
+
+    /// Create a 1-D tensor of a random permutation of integers `[0, n)`.
+    ///
+    /// Equivalent to `torch.randperm(n)`.
+    pub fn randperm(&mut self, n: usize) -> Result<TensorNodeId, AutogradError> {
+        let mut perm: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        // Fisher-Yates shuffle
+        for i in (1..n).rev() {
+            let j = (self.rng.next_f64() * (i + 1) as f64).floor() as usize;
+            let j = j.min(i); // safety clamp
+            perm.swap(i, j);
+        }
+        self.tensor_tape.leaf(perm, vec![n], false)
+    }
+
+    /// Sample indices from a probability distribution (with or without replacement).
+    ///
+    /// Equivalent to `torch.multinomial(input, num_samples, replacement=False)`.
+    /// `input` is a 1-D or 2-D tensor of non-negative weights (not required to sum to 1).
+    /// Returns a tensor of sampled indices.
+    pub fn multinomial(
+        &mut self,
+        input: TensorNodeId,
+        num_samples: usize,
+        replacement: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+
+        let (batch, num_categories) = match shape.len() {
+            1 => (1, shape[0]),
+            2 => (shape[0], shape[1]),
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "multinomial: input must be 1-D or 2-D",
+                    },
+                )));
+            }
+        };
+
+        if !replacement && num_samples > num_categories {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multinomial: num_samples exceeds num_categories without replacement",
+                },
+            )));
+        }
+
+        let mut result = Vec::with_capacity(batch * num_samples);
+
+        for b in 0..batch {
+            let base = b * num_categories;
+            let mut weights: Vec<f64> = vals[base..base + num_categories].to_vec();
+            let total: f64 = weights.iter().sum();
+            if total <= 0.0 {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "multinomial: sum of weights must be positive",
+                    },
+                )));
+            }
+
+            for _ in 0..num_samples {
+                // Normalize current weights
+                let w_sum: f64 = weights.iter().sum();
+                let r = self.rng.next_f64() * w_sum;
+                let mut cumulative = 0.0;
+                let mut chosen = num_categories - 1;
+                for (j, &w) in weights.iter().enumerate() {
+                    cumulative += w;
+                    if r < cumulative {
+                        chosen = j;
+                        break;
+                    }
+                }
+                result.push(chosen as f64);
+
+                if !replacement {
+                    weights[chosen] = 0.0;
+                }
+            }
+        }
+
+        let out_shape = if shape.len() == 1 {
+            vec![num_samples]
+        } else {
+            vec![batch, num_samples]
+        };
+        self.tensor_variable(result, out_shape, false)
+    }
+
     /// Create a 1-D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
     pub fn linspace(
         &mut self,
@@ -2143,6 +2259,40 @@ impl FrankenTorchSession {
         self.tensor_variable(data, vec![total_rows, total_cols], false)
     }
 
+    /// Generate a Vandermonde matrix from a 1-D input tensor.
+    ///
+    /// Equivalent to `torch.vander(x, N=None, increasing=False)`.
+    /// If `n` is None, N = len(x). Each row `i` is `[x[i]^(N-1), ..., x[i]^0]`
+    /// (decreasing) or `[x[i]^0, ..., x[i]^(N-1)]` (increasing).
+    pub fn tensor_vander(
+        &mut self,
+        input: TensorNodeId,
+        n: Option<usize>,
+        increasing: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 1 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "vander: input must be 1-D",
+                },
+            )));
+        }
+        let rows = shape[0];
+        let cols = n.unwrap_or(rows);
+        let mut data = vec![0.0f64; rows * cols];
+
+        for i in 0..rows {
+            for j in 0..cols {
+                let exp = if increasing { j } else { cols - 1 - j };
+                data[i * cols + j] = vals[i].powi(exp as i32);
+            }
+        }
+
+        self.tensor_variable(data, vec![rows, cols], false)
+    }
+
     /// Compute batched pairwise distance between two sets of vectors.
     ///
     /// Equivalent to `torch.cdist(x1, x2, p=2.0)`.
@@ -2666,6 +2816,28 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Clamp all elements to be >= min_val.
+    ///
+    /// Equivalent to `torch.clamp_min(input, min)` or `torch.clamp(input, min=min)`.
+    pub fn tensor_clamp_min(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, min_val, f64::INFINITY)
+    }
+
+    /// Clamp all elements to be <= max_val.
+    ///
+    /// Equivalent to `torch.clamp_max(input, max)` or `torch.clamp(input, max=max)`.
+    pub fn tensor_clamp_max(
+        &mut self,
+        input: TensorNodeId,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, f64::NEG_INFINITY, max_val)
+    }
+
     pub fn isnan(&mut self, input: NodeId) -> Result<NodeId, AutogradError> {
         self.scalar_float_classify(UnaryOp::IsNan, input)
     }
@@ -2968,6 +3140,155 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Lp-normalize a tensor along a dimension.
+    ///
+    /// Equivalent to `torch.nn.functional.normalize(input, p=2.0, dim=1)`.
+    /// Normalizes each slice along `dim` to have unit Lp norm.
+    pub fn functional_normalize(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let ndim = shape.len();
+        if dim >= ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "normalize: dim out of range",
+                },
+            )));
+        }
+
+        let dim_size = shape[dim];
+        let outer: usize = shape[..dim].iter().product();
+        let inner: usize = shape[dim + 1..].iter().product();
+        let mut result = vals.clone();
+
+        for o in 0..outer {
+            for i in 0..inner {
+                // Compute Lp norm along dim
+                let mut norm = 0.0f64;
+                for d in 0..dim_size {
+                    let idx = o * dim_size * inner + d * inner + i;
+                    norm += vals[idx].abs().powf(p);
+                }
+                norm = norm.powf(1.0 / p).max(1e-12); // clamp for stability
+
+                for d in 0..dim_size {
+                    let idx = o * dim_size * inner + d * inner + i;
+                    result[idx] = vals[idx] / norm;
+                }
+            }
+        }
+
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Apply dropout (random zeroing) to a tensor.
+    ///
+    /// Equivalent to `torch.nn.functional.dropout(input, p=0.5, training=True)`.
+    /// During training, randomly zeroes elements with probability `p` and scales
+    /// remaining elements by `1/(1-p)`. During eval (training=false), returns input unchanged.
+    pub fn functional_dropout(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+        training: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !training || p == 0.0 {
+            return Ok(input);
+        }
+        if p >= 1.0 {
+            let shape = self.tensor_shape(input)?;
+            let numel: usize = shape.iter().product();
+            return self.tensor_variable(vec![0.0; numel], shape, false);
+        }
+
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let scale = 1.0 / (1.0 - p);
+        let result: Vec<f64> = vals
+            .iter()
+            .map(|&v| {
+                if self.rng.next_f64() < p {
+                    0.0
+                } else {
+                    v * scale
+                }
+            })
+            .collect();
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Look up embeddings from a weight matrix.
+    ///
+    /// Equivalent to `torch.nn.functional.embedding(input, weight)`.
+    /// `input` is a tensor of integer indices, `weight` is `[num_embeddings, embedding_dim]`.
+    /// Returns a tensor where each index is replaced by the corresponding row of `weight`.
+    pub fn functional_embedding(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let indices = self.tensor_values(input)?;
+        let input_shape = self.tensor_shape(input)?;
+        let w_vals = self.tensor_values(weight)?;
+        let w_shape = self.tensor_shape(weight)?;
+
+        if w_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding: weight must be 2-D [num_embeddings, embedding_dim]",
+                },
+            )));
+        }
+        let num_emb = w_shape[0];
+        let emb_dim = w_shape[1];
+
+        let mut result = Vec::with_capacity(indices.len() * emb_dim);
+        for &idx_f in &indices {
+            let idx = idx_f as usize;
+            if idx >= num_emb {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "embedding: index out of range",
+                    },
+                )));
+            }
+            let start = idx * emb_dim;
+            result.extend_from_slice(&w_vals[start..start + emb_dim]);
+        }
+
+        let mut out_shape = input_shape;
+        out_shape.push(emb_dim);
+        self.tensor_variable(result, out_shape, false)
+    }
+
+    /// Apply a linear transformation: `y = x @ weight^T + bias`.
+    ///
+    /// Equivalent to `torch.nn.functional.linear(input, weight, bias)`.
+    /// `input`: `[*, in_features]`, `weight`: `[out_features, in_features]`,
+    /// `bias` (optional): `[out_features]`.
+    pub fn functional_linear(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let weight_t = self.tensor_transpose(weight, 0, 1)?;
+        let output = self.tensor_matmul(input, weight_t)?;
+        match bias {
+            Some(b) => {
+                let out_shape = self.tensor_shape(output)?;
+                let expanded = self.tensor_expand(b, out_shape)?;
+                self.tensor_add(output, expanded)
+            }
+            None => Ok(output),
+        }
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
@@ -3120,6 +3441,150 @@ impl FrankenTorchSession {
         let shape = self.tensor_shape(input)?;
         let fill_tensor = self.full(shape, value, false)?;
         self.tensor_where(mask, fill_tensor, input)
+    }
+
+    /// Accumulate `src` into `self` at positions specified by `index` along `dim`.
+    ///
+    /// Equivalent to `tensor.index_add_(dim, index, source)`.
+    /// For each `i`, adds `src[i]` to `self[index[i]]` along `dim`.
+    pub fn tensor_index_add(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+        src: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let mut result = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let idx_vals = self.tensor_values(index)?;
+        let src_vals = self.tensor_values(src)?;
+        let src_shape = self.tensor_shape(src)?;
+
+        let ndim = shape.len();
+        if dim >= ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_add: dim out of range",
+                },
+            )));
+        }
+
+        let dim_size = shape[dim];
+        let outer: usize = shape[..dim].iter().product();
+        let inner: usize = shape[dim + 1..].iter().product();
+        let src_dim_size = src_shape.get(dim).copied().unwrap_or(1);
+
+        for o in 0..outer {
+            for (si, &idx_f) in idx_vals.iter().enumerate() {
+                let idx = idx_f as usize;
+                if idx >= dim_size || si >= src_dim_size {
+                    continue;
+                }
+                for i in 0..inner {
+                    let dst_offset = o * dim_size * inner + idx * inner + i;
+                    let src_offset = o * src_dim_size * inner + si * inner + i;
+                    if dst_offset < result.len() && src_offset < src_vals.len() {
+                        result[dst_offset] += src_vals[src_offset];
+                    }
+                }
+            }
+        }
+
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Copy `src` into `self` at positions specified by `index` along `dim`.
+    ///
+    /// Equivalent to `tensor.index_copy_(dim, index, source)`.
+    pub fn tensor_index_copy(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+        src: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let mut result = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let idx_vals = self.tensor_values(index)?;
+        let src_vals = self.tensor_values(src)?;
+        let src_shape = self.tensor_shape(src)?;
+
+        let ndim = shape.len();
+        if dim >= ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_copy: dim out of range",
+                },
+            )));
+        }
+
+        let dim_size = shape[dim];
+        let outer: usize = shape[..dim].iter().product();
+        let inner: usize = shape[dim + 1..].iter().product();
+        let src_dim_size = src_shape.get(dim).copied().unwrap_or(1);
+
+        for o in 0..outer {
+            for (si, &idx_f) in idx_vals.iter().enumerate() {
+                let idx = idx_f as usize;
+                if idx >= dim_size || si >= src_dim_size {
+                    continue;
+                }
+                for i in 0..inner {
+                    let dst_offset = o * dim_size * inner + idx * inner + i;
+                    let src_offset = o * src_dim_size * inner + si * inner + i;
+                    if dst_offset < result.len() && src_offset < src_vals.len() {
+                        result[dst_offset] = src_vals[src_offset];
+                    }
+                }
+            }
+        }
+
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Fill positions specified by `index` along `dim` with a scalar value.
+    ///
+    /// Equivalent to `tensor.index_fill_(dim, index, value)`.
+    pub fn tensor_index_fill(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let mut result = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let idx_vals = self.tensor_values(index)?;
+
+        let ndim = shape.len();
+        if dim >= ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_fill: dim out of range",
+                },
+            )));
+        }
+
+        let dim_size = shape[dim];
+        let outer: usize = shape[..dim].iter().product();
+        let inner: usize = shape[dim + 1..].iter().product();
+
+        for o in 0..outer {
+            for &idx_f in &idx_vals {
+                let idx = idx_f as usize;
+                if idx >= dim_size {
+                    continue;
+                }
+                for i in 0..inner {
+                    let offset = o * dim_size * inner + idx * inner + i;
+                    if offset < result.len() {
+                        result[offset] = value;
+                    }
+                }
+            }
+        }
+
+        self.tensor_variable(result, shape, false)
     }
 
     pub fn tensor_cat(
@@ -15074,6 +15539,49 @@ mod tests {
         assert_eq!(shape, vec![0, 0]);
     }
 
+    // ── vander tests ────────────────────────────────────────────────────
+
+    #[test]
+    fn vander_decreasing() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_vander(t, None, false).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![3, 3]);
+        let vals = s.tensor_values(out).unwrap();
+        // Row 0: [1^2, 1^1, 1^0] = [1, 1, 1]
+        // Row 1: [2^2, 2^1, 2^0] = [4, 2, 1]
+        // Row 2: [3^2, 3^1, 3^0] = [9, 3, 1]
+        assert_eq!(vals, vec![1.0, 1.0, 1.0, 4.0, 2.0, 1.0, 9.0, 3.0, 1.0]);
+    }
+
+    #[test]
+    fn vander_increasing() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_vander(t, None, true).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Row 0: [1^0, 1^1, 1^2] = [1, 1, 1]
+        // Row 1: [2^0, 2^1, 2^2] = [1, 2, 4]
+        assert_eq!(vals, vec![1.0, 1.0, 1.0, 1.0, 2.0, 4.0, 1.0, 3.0, 9.0]);
+    }
+
+    #[test]
+    fn vander_custom_n() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![2.0, 3.0], vec![2], false).unwrap();
+        let out = s.tensor_vander(t, Some(4), false).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![2, 4]);
+        let vals = s.tensor_values(out).unwrap();
+        // Row 0: [2^3, 2^2, 2^1, 2^0] = [8, 4, 2, 1]
+        assert_eq!(&vals[0..4], &[8.0, 4.0, 2.0, 1.0]);
+    }
+
     // ── cdist tests ────────────────────────────────────────────────────
 
     #[test]
@@ -15924,6 +16432,239 @@ mod tests {
         assert_eq!(shape[1], 8);
     }
 
+    // ── clamp_min / clamp_max tests ──────────────────────────────────
+
+    #[test]
+    fn clamp_min_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![-2.0, 0.0, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_clamp_min(t, 0.0).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, vec![0.0, 0.0, 3.0]);
+    }
+
+    #[test]
+    fn clamp_max_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![-2.0, 0.0, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_clamp_max(t, 1.0).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, vec![-2.0, 0.0, 1.0]);
+    }
+
+    // ── index_add / index_copy / index_fill tests ──────────────────────
+
+    #[test]
+    fn index_add_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 0.0, 0.0, 0.0], vec![4], false)
+            .unwrap();
+        let index = s.tensor_variable(vec![1.0, 3.0], vec![2], false).unwrap();
+        let src = s.tensor_variable(vec![10.0, 20.0], vec![2], false).unwrap();
+        let out = s.tensor_index_add(input, 0, index, src).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, vec![0.0, 10.0, 0.0, 20.0]);
+    }
+
+    #[test]
+    fn index_add_accumulates() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let index = s.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+        let src = s.tensor_variable(vec![10.0, 20.0], vec![2], false).unwrap();
+        let out = s.tensor_index_add(input, 0, index, src).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // 1.0 + 10.0 + 20.0 = 31.0 at index 0
+        assert!((vals[0] - 31.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn index_copy_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
+            .unwrap();
+        let index = s.tensor_variable(vec![1.0, 3.0], vec![2], false).unwrap();
+        let src = s.tensor_variable(vec![99.0, 88.0], vec![2], false).unwrap();
+        let out = s.tensor_index_copy(input, 0, index, src).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, vec![1.0, 99.0, 3.0, 88.0]);
+    }
+
+    #[test]
+    fn index_fill_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], false)
+            .unwrap();
+        let index = s
+            .tensor_variable(vec![0.0, 2.0, 4.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_index_fill(input, 0, index, 0.0).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, vec![0.0, 2.0, 0.0, 4.0, 0.0]);
+    }
+
+    // ── functional API tests ─────────────────────────────────────────
+
+    #[test]
+    fn functional_normalize_l2() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![3.0, 4.0, 0.0, 5.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.functional_normalize(t, 2.0, 1).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Row 0: [3/5, 4/5], Row 1: [0/5, 5/5]
+        assert!((vals[0] - 0.6).abs() < 1e-10);
+        assert!((vals[1] - 0.8).abs() < 1e-10);
+        assert!(vals[2].abs() < 1e-10);
+        assert!((vals[3] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn functional_normalize_l1() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        let out = s.functional_normalize(t, 1.0, 1).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // L1 norm = 6, so [1/6, 2/6, 3/6]
+        assert!((vals[0] - 1.0 / 6.0).abs() < 1e-10);
+        assert!((vals[1] - 2.0 / 6.0).abs() < 1e-10);
+        assert!((vals[2] - 3.0 / 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn functional_dropout_training_false_is_identity() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.functional_dropout(t, 0.5, false).unwrap();
+        assert_eq!(out, t); // should return same node
+    }
+
+    #[test]
+    fn functional_dropout_p1_zeros_all() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.functional_dropout(t, 1.0, true).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        for &v in &vals {
+            assert!(v.abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn functional_dropout_preserves_mean_approximately() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data: Vec<f64> = vec![1.0; 1000];
+        let t = s.tensor_variable(data, vec![1000], false).unwrap();
+        let out = s.functional_dropout(t, 0.5, true).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        let mean: f64 = vals.iter().sum::<f64>() / 1000.0;
+        // With inverted dropout, mean should be approximately 1.0
+        assert!(
+            (mean - 1.0).abs() < 0.2,
+            "dropout mean {mean} should be ~1.0"
+        );
+    }
+
+    #[test]
+    fn functional_embedding_lookup() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Weight: 3 embeddings of dim 2
+        let weight = s
+            .tensor_variable(vec![0.1, 0.2, 0.3, 0.4, 0.5, 0.6], vec![3, 2], false)
+            .unwrap();
+        let indices = s
+            .tensor_variable(vec![0.0, 2.0, 1.0], vec![3], false)
+            .unwrap();
+        let out = s.functional_embedding(indices, weight).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![3, 2]);
+        let vals = s.tensor_values(out).unwrap();
+        // Index 0 -> [0.1, 0.2], Index 2 -> [0.5, 0.6], Index 1 -> [0.3, 0.4]
+        assert!((vals[0] - 0.1).abs() < 1e-10);
+        assert!((vals[1] - 0.2).abs() < 1e-10);
+        assert!((vals[2] - 0.5).abs() < 1e-10);
+        assert!((vals[3] - 0.6).abs() < 1e-10);
+        assert!((vals[4] - 0.3).abs() < 1e-10);
+        assert!((vals[5] - 0.4).abs() < 1e-10);
+    }
+
+    #[test]
+    fn functional_embedding_2d_indices() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let indices = s
+            .tensor_variable(vec![0.0, 1.0, 1.0, 0.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.functional_embedding(indices, weight).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn functional_embedding_out_of_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let weight = s
+            .tensor_variable(vec![1.0, 2.0], vec![1, 2], false)
+            .unwrap();
+        let indices = s.tensor_variable(vec![5.0], vec![1], false).unwrap();
+        assert!(s.functional_embedding(indices, weight).is_err());
+    }
+
+    #[test]
+    fn functional_linear_no_bias() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], true)
+            .unwrap();
+        let weight = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![2, 3], false)
+            .unwrap();
+        let out = s.functional_linear(input, weight, None).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 2]);
+        let vals = s.tensor_values(out).unwrap();
+        // [1,2,3] @ [[1,0],[0,1],[0,0]] = [1, 2]
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[1] - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn functional_linear_with_bias() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 1.0], vec![1, 2], false)
+            .unwrap();
+        let weight = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false)
+            .unwrap();
+        let bias = s
+            .tensor_variable(vec![10.0, 20.0], vec![1, 2], false)
+            .unwrap();
+        let out = s.functional_linear(input, weight, Some(bias)).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // [1,1] @ I + [10,20] = [11, 21]
+        assert!((vals[0] - 11.0).abs() < 1e-10);
+        assert!((vals[1] - 21.0).abs() < 1e-10);
+    }
+
     // ── tensordot / kron tests (bd-2klp.8) ────────────────────────────
 
     #[test]
@@ -16412,6 +17153,106 @@ mod tests {
         let t = s.logspace(0.0, 2.0, 0, 10.0, false).unwrap();
         let vals = s.tensor_values(t).unwrap();
         assert!(vals.is_empty());
+    }
+
+    // ── randint / randperm / multinomial tests ───────────────────────
+
+    #[test]
+    fn randint_in_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.randint(0, 10, vec![100]).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert_eq!(vals.len(), 100);
+        for &v in &vals {
+            assert!((0.0..10.0).contains(&v), "randint value {v} out of [0, 10)");
+        }
+    }
+
+    #[test]
+    fn randint_negative_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.randint(-5, 5, vec![50]).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        for &v in &vals {
+            assert!((-5.0..5.0).contains(&v), "randint value {v} out of [-5, 5)");
+        }
+    }
+
+    #[test]
+    fn randint_rejects_empty_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        assert!(s.randint(5, 5, vec![10]).is_err());
+        assert!(s.randint(10, 5, vec![10]).is_err());
+    }
+
+    #[test]
+    fn randperm_is_permutation() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.randperm(10).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert_eq!(vals.len(), 10);
+        let mut sorted: Vec<f64> = vals.clone();
+        sorted.sort_by(|a, b| a.total_cmp(b));
+        let expected: Vec<f64> = (0..10).map(|i| i as f64).collect();
+        assert_eq!(sorted, expected);
+    }
+
+    #[test]
+    fn randperm_zero() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.randperm(0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert!(vals.is_empty());
+    }
+
+    #[test]
+    fn multinomial_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Uniform weights
+        let w = s
+            .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![4], false)
+            .unwrap();
+        let samples = s.multinomial(w, 2, false).unwrap();
+        let vals = s.tensor_values(samples).unwrap();
+        assert_eq!(vals.len(), 2);
+        // All indices should be in [0, 4)
+        for &v in &vals {
+            assert!((0.0..4.0).contains(&v));
+        }
+        // Without replacement, indices should be distinct
+        assert_ne!(vals[0], vals[1]);
+    }
+
+    #[test]
+    fn multinomial_with_replacement() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, 0.0, 0.0], vec![3], false)
+            .unwrap();
+        // Only first category has weight, so all samples should be 0
+        let samples = s.multinomial(w, 5, true).unwrap();
+        let vals = s.tensor_values(samples).unwrap();
+        for &v in &vals {
+            assert!((v - 0.0).abs() < 1e-10);
+        }
+    }
+
+    #[test]
+    fn multinomial_batched() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0], vec![2, 3], false)
+            .unwrap();
+        let samples = s.multinomial(w, 2, false).unwrap();
+        let shape = s.tensor_shape(samples).unwrap();
+        assert_eq!(shape, vec![2, 2]);
+    }
+
+    #[test]
+    fn multinomial_rejects_too_many_without_replacement() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s.tensor_variable(vec![1.0, 1.0], vec![2], false).unwrap();
+        assert!(s.multinomial(w, 3, false).is_err());
     }
 
     #[test]

@@ -76,7 +76,7 @@ tensor_add_, tensor_sub_, tensor_mul_, tensor_div_, tensor_zero_, tensor_fill_, 
 mse_loss, l1_loss, bce_loss, smooth_l1_loss, huber_loss, cross_entropy_loss, nll_loss, cosine_embedding_loss
 
 ### Advanced Indexing
-index_select, gather, scatter, masked_fill
+index_select, gather, scatter, scatter_add, masked_fill, index_add, index_copy, index_fill, index_put
 
 ### Sorting & Selection
 sort, topk, argsort
@@ -101,7 +101,7 @@ tensor_pad (constant padding, PyTorch F.pad convention)
 - `crates/ft-conformance/fixtures/serialization_cases.json`
 
 Modes tested for all listed families: strict + hardened.
-2336 tests passing across workspace.
+2358 tests passing across workspace.
 
 ## Gap Policy
 
