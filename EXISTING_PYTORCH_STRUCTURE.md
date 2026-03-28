@@ -184,7 +184,7 @@ Durability evidence:
 ## 4. Legacy Oracle Cartography (PyTorch -> FrankenTorch ownership)
 
 Legacy root:
-- `/data/projects/frankentorch/legacy_pytorch_code/pytorch`
+- typical local mirror when present: `/data/projects/frankentorch/legacy_pytorch_code/pytorch`
 - upstream: `pytorch/pytorch`
 
 | Legacy package zone | Observable contract class | FrankenTorch owner crate(s) | Current evidence harness linkage | Lifecycle note |
