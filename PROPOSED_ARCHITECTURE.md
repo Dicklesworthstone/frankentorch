@@ -19,6 +19,9 @@
 - `ft-serialize`: snapshot/checkpoint codecs.
 - `ft-runtime`: mode policy + evidence ledger + durability envelopes.
 - `ft-api`: user-facing execution session.
+- `ft-nn`: neural network modules and layer composition.
+- `ft-optim`: optimizer state/update rules.
+- `ft-data`: dataset and dataloader primitives.
 - `ft-conformance`: differential fixtures, parity checks, and benchmark harness.
 
 ## 3. Runtime Flow
@@ -27,8 +30,9 @@
 2. Dispatcher selects kernel and emits decision evidence.
 3. Kernel executes with explicit compatibility checks.
 4. Autograd engine builds replayable trace and deterministic backward report.
-5. Conformance layer compares against oracle fixtures and emits parity artifacts.
-6. Durability layer wraps long-lived artifacts with sidecar metadata.
+5. Higher-level module, optimizer, and data layers compose session-level execution into train/eval workflows.
+6. Conformance layer compares against oracle fixtures and emits parity artifacts.
+7. Durability layer wraps long-lived artifacts with sidecar metadata.
 
 ## 4. Asupersync + FrankenTUI Leverage
 
