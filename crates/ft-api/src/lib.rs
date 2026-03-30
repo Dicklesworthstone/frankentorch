@@ -2260,10 +2260,10 @@ impl FrankenTorchSession {
         // Find max value to determine output size
         let mut max_val: Option<i64> = None;
         for &v in &vals {
-            if v != v.floor() {
+            if !v.is_finite() || v != v.floor() {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "bincount: input must contain integer values",
+                        reason: "bincount: input must contain finite integer values",
                     },
                 )));
             }
@@ -2317,8 +2317,24 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        if !min_val.is_finite() || !max_val.is_finite() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "histc: min and max must be finite",
+                },
+            )));
+        }
 
         let vals = self.tensor_values(input)?;
+        for &v in &vals {
+            if !v.is_finite() {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "histc: input values must be finite",
+                    },
+                )));
+            }
+        }
 
         let (lo, hi) = if (min_val - max_val).abs() < f64::EPSILON {
             // Auto-range from data
@@ -3649,10 +3665,10 @@ impl FrankenTorchSession {
 
         for o in 0..outer {
             for (si, &idx_f) in idx_vals.iter().enumerate() {
-                if idx_f < 0.0 || idx_f != idx_f.floor() {
+                if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                         ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_add: index values must be non-negative integers",
+                            reason: "index_add: index values must be finite non-negative integers",
                         },
                     )));
                 }
@@ -3705,10 +3721,10 @@ impl FrankenTorchSession {
 
         for o in 0..outer {
             for (si, &idx_f) in idx_vals.iter().enumerate() {
-                if idx_f < 0.0 || idx_f != idx_f.floor() {
+                if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                         ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_copy: index values must be non-negative integers",
+                            reason: "index_copy: index values must be finite non-negative integers",
                         },
                     )));
                 }
@@ -3758,10 +3774,10 @@ impl FrankenTorchSession {
 
         for o in 0..outer {
             for &idx_f in &idx_vals {
-                if idx_f < 0.0 || idx_f != idx_f.floor() {
+                if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                         ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_fill: index values must be non-negative integers",
+                            reason: "index_fill: index values must be finite non-negative integers",
                         },
                     )));
                 }
@@ -6014,10 +6030,10 @@ impl FrankenTorchSession {
         let mut output = vec![0.0; total * num_classes];
         for (i, &idx) in idx_vals.iter().enumerate() {
             let class = idx as usize;
-            if class >= num_classes || idx < 0.0 || idx != idx.floor() {
+            if !idx.is_finite() || class >= num_classes || idx < 0.0 || idx != idx.floor() {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "one_hot index out of range or not an integer",
+                        reason: "one_hot index out of range or not a finite integer",
                     },
                 )));
             }
@@ -14329,6 +14345,15 @@ mod tests {
         assert!(session.one_hot(indices, 3).is_err());
     }
 
+    #[test]
+    fn session_one_hot_rejects_infinite_index() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let indices = session
+            .tensor_variable(vec![0.0, f64::INFINITY], vec![2], false)
+            .expect("indices");
+        assert!(session.one_hot(indices, 3).is_err());
+    }
+
     // ---- tensor_pad tests ----
 
     #[test]
@@ -15630,6 +15655,15 @@ mod tests {
     }
 
     #[test]
+    fn bincount_rejects_infinite() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0, f64::INFINITY], vec![2], false)
+            .unwrap();
+        assert!(s.tensor_bincount(t, None, 0).is_err());
+    }
+
+    #[test]
     fn bincount_rejects_2d() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let t = s
@@ -15694,6 +15728,22 @@ mod tests {
         // -10 clamps to bin 0, 100 clamps to bin 1
         assert!((vals[0] - 2.0).abs() < 1e-12); // -10, 0.5
         assert!((vals[1] - 2.0).abs() < 1e-12); // 1.5, 100
+    }
+
+    #[test]
+    fn histc_rejects_non_finite_input() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0, f64::NAN], vec![2], false)
+            .unwrap();
+        assert!(s.tensor_histc(t, 2, 0.0, 1.0).is_err());
+    }
+
+    #[test]
+    fn histc_rejects_non_finite_bounds() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0, 1.0], vec![2], false).unwrap();
+        assert!(s.tensor_histc(t, 2, 0.0, f64::INFINITY).is_err());
     }
 
     // ── count_nonzero tests ──────────────────────────────────────────
@@ -16947,6 +16997,19 @@ mod tests {
     }
 
     #[test]
+    fn index_add_rejects_infinite_index() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false)
+            .unwrap();
+        let index = s
+            .tensor_variable(vec![f64::INFINITY], vec![1], false)
+            .unwrap();
+        let src = s.tensor_variable(vec![10.0], vec![1], false).unwrap();
+        assert!(s.tensor_index_add(input, 0, index, src).is_err());
+    }
+
+    #[test]
     fn index_copy_rejects_fractional_index() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
@@ -16958,12 +17021,37 @@ mod tests {
     }
 
     #[test]
+    fn index_copy_rejects_infinite_index() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let index = s
+            .tensor_variable(vec![f64::INFINITY], vec![1], false)
+            .unwrap();
+        let src = s.tensor_variable(vec![99.0], vec![1], false).unwrap();
+        assert!(s.tensor_index_copy(input, 0, index, src).is_err());
+    }
+
+    #[test]
     fn index_fill_rejects_negative_index() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
             .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
             .unwrap();
         let index = s.tensor_variable(vec![-2.0], vec![1], false).unwrap();
+        assert!(s.tensor_index_fill(input, 0, index, 0.0).is_err());
+    }
+
+    #[test]
+    fn index_fill_rejects_infinite_index() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let index = s
+            .tensor_variable(vec![f64::INFINITY], vec![1], false)
+            .unwrap();
         assert!(s.tensor_index_fill(input, 0, index, 0.0).is_err());
     }
 
