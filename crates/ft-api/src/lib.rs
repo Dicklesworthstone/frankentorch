@@ -994,6 +994,15 @@ impl FrankenTorchSession {
         for b in 0..batch {
             let base = b * num_categories;
             let mut weights: Vec<f64> = vals[base..base + num_categories].to_vec();
+            for &weight in &weights {
+                if !weight.is_finite() || weight < 0.0 {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "multinomial: weights must be finite and non-negative",
+                        },
+                    )));
+                }
+            }
             let total: f64 = weights.iter().sum();
             if total <= 0.0 {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -1001,6 +1010,16 @@ impl FrankenTorchSession {
                         reason: "multinomial: sum of weights must be positive",
                     },
                 )));
+            }
+            if !replacement {
+                let positive_count = weights.iter().filter(|&&weight| weight > 0.0).count();
+                if num_samples > positive_count {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "multinomial: num_samples exceeds positive-weight categories without replacement",
+                        },
+                    )));
+                }
             }
 
             for _ in 0..num_samples {
@@ -17974,6 +17993,42 @@ mod tests {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let w = s.tensor_variable(vec![1.0, 1.0], vec![2], false).unwrap();
         assert!(s.multinomial(w, 3, false).is_err());
+    }
+
+    #[test]
+    fn multinomial_rejects_too_many_positive_weight_draws_without_replacement() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, 0.0, 0.0], vec![3], false)
+            .unwrap();
+        assert!(s.multinomial(w, 2, false).is_err());
+    }
+
+    #[test]
+    fn multinomial_rejects_negative_weights() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, -1.0, 2.0], vec![3], false)
+            .unwrap();
+        assert!(s.multinomial(w, 1, true).is_err());
+    }
+
+    #[test]
+    fn multinomial_rejects_nan_weights() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, f64::NAN, 2.0], vec![3], false)
+            .unwrap();
+        assert!(s.multinomial(w, 1, true).is_err());
+    }
+
+    #[test]
+    fn multinomial_rejects_infinite_weights() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, f64::INFINITY, 2.0], vec![3], false)
+            .unwrap();
+        assert!(s.multinomial(w, 1, true).is_err());
     }
 
     #[test]
