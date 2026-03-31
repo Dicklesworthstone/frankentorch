@@ -1,5 +1,7 @@
 #![forbid(unsafe_code)]
 
+use std::sync::Arc;
+
 use ft_autograd::{
     AutogradError, BackwardOptions, BackwardReport, ClampOperationEvent, FunctionCtx, NodeId,
     OperationEvent, PowOperationEvent, Tape, TensorAddmmOperationEvent, TensorAddmvOperationEvent,
@@ -10,7 +12,7 @@ use ft_autograd::{
     TensorSortOperationEvent, TensorTape, TensorTopKOperationEvent, TensorUnaryOperationEvent,
     UnaryOperationEvent,
 };
-use ft_core::{DType, DenseTensor, ExecutionMode, TensorCompatError, TensorMeta};
+use ft_core::{DType, DenseTensor, ExecutionMode, TensorCompatError, TensorMeta, TensorStorage};
 use ft_dispatch::{
     ComparisonDispatchDecision, ComparisonOp, UnaryDispatchDecision, UnaryOp,
     dispatch_scalar_comparison, dispatch_scalar_unary, dispatch_tensor_comparison_contiguous_f64,
@@ -562,6 +564,118 @@ impl FrankenTorchSession {
         dtype: DType,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_tape.to_dtype(input, dtype)
+    }
+
+    /// Return the real component of a complex tensor.
+    pub fn tensor_real(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let tensor = self.tensor_tape.tensor(input)?;
+        let meta = tensor.meta().clone();
+        if self.tensor_tape.tensor_requires_grad(input)? {
+            return Err(AutogradError::TensorRequiresGradNonFloating {
+                node: input,
+                dtype: meta.dtype(),
+            });
+        }
+
+        let (output_meta, output_storage) = match tensor.typed_storage() {
+            TensorStorage::Complex64(values) => (
+                TensorMeta::from_shape(meta.shape().to_vec(), DType::F32, meta.device()),
+                TensorStorage::F32(Arc::new(values.iter().map(|z| z.re).collect())),
+            ),
+            TensorStorage::Complex128(values) => (
+                TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+                TensorStorage::F64(Arc::new(values.iter().map(|z| z.re).collect())),
+            ),
+            _ => {
+                return Err(AutogradError::DenseTensor(
+                    ft_core::DenseTensorError::UnsupportedDType(meta.dtype()),
+                ));
+            }
+        };
+
+        let out = self.tensor_tape.leaf_tensor(
+            DenseTensor::from_typed_storage(output_meta, output_storage)?,
+            false,
+        );
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("real input={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Return the imaginary component of a complex tensor.
+    pub fn tensor_imag(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let tensor = self.tensor_tape.tensor(input)?;
+        let meta = tensor.meta().clone();
+        if self.tensor_tape.tensor_requires_grad(input)? {
+            return Err(AutogradError::TensorRequiresGradNonFloating {
+                node: input,
+                dtype: meta.dtype(),
+            });
+        }
+
+        let (output_meta, output_storage) = match tensor.typed_storage() {
+            TensorStorage::Complex64(values) => (
+                TensorMeta::from_shape(meta.shape().to_vec(), DType::F32, meta.device()),
+                TensorStorage::F32(Arc::new(values.iter().map(|z| z.im).collect())),
+            ),
+            TensorStorage::Complex128(values) => (
+                TensorMeta::from_shape(meta.shape().to_vec(), DType::F64, meta.device()),
+                TensorStorage::F64(Arc::new(values.iter().map(|z| z.im).collect())),
+            ),
+            _ => {
+                return Err(AutogradError::DenseTensor(
+                    ft_core::DenseTensorError::UnsupportedDType(meta.dtype()),
+                ));
+            }
+        };
+
+        let out = self.tensor_tape.leaf_tensor(
+            DenseTensor::from_typed_storage(output_meta, output_storage)?,
+            false,
+        );
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("imag input={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Return the element-wise complex conjugate of a complex tensor.
+    pub fn tensor_conj(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let tensor = self.tensor_tape.tensor(input)?;
+        let meta = tensor.meta().clone();
+        if self.tensor_tape.tensor_requires_grad(input)? {
+            return Err(AutogradError::TensorRequiresGradNonFloating {
+                node: input,
+                dtype: meta.dtype(),
+            });
+        }
+
+        let output_storage = match tensor.typed_storage() {
+            TensorStorage::Complex64(values) => {
+                TensorStorage::Complex64(Arc::new(values.iter().map(|z| z.conj()).collect()))
+            }
+            TensorStorage::Complex128(values) => {
+                TensorStorage::Complex128(Arc::new(values.iter().map(|z| z.conj()).collect()))
+            }
+            _ => {
+                return Err(AutogradError::DenseTensor(
+                    ft_core::DenseTensorError::UnsupportedDType(meta.dtype()),
+                ));
+            }
+        };
+
+        let out = self.tensor_tape.leaf_tensor(
+            DenseTensor::from_typed_storage(meta, output_storage)?,
+            false,
+        );
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("conj input={} out={}", input.0, out.0),
+        );
+        Ok(out)
     }
 
     pub fn zeros_f32(
@@ -7366,10 +7480,7 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.cov(input)`.
     /// Input shape: `(N, M)` where N is the number of variables and M is
     /// the number of observations. Returns an `(N, N)` covariance matrix.
-    pub fn tensor_cov(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_cov(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = {
             let (v, m) = self.tensor_values_meta(input)?;
             (v, m.shape().to_vec())
@@ -7428,10 +7539,7 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.corrcoef(input)`.
     /// Input shape: `(N, M)`. Returns an `(N, N)` correlation matrix.
-    pub fn tensor_corrcoef(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_corrcoef(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let cov = self.tensor_cov(input)?;
         let cov_vals = self.tensor_values(cov)?;
         let n_shape = self.tensor_shape(cov)?;
@@ -7479,8 +7587,12 @@ impl FrankenTorchSession {
         for o in 0..outer {
             let slice = &vals[o * last_dim..(o + 1) * last_dim];
             // Sort and find the value with the longest run
-            let mut sorted: Vec<(f64, usize)> =
-                slice.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+            let mut sorted: Vec<(f64, usize)> = slice
+                .iter()
+                .copied()
+                .enumerate()
+                .map(|(i, v)| (v, i))
+                .collect();
             sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
             let mut best_val = sorted[0].0;
@@ -7515,7 +7627,10 @@ impl FrankenTorchSession {
         let idxs_out = self.tensor_tape.leaf(mode_idxs, out_shape, false)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
-            format!("mode input={} vals={} idxs={}", input.0, vals_out.0, idxs_out.0),
+            format!(
+                "mode input={} vals={} idxs={}",
+                input.0, vals_out.0, idxs_out.0
+            ),
         );
         Ok((vals_out, idxs_out))
     }
@@ -7613,7 +7728,9 @@ mod tests {
     use std::sync::{Arc, Mutex};
 
     use ft_autograd::{AutogradError, BackwardOptions, ReentrantPolicy};
-    use ft_core::{DType, DenseTensor, Device, ExecutionMode, TensorMeta};
+    use ft_core::{
+        Complex64, Complex128, DType, DenseTensor, Device, ExecutionMode, TensorMeta, TensorStorage,
+    };
     use ft_runtime::EvidenceKind;
 
     use super::FrankenTorchSession;
@@ -19861,6 +19978,99 @@ mod tests {
     }
 
     #[test]
+    fn complex128_real_imag_and_conj_session_ops() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = DenseTensor::from_typed_storage(
+            TensorMeta::from_shape(vec![2], DType::Complex128, Device::Cpu),
+            TensorStorage::Complex128(Arc::new(vec![
+                Complex128::new(1.5, -2.0),
+                Complex128::new(-3.0, 4.5),
+            ])),
+        )
+        .unwrap();
+        let input = s.tensor_variable_from_storage(tensor, false);
+
+        let real = s.tensor_real(input).unwrap();
+        let imag = s.tensor_imag(input).unwrap();
+        let conj = s.tensor_conj(input).unwrap();
+
+        assert_eq!(s.tensor_dtype(real).unwrap(), DType::F64);
+        assert_eq!(s.tensor_dtype(imag).unwrap(), DType::F64);
+        assert_eq!(s.tensor_dtype(conj).unwrap(), DType::Complex128);
+        assert_eq!(s.tensor_values(real).unwrap(), vec![1.5, -3.0]);
+        assert_eq!(s.tensor_values(imag).unwrap(), vec![-2.0, 4.5]);
+
+        let conj_tensor = s.tensor_tape.tensor(conj).unwrap();
+        let TensorStorage::Complex128(values) = conj_tensor.typed_storage() else {
+            unreachable!("tensor_conj should preserve Complex128 dtype");
+        };
+        assert_eq!(values[0], Complex128::new(1.5, 2.0));
+        assert_eq!(values[1], Complex128::new(-3.0, -4.5));
+    }
+
+    #[test]
+    fn complex64_real_imag_and_conj_session_ops() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = DenseTensor::from_typed_storage(
+            TensorMeta::from_shape(vec![2], DType::Complex64, Device::Cpu),
+            TensorStorage::Complex64(Arc::new(vec![
+                Complex64::new(2.5, -1.25),
+                Complex64::new(-0.5, 3.0),
+            ])),
+        )
+        .unwrap();
+        let input = s.tensor_variable_from_storage(tensor, false);
+
+        let real = s.tensor_real(input).unwrap();
+        let imag = s.tensor_imag(input).unwrap();
+        let conj = s.tensor_conj(input).unwrap();
+
+        assert_eq!(s.tensor_dtype(real).unwrap(), DType::F32);
+        assert_eq!(s.tensor_dtype(imag).unwrap(), DType::F32);
+        assert_eq!(s.tensor_values_f32(real).unwrap(), vec![2.5f32, -0.5]);
+        assert_eq!(s.tensor_values_f32(imag).unwrap(), vec![-1.25f32, 3.0]);
+
+        let conj_tensor = s.tensor_tape.tensor(conj).unwrap();
+        let TensorStorage::Complex64(values) = conj_tensor.typed_storage() else {
+            unreachable!("tensor_conj should preserve Complex64 dtype");
+        };
+        assert_eq!(values[0], Complex64::new(2.5, 1.25));
+        assert_eq!(values[1], Complex64::new(-0.5, -3.0));
+    }
+
+    #[test]
+    fn complex_session_ops_reject_non_complex_inputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+
+        assert!(s.tensor_real(input).is_err());
+        assert!(s.tensor_imag(input).is_err());
+        assert!(s.tensor_conj(input).is_err());
+    }
+
+    #[test]
+    fn complex_session_ops_fail_closed_for_grad_tracked_complex_inputs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tensor = DenseTensor::from_typed_storage(
+            TensorMeta::from_shape(vec![1], DType::Complex128, Device::Cpu),
+            TensorStorage::Complex128(Arc::new(vec![Complex128::new(1.0, 2.0)])),
+        )
+        .unwrap();
+        let input = s.tensor_variable_from_storage(tensor, true);
+
+        let err = s.tensor_real(input).unwrap_err();
+        assert!(matches!(
+            err,
+            AutogradError::TensorRequiresGradNonFloating {
+                node,
+                dtype: DType::Complex128
+            } if node == input
+        ));
+        assert!(s.tensor_imag(input).is_err());
+        assert!(s.tensor_conj(input).is_err());
+    }
+
+    #[test]
     fn mixed_f32_f64_binary_op_promotes_to_f64() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = s
@@ -20326,7 +20536,9 @@ mod tests {
     #[test]
     fn tile_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
         let out = s.tensor_tile(x, &[2]).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(vals, &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
@@ -20335,7 +20547,9 @@ mod tests {
     #[test]
     fn tile_2d() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable(vec![1.0, 2.0], vec![1, 2], false).unwrap();
+        let x = s
+            .tensor_variable(vec![1.0, 2.0], vec![1, 2], false)
+            .unwrap();
         let out = s.tensor_tile(x, &[2, 1]).unwrap();
         let shape = s.tensor_shape(out).unwrap();
         assert_eq!(shape, &[2, 2]);
@@ -20378,7 +20592,10 @@ mod tests {
             .unwrap();
         let out = s.tensor_cov(x).unwrap();
         let vals = s.tensor_values(out).unwrap();
-        assert!((vals[1]).abs() < 1e-10, "uncorrelated variables should have 0 covariance");
+        assert!(
+            (vals[1]).abs() < 1e-10,
+            "uncorrelated variables should have 0 covariance"
+        );
     }
 
     #[test]
@@ -20479,12 +20696,13 @@ mod tests {
     #[test]
     fn quantile_interpolation() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s
-            .tensor_variable(vec![0.0, 10.0], vec![2], false)
-            .unwrap();
+        let x = s.tensor_variable(vec![0.0, 10.0], vec![2], false).unwrap();
         let out = s.tensor_quantile(x, 0.25).unwrap();
         let vals = s.tensor_values(out).unwrap();
-        assert!((vals[0] - 2.5).abs() < 1e-10, "25th percentile of [0,10] should be 2.5");
+        assert!(
+            (vals[0] - 2.5).abs() < 1e-10,
+            "25th percentile of [0,10] should be 2.5"
+        );
     }
 
     #[test]

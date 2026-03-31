@@ -11135,8 +11135,7 @@ impl Module for LPPool2d {
                             for kj in 0..kw {
                                 let row = i * sh + ki;
                                 let col = j * sw + kj;
-                                let idx =
-                                    b * channels * h * w + c * h * w + row * w + col;
+                                let idx = b * channels * h * w + c * h * w + row * w + col;
                                 lp_sum += vals[idx].abs().powf(self.norm_type);
                             }
                         }
@@ -20684,7 +20683,10 @@ mod tests {
             .unwrap();
         let loss = loss_fn.forward(&mut session, input, target).unwrap();
         let val = session.tensor_values(loss).unwrap()[0];
-        assert!(val > 1.0, "wrong classification should have high loss, got {val}");
+        assert!(
+            val > 1.0,
+            "wrong classification should have high loss, got {val}"
+        );
     }
 
     #[test]
