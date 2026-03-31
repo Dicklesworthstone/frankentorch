@@ -10900,6 +10900,260 @@ impl LossModule for SoftMarginLoss {
     }
 }
 
+// ── MultiLabelMarginLoss ──────────────────────────────────────────────
+
+/// Multi-label classification hinge loss.
+///
+/// Equivalent to `torch.nn.MultiLabelMarginLoss`.
+/// For each sample, the loss considers only the first `k` non-negative target
+/// indices (padded with -1) and computes:
+///   `loss = (1/C) * sum_{j not in target} max(0, 1 - (x[y] - x[j]))` for each y in target.
+///
+/// In the simplified version here, target is a binary mask {0, 1} of the same
+/// shape as input. Loss penalizes non-target classes scoring close to or above
+/// target classes.
+pub struct MultiLabelMarginLoss {
+    reduction: Reduction,
+}
+
+impl MultiLabelMarginLoss {
+    #[must_use]
+    pub fn new(reduction: Reduction) -> Self {
+        Self { reduction }
+    }
+}
+
+impl LossModule for MultiLabelMarginLoss {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let x = session.tensor_values(input)?;
+        let y = session.tensor_values(target)?;
+        let shape = session.tensor_shape(input)?;
+
+        if shape.len() < 1 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "MultiLabelMarginLoss: input must be at least 1-D",
+                },
+            )));
+        }
+
+        let c = *shape.last().unwrap();
+        let batch_size = x.len() / c;
+        let mut losses = Vec::with_capacity(batch_size);
+
+        for b in 0..batch_size {
+            let offset = b * c;
+            let mut sample_loss = 0.0;
+            let mut count = 0;
+            for i in 0..c {
+                if y[offset + i] > 0.5 {
+                    // This is a target class
+                    for j in 0..c {
+                        if y[offset + j] <= 0.5 {
+                            // Not a target class
+                            let margin = 1.0 - (x[offset + i] - x[offset + j]);
+                            if margin > 0.0 {
+                                sample_loss += margin;
+                            }
+                            count += 1;
+                        }
+                    }
+                }
+            }
+            losses.push(if count > 0 {
+                sample_loss / c as f64
+            } else {
+                0.0
+            });
+        }
+
+        match self.reduction {
+            Reduction::None => {
+                let out_shape = if shape.len() > 1 {
+                    shape[..shape.len() - 1].to_vec()
+                } else {
+                    vec![1]
+                };
+                session.tensor_variable(losses, out_shape, false)
+            }
+            Reduction::Mean => {
+                let mean = if losses.is_empty() {
+                    0.0
+                } else {
+                    losses.iter().sum::<f64>() / losses.len() as f64
+                };
+                session.tensor_variable(vec![mean], vec![1], false)
+            }
+            Reduction::Sum => {
+                let sum = losses.iter().sum::<f64>();
+                session.tensor_variable(vec![sum], vec![1], false)
+            }
+        }
+    }
+}
+
+// ── LPPool1d ─────────────────────────────────────────────────────────
+
+/// Power-average pooling over 1D signals.
+///
+/// Equivalent to `torch.nn.LPPool1d`.
+/// Computes `f(X) = (sum(|X|^p))^(1/p)` over each kernel window.
+pub struct LPPool1d {
+    norm_type: f64,
+    kernel_size: usize,
+    stride: usize,
+}
+
+impl LPPool1d {
+    #[must_use]
+    pub fn new(norm_type: f64, kernel_size: usize) -> Self {
+        Self {
+            norm_type,
+            kernel_size,
+            stride: kernel_size,
+        }
+    }
+
+    #[must_use]
+    pub fn stride(mut self, stride: usize) -> Self {
+        self.stride = stride;
+        self
+    }
+}
+
+impl Module for LPPool1d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (vals, shape) = {
+            let (v, m) = session.tensor_values_meta(input)?;
+            (v, m.shape().to_vec())
+        };
+
+        if shape.len() != 3 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LPPool1d expects 3D input [N, C, L]",
+                },
+            )));
+        }
+
+        let (batch, channels, length) = (shape[0], shape[1], shape[2]);
+        let out_len = (length - self.kernel_size) / self.stride + 1;
+        let mut output = Vec::with_capacity(batch * channels * out_len);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for i in 0..out_len {
+                    let start = i * self.stride;
+                    let mut lp_sum = 0.0_f64;
+                    for k in 0..self.kernel_size {
+                        let idx = b * channels * length + c * length + start + k;
+                        lp_sum += vals[idx].abs().powf(self.norm_type);
+                    }
+                    output.push(lp_sum.powf(1.0 / self.norm_type));
+                }
+            }
+        }
+
+        session.tensor_variable(output, vec![batch, channels, out_len], false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
+// ── LPPool2d ─────────────────────────────────────────────────────────
+
+/// Power-average pooling over 2D signals.
+///
+/// Equivalent to `torch.nn.LPPool2d`.
+/// Computes `f(X) = (sum(|X|^p))^(1/p)` over each 2D kernel window.
+pub struct LPPool2d {
+    norm_type: f64,
+    kernel_size: (usize, usize),
+    stride: (usize, usize),
+}
+
+impl LPPool2d {
+    #[must_use]
+    pub fn new(norm_type: f64, kernel_size: (usize, usize)) -> Self {
+        Self {
+            norm_type,
+            kernel_size,
+            stride: kernel_size,
+        }
+    }
+
+    #[must_use]
+    pub fn stride(mut self, stride: (usize, usize)) -> Self {
+        self.stride = stride;
+        self
+    }
+}
+
+impl Module for LPPool2d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (vals, shape) = {
+            let (v, m) = session.tensor_values_meta(input)?;
+            (v, m.shape().to_vec())
+        };
+
+        if shape.len() != 4 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LPPool2d expects 4D input [N, C, H, W]",
+                },
+            )));
+        }
+
+        let (batch, channels, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let (kh, kw) = self.kernel_size;
+        let (sh, sw) = self.stride;
+        let oh = (h - kh) / sh + 1;
+        let ow = (w - kw) / sw + 1;
+        let mut output = Vec::with_capacity(batch * channels * oh * ow);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                for i in 0..oh {
+                    for j in 0..ow {
+                        let mut lp_sum = 0.0_f64;
+                        for ki in 0..kh {
+                            for kj in 0..kw {
+                                let row = i * sh + ki;
+                                let col = j * sw + kj;
+                                let idx =
+                                    b * channels * h * w + c * h * w + row * w + col;
+                                lp_sum += vals[idx].abs().powf(self.norm_type);
+                            }
+                        }
+                        output.push(lp_sum.powf(1.0 / self.norm_type));
+                    }
+                }
+            }
+        }
+
+        session.tensor_variable(output, vec![batch, channels, oh, ow], false)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 // ── Parameter Containers ───────────────────────────────────────────────
 
 /// A list of parameters (tensors), indexed by position.
@@ -20394,5 +20648,134 @@ mod tests {
             "L1 distance should be 7.0, got {}",
             vals[0]
         );
+    }
+
+    // ── MultiLabelMarginLoss Tests ──────────────────────────────────────
+
+    #[test]
+    fn multi_label_margin_loss_perfect_classification() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let loss_fn = MultiLabelMarginLoss::new(Reduction::Mean);
+        // Target classes have much higher scores than non-target
+        let input = session
+            .tensor_variable(vec![10.0, -10.0, -10.0], vec![1, 3], false)
+            .unwrap();
+        let target = session
+            .tensor_variable(vec![1.0, 0.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let loss = loss_fn.forward(&mut session, input, target).unwrap();
+        let val = session.tensor_values(loss).unwrap()[0];
+        assert!(
+            val < 0.01,
+            "perfect classification should have near-zero loss, got {val}"
+        );
+    }
+
+    #[test]
+    fn multi_label_margin_loss_wrong_classification() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let loss_fn = MultiLabelMarginLoss::new(Reduction::Mean);
+        // Target class has lower score than non-target
+        let input = session
+            .tensor_variable(vec![-5.0, 5.0, 5.0], vec![1, 3], false)
+            .unwrap();
+        let target = session
+            .tensor_variable(vec![1.0, 0.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let loss = loss_fn.forward(&mut session, input, target).unwrap();
+        let val = session.tensor_values(loss).unwrap()[0];
+        assert!(val > 1.0, "wrong classification should have high loss, got {val}");
+    }
+
+    #[test]
+    fn multi_label_margin_loss_reduction_sum() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let loss_fn = MultiLabelMarginLoss::new(Reduction::Sum);
+        let input = session
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let target = session
+            .tensor_variable(vec![1.0, 0.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let loss = loss_fn.forward(&mut session, input, target).unwrap();
+        let val = session.tensor_values(loss).unwrap()[0];
+        // With equal scores, margin = 1 for each non-target, divided by C=3
+        assert!(val > 0.0, "loss with margin violations should be positive");
+    }
+
+    // ── LPPool1d Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn lp_pool1d_l2_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pool = LPPool1d::new(2.0, 2);
+        // [1, 1, 4] input with kernel_size=2, stride=2 → [1, 1, 2]
+        let input = session
+            .tensor_variable(vec![3.0, 4.0, 1.0, 0.0], vec![1, 1, 4], false)
+            .unwrap();
+        let out = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(out).unwrap();
+        assert_eq!(shape, &[1, 1, 2]);
+        let vals = session.tensor_values(out).unwrap();
+        // sqrt(3^2 + 4^2) = 5.0
+        assert!((vals[0] - 5.0).abs() < 1e-10);
+        // sqrt(1^2 + 0^2) = 1.0
+        assert!((vals[1] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn lp_pool1d_l1() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pool = LPPool1d::new(1.0, 3);
+        let input = session
+            .tensor_variable(vec![1.0, -2.0, 3.0], vec![1, 1, 3], false)
+            .unwrap();
+        let out = pool.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(out).unwrap();
+        // |1| + |-2| + |3| = 6.0
+        assert!((vals[0] - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn lp_pool1d_no_params() {
+        let pool = LPPool1d::new(2.0, 2);
+        assert!(pool.parameters().is_empty());
+    }
+
+    // ── LPPool2d Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn lp_pool2d_l2_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pool = LPPool2d::new(2.0, (2, 2));
+        // [1, 1, 2, 2] with kernel (2,2), stride (2,2) → [1, 1, 1, 1]
+        let input = session
+            .tensor_variable(vec![1.0, 2.0, 2.0, 4.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let out = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(out).unwrap();
+        assert_eq!(shape, &[1, 1, 1, 1]);
+        let vals = session.tensor_values(out).unwrap();
+        // sqrt(1 + 4 + 4 + 16) = sqrt(25) = 5.0
+        assert!((vals[0] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn lp_pool2d_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pool = LPPool2d::new(2.0, (2, 2)).stride((1, 1));
+        let input = session
+            .tensor_variable(vec![0.0; 16], vec![1, 1, 4, 4], false)
+            .unwrap();
+        let out = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(out).unwrap();
+        // (4-2)/1+1=3 in each spatial dim
+        assert_eq!(shape, &[1, 1, 3, 3]);
+    }
+
+    #[test]
+    fn lp_pool2d_no_params() {
+        let pool = LPPool2d::new(2.0, (2, 2));
+        assert!(pool.parameters().is_empty());
     }
 }

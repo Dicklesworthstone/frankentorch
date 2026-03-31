@@ -7320,6 +7320,254 @@ impl FrankenTorchSession {
         // reshape to (N, C*r*r, H/r, W/r)
         self.tensor_reshape(permuted, vec![batch, channels * r * r, oh, ow])
     }
+
+    // ── tile ────────────────────────────────────────────────────────────
+    /// Repeat tensor along each dimension the specified number of times.
+    ///
+    /// Equivalent to `torch.tile(input, dims)` / `numpy.tile`.
+    pub fn tensor_tile(
+        &mut self,
+        input: TensorNodeId,
+        dims: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let ndim = shape.len();
+        let reps_len = dims.len();
+
+        // Pad dims or shape to match lengths
+        let (eff_shape, eff_reps) = if reps_len > ndim {
+            let mut new_shape = vec![1; reps_len - ndim];
+            new_shape.extend_from_slice(&shape);
+            (new_shape, dims.to_vec())
+        } else {
+            let mut new_reps = vec![1; ndim - reps_len];
+            new_reps.extend_from_slice(dims);
+            (shape, new_reps)
+        };
+
+        // If input needs reshaping to match effective dims
+        let mut current = if eff_shape.len() != {
+            let t = self.tensor_tape.tensor(input)?;
+            t.meta().shape().len()
+        } {
+            self.tensor_reshape(input, eff_shape.clone())?
+        } else {
+            input
+        };
+
+        // Use tensor_repeat which repeats along each dimension
+        current = self.tensor_repeat(current, &eff_reps)?;
+        Ok(current)
+    }
+
+    // ── cov ─────────────────────────────────────────────────────────────
+    /// Compute the covariance matrix of a 2-D tensor (variables × observations).
+    ///
+    /// Equivalent to `torch.cov(input)`.
+    /// Input shape: `(N, M)` where N is the number of variables and M is
+    /// the number of observations. Returns an `(N, N)` covariance matrix.
+    pub fn tensor_cov(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (vals, meta) = {
+            let (v, m) = self.tensor_values_meta(input)?;
+            (v, m.shape().to_vec())
+        };
+
+        if meta.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cov: input must be a 2-D tensor (N, M)",
+                },
+            )));
+        }
+
+        let n = meta[0]; // variables
+        let m = meta[1]; // observations
+
+        if m < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cov: need at least 2 observations",
+                },
+            )));
+        }
+
+        // Compute means
+        let mut means = vec![0.0; n];
+        for i in 0..n {
+            let sum: f64 = (0..m).map(|j| vals[i * m + j]).sum();
+            means[i] = sum / m as f64;
+        }
+
+        // Compute covariance matrix
+        let mut cov = vec![0.0; n * n];
+        for i in 0..n {
+            for j in i..n {
+                let mut s = 0.0;
+                for k in 0..m {
+                    s += (vals[i * m + k] - means[i]) * (vals[j * m + k] - means[j]);
+                }
+                let c = s / (m - 1) as f64;
+                cov[i * n + j] = c;
+                cov[j * n + i] = c;
+            }
+        }
+
+        let out = self.tensor_tape.leaf(cov, vec![n, n], false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("cov input={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    // ── corrcoef ────────────────────────────────────────────────────────
+    /// Compute the Pearson correlation coefficient matrix.
+    ///
+    /// Equivalent to `torch.corrcoef(input)`.
+    /// Input shape: `(N, M)`. Returns an `(N, N)` correlation matrix.
+    pub fn tensor_corrcoef(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let cov = self.tensor_cov(input)?;
+        let cov_vals = self.tensor_values(cov)?;
+        let n_shape = self.tensor_shape(cov)?;
+        let n = n_shape[0];
+
+        let mut corr = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let cij = cov_vals[i * n + j];
+                let cii = cov_vals[i * n + i];
+                let cjj = cov_vals[j * n + j];
+                let denom = (cii * cjj).sqrt();
+                corr[i * n + j] = if denom > 0.0 { cij / denom } else { 0.0 };
+            }
+        }
+
+        let out = self.tensor_tape.leaf(corr, vec![n, n], false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("corrcoef input={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    // ── mode ────────────────────────────────────────────────────────────
+    /// Return the mode (most frequent value) and its index along the last dimension.
+    ///
+    /// Equivalent to `torch.mode(input)`.
+    /// Returns `(values, indices)` as a pair of tensors.
+    pub fn tensor_mode(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (vals, shape) = {
+            let (v, m) = self.tensor_values_meta(input)?;
+            (v, m.shape().to_vec())
+        };
+
+        let last_dim = *shape.last().unwrap();
+        let outer: usize = vals.len() / last_dim;
+
+        let mut mode_vals = Vec::with_capacity(outer);
+        let mut mode_idxs = Vec::with_capacity(outer);
+
+        for o in 0..outer {
+            let slice = &vals[o * last_dim..(o + 1) * last_dim];
+            // Sort and find the value with the longest run
+            let mut sorted: Vec<(f64, usize)> =
+                slice.iter().copied().enumerate().map(|(i, v)| (v, i)).collect();
+            sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
+
+            let mut best_val = sorted[0].0;
+            let mut best_idx = sorted[0].1;
+            let mut best_count = 1usize;
+            let mut cur_count = 1usize;
+
+            for i in 1..sorted.len() {
+                if (sorted[i].0 - sorted[i - 1].0).abs() < f64::EPSILON {
+                    cur_count += 1;
+                } else {
+                    cur_count = 1;
+                }
+                if cur_count > best_count {
+                    best_count = cur_count;
+                    best_val = sorted[i].0;
+                    best_idx = sorted[i].1;
+                }
+            }
+
+            mode_vals.push(best_val);
+            mode_idxs.push(best_idx as f64);
+        }
+
+        let out_shape = if shape.len() > 1 {
+            shape[..shape.len() - 1].to_vec()
+        } else {
+            vec![1]
+        };
+
+        let vals_out = self.tensor_tape.leaf(mode_vals, out_shape.clone(), false)?;
+        let idxs_out = self.tensor_tape.leaf(mode_idxs, out_shape, false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("mode input={} vals={} idxs={}", input.0, vals_out.0, idxs_out.0),
+        );
+        Ok((vals_out, idxs_out))
+    }
+
+    // ── quantile ────────────────────────────────────────────────────────
+    /// Compute the q-th quantile of the flattened tensor.
+    ///
+    /// Equivalent to `torch.quantile(input, q)`.
+    /// `q` should be in [0, 1]. Uses linear interpolation between data points.
+    pub fn tensor_quantile(
+        &mut self,
+        input: TensorNodeId,
+        q: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !(0.0..=1.0).contains(&q) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "quantile: q must be in [0, 1]",
+                },
+            )));
+        }
+
+        let vals = self.tensor_values(input)?;
+        let n = vals.len();
+        if n == 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "quantile: input must not be empty",
+                },
+            )));
+        }
+
+        let mut sorted = vals.clone();
+        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        let result = if n == 1 {
+            sorted[0]
+        } else {
+            let idx = q * (n - 1) as f64;
+            let lo = idx.floor() as usize;
+            let hi = idx.ceil() as usize;
+            let frac = idx - lo as f64;
+            sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+        };
+
+        let out = self.tensor_tape.leaf(vec![result], vec![1], false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("quantile input={} q={q} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
 }
 
 pub use ft_autograd::{
@@ -20071,5 +20319,179 @@ mod tests {
         let out = s.tensor_logcumsumexp(x, 0).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert!((vals[0] - 42.0).abs() < 1e-10);
+    }
+
+    // ── tile tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn tile_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let out = s.tensor_tile(x, &[2]).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, &[1.0, 2.0, 3.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn tile_2d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![1, 2], false).unwrap();
+        let out = s.tensor_tile(x, &[2, 1]).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, &[2, 2]);
+    }
+
+    #[test]
+    fn tile_identity() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let out = s.tensor_tile(x, &[1]).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, &[1.0, 2.0]);
+    }
+
+    // ── cov tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn cov_identity_correlation() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Two identical variables → perfect correlation, equal covariance
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0], vec![2, 3], false)
+            .unwrap();
+        let out = s.tensor_cov(x).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, &[2, 2]);
+        // Variance of [1,2,3] = 1.0
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        // Covariance of identical variables = variance
+        assert!((vals[1] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn cov_uncorrelated() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // x = [1, -1], y = [1, 1] → cov(x,y) should be 0
+        let x = s
+            .tensor_variable(vec![1.0, -1.0, 1.0, 1.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.tensor_cov(x).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert!((vals[1]).abs() < 1e-10, "uncorrelated variables should have 0 covariance");
+    }
+
+    #[test]
+    fn cov_1d_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        assert!(s.tensor_cov(x).is_err());
+    }
+
+    // ── corrcoef tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn corrcoef_perfect_correlation() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 2.0, 4.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let out = s.tensor_corrcoef(x).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Diagonal should be 1.0
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[3] - 1.0).abs() < 1e-10);
+        // Perfect linear correlation
+        assert!((vals[1] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn corrcoef_negative_correlation() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 3.0, 2.0, 1.0], vec![2, 3], false)
+            .unwrap();
+        let out = s.tensor_corrcoef(x).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Perfect negative correlation
+        assert!((vals[1] + 1.0).abs() < 1e-10);
+    }
+
+    // ── mode tests ──────────────────────────────────────────────────────
+
+    #[test]
+    fn mode_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 2.0, 3.0], vec![4], false)
+            .unwrap();
+        let (vals, _idxs) = s.tensor_mode(x).unwrap();
+        let v = s.tensor_values(vals).unwrap();
+        assert_eq!(v[0], 2.0, "mode of [1,2,2,3] should be 2");
+    }
+
+    #[test]
+    fn mode_single_element() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![42.0], vec![1], false).unwrap();
+        let (vals, _) = s.tensor_mode(x).unwrap();
+        let v = s.tensor_values(vals).unwrap();
+        assert_eq!(v[0], 42.0);
+    }
+
+    #[test]
+    fn mode_2d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [[1, 1, 2], [3, 3, 3]] → modes [1, 3]
+        let x = s
+            .tensor_variable(vec![1.0, 1.0, 2.0, 3.0, 3.0, 3.0], vec![2, 3], false)
+            .unwrap();
+        let (vals, _) = s.tensor_mode(x).unwrap();
+        let v = s.tensor_values(vals).unwrap();
+        assert_eq!(v, &[1.0, 3.0]);
+    }
+
+    // ── quantile tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn quantile_median() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], false)
+            .unwrap();
+        let out = s.tensor_quantile(x, 0.5).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert!((vals[0] - 3.0).abs() < 1e-10, "median should be 3.0");
+    }
+
+    #[test]
+    fn quantile_extremes() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false)
+            .unwrap();
+        let q0 = s.tensor_quantile(x, 0.0).unwrap();
+        let q1 = s.tensor_quantile(x, 1.0).unwrap();
+        assert_eq!(s.tensor_values(q0).unwrap()[0], 10.0, "q=0 should be min");
+        assert_eq!(s.tensor_values(q1).unwrap()[0], 30.0, "q=1 should be max");
+    }
+
+    #[test]
+    fn quantile_interpolation() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 10.0], vec![2], false)
+            .unwrap();
+        let out = s.tensor_quantile(x, 0.25).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert!((vals[0] - 2.5).abs() < 1e-10, "25th percentile of [0,10] should be 2.5");
+    }
+
+    #[test]
+    fn quantile_invalid_q_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        assert!(s.tensor_quantile(x, 1.5).is_err());
+        assert!(s.tensor_quantile(x, -0.1).is_err());
     }
 }
