@@ -3573,6 +3573,77 @@ impl LRScheduler for ConstantLR {
     }
 }
 
+// ── MultiplicativeLR Scheduler ─────────────────────────────────────────
+
+/// Multiply the learning rate by a user-defined factor each epoch.
+///
+/// Equivalent to `torch.optim.lr_scheduler.MultiplicativeLR`.
+/// The factor function takes the epoch number and returns the multiplicative factor.
+pub struct MultiplicativeLR {
+    initial_lr: f64,
+    factor_fn: Box<dyn Fn(i64) -> f64>,
+    last_epoch: i64,
+    last_lr: f64,
+}
+
+impl MultiplicativeLR {
+    pub fn new(optimizer: &dyn Optimizer, factor_fn: impl Fn(i64) -> f64 + 'static) -> Self {
+        let initial_lr = optimizer.get_lr();
+        Self {
+            initial_lr,
+            factor_fn: Box::new(factor_fn),
+            last_epoch: -1,
+            last_lr: initial_lr,
+        }
+    }
+}
+
+impl LRScheduler for MultiplicativeLR {
+    fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
+        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = new_epoch;
+
+        if new_epoch == 0 {
+            // First step: set to initial_lr
+            optimizer.set_lr(self.initial_lr);
+            self.last_lr = self.initial_lr;
+        } else {
+            let factor = (self.factor_fn)(new_epoch);
+            let new_lr = self.last_lr * factor;
+            optimizer.set_lr(new_lr);
+            self.last_lr = new_lr;
+        }
+    }
+
+    fn get_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn get_last_lr(&self) -> Vec<f64> {
+        vec![self.last_lr]
+    }
+
+    fn state_dict(&self) -> SchedulerState {
+        SchedulerState {
+            last_epoch: self.last_epoch,
+            last_lrs: vec![self.last_lr],
+            extra: vec![("initial_lr".to_owned(), self.initial_lr)],
+        }
+    }
+
+    fn load_state_dict(&mut self, state: SchedulerState) {
+        self.last_epoch = state.last_epoch;
+        if let Some(&lr) = state.last_lrs.first() {
+            self.last_lr = lr;
+        }
+        for (key, val) in &state.extra {
+            if key == "initial_lr" {
+                self.initial_lr = *val;
+            }
+        }
+    }
+}
+
 // ── CyclicLR Scheduler ─────────────────────────────────────────────────
 
 /// Cyclically varies the learning rate between `base_lr` and `max_lr`.
@@ -8796,6 +8867,66 @@ mod tests {
             last[0] > 0.001,
             "lr should be above base after several steps, got {}",
             last[0]
+        );
+    }
+
+    // ── MultiplicativeLR Tests ──────────────────────────────────────────
+
+    #[test]
+    fn multiplicative_lr_constant_factor() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("variable");
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut scheduler = MultiplicativeLR::new(&opt, |_epoch| 0.5);
+
+        scheduler.step(&mut opt, None); // epoch 0: lr stays at 1.0
+        assert!((opt.get_lr() - 1.0).abs() < 1e-10);
+
+        scheduler.step(&mut opt, None); // epoch 1: lr *= 0.5 → 0.5
+        assert!((opt.get_lr() - 0.5).abs() < 1e-10);
+
+        scheduler.step(&mut opt, None); // epoch 2: lr *= 0.5 → 0.25
+        assert!((opt.get_lr() - 0.25).abs() < 1e-10);
+    }
+
+    #[test]
+    fn multiplicative_lr_state_dict() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("variable");
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut scheduler = MultiplicativeLR::new(&opt, |_| 0.9);
+
+        for _ in 0..5 {
+            scheduler.step(&mut opt, None);
+        }
+
+        let state = scheduler.state_dict();
+        assert_eq!(state.last_epoch, 4);
+        assert_eq!(state.last_lrs.len(), 1);
+    }
+
+    #[test]
+    fn multiplicative_lr_epoch_dependent() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("variable");
+        let mut opt = SGD::new(vec![x], 1.0);
+        // Factor that depends on epoch: 1/(epoch+1)
+        let mut scheduler = MultiplicativeLR::new(&opt, |epoch| 1.0 / (epoch as f64 + 1.0));
+
+        scheduler.step(&mut opt, None); // epoch 0
+        scheduler.step(&mut opt, None); // epoch 1: *= 1/2 → 0.5
+        scheduler.step(&mut opt, None); // epoch 2: *= 1/3 → ~0.1667
+
+        let lr = opt.get_lr();
+        assert!(
+            (lr - 1.0 / 6.0).abs() < 1e-10,
+            "expected ~0.1667, got {lr}"
         );
     }
 }

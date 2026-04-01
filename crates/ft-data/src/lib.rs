@@ -628,6 +628,161 @@ fn collate(
     })
 }
 
+// ── Transforms ──────────────────────────────────────────────────────────
+
+/// A transform that can be applied to a `DataItem`.
+///
+/// Equivalent to `torchvision.transforms` applied to tensors.
+pub trait Transform {
+    /// Apply the transform to a data item, returning a modified copy.
+    fn apply(&self, item: DataItem) -> DataItem;
+}
+
+/// Compose multiple transforms into a pipeline.
+///
+/// Equivalent to `torchvision.transforms.Compose`.
+/// Applies transforms in order.
+pub struct Compose {
+    transforms: Vec<Box<dyn Transform>>,
+}
+
+impl Compose {
+    pub fn new(transforms: Vec<Box<dyn Transform>>) -> Self {
+        Self { transforms }
+    }
+}
+
+impl Transform for Compose {
+    fn apply(&self, mut item: DataItem) -> DataItem {
+        for t in &self.transforms {
+            item = t.apply(item);
+        }
+        item
+    }
+}
+
+/// Normalize a named tensor in a data item by subtracting mean and dividing by std.
+///
+/// Equivalent to `torchvision.transforms.Normalize(mean, std)`.
+/// Applied per-channel: `output[c] = (input[c] - mean[c]) / std[c]`.
+pub struct NormalizeTransform {
+    /// Name of the tensor to normalize (e.g., "input").
+    tensor_name: String,
+    /// Per-channel means.
+    mean: Vec<f64>,
+    /// Per-channel standard deviations.
+    std: Vec<f64>,
+}
+
+impl NormalizeTransform {
+    pub fn new(tensor_name: &str, mean: Vec<f64>, std: Vec<f64>) -> Self {
+        Self {
+            tensor_name: tensor_name.to_string(),
+            mean,
+            std,
+        }
+    }
+}
+
+impl Transform for NormalizeTransform {
+    fn apply(&self, mut item: DataItem) -> DataItem {
+        for (name, values, _shape) in &mut item.tensors {
+            if name == &self.tensor_name && !self.mean.is_empty() {
+                let channels = self.mean.len();
+                let channel_size = values.len() / channels;
+                for c in 0..channels {
+                    let m = self.mean[c];
+                    let s = self.std[c];
+                    for i in 0..channel_size {
+                        let idx = c * channel_size + i;
+                        if idx < values.len() {
+                            values[idx] = (values[idx] - m) / s;
+                        }
+                    }
+                }
+            }
+        }
+        item
+    }
+}
+
+/// Apply an arbitrary function to a data item.
+///
+/// Equivalent to `torchvision.transforms.Lambda`.
+pub struct LambdaTransform {
+    func: Box<dyn Fn(DataItem) -> DataItem>,
+}
+
+impl LambdaTransform {
+    pub fn new(func: impl Fn(DataItem) -> DataItem + 'static) -> Self {
+        Self {
+            func: Box::new(func),
+        }
+    }
+}
+
+impl Transform for LambdaTransform {
+    fn apply(&self, item: DataItem) -> DataItem {
+        (self.func)(item)
+    }
+}
+
+/// Scale all values in a named tensor by a constant factor.
+pub struct ScaleTransform {
+    tensor_name: String,
+    factor: f64,
+}
+
+impl ScaleTransform {
+    pub fn new(tensor_name: &str, factor: f64) -> Self {
+        Self {
+            tensor_name: tensor_name.to_string(),
+            factor,
+        }
+    }
+}
+
+impl Transform for ScaleTransform {
+    fn apply(&self, mut item: DataItem) -> DataItem {
+        for (name, values, _shape) in &mut item.tensors {
+            if name == &self.tensor_name {
+                for v in values.iter_mut() {
+                    *v *= self.factor;
+                }
+            }
+        }
+        item
+    }
+}
+
+/// A dataset wrapper that applies a transform to each item.
+///
+/// Equivalent to applying `transform` in a PyTorch `Dataset.__getitem__`.
+pub struct TransformDataset<D: Dataset> {
+    inner: D,
+    transform: Box<dyn Transform>,
+}
+
+impl<D: Dataset> TransformDataset<D> {
+    pub fn new(dataset: D, transform: Box<dyn Transform>) -> Self {
+        Self {
+            inner: dataset,
+            transform: transform,
+        }
+    }
+}
+
+impl<D: Dataset> Dataset for TransformDataset<D> {
+    fn len(&self) -> usize {
+        self.inner.len()
+    }
+
+    fn get(&self, index: usize) -> DataItem {
+        let item = self.inner.get(index);
+        self.transform.apply(item)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ft_core::ExecutionMode;
@@ -1105,5 +1260,79 @@ mod tests {
                 .iter()
                 .all(|&v| (v as usize) >= 7 && (v as usize) < 10)
         );
+    }
+
+    // ── Transform Tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn normalize_transform() {
+        let item = DataItem::single("input", vec![10.0, 20.0, 30.0, 40.0], vec![2, 2]);
+        let t = NormalizeTransform::new("input", vec![10.0, 30.0], vec![10.0, 10.0]);
+        let result = t.apply(item);
+        let vals = &result.tensors[0].1;
+        // Channel 0: (10-10)/10=0, (20-10)/10=1
+        assert!((vals[0] - 0.0).abs() < 1e-10);
+        assert!((vals[1] - 1.0).abs() < 1e-10);
+        // Channel 1: (30-30)/10=0, (40-30)/10=1
+        assert!((vals[2] - 0.0).abs() < 1e-10);
+        assert!((vals[3] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn scale_transform() {
+        let item = DataItem::single("input", vec![1.0, 2.0, 3.0], vec![3]);
+        let t = ScaleTransform::new("input", 2.0);
+        let result = t.apply(item);
+        assert_eq!(result.tensors[0].1, vec![2.0, 4.0, 6.0]);
+    }
+
+    #[test]
+    fn lambda_transform() {
+        let item = DataItem::single("input", vec![1.0, 2.0], vec![2]);
+        let t = LambdaTransform::new(|mut item| {
+            for (_, vals, _) in &mut item.tensors {
+                for v in vals.iter_mut() {
+                    *v += 100.0;
+                }
+            }
+            item
+        });
+        let result = t.apply(item);
+        assert_eq!(result.tensors[0].1, vec![101.0, 102.0]);
+    }
+
+    #[test]
+    fn compose_transforms() {
+        let item = DataItem::single("input", vec![1.0, 2.0], vec![2]);
+        let t = Compose::new(vec![
+            Box::new(ScaleTransform::new("input", 10.0)),
+            Box::new(ScaleTransform::new("input", 0.5)),
+        ]);
+        let result = t.apply(item);
+        // 1*10*0.5=5, 2*10*0.5=10
+        assert_eq!(result.tensors[0].1, vec![5.0, 10.0]);
+    }
+
+    #[test]
+    fn transform_dataset_wraps() {
+        let ds = TensorDataset::new(vec![
+            DataItem::single("input", vec![1.0, 2.0], vec![2]),
+            DataItem::single("input", vec![3.0, 4.0], vec![2]),
+        ]);
+        let tds = TransformDataset::new(ds, Box::new(ScaleTransform::new("input", 3.0)));
+        assert_eq!(tds.len(), 2);
+        let item0 = tds.get(0);
+        assert_eq!(item0.tensors[0].1, vec![3.0, 6.0]);
+        let item1 = tds.get(1);
+        assert_eq!(item1.tensors[0].1, vec![9.0, 12.0]);
+    }
+
+    #[test]
+    fn normalize_wrong_name_passthrough() {
+        let item = DataItem::single("input", vec![5.0], vec![1]);
+        let t = NormalizeTransform::new("other", vec![0.0], vec![1.0]);
+        let result = t.apply(item);
+        // "input" not affected because name doesn't match
+        assert_eq!(result.tensors[0].1, vec![5.0]);
     }
 }

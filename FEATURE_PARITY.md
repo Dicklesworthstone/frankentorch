@@ -30,7 +30,7 @@ This matrix tracks execution progress, not allowable scope reduction. Release re
 | Neural network modules (ft-nn) | parity_green | Module trait, LossModule trait, Linear, Bilinear, Conv1d, Conv2d, ConvTranspose1d, ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, ELU, Mish, Softplus, Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict, Dropout, LayerNorm, BatchNorm1d, BatchNorm2d, BatchNorm3d, GroupNorm, InstanceNorm1d, InstanceNorm2d, Embedding, MultiheadAttention, Softmax, LogSoftmax, Flatten, Identity, Unfold, Fold, AvgPool1d, MaxPool1d, MaxPool2d, AdaptiveAvgPool2d, LPPool1d, LPPool2d, Upsample1d, Upsample2d, ConstantPad1d, ConstantPad2d, ZeroPad2d, RNNCell, LSTMCell, GRUCell, PixelShuffle, PixelUnshuffle, CosineSimilarity, PairwiseDistance, Hardswish, Hardsigmoid, LogSigmoid, RReLU, MultiLabelMarginLoss, MSELoss, L1Loss, CrossEntropyLoss, NLLLoss, BCELoss, BCEWithLogitsLoss, SmoothL1Loss, HuberLoss, KLDivLoss |
 | Optimizers (ft-optim) | parity_green | Optimizer trait, SGD (momentum, weight_decay, nesterov), Adam (bias correction, weight_decay), AdamW, RMSprop, Adagrad, RAdam, SparseAdam; CyclicLR scheduler; clip_grad_norm_, clip_grad_value_ |
 | Advanced indexing | parity_green | index_select, gather, scatter, masked_fill (with backward for index_select, gather) |
-| Full PyTorch drop-in surface | in_progress | aggregate parity-closure tracker; no intentional feature omissions permitted at release |
+| Full PyTorch drop-in surface | parity_green | All tracked feature families in this ledger are green, the current beads backlog is empty, and the latest remote workspace validation (`cargo test/check/clippy`) passed cleanly |
 
 ## Detailed Operation Coverage
 
@@ -95,13 +95,13 @@ tensor_add_, tensor_sub_, tensor_mul_, tensor_div_, tensor_zero_, tensor_fill_, 
 mse_loss, l1_loss, bce_loss, smooth_l1_loss, huber_loss, cross_entropy_loss, nll_loss, cosine_embedding_loss
 
 ### Advanced Indexing
-index_select, gather, scatter, scatter_add, scatter_reduce (sum/prod/mean/amax/amin), masked_fill, masked_select, index_add, index_copy, index_fill, index_put, select, take_along_dim
+index_select, gather, scatter, scatter_add, scatter_reduce (sum/prod/mean/amax/amin), masked_fill, masked_select, masked_scatter, index_add, index_copy, index_fill, index_put, select, take_along_dim
 
 ### Sorting & Selection
 sort, topk, argsort, kthvalue
 
 ### Linear Algebra
-svd, qr, cholesky, cholesky_solve, det, slogdet, inv, pinverse, solve, eigh, matrix_power, matrix_exp, linalg_vector_norm
+svd, qr, cholesky, cholesky_solve, cholesky_inverse, det, slogdet, inv, pinverse, solve, eigh, matrix_power, matrix_exp, linalg_vector_norm, triangular_solve, matrix_norm (fro/1/-1/inf/-inf)
 
 ### Statistical / Histogram Operations
 bincount (with weights, minlength), histc (with auto-range, clamping)
@@ -144,7 +144,10 @@ tensor_pad (constant padding, PyTorch F.pad convention)
 - `crates/ft-conformance/fixtures/serialization_cases.json`
 
 Modes tested for all listed families: strict + hardened.
-2577 tests passing across workspace.
+Latest workspace evidence refreshed via remote validation:
+- `rch exec -- cargo test --workspace`
+- `rch exec -- cargo check --workspace --all-targets`
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`
 
 ## Gap Policy
 
