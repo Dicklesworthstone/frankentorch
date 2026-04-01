@@ -113,7 +113,19 @@ block_diag (from 1-D or 2-D tensors), diagflat (with offset support)
 cdist (batched pairwise Lp distance, L0/L2/Linf), pdist (within-tensor pairwise Lp distance)
 
 ### Numeric Stability Operations
-nan_to_num, logaddexp, logaddexp2, xlogy, logcumsumexp
+nan_to_num, logaddexp, logaddexp2, xlogy, logcumsumexp, logsumexp
+
+### Dimension Manipulation
+movedim (move dimension to new position)
+
+### Element Testing
+isin (set membership), renorm (per-slice norm capping)
+
+### Sliding Windows
+unfold (extract sliding local blocks)
+
+### Combined Reductions
+aminmax (simultaneous min and max along dim), dist (p-norm distance between tensors)
 
 ### Rotation / Rearrangement
 rot90, pixel_shuffle, pixel_unshuffle, tile, fliplr, flipud
@@ -132,7 +144,7 @@ tensor_pad (constant padding, PyTorch F.pad convention)
 - `crates/ft-conformance/fixtures/serialization_cases.json`
 
 Modes tested for all listed families: strict + hardened.
-2555 tests passing across workspace.
+2577 tests passing across workspace.
 
 ## Gap Policy
 

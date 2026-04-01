@@ -8441,6 +8441,222 @@ impl FrankenTorchSession {
         self.tensor_variable(result, shape, false)
     }
 
+    /// Solve a triangular linear system: A @ X = B.
+    ///
+    /// Equivalent to `torch.linalg.solve_triangular(A, B, upper)`.
+    /// A must be a square triangular matrix.
+    pub fn tensor_triangular_solve(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+        upper: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let a_vals = self.tensor_values(a)?;
+        let a_shape = self.tensor_shape(a)?;
+        let b_vals = self.tensor_values(b)?;
+        let b_shape = self.tensor_shape(b)?;
+
+        if a_shape.len() != 2 || a_shape[0] != a_shape[1] {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "triangular_solve: A must be a square 2-D matrix",
+                },
+            )));
+        }
+
+        let n = a_shape[0];
+        let nrhs = if b_shape.len() == 1 { 1 } else { b_shape[1] };
+
+        if (b_shape.len() == 1 && b_shape[0] != n) || (b_shape.len() == 2 && b_shape[0] != n) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "triangular_solve: B rows must match A dimension",
+                },
+            )));
+        }
+
+        let mut x = b_vals.clone();
+
+        for col in 0..nrhs {
+            if upper {
+                // Back substitution
+                for i in (0..n).rev() {
+                    let diag = a_vals[i * n + i];
+                    if diag.abs() < 1e-15 {
+                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "triangular_solve: singular triangular matrix",
+                            },
+                        )));
+                    }
+                    let mut sum = x[i * nrhs + col];
+                    for j in (i + 1)..n {
+                        sum -= a_vals[i * n + j] * x[j * nrhs + col];
+                    }
+                    x[i * nrhs + col] = sum / diag;
+                }
+            } else {
+                // Forward substitution
+                for i in 0..n {
+                    let diag = a_vals[i * n + i];
+                    if diag.abs() < 1e-15 {
+                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "triangular_solve: singular triangular matrix",
+                            },
+                        )));
+                    }
+                    let mut sum = x[i * nrhs + col];
+                    for j in 0..i {
+                        sum -= a_vals[i * n + j] * x[j * nrhs + col];
+                    }
+                    x[i * nrhs + col] = sum / diag;
+                }
+            }
+        }
+
+        let out = self.tensor_tape.leaf(x, b_shape, false)?;
+        Ok(out)
+    }
+
+    /// Compute the inverse of a symmetric positive-definite matrix via Cholesky.
+    ///
+    /// Equivalent to `torch.cholesky_inverse(L, upper)`.
+    /// More numerically stable than general inverse for SPD matrices.
+    pub fn tensor_cholesky_inverse(
+        &mut self,
+        cholesky_factor: TensorNodeId,
+        upper: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(cholesky_factor)?;
+        if shape.len() != 2 || shape[0] != shape[1] {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cholesky_inverse: input must be square 2-D",
+                },
+            )));
+        }
+        let n = shape[0];
+        // Solve L @ L^T @ X = I using cholesky_solve
+        let identity = self.eye(n, false)?;
+        self.tensor_cholesky_solve(identity, cholesky_factor, upper)
+    }
+
+    /// Compute a matrix norm (Frobenius or nuclear).
+    ///
+    /// Equivalent to `torch.linalg.matrix_norm(input, ord)`.
+    /// Supported ords: "fro" (Frobenius, default), 1 (max col sum), -1 (min col sum),
+    /// inf (max row sum), -inf (min row sum).
+    pub fn tensor_matrix_norm(
+        &mut self,
+        input: TensorNodeId,
+        ord: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "matrix_norm: input must be 2-D",
+                },
+            )));
+        }
+        let (m, n) = (shape[0], shape[1]);
+
+        let result = match ord {
+            "fro" => {
+                vals.iter().map(|&v| v * v).sum::<f64>().sqrt()
+            }
+            "1" => {
+                // Max absolute column sum
+                let mut max_col = 0.0_f64;
+                for j in 0..n {
+                    let col_sum: f64 = (0..m).map(|i| vals[i * n + j].abs()).sum();
+                    if col_sum > max_col { max_col = col_sum; }
+                }
+                max_col
+            }
+            "inf" => {
+                // Max absolute row sum
+                let mut max_row = 0.0_f64;
+                for i in 0..m {
+                    let row_sum: f64 = (0..n).map(|j| vals[i * n + j].abs()).sum();
+                    if row_sum > max_row { max_row = row_sum; }
+                }
+                max_row
+            }
+            "-1" => {
+                // Min absolute column sum
+                let mut min_col = f64::INFINITY;
+                for j in 0..n {
+                    let col_sum: f64 = (0..m).map(|i| vals[i * n + j].abs()).sum();
+                    if col_sum < min_col { min_col = col_sum; }
+                }
+                min_col
+            }
+            "-inf" => {
+                // Min absolute row sum
+                let mut min_row = f64::INFINITY;
+                for i in 0..m {
+                    let row_sum: f64 = (0..n).map(|j| vals[i * n + j].abs()).sum();
+                    if row_sum < min_row { min_row = row_sum; }
+                }
+                min_row
+            }
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "matrix_norm: unsupported ord (use fro, 1, -1, inf, -inf)",
+                    },
+                )));
+            }
+        };
+
+        self.tensor_tape.leaf(vec![result], vec![1], false)
+    }
+
+    /// Scatter values into positions indicated by a mask.
+    ///
+    /// Equivalent to `torch.Tensor.masked_scatter_(mask, source)`.
+    /// Copies elements from `source` into positions where `mask` is non-zero.
+    pub fn tensor_masked_scatter(
+        &mut self,
+        input: TensorNodeId,
+        mask: TensorNodeId,
+        source: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_vals = self.tensor_values(input)?;
+        let mask_vals = self.tensor_values(mask)?;
+        let src_vals = self.tensor_values(source)?;
+        let shape = self.tensor_shape(input)?;
+
+        if input_vals.len() != mask_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "masked_scatter: input and mask must have same number of elements",
+                },
+            )));
+        }
+
+        let mut result = input_vals;
+        let mut src_idx = 0;
+        for (i, &m) in mask_vals.iter().enumerate() {
+            if m != 0.0 {
+                if src_idx >= src_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "masked_scatter: source doesn't have enough elements",
+                        },
+                    )));
+                }
+                result[i] = src_vals[src_idx];
+                src_idx += 1;
+            }
+        }
+
+        self.tensor_tape.leaf(result, shape, false)
+    }
+
     /// Compute A^n via binary exponentiation.
     ///
     /// n > 0: repeated squaring. n = 0: identity. n < 0: inv(A)^|n|.
@@ -25053,6 +25269,13 @@ mod tests {
     }
 
     #[test]
+    fn logsumexp_dim_out_of_range_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        assert!(s.tensor_logsumexp(x, 1).is_err());
+    }
+
+    #[test]
     fn dist_l2() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = s.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
@@ -25063,6 +25286,20 @@ mod tests {
     }
 
     #[test]
+    fn dist_l1() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let b = s
+            .tensor_variable(vec![3.0, 2.0, -1.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_dist(a, b, 1.0).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert!((vals[0] - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
     fn movedim_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s
@@ -25070,6 +25307,16 @@ mod tests {
             .unwrap();
         let out = s.tensor_movedim(x, 0, 1).unwrap();
         assert_eq!(s.tensor_shape(out).unwrap(), &[3, 2]);
+    }
+
+    #[test]
+    fn movedim_out_of_range_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        assert!(s.tensor_movedim(x, 2, 0).is_err());
+        assert!(s.tensor_movedim(x, 0, 2).is_err());
     }
 
     #[test]
@@ -25092,6 +25339,13 @@ mod tests {
         let (mins, maxs) = s.tensor_aminmax(x, 1).unwrap();
         assert_eq!(s.tensor_values(mins).unwrap(), &[1.0, 2.0]);
         assert_eq!(s.tensor_values(maxs).unwrap(), &[5.0, 3.0]);
+    }
+
+    #[test]
+    fn aminmax_dim_out_of_range_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        assert!(s.tensor_aminmax(x, 1).is_err());
     }
 
     #[test]
@@ -25119,6 +25373,17 @@ mod tests {
     }
 
     #[test]
+    fn unfold_invalid_args_error() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
+            .unwrap();
+        assert!(s.tensor_unfold(x, 0, 5, 1).is_err());
+        assert!(s.tensor_unfold(x, 0, 2, 0).is_err());
+        assert!(s.tensor_unfold(x, 1, 2, 1).is_err());
+    }
+
+    #[test]
     fn renorm_clips() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s
@@ -25131,6 +25396,27 @@ mod tests {
     }
 
     #[test]
+    fn renorm_dim_out_of_range_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![3.0, 4.0, 1.0, 0.0], vec![2, 2], false)
+            .unwrap();
+        assert!(s.tensor_renorm(x, 2.0, 2, 2.5).is_err());
+    }
+
+    #[test]
+    fn isin_preserves_input_shape() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let elements = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let test = s.tensor_variable(vec![2.0, 4.0], vec![2], false).unwrap();
+        let out = s.tensor_isin(elements, test).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), &[2, 2]);
+        assert_eq!(s.tensor_values(out).unwrap(), &[0.0, 1.0, 0.0, 1.0]);
+    }
+
+    #[test]
     fn isin_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let elements = s
@@ -25139,5 +25425,119 @@ mod tests {
         let test = s.tensor_variable(vec![2.0, 4.0], vec![2], false).unwrap();
         let out = s.tensor_isin(elements, test).unwrap();
         assert_eq!(s.tensor_values(out).unwrap(), &[0.0, 1.0, 0.0, 1.0]);
+    }
+
+    // ── triangular_solve tests ──────────────────────────────────────────
+
+    #[test]
+    fn triangular_solve_lower() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // L = [[2, 0], [1, 3]], b = [4, 7]
+        // Forward sub: x0 = 4/2 = 2, x1 = (7 - 1*2)/3 = 5/3
+        let a = s
+            .tensor_variable(vec![2.0, 0.0, 1.0, 3.0], vec![2, 2], false)
+            .unwrap();
+        let b = s.tensor_variable(vec![4.0, 7.0], vec![2, 1], false).unwrap();
+        let x = s.tensor_triangular_solve(a, b, false).unwrap();
+        let vals = s.tensor_values(x).unwrap();
+        assert!((vals[0] - 2.0).abs() < 1e-10);
+        assert!((vals[1] - 5.0 / 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn triangular_solve_upper() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // U = [[2, 1], [0, 3]], b = [5, 6]
+        // Back sub: x1 = 6/3 = 2, x0 = (5 - 1*2)/2 = 1.5
+        let a = s
+            .tensor_variable(vec![2.0, 1.0, 0.0, 3.0], vec![2, 2], false)
+            .unwrap();
+        let b = s.tensor_variable(vec![5.0, 6.0], vec![2, 1], false).unwrap();
+        let x = s.tensor_triangular_solve(a, b, true).unwrap();
+        let vals = s.tensor_values(x).unwrap();
+        assert!((vals[0] - 1.5).abs() < 1e-10);
+        assert!((vals[1] - 2.0).abs() < 1e-10);
+    }
+
+    // ── cholesky_inverse tests ──────────────────────────────────────────
+
+    #[test]
+    fn cholesky_inverse_identity() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eye = s.eye(3, false).unwrap();
+        let l = s.tensor_linalg_cholesky(eye, false).unwrap();
+        let inv = s.tensor_cholesky_inverse(l, false).unwrap();
+        let vals = s.tensor_values(inv).unwrap();
+        // inv(I) = I
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!(vals[1].abs() < 1e-10);
+        assert!((vals[4] - 1.0).abs() < 1e-10);
+    }
+
+    // ── matrix_norm tests ───────────────────────────────────────────────
+
+    #[test]
+    fn matrix_norm_frobenius() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.tensor_matrix_norm(a, "fro").unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // sqrt(1+4+9+16) = sqrt(30)
+        assert!((vals[0] - 30.0_f64.sqrt()).abs() < 1e-10);
+    }
+
+    #[test]
+    fn matrix_norm_1() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [[1, -2], [3, 4]]
+        let a = s
+            .tensor_variable(vec![1.0, -2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.tensor_matrix_norm(a, "1").unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Max col sum: col0=|1|+|3|=4, col1=|-2|+|4|=6 → 6
+        assert!((vals[0] - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn matrix_norm_inf() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, -2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.tensor_matrix_norm(a, "inf").unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Max row sum: row0=|1|+|-2|=3, row1=|3|+|4|=7 → 7
+        assert!((vals[0] - 7.0).abs() < 1e-10);
+    }
+
+    // ── masked_scatter tests ────────────────────────────────────────────
+
+    #[test]
+    fn masked_scatter_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 0.0, 0.0, 0.0], vec![4], false)
+            .unwrap();
+        let mask = s
+            .tensor_variable(vec![1.0, 0.0, 1.0, 0.0], vec![4], false)
+            .unwrap();
+        let source = s
+            .tensor_variable(vec![10.0, 20.0], vec![2], false)
+            .unwrap();
+        let out = s.tensor_masked_scatter(input, mask, source).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert_eq!(vals, &[10.0, 0.0, 20.0, 0.0]);
+    }
+
+    #[test]
+    fn masked_scatter_not_enough_source_errors() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+        let mask = s.tensor_variable(vec![1.0, 1.0], vec![2], false).unwrap();
+        let source = s.tensor_variable(vec![10.0], vec![1], false).unwrap();
+        assert!(s.tensor_masked_scatter(input, mask, source).is_err());
     }
 }
