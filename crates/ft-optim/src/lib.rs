@@ -8924,9 +8924,6 @@ mod tests {
         scheduler.step(&mut opt, None); // epoch 2: *= 1/3 → ~0.1667
 
         let lr = opt.get_lr();
-        assert!(
-            (lr - 1.0 / 6.0).abs() < 1e-10,
-            "expected ~0.1667, got {lr}"
-        );
+        assert!((lr - 1.0 / 6.0).abs() < 1e-10, "expected ~0.1667, got {lr}");
     }
 }

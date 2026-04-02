@@ -890,9 +890,14 @@ struct TensorAdvancedCase {
     padding: Option<Vec<usize>>,
     #[serde(default)]
     pad_value: Option<f64>,
+    // For quantile
+    #[serde(default)]
+    q: Option<f64>,
     // Expected
     expected_output: Vec<f64>,
     expected_shape: Vec<usize>,
+    #[serde(default)]
+    expected_indices: Option<Vec<usize>>,
     #[serde(default)]
     tolerance: Option<f64>,
     #[serde(default)]
@@ -5921,13 +5926,18 @@ fn run_tensor_advanced_case(
         .tensor_variable(case.input.clone(), case.input_shape.clone(), false)
         .map_err(|e| format!("input tensor build failed for '{}': {e}", case.name))?;
 
-    let out = match case.op.as_str() {
+    let (out, actual_indices) = match case.op.as_str() {
         "flip" => {
             let dims = case
                 .dims
                 .as_ref()
                 .ok_or_else(|| format!("flip case '{}' missing dims", case.name))?;
-            session.tensor_flip(input, dims)
+            (
+                session
+                    .tensor_flip(input, dims)
+                    .map_err(|e| format!("flip failed for '{}': {e}", case.name))?,
+                None,
+            )
         }
         "roll" => {
             let shift = case
@@ -5936,14 +5946,24 @@ fn run_tensor_advanced_case(
             let dim = case
                 .roll_dim
                 .ok_or_else(|| format!("roll case '{}' missing roll_dim", case.name))?;
-            session.tensor_roll(input, shift, dim)
+            (
+                session
+                    .tensor_roll(input, shift, dim)
+                    .map_err(|e| format!("roll failed for '{}': {e}", case.name))?,
+                None,
+            )
         }
         "repeat" => {
             let repeats = case
                 .repeats
                 .as_ref()
                 .ok_or_else(|| format!("repeat case '{}' missing repeats", case.name))?;
-            session.tensor_repeat(input, repeats)
+            (
+                session
+                    .tensor_repeat(input, repeats)
+                    .map_err(|e| format!("repeat failed for '{}': {e}", case.name))?,
+                None,
+            )
         }
         "pad" => {
             let padding = case
@@ -5951,11 +5971,50 @@ fn run_tensor_advanced_case(
                 .as_ref()
                 .ok_or_else(|| format!("pad case '{}' missing padding", case.name))?;
             let value = case.pad_value.unwrap_or(0.0);
-            session.tensor_pad(input, padding, value)
+            (
+                session
+                    .tensor_pad(input, padding, value)
+                    .map_err(|e| format!("pad failed for '{}': {e}", case.name))?,
+                None,
+            )
+        }
+        "cov" => (
+            session
+                .tensor_cov(input)
+                .map_err(|e| format!("cov failed for '{}': {e}", case.name))?,
+            None,
+        ),
+        "corrcoef" => (
+            session
+                .tensor_corrcoef(input)
+                .map_err(|e| format!("corrcoef failed for '{}': {e}", case.name))?,
+            None,
+        ),
+        "mode" => {
+            let (values, indices) = session
+                .tensor_mode(input)
+                .map_err(|e| format!("mode failed for '{}': {e}", case.name))?;
+            let actual_indices: Vec<usize> = session
+                .tensor_values(indices)
+                .map_err(|e| format!("mode index read failed for '{}': {e}", case.name))?
+                .into_iter()
+                .map(|index| index as usize)
+                .collect();
+            (values, Some(actual_indices))
+        }
+        "quantile" => {
+            let q = case
+                .q
+                .ok_or_else(|| format!("quantile case '{}' missing q", case.name))?;
+            (
+                session
+                    .tensor_quantile(input, q)
+                    .map_err(|e| format!("quantile failed for '{}': {e}", case.name))?,
+                None,
+            )
         }
         _ => return Err(format!("unsupported advanced op '{}'", case.op)),
-    }
-    .map_err(|e| format!("{} failed for '{}': {e}", case.op, case.name))?;
+    };
 
     let actual_output = session
         .tensor_values(out)
@@ -5971,8 +6030,13 @@ fn run_tensor_advanced_case(
         tolerance,
     );
     let shape_ok = actual_shape == case.expected_shape;
+    let indices_ok = match (actual_indices.as_ref(), case.expected_indices.as_ref()) {
+        (Some(actual), Some(expected)) => actual == expected,
+        (None, None) => true,
+        _ => false,
+    };
 
-    let passed = output_ok && shape_ok;
+    let passed = output_ok && shape_ok && indices_ok;
     let outcome = if passed { "pass" } else { "fail" };
     let reason_code = if passed {
         "tensor_advanced_parity_ok"
@@ -5982,6 +6046,12 @@ fn run_tensor_advanced_case(
 
     let mut extra_fields = std::collections::BTreeMap::new();
     extra_fields.insert("op".to_string(), serde_json::Value::String(case.op.clone()));
+    if let Some(expected_indices) = case.expected_indices.as_ref() {
+        extra_fields.insert("expected_indices".to_string(), json!(expected_indices));
+    }
+    if let Some(actual_indices) = actual_indices.as_ref() {
+        extra_fields.insert("actual_indices".to_string(), json!(actual_indices));
+    }
     extra_fields.insert(
         "runtime_evidence".to_string(),
         runtime_evidence_field(session.evidence()),

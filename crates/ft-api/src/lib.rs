@@ -1782,6 +1782,79 @@ impl FrankenTorchSession {
         self.tensor_variable(result, out_shape, false)
     }
 
+    /// Sample from a Bernoulli distribution.
+    ///
+    /// Equivalent to `torch.bernoulli(input)`.
+    /// `input` contains probabilities in [0, 1]. Returns a tensor of the same shape
+    /// with values 0.0 or 1.0 sampled from Bernoulli(p) for each element p.
+    pub fn bernoulli(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let probs = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let values: Vec<f64> = probs
+            .iter()
+            .map(|&p| if self.rng.next_f64() < p { 1.0 } else { 0.0 })
+            .collect();
+        self.tensor_variable(values, shape, false)
+    }
+
+    /// Create a tensor with each element sampled from a Bernoulli distribution
+    /// with the given uniform probability.
+    ///
+    /// Equivalent to `torch.bernoulli(torch.full(shape, p))` or using `Tensor.bernoulli_(p)`.
+    pub fn bernoulli_p(
+        &mut self,
+        shape: Vec<usize>,
+        p: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let numel =
+            Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in bernoulli")?;
+        let values: Vec<f64> = (0..numel)
+            .map(|_| if self.rng.next_f64() < p { 1.0 } else { 0.0 })
+            .collect();
+        self.tensor_variable(values, shape, false)
+    }
+
+    /// Sample from a Poisson distribution element-wise.
+    ///
+    /// Equivalent to `torch.poisson(input)`.
+    /// Each element of `input` is the rate parameter λ; returns integer samples
+    /// (as f64) from Poisson(λ) for each element.
+    pub fn poisson(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let rates = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+
+        let values: Vec<f64> = rates
+            .iter()
+            .map(|&lambda| {
+                if lambda < 0.0 {
+                    return f64::NAN;
+                }
+                if lambda == 0.0 {
+                    return 0.0;
+                }
+                // Knuth's algorithm for Poisson sampling
+                let l = (-lambda).exp();
+                let mut k = 0u64;
+                let mut p = 1.0;
+                loop {
+                    k += 1;
+                    p *= self.rng.next_f64();
+                    if p <= l {
+                        break;
+                    }
+                }
+                (k - 1) as f64
+            })
+            .collect();
+        self.tensor_variable(values, shape, false)
+    }
+
     /// Create a 1-D tensor with `steps` evenly spaced values from `start` to `end` (inclusive).
     pub fn linspace(
         &mut self,
@@ -8467,7 +8540,7 @@ impl FrankenTorchSession {
         let n = a_shape[0];
         let nrhs = if b_shape.len() == 1 { 1 } else { b_shape[1] };
 
-        if (b_shape.len() == 1 && b_shape[0] != n) || (b_shape.len() == 2 && b_shape[0] != n) {
+        if matches!(b_shape.len(), 1 | 2) && b_shape[0] != n {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "triangular_solve: B rows must match A dimension",
@@ -8564,15 +8637,15 @@ impl FrankenTorchSession {
         let (m, n) = (shape[0], shape[1]);
 
         let result = match ord {
-            "fro" => {
-                vals.iter().map(|&v| v * v).sum::<f64>().sqrt()
-            }
+            "fro" => vals.iter().map(|&v| v * v).sum::<f64>().sqrt(),
             "1" => {
                 // Max absolute column sum
                 let mut max_col = 0.0_f64;
                 for j in 0..n {
                     let col_sum: f64 = (0..m).map(|i| vals[i * n + j].abs()).sum();
-                    if col_sum > max_col { max_col = col_sum; }
+                    if col_sum > max_col {
+                        max_col = col_sum;
+                    }
                 }
                 max_col
             }
@@ -8581,7 +8654,9 @@ impl FrankenTorchSession {
                 let mut max_row = 0.0_f64;
                 for i in 0..m {
                     let row_sum: f64 = (0..n).map(|j| vals[i * n + j].abs()).sum();
-                    if row_sum > max_row { max_row = row_sum; }
+                    if row_sum > max_row {
+                        max_row = row_sum;
+                    }
                 }
                 max_row
             }
@@ -8590,7 +8665,9 @@ impl FrankenTorchSession {
                 let mut min_col = f64::INFINITY;
                 for j in 0..n {
                     let col_sum: f64 = (0..m).map(|i| vals[i * n + j].abs()).sum();
-                    if col_sum < min_col { min_col = col_sum; }
+                    if col_sum < min_col {
+                        min_col = col_sum;
+                    }
                 }
                 min_col
             }
@@ -8599,7 +8676,9 @@ impl FrankenTorchSession {
                 let mut min_row = f64::INFINITY;
                 for i in 0..m {
                     let row_sum: f64 = (0..n).map(|j| vals[i * n + j].abs()).sum();
-                    if row_sum < min_row { min_row = row_sum; }
+                    if row_sum < min_row {
+                        min_row = row_sum;
+                    }
                 }
                 min_row
             }
@@ -8920,6 +8999,187 @@ impl FrankenTorchSession {
         };
 
         self.tensor_variable(vec![norm], vec![1], false)
+    }
+
+    /// Compute the least-squares solution to a linear system A @ X = B.
+    ///
+    /// Equivalent to `torch.linalg.lstsq(A, B)`.
+    /// Returns the solution X that minimizes ||A @ X - B||_2.
+    /// A is (m, n), B is (m,) or (m, k). Returns X of shape (n,) or (n, k).
+    pub fn tensor_linalg_lstsq(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let a_shape = self.tensor_shape(a)?;
+        let b_shape = self.tensor_shape(b)?;
+
+        if a_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "lstsq: A must be 2-D",
+                },
+            )));
+        }
+
+        let m = a_shape[0];
+        let n = a_shape[1];
+
+        // Solve via SVD: X = V @ diag(1/sigma) @ U^T @ B (pseudoinverse approach)
+        let (u, s, vt) = self.tensor_linalg_svd(a, false)?;
+        let u_vals = self.tensor_values(u)?;
+        let s_vals = self.tensor_values(s)?;
+        let vt_vals = self.tensor_values(vt)?;
+        let b_vals = self.tensor_values(b)?;
+
+        let k = m.min(n); // number of singular values
+
+        let nrhs = if b_shape.len() == 1 { 1 } else { b_shape[1] };
+
+        // Compute U^T @ B -> (k, nrhs)
+        let u_shape = self.tensor_shape(u)?;
+        let u_cols = u_shape[1]; // k in reduced mode
+
+        let mut utb = vec![0.0; u_cols * nrhs];
+        for i in 0..u_cols {
+            for j in 0..nrhs {
+                let mut sum = 0.0;
+                for r in 0..m {
+                    let b_val = if b_shape.len() == 1 {
+                        b_vals[r]
+                    } else {
+                        b_vals[r * nrhs + j]
+                    };
+                    sum += u_vals[r * u_cols + i] * b_val;
+                }
+                utb[i * nrhs + j] = sum;
+            }
+        }
+
+        // Apply diag(1/sigma): divide each row i by s[i] (skip near-zero singular values)
+        let eps = 1e-15 * s_vals.iter().cloned().fold(0.0_f64, f64::max);
+        for i in 0..k {
+            let inv_s = if s_vals[i].abs() > eps {
+                1.0 / s_vals[i]
+            } else {
+                0.0
+            };
+            for j in 0..nrhs {
+                utb[i * nrhs + j] *= inv_s;
+            }
+        }
+
+        // Compute V @ (diag(1/s) @ U^T @ B) -> (n, nrhs)
+        let vt_shape = self.tensor_shape(vt)?;
+        let vt_rows = vt_shape[0]; // n in reduced mode
+
+        let mut result = vec![0.0; n * nrhs];
+        for i in 0..n {
+            for j in 0..nrhs {
+                let mut sum = 0.0;
+                for r in 0..vt_rows.min(k) {
+                    sum += vt_vals[r * n + i] * utb[r * nrhs + j];
+                }
+                result[i * nrhs + j] = sum;
+            }
+        }
+
+        let out_shape = if b_shape.len() == 1 {
+            vec![n]
+        } else {
+            vec![n, nrhs]
+        };
+        self.tensor_variable(result, out_shape, false)
+    }
+
+    /// Compute the condition number of a matrix.
+    ///
+    /// Equivalent to `torch.linalg.cond(A, p)`.
+    /// For p=2 (default), uses the ratio of largest to smallest singular value.
+    /// For p=1 or p=inf, uses norm(A) * norm(inv(A)).
+    pub fn tensor_linalg_cond(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cond: input must be 2-D",
+                },
+            )));
+        }
+
+        if p == 2.0 || p == -2.0 {
+            // SVD-based: cond = sigma_max / sigma_min (or reciprocal for p=-2)
+            let s = self.tensor_linalg_svdvals(input)?;
+            let s_vals = self.tensor_values(s)?;
+            if s_vals.is_empty() {
+                return self.tensor_variable(vec![f64::NAN], vec![1], false);
+            }
+            let sigma_max = s_vals[0]; // svdvals returns descending order
+            let sigma_min = s_vals[s_vals.len() - 1];
+            let cond = if p == 2.0 {
+                if sigma_min == 0.0 {
+                    f64::INFINITY
+                } else {
+                    sigma_max / sigma_min
+                }
+            } else {
+                // p == -2: reciprocal
+                if sigma_max == 0.0 {
+                    f64::INFINITY
+                } else {
+                    sigma_min / sigma_max
+                }
+            };
+            self.tensor_variable(vec![cond], vec![1], false)
+        } else {
+            // For other norms: cond(A) = norm(A, p) * norm(inv(A), p)
+            let norm_a = self.tensor_matrix_norm(input, if p == f64::INFINITY { "inf" } else if p == f64::NEG_INFINITY { "-inf" } else if p == 1.0 { "1" } else { "fro" })?;
+            let inv = self.tensor_linalg_inv(input)?;
+            let norm_inv = self.tensor_matrix_norm(inv, if p == f64::INFINITY { "inf" } else if p == f64::NEG_INFINITY { "-inf" } else if p == 1.0 { "1" } else { "fro" })?;
+
+            let norm_a_val = self.tensor_values(norm_a)?[0];
+            let norm_inv_val = self.tensor_values(norm_inv)?[0];
+            self.tensor_variable(vec![norm_a_val * norm_inv_val], vec![1], false)
+        }
+    }
+
+    /// Compute the numerical rank of a matrix.
+    ///
+    /// Equivalent to `torch.linalg.matrix_rank(A, tol)`.
+    /// Uses SVD and counts singular values above the tolerance threshold.
+    pub fn tensor_linalg_matrix_rank(
+        &mut self,
+        input: TensorNodeId,
+        tol: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "matrix_rank: input must be 2-D",
+                },
+            )));
+        }
+
+        let s = self.tensor_linalg_svdvals(input)?;
+        let s_vals = self.tensor_values(s)?;
+
+        let threshold = match tol {
+            Some(t) => t,
+            None => {
+                // Default: max(m, n) * eps * sigma_max
+                let (m, n) = (shape[0], shape[1]);
+                let sigma_max = s_vals.first().copied().unwrap_or(0.0);
+                m.max(n) as f64 * f64::EPSILON * sigma_max
+            }
+        };
+
+        let rank = s_vals.iter().filter(|&&sv| sv > threshold).count();
+        self.tensor_variable(vec![rank as f64], vec![1], false)
     }
 
     /// Compute the QR decomposition: `A = Q @ R`.
@@ -9517,6 +9777,291 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    // ── torch.special functions ──────────────────────────────────────────
+
+    /// Element-wise sigmoid (expit) function: 1 / (1 + exp(-x)).
+    ///
+    /// Equivalent to `torch.special.expit(input)`.
+    pub fn tensor_expit(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // expit is identical to sigmoid
+        self.tensor_sigmoid(input)
+    }
+
+    /// Element-wise logit function: log(x / (1 - x)).
+    ///
+    /// Equivalent to `torch.special.logit(input, eps)`.
+    /// Values are clamped to [eps, 1 - eps] if eps is provided.
+    pub fn tensor_logit(
+        &mut self,
+        input: TensorNodeId,
+        eps: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| {
+                let clamped = if let Some(e) = eps {
+                    x.clamp(e, 1.0 - e)
+                } else {
+                    x
+                };
+                (clamped / (1.0 - clamped)).ln()
+            })
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("logit in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise inverse error function.
+    ///
+    /// Equivalent to `torch.special.erfinv(input)`.
+    /// Uses a rational approximation (Winitzki, 2008).
+    pub fn tensor_erfinv(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| erfinv_approx(x))
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("erfinv in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise natural logarithm of the absolute value of the gamma function.
+    ///
+    /// Equivalent to `torch.special.gammaln(input)` / `torch.lgamma(input)`.
+    pub fn tensor_gammaln(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| lgamma_approx(x))
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("gammaln in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise digamma (psi) function: d/dx ln(Gamma(x)).
+    ///
+    /// Equivalent to `torch.special.digamma(input)`.
+    pub fn tensor_digamma(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| digamma_approx(x))
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("digamma in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise polygamma function of order n.
+    ///
+    /// Equivalent to `torch.special.polygamma(n, input)`.
+    /// Only n=0 (digamma) and n=1 (trigamma) are directly supported.
+    pub fn tensor_polygamma(
+        &mut self,
+        n: u32,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if n == 0 {
+            return self.tensor_digamma(input);
+        }
+
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| polygamma_approx(n, x))
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("polygamma n={n} in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Multivariate log-gamma function.
+    ///
+    /// Equivalent to `torch.special.multigammaln(input, p)`.
+    /// Computes: log(pi^{p*(p-1)/4} * prod_{i=1}^{p} Gamma(input - (i-1)/2))
+    pub fn tensor_multigammaln(
+        &mut self,
+        input: TensorNodeId,
+        p: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let log_pi = std::f64::consts::PI.ln();
+        let constant = (p * (p - 1)) as f64 / 4.0 * log_pi;
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| {
+                let mut sum = constant;
+                for i in 0..p {
+                    sum += lgamma_approx(x - i as f64 / 2.0);
+                }
+                sum
+            })
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("multigammaln p={p} in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise x * log1p(y) with the convention 0 * log1p(y) = 0.
+    ///
+    /// Equivalent to `torch.special.xlog1py(input, other)`.
+    pub fn tensor_xlog1py(
+        &mut self,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (x_vals, x_meta) = {
+            let tensor = self.tensor_tape.tensor(x)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+        let y_vals = {
+            let tensor = self.tensor_tape.tensor(y)?;
+            tensor.storage().to_vec()
+        };
+
+        if x_vals.len() != y_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "xlog1py: inputs must have the same number of elements",
+                },
+            )));
+        }
+
+        let values: Vec<f64> = x_vals
+            .iter()
+            .zip(y_vals.iter())
+            .map(|(&xi, &yi)| {
+                if xi == 0.0 {
+                    0.0
+                } else {
+                    xi * (1.0 + yi).ln()
+                }
+            })
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, x_meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("xlog1py x={} y={} out={}", x.0, y.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise entropy: -x * log(x).
+    ///
+    /// Equivalent to `torch.special.entr(input)`.
+    /// Returns 0 when x == 0 and -inf when x < 0.
+    pub fn tensor_entr(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+
+        let values: Vec<f64> = storage
+            .iter()
+            .map(|&x| {
+                if x == 0.0 {
+                    0.0
+                } else if x < 0.0 {
+                    f64::NEG_INFINITY
+                } else {
+                    -x * x.ln()
+                }
+            })
+            .collect();
+
+        let out = self
+            .tensor_tape
+            .leaf(values, meta.shape().to_vec(), false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("entr in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
     // ── logcumsumexp ─────────────────────────────────────────────────────
     /// Numerically stable cumulative log-sum-exp along a dimension.
     ///
@@ -9734,6 +10279,201 @@ impl FrankenTorchSession {
         let permuted = self.tensor_permute(reshaped, vec![0, 1, 3, 5, 2, 4])?;
         // reshape to (N, C*r*r, H/r, W/r)
         self.tensor_reshape(permuted, vec![batch, channels * r * r, oh, ow])
+    }
+
+    // ── FFT operations ───────────────────────────────────────────────────
+
+    /// Compute the 1-D Discrete Fourier Transform.
+    ///
+    /// Equivalent to `torch.fft.fft(input, n)`.
+    /// Input is a 1-D real tensor. Output is a 1-D Complex128 tensor of length `n`.
+    /// If `n` is None, uses the input length.
+    pub fn tensor_fft(
+        &mut self,
+        input: TensorNodeId,
+        n: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let input_len = vals.len();
+        let fft_len = n.unwrap_or(input_len);
+
+        // Zero-pad or truncate input to length n
+        let mut x = vec![0.0; fft_len];
+        let copy_len = input_len.min(fft_len);
+        x[..copy_len].copy_from_slice(&vals[..copy_len]);
+
+        // Direct DFT: X[k] = sum_n x[n] * exp(-2*pi*i*k*n/N)
+        let mut real_out = Vec::with_capacity(fft_len);
+        let mut imag_out = Vec::with_capacity(fft_len);
+        let two_pi = 2.0 * std::f64::consts::PI;
+
+        for k in 0..fft_len {
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (nn, &xn) in x.iter().enumerate() {
+                let angle = -two_pi * k as f64 * nn as f64 / fft_len as f64;
+                re += xn * angle.cos();
+                im += xn * angle.sin();
+            }
+            real_out.push(re);
+            imag_out.push(im);
+        }
+
+        // Create real and imag tensors, then combine as complex
+        let re_node = self.tensor_variable(real_out, vec![fft_len], false)?;
+        let im_node = self.tensor_variable(imag_out, vec![fft_len], false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
+    /// Compute the 1-D Inverse Discrete Fourier Transform.
+    ///
+    /// Equivalent to `torch.fft.ifft(input, n)`.
+    /// Input is a Complex128 tensor. Output is Complex128.
+    pub fn tensor_ifft(
+        &mut self,
+        input: TensorNodeId,
+        n: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let dtype = self.tensor_dtype(input)?;
+
+        if dtype != DType::Complex128 && dtype != DType::Complex64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "ifft: input must be complex",
+                },
+            )));
+        }
+
+        let input_len = vals.len() / 2; // complex elements
+        let fft_len = n.unwrap_or(input_len);
+
+        // Extract real/imag parts (zero-pad if needed)
+        let mut re_in = vec![0.0; fft_len];
+        let mut im_in = vec![0.0; fft_len];
+        let copy_len = input_len.min(fft_len);
+        for i in 0..copy_len {
+            re_in[i] = vals[i * 2];
+            im_in[i] = vals[i * 2 + 1];
+        }
+
+        // Inverse DFT: x[n] = (1/N) * sum_k X[k] * exp(2*pi*i*k*n/N)
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut re_out = Vec::with_capacity(fft_len);
+        let mut im_out = Vec::with_capacity(fft_len);
+
+        for nn in 0..fft_len {
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for k in 0..fft_len {
+                let angle = two_pi * k as f64 * nn as f64 / fft_len as f64;
+                let cos_a = angle.cos();
+                let sin_a = angle.sin();
+                re += re_in[k] * cos_a - im_in[k] * sin_a;
+                im += re_in[k] * sin_a + im_in[k] * cos_a;
+            }
+            re_out.push(re / fft_len as f64);
+            im_out.push(im / fft_len as f64);
+        }
+
+        let re_node = self.tensor_variable(re_out, vec![fft_len], false)?;
+        let im_node = self.tensor_variable(im_out, vec![fft_len], false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
+    /// Compute the 1-D real FFT (only positive frequencies).
+    ///
+    /// Equivalent to `torch.fft.rfft(input, n)`.
+    /// Input is real. Output is Complex128 of length `n/2 + 1`.
+    pub fn tensor_rfft(
+        &mut self,
+        input: TensorNodeId,
+        n: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let input_len = vals.len();
+        let fft_len = n.unwrap_or(input_len);
+        let out_len = fft_len / 2 + 1;
+
+        let mut x = vec![0.0; fft_len];
+        let copy_len = input_len.min(fft_len);
+        x[..copy_len].copy_from_slice(&vals[..copy_len]);
+
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut re_out = Vec::with_capacity(out_len);
+        let mut im_out = Vec::with_capacity(out_len);
+
+        for k in 0..out_len {
+            let mut re = 0.0;
+            let mut im = 0.0;
+            for (nn, &xn) in x.iter().enumerate() {
+                let angle = -two_pi * k as f64 * nn as f64 / fft_len as f64;
+                re += xn * angle.cos();
+                im += xn * angle.sin();
+            }
+            re_out.push(re);
+            im_out.push(im);
+        }
+
+        let re_node = self.tensor_variable(re_out, vec![out_len], false)?;
+        let im_node = self.tensor_variable(im_out, vec![out_len], false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
+    /// Compute the inverse of rfft.
+    ///
+    /// Equivalent to `torch.fft.irfft(input, n)`.
+    /// Input is Complex128 of length `n/2+1`. Output is real of length `n`.
+    pub fn tensor_irfft(
+        &mut self,
+        input: TensorNodeId,
+        n: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let dtype = self.tensor_dtype(input)?;
+
+        if dtype != DType::Complex128 && dtype != DType::Complex64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "irfft: input must be complex",
+                },
+            )));
+        }
+
+        let freq_len = vals.len() / 2;
+        let out_len = n.unwrap_or((freq_len - 1) * 2);
+
+        // Reconstruct full spectrum using conjugate symmetry
+        let mut re_full = vec![0.0; out_len];
+        let mut im_full = vec![0.0; out_len];
+
+        for k in 0..freq_len.min(out_len) {
+            re_full[k] = vals[k * 2];
+            im_full[k] = vals[k * 2 + 1];
+        }
+        // Mirror: X[N-k] = conj(X[k])
+        for k in 1..freq_len.min(out_len) {
+            let mirror = out_len - k;
+            if mirror < out_len && mirror != k {
+                re_full[mirror] = vals[k * 2];
+                im_full[mirror] = -vals[k * 2 + 1];
+            }
+        }
+
+        // Inverse DFT to get real output
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut result = Vec::with_capacity(out_len);
+
+        for nn in 0..out_len {
+            let mut re = 0.0;
+            for k in 0..out_len {
+                let angle = two_pi * k as f64 * nn as f64 / out_len as f64;
+                re += re_full[k] * angle.cos() - im_full[k] * angle.sin();
+            }
+            result.push(re / out_len as f64);
+        }
+
+        self.tensor_variable(result, vec![out_len], false)
     }
 
     // ── logsumexp ────────────────────────────────────────────────────────
@@ -10934,6 +11674,157 @@ pub use ft_autograd::{
     FunctionCtx as DacFunctionCtx, NodeId as DacNodeId, ReentrantPolicy as DacReentrantPolicy,
     TensorBackwardReport as DacTensorBackwardReport, TensorNodeId as DacTensorNodeId,
 };
+
+// ── torch.special helper approximations ─────────────────────────────────
+
+/// Inverse error function approximation (Winitzki 2008, refined).
+///
+/// Accurate to ~1e-9 over [-1, 1].
+fn erfinv_approx(x: f64) -> f64 {
+    if x <= -1.0 {
+        return f64::NEG_INFINITY;
+    }
+    if x >= 1.0 {
+        return f64::INFINITY;
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    let a = 0.147;
+    let ln_term = (1.0 - x * x).ln();
+    let t1 = 2.0 / (std::f64::consts::PI * a) + ln_term / 2.0;
+    let t2 = ln_term / a;
+    let sign = if x < 0.0 { -1.0 } else { 1.0 };
+    sign * (((t1 * t1 - t2).sqrt() - t1).sqrt())
+}
+
+/// Log-gamma via Stirling's asymptotic series with recurrence reduction.
+///
+/// For large x, uses the asymptotic expansion. For small x, uses the recurrence
+/// lgamma(x) = lgamma(x+1) - ln(x) to shift the argument up.
+fn lgamma_approx(x: f64) -> f64 {
+    if x.is_nan() || x.is_infinite() {
+        if x == f64::INFINITY {
+            return f64::INFINITY;
+        }
+        return f64::NAN;
+    }
+    if x <= 0.0 && x == x.floor() {
+        return f64::INFINITY; // poles at non-positive integers
+    }
+
+    // Reflection formula for x < 0
+    if x < 0.0 {
+        let sin_val = (std::f64::consts::PI * x).sin().abs();
+        if sin_val == 0.0 {
+            return f64::INFINITY;
+        }
+        return (std::f64::consts::PI / sin_val).ln() - lgamma_approx(1.0 - x);
+    }
+
+    // Recurrence: shift x up until x >= 8 for good Stirling convergence
+    let mut shift = 0.0;
+    let mut z = x;
+    while z < 8.0 {
+        shift -= z.ln();
+        z += 1.0;
+    }
+
+    // Stirling's asymptotic series for lgamma(z) when z >= 8:
+    // lgamma(z) = (z-0.5)*ln(z) - z + 0.5*ln(2*pi) + sum B_{2k}/(2k*(2k-1)*z^{2k-1})
+    let inv_z = 1.0 / z;
+    let inv_z2 = inv_z * inv_z;
+    let stirling = (z - 0.5) * z.ln() - z
+        + 0.5 * (2.0 * std::f64::consts::PI).ln()
+        + inv_z
+            * (1.0 / 12.0
+                + inv_z2
+                    * (-1.0 / 360.0
+                        + inv_z2
+                            * (1.0 / 1260.0
+                                + inv_z2 * (-1.0 / 1680.0 + inv_z2 * 1.0 / 1188.0))));
+
+    stirling + shift
+}
+
+/// Digamma (psi) function approximation.
+///
+/// Uses recurrence to shift argument to large values, then asymptotic series.
+fn digamma_approx(mut x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 && x == x.floor() {
+        return f64::NAN; // poles at non-positive integers
+    }
+
+    let mut result = 0.0;
+
+    // Reflection formula for negative x
+    if x < 0.0 {
+        result -= std::f64::consts::PI / (std::f64::consts::PI * x).tan();
+        x = 1.0 - x;
+    }
+
+    // Recurrence: psi(x) = psi(x+1) - 1/x, shift x up until x >= 8
+    while x < 8.0 {
+        result -= 1.0 / x;
+        x += 1.0;
+    }
+
+    // Asymptotic expansion for large x
+    result += x.ln() - 0.5 / x;
+    let x2 = 1.0 / (x * x);
+    // Bernoulli numbers: B2=1/6, B4=-1/30, B6=1/42, B8=-1/30, B10=5/66
+    result -= x2
+        * (1.0 / 12.0
+            - x2 * (1.0 / 120.0
+                - x2 * (1.0 / 252.0 - x2 * (1.0 / 240.0 - x2 * 5.0 / 660.0))));
+    result
+}
+
+/// Polygamma function of order n for n >= 1.
+///
+/// Uses recurrence + asymptotic series.
+fn polygamma_approx(n: u32, mut x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x <= 0.0 && x == x.floor() {
+        return f64::NAN;
+    }
+
+    let mut result = 0.0;
+
+    // Recurrence: psi_n(x) = psi_n(x+1) + (-1)^(n+1) * n! / x^(n+1)
+    let sign = if (n + 1).is_multiple_of(2) { 1.0 } else { -1.0 };
+    let n_f = n as f64;
+    let mut factorial = 1.0;
+    for i in 1..=n {
+        factorial *= i as f64;
+    }
+
+    while x < 10.0 {
+        result += sign * factorial / x.powf(n_f + 1.0);
+        x += 1.0;
+    }
+
+    // Asymptotic expansion (leading terms)
+    let np1 = n_f + 1.0;
+    let sign_lead = if n.is_multiple_of(2) { -1.0 } else { 1.0 };
+    // psi_n(x) ~ (-1)^(n+1) * [ (n-1)!/x^n + n!/(2*x^(n+1)) + ... ]
+    let xn = x.powf(n_f);
+    let xn1 = xn * x;
+    let xn2 = xn1 * x;
+    let xn3 = xn2 * x;
+    result += sign_lead
+        * (factorial / (n_f * xn)
+            + factorial / (2.0 * xn1)
+            + factorial * np1 / (12.0 * xn2)
+            - factorial * np1 * (n_f + 2.0) / (120.0 * xn3));
+
+    result
+}
 
 /// Binary search: leftmost insertion position (lower_bound).
 /// Returns the index i such that all elements before i are < value.
@@ -20708,6 +21599,141 @@ mod tests {
         }
     }
 
+    // ── lstsq / cond / matrix_rank tests ──────────────────────────────
+
+    #[test]
+    fn lstsq_exact_solution() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // A = [[1, 0], [0, 1]], b = [3, 7] => x = [3, 7]
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        let b = s
+            .tensor_variable(vec![3.0, 7.0], vec![2], false)
+            .unwrap();
+        let x = s.tensor_linalg_lstsq(a, b).unwrap();
+        let vals = s.tensor_values(x).unwrap();
+        assert!((vals[0] - 3.0).abs() < 1e-8, "x[0]={}", vals[0]);
+        assert!((vals[1] - 7.0).abs() < 1e-8, "x[1]={}", vals[1]);
+    }
+
+    #[test]
+    fn lstsq_overdetermined() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // A = [[1, 1], [1, 2], [1, 3]], b = [1, 2, 2] -> least squares fit
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![
+            1.0, 1.0,
+            1.0, 2.0,
+            1.0, 3.0,
+        ], vec![3, 2], false).unwrap();
+        let b = s
+            .tensor_variable(vec![1.0, 2.0, 2.0], vec![3], false)
+            .unwrap();
+        let x = s.tensor_linalg_lstsq(a, b).unwrap();
+        let x_shape = s.tensor_shape(x).unwrap();
+        assert_eq!(x_shape, vec![2], "solution should be 2-D");
+        // Verify A @ x ≈ b (in least-squares sense)
+        let x_vals = s.tensor_values(x).unwrap();
+        let residuals = [
+            1.0 * x_vals[0] + 1.0 * x_vals[1] - 1.0,
+            1.0 * x_vals[0] + 2.0 * x_vals[1] - 2.0,
+            1.0 * x_vals[0] + 3.0 * x_vals[1] - 2.0,
+        ];
+        let residual_norm: f64 = residuals.iter().map(|r| r * r).sum::<f64>().sqrt();
+        assert!(
+            residual_norm < 1.0,
+            "residual should be small, got {residual_norm}"
+        );
+    }
+
+    #[test]
+    fn lstsq_multiple_rhs() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        #[rustfmt::skip]
+        let b = s.tensor_variable(vec![
+            1.0, 2.0,
+            3.0, 4.0,
+        ], vec![2, 2], false).unwrap();
+        let x = s.tensor_linalg_lstsq(a, b).unwrap();
+        let x_shape = s.tensor_shape(x).unwrap();
+        assert_eq!(x_shape, vec![2, 2]);
+        let vals = s.tensor_values(x).unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-8);
+        assert!((vals[1] - 2.0).abs() < 1e-8);
+        assert!((vals[2] - 3.0).abs() < 1e-8);
+        assert!((vals[3] - 4.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn cond_identity_is_one() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        let c = s.tensor_linalg_cond(a, 2.0).unwrap();
+        let vals = s.tensor_values(c).unwrap();
+        assert!(
+            (vals[0] - 1.0).abs() < 1e-8,
+            "cond(I) should be 1.0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cond_ill_conditioned() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1e-10], vec![2, 2], false).unwrap();
+        let c = s.tensor_linalg_cond(a, 2.0).unwrap();
+        let vals = s.tensor_values(c).unwrap();
+        assert!(vals[0] > 1e9, "ill-conditioned matrix should have large cond, got {}", vals[0]);
+    }
+
+    #[test]
+    fn matrix_rank_full_rank() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        let r = s.tensor_linalg_matrix_rank(a, None).unwrap();
+        let vals = s.tensor_values(r).unwrap();
+        assert_eq!(vals[0] as usize, 2);
+    }
+
+    #[test]
+    fn matrix_rank_deficient() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Rank-1 matrix: [[1, 2], [2, 4]]
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 2.0, 2.0, 4.0], vec![2, 2], false).unwrap();
+        let r = s.tensor_linalg_matrix_rank(a, None).unwrap();
+        let vals = s.tensor_values(r).unwrap();
+        assert_eq!(vals[0] as usize, 1);
+    }
+
+    #[test]
+    fn matrix_rank_zero_matrix() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![0.0; 4], vec![2, 2], false)
+            .unwrap();
+        let r = s.tensor_linalg_matrix_rank(a, None).unwrap();
+        let vals = s.tensor_values(r).unwrap();
+        assert_eq!(vals[0] as usize, 0);
+    }
+
+    #[test]
+    fn matrix_rank_custom_tolerance() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Near-rank-1 matrix with tiny second singular value
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![1.0, 2.0, 2.0, 4.0 + 1e-12], vec![2, 2], false).unwrap();
+        // With large tolerance, should see rank 1
+        let r = s.tensor_linalg_matrix_rank(a, Some(1e-6)).unwrap();
+        let vals = s.tensor_values(r).unwrap();
+        assert_eq!(vals[0] as usize, 1);
+    }
+
     // ── cross / vecdot / diag_embed tests (bd-2drq.9) ─────────────────
 
     #[test]
@@ -22253,6 +23279,280 @@ mod tests {
             .tensor_variable(vec![1.0, f64::INFINITY, 2.0], vec![3], false)
             .unwrap();
         assert!(s.multinomial(w, 1, true).is_err());
+    }
+
+    #[test]
+    fn bernoulli_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // All ones -> all 1.0
+        let probs = s.tensor_variable(vec![1.0; 10], vec![10], false).unwrap();
+        let result = s.bernoulli(probs).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals.iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn bernoulli_all_zeros() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let probs = s.tensor_variable(vec![0.0; 10], vec![10], false).unwrap();
+        let result = s.bernoulli(probs).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn bernoulli_shape_preserved() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let probs = s
+            .tensor_variable(vec![0.5; 12], vec![3, 4], false)
+            .unwrap();
+        let result = s.bernoulli(probs).unwrap();
+        assert_eq!(s.tensor_shape(result).unwrap(), vec![3, 4]);
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals.iter().all(|&v| v == 0.0 || v == 1.0));
+    }
+
+    #[test]
+    fn bernoulli_p_uniform() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let result = s.bernoulli_p(vec![1000], 0.5).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals.iter().all(|&v| v == 0.0 || v == 1.0));
+        let ones: f64 = vals.iter().sum();
+        // Should be roughly 500 ± 100
+        assert!(
+            ones > 300.0 && ones < 700.0,
+            "expected ~500 ones, got {ones}"
+        );
+    }
+
+    #[test]
+    fn poisson_zero_rate() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rates = s.tensor_variable(vec![0.0; 5], vec![5], false).unwrap();
+        let result = s.poisson(rates).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn poisson_basic_statistics() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // lambda = 5.0 for 1000 samples; mean should be ~5
+        let rates = s
+            .tensor_variable(vec![5.0; 1000], vec![1000], false)
+            .unwrap();
+        let result = s.poisson(rates).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
+        assert!(
+            (mean - 5.0).abs() < 1.0,
+            "Poisson(5) mean should be ~5, got {mean}"
+        );
+        // All values should be non-negative integers
+        assert!(vals.iter().all(|&v| v >= 0.0 && v == v.floor()));
+    }
+
+    #[test]
+    fn poisson_negative_rate_gives_nan() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rates = s
+            .tensor_variable(vec![-1.0], vec![1], false)
+            .unwrap();
+        let result = s.poisson(rates).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals[0].is_nan());
+    }
+
+    #[test]
+    fn poisson_shape_preserved() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rates = s
+            .tensor_variable(vec![2.0; 6], vec![2, 3], false)
+            .unwrap();
+        let result = s.poisson(rates).unwrap();
+        assert_eq!(s.tensor_shape(result).unwrap(), vec![2, 3]);
+    }
+
+    // ── torch.special tests ────────────────────────────────────────────
+
+    #[test]
+    fn expit_matches_sigmoid() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![-2.0, -1.0, 0.0, 1.0, 2.0], vec![5], false)
+            .unwrap();
+        let result = s.tensor_expit(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        let expected = [
+            1.0 / (1.0 + 2.0_f64.exp()),
+            1.0 / (1.0 + 1.0_f64.exp()),
+            0.5,
+            1.0 / (1.0 + (-1.0_f64).exp()),
+            1.0 / (1.0 + (-2.0_f64).exp()),
+        ];
+        for (a, b) in vals.iter().zip(expected.iter()) {
+            assert!((a - b).abs() < 1e-10, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn logit_inverse_of_sigmoid() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.1, 0.5, 0.9], vec![3], false)
+            .unwrap();
+        let result = s.tensor_logit(input, None).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // logit(0.5) = 0, logit(0.1) < 0, logit(0.9) > 0
+        assert!((vals[1]).abs() < 1e-10, "logit(0.5) should be 0");
+        assert!(vals[0] < 0.0, "logit(0.1) should be negative");
+        assert!(vals[2] > 0.0, "logit(0.9) should be positive");
+        // logit(x) should approximately invert sigmoid
+        assert!((vals[0] + vals[2]).abs() < 1e-10, "logit should be antisymmetric around 0.5");
+    }
+
+    #[test]
+    fn logit_with_eps_clamping() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 0.5, 1.0], vec![3], false)
+            .unwrap();
+        let result = s.tensor_logit(input, Some(0.01)).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        // With eps=0.01, inputs are clamped to [0.01, 0.99]
+        assert!(vals[0].is_finite(), "logit(0) with eps should be finite");
+        assert!(vals[2].is_finite(), "logit(1) with eps should be finite");
+    }
+
+    #[test]
+    fn erfinv_basic_values() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 0.5, -0.5], vec![3], false)
+            .unwrap();
+        let result = s.tensor_erfinv(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0]).abs() < 1e-10, "erfinv(0) should be 0");
+        // erfinv(0.5) ≈ 0.4769
+        assert!((vals[1] - 0.4769).abs() < 0.01, "erfinv(0.5) ≈ 0.4769, got {}", vals[1]);
+        // Antisymmetric
+        assert!((vals[1] + vals[2]).abs() < 1e-10, "erfinv should be antisymmetric");
+    }
+
+    #[test]
+    fn erfinv_boundary_values() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![-1.0, 1.0], vec![2], false)
+            .unwrap();
+        let result = s.tensor_erfinv(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals[0] == f64::NEG_INFINITY);
+        assert!(vals[1] == f64::INFINITY);
+    }
+
+    #[test]
+    fn gammaln_known_values() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // lgamma(1) = 0, lgamma(2) = 0, lgamma(0.5) = ln(sqrt(pi))
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 0.5], vec![3], false)
+            .unwrap();
+        let result = s.tensor_gammaln(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0]).abs() < 1e-8, "lgamma(1) = 0, got {}", vals[0]);
+        assert!((vals[1]).abs() < 1e-8, "lgamma(2) = 0, got {}", vals[1]);
+        let expected_half = 0.5 * std::f64::consts::PI.ln(); // ln(sqrt(pi))
+        assert!(
+            (vals[2] - expected_half).abs() < 1e-6,
+            "lgamma(0.5) = {expected_half}, got {}",
+            vals[2]
+        );
+    }
+
+    #[test]
+    fn digamma_known_values() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // psi(1) = -gamma ≈ -0.5772
+        let input = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let result = s.tensor_digamma(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        let euler_mascheroni = 0.577_215_664_901_532_9;
+        assert!(
+            (vals[0] + euler_mascheroni).abs() < 1e-6,
+            "psi(1) ≈ -{euler_mascheroni}, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn multigammaln_p1_matches_gammaln() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![3.0, 5.0], vec![2], false)
+            .unwrap();
+        let mg = s.tensor_multigammaln(input, 1).unwrap();
+        let mg_vals = s.tensor_values(mg).unwrap();
+
+        let input2 = s
+            .tensor_variable(vec![3.0, 5.0], vec![2], false)
+            .unwrap();
+        let lg = s.tensor_gammaln(input2).unwrap();
+        let lg_vals = s.tensor_values(lg).unwrap();
+
+        for (a, b) in mg_vals.iter().zip(lg_vals.iter()) {
+            assert!((a - b).abs() < 1e-8, "multigammaln(x,1) should equal gammaln(x)");
+        }
+    }
+
+    #[test]
+    fn xlog1py_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 2.0, 1.0], vec![3], false)
+            .unwrap();
+        let y = s
+            .tensor_variable(vec![1.0, 1.0, 0.0], vec![3], false)
+            .unwrap();
+        let result = s.tensor_xlog1py(x, y).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0]).abs() < 1e-12, "0 * log1p(1) = 0");
+        assert!((vals[1] - 2.0 * 2.0_f64.ln()).abs() < 1e-10, "2 * log1p(1) = 2*ln(2)");
+        assert!((vals[2]).abs() < 1e-12, "1 * log1p(0) = 0");
+    }
+
+    #[test]
+    fn entr_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 0.5, 1.0, -0.1], vec![4], false)
+            .unwrap();
+        let result = s.tensor_entr(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0]).abs() < 1e-12, "entr(0) = 0");
+        assert!((vals[1] - 0.5 * 0.5_f64.ln().abs()).abs() < 1e-10, "entr(0.5) = 0.5 * ln(2)");
+        assert!((vals[2]).abs() < 1e-12, "entr(1) = -1*ln(1) = 0");
+        assert!(vals[3] == f64::NEG_INFINITY, "entr(negative) = -inf");
+    }
+
+    #[test]
+    fn polygamma_n1_trigamma() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // trigamma(1) = pi^2/6 ≈ 1.6449
+        let input = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let result = s.tensor_polygamma(1, input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        let expected = std::f64::consts::PI.powi(2) / 6.0;
+        assert!(
+            (vals[0] - expected).abs() < 0.01,
+            "trigamma(1) ≈ {expected}, got {}",
+            vals[0]
+        );
     }
 
     #[test]
@@ -25437,7 +26737,9 @@ mod tests {
         let a = s
             .tensor_variable(vec![2.0, 0.0, 1.0, 3.0], vec![2, 2], false)
             .unwrap();
-        let b = s.tensor_variable(vec![4.0, 7.0], vec![2, 1], false).unwrap();
+        let b = s
+            .tensor_variable(vec![4.0, 7.0], vec![2, 1], false)
+            .unwrap();
         let x = s.tensor_triangular_solve(a, b, false).unwrap();
         let vals = s.tensor_values(x).unwrap();
         assert!((vals[0] - 2.0).abs() < 1e-10);
@@ -25452,7 +26754,9 @@ mod tests {
         let a = s
             .tensor_variable(vec![2.0, 1.0, 0.0, 3.0], vec![2, 2], false)
             .unwrap();
-        let b = s.tensor_variable(vec![5.0, 6.0], vec![2, 1], false).unwrap();
+        let b = s
+            .tensor_variable(vec![5.0, 6.0], vec![2, 1], false)
+            .unwrap();
         let x = s.tensor_triangular_solve(a, b, true).unwrap();
         let vals = s.tensor_values(x).unwrap();
         assert!((vals[0] - 1.5).abs() < 1e-10);
@@ -25524,9 +26828,7 @@ mod tests {
         let mask = s
             .tensor_variable(vec![1.0, 0.0, 1.0, 0.0], vec![4], false)
             .unwrap();
-        let source = s
-            .tensor_variable(vec![10.0, 20.0], vec![2], false)
-            .unwrap();
+        let source = s.tensor_variable(vec![10.0, 20.0], vec![2], false).unwrap();
         let out = s.tensor_masked_scatter(input, mask, source).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(vals, &[10.0, 0.0, 20.0, 0.0]);

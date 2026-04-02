@@ -86,7 +86,7 @@ inner (generalized inner product), addr (rank-1 update: beta*M + alpha*v1⊗v2),
 meshgrid, diagonal (with offset support), one_hot
 
 ### Random Operations
-rand (uniform [0,1)), randn (normal), rand_like, randn_like (deterministic xoshiro256++ PRNG)
+rand (uniform [0,1)), randn (normal), rand_like, randn_like, randint, randperm, multinomial, bernoulli, bernoulli_p, poisson (deterministic xoshiro256++ PRNG)
 
 ### In-Place Operations
 tensor_add_, tensor_sub_, tensor_mul_, tensor_div_, tensor_zero_, tensor_fill_, tensor_mul_scalar_, tensor_add_scalar_
@@ -101,7 +101,7 @@ index_select, gather, scatter, scatter_add, scatter_reduce (sum/prod/mean/amax/a
 sort, topk, argsort, kthvalue
 
 ### Linear Algebra
-svd, qr, cholesky, cholesky_solve, cholesky_inverse, det, slogdet, inv, pinverse, solve, eigh, matrix_power, matrix_exp, linalg_vector_norm, triangular_solve, matrix_norm (fro/1/-1/inf/-inf)
+svd, qr, cholesky, cholesky_solve, cholesky_inverse, det, slogdet, inv, pinverse, solve, eigh, matrix_power, matrix_exp, linalg_vector_norm, triangular_solve, matrix_norm (fro/1/-1/inf/-inf), lstsq, cond, matrix_rank
 
 ### Statistical / Histogram Operations
 bincount (with weights, minlength), histc (with auto-range, clamping)
@@ -135,6 +135,12 @@ cov (covariance matrix), corrcoef (Pearson correlation), mode (most frequent val
 
 ### Padding
 tensor_pad (constant padding, PyTorch F.pad convention)
+
+### torch.special Functions
+expit (sigmoid), logit, erfinv, gammaln (lgamma), digamma, polygamma, multigammaln, xlog1py, entr, xlogy
+
+### Parameter Initialization (torch.nn.init)
+constant_, zeros_, ones_, uniform_, normal_, trunc_normal_, eye_, xavier_uniform_, xavier_normal_, kaiming_uniform_, kaiming_normal_, orthogonal_, sparse_, dirac_, calculate_gain
 
 ## Current Green Scope
 

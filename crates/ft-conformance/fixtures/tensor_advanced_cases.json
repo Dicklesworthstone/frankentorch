@@ -113,6 +113,52 @@
       "expected_shape": [6],
       "contract_ids": ["CPU-KERNEL-ADV-010"],
       "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "cov_identical_rows",
+      "op": "cov",
+      "input": [1.0, 2.0, 3.0, 1.0, 2.0, 3.0],
+      "input_shape": [2, 3],
+      "expected_output": [1.0, 1.0, 1.0, 1.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-ADV-011"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "corrcoef_negative_linear",
+      "op": "corrcoef",
+      "input": [1.0, 2.0, 3.0, 3.0, 2.0, 1.0],
+      "input_shape": [2, 3],
+      "expected_output": [1.0, -1.0, -1.0, 1.0],
+      "expected_shape": [2, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-ADV-012"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "mode_last_dim_tracks_indices",
+      "op": "mode",
+      "input": [1.0, 1.0, 2.0, 3.0, 3.0, 3.0],
+      "input_shape": [2, 3],
+      "expected_output": [1.0, 3.0],
+      "expected_shape": [2],
+      "expected_indices": [1, 2],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-ADV-013"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
+    },
+    {
+      "name": "quantile_linear_interpolation",
+      "op": "quantile",
+      "input": [0.0, 10.0],
+      "input_shape": [2],
+      "q": 0.25,
+      "expected_output": [2.5],
+      "expected_shape": [1],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-ADV-014"],
+      "e2e_scenarios": ["cpu_kernel:advanced"]
     }
   ]
 }

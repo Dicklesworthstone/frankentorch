@@ -12366,6 +12366,367 @@ impl Module for PairwiseDistance {
     }
 }
 
+// ── torch.nn.init — Parameter initialization functions ─────────────────────
+
+/// Fill tensor with a constant value. Equivalent to `torch.nn.init.constant_`.
+pub fn init_constant_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    val: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let numel: usize = shape.iter().product();
+    let new_values = vec![val; numel];
+    session.tensor_update_param_values(tensor, new_values)?;
+    Ok(tensor)
+}
+
+/// Fill tensor with zeros. Equivalent to `torch.nn.init.zeros_`.
+pub fn init_zeros_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+) -> Result<TensorNodeId, AutogradError> {
+    init_constant_(session, tensor, 0.0)
+}
+
+/// Fill tensor with ones. Equivalent to `torch.nn.init.ones_`.
+pub fn init_ones_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+) -> Result<TensorNodeId, AutogradError> {
+    init_constant_(session, tensor, 1.0)
+}
+
+/// Fill tensor with values from U(a, b). Equivalent to `torch.nn.init.uniform_`.
+pub fn init_uniform_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    a: f64,
+    b: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let numel: usize = shape.iter().product();
+    // Generate uniform [0,1) then scale to [a, b)
+    let rand_node = session.rand(vec![numel], false)?;
+    let rand_vals = session.tensor_values(rand_node)?;
+    let new_values: Vec<f64> = rand_vals.iter().map(|&v| a + (b - a) * v).collect();
+    session.tensor_update_param_values(tensor, new_values)?;
+    Ok(tensor)
+}
+
+/// Fill tensor with values from N(mean, std^2). Equivalent to `torch.nn.init.normal_`.
+pub fn init_normal_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    mean: f64,
+    std: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let numel: usize = shape.iter().product();
+    let randn_node = session.randn(vec![numel], false)?;
+    let randn_vals = session.tensor_values(randn_node)?;
+    let new_values: Vec<f64> = randn_vals.iter().map(|&v| mean + std * v).collect();
+    session.tensor_update_param_values(tensor, new_values)?;
+    Ok(tensor)
+}
+
+/// Fill tensor with values from a truncated normal distribution.
+/// Values are drawn from N(mean, std^2) and resampled if they fall outside
+/// [a, b]. Equivalent to `torch.nn.init.trunc_normal_`.
+pub fn init_trunc_normal_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    mean: f64,
+    std: f64,
+    a: f64,
+    b: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let numel: usize = shape.iter().product();
+    let mut values = Vec::with_capacity(numel);
+    // Generate in batches, rejecting out-of-range samples
+    let mut remaining = numel;
+    while remaining > 0 {
+        let batch_size = remaining * 2 + 64; // over-generate
+        let randn_node = session.randn(vec![batch_size], false)?;
+        let randn_vals = session.tensor_values(randn_node)?;
+        for &v in &randn_vals {
+            if remaining == 0 {
+                break;
+            }
+            let scaled = mean + std * v;
+            if scaled >= a && scaled <= b {
+                values.push(scaled);
+                remaining -= 1;
+            }
+        }
+    }
+    session.tensor_update_param_values(tensor, values)?;
+    Ok(tensor)
+}
+
+/// Fill a 2-D tensor with the identity matrix. Equivalent to `torch.nn.init.eye_`.
+pub fn init_eye_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    if shape.len() != 2 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "eye_ requires a 2-D tensor",
+            },
+        )));
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    let mut values = vec![0.0; rows * cols];
+    let diag_len = rows.min(cols);
+    for i in 0..diag_len {
+        values[i * cols + i] = 1.0;
+    }
+    session.tensor_update_param_values(tensor, values)?;
+    Ok(tensor)
+}
+
+/// Compute fan_in and fan_out for a tensor shape.
+///
+/// Convention (matching PyTorch):
+/// - 1-D: fan_in = fan_out = shape[0]
+/// - 2-D: fan_in = shape[1], fan_out = shape[0]
+/// - ≥3-D: receptive_field = product of shape[2..], fan_in = shape[1] * rf, fan_out = shape[0] * rf
+fn calculate_fan_in_fan_out(shape: &[usize]) -> Result<(usize, usize), AutogradError> {
+    if shape.is_empty() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "fan_in/fan_out requires at least 1 dimension",
+            },
+        )));
+    }
+    if shape.len() == 1 {
+        return Ok((shape[0], shape[0]));
+    }
+    let fan_in;
+    let fan_out;
+    if shape.len() == 2 {
+        fan_in = shape[1];
+        fan_out = shape[0];
+    } else {
+        let receptive_field: usize = shape[2..].iter().product();
+        fan_in = shape[1] * receptive_field;
+        fan_out = shape[0] * receptive_field;
+    }
+    Ok((fan_in, fan_out))
+}
+
+/// Gain value for different nonlinearities, matching `torch.nn.init.calculate_gain`.
+pub fn calculate_gain(nonlinearity: &str, param: Option<f64>) -> f64 {
+    match nonlinearity {
+        "linear" | "conv1d" | "conv2d" | "conv3d" | "conv_transpose1d" | "conv_transpose2d"
+        | "conv_transpose3d" | "sigmoid" => 1.0,
+        "tanh" => 5.0 / 3.0,
+        "relu" => (2.0_f64).sqrt(),
+        "leaky_relu" => {
+            let negative_slope = param.unwrap_or(0.01);
+            (2.0 / (1.0 + negative_slope * negative_slope)).sqrt()
+        }
+        "selu" => 0.75,
+        _ => 1.0,
+    }
+}
+
+/// Xavier (Glorot) uniform initialization. Equivalent to `torch.nn.init.xavier_uniform_`.
+///
+/// Fills with values from U(-a, a) where a = gain * sqrt(6 / (fan_in + fan_out)).
+pub fn init_xavier_uniform_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    gain: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let (fan_in, fan_out) = calculate_fan_in_fan_out(&shape)?;
+    let a = gain * (6.0 / (fan_in + fan_out) as f64).sqrt();
+    init_uniform_(session, tensor, -a, a)
+}
+
+/// Xavier (Glorot) normal initialization. Equivalent to `torch.nn.init.xavier_normal_`.
+///
+/// Fills with values from N(0, std^2) where std = gain * sqrt(2 / (fan_in + fan_out)).
+pub fn init_xavier_normal_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    gain: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let (fan_in, fan_out) = calculate_fan_in_fan_out(&shape)?;
+    let std = gain * (2.0 / (fan_in + fan_out) as f64).sqrt();
+    init_normal_(session, tensor, 0.0, std)
+}
+
+/// Kaiming (He) uniform initialization. Equivalent to `torch.nn.init.kaiming_uniform_`.
+///
+/// Fills with values from U(-bound, bound) where bound = gain * sqrt(3 / fan).
+/// `mode` is "fan_in" (default) or "fan_out".
+pub fn init_kaiming_uniform_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    a: f64,
+    mode: &str,
+    nonlinearity: &str,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let (fan_in, fan_out) = calculate_fan_in_fan_out(&shape)?;
+    let fan = if mode == "fan_out" { fan_out } else { fan_in };
+    let gain = calculate_gain(nonlinearity, Some(a));
+    let std = gain / (fan as f64).sqrt();
+    let bound = (3.0_f64).sqrt() * std;
+    init_uniform_(session, tensor, -bound, bound)
+}
+
+/// Kaiming (He) normal initialization. Equivalent to `torch.nn.init.kaiming_normal_`.
+///
+/// Fills with values from N(0, std^2) where std = gain / sqrt(fan).
+/// `mode` is "fan_in" (default) or "fan_out".
+pub fn init_kaiming_normal_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    a: f64,
+    mode: &str,
+    nonlinearity: &str,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    let (fan_in, fan_out) = calculate_fan_in_fan_out(&shape)?;
+    let fan = if mode == "fan_out" { fan_out } else { fan_in };
+    let gain = calculate_gain(nonlinearity, Some(a));
+    let std = gain / (fan as f64).sqrt();
+    init_normal_(session, tensor, 0.0, std)
+}
+
+/// Orthogonal initialization. Equivalent to `torch.nn.init.orthogonal_`.
+///
+/// Fills a ≥2-D tensor with a (semi-)orthogonal matrix via QR decomposition.
+pub fn init_orthogonal_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    gain: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    if shape.len() < 2 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "orthogonal_ requires at least a 2-D tensor",
+            },
+        )));
+    }
+    let rows = shape[0];
+    let cols: usize = shape[1..].iter().product();
+
+    // Generate random matrix and compute QR
+    let rand_node = session.randn(vec![rows, cols], false)?;
+    let (q, _r) = session.tensor_linalg_qr(rand_node, true)?;
+    let q_shape = session.tensor_shape(q)?;
+
+    // If rows < cols, Q is [rows, rows]; we need to pad or use the transpose approach
+    // If rows >= cols, Q is [rows, cols] which is what we want
+    let q_vals = session.tensor_values(q)?;
+    let q_rows = q_shape[0];
+    let q_cols = q_shape[1];
+
+    let numel: usize = shape.iter().product();
+    let mut values = vec![0.0; numel];
+
+    // Copy Q into the result, scaling by gain
+    for r in 0..rows.min(q_rows) {
+        for c in 0..cols.min(q_cols) {
+            values[r * cols + c] = gain * q_vals[r * q_cols + c];
+        }
+    }
+
+    session.tensor_update_param_values(tensor, values)?;
+    Ok(tensor)
+}
+
+/// Sparse initialization. Equivalent to `torch.nn.init.sparse_`.
+///
+/// Fills a 2-D tensor as a sparse matrix where a fraction of elements in each
+/// column are set to zero, and the rest are drawn from N(0, std^2).
+pub fn init_sparse_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+    sparsity: f64,
+    std: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    if shape.len() != 2 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "sparse_ requires a 2-D tensor",
+            },
+        )));
+    }
+    let (rows, cols) = (shape[0], shape[1]);
+    let num_zeros_per_col = (rows as f64 * sparsity).ceil() as usize;
+
+    // Start with normal-distributed values
+    init_normal_(session, tensor, 0.0, std)?;
+    let mut values = session.tensor_values(tensor)?;
+
+    // For each column, zero out a random selection of rows
+    // Use a simple deterministic approach based on session RNG
+    let rand_node = session.rand(vec![rows * cols], false)?;
+    let rand_vals = session.tensor_values(rand_node)?;
+
+    for j in 0..cols {
+        // Collect (random_key, row_index) for this column, sort by key, zero the top entries
+        let mut col_indices: Vec<(u64, usize)> = (0..rows)
+            .map(|i| (rand_vals[i * cols + j].to_bits(), i))
+            .collect();
+        col_indices.sort_unstable();
+        for &(_, row) in col_indices.iter().take(num_zeros_per_col) {
+            values[row * cols + j] = 0.0;
+        }
+    }
+
+    session.tensor_update_param_values(tensor, values)?;
+    Ok(tensor)
+}
+
+/// Dirac initialization. Equivalent to `torch.nn.init.dirac_`.
+///
+/// Fills a {3, 4, 5}-D tensor with the Dirac delta function.
+/// Preserves the identity of the inputs in convolution layers.
+pub fn init_dirac_(
+    session: &mut FrankenTorchSession,
+    tensor: TensorNodeId,
+) -> Result<TensorNodeId, AutogradError> {
+    let shape = session.tensor_shape(tensor)?;
+    if shape.len() < 3 || shape.len() > 5 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "dirac_ requires a 3, 4, or 5-D tensor",
+            },
+        )));
+    }
+    let numel: usize = shape.iter().product();
+    let mut values = vec![0.0; numel];
+
+    let out_channels = shape[0];
+    let in_channels = shape[1];
+    let min_channels = out_channels.min(in_channels);
+    let spatial: usize = shape[2..].iter().product();
+    let center = spatial / 2; // center of the spatial kernel
+
+    for i in 0..min_channels {
+        // For channel pair (i, i), set the center spatial element to 1.0
+        let offset = i * in_channels * spatial + i * spatial + center;
+        if offset < numel {
+            values[offset] = 1.0;
+        }
+    }
+
+    session.tensor_update_param_values(tensor, values)?;
+    Ok(tensor)
+}
+
 #[cfg(test)]
 mod tests {
     use ft_api::FrankenTorchSession;
@@ -21148,5 +21509,235 @@ mod tests {
         assert!(m.is_training());
         m.eval();
         assert!(!m.is_training());
+    }
+
+    // ── nn.init Tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn init_constant_fills_value() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 6], vec![2, 3], true).unwrap();
+        init_constant_(&mut s, t, 42.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert!(vals.iter().all(|&v| (v - 42.0).abs() < 1e-12));
+    }
+
+    #[test]
+    fn init_zeros_and_ones() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![5.0; 4], vec![4], true).unwrap();
+        init_zeros_(&mut s, t).unwrap();
+        assert!(s.tensor_values(t).unwrap().iter().all(|&v| v == 0.0));
+
+        init_ones_(&mut s, t).unwrap();
+        assert!(s.tensor_values(t).unwrap().iter().all(|&v| v == 1.0));
+    }
+
+    #[test]
+    fn init_uniform_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 1000], vec![1000], true)
+            .unwrap();
+        init_uniform_(&mut s, t, -3.0, 3.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert!(vals.iter().all(|&v| (-3.0..=3.0).contains(&v)));
+        // Check that we're not all the same value (extremely unlikely)
+        let first = vals[0];
+        assert!(vals.iter().any(|&v| (v - first).abs() > 1e-6));
+    }
+
+    #[test]
+    fn init_normal_statistics() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 10000], vec![10000], true)
+            .unwrap();
+        init_normal_(&mut s, t, 5.0, 2.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
+        let var: f64 = vals.iter().map(|&v| (v - mean).powi(2)).sum::<f64>() / vals.len() as f64;
+        // Loose bounds: mean ~5, std ~2
+        assert!((mean - 5.0).abs() < 0.2, "mean={mean}");
+        assert!((var.sqrt() - 2.0).abs() < 0.2, "std={}", var.sqrt());
+    }
+
+    #[test]
+    fn init_trunc_normal_within_bounds() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 500], vec![500], true).unwrap();
+        init_trunc_normal_(&mut s, t, 0.0, 1.0, -2.0, 2.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert!(vals.iter().all(|&v| (-2.0..=2.0).contains(&v)));
+    }
+
+    #[test]
+    fn init_eye_identity() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 9], vec![3, 3], true).unwrap();
+        init_eye_(&mut s, t).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        let expected = vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0];
+        assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn init_eye_non_square() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 6], vec![2, 3], true).unwrap();
+        init_eye_(&mut s, t).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        assert_eq!(vals, vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn init_eye_rejects_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 3], vec![3], true).unwrap();
+        assert!(init_eye_(&mut s, t).is_err());
+    }
+
+    #[test]
+    fn init_xavier_uniform_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 600], vec![20, 30], true)
+            .unwrap();
+        init_xavier_uniform_(&mut s, t, 1.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        let bound = (6.0 / 50.0_f64).sqrt(); // sqrt(6 / (20+30))
+        assert!(
+            vals.iter()
+                .all(|&v| (-bound - 1e-10..=bound + 1e-10).contains(&v)),
+            "values should be in [-{bound}, {bound}]"
+        );
+    }
+
+    #[test]
+    fn init_xavier_normal_statistics() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 10000], vec![100, 100], true)
+            .unwrap();
+        init_xavier_normal_(&mut s, t, 1.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
+        assert!((mean).abs() < 0.05, "mean should be ~0, got {mean}");
+    }
+
+    #[test]
+    fn init_kaiming_uniform_relu() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 500], vec![50, 10], true)
+            .unwrap();
+        init_kaiming_uniform_(&mut s, t, 0.0, "fan_in", "relu").unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        // gain = sqrt(2), std = sqrt(2)/sqrt(10), bound = sqrt(3)*std
+        let gain = (2.0_f64).sqrt();
+        let std = gain / (10.0_f64).sqrt();
+        let bound = (3.0_f64).sqrt() * std;
+        assert!(
+            vals.iter()
+                .all(|&v| (-bound - 1e-10..=bound + 1e-10).contains(&v)),
+            "values should be in [-{bound}, {bound}]"
+        );
+    }
+
+    #[test]
+    fn init_kaiming_normal_fan_out() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 5000], vec![50, 100], true)
+            .unwrap();
+        init_kaiming_normal_(&mut s, t, 0.01, "fan_out", "leaky_relu").unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
+        assert!(mean.abs() < 0.1, "mean should be ~0, got {mean}");
+    }
+
+    #[test]
+    fn init_orthogonal_preserves_orthonormality() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 25], vec![5, 5], true).unwrap();
+        init_orthogonal_(&mut s, t, 1.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        // Check Q^T Q ≈ I: dot products of different rows should be ~0
+        for i in 0..5 {
+            for j in 0..5 {
+                let dot: f64 = (0..5).map(|k| vals[i * 5 + k] * vals[j * 5 + k]).sum();
+                if i == j {
+                    assert!(
+                        (dot - 1.0).abs() < 0.1,
+                        "diagonal dot({i},{j})={dot}, expected ~1"
+                    );
+                } else {
+                    assert!(
+                        dot.abs() < 0.1,
+                        "off-diagonal dot({i},{j})={dot}, expected ~0"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn init_sparse_zeros_fraction() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0; 100], vec![10, 10], true)
+            .unwrap();
+        init_sparse_(&mut s, t, 0.5, 1.0).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        let zero_count = vals.iter().filter(|&&v| v == 0.0).count();
+        // ~50% should be zero (5 per column * 10 columns = 50)
+        assert!((30..=70).contains(&zero_count), "zero_count={zero_count}");
+    }
+
+    #[test]
+    fn init_sparse_rejects_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 10], vec![10], true).unwrap();
+        assert!(init_sparse_(&mut s, t, 0.5, 1.0).is_err());
+    }
+
+    #[test]
+    fn init_dirac_3d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [out=2, in=2, kernel=3]
+        let t = s
+            .tensor_variable(vec![0.0; 12], vec![2, 2, 3], true)
+            .unwrap();
+        init_dirac_(&mut s, t).unwrap();
+        let vals = s.tensor_values(t).unwrap();
+        // center = 3/2 = 1
+        // channel (0,0): offset = 0*2*3 + 0*3 + 1 = 1
+        // channel (1,1): offset = 1*2*3 + 1*3 + 1 = 10
+        assert!((vals[1] - 1.0).abs() < 1e-12, "dirac delta at (0,0,center)");
+        assert!(
+            (vals[10] - 1.0).abs() < 1e-12,
+            "dirac delta at (1,1,center)"
+        );
+        // Everything else should be zero
+        let non_dirac_sum: f64 = vals.iter().sum::<f64>() - 2.0;
+        assert!(non_dirac_sum.abs() < 1e-12);
+    }
+
+    #[test]
+    fn init_dirac_rejects_2d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![0.0; 6], vec![2, 3], true).unwrap();
+        assert!(init_dirac_(&mut s, t).is_err());
+    }
+
+    #[test]
+    fn calculate_gain_values() {
+        assert!((calculate_gain("linear", None) - 1.0).abs() < 1e-12);
+        assert!((calculate_gain("tanh", None) - 5.0 / 3.0).abs() < 1e-12);
+        assert!((calculate_gain("relu", None) - (2.0_f64).sqrt()).abs() < 1e-12);
+        assert!((calculate_gain("selu", None) - 0.75).abs() < 1e-12);
+        let leaky_gain = calculate_gain("leaky_relu", Some(0.2));
+        let expected = (2.0_f64 / (1.0 + 0.04)).sqrt();
+        assert!((leaky_gain - expected).abs() < 1e-12);
     }
 }

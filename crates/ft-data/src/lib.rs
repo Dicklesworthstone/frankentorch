@@ -767,7 +767,7 @@ impl<D: Dataset> TransformDataset<D> {
     pub fn new(dataset: D, transform: Box<dyn Transform>) -> Self {
         Self {
             inner: dataset,
-            transform: transform,
+            transform,
         }
     }
 }
