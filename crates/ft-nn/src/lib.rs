@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-
+// RNN utils, init functions, and module implementations
 use std::collections::BTreeMap;
 
 use ft_api::FrankenTorchSession;
@@ -12366,6 +12366,262 @@ impl Module for PairwiseDistance {
     }
 }
 
+// ── torch.nn.utils.rnn — Variable-length sequence utilities ────────────────
+
+/// A packed representation of variable-length sequences.
+///
+/// Equivalent to `torch.nn.utils.rnn.PackedSequence`.
+/// Stores all sequence elements sorted by length in a flat tensor,
+/// along with batch sizes at each timestep.
+pub struct PackedSequence {
+    /// Flattened packed data as a tensor node.
+    pub data: TensorNodeId,
+    /// Number of active sequences at each timestep (descending).
+    pub batch_sizes: Vec<usize>,
+    /// Original indices to unsort the sequences.
+    pub sorted_indices: Vec<usize>,
+    /// Inverse of sorted_indices to restore original order.
+    pub unsorted_indices: Vec<usize>,
+}
+
+/// Pack a padded batch of variable-length sequences.
+///
+/// Equivalent to `torch.nn.utils.rnn.pack_padded_sequence(input, lengths, batch_first, enforce_sorted)`.
+///
+/// `input` shape: `[T, B, *]` (or `[B, T, *]` if `batch_first=true`).
+/// `lengths`: actual lengths of each sequence in the batch.
+///
+/// Returns a `PackedSequence` with sequences sorted by length (descending).
+pub fn pack_padded_sequence(
+    session: &mut FrankenTorchSession,
+    input: TensorNodeId,
+    lengths: &[usize],
+    batch_first: bool,
+    enforce_sorted: bool,
+) -> Result<PackedSequence, AutogradError> {
+    let shape = session.tensor_shape(input)?;
+    let storage = session.tensor_values(input)?;
+
+    let (max_len, batch_size) = if batch_first {
+        (shape[1], shape[0])
+    } else {
+        (shape[0], shape[1])
+    };
+
+    if lengths.len() != batch_size {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: lengths must match batch size",
+            },
+        )));
+    }
+
+    // Sort sequences by length (descending)
+    let mut indexed_lengths: Vec<(usize, usize)> =
+        lengths.iter().copied().enumerate().collect();
+
+    if enforce_sorted {
+        // Verify already sorted descending
+        for i in 1..indexed_lengths.len() {
+            if indexed_lengths[i].1 > indexed_lengths[i - 1].1 {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "pack_padded_sequence: sequences must be sorted by length (descending) when enforce_sorted=true",
+                    },
+                )));
+            }
+        }
+    } else {
+        indexed_lengths.sort_by_key(|b| std::cmp::Reverse(b.1));
+    }
+
+    let sorted_indices: Vec<usize> = indexed_lengths.iter().map(|&(i, _)| i).collect();
+    let sorted_lengths: Vec<usize> = indexed_lengths.iter().map(|&(_, l)| l).collect();
+
+    let mut unsorted_indices = vec![0usize; batch_size];
+    for (new_pos, &orig_idx) in sorted_indices.iter().enumerate() {
+        unsorted_indices[orig_idx] = new_pos;
+    }
+
+    // Feature size (product of dimensions after [T, B] or [B, T])
+    let feature_size: usize = shape[2..].iter().product::<usize>().max(1);
+
+    // Compute batch_sizes: at timestep t, how many sequences are still active
+    let mut batch_sizes = Vec::with_capacity(max_len);
+    for t in 0..max_len {
+        let count = sorted_lengths.iter().filter(|&&l| l > t).count();
+        if count == 0 {
+            break;
+        }
+        batch_sizes.push(count);
+    }
+
+    // Pack data: for each timestep, emit elements for active sequences (in sorted order)
+    let mut packed_data = Vec::new();
+    for (t, &bs) in batch_sizes.iter().enumerate() {
+        for &orig_batch in sorted_indices.iter().take(bs) {
+            let offset = if batch_first {
+                (orig_batch * max_len + t) * feature_size
+            } else {
+                (t * batch_size + orig_batch) * feature_size
+            };
+            packed_data.extend_from_slice(&storage[offset..offset + feature_size]);
+        }
+    }
+
+    let total_elements = packed_data.len();
+    let data_shape = if feature_size == 1 {
+        vec![total_elements]
+    } else {
+        vec![total_elements / feature_size, feature_size]
+    };
+    let data = session.tensor_variable(packed_data, data_shape, false)?;
+
+    Ok(PackedSequence {
+        data,
+        batch_sizes,
+        sorted_indices,
+        unsorted_indices,
+    })
+}
+
+/// Unpack a `PackedSequence` back into a padded tensor.
+///
+/// Equivalent to `torch.nn.utils.rnn.pad_packed_sequence(sequence, batch_first, padding_value, total_length)`.
+///
+/// Returns `(padded_output, lengths)`.
+pub fn pad_packed_sequence(
+    session: &mut FrankenTorchSession,
+    packed: &PackedSequence,
+    batch_first: bool,
+    padding_value: f64,
+    total_length: Option<usize>,
+) -> Result<(TensorNodeId, Vec<usize>), AutogradError> {
+    let packed_data = session.tensor_values(packed.data)?;
+    let packed_shape = session.tensor_shape(packed.data)?;
+
+    let feature_size = if packed_shape.len() > 1 {
+        packed_shape[1]
+    } else {
+        1
+    };
+
+    let batch_size = packed.batch_sizes[0]; // first timestep has all sequences
+    let max_len = packed.batch_sizes.len();
+    let out_len = total_length.unwrap_or(max_len);
+
+    // Recover sorted lengths from batch_sizes
+    let mut sorted_lengths = vec![0usize; batch_size];
+    for (t, &bs) in packed.batch_sizes.iter().enumerate() {
+        for len in sorted_lengths.iter_mut().take(bs) {
+            *len = t + 1;
+        }
+    }
+
+    // Unsort lengths to original order
+    let lengths: Vec<usize> = packed
+        .unsorted_indices
+        .iter()
+        .map(|&sorted_pos| sorted_lengths[sorted_pos])
+        .collect();
+
+    // Build padded output
+    let total = batch_size * out_len * feature_size;
+    let mut output = vec![padding_value; total];
+
+    let mut data_offset = 0;
+    for (t, &bs) in packed.batch_sizes.iter().enumerate() {
+        for s in 0..bs {
+            let orig_batch = packed.sorted_indices[s];
+            let out_offset = if batch_first {
+                (orig_batch * out_len + t) * feature_size
+            } else {
+                (t * batch_size + orig_batch) * feature_size
+            };
+            output[out_offset..out_offset + feature_size]
+                .copy_from_slice(&packed_data[data_offset..data_offset + feature_size]);
+            data_offset += feature_size;
+        }
+    }
+
+    let out_shape = if batch_first {
+        if feature_size > 1 {
+            vec![batch_size, out_len, feature_size]
+        } else {
+            vec![batch_size, out_len]
+        }
+    } else if feature_size > 1 {
+        vec![out_len, batch_size, feature_size]
+    } else {
+        vec![out_len, batch_size]
+    };
+
+    let padded = session.tensor_variable(output, out_shape, false)?;
+    Ok((padded, lengths))
+}
+
+/// Pad a list of variable-length tensors into a single padded tensor.
+///
+/// Equivalent to `torch.nn.utils.rnn.pad_sequence(sequences, batch_first, padding_value)`.
+///
+/// Each sequence is a tensor of shape `[L_i, *]`. Returns a padded tensor
+/// of shape `[B, T, *]` (batch_first=true) or `[T, B, *]` (batch_first=false).
+pub fn pad_sequence(
+    session: &mut FrankenTorchSession,
+    sequences: &[TensorNodeId],
+    batch_first: bool,
+    padding_value: f64,
+) -> Result<TensorNodeId, AutogradError> {
+    if sequences.is_empty() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_sequence: sequences must not be empty",
+            },
+        )));
+    }
+
+    let mut max_len = 0usize;
+    let mut shapes = Vec::with_capacity(sequences.len());
+    for &seq in sequences {
+        let s = session.tensor_shape(seq)?;
+        if s[0] > max_len {
+            max_len = s[0];
+        }
+        shapes.push(s);
+    }
+
+    let feature_shape = &shapes[0][1..];
+    let feature_size: usize = feature_shape.iter().product::<usize>().max(1);
+    let batch_size = sequences.len();
+
+    let total = batch_size * max_len * feature_size;
+    let mut output = vec![padding_value; total];
+
+    for (b, &seq) in sequences.iter().enumerate() {
+        let vals = session.tensor_values(seq)?;
+        let seq_len = shapes[b][0];
+        for t in 0..seq_len {
+            let src_offset = t * feature_size;
+            let dst_offset = if batch_first {
+                (b * max_len + t) * feature_size
+            } else {
+                (t * batch_size + b) * feature_size
+            };
+            output[dst_offset..dst_offset + feature_size]
+                .copy_from_slice(&vals[src_offset..src_offset + feature_size]);
+        }
+    }
+
+    let mut out_shape = if batch_first {
+        vec![batch_size, max_len]
+    } else {
+        vec![max_len, batch_size]
+    };
+    out_shape.extend_from_slice(feature_shape);
+
+    session.tensor_variable(output, out_shape, false)
+}
+
 // ── torch.nn.init — Parameter initialization functions ─────────────────────
 
 /// Fill tensor with a constant value. Equivalent to `torch.nn.init.constant_`.
@@ -21509,6 +21765,116 @@ mod tests {
         assert!(m.is_training());
         m.eval();
         assert!(!m.is_training());
+    }
+
+    // ── RNN utils tests ──────────────────────────────────────────────────
+
+    #[test]
+    fn pack_padded_roundtrip() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [T=4, B=3] with lengths [4, 2, 3] -> pack -> unpack should recover original
+        #[rustfmt::skip]
+        let input = s.tensor_variable(vec![
+            1.0, 2.0, 3.0,  // t=0
+            4.0, 5.0, 6.0,  // t=1
+            7.0, 0.0, 8.0,  // t=2 (seq 1 padded)
+            9.0, 0.0, 0.0,  // t=3 (seq 1,2 padded)
+        ], vec![4, 3], false).unwrap();
+
+        let packed = pack_padded_sequence(&mut s, input, &[4, 2, 3], false, false).unwrap();
+        assert_eq!(packed.batch_sizes, vec![3, 3, 2, 1]);
+
+        let (unpacked, lengths) = pad_packed_sequence(&mut s, &packed, false, 0.0, None).unwrap();
+        let vals = s.tensor_values(unpacked).unwrap();
+        let shape = s.tensor_shape(unpacked).unwrap();
+        assert_eq!(shape, vec![4, 3]);
+        assert_eq!(lengths, vec![4, 2, 3]);
+
+        // Verify non-padded values match
+        assert!((vals[0] - 1.0).abs() < 1e-10); // t=0, b=0
+        assert!((vals[1] - 2.0).abs() < 1e-10); // t=0, b=1
+        assert!((vals[2] - 3.0).abs() < 1e-10); // t=0, b=2
+        assert!((vals[3] - 4.0).abs() < 1e-10); // t=1, b=0
+        assert!((vals[4] - 5.0).abs() < 1e-10); // t=1, b=1
+        assert!((vals[5] - 6.0).abs() < 1e-10); // t=1, b=2
+        assert!((vals[6] - 7.0).abs() < 1e-10); // t=2, b=0
+        assert!((vals[8] - 8.0).abs() < 1e-10); // t=2, b=2
+        assert!((vals[9] - 9.0).abs() < 1e-10); // t=3, b=0
+    }
+
+    #[test]
+    fn pack_padded_batch_first_roundtrip() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [B=2, T=3] with lengths [3, 1]
+        #[rustfmt::skip]
+        let input = s.tensor_variable(vec![
+            10.0, 20.0, 30.0,  // seq 0
+            40.0,  0.0,  0.0,  // seq 1 (padded after 1)
+        ], vec![2, 3], false).unwrap();
+
+        let packed = pack_padded_sequence(&mut s, input, &[3, 1], true, false).unwrap();
+        assert_eq!(packed.batch_sizes, vec![2, 1, 1]);
+
+        let (unpacked, lengths) =
+            pad_packed_sequence(&mut s, &packed, true, 0.0, None).unwrap();
+        let vals = s.tensor_values(unpacked).unwrap();
+        assert_eq!(s.tensor_shape(unpacked).unwrap(), vec![2, 3]);
+        assert_eq!(lengths, vec![3, 1]);
+        assert!((vals[0] - 10.0).abs() < 1e-10);
+        assert!((vals[1] - 20.0).abs() < 1e-10);
+        assert!((vals[2] - 30.0).abs() < 1e-10);
+        assert!((vals[3] - 40.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pack_padded_enforce_sorted_rejects_unsorted() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0; 6], vec![3, 2], false)
+            .unwrap();
+        // lengths [1, 3] are NOT sorted descending
+        assert!(
+            pack_padded_sequence(&mut s, input, &[1, 3], false, true).is_err()
+        );
+    }
+
+    #[test]
+    fn pad_sequence_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let seq1 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let seq2 = s
+            .tensor_variable(vec![4.0, 5.0], vec![2], false)
+            .unwrap();
+        let seq3 = s.tensor_variable(vec![6.0], vec![1], false).unwrap();
+
+        let padded = pad_sequence(&mut s, &[seq1, seq2, seq3], true, 0.0).unwrap();
+        let shape = s.tensor_shape(padded).unwrap();
+        assert_eq!(shape, vec![3, 3]); // [B=3, T=3]
+        let vals = s.tensor_values(padded).unwrap();
+        // seq1: [1, 2, 3]
+        // seq2: [4, 5, 0]
+        // seq3: [6, 0, 0]
+        assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 0.0, 6.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn pad_sequence_time_first() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let seq1 = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let seq2 = s
+            .tensor_variable(vec![3.0, 4.0, 5.0], vec![3], false)
+            .unwrap();
+
+        let padded = pad_sequence(&mut s, &[seq1, seq2], false, -1.0).unwrap();
+        let shape = s.tensor_shape(padded).unwrap();
+        assert_eq!(shape, vec![3, 2]); // [T=3, B=2]
+        let vals = s.tensor_values(padded).unwrap();
+        // t=0: [1, 3], t=1: [2, 4], t=2: [-1, 5]
+        assert_eq!(vals, vec![1.0, 3.0, 2.0, 4.0, -1.0, 5.0]);
     }
 
     // ── nn.init Tests ──────────────────────────────────────────────────

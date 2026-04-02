@@ -1787,10 +1787,7 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.bernoulli(input)`.
     /// `input` contains probabilities in [0, 1]. Returns a tensor of the same shape
     /// with values 0.0 or 1.0 sampled from Bernoulli(p) for each element p.
-    pub fn bernoulli(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn bernoulli(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let probs = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         let values: Vec<f64> = probs
@@ -1822,10 +1819,7 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.poisson(input)`.
     /// Each element of `input` is the rate parameter λ; returns integer samples
     /// (as f64) from Poisson(λ) for each element.
-    pub fn poisson(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn poisson(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let rates = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
 
@@ -9137,9 +9131,31 @@ impl FrankenTorchSession {
             self.tensor_variable(vec![cond], vec![1], false)
         } else {
             // For other norms: cond(A) = norm(A, p) * norm(inv(A), p)
-            let norm_a = self.tensor_matrix_norm(input, if p == f64::INFINITY { "inf" } else if p == f64::NEG_INFINITY { "-inf" } else if p == 1.0 { "1" } else { "fro" })?;
+            let norm_a = self.tensor_matrix_norm(
+                input,
+                if p == f64::INFINITY {
+                    "inf"
+                } else if p == f64::NEG_INFINITY {
+                    "-inf"
+                } else if p == 1.0 {
+                    "1"
+                } else {
+                    "fro"
+                },
+            )?;
             let inv = self.tensor_linalg_inv(input)?;
-            let norm_inv = self.tensor_matrix_norm(inv, if p == f64::INFINITY { "inf" } else if p == f64::NEG_INFINITY { "-inf" } else if p == 1.0 { "1" } else { "fro" })?;
+            let norm_inv = self.tensor_matrix_norm(
+                inv,
+                if p == f64::INFINITY {
+                    "inf"
+                } else if p == f64::NEG_INFINITY {
+                    "-inf"
+                } else if p == 1.0 {
+                    "1"
+                } else {
+                    "fro"
+                },
+            )?;
 
             let norm_a_val = self.tensor_values(norm_a)?[0];
             let norm_inv_val = self.tensor_values(norm_inv)?[0];
@@ -9782,10 +9798,7 @@ impl FrankenTorchSession {
     /// Element-wise sigmoid (expit) function: 1 / (1 + exp(-x)).
     ///
     /// Equivalent to `torch.special.expit(input)`.
-    pub fn tensor_expit(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_expit(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         // expit is identical to sigmoid
         self.tensor_sigmoid(input)
     }
@@ -9830,19 +9843,13 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.special.erfinv(input)`.
     /// Uses a rational approximation (Winitzki, 2008).
-    pub fn tensor_erfinv(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_erfinv(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (storage, meta) = {
             let tensor = self.tensor_tape.tensor(input)?;
             (tensor.storage().to_vec(), tensor.meta().clone())
         };
 
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| erfinv_approx(x))
-            .collect();
+        let values: Vec<f64> = storage.iter().map(|&x| erfinv_approx(x)).collect();
 
         let out = self
             .tensor_tape
@@ -9857,19 +9864,13 @@ impl FrankenTorchSession {
     /// Element-wise natural logarithm of the absolute value of the gamma function.
     ///
     /// Equivalent to `torch.special.gammaln(input)` / `torch.lgamma(input)`.
-    pub fn tensor_gammaln(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_gammaln(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (storage, meta) = {
             let tensor = self.tensor_tape.tensor(input)?;
             (tensor.storage().to_vec(), tensor.meta().clone())
         };
 
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| lgamma_approx(x))
-            .collect();
+        let values: Vec<f64> = storage.iter().map(|&x| lgamma_approx(x)).collect();
 
         let out = self
             .tensor_tape
@@ -9884,19 +9885,13 @@ impl FrankenTorchSession {
     /// Element-wise digamma (psi) function: d/dx ln(Gamma(x)).
     ///
     /// Equivalent to `torch.special.digamma(input)`.
-    pub fn tensor_digamma(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_digamma(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (storage, meta) = {
             let tensor = self.tensor_tape.tensor(input)?;
             (tensor.storage().to_vec(), tensor.meta().clone())
         };
 
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| digamma_approx(x))
-            .collect();
+        let values: Vec<f64> = storage.iter().map(|&x| digamma_approx(x)).collect();
 
         let out = self
             .tensor_tape
@@ -9926,10 +9921,7 @@ impl FrankenTorchSession {
             (tensor.storage().to_vec(), tensor.meta().clone())
         };
 
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| polygamma_approx(n, x))
-            .collect();
+        let values: Vec<f64> = storage.iter().map(|&x| polygamma_approx(n, x)).collect();
 
         let out = self
             .tensor_tape
@@ -10007,13 +9999,11 @@ impl FrankenTorchSession {
         let values: Vec<f64> = x_vals
             .iter()
             .zip(y_vals.iter())
-            .map(|(&xi, &yi)| {
-                if xi == 0.0 {
-                    0.0
-                } else {
-                    xi * (1.0 + yi).ln()
-                }
-            })
+            .map(
+                |(&xi, &yi)| {
+                    if xi == 0.0 { 0.0 } else { xi * (1.0 + yi).ln() }
+                },
+            )
             .collect();
 
         let out = self
@@ -10030,10 +10020,7 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.special.entr(input)`.
     /// Returns 0 when x == 0 and -inf when x < 0.
-    pub fn tensor_entr(
-        &mut self,
-        input: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
+    pub fn tensor_entr(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (storage, meta) = {
             let tensor = self.tensor_tape.tensor(input)?;
             (tensor.storage().to_vec(), tensor.meta().clone())
@@ -10279,6 +10266,383 @@ impl FrankenTorchSession {
         let permuted = self.tensor_permute(reshaped, vec![0, 1, 3, 5, 2, 4])?;
         // reshape to (N, C*r*r, H/r, W/r)
         self.tensor_reshape(permuted, vec![batch, channels * r * r, oh, ow])
+    }
+
+    // ── F.interpolate ────────────────────────────────────────────────────
+
+    /// Interpolate (resize) a tensor using the specified mode.
+    ///
+    /// Equivalent to `torch.nn.functional.interpolate(input, size, scale_factor, mode, align_corners)`.
+    ///
+    /// Supports:
+    /// - 3-D input `[N, C, L]` (temporal): nearest, linear
+    /// - 4-D input `[N, C, H, W]` (spatial): nearest, bilinear, bicubic
+    /// - 5-D input `[N, C, D, H, W]` (volumetric): nearest, trilinear
+    ///
+    /// Either `size` or `scale_factor` must be provided (not both).
+    /// `align_corners` applies only to linear/bilinear/bicubic/trilinear modes.
+    pub fn tensor_interpolate(
+        &mut self,
+        input: TensorNodeId,
+        size: Option<Vec<usize>>,
+        scale_factor: Option<Vec<f64>>,
+        mode: &str,
+        align_corners: Option<bool>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+        let shape = meta.shape();
+        let ndim = shape.len();
+
+        if !(3..=5).contains(&ndim) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "interpolate: input must be 3-D, 4-D, or 5-D",
+                },
+            )));
+        }
+
+        if size.is_some() && scale_factor.is_some() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "interpolate: only one of size or scale_factor should be defined",
+                },
+            )));
+        }
+
+        let spatial_dims = ndim - 2;
+        let in_spatial: Vec<usize> = shape[2..].to_vec();
+
+        let out_spatial: Vec<usize> = if let Some(ref s) = size {
+            if s.len() != spatial_dims {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "interpolate: size length must match spatial dimensions",
+                    },
+                )));
+            }
+            s.clone()
+        } else if let Some(ref sf) = scale_factor {
+            if sf.len() != spatial_dims {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "interpolate: scale_factor length must match spatial dimensions",
+                    },
+                )));
+            }
+            in_spatial
+                .iter()
+                .zip(sf.iter())
+                .map(|(&d, &s)| (d as f64 * s).floor() as usize)
+                .collect()
+        } else {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "interpolate: either size or scale_factor must be provided",
+                },
+            )));
+        };
+
+        let batch = shape[0];
+        let channels = shape[1];
+        let align = align_corners.unwrap_or(false);
+
+        match mode {
+            "nearest" => self.interpolate_nearest(&storage, batch, channels, &in_spatial, &out_spatial),
+            "linear" if spatial_dims == 1 => self.interpolate_linear_1d(&storage, batch, channels, in_spatial[0], out_spatial[0], align),
+            "bilinear" if spatial_dims == 2 => self.interpolate_bilinear(&storage, batch, channels, &in_spatial, &out_spatial, align),
+            "bicubic" if spatial_dims == 2 => self.interpolate_bicubic(&storage, batch, channels, &in_spatial, &out_spatial, align),
+            "trilinear" if spatial_dims == 3 => self.interpolate_trilinear(&storage, batch, channels, &in_spatial, &out_spatial, align),
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "interpolate: unsupported mode for given input dimensionality",
+                },
+            ))),
+        }
+    }
+
+    fn interpolate_nearest(
+        &mut self,
+        storage: &[f64],
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let spatial_dims = in_spatial.len();
+        let out_numel: usize = out_spatial.iter().product();
+        let in_numel: usize = in_spatial.iter().product();
+        let total = batch * channels * out_numel;
+        let mut values = Vec::with_capacity(total);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                let base = (b * channels + c) * in_numel;
+                match spatial_dims {
+                    1 => {
+                        for oi in 0..out_spatial[0] {
+                            let ii = (oi as f64 * in_spatial[0] as f64 / out_spatial[0] as f64).floor() as usize;
+                            values.push(storage[base + ii.min(in_spatial[0] - 1)]);
+                        }
+                    }
+                    2 => {
+                        let (ih, iw) = (in_spatial[0], in_spatial[1]);
+                        let (oh, ow) = (out_spatial[0], out_spatial[1]);
+                        for oy in 0..oh {
+                            let iy = ((oy as f64 * ih as f64 / oh as f64).floor() as usize).min(ih - 1);
+                            for ox in 0..ow {
+                                let ix = ((ox as f64 * iw as f64 / ow as f64).floor() as usize).min(iw - 1);
+                                values.push(storage[base + iy * iw + ix]);
+                            }
+                        }
+                    }
+                    3 => {
+                        let (id, ih, iw) = (in_spatial[0], in_spatial[1], in_spatial[2]);
+                        let (od, oh, ow) = (out_spatial[0], out_spatial[1], out_spatial[2]);
+                        for oz in 0..od {
+                            let iz = ((oz as f64 * id as f64 / od as f64).floor() as usize).min(id - 1);
+                            for oy in 0..oh {
+                                let iy = ((oy as f64 * ih as f64 / oh as f64).floor() as usize).min(ih - 1);
+                                for ox in 0..ow {
+                                    let ix = ((ox as f64 * iw as f64 / ow as f64).floor() as usize).min(iw - 1);
+                                    values.push(storage[base + iz * ih * iw + iy * iw + ix]);
+                                }
+                            }
+                        }
+                    }
+                    _ => unreachable!(),
+                }
+            }
+        }
+
+        let mut out_shape = vec![batch, channels];
+        out_shape.extend_from_slice(out_spatial);
+        self.tensor_variable(values, out_shape, false)
+    }
+
+    fn interpolate_linear_1d(
+        &mut self,
+        storage: &[f64],
+        batch: usize,
+        channels: usize,
+        in_len: usize,
+        out_len: usize,
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let total = batch * channels * out_len;
+        let mut values = Vec::with_capacity(total);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                let base = (b * channels + c) * in_len;
+                for oi in 0..out_len {
+                    let src = if align_corners && out_len > 1 {
+                        oi as f64 * (in_len - 1) as f64 / (out_len - 1) as f64
+                    } else {
+                        (oi as f64 + 0.5) * in_len as f64 / out_len as f64 - 0.5
+                    };
+                    let src = src.max(0.0);
+                    let lo = (src.floor() as usize).min(in_len - 1);
+                    let hi = (lo + 1).min(in_len - 1);
+                    let t = src - lo as f64;
+                    values.push(storage[base + lo] * (1.0 - t) + storage[base + hi] * t);
+                }
+            }
+        }
+
+        self.tensor_variable(values, vec![batch, channels, out_len], false)
+    }
+
+    fn interpolate_bilinear(
+        &mut self,
+        storage: &[f64],
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (ih, iw) = (in_spatial[0], in_spatial[1]);
+        let (oh, ow) = (out_spatial[0], out_spatial[1]);
+        let total = batch * channels * oh * ow;
+        let mut values = Vec::with_capacity(total);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                let base = (b * channels + c) * ih * iw;
+                for oy in 0..oh {
+                    let src_y = if align_corners && oh > 1 {
+                        oy as f64 * (ih - 1) as f64 / (oh - 1) as f64
+                    } else {
+                        (oy as f64 + 0.5) * ih as f64 / oh as f64 - 0.5
+                    };
+                    let src_y = src_y.max(0.0);
+                    let y0 = (src_y.floor() as usize).min(ih - 1);
+                    let y1 = (y0 + 1).min(ih - 1);
+                    let ty = src_y - y0 as f64;
+
+                    for ox in 0..ow {
+                        let src_x = if align_corners && ow > 1 {
+                            ox as f64 * (iw - 1) as f64 / (ow - 1) as f64
+                        } else {
+                            (ox as f64 + 0.5) * iw as f64 / ow as f64 - 0.5
+                        };
+                        let src_x = src_x.max(0.0);
+                        let x0 = (src_x.floor() as usize).min(iw - 1);
+                        let x1 = (x0 + 1).min(iw - 1);
+                        let tx = src_x - x0 as f64;
+
+                        let v00 = storage[base + y0 * iw + x0];
+                        let v01 = storage[base + y0 * iw + x1];
+                        let v10 = storage[base + y1 * iw + x0];
+                        let v11 = storage[base + y1 * iw + x1];
+
+                        let val = v00 * (1.0 - ty) * (1.0 - tx)
+                            + v01 * (1.0 - ty) * tx
+                            + v10 * ty * (1.0 - tx)
+                            + v11 * ty * tx;
+                        values.push(val);
+                    }
+                }
+            }
+        }
+
+        self.tensor_variable(values, vec![batch, channels, oh, ow], false)
+    }
+
+    fn interpolate_bicubic(
+        &mut self,
+        storage: &[f64],
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (ih, iw) = (in_spatial[0], in_spatial[1]);
+        let (oh, ow) = (out_spatial[0], out_spatial[1]);
+        let total = batch * channels * oh * ow;
+        let mut values = Vec::with_capacity(total);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                let base = (b * channels + c) * ih * iw;
+                for oy in 0..oh {
+                    let src_y = if align_corners && oh > 1 {
+                        oy as f64 * (ih - 1) as f64 / (oh - 1) as f64
+                    } else {
+                        (oy as f64 + 0.5) * ih as f64 / oh as f64 - 0.5
+                    };
+                    let src_y = src_y.max(0.0).min((ih - 1) as f64);
+                    let iy = src_y.floor() as i64;
+                    let ty = src_y - iy as f64;
+
+                    for ox in 0..ow {
+                        let src_x = if align_corners && ow > 1 {
+                            ox as f64 * (iw - 1) as f64 / (ow - 1) as f64
+                        } else {
+                            (ox as f64 + 0.5) * iw as f64 / ow as f64 - 0.5
+                        };
+                        let src_x = src_x.max(0.0).min((iw - 1) as f64);
+                        let ix = src_x.floor() as i64;
+                        let tx = src_x - ix as f64;
+
+                        let mut val = 0.0;
+                        for dy in -1..=2_i64 {
+                            let wy = cubic_weight(ty - dy as f64);
+                            let sy = (iy + dy).clamp(0, ih as i64 - 1) as usize;
+                            for dx in -1..=2_i64 {
+                                let wx = cubic_weight(tx - dx as f64);
+                                let sx = (ix + dx).clamp(0, iw as i64 - 1) as usize;
+                                val += wy * wx * storage[base + sy * iw + sx];
+                            }
+                        }
+                        values.push(val);
+                    }
+                }
+            }
+        }
+
+        self.tensor_variable(values, vec![batch, channels, oh, ow], false)
+    }
+
+    fn interpolate_trilinear(
+        &mut self,
+        storage: &[f64],
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (id, ih, iw) = (in_spatial[0], in_spatial[1], in_spatial[2]);
+        let (od, oh, ow) = (out_spatial[0], out_spatial[1], out_spatial[2]);
+        let total = batch * channels * od * oh * ow;
+        let mut values = Vec::with_capacity(total);
+
+        for b in 0..batch {
+            for c in 0..channels {
+                let base = (b * channels + c) * id * ih * iw;
+                for oz in 0..od {
+                    let src_z = if align_corners && od > 1 {
+                        oz as f64 * (id - 1) as f64 / (od - 1) as f64
+                    } else {
+                        (oz as f64 + 0.5) * id as f64 / od as f64 - 0.5
+                    };
+                    let src_z = src_z.max(0.0);
+                    let z0 = (src_z.floor() as usize).min(id - 1);
+                    let z1 = (z0 + 1).min(id - 1);
+                    let tz = src_z - z0 as f64;
+
+                    for oy in 0..oh {
+                        let src_y = if align_corners && oh > 1 {
+                            oy as f64 * (ih - 1) as f64 / (oh - 1) as f64
+                        } else {
+                            (oy as f64 + 0.5) * ih as f64 / oh as f64 - 0.5
+                        };
+                        let src_y = src_y.max(0.0);
+                        let y0 = (src_y.floor() as usize).min(ih - 1);
+                        let y1 = (y0 + 1).min(ih - 1);
+                        let ty = src_y - y0 as f64;
+
+                        for ox in 0..ow {
+                            let src_x = if align_corners && ow > 1 {
+                                ox as f64 * (iw - 1) as f64 / (ow - 1) as f64
+                            } else {
+                                (ox as f64 + 0.5) * iw as f64 / ow as f64 - 0.5
+                            };
+                            let src_x = src_x.max(0.0);
+                            let x0 = (src_x.floor() as usize).min(iw - 1);
+                            let x1 = (x0 + 1).min(iw - 1);
+                            let tx = src_x - x0 as f64;
+
+                            let v000 = storage[base + z0 * ih * iw + y0 * iw + x0];
+                            let v001 = storage[base + z0 * ih * iw + y0 * iw + x1];
+                            let v010 = storage[base + z0 * ih * iw + y1 * iw + x0];
+                            let v011 = storage[base + z0 * ih * iw + y1 * iw + x1];
+                            let v100 = storage[base + z1 * ih * iw + y0 * iw + x0];
+                            let v101 = storage[base + z1 * ih * iw + y0 * iw + x1];
+                            let v110 = storage[base + z1 * ih * iw + y1 * iw + x0];
+                            let v111 = storage[base + z1 * ih * iw + y1 * iw + x1];
+
+                            let val = v000 * (1.0 - tz) * (1.0 - ty) * (1.0 - tx)
+                                + v001 * (1.0 - tz) * (1.0 - ty) * tx
+                                + v010 * (1.0 - tz) * ty * (1.0 - tx)
+                                + v011 * (1.0 - tz) * ty * tx
+                                + v100 * tz * (1.0 - ty) * (1.0 - tx)
+                                + v101 * tz * (1.0 - ty) * tx
+                                + v110 * tz * ty * (1.0 - tx)
+                                + v111 * tz * ty * tx;
+                            values.push(val);
+                        }
+                    }
+                }
+            }
+        }
+
+        self.tensor_variable(values, vec![batch, channels, od, oh, ow], false)
     }
 
     // ── FFT operations ───────────────────────────────────────────────────
@@ -11680,6 +12044,21 @@ pub use ft_autograd::{
 /// Inverse error function approximation (Winitzki 2008, refined).
 ///
 /// Accurate to ~1e-9 over [-1, 1].
+/// Cubic interpolation weight (Keys, 1981 / Catmull-Rom spline, a = -0.75).
+///
+/// Used by bicubic interpolation in F.interpolate.
+fn cubic_weight(x: f64) -> f64 {
+    let a = -0.75; // PyTorch default
+    let abs_x = x.abs();
+    if abs_x <= 1.0 {
+        (a + 2.0) * abs_x * abs_x * abs_x - (a + 3.0) * abs_x * abs_x + 1.0
+    } else if abs_x <= 2.0 {
+        a * abs_x * abs_x * abs_x - 5.0 * a * abs_x * abs_x + 8.0 * a * abs_x - 4.0 * a
+    } else {
+        0.0
+    }
+}
+
 fn erfinv_approx(x: f64) -> f64 {
     if x <= -1.0 {
         return f64::NEG_INFINITY;
@@ -11741,8 +12120,7 @@ fn lgamma_approx(x: f64) -> f64 {
                 + inv_z2
                     * (-1.0 / 360.0
                         + inv_z2
-                            * (1.0 / 1260.0
-                                + inv_z2 * (-1.0 / 1680.0 + inv_z2 * 1.0 / 1188.0))));
+                            * (1.0 / 1260.0 + inv_z2 * (-1.0 / 1680.0 + inv_z2 * 1.0 / 1188.0))));
 
     stirling + shift
 }
@@ -11778,8 +12156,7 @@ fn digamma_approx(mut x: f64) -> f64 {
     // Bernoulli numbers: B2=1/6, B4=-1/30, B6=1/42, B8=-1/30, B10=5/66
     result -= x2
         * (1.0 / 12.0
-            - x2 * (1.0 / 120.0
-                - x2 * (1.0 / 252.0 - x2 * (1.0 / 240.0 - x2 * 5.0 / 660.0))));
+            - x2 * (1.0 / 120.0 - x2 * (1.0 / 252.0 - x2 * (1.0 / 240.0 - x2 * 5.0 / 660.0))));
     result
 }
 
@@ -11818,9 +12195,7 @@ fn polygamma_approx(n: u32, mut x: f64) -> f64 {
     let xn2 = xn1 * x;
     let xn3 = xn2 * x;
     result += sign_lead
-        * (factorial / (n_f * xn)
-            + factorial / (2.0 * xn1)
-            + factorial * np1 / (12.0 * xn2)
+        * (factorial / (n_f * xn) + factorial / (2.0 * xn1) + factorial * np1 / (12.0 * xn2)
             - factorial * np1 * (n_f + 2.0) / (120.0 * xn3));
 
     result
@@ -21607,9 +21982,7 @@ mod tests {
         // A = [[1, 0], [0, 1]], b = [3, 7] => x = [3, 7]
         #[rustfmt::skip]
         let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
-        let b = s
-            .tensor_variable(vec![3.0, 7.0], vec![2], false)
-            .unwrap();
+        let b = s.tensor_variable(vec![3.0, 7.0], vec![2], false).unwrap();
         let x = s.tensor_linalg_lstsq(a, b).unwrap();
         let vals = s.tensor_values(x).unwrap();
         assert!((vals[0] - 3.0).abs() < 1e-8, "x[0]={}", vals[0]);
@@ -21687,7 +22060,11 @@ mod tests {
         let a = s.tensor_variable(vec![1.0, 0.0, 0.0, 1e-10], vec![2, 2], false).unwrap();
         let c = s.tensor_linalg_cond(a, 2.0).unwrap();
         let vals = s.tensor_values(c).unwrap();
-        assert!(vals[0] > 1e9, "ill-conditioned matrix should have large cond, got {}", vals[0]);
+        assert!(
+            vals[0] > 1e9,
+            "ill-conditioned matrix should have large cond, got {}",
+            vals[0]
+        );
     }
 
     #[test]
@@ -21714,9 +22091,7 @@ mod tests {
     #[test]
     fn matrix_rank_zero_matrix() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s
-            .tensor_variable(vec![0.0; 4], vec![2, 2], false)
-            .unwrap();
+        let a = s.tensor_variable(vec![0.0; 4], vec![2, 2], false).unwrap();
         let r = s.tensor_linalg_matrix_rank(a, None).unwrap();
         let vals = s.tensor_values(r).unwrap();
         assert_eq!(vals[0] as usize, 0);
@@ -21732,6 +22107,180 @@ mod tests {
         let r = s.tensor_linalg_matrix_rank(a, Some(1e-6)).unwrap();
         let vals = s.tensor_values(r).unwrap();
         assert_eq!(vals[0] as usize, 1);
+    }
+
+    // ── F.interpolate tests ─────────────────────────────────────────────
+
+    #[test]
+    fn interpolate_nearest_2x_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4] -> [1, 1, 8] via nearest
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![8]), None, "nearest", None)
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 8]);
+        let vals = s.tensor_values(out).unwrap();
+        // Each value should be repeated twice
+        assert_eq!(vals, vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn interpolate_nearest_2d_upsample() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2, 2] -> [1, 1, 4, 4] via nearest
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, None, Some(vec![2.0, 2.0]), "nearest", None)
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4]);
+        let vals = s.tensor_values(out).unwrap();
+        #[rustfmt::skip]
+        let expected = vec![
+            1.0, 1.0, 2.0, 2.0,
+            1.0, 1.0, 2.0, 2.0,
+            3.0, 3.0, 4.0, 4.0,
+            3.0, 3.0, 4.0, 4.0,
+        ];
+        assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn interpolate_bilinear_identity() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Same size -> should preserve values
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![2, 2]), None, "bilinear", Some(true))
+            .unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        for (a, b) in vals.iter().zip([1.0, 2.0, 3.0, 4.0].iter()) {
+            assert!((a - b).abs() < 1e-10, "{a} != {b}");
+        }
+    }
+
+    #[test]
+    fn interpolate_bilinear_upsample() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2, 2] -> [1, 1, 4, 4] with align_corners=true
+        #[rustfmt::skip]
+        let input = s.tensor_variable(
+            vec![0.0, 1.0, 1.0, 0.0],
+            vec![1, 1, 2, 2], false,
+        ).unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![4, 4]), None, "bilinear", Some(true))
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4]);
+        let vals = s.tensor_values(out).unwrap();
+        // Corners should be preserved exactly
+        assert!((vals[0] - 0.0).abs() < 1e-10, "top-left");
+        assert!((vals[3] - 1.0).abs() < 1e-10, "top-right");
+        assert!((vals[12] - 1.0).abs() < 1e-10, "bottom-left");
+        assert!((vals[15] - 0.0).abs() < 1e-10, "bottom-right");
+    }
+
+    #[test]
+    fn interpolate_bicubic_shape() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0; 16], vec![1, 1, 4, 4], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![8, 8]), None, "bicubic", Some(false))
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 8, 8]);
+        // Constant input should stay constant through bicubic
+        let vals = s.tensor_values(out).unwrap();
+        for (i, &v) in vals.iter().enumerate() {
+            assert!((v - 1.0).abs() < 0.1, "bicubic constant at {i}: {v}");
+        }
+    }
+
+    #[test]
+    fn interpolate_linear_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 2] -> [1, 1, 4] with align_corners=true
+        let input = s
+            .tensor_variable(vec![0.0, 1.0], vec![1, 1, 2], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![4]), None, "linear", Some(true))
+            .unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Should be [0, 1/3, 2/3, 1] with align_corners
+        assert!((vals[0]).abs() < 1e-10);
+        assert!((vals[3] - 1.0).abs() < 1e-10);
+        // Monotonically increasing
+        for i in 1..vals.len() {
+            assert!(vals[i] >= vals[i - 1] - 1e-10);
+        }
+    }
+
+    #[test]
+    fn interpolate_trilinear_shape() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0; 8], vec![1, 1, 2, 2, 2], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![4, 4, 4]), None, "trilinear", Some(false))
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4, 4]);
+    }
+
+    #[test]
+    fn interpolate_rejects_invalid_mode() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], false)
+            .unwrap();
+        assert!(s
+            .tensor_interpolate(input, Some(vec![4, 4]), None, "linear", None)
+            .is_err());
+    }
+
+    #[test]
+    fn interpolate_rejects_both_size_and_scale() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], false)
+            .unwrap();
+        assert!(s
+            .tensor_interpolate(
+                input,
+                Some(vec![4, 4]),
+                Some(vec![2.0, 2.0]),
+                "nearest",
+                None
+            )
+            .is_err());
+    }
+
+    #[test]
+    fn interpolate_batch_channels() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [2, 3, 2, 2] -> [2, 3, 4, 4] — verify shape is correct for batched multi-channel
+        let input = s
+            .tensor_variable(vec![1.0; 24], vec![2, 3, 2, 2], false)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![4, 4]), None, "nearest", None)
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![2, 3, 4, 4]);
+        assert_eq!(s.tensor_values(out).unwrap().len(), 2 * 3 * 4 * 4);
     }
 
     // ── cross / vecdot / diag_embed tests (bd-2drq.9) ─────────────────
@@ -23303,9 +23852,7 @@ mod tests {
     #[test]
     fn bernoulli_shape_preserved() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let probs = s
-            .tensor_variable(vec![0.5; 12], vec![3, 4], false)
-            .unwrap();
+        let probs = s.tensor_variable(vec![0.5; 12], vec![3, 4], false).unwrap();
         let result = s.bernoulli(probs).unwrap();
         assert_eq!(s.tensor_shape(result).unwrap(), vec![3, 4]);
         let vals = s.tensor_values(result).unwrap();
@@ -23356,9 +23903,7 @@ mod tests {
     #[test]
     fn poisson_negative_rate_gives_nan() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let rates = s
-            .tensor_variable(vec![-1.0], vec![1], false)
-            .unwrap();
+        let rates = s.tensor_variable(vec![-1.0], vec![1], false).unwrap();
         let result = s.poisson(rates).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!(vals[0].is_nan());
@@ -23367,9 +23912,7 @@ mod tests {
     #[test]
     fn poisson_shape_preserved() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let rates = s
-            .tensor_variable(vec![2.0; 6], vec![2, 3], false)
-            .unwrap();
+        let rates = s.tensor_variable(vec![2.0; 6], vec![2, 3], false).unwrap();
         let result = s.poisson(rates).unwrap();
         assert_eq!(s.tensor_shape(result).unwrap(), vec![2, 3]);
     }
@@ -23409,7 +23952,10 @@ mod tests {
         assert!(vals[0] < 0.0, "logit(0.1) should be negative");
         assert!(vals[2] > 0.0, "logit(0.9) should be positive");
         // logit(x) should approximately invert sigmoid
-        assert!((vals[0] + vals[2]).abs() < 1e-10, "logit should be antisymmetric around 0.5");
+        assert!(
+            (vals[0] + vals[2]).abs() < 1e-10,
+            "logit should be antisymmetric around 0.5"
+        );
     }
 
     #[test]
@@ -23435,17 +23981,22 @@ mod tests {
         let vals = s.tensor_values(result).unwrap();
         assert!((vals[0]).abs() < 1e-10, "erfinv(0) should be 0");
         // erfinv(0.5) ≈ 0.4769
-        assert!((vals[1] - 0.4769).abs() < 0.01, "erfinv(0.5) ≈ 0.4769, got {}", vals[1]);
+        assert!(
+            (vals[1] - 0.4769).abs() < 0.01,
+            "erfinv(0.5) ≈ 0.4769, got {}",
+            vals[1]
+        );
         // Antisymmetric
-        assert!((vals[1] + vals[2]).abs() < 1e-10, "erfinv should be antisymmetric");
+        assert!(
+            (vals[1] + vals[2]).abs() < 1e-10,
+            "erfinv should be antisymmetric"
+        );
     }
 
     #[test]
     fn erfinv_boundary_values() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let input = s
-            .tensor_variable(vec![-1.0, 1.0], vec![2], false)
-            .unwrap();
+        let input = s.tensor_variable(vec![-1.0, 1.0], vec![2], false).unwrap();
         let result = s.tensor_erfinv(input).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!(vals[0] == f64::NEG_INFINITY);
@@ -23475,9 +24026,7 @@ mod tests {
     fn digamma_known_values() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // psi(1) = -gamma ≈ -0.5772
-        let input = s
-            .tensor_variable(vec![1.0], vec![1], false)
-            .unwrap();
+        let input = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
         let result = s.tensor_digamma(input).unwrap();
         let vals = s.tensor_values(result).unwrap();
         let euler_mascheroni = 0.577_215_664_901_532_9;
@@ -23491,20 +24040,19 @@ mod tests {
     #[test]
     fn multigammaln_p1_matches_gammaln() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let input = s
-            .tensor_variable(vec![3.0, 5.0], vec![2], false)
-            .unwrap();
+        let input = s.tensor_variable(vec![3.0, 5.0], vec![2], false).unwrap();
         let mg = s.tensor_multigammaln(input, 1).unwrap();
         let mg_vals = s.tensor_values(mg).unwrap();
 
-        let input2 = s
-            .tensor_variable(vec![3.0, 5.0], vec![2], false)
-            .unwrap();
+        let input2 = s.tensor_variable(vec![3.0, 5.0], vec![2], false).unwrap();
         let lg = s.tensor_gammaln(input2).unwrap();
         let lg_vals = s.tensor_values(lg).unwrap();
 
         for (a, b) in mg_vals.iter().zip(lg_vals.iter()) {
-            assert!((a - b).abs() < 1e-8, "multigammaln(x,1) should equal gammaln(x)");
+            assert!(
+                (a - b).abs() < 1e-8,
+                "multigammaln(x,1) should equal gammaln(x)"
+            );
         }
     }
 
@@ -23520,7 +24068,10 @@ mod tests {
         let result = s.tensor_xlog1py(x, y).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!((vals[0]).abs() < 1e-12, "0 * log1p(1) = 0");
-        assert!((vals[1] - 2.0 * 2.0_f64.ln()).abs() < 1e-10, "2 * log1p(1) = 2*ln(2)");
+        assert!(
+            (vals[1] - 2.0 * 2.0_f64.ln()).abs() < 1e-10,
+            "2 * log1p(1) = 2*ln(2)"
+        );
         assert!((vals[2]).abs() < 1e-12, "1 * log1p(0) = 0");
     }
 
@@ -23533,7 +24084,10 @@ mod tests {
         let result = s.tensor_entr(input).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!((vals[0]).abs() < 1e-12, "entr(0) = 0");
-        assert!((vals[1] - 0.5 * 0.5_f64.ln().abs()).abs() < 1e-10, "entr(0.5) = 0.5 * ln(2)");
+        assert!(
+            (vals[1] - 0.5 * 0.5_f64.ln().abs()).abs() < 1e-10,
+            "entr(0.5) = 0.5 * ln(2)"
+        );
         assert!((vals[2]).abs() < 1e-12, "entr(1) = -1*ln(1) = 0");
         assert!(vals[3] == f64::NEG_INFINITY, "entr(negative) = -inf");
     }
@@ -23542,9 +24096,7 @@ mod tests {
     fn polygamma_n1_trigamma() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // trigamma(1) = pi^2/6 ≈ 1.6449
-        let input = s
-            .tensor_variable(vec![1.0], vec![1], false)
-            .unwrap();
+        let input = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
         let result = s.tensor_polygamma(1, input).unwrap();
         let vals = s.tensor_values(result).unwrap();
         let expected = std::f64::consts::PI.powi(2) / 6.0;

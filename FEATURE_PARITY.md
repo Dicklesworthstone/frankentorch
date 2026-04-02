@@ -142,6 +142,12 @@ expit (sigmoid), logit, erfinv, gammaln (lgamma), digamma, polygamma, multigamma
 ### Parameter Initialization (torch.nn.init)
 constant_, zeros_, ones_, uniform_, normal_, trunc_normal_, eye_, xavier_uniform_, xavier_normal_, kaiming_uniform_, kaiming_normal_, orthogonal_, sparse_, dirac_, calculate_gain
 
+### Interpolation (F.interpolate)
+nearest, linear (1D), bilinear (2D), bicubic (2D), trilinear (3D) — supports size, scale_factor, align_corners
+
+### RNN Utilities (torch.nn.utils.rnn)
+PackedSequence, pack_padded_sequence, pad_packed_sequence, pad_sequence
+
 ## Current Green Scope
 
 - `crates/ft-conformance/fixtures/scalar_autograd_cases.json`
