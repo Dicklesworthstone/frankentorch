@@ -153,6 +153,22 @@ impl TensorFactoryCaseReport {
 }
 
 #[derive(Debug, Clone, PartialEq)]
+pub struct TensorInitCaseReport {
+    pub name: String,
+    pub mode: ExecutionMode,
+    pub output_ok: bool,
+    pub shape_ok: bool,
+    pub forensic_log: StructuredCaseLog,
+}
+
+impl TensorInitCaseReport {
+    #[must_use]
+    pub fn passed(&self) -> bool {
+        self.output_ok && self.shape_ok
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
 pub struct TensorEinsumCaseReport {
     pub name: String,
     pub mode: ExecutionMode,
@@ -629,6 +645,11 @@ struct TensorFactoryFixtureFile {
 }
 
 #[derive(Debug, Clone, Deserialize)]
+struct TensorInitFixtureFile {
+    cases: Vec<TensorInitCase>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
 struct TensorFactoryCase {
     name: String,
     op: String,
@@ -648,6 +669,42 @@ struct TensorFactoryCase {
     base: Option<f64>,
     #[serde(default)]
     n: Option<usize>,
+    expected_output: Vec<f64>,
+    #[serde(default)]
+    expected_shape: Option<Vec<usize>>,
+    #[serde(default)]
+    tolerance: Option<f64>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct TensorInitCase {
+    name: String,
+    op: String,
+    shape: Vec<usize>,
+    #[serde(default)]
+    val: Option<f64>,
+    #[serde(default)]
+    a: Option<f64>,
+    #[serde(default)]
+    b: Option<f64>,
+    #[serde(default)]
+    mean: Option<f64>,
+    #[serde(default)]
+    std: Option<f64>,
+    #[serde(default)]
+    gain: Option<f64>,
+    #[serde(default)]
+    groups: Option<usize>,
+    #[serde(default)]
+    mode_param: Option<String>,
+    #[serde(default)]
+    nonlinearity: Option<String>,
+    #[serde(default)]
+    sparsity: Option<f64>,
     expected_output: Vec<f64>,
     #[serde(default)]
     expected_shape: Option<Vec<usize>>,
@@ -1069,6 +1126,7 @@ impl_fixture_metadata!(
     TensorComparisonCase,
     TensorSearchsortedCase,
     TensorFactoryCase,
+    TensorInitCase,
     TensorEinsumCase,
     TensorReductionCase,
     TensorLossCase,
@@ -1447,6 +1505,10 @@ pub fn run_smoke(config: &HarnessConfig) -> HarnessReport {
         .map_or((0, 0), |(_, cases)| {
             summarize_passes(cases.iter().map(TensorBinaryCaseReport::passed))
         });
+    let (tensor_init_total, tensor_init_passed) = run_tensor_init_conformance(config, mode)
+        .map_or((0, 0), |(_, cases)| {
+            summarize_passes(cases.iter().map(TensorInitCaseReport::passed))
+        });
     let (tensor_meta_total, tensor_meta_passed) = run_tensor_meta_conformance(config, mode)
         .map_or((0, 0), |(_, cases)| {
             summarize_passes(cases.iter().map(TensorMetaCaseReport::passed))
@@ -1483,6 +1545,7 @@ pub fn run_smoke(config: &HarnessConfig) -> HarnessReport {
         strict_mode: config.strict_mode,
         cases_total: scalar_total
             + tensor_binary_total
+            + tensor_init_total
             + tensor_meta_total
             + dispatch_total
             + op_schema_total
@@ -1492,6 +1555,7 @@ pub fn run_smoke(config: &HarnessConfig) -> HarnessReport {
             + optimizer_total,
         cases_passed: scalar_passed
             + tensor_binary_passed
+            + tensor_init_passed
             + tensor_meta_passed
             + dispatch_passed
             + op_schema_passed
@@ -1647,6 +1711,34 @@ pub fn run_tensor_factory_conformance(
 
     let report = HarnessReport {
         suite: "tensor_factory",
+        oracle_present: config.oracle_root.exists(),
+        fixture_count: 1,
+        strict_mode: mode == ExecutionMode::Strict,
+        cases_total,
+        cases_passed,
+    };
+
+    Ok((report, case_reports))
+}
+
+pub fn run_tensor_init_conformance(
+    config: &HarnessConfig,
+    mode: ExecutionMode,
+) -> Result<(HarnessReport, Vec<TensorInitCaseReport>), String> {
+    let fixture_path = config.fixture_root.join("tensor_init_cases.json");
+    let fixture: TensorInitFixtureFile = load_fixture(&fixture_path)?;
+
+    let mut case_reports = Vec::with_capacity(fixture.cases.len());
+    for case in &fixture.cases {
+        validate_fixture_metadata(case.name.as_str(), case)?;
+        case_reports.push(run_tensor_init_case(case, mode)?);
+    }
+
+    let (cases_total, cases_passed) =
+        summarize_passes(case_reports.iter().map(TensorInitCaseReport::passed));
+
+    let report = HarnessReport {
+        suite: "tensor_init",
         oracle_present: config.oracle_root.exists(),
         fixture_count: 1,
         strict_mode: mode == ExecutionMode::Strict,
@@ -4969,6 +5061,162 @@ fn run_tensor_factory_case(
             ],
             format!(
                 "cargo test -p ft-conformance tensor_factory_conformance -- --nocapture # mode={}",
+                mode_label(mode)
+            ),
+            outcome,
+            reason_code,
+        )
+        .with_extra_fields(extra_fields),
+    })
+}
+
+fn run_tensor_init_case(
+    case: &TensorInitCase,
+    mode: ExecutionMode,
+) -> Result<TensorInitCaseReport, String> {
+    let mut session = FrankenTorchSession::new(mode);
+    let numel = case.shape.iter().product();
+    let target = session
+        .tensor_variable(vec![0.0; numel], case.shape.clone(), false)
+        .map_err(|error| format!("init target build failed for '{}': {error}", case.name))?;
+
+    match case.op.as_str() {
+        "constant_" => {
+            let val = case
+                .val
+                .ok_or_else(|| format!("constant_ case '{}' missing val", case.name))?;
+            session.init_constant_(target, val)
+        }
+        "zeros_" => session.init_zeros_(target),
+        "ones_" => session.init_ones_(target),
+        "uniform_" => {
+            let a = case
+                .a
+                .ok_or_else(|| format!("uniform_ case '{}' missing a", case.name))?;
+            let b = case
+                .b
+                .ok_or_else(|| format!("uniform_ case '{}' missing b", case.name))?;
+            session.init_uniform_(target, a, b)
+        }
+        "normal_" => {
+            let mean = case
+                .mean
+                .ok_or_else(|| format!("normal_ case '{}' missing mean", case.name))?;
+            let std = case
+                .std
+                .ok_or_else(|| format!("normal_ case '{}' missing std", case.name))?;
+            session.init_normal_(target, mean, std)
+        }
+        "eye_" => session.init_eye_(target),
+        "dirac_" => {
+            let groups = case
+                .groups
+                .ok_or_else(|| format!("dirac_ case '{}' missing groups", case.name))?;
+            session.init_dirac_(target, groups)
+        }
+        "xavier_uniform_" => {
+            let gain = case
+                .gain
+                .ok_or_else(|| format!("xavier_uniform_ case '{}' missing gain", case.name))?;
+            session.init_xavier_uniform_(target, gain)
+        }
+        "xavier_normal_" => {
+            let gain = case
+                .gain
+                .ok_or_else(|| format!("xavier_normal_ case '{}' missing gain", case.name))?;
+            session.init_xavier_normal_(target, gain)
+        }
+        "kaiming_uniform_" => {
+            let a = case
+                .a
+                .ok_or_else(|| format!("kaiming_uniform_ case '{}' missing a", case.name))?;
+            let mode_param = case.mode_param.as_deref().ok_or_else(|| {
+                format!("kaiming_uniform_ case '{}' missing mode_param", case.name)
+            })?;
+            let nonlinearity = case.nonlinearity.as_deref().ok_or_else(|| {
+                format!("kaiming_uniform_ case '{}' missing nonlinearity", case.name)
+            })?;
+            session.init_kaiming_uniform_(target, a, mode_param, nonlinearity)
+        }
+        "kaiming_normal_" => {
+            let a = case
+                .a
+                .ok_or_else(|| format!("kaiming_normal_ case '{}' missing a", case.name))?;
+            let mode_param = case.mode_param.as_deref().ok_or_else(|| {
+                format!("kaiming_normal_ case '{}' missing mode_param", case.name)
+            })?;
+            let nonlinearity = case.nonlinearity.as_deref().ok_or_else(|| {
+                format!("kaiming_normal_ case '{}' missing nonlinearity", case.name)
+            })?;
+            session.init_kaiming_normal_(target, a, mode_param, nonlinearity)
+        }
+        "sparse_" => {
+            let sparsity = case
+                .sparsity
+                .ok_or_else(|| format!("sparse_ case '{}' missing sparsity", case.name))?;
+            let std = case
+                .std
+                .ok_or_else(|| format!("sparse_ case '{}' missing std", case.name))?;
+            session.init_sparse_(target, sparsity, std)
+        }
+        _ => return Err(format!("unsupported init op '{}'", case.op)),
+    }
+    .map_err(|error| format!("tensor init '{}' failed: {error}", case.name))?;
+
+    let actual_output = session
+        .tensor_values(target)
+        .map_err(|error| format!("tensor value read failed for '{}': {error}", case.name))?;
+    let actual_shape = session
+        .tensor_shape(target)
+        .map_err(|error| format!("tensor shape read failed for '{}': {error}", case.name))?;
+
+    let tolerance = case.tolerance.unwrap_or(1e-12);
+    let output_ok = vec_within(
+        actual_output.as_slice(),
+        case.expected_output.as_slice(),
+        tolerance,
+    );
+    let shape_ok = if let Some(ref expected_shape) = case.expected_shape {
+        actual_shape == *expected_shape
+    } else {
+        actual_shape == case.shape
+    };
+
+    let outcome = if output_ok && shape_ok {
+        "pass"
+    } else {
+        "fail"
+    };
+    let reason_code = if outcome == "pass" {
+        "tensor_init_parity_ok"
+    } else {
+        "tensor_init_mismatch"
+    };
+
+    let mut extra_fields = std::collections::BTreeMap::new();
+    extra_fields.insert("op".to_string(), serde_json::Value::String(case.op.clone()));
+    extra_fields.insert(
+        "runtime_evidence".to_string(),
+        runtime_evidence_field(session.evidence()),
+    );
+
+    Ok(TensorInitCaseReport {
+        name: case.name.clone(),
+        mode,
+        output_ok,
+        shape_ok,
+        forensic_log: StructuredCaseLog::new(
+            "tensor_init",
+            "tensor_init_cases.json",
+            "FT-P2C-001",
+            case.name.as_str(),
+            mode,
+            vec![
+                "crates/ft-conformance/fixtures/tensor_init_cases.json".to_string(),
+                "artifacts/phase2c/FT-P2C-001/parity_report.json".to_string(),
+            ],
+            format!(
+                "cargo test -p ft-conformance tensor_init_conformance -- --nocapture # mode={}",
                 mode_label(mode)
             ),
             outcome,

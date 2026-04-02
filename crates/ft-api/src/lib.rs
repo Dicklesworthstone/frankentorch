@@ -3277,6 +3277,137 @@ impl FrankenTorchSession {
         self.tensor_variable(data, vec![rows, cols], false)
     }
 
+    /// Create a complex tensor from magnitude and phase angle.
+    ///
+    /// Equivalent to `torch.polar(abs, angle)`.
+    /// Returns a complex tensor where `real = abs * cos(angle)` and `imag = abs * sin(angle)`.
+    ///
+    /// Inputs should be F32 tensors (Complex64 output) or F64 tensors (Complex128 output).
+    pub fn tensor_polar(
+        &mut self,
+        abs: TensorNodeId,
+        angle: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Compute real = abs * cos(angle), imag = abs * sin(angle) via autograd ops
+        let cos_angle = self.tensor_cos(angle)?;
+        let sin_angle = self.tensor_sin(angle)?;
+        let real = self.tensor_mul(abs, cos_angle)?;
+        let imag = self.tensor_mul(abs, sin_angle)?;
+        self.tensor_complex(real, imag)
+    }
+
+    /// Cartesian product of 1-D tensors.
+    ///
+    /// Equivalent to `torch.cartesian_prod(*tensors)`.
+    /// Returns a 2-D tensor where each row is one element of the Cartesian product.
+    pub fn tensor_cartesian_prod(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        if tensors.is_empty() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cartesian_prod: need at least one tensor",
+                },
+            )));
+        }
+
+        let mut all_vals: Vec<Vec<f64>> = Vec::new();
+        for &t in tensors {
+            let s = self.tensor_shape(t)?;
+            if s.len() != 1 {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "cartesian_prod: all inputs must be 1-D",
+                    },
+                )));
+            }
+            all_vals.push(self.tensor_values(t)?);
+        }
+
+        let n_tensors = all_vals.len();
+        let total_rows: usize = all_vals.iter().map(|v| v.len()).product();
+
+        let mut result = Vec::with_capacity(total_rows * n_tensors);
+        let mut indices = vec![0usize; n_tensors];
+
+        for _ in 0..total_rows {
+            for (k, vals) in all_vals.iter().enumerate() {
+                result.push(vals[indices[k]]);
+            }
+            // Increment indices (odometer style, rightmost first)
+            for k in (0..n_tensors).rev() {
+                indices[k] += 1;
+                if indices[k] < all_vals[k].len() {
+                    break;
+                }
+                indices[k] = 0;
+            }
+        }
+
+        self.tensor_variable(result, vec![total_rows, n_tensors], false)
+    }
+
+    /// All r-length combinations of elements from a 1-D tensor.
+    ///
+    /// Equivalent to `torch.combinations(input, r, with_replacement)`.
+    /// Returns a 2-D tensor where each row is one combination.
+    pub fn tensor_combinations(
+        &mut self,
+        input: TensorNodeId,
+        r: usize,
+        with_replacement: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 1 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "combinations: input must be 1-D",
+                },
+            )));
+        }
+
+        let n = vals.len();
+        let mut combos: Vec<Vec<f64>> = Vec::new();
+        let mut current = Vec::with_capacity(r);
+
+        fn generate(
+            vals: &[f64],
+            n: usize,
+            r: usize,
+            start: usize,
+            current: &mut Vec<f64>,
+            combos: &mut Vec<Vec<f64>>,
+            with_replacement: bool,
+        ) {
+            if current.len() == r {
+                combos.push(current.clone());
+                return;
+            }
+            for i in start..n {
+                current.push(vals[i]);
+                let next = if with_replacement { i } else { i + 1 };
+                generate(vals, n, r, next, current, combos, with_replacement);
+                current.pop();
+            }
+        }
+
+        generate(&vals, n, r, 0, &mut current, &mut combos, with_replacement);
+
+        let num_combos = combos.len();
+        let mut result = Vec::with_capacity(num_combos * r);
+        for combo in &combos {
+            result.extend_from_slice(combo);
+        }
+
+        if num_combos == 0 {
+            self.tensor_variable(vec![], vec![0, r], false)
+        } else {
+            self.tensor_variable(result, vec![num_combos, r], false)
+        }
+    }
+
     /// Compute batched pairwise distance between two sets of vectors.
     ///
     /// Equivalent to `torch.cdist(x1, x2, p=2.0)`.
@@ -7793,6 +7924,239 @@ impl FrankenTorchSession {
         self.tensor_mean(total)
     }
 
+    /// Focal loss for dense object detection.
+    ///
+    /// Equivalent to a focal variant of BCE: `FL(p_t) = -alpha_t * (1 - p_t)^gamma * log(p_t)`.
+    /// `input` contains logits, `target` contains binary labels (0 or 1).
+    /// Returns the mean focal loss.
+    pub fn focal_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        alpha: f64,
+        gamma: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let logit_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let shape = self.tensor_shape(input)?;
+
+        if logit_vals.len() != target_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "focal_loss: input and target must have the same number of elements",
+                },
+            )));
+        }
+
+        let values: Vec<f64> = logit_vals
+            .iter()
+            .zip(target_vals.iter())
+            .map(|(&logit, &t)| {
+                let p = 1.0 / (1.0 + (-logit).exp()); // sigmoid
+                let p_t = if t == 1.0 { p } else { 1.0 - p };
+                let alpha_t = if t == 1.0 { alpha } else { 1.0 - alpha };
+                -alpha_t * (1.0 - p_t).powf(gamma) * p_t.max(1e-15).ln()
+            })
+            .collect();
+
+        let loss_node = self.tensor_variable(values, shape, false)?;
+        self.tensor_mean(loss_node)
+    }
+
+    /// Poisson negative log likelihood loss.
+    ///
+    /// Equivalent to `torch.nn.functional.poisson_nll_loss(input, target, log_input, full, eps)`.
+    /// When `log_input=true`: `loss = exp(input) - target * input`
+    /// When `log_input=false`: `loss = input - target * log(input + eps)`
+    pub fn poisson_nll_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        log_input: bool,
+        full: bool,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let shape = self.tensor_shape(input)?;
+
+        let values: Vec<f64> = input_vals
+            .iter()
+            .zip(target_vals.iter())
+            .map(|(&inp, &tgt)| {
+                let mut loss = if log_input {
+                    inp.exp() - tgt * inp
+                } else {
+                    inp - tgt * (inp + eps).ln()
+                };
+                if full {
+                    // Stirling approximation for log(target!)
+                    if tgt > 1.0 {
+                        loss += tgt * tgt.ln() - tgt + 0.5 * (2.0 * std::f64::consts::PI * tgt).ln();
+                    }
+                }
+                loss
+            })
+            .collect();
+
+        let loss_node = self.tensor_variable(values, shape, false)?;
+        self.tensor_mean(loss_node)
+    }
+
+    /// Gaussian negative log likelihood loss.
+    ///
+    /// Equivalent to `torch.nn.functional.gaussian_nll_loss(input, target, var, full, eps)`.
+    /// `loss = 0.5 * (log(var) + (input - target)^2 / var)`
+    /// With `full=true`, adds the constant `0.5 * log(2*pi)`.
+    pub fn gaussian_nll_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        var: TensorNodeId,
+        full: bool,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let var_vals = self.tensor_values(var)?;
+        let shape = self.tensor_shape(input)?;
+
+        let values: Vec<f64> = input_vals
+            .iter()
+            .zip(target_vals.iter())
+            .zip(var_vals.iter())
+            .map(|((&inp, &tgt), &v)| {
+                let v_clamped = v.max(eps);
+                let diff = inp - tgt;
+                let mut loss = 0.5 * (v_clamped.ln() + diff * diff / v_clamped);
+                if full {
+                    loss += 0.5 * (2.0 * std::f64::consts::PI).ln();
+                }
+                loss
+            })
+            .collect();
+
+        let loss_node = self.tensor_variable(values, shape, false)?;
+        self.tensor_mean(loss_node)
+    }
+
+    /// Soft margin loss.
+    ///
+    /// Equivalent to `torch.nn.functional.soft_margin_loss(input, target)`.
+    /// `loss = mean(log(1 + exp(-target * input)))`
+    pub fn soft_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let shape = self.tensor_shape(input)?;
+
+        let values: Vec<f64> = input_vals
+            .iter()
+            .zip(target_vals.iter())
+            .map(|(&inp, &tgt)| {
+                let z = -tgt * inp;
+                // Numerically stable: log(1 + exp(z)) = max(0, z) + log(1 + exp(-|z|))
+                z.max(0.0) + (1.0 + (-z.abs()).exp()).ln()
+            })
+            .collect();
+
+        let loss_node = self.tensor_variable(values, shape, false)?;
+        self.tensor_mean(loss_node)
+    }
+
+    /// Multi-class margin (hinge) loss.
+    ///
+    /// Equivalent to `torch.nn.functional.multi_margin_loss(input, target, p, margin)`.
+    /// `loss = mean(max(0, margin - input[y] + input[j])^p for j != y)`
+    pub fn multi_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        p: f64,
+        margin: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let shape = self.tensor_shape(input)?;
+
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multi_margin_loss: input must be 2-D [batch, classes]",
+                },
+            )));
+        }
+
+        let (batch, classes) = (shape[0], shape[1]);
+        let mut total_loss = 0.0;
+
+        for (i, &tgt) in target_vals.iter().enumerate().take(batch) {
+            let y = tgt as usize;
+            let base = i * classes;
+            let score_y = input_vals[base + y];
+            let mut sample_loss = 0.0;
+            for j in 0..classes {
+                if j == y {
+                    continue;
+                }
+                let diff = margin - score_y + input_vals[base + j];
+                if diff > 0.0 {
+                    sample_loss += diff.powf(p);
+                }
+            }
+            total_loss += sample_loss / classes as f64;
+        }
+
+        let mean_loss = total_loss / batch as f64;
+        self.tensor_variable(vec![mean_loss], vec![1], false)
+    }
+
+    /// Multi-label soft margin loss.
+    ///
+    /// Equivalent to `torch.nn.functional.multilabel_soft_margin_loss(input, target)`.
+    /// `loss = -mean(target * log(sigmoid(input)) + (1 - target) * log(1 - sigmoid(input)))`
+    pub fn multilabel_soft_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let shape = self.tensor_shape(input)?;
+
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_soft_margin_loss: input must be 2-D [batch, classes]",
+                },
+            )));
+        }
+
+        let (batch, classes) = (shape[0], shape[1]);
+        let mut total_loss = 0.0;
+
+        for i in 0..batch {
+            let mut sample_loss = 0.0;
+            for j in 0..classes {
+                let idx = i * classes + j;
+                let x = input_vals[idx];
+                let t = target_vals[idx];
+                // Numerically stable BCE with logits per element:
+                // -[t * log(sigmoid(x)) + (1-t) * log(1-sigmoid(x))]
+                // = max(x, 0) - x*t + log(1 + exp(-|x|))
+                let bce = x.max(0.0) - x * t + (1.0 + (-x.abs()).exp()).ln();
+                sample_loss += bce;
+            }
+            total_loss += sample_loss / classes as f64;
+        }
+
+        let mean_loss = total_loss / batch as f64;
+        self.tensor_variable(vec![mean_loss], vec![1], false)
+    }
+
     /// Negative log likelihood loss.
     ///
     /// Expects `log_probs` to be log-probabilities of shape [batch, classes] and
@@ -8340,6 +8704,128 @@ impl FrankenTorchSession {
         value: f64,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_tape.pad(input, padding, value)
+    }
+
+    /// Pad a tensor with the specified mode.
+    ///
+    /// Equivalent to `torch.nn.functional.pad(input, pad, mode, value)`.
+    ///
+    /// Modes:
+    /// - `"constant"`: pad with `value` (default 0.0)
+    /// - `"reflect"`: reflect padding (last element not repeated)
+    /// - `"replicate"`: replicate edge values
+    /// - `"circular"`: circular (wrap-around) padding
+    ///
+    /// `padding` uses PyTorch convention: `[left, right]` for 1D,
+    /// `[left, right, top, bottom]` for 2D, etc. (innermost dim first).
+    pub fn tensor_pad_mode(
+        &mut self,
+        input: TensorNodeId,
+        padding: &[usize],
+        mode: &str,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if mode == "constant" {
+            return self.tensor_pad(input, padding, value);
+        }
+
+        if !padding.len().is_multiple_of(2) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "pad: padding must have even number of elements",
+                },
+            )));
+        }
+
+        let (storage, meta) = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            (tensor.storage().to_vec(), tensor.meta().clone())
+        };
+        let shape = meta.shape();
+        let ndim = shape.len();
+        let num_pad_dims = padding.len() / 2;
+
+        if num_pad_dims > ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "pad: padding specifies more dimensions than input has",
+                },
+            )));
+        }
+
+        // Build output shape
+        let mut out_shape = shape.to_vec();
+        for i in 0..num_pad_dims {
+            let dim = ndim - 1 - i;
+            out_shape[dim] = shape[dim] + padding[i * 2] + padding[i * 2 + 1];
+        }
+
+        // Build per-dim pad_before
+        let mut pad_before = vec![0usize; ndim];
+        let mut pad_after = vec![0usize; ndim];
+        for i in 0..num_pad_dims {
+            let dim = ndim - 1 - i;
+            pad_before[dim] = padding[i * 2];
+            pad_after[dim] = padding[i * 2 + 1];
+        }
+
+        let out_numel: usize = out_shape.iter().product();
+        let out_strides = ft_core::contiguous_strides(&out_shape);
+        let in_strides = ft_core::contiguous_strides(shape);
+
+        let mut output = vec![0.0; out_numel];
+
+        // For each output element, compute the source coordinate
+        let mut out_coords = vec![0usize; ndim];
+        for (flat_out, out_val) in output.iter_mut().enumerate() {
+            // Decompose flat_out into coordinates
+            let mut rem = flat_out;
+            for d in 0..ndim {
+                out_coords[d] = rem / out_strides[d];
+                rem %= out_strides[d];
+            }
+
+            // Map each coordinate back to input space
+            let mut valid = true;
+            let mut flat_in = 0usize;
+            for d in 0..ndim {
+                let out_c = out_coords[d] as isize - pad_before[d] as isize;
+                let dim_size = shape[d] as isize;
+
+                let in_c = match mode {
+                    "reflect" => {
+                        if dim_size <= 1 {
+                            0
+                        } else {
+                            reflect_index(out_c, dim_size)
+                        }
+                    }
+                    "replicate" => out_c.clamp(0, dim_size - 1) as usize,
+                    "circular" => out_c.rem_euclid(dim_size) as usize,
+                    _ => {
+                        valid = false;
+                        0
+                    }
+                };
+
+                if !valid {
+                    break;
+                }
+                flat_in += in_c * in_strides[d];
+            }
+
+            if !valid {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "pad: unsupported mode (use constant, reflect, replicate, or circular)",
+                    },
+                )));
+            }
+
+            *out_val = storage[flat_in];
+        }
+
+        self.tensor_variable(output, out_shape, false)
     }
 
     // -------------------------------------------------------------------
@@ -12047,6 +12533,22 @@ pub use ft_autograd::{
 /// Cubic interpolation weight (Keys, 1981 / Catmull-Rom spline, a = -0.75).
 ///
 /// Used by bicubic interpolation in F.interpolate.
+/// Reflect an index into [0, size-1] using symmetric reflection.
+///
+/// For `reflect` padding mode: the boundary is not repeated.
+/// E.g., for size=4: ..., 3, 2, 1, [0, 1, 2, 3], 2, 1, 0, 1, ...
+fn reflect_index(idx: isize, size: isize) -> usize {
+    if size <= 1 {
+        return 0;
+    }
+    let period = 2 * (size - 1);
+    let mut i = idx.rem_euclid(period);
+    if i >= size {
+        i = period - i;
+    }
+    i as usize
+}
+
 fn cubic_weight(x: f64) -> f64 {
     let a = -0.75; // PyTorch default
     let abs_x = x.abs();
@@ -22281,6 +22783,347 @@ mod tests {
         let shape = s.tensor_shape(out).unwrap();
         assert_eq!(shape, vec![2, 3, 4, 4]);
         assert_eq!(s.tensor_values(out).unwrap().len(), 2 * 3 * 4 * 4);
+    }
+
+    // ── F.pad mode tests ─────────────────────────────────────────────────
+
+    #[test]
+    fn pad_reflect_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 4] with padding [2, 2] -> reflect pad
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false)
+            .unwrap();
+        let out = s
+            .tensor_pad_mode(input, &[2, 2], "reflect", 0.0)
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 8]);
+        let vals = s.tensor_values(out).unwrap();
+        // Reflect: [3, 2, 1, 2, 3, 4, 3, 2]
+        assert_eq!(vals, vec![3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0]);
+    }
+
+    #[test]
+    fn pad_replicate_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false)
+            .unwrap();
+        let out = s
+            .tensor_pad_mode(input, &[2, 2], "replicate", 0.0)
+            .unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Replicate: [1, 1, 1, 2, 3, 4, 4, 4]
+        assert_eq!(vals, vec![1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn pad_circular_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false)
+            .unwrap();
+        let out = s
+            .tensor_pad_mode(input, &[2, 2], "circular", 0.0)
+            .unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // Circular: [3, 4, 1, 2, 3, 4, 1, 2]
+        assert_eq!(vals, vec![3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn pad_reflect_2d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 1, 3, 3] with padding [1, 1, 1, 1]
+        #[rustfmt::skip]
+        let input = s.tensor_variable(vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ], vec![1, 1, 3, 3], false).unwrap();
+        let out = s
+            .tensor_pad_mode(input, &[1, 1, 1, 1], "reflect", 0.0)
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 5, 5]);
+        let vals = s.tensor_values(out).unwrap();
+        // Output is 5x5. Row 1, col 1 should map to input [0,0] = 1.0
+        // Row 2, col 2 should map to input [1,1] = 5.0
+        assert!((vals[6] - 1.0).abs() < 1e-10, "input[0,0]={}", vals[6]);
+        assert!((vals[12] - 5.0).abs() < 1e-10, "input[1,1]={}", vals[12]);
+        assert!((vals[18] - 9.0).abs() < 1e-10, "input[2,2]={}", vals[18]);
+    }
+
+    #[test]
+    fn pad_replicate_2d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let input = s.tensor_variable(vec![
+            1.0, 2.0,
+            3.0, 4.0,
+        ], vec![1, 1, 2, 2], false).unwrap();
+        let out = s
+            .tensor_pad_mode(input, &[1, 1, 1, 1], "replicate", 0.0)
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4]);
+        let vals = s.tensor_values(out).unwrap();
+        // Top-left corner replicated from [0,0] = 1.0
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        // Bottom-right corner replicated from [1,1] = 4.0
+        assert!((vals[15] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn pad_constant_mode_matches_tensor_pad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 1, 3], false)
+            .unwrap();
+        let a = s.tensor_pad(input, &[1, 1], 0.0).unwrap();
+        let input2 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 1, 3], false)
+            .unwrap();
+        let b = s
+            .tensor_pad_mode(input2, &[1, 1], "constant", 0.0)
+            .unwrap();
+        assert_eq!(s.tensor_values(a).unwrap(), s.tensor_values(b).unwrap());
+    }
+
+    // ── Loss function tests ─────────────────────────────────────────────
+
+    #[test]
+    fn focal_loss_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // With gamma=0, alpha=0.5: both classes equally weighted
+        let input = s
+            .tensor_variable(vec![0.0, 0.0], vec![2], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![1.0, 0.0], vec![2], false)
+            .unwrap();
+        let loss = s.focal_loss(input, target, 0.5, 0.0).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        // sigmoid(0)=0.5, -0.5*log(0.5) = 0.5*0.693 = 0.347 for each, mean=0.347
+        assert!((val - 0.347).abs() < 0.01, "focal_loss={val}");
+    }
+
+    #[test]
+    fn focal_loss_gamma_reduces_easy_examples() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // High confidence correct prediction: sigmoid(5) ≈ 0.993
+        let input = s
+            .tensor_variable(vec![5.0], vec![1], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let loss_g0 = s.focal_loss(input, target, 0.5, 0.0).unwrap();
+        let val_g0 = s.tensor_values(loss_g0).unwrap()[0];
+
+        let input2 = s
+            .tensor_variable(vec![5.0], vec![1], false)
+            .unwrap();
+        let target2 = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let loss_g2 = s.focal_loss(input2, target2, 0.5, 2.0).unwrap();
+        let val_g2 = s.tensor_values(loss_g2).unwrap()[0];
+
+        assert!(
+            val_g2 < val_g0,
+            "gamma=2 should down-weight easy examples: g0={val_g0}, g2={val_g2}"
+        );
+    }
+
+    #[test]
+    fn poisson_nll_loss_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // log_input=true: loss = exp(input) - target * input
+        let input = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![1.0, 1.0], vec![2], false)
+            .unwrap();
+        let loss = s.poisson_nll_loss(input, target, true, false, 1e-8).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        // mean((e^1 - 1*1) + (e^2 - 1*2)) / 2 = ((e-1) + (e^2-2)) / 2
+        let expected = ((std::f64::consts::E - 1.0) + (std::f64::consts::E.powi(2) - 2.0)) / 2.0;
+        assert!((val - expected).abs() < 1e-8, "poisson_nll={val}, expected={expected}");
+    }
+
+    #[test]
+    fn gaussian_nll_loss_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Perfect prediction with variance 1: loss = 0.5 * log(1) + 0 = 0
+        let input = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let var = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let loss = s.gaussian_nll_loss(input, target, var, false, 1e-6).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        assert!(val.abs() < 1e-8, "perfect prediction should have ~0 loss, got {val}");
+    }
+
+    #[test]
+    fn soft_margin_loss_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Correctly classified: target=1, input=large positive -> low loss
+        let input = s
+            .tensor_variable(vec![5.0, -5.0], vec![2], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![1.0, -1.0], vec![2], false)
+            .unwrap();
+        let loss = s.soft_margin_loss(input, target).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        // log(1 + exp(-5)) ≈ 0.0067 for both, mean ≈ 0.0067
+        assert!(val < 0.01, "well-classified should have low loss: {val}");
+    }
+
+    #[test]
+    fn multi_margin_loss_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // input = [[3, 1, 0]], target = [0] -> correct class has highest score
+        let input = s
+            .tensor_variable(vec![3.0, 1.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![0.0], vec![1], false)
+            .unwrap();
+        let loss = s.multi_margin_loss(input, target, 1.0, 1.0).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        // max(0, 1-3+1) + max(0, 1-3+0) = 0 + 0 = 0
+        assert!(val.abs() < 1e-10, "correct prediction should give 0 loss: {val}");
+    }
+
+    #[test]
+    fn multi_margin_loss_misclassified() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // input = [[0, 3]], target = [0] -> wrong class has highest score
+        let input = s
+            .tensor_variable(vec![0.0, 3.0], vec![1, 2], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![0.0], vec![1], false)
+            .unwrap();
+        let loss = s.multi_margin_loss(input, target, 1.0, 1.0).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        // max(0, 1-0+3) = 4, / 2 classes = 2
+        assert!((val - 2.0).abs() < 1e-10, "expected 2.0, got {val}");
+    }
+
+    #[test]
+    fn multilabel_soft_margin_loss_all_correct() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Large positive logits for target=1, large negative for target=0
+        let input = s
+            .tensor_variable(vec![10.0, -10.0, 10.0, -10.0], vec![1, 4], false)
+            .unwrap();
+        let target = s
+            .tensor_variable(vec![1.0, 0.0, 1.0, 0.0], vec![1, 4], false)
+            .unwrap();
+        let loss = s.multilabel_soft_margin_loss(input, target).unwrap();
+        let val = s.tensor_values(loss).unwrap()[0];
+        assert!(val < 0.01, "well-classified should have low loss: {val}");
+    }
+
+    // ── tensor creation op tests ──────────────────────────────────────
+
+    #[test]
+    fn polar_f32_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Use f32 tensors since complex output requires F32 inputs currently
+        let abs = s
+            .tensor_variable_f32(vec![1.0_f32, 2.0], vec![2], false)
+            .unwrap();
+        let angle = s
+            .tensor_variable_f32(
+                vec![0.0_f32, std::f64::consts::FRAC_PI_2 as f32],
+                vec![2],
+                false,
+            )
+            .unwrap();
+        let result = s.tensor_polar(abs, angle).unwrap();
+        let dtype = s.tensor_dtype(result).unwrap();
+        assert_eq!(dtype, DType::Complex64);
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![2]);
+    }
+
+    #[test]
+    fn cartesian_prod_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let b = s
+            .tensor_variable(vec![3.0, 4.0, 5.0], vec![3], false)
+            .unwrap();
+        let result = s.tensor_cartesian_prod(&[a, b]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![6, 2]); // 2*3 = 6 rows, 2 columns
+        let vals = s.tensor_values(result).unwrap();
+        // Should be: (1,3), (1,4), (1,5), (2,3), (2,4), (2,5)
+        assert_eq!(
+            vals,
+            vec![1.0, 3.0, 1.0, 4.0, 1.0, 5.0, 2.0, 3.0, 2.0, 4.0, 2.0, 5.0]
+        );
+    }
+
+    #[test]
+    fn cartesian_prod_single() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let result = s.tensor_cartesian_prod(&[a]).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![3, 1]);
+    }
+
+    #[test]
+    fn combinations_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let result = s.tensor_combinations(input, 2, false).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![3, 2]); // C(3,2) = 3
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![1.0, 2.0, 1.0, 3.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn combinations_with_replacement() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let result = s.tensor_combinations(input, 2, true).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![3, 2]); // (1,1), (1,2), (2,2)
+        let vals = s.tensor_values(result).unwrap();
+        assert_eq!(vals, vec![1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn combinations_empty() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0], vec![1], false)
+            .unwrap();
+        let result = s.tensor_combinations(input, 2, false).unwrap();
+        let shape = s.tensor_shape(result).unwrap();
+        assert_eq!(shape, vec![0, 2]); // C(1,2) = 0
     }
 
     // ── cross / vecdot / diag_embed tests (bd-2drq.9) ─────────────────

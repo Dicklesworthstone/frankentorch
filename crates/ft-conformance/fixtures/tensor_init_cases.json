@@ -1,0 +1,178 @@
+{
+  "cases": [
+    {
+      "name": "constant_fill_2d",
+      "op": "constant_",
+      "shape": [2, 3],
+      "val": 2.5,
+      "expected_output": [2.5, 2.5, 2.5, 2.5, 2.5, 2.5],
+      "contract_ids": ["CPU-KERNEL-INIT-001"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "zeros_fill_2d",
+      "op": "zeros_",
+      "shape": [2, 3],
+      "expected_output": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-INIT-002"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "ones_fill_2d",
+      "op": "ones_",
+      "shape": [2, 3],
+      "expected_output": [1.0, 1.0, 1.0, 1.0, 1.0, 1.0],
+      "contract_ids": ["CPU-KERNEL-INIT-003"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "uniform_fill_seeded",
+      "op": "uniform_",
+      "shape": [2, 3],
+      "a": -0.5,
+      "b": 0.5,
+      "expected_output": [
+        0.31430514512290986,
+        -0.18117895993833888,
+        0.48389416817748876,
+        0.20113559813475557,
+        0.29350448969172904,
+        0.08809846646755959
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-004"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "normal_fill_seeded",
+      "op": "normal_",
+      "shape": [2, 3],
+      "mean": 0.0,
+      "std": 0.5,
+      "expected_output": [
+        -0.13430368473104753,
+        -0.027231085054075573,
+        -0.2892876884219781,
+        -0.8046686045244412,
+        0.8098411915170806,
+        0.31678864967058795
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-005"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "eye_rectangular",
+      "op": "eye_",
+      "shape": [2, 3],
+      "expected_output": [1.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-INIT-006"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "dirac_conv1d_groups1",
+      "op": "dirac_",
+      "shape": [2, 2, 3],
+      "groups": 1,
+      "expected_output": [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
+      "contract_ids": ["CPU-KERNEL-INIT-007"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "xavier_uniform_seeded",
+      "op": "xavier_uniform_",
+      "shape": [2, 3],
+      "gain": 1.0,
+      "expected_output": [
+        0.6886080716950103,
+        -0.396943213214212,
+        1.0601590054240364,
+        0.4406660168627985,
+        0.64303611893281,
+        0.19301406946357935
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-008"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "xavier_normal_seeded",
+      "op": "xavier_normal_",
+      "shape": [2, 3],
+      "gain": 1.0,
+      "expected_output": [
+        -0.16988221676131549,
+        -0.03444490077145929,
+        -0.36592319778342886,
+        -1.017834220770602,
+        1.0243770832874424,
+        0.4007094679392829
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-009"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "kaiming_uniform_seeded",
+      "op": "kaiming_uniform_",
+      "shape": [2, 3],
+      "a": 0.0,
+      "mode_param": "fan_in",
+      "nonlinearity": "relu",
+      "expected_output": [
+        0.8889891979129259,
+        -0.512451484722901,
+        1.368659390779704,
+        0.5688973815163918,
+        0.8301560598788751,
+        0.24918009220538817
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-010"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "kaiming_normal_seeded",
+      "op": "kaiming_normal_",
+      "shape": [2, 3],
+      "a": 0.0,
+      "mode_param": "fan_out",
+      "nonlinearity": "relu",
+      "expected_output": [
+        -0.26860736946209507,
+        -0.054462170108151145,
+        -0.5785753768439562,
+        -1.6093372090488824,
+        1.6196823830341611,
+        0.6335772993411759
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-011"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    },
+    {
+      "name": "sparse_seeded",
+      "op": "sparse_",
+      "shape": [3, 4],
+      "sparsity": 0.5,
+      "std": 0.01,
+      "expected_output": [
+        -0.002686073694620951,
+        0.0,
+        0.01671952354129193,
+        0.003982231842222362,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.0,
+        0.007957552379991293,
+        0.0,
+        0.0
+      ],
+      "tolerance": 1e-12,
+      "contract_ids": ["CPU-KERNEL-INIT-012"],
+      "e2e_scenarios": ["cpu_kernel:init"]
+    }
+  ]
+}
