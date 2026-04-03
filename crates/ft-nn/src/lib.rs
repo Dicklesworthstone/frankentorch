@@ -202,30 +202,66 @@ pub trait Module {
     /// Collect all trainable parameter node IDs.
     fn parameters(&self) -> Vec<TensorNodeId>;
 
-    /// Return this module's own named parameters (non-recursive).
+    /// Return this module's own named parameters without recursing into children.
     ///
-    /// Each tuple is `(local_name, node_id)` — e.g. `("weight", id)`, `("bias", id)`.
-    /// Container modules that only hold children (like Sequential) should return an
-    /// empty vec here; their children's parameters are collected by `named_parameters`.
+    /// # Default behavior
+    /// Returns an empty vector. This is correct for leaf modules that do not own
+    /// trainable parameters directly because there is no local parameter state to
+    /// expose at this layer.
+    ///
+    /// # When to override
+    /// Override this method when your module owns fixed, statically named parameters.
+    /// For example, `Linear` overrides this to return its `weight` and optional `bias`
+    /// tensors, while containers such as `Sequential` keep the default and delegate
+    /// parameter traversal to their children.
     fn named_parameters_own(&self) -> Vec<(&'static str, TensorNodeId)> {
         Vec::new()
     }
 
-    /// Return dynamically-registered own parameters, including optional slots.
+    /// Return dynamically-registered own parameter slots, including empty registrations.
     ///
-    /// Entries with `None` represent registered names without tensor payload.
+    /// # Default behavior
+    /// Returns an empty vector. This is correct for modules that do not support
+    /// runtime parameter registration because they have no dynamic parameter namespace
+    /// to report.
+    ///
+    /// # When to override
+    /// Override this method when your module accepts named parameter registrations that
+    /// may or may not currently hold a tensor. For example, modules with optional or
+    /// user-supplied parameter slots should return `(name, Option<TensorNodeId>)` pairs
+    /// so state traversal can preserve the registration shape even when a slot is empty.
     fn named_parameter_slots_own(&self) -> Vec<(String, Option<TensorNodeId>)> {
         Vec::new()
     }
 
-    /// Return own registered buffers, including persistence metadata.
+    /// Return own registered buffers together with persistence metadata.
     ///
-    /// Entries with `None` represent registered names without tensor payload.
+    /// # Default behavior
+    /// Returns an empty vector. This is correct for modules that do not maintain
+    /// buffer state because there are no local non-parameter tensors to serialize
+    /// or restore.
+    ///
+    /// # When to override
+    /// Override this method when your module owns registered buffers such as running
+    /// statistics, caches, or optional state tensors. For example, normalization
+    /// layers override this to surface running moments and persistence flags during
+    /// state-dict traversal.
     fn named_buffer_slots_own(&self) -> Vec<(String, Option<TensorNodeId>, bool)> {
         Vec::new()
     }
 
-    /// Register (or replace) a named parameter slot.
+    /// Register or replace a named parameter slot on this module.
+    ///
+    /// # Default behavior
+    /// Returns `ModuleRegistrationError::Unsupported` with the module type and operation
+    /// name. This is correct for modules whose parameter layout is fixed at construction
+    /// time because accepting arbitrary registrations would create unreachable state.
+    ///
+    /// # When to override
+    /// Override this method when your module intentionally supports runtime parameter
+    /// registration. For example, modules that manage user-extensible state dictionaries
+    /// should validate names, update their slot tables, and preserve deterministic
+    /// traversal order.
     fn register_parameter(
         &mut self,
         _name: &str,
@@ -237,7 +273,18 @@ pub trait Module {
         })
     }
 
-    /// Register (or replace) a named buffer slot.
+    /// Register or replace a named buffer slot on this module.
+    ///
+    /// # Default behavior
+    /// Returns `ModuleRegistrationError::Unsupported` with the module type and operation
+    /// name. This is correct for modules whose buffer inventory is fixed because the
+    /// base trait cannot infer safe persistence or replacement rules for arbitrary names.
+    ///
+    /// # When to override
+    /// Override this method when your module supports runtime buffer registration. For
+    /// example, stateful normalization or caching modules should implement this to
+    /// validate names, store the optional tensor, and record whether the buffer is
+    /// persistent in the state dict.
     fn register_buffer(
         &mut self,
         _name: &str,
@@ -250,11 +297,18 @@ pub trait Module {
         })
     }
 
-    /// Return direct child sub-modules with their local names.
+    /// Return direct child sub-modules together with their local names.
     ///
-    /// For indexed containers (Sequential, ModuleList), names are `"0"`, `"1"`, etc.
-    /// For named containers (ModuleDict), names are the user-supplied keys.
-    /// For composite modules (MultiheadAttention), names are field names like `"q_proj"`.
+    /// # Default behavior
+    /// Returns an empty vector. This is correct for leaf modules because they do not
+    /// contain nested sub-modules that need recursive traversal for parameters, buffers,
+    /// or mode propagation.
+    ///
+    /// # When to override
+    /// Override this method when your module is a container or composite over other
+    /// modules. For example, `Sequential` returns indexed children like `"0"` and `"1"`,
+    /// while composite modules such as `MultiheadAttention` return field names like
+    /// `"q_proj"` so recursive walks remain deterministic.
     fn named_children(&self) -> Vec<(String, &dyn Module)> {
         Vec::new()
     }

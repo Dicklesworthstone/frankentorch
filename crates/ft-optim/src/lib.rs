@@ -102,12 +102,31 @@ pub trait Optimizer {
     /// Set the learning rate.
     fn set_lr(&mut self, lr: f64);
 
-    /// Return momentum if the optimizer exposes one.
+    /// Return the optimizer's momentum hyperparameter when the algorithm exposes one.
+    ///
+    /// # Default behavior
+    /// Returns `None`. This is correct for optimizers whose update rule has no momentum
+    /// term because the base trait cannot invent a meaningful synthetic value.
+    ///
+    /// # When to override
+    /// Override this method when your optimizer has a momentum-like hyperparameter that
+    /// should participate in scheduler coordination or diagnostics. For example, `SGD`
+    /// overrides this to return its configured momentum so `OneCycleLR` can inspect it.
     fn get_momentum(&self) -> Option<f64> {
         None
     }
 
-    /// Set momentum for optimizers that expose it.
+    /// Update the optimizer's momentum hyperparameter when supported.
+    ///
+    /// # Default behavior
+    /// Returns an `AutogradError` indicating that momentum is unsupported. This is
+    /// correct for optimizers without a momentum term because silently accepting the
+    /// request would hide scheduler misconfiguration.
+    ///
+    /// # When to override
+    /// Override this method when your optimizer exposes a mutable momentum value. For
+    /// example, `SGD` overrides this to apply scheduler-driven momentum changes during
+    /// training while preserving explicit error reporting for unsupported optimizers.
     fn set_momentum(&mut self, _momentum: f64) -> Result<(), AutogradError> {
         Err(optimizer_hparam_error(
             "this optimizer does not support momentum",
