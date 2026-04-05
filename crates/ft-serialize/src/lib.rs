@@ -561,40 +561,49 @@ pub fn save_state_dict<P: AsRef<Path>>(
     path: P,
 ) -> Result<(), TensorIOError> {
     let path_str = path.as_ref().to_string_lossy().to_string();
-    let mut file = std::fs::File::create(&path).map_err(|e| io_err(&path_str, e))?;
+    let encoded = encode_state_dict_to_bytes(state_dict)?;
+    std::fs::write(&path, encoded).map_err(|e| io_err(&path_str, e))?;
+    Ok(())
+}
 
+fn encode_state_dict_to_bytes(
+    state_dict: &BTreeMap<String, DenseTensor>,
+) -> Result<Vec<u8>, TensorIOError> {
+    let mut encoded = Vec::new();
     // Magic
-    file.write_all(FT_MAGIC).map_err(|e| io_err(&path_str, e))?;
+    encoded.extend_from_slice(FT_MAGIC);
     // Version
-    file.write_all(&FT_STATE_FORMAT_VERSION.to_le_bytes())
-        .map_err(|e| io_err(&path_str, e))?;
+    encoded.extend_from_slice(&FT_STATE_FORMAT_VERSION.to_le_bytes());
     // Number of tensors
     let num_tensors = state_dict.len() as u64;
-    file.write_all(&num_tensors.to_le_bytes())
-        .map_err(|e| io_err(&path_str, e))?;
+    encoded.extend_from_slice(&num_tensors.to_le_bytes());
 
     for (key, tensor) in state_dict {
         let meta = tensor.meta();
+        let dtype_tag = match meta.dtype() {
+            DType::F64 => dtype_to_tag(DType::F64),
+            DType::F32 => dtype_to_tag(DType::F32),
+            other => {
+                return Err(TensorIOError::Corrupt {
+                    reason: format!("unsupported dtype for save: {other:?}"),
+                });
+            }
+        };
 
         // Key
         let key_bytes = key.as_bytes();
-        file.write_all(&(key_bytes.len() as u64).to_le_bytes())
-            .map_err(|e| io_err(&path_str, e))?;
-        file.write_all(key_bytes)
-            .map_err(|e| io_err(&path_str, e))?;
+        encoded.extend_from_slice(&(key_bytes.len() as u64).to_le_bytes());
+        encoded.extend_from_slice(key_bytes);
 
         // Shape
         let shape = meta.shape();
-        file.write_all(&(shape.len() as u64).to_le_bytes())
-            .map_err(|e| io_err(&path_str, e))?;
+        encoded.extend_from_slice(&(shape.len() as u64).to_le_bytes());
         for &dim in shape {
-            file.write_all(&(dim as u64).to_le_bytes())
-                .map_err(|e| io_err(&path_str, e))?;
+            encoded.extend_from_slice(&(dim as u64).to_le_bytes());
         }
 
         // DType
-        file.write_all(&[dtype_to_tag(meta.dtype())])
-            .map_err(|e| io_err(&path_str, e))?;
+        encoded.push(dtype_tag);
 
         // Values
         match meta.dtype() {
@@ -603,8 +612,7 @@ pub fn save_state_dict<P: AsRef<Path>>(
                     .contiguous_values()
                     .map_err(TensorIOError::TensorError)?;
                 for &v in values {
-                    file.write_all(&v.to_le_bytes())
-                        .map_err(|e| io_err(&path_str, e))?;
+                    encoded.extend_from_slice(&v.to_le_bytes());
                 }
             }
             DType::F32 => {
@@ -612,8 +620,7 @@ pub fn save_state_dict<P: AsRef<Path>>(
                     .contiguous_values_f32()
                     .map_err(TensorIOError::TensorError)?;
                 for &v in values {
-                    file.write_all(&v.to_le_bytes())
-                        .map_err(|e| io_err(&path_str, e))?;
+                    encoded.extend_from_slice(&v.to_le_bytes());
                 }
             }
             other => {
@@ -624,7 +631,7 @@ pub fn save_state_dict<P: AsRef<Path>>(
         }
     }
 
-    Ok(())
+    Ok(encoded)
 }
 
 /// Load a state dict from a FrankenTorch native format file.
@@ -733,6 +740,15 @@ pub fn load_state_dict_from_bytes(
         };
 
         result.insert(key, tensor);
+    }
+
+    if pos != data.len() {
+        return Err(TensorIOError::Corrupt {
+            reason: format!(
+                "trailing bytes after state dict payload: remaining={}",
+                data.len() - pos
+            ),
+        });
     }
 
     Ok(result)
@@ -1876,6 +1892,45 @@ mod tests {
             result,
             Err(TensorIOError::UnsupportedVersion { .. })
         ));
+    }
+
+    #[test]
+    fn load_state_dict_rejects_trailing_bytes() {
+        let mut sd = BTreeMap::new();
+        sd.insert("w".to_string(), make_f64_tensor(vec![1.0, 2.0], vec![2]));
+
+        let mut bytes = super::encode_state_dict_to_bytes(&sd).unwrap();
+        bytes.extend_from_slice(b"junk");
+
+        let err = load_state_dict_from_bytes(&bytes).expect_err("trailing bytes must fail");
+        assert!(matches!(err, TensorIOError::Corrupt { .. }));
+        assert!(err.to_string().contains("trailing bytes"));
+    }
+
+    #[test]
+    fn save_state_dict_unsupported_dtype_leaves_existing_file_untouched() {
+        let path = std::env::temp_dir().join("ft_test_save_unsupported_dtype");
+        let original = b"sentinel-state";
+        std::fs::write(&path, original).unwrap();
+
+        let meta = TensorMeta::from_shape(vec![2], DType::F16, Device::Cpu);
+        let tensor = DenseTensor::from_storage_f16(
+            meta,
+            vec![
+                ft_core::Float16::from_f32(1.0),
+                ft_core::Float16::from_f32(2.0),
+            ],
+        )
+        .unwrap();
+        let mut sd = BTreeMap::new();
+        sd.insert("half".to_string(), tensor);
+
+        let err = save_state_dict(&sd, &path).expect_err("unsupported dtype must fail");
+        let persisted = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(matches!(err, TensorIOError::Corrupt { .. }));
+        assert_eq!(persisted, original);
     }
 
     #[test]
