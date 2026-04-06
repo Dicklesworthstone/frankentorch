@@ -1074,8 +1074,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        decode_checkpoint, decode_snapshot, encode_checkpoint, encode_snapshot,
-        generate_raptorq_sidecar, CheckpointMode, DecodeMode, SerializeError, SnapshotEntry,
+        CheckpointMode, DecodeMode, SerializeError, SnapshotEntry, decode_checkpoint,
+        decode_snapshot, encode_checkpoint, encode_snapshot, generate_raptorq_sidecar,
     };
 
     fn det_seed(parts: &[u64]) -> u64 {
@@ -1800,7 +1800,7 @@ mod tests {
 
     // ── Tensor State Dict Save/Load Tests ──────────────────────────────
 
-    use super::{load_state_dict, load_state_dict_from_bytes, save_state_dict, TensorIOError};
+    use super::{TensorIOError, load_state_dict, load_state_dict_from_bytes, save_state_dict};
     use ft_core::{DType, DenseTensor, Device, TensorMeta};
 
     fn make_f64_tensor(values: Vec<f64>, shape: Vec<usize>) -> DenseTensor {
@@ -2303,7 +2303,7 @@ mod tests {
         data.extend_from_slice(b"FTSV");
         data.extend_from_slice(&1u32.to_le_bytes()); // version
         data.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
-                                                     // key: "x"
+        // key: "x"
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(b'x');
         // ndim = 2
@@ -2340,7 +2340,7 @@ mod tests {
         data.extend_from_slice(b"FTSV");
         data.extend_from_slice(&1u32.to_le_bytes()); // version
         data.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
-                                                     // key: "y"
+        // key: "y"
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(b'y');
         // ndim = 1
