@@ -9122,8 +9122,7 @@ impl FrankenTorchSession {
 
         let nll_vals = self.tensor_values(nll)?;
         let uniform_vals = self.tensor_values(uniform_loss)?;
-        let blended =
-            (1.0 - label_smoothing) * nll_vals[0] + label_smoothing * uniform_vals[0];
+        let blended = (1.0 - label_smoothing) * nll_vals[0] + label_smoothing * uniform_vals[0];
         self.tensor_variable(vec![blended], vec![1], false)
     }
 
@@ -12694,6 +12693,10 @@ impl FrankenTorchSession {
         let ndim = input_shape.len();
         let mut result = input_vals.clone();
 
+        // Validate all index values are in range (supports negative wrapping)
+        Self::validate_index_tensor_values(&input_shape, dim, &idx_vals)?;
+        let dim_size = input_shape[dim];
+
         // For counting (mean reduction)
         let mut counts: Vec<usize> = if reduce == "mean" {
             vec![0; result.len()]
@@ -12724,10 +12727,13 @@ impl FrankenTorchSession {
                 remaining %= idx_strides[d];
             }
 
-            let target_dim_idx = idx_vals[flat_i] as usize;
-            if target_dim_idx >= input_shape[dim] {
-                continue;
-            }
+            // Normalize negative indices (already validated by validate_index_tensor_values)
+            let raw_idx = idx_vals[flat_i] as isize;
+            let target_dim_idx = if raw_idx < 0 {
+                (raw_idx + dim_size as isize) as usize
+            } else {
+                raw_idx as usize
+            };
 
             // Compute output flat index
             coords[dim] = target_dim_idx;
@@ -18471,17 +18477,13 @@ mod tests {
         let logits = s
             .tensor_variable(vec![2.0, 1.0, 0.1], vec![1, 3], false)
             .unwrap();
-        let targets = s
-            .tensor_variable(vec![0.0], vec![1], false)
-            .unwrap();
+        let targets = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
         let loss_plain = s.cross_entropy_loss(logits, targets).unwrap();
 
         let logits2 = s
             .tensor_variable(vec![2.0, 1.0, 0.1], vec![1, 3], false)
             .unwrap();
-        let targets2 = s
-            .tensor_variable(vec![0.0], vec![1], false)
-            .unwrap();
+        let targets2 = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
         let loss_smooth = s
             .cross_entropy_loss_with_smoothing(logits2, targets2, 0.0)
             .unwrap();
@@ -18501,17 +18503,13 @@ mod tests {
         let logits = s
             .tensor_variable(vec![10.0, 0.0, 0.0], vec![1, 3], false)
             .unwrap();
-        let targets = s
-            .tensor_variable(vec![0.0], vec![1], false)
-            .unwrap();
+        let targets = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
         let loss_0 = s.cross_entropy_loss(logits, targets).unwrap();
 
         let logits2 = s
             .tensor_variable(vec![10.0, 0.0, 0.0], vec![1, 3], false)
             .unwrap();
-        let targets2 = s
-            .tensor_variable(vec![0.0], vec![1], false)
-            .unwrap();
+        let targets2 = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
         let loss_s = s
             .cross_entropy_loss_with_smoothing(logits2, targets2, 0.1)
             .unwrap();
@@ -18531,9 +18529,7 @@ mod tests {
         let logits = s
             .tensor_variable(vec![1.0, 1.0, 1.0], vec![1, 3], false)
             .unwrap();
-        let targets = s
-            .tensor_variable(vec![0.0], vec![1], false)
-            .unwrap();
+        let targets = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
         let loss = s
             .cross_entropy_loss_with_smoothing(logits, targets, 1.0)
             .unwrap();
@@ -28366,6 +28362,39 @@ mod tests {
         assert!(
             s.tensor_scatter_reduce(input, 0, index, src, "invalid")
                 .is_err()
+        );
+    }
+
+    #[test]
+    fn scatter_reduce_negative_index_wraps() {
+        // PyTorch semantics: negative index wraps (e.g., -1 means last)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        // Index -1 should wrap to index 2
+        let index = s.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        let src = s.tensor_variable(vec![10.0], vec![1], false).unwrap();
+        let out = s
+            .tensor_scatter_reduce(input, 0, index, src, "sum")
+            .unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // input[2] = 3.0 + 10.0 = 13.0
+        assert_eq!(vals, &[1.0, 2.0, 13.0]);
+    }
+
+    #[test]
+    fn scatter_reduce_rejects_out_of_range_index() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let index = s.tensor_variable(vec![5.0], vec![1], false).unwrap();
+        let src = s.tensor_variable(vec![10.0], vec![1], false).unwrap();
+        let err = s
+            .tensor_scatter_reduce(input, 0, index, src, "sum")
+            .expect_err("out-of-range index must fail");
+        assert!(
+            err.to_string().contains("out of bounds"),
+            "unexpected error: {err}"
         );
     }
 

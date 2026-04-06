@@ -2191,16 +2191,45 @@ impl EmbeddingBag {
         let num_bags = offsets_vals.len();
         let dim = self.embedding_dim;
         let n_indices = indices_vals.len();
+        let num_emb = self.num_embeddings;
         let mut output = vec![0.0f64; num_bags * dim];
 
+        // Validate per-sample weights length if provided
+        if let Some(ref psw) = psw
+            && psw.len() != n_indices
+        {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "EmbeddingBag: per_sample_weights length must match indices length",
+                },
+            )));
+        }
+
         for bag in 0..num_bags {
-            let start = offsets_vals[bag] as usize;
+            let start_f = offsets_vals[bag];
+            if start_f < 0.0 || start_f != start_f.trunc() {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "EmbeddingBag: offset value must be a non-negative integer",
+                    },
+                )));
+            }
+            let start = start_f as usize;
             let end = if bag + 1 < num_bags {
-                offsets_vals[bag + 1] as usize
+                let end_f = offsets_vals[bag + 1];
+                if end_f < 0.0 || end_f != end_f.trunc() {
+                    return Err(AutogradError::Dispatch(DispatchError::Key(
+                        DispatchKeyError::IncompatibleSet {
+                            reason: "EmbeddingBag: offset value must be a non-negative integer",
+                        },
+                    )));
+                }
+                (end_f as usize).min(n_indices)
             } else {
                 n_indices
             };
 
+            let start = start.min(n_indices);
             if start >= end {
                 // Empty bag: leave as zeros
                 continue;
@@ -2215,6 +2244,13 @@ impl EmbeddingBag {
                         let idx = indices_vals[i] as usize;
                         if Some(idx) == self.padding_idx {
                             continue;
+                        }
+                        if idx >= num_emb {
+                            return Err(AutogradError::Dispatch(DispatchError::Key(
+                                DispatchKeyError::IncompatibleSet {
+                                    reason: "EmbeddingBag: index out of range for embedding table",
+                                },
+                            )));
                         }
                         let w = if let Some(ref psw) = psw { psw[i] } else { 1.0 };
                         for d in 0..dim {
@@ -2236,6 +2272,13 @@ impl EmbeddingBag {
                         let idx = iv as usize;
                         if Some(idx) == self.padding_idx {
                             continue;
+                        }
+                        if idx >= num_emb {
+                            return Err(AutogradError::Dispatch(DispatchError::Key(
+                                DispatchKeyError::IncompatibleSet {
+                                    reason: "EmbeddingBag: index out of range for embedding table",
+                                },
+                            )));
                         }
                         for d in 0..dim {
                             let v = weight_vals[idx * dim + d];
@@ -20838,6 +20881,77 @@ mod tests {
         assert_eq!(eb.parameters().len(), 1);
     }
 
+    // ── frankentorch-gls: EmbeddingBag bounds check tests ─────────────
+
+    #[test]
+    fn embedding_bag_rejects_out_of_range_index() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 5, 3, EmbeddingBagMode::Sum, None).unwrap();
+        // Index 10 is out of range for 5 embeddings
+        let indices = session
+            .tensor_variable(vec![0.0, 10.0, 2.0], vec![3], false)
+            .unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let err = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .expect_err("out-of-range index must fail");
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn embedding_bag_rejects_out_of_range_index_max_mode() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 3, 2, EmbeddingBagMode::Max, None).unwrap();
+        let indices = session.tensor_variable(vec![5.0], vec![1], false).unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let err = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .expect_err("out-of-range index must fail in max mode");
+        assert!(
+            err.to_string().contains("out of range"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn embedding_bag_rejects_mismatched_per_sample_weights() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 5, 3, EmbeddingBagMode::Sum, None).unwrap();
+        let indices = session
+            .tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false)
+            .unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        // per_sample_weights has wrong length (2 instead of 3)
+        let psw = session
+            .tensor_variable(vec![1.0, 1.0], vec![2], false)
+            .unwrap();
+        let err = eb
+            .forward_with_offsets(&mut session, indices, offsets, Some(psw))
+            .expect_err("mismatched psw length must fail");
+        assert!(
+            err.to_string().contains("per_sample_weights"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn embedding_bag_negative_offset_rejected() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 5, 3, EmbeddingBagMode::Sum, None).unwrap();
+        let indices = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let offsets = session.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        let err = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .expect_err("negative offset must fail");
+        assert!(
+            err.to_string().contains("non-negative"),
+            "unexpected error: {err}"
+        );
+    }
+
     // ── CTCLoss Tests ──────────────────────────────────────────────────
 
     /// Helper to create log_probs tensor from a flat array with shape [T, N, C].
@@ -22323,7 +22437,11 @@ mod tests {
         let (g, v) = weight_norm_decompose(&mut s, w, 0).unwrap();
 
         let g_shape = s.tensor_shape(g).unwrap();
-        assert_eq!(g_shape, vec![2], "g should have one element per dim-0 slice");
+        assert_eq!(
+            g_shape,
+            vec![2],
+            "g should have one element per dim-0 slice"
+        );
 
         // Reconstruct and verify it matches the original
         let w_reconstructed = weight_norm_reconstruct(&mut s, g, v, 0).unwrap();
@@ -22353,9 +22471,7 @@ mod tests {
     #[test]
     fn weight_norm_rejects_bad_dim() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let w = s
-            .tensor_variable(vec![1.0; 6], vec![2, 3], true)
-            .unwrap();
+        let w = s.tensor_variable(vec![1.0; 6], vec![2, 3], true).unwrap();
         assert!(weight_norm_decompose(&mut s, w, 5).is_err());
     }
 
