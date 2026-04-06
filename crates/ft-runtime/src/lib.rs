@@ -138,6 +138,13 @@ impl DurabilityEnvelope {
         repair_symbols: u32,
         overhead_ratio: f64,
     ) -> Self {
+        let k = k.max(1);
+        let repair_symbols = repair_symbols.max(1);
+        let overhead_ratio = if overhead_ratio.is_finite() {
+            overhead_ratio.max(0.0)
+        } else {
+            0.0
+        };
         Self {
             artifact_id: artifact_id.into(),
             artifact_type: artifact_type.into(),
@@ -299,6 +306,26 @@ mod tests {
         let mut envelope = DurabilityEnvelope::new("art-3", "fixture", "blake3:ghi", 64, 8, 0.125);
         envelope.mark_scrub_status(ScrubStatus::Failed);
         assert_eq!(envelope.scrub_status, ScrubStatus::Failed);
+    }
+
+    #[test]
+    fn durability_envelope_normalizes_zero_symbol_counts() {
+        let envelope = DurabilityEnvelope::new("art-3b", "fixture", "blake3:ghi", 0, 0, 0.125);
+        assert_eq!(envelope.k, 1);
+        assert_eq!(envelope.repair_symbols, 1);
+    }
+
+    #[test]
+    fn durability_envelope_normalizes_invalid_overhead_ratio() {
+        let negative = DurabilityEnvelope::new("art-3c", "fixture", "blake3:ghi", 64, 8, -0.25);
+        assert_eq!(negative.overhead_ratio, 0.0);
+
+        let nan = DurabilityEnvelope::new("art-3d", "fixture", "blake3:ghi", 64, 8, f64::NAN);
+        assert_eq!(nan.overhead_ratio, 0.0);
+
+        let infinite =
+            DurabilityEnvelope::new("art-3e", "fixture", "blake3:ghi", 64, 8, f64::INFINITY);
+        assert_eq!(infinite.overhead_ratio, 0.0);
     }
 
     #[test]
