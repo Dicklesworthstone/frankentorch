@@ -757,6 +757,15 @@ impl From<TensorMetaError> for DenseTensorError {
     }
 }
 
+fn contiguous_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError> {
+    meta.storage_offset()
+        .checked_add(meta.numel())
+        .ok_or(DenseTensorError::StorageSpanOverflow {
+            storage_offset: meta.storage_offset(),
+            numel: meta.numel(),
+        })
+}
+
 impl DenseTensor {
     pub fn from_typed_storage(
         meta: TensorMeta,
@@ -858,12 +867,7 @@ impl DenseTensor {
     }
 
     fn contiguous_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError> {
-        meta.storage_offset().checked_add(meta.numel()).ok_or(
-            DenseTensorError::StorageSpanOverflow {
-                storage_offset: meta.storage_offset(),
-                numel: meta.numel(),
-            },
-        )
+        contiguous_required_len(meta)
     }
 
     fn storage_span_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError> {
@@ -1156,7 +1160,7 @@ impl DenseI64Tensor {
         if !meta.is_contiguous() {
             return Err(DenseTensorError::UnsupportedLayout);
         }
-        let needed = meta.storage_offset() + meta.numel();
+        let needed = contiguous_required_len(&meta)?;
         if storage.len() < needed {
             return Err(DenseTensorError::InsufficientStorage {
                 needed,
@@ -1207,7 +1211,7 @@ impl DenseI64Tensor {
             return Err(DenseTensorError::UnsupportedLayout);
         }
         let start = self.meta.storage_offset();
-        let end = start + self.meta.numel();
+        let end = contiguous_required_len(&self.meta)?;
         Ok(&self.storage[start..end])
     }
 
@@ -1238,7 +1242,7 @@ impl DenseI32Tensor {
         if !meta.is_contiguous() {
             return Err(DenseTensorError::UnsupportedLayout);
         }
-        let needed = meta.storage_offset() + meta.numel();
+        let needed = contiguous_required_len(&meta)?;
         if storage.len() < needed {
             return Err(DenseTensorError::InsufficientStorage {
                 needed,
@@ -1289,7 +1293,7 @@ impl DenseI32Tensor {
             return Err(DenseTensorError::UnsupportedLayout);
         }
         let start = self.meta.storage_offset();
-        let end = start + self.meta.numel();
+        let end = contiguous_required_len(&self.meta)?;
         Ok(&self.storage[start..end])
     }
 
@@ -1320,7 +1324,7 @@ impl DenseBoolTensor {
         if !meta.is_contiguous() {
             return Err(DenseTensorError::UnsupportedLayout);
         }
-        let needed = meta.storage_offset() + meta.numel();
+        let needed = contiguous_required_len(&meta)?;
         if storage.len() < needed {
             return Err(DenseTensorError::InsufficientStorage {
                 needed,
@@ -1372,7 +1376,7 @@ impl DenseBoolTensor {
             return Err(DenseTensorError::UnsupportedLayout);
         }
         let start = self.meta.storage_offset();
-        let end = start + self.meta.numel();
+        let end = contiguous_required_len(&self.meta)?;
         Ok(&self.storage[start..end])
     }
 
@@ -2144,6 +2148,21 @@ mod tests {
     }
 
     #[test]
+    fn dense_i64_tensor_rejects_storage_span_overflow() {
+        let meta = TensorMeta::from_shape(vec![1], DType::I64, Device::Cpu)
+            .with_storage_offset(usize::MAX);
+        let err =
+            DenseI64Tensor::from_storage(meta, vec![1]).expect_err("overflowing span must fail");
+        assert!(matches!(
+            err,
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset,
+                numel: 1
+            } if storage_offset == usize::MAX
+        ));
+    }
+
+    #[test]
     fn dense_i64_tensor_negative_values() {
         let dt = DenseI64Tensor::from_contiguous_values(
             vec![-100, 0, i64::MAX, i64::MIN],
@@ -2199,6 +2218,21 @@ mod tests {
         let dt = DenseI32Tensor::from_contiguous_values(vec![8, 9], vec![2], Device::Cpu)
             .expect("create i32 tensor");
         assert_eq!(dt.storage(), &[8i32, 9]);
+    }
+
+    #[test]
+    fn dense_i32_tensor_rejects_storage_span_overflow() {
+        let meta = TensorMeta::from_shape(vec![1], DType::I32, Device::Cpu)
+            .with_storage_offset(usize::MAX);
+        let err =
+            DenseI32Tensor::from_storage(meta, vec![1]).expect_err("overflowing span must fail");
+        assert!(matches!(
+            err,
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset,
+                numel: 1
+            } if storage_offset == usize::MAX
+        ));
     }
 
     // ---- Bool DType tests (bd-2do9.2) ----
@@ -2275,6 +2309,90 @@ mod tests {
                 needed: 5,
                 actual: 2
             }
+        ));
+    }
+
+    #[test]
+    fn dense_bool_tensor_rejects_storage_span_overflow() {
+        let meta = TensorMeta::from_shape(vec![1], DType::Bool, Device::Cpu)
+            .with_storage_offset(usize::MAX);
+        let err =
+            DenseBoolTensor::from_storage(meta, vec![1]).expect_err("overflowing span must fail");
+        assert!(matches!(
+            err,
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset,
+                numel: 1
+            } if storage_offset == usize::MAX
+        ));
+    }
+
+    #[test]
+    fn dense_i64_tensor_contiguous_values_rejects_storage_span_overflow() {
+        let tensor = DenseI64Tensor {
+            id: 1,
+            storage_id: 1,
+            meta: TensorMeta::from_shape(vec![1], DType::I64, Device::Cpu)
+                .with_storage_offset(usize::MAX),
+            storage: vec![1],
+            version: 0,
+        };
+
+        let err = tensor
+            .contiguous_values()
+            .expect_err("overflowing span must fail");
+        assert!(matches!(
+            err,
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset,
+                numel: 1
+            } if storage_offset == usize::MAX
+        ));
+    }
+
+    #[test]
+    fn dense_i32_tensor_contiguous_values_rejects_storage_span_overflow() {
+        let tensor = DenseI32Tensor {
+            id: 1,
+            storage_id: 1,
+            meta: TensorMeta::from_shape(vec![1], DType::I32, Device::Cpu)
+                .with_storage_offset(usize::MAX),
+            storage: vec![1],
+            version: 0,
+        };
+
+        let err = tensor
+            .contiguous_values()
+            .expect_err("overflowing span must fail");
+        assert!(matches!(
+            err,
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset,
+                numel: 1
+            } if storage_offset == usize::MAX
+        ));
+    }
+
+    #[test]
+    fn dense_bool_tensor_contiguous_values_rejects_storage_span_overflow() {
+        let tensor = DenseBoolTensor {
+            id: 1,
+            storage_id: 1,
+            meta: TensorMeta::from_shape(vec![1], DType::Bool, Device::Cpu)
+                .with_storage_offset(usize::MAX),
+            storage: vec![1],
+            version: 0,
+        };
+
+        let err = tensor
+            .contiguous_values()
+            .expect_err("overflowing span must fail");
+        assert!(matches!(
+            err,
+            DenseTensorError::StorageSpanOverflow {
+                storage_offset,
+                numel: 1
+            } if storage_offset == usize::MAX
         ));
     }
 
