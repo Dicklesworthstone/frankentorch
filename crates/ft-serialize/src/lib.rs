@@ -812,9 +812,11 @@ fn ft_dtype_to_st(dtype: DType) -> Result<StDtype, TensorIOError> {
         DType::F32 => Ok(StDtype::F32),
         DType::F16 => Ok(StDtype::F16),
         DType::BF16 => Ok(StDtype::BF16),
-        DType::I64 => Ok(StDtype::I64),
-        DType::I32 => Ok(StDtype::I32),
-        DType::Bool => Ok(StDtype::BOOL),
+        DType::I64 | DType::I32 | DType::Bool => Err(TensorIOError::Corrupt {
+            reason: format!(
+                "integer/bool dtypes ({dtype:?}) are not supported by the DenseTensor SafeTensors bridge"
+            ),
+        }),
         DType::Complex64 | DType::Complex128 => Err(TensorIOError::Corrupt {
             reason: format!("complex dtypes ({dtype:?}) are not supported by SafeTensors"),
         }),
@@ -828,9 +830,11 @@ fn st_dtype_to_ft(dtype: StDtype) -> Result<DType, TensorIOError> {
         StDtype::F32 => Ok(DType::F32),
         StDtype::F16 => Ok(DType::F16),
         StDtype::BF16 => Ok(DType::BF16),
-        StDtype::I64 => Ok(DType::I64),
-        StDtype::I32 => Ok(DType::I32),
-        StDtype::BOOL => Ok(DType::Bool),
+        StDtype::I64 | StDtype::I32 | StDtype::BOOL => Err(TensorIOError::Corrupt {
+            reason: format!(
+                "integer/bool SafeTensors dtype ({dtype:?}) is unsupported by the DenseTensor loader"
+            ),
+        }),
         other => Err(TensorIOError::Corrupt {
             reason: format!("unsupported SafeTensors dtype: {other:?}"),
         }),
@@ -1074,8 +1078,8 @@ mod tests {
     use serde_json::json;
 
     use super::{
-        CheckpointMode, DecodeMode, SerializeError, SnapshotEntry, decode_checkpoint,
-        decode_snapshot, encode_checkpoint, encode_snapshot, generate_raptorq_sidecar,
+        decode_checkpoint, decode_snapshot, encode_checkpoint, encode_snapshot,
+        generate_raptorq_sidecar, CheckpointMode, DecodeMode, SerializeError, SnapshotEntry,
     };
 
     fn det_seed(parts: &[u64]) -> u64 {
@@ -1800,7 +1804,7 @@ mod tests {
 
     // ── Tensor State Dict Save/Load Tests ──────────────────────────────
 
-    use super::{TensorIOError, load_state_dict, load_state_dict_from_bytes, save_state_dict};
+    use super::{load_state_dict, load_state_dict_from_bytes, save_state_dict, TensorIOError};
     use ft_core::{DType, DenseTensor, Device, TensorMeta};
 
     fn make_f64_tensor(values: Vec<f64>, shape: Vec<usize>) -> DenseTensor {
@@ -2293,6 +2297,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn safetensors_rejects_i64_dtype_for_dense_tensor_loader() {
+        let bytes = malformed_safetensors_bytes("I64", &[1], &42_i64.to_le_bytes());
+
+        let err = load_safetensors_from_bytes(&bytes).expect_err("i64 dtype must fail");
+        let msg = err.to_string();
+
+        assert!(matches!(err, TensorIOError::Corrupt { .. }));
+        assert!(
+            msg.contains("integer/bool SafeTensors dtype") || msg.contains("unsupported"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn safetensors_rejects_bool_dtype_for_dense_tensor_loader() {
+        let bytes = malformed_safetensors_bytes("BOOL", &[1], &[1]);
+
+        let err = load_safetensors_from_bytes(&bytes).expect_err("bool dtype must fail");
+        let msg = err.to_string();
+
+        assert!(matches!(err, TensorIOError::Corrupt { .. }));
+        assert!(
+            msg.contains("integer/bool SafeTensors dtype") || msg.contains("unsupported"),
+            "unexpected error: {msg}"
+        );
+    }
+
     // ── frankentorch-u0p: Audit edge cases ───────────────────────��─────
 
     #[test]
@@ -2303,7 +2335,7 @@ mod tests {
         data.extend_from_slice(b"FTSV");
         data.extend_from_slice(&1u32.to_le_bytes()); // version
         data.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
-        // key: "x"
+                                                     // key: "x"
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(b'x');
         // ndim = 2
@@ -2340,7 +2372,7 @@ mod tests {
         data.extend_from_slice(b"FTSV");
         data.extend_from_slice(&1u32.to_le_bytes()); // version
         data.extend_from_slice(&1u64.to_le_bytes()); // num_tensors = 1
-        // key: "y"
+                                                     // key: "y"
         data.extend_from_slice(&1u64.to_le_bytes());
         data.push(b'y');
         // ndim = 1
