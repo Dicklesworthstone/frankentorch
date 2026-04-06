@@ -55,6 +55,21 @@ fn ensure_state_len(
     Ok(())
 }
 
+fn decode_exact_usize_field(value: f64, min: usize) -> Option<usize> {
+    if !value.is_finite() || value.fract() != 0.0 || value < min as f64 || value > usize::MAX as f64
+    {
+        return None;
+    }
+    Some(value as usize)
+}
+
+fn decode_exact_i64_field(value: f64, min: i64) -> Option<i64> {
+    if !value.is_finite() || value.fract() != 0.0 || value < min as f64 || value > i64::MAX as f64 {
+        return None;
+    }
+    Some(value as i64)
+}
+
 fn load_param_gradient(
     session: &FrankenTorchSession,
     param: TensorNodeId,
@@ -1843,7 +1858,11 @@ impl LRScheduler for StepLR {
         for (key, val) in &state.extra {
             match key.as_str() {
                 "initial_lr" => self.initial_lr = *val,
-                "step_size" => self.step_size = *val as usize,
+                "step_size" => {
+                    if let Some(step_size) = decode_exact_usize_field(*val, 1) {
+                        self.step_size = step_size;
+                    }
+                }
                 "gamma" => self.gamma = *val,
                 _ => {}
             }
@@ -1988,8 +2007,9 @@ impl LRScheduler for MultiStepLR {
                     if let Some(index) = key
                         .strip_prefix("milestone_")
                         .and_then(|suffix| suffix.parse::<usize>().ok())
+                        && let Some(milestone) = decode_exact_usize_field(*val, 0)
                     {
-                        indexed_milestones.push((index, *val as usize));
+                        indexed_milestones.push((index, milestone));
                     }
                 }
             }
@@ -2122,7 +2142,11 @@ impl LRScheduler for CosineAnnealingLR {
         for (key, val) in &state.extra {
             match key.as_str() {
                 "initial_lr" => self.initial_lr = *val,
-                "t_max" => self.t_max = (*val as usize).max(1),
+                "t_max" => {
+                    if let Some(t_max) = decode_exact_usize_field(*val, 1) {
+                        self.t_max = t_max;
+                    }
+                }
                 "eta_min" => self.eta_min = *val,
                 _ => {}
             }
@@ -2274,11 +2298,27 @@ impl LRScheduler for CosineAnnealingWarmRestarts {
         for (key, val) in &state.extra {
             match key.as_str() {
                 "initial_lr" => self.initial_lr = *val,
-                "t_0" => self.t_0 = (*val as usize).max(1),
-                "t_mult" => self.t_mult = (*val as usize).max(1),
+                "t_0" => {
+                    if let Some(t_0) = decode_exact_usize_field(*val, 1) {
+                        self.t_0 = t_0;
+                    }
+                }
+                "t_mult" => {
+                    if let Some(t_mult) = decode_exact_usize_field(*val, 1) {
+                        self.t_mult = t_mult;
+                    }
+                }
                 "eta_min" => self.eta_min = *val,
-                "t_cur" => self.t_cur = *val as i64,
-                "t_i" => self.t_i = (*val as usize).max(1),
+                "t_cur" => {
+                    if let Some(t_cur) = decode_exact_i64_field(*val, -1) {
+                        self.t_cur = t_cur;
+                    }
+                }
+                "t_i" => {
+                    if let Some(t_i) = decode_exact_usize_field(*val, 1) {
+                        self.t_i = t_i;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2522,7 +2562,11 @@ impl LRScheduler for LinearLR {
                 "initial_lr" => self.initial_lr = *val,
                 "start_factor" => self.start_factor = *val,
                 "end_factor" => self.end_factor = *val,
-                "total_iters" => self.total_iters = *val as usize,
+                "total_iters" => {
+                    if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
+                        self.total_iters = total_iters;
+                    }
+                }
                 _ => {}
             }
         }
@@ -2789,7 +2833,11 @@ impl LRScheduler for ReduceLROnPlateau {
                     };
                 }
                 "factor" => self.factor = *val,
-                "patience" => self.patience = *val as usize,
+                "patience" => {
+                    if let Some(patience) = decode_exact_usize_field(*val, 0) {
+                        self.patience = patience;
+                    }
+                }
                 "threshold" => self.threshold = *val,
                 "threshold_mode" => {
                     self.threshold_mode = if *val >= 0.5 {
@@ -2798,12 +2846,24 @@ impl LRScheduler for ReduceLROnPlateau {
                         ThresholdMode::Rel
                     };
                 }
-                "cooldown" => self.cooldown = *val as usize,
+                "cooldown" => {
+                    if let Some(cooldown) = decode_exact_usize_field(*val, 0) {
+                        self.cooldown = cooldown;
+                    }
+                }
                 "min_lr" => self.min_lr = *val,
                 "eps" => self.eps = *val,
                 "best" => self.best = *val,
-                "num_bad_epochs" => self.num_bad_epochs = *val as usize,
-                "cooldown_counter" => self.cooldown_counter = *val as usize,
+                "num_bad_epochs" => {
+                    if let Some(num_bad_epochs) = decode_exact_usize_field(*val, 0) {
+                        self.num_bad_epochs = num_bad_epochs;
+                    }
+                }
+                "cooldown_counter" => {
+                    if let Some(cooldown_counter) = decode_exact_usize_field(*val, 0) {
+                        self.cooldown_counter = cooldown_counter;
+                    }
+                }
                 "initialized" => self.initialized = *val >= 0.5,
                 _ => {}
             }
@@ -3022,8 +3082,9 @@ impl LRScheduler for SequentialLR {
             if let Some(index) = key
                 .strip_prefix("milestone_")
                 .and_then(|suffix| suffix.parse::<usize>().ok())
+                && let Some(milestone) = decode_exact_usize_field(*val, 0)
             {
-                indexed_milestones.push((index, *val as usize));
+                indexed_milestones.push((index, milestone));
             }
         }
         if !indexed_milestones.is_empty() {
@@ -3419,7 +3480,11 @@ impl LRScheduler for OneCycleLR {
         for (key, val) in &state.extra {
             match key.as_str() {
                 "max_lr" => self.max_lr = *val,
-                "total_steps" => self.total_steps = (*val as usize).max(1),
+                "total_steps" => {
+                    if let Some(total_steps) = decode_exact_usize_field(*val, 1) {
+                        self.total_steps = total_steps;
+                    }
+                }
                 "pct_start" => self.pct_start = val.clamp(0.0, 1.0),
                 "anneal_strategy" => {
                     self.anneal_strategy = if *val >= 0.5 {
@@ -3517,7 +3582,11 @@ impl LRScheduler for PolynomialLR {
         for (key, val) in &state.extra {
             match key.as_str() {
                 "initial_lr" => self.initial_lr = *val,
-                "total_iters" => self.total_iters = *val as usize,
+                "total_iters" => {
+                    if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
+                        self.total_iters = total_iters;
+                    }
+                }
                 "power" => self.power = *val,
                 _ => {}
             }
@@ -3597,7 +3666,11 @@ impl LRScheduler for ConstantLR {
             match key.as_str() {
                 "initial_lr" => self.initial_lr = *val,
                 "factor" => self.factor = *val,
-                "total_iters" => self.total_iters = *val as usize,
+                "total_iters" => {
+                    if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
+                        self.total_iters = total_iters;
+                    }
+                }
                 _ => {}
             }
         }
@@ -3795,9 +3868,21 @@ impl LRScheduler for CyclicLR {
             match key.as_str() {
                 "base_lr" => self.base_lr = *val,
                 "max_lr" => self.max_lr = *val,
-                "step_size_up" => self.step_size_up = *val as usize,
-                "step_size_down" => self.step_size_down = *val as usize,
-                "iteration" => self.iteration = *val as usize,
+                "step_size_up" => {
+                    if let Some(step_size_up) = decode_exact_usize_field(*val, 1) {
+                        self.step_size_up = step_size_up;
+                    }
+                }
+                "step_size_down" => {
+                    if let Some(step_size_down) = decode_exact_usize_field(*val, 1) {
+                        self.step_size_down = step_size_down;
+                    }
+                }
+                "iteration" => {
+                    if let Some(iteration) = decode_exact_usize_field(*val, 0) {
+                        self.iteration = iteration;
+                    }
+                }
                 _ => {}
             }
         }
@@ -7133,6 +7218,43 @@ mod tests {
     }
 
     #[test]
+    fn step_lr_load_state_dict_ignores_invalid_step_size() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let opt = SGD::new(vec![x], 0.1);
+        let mut scheduler = StepLR::new(&opt, 7).gamma(0.3);
+        let original = scheduler.state_dict();
+
+        scheduler.load_state_dict(SchedulerState {
+            last_epoch: 5,
+            last_lrs: vec![0.03],
+            extra: vec![
+                ("initial_lr".to_owned(), 0.1),
+                ("step_size".to_owned(), 0.0),
+                ("gamma".to_owned(), 0.3),
+            ],
+        });
+
+        let restored = scheduler.state_dict();
+        assert_eq!(restored.last_epoch, 5);
+        assert_eq!(restored.last_lrs, vec![0.03]);
+        assert_eq!(
+            restored
+                .extra
+                .iter()
+                .find(|(key, _)| key == "step_size")
+                .map(|(_, value)| *value),
+            original
+                .extra
+                .iter()
+                .find(|(key, _)| key == "step_size")
+                .map(|(_, value)| *value)
+        );
+    }
+
+    #[test]
     fn step_lr_with_sgd_integration() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -7346,6 +7468,46 @@ mod tests {
     }
 
     #[test]
+    fn multistep_lr_load_state_dict_ignores_invalid_milestones() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let opt = SGD::new(vec![x], 0.8);
+        let mut scheduler = MultiStepLR::new(&opt, vec![4, 8]).gamma(0.2);
+        let original = scheduler.state_dict();
+
+        scheduler.load_state_dict(SchedulerState {
+            last_epoch: 9,
+            last_lrs: vec![0.032],
+            extra: vec![
+                ("initial_lr".to_owned(), 0.8),
+                ("gamma".to_owned(), 0.2),
+                ("milestone_0".to_owned(), -1.0),
+                ("milestone_1".to_owned(), 3.5),
+            ],
+        });
+
+        let restored = scheduler.state_dict();
+        assert_eq!(restored.last_epoch, 9);
+        assert_eq!(restored.last_lrs, vec![0.032]);
+        assert_eq!(
+            restored
+                .extra
+                .iter()
+                .filter(|(key, _)| key.starts_with("milestone_"))
+                .cloned()
+                .collect::<Vec<_>>(),
+            original
+                .extra
+                .iter()
+                .filter(|(key, _)| key.starts_with("milestone_"))
+                .cloned()
+                .collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
     fn cosine_annealing_lr_key_epochs() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -7504,6 +7666,42 @@ mod tests {
         assert_eq!(scheduler2.state_dict(), state);
         assert_eq!(scheduler2.get_last_lr(), scheduler.get_last_lr());
         assert_eq!(scheduler2.get_lr(), scheduler.get_lr());
+    }
+
+    #[test]
+    fn cosine_warm_restarts_load_state_dict_ignores_invalid_cycle_fields() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let opt = SGD::new(vec![x], 0.5);
+        let mut scheduler = CosineAnnealingWarmRestarts::new(&opt, 3)
+            .t_mult(2)
+            .eta_min(0.05);
+        let original = scheduler.state_dict();
+
+        scheduler.load_state_dict(SchedulerState {
+            last_epoch: 4,
+            last_lrs: vec![0.42],
+            extra: vec![
+                ("initial_lr".to_owned(), 0.5),
+                ("t_0".to_owned(), -3.0),
+                ("t_mult".to_owned(), 1.5),
+                ("eta_min".to_owned(), 0.05),
+                ("t_cur".to_owned(), f64::NAN),
+                ("t_i".to_owned(), 0.0),
+            ],
+        });
+
+        let restored = scheduler.state_dict();
+        assert_eq!(restored.last_epoch, 4);
+        assert_eq!(restored.last_lrs, vec![0.42]);
+        for key in ["t_0", "t_mult", "t_cur", "t_i"] {
+            assert_eq!(
+                restored.extra.iter().find(|(name, _)| name == key),
+                original.extra.iter().find(|(name, _)| name == key)
+            );
+        }
     }
 
     #[test]
@@ -8903,6 +9101,39 @@ mod tests {
         scheduler2.load_state_dict(state);
 
         assert_eq!(scheduler.get_last_lr(), scheduler2.get_last_lr());
+    }
+
+    #[test]
+    fn cyclic_lr_load_state_dict_ignores_invalid_step_sizes() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("variable");
+        let opt = SGD::new(vec![x], 0.1);
+        let mut scheduler = CyclicLR::new(&opt, 0.001, 0.01, 5).step_size_down(4);
+        let original = scheduler.state_dict();
+
+        scheduler.load_state_dict(SchedulerState {
+            last_epoch: 3,
+            last_lrs: vec![0.006],
+            extra: vec![
+                ("base_lr".to_owned(), 0.001),
+                ("max_lr".to_owned(), 0.01),
+                ("step_size_up".to_owned(), 0.0),
+                ("step_size_down".to_owned(), -2.0),
+                ("iteration".to_owned(), 2.25),
+            ],
+        });
+
+        let restored = scheduler.state_dict();
+        assert_eq!(restored.last_epoch, 3);
+        assert_eq!(restored.last_lrs, vec![0.006]);
+        for key in ["step_size_up", "step_size_down", "iteration"] {
+            assert_eq!(
+                restored.extra.iter().find(|(name, _)| name == key),
+                original.extra.iter().find(|(name, _)| name == key)
+            );
+        }
     }
 
     #[test]
