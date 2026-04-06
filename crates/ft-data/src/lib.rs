@@ -343,7 +343,7 @@ impl WeightedRandomSampler {
             // Generate uniform [0, 1) using the RNG
             let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
             // Binary search for the index
-            let idx = match cumulative.binary_search_by(|c| c.partial_cmp(&u).unwrap()) {
+            let idx = match cumulative.binary_search_by(|c| c.total_cmp(&u)) {
                 Ok(i) => i,
                 Err(i) => i.min(self.weights.len() - 1),
             };
@@ -415,6 +415,9 @@ impl BatchSampler {
 
     /// Return all batches as vectors of indices.
     pub fn batches(&self) -> Vec<Vec<usize>> {
+        if self.batch_size == 0 {
+            return Vec::new();
+        }
         let mut result = Vec::with_capacity(self.len());
         let mut pos = 0;
         while pos < self.indices.len() {
@@ -852,11 +855,7 @@ impl<D: Dataset> Dataset for Subset<D> {
 ///
 /// Uses a deterministic Fisher-Yates shuffle seeded by `seed`.
 /// The underlying dataset is shared via `Arc` (no data cloning).
-pub fn random_split<D: Dataset>(
-    dataset: D,
-    lengths: &[usize],
-    seed: u64,
-) -> Vec<Subset<D>> {
+pub fn random_split<D: Dataset>(dataset: D, lengths: &[usize], seed: u64) -> Vec<Subset<D>> {
     let n = dataset.len();
     let total: usize = lengths.iter().sum();
     assert!(
@@ -1561,5 +1560,192 @@ mod tests {
     fn random_split_rejects_too_large() {
         let ds = make_dataset(5, 1);
         random_split(ds, &[3, 4], 0);
+    }
+
+    // ── frankentorch-4i2: Sampler builder and edge case tests ──────────
+
+    #[test]
+    fn random_sampler_deterministic_with_same_seed() {
+        let a = RandomSampler::new(20).with_seed(999).indices();
+        let b = RandomSampler::new(20).with_seed(999).indices();
+        assert_eq!(a, b, "same seed must produce identical indices");
+    }
+
+    #[test]
+    fn random_sampler_different_seeds_differ() {
+        let a = RandomSampler::new(20).with_seed(1).indices();
+        let b = RandomSampler::new(20).with_seed(2).indices();
+        assert_ne!(
+            a, b,
+            "different seeds should produce different permutations"
+        );
+    }
+
+    #[test]
+    fn random_sampler_truncated_without_replacement() {
+        let s = RandomSampler::new(10).with_num_samples(5).with_seed(42);
+        let indices = s.indices();
+        assert_eq!(indices.len(), 5);
+        assert_eq!(s.len(), 5);
+        // All indices in range and unique (no replacement)
+        let unique: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        assert_eq!(unique.len(), 5);
+        assert!(indices.iter().all(|&i| i < 10));
+    }
+
+    #[test]
+    fn random_sampler_empty() {
+        let s = RandomSampler::new(0);
+        assert!(s.is_empty());
+        assert!(s.indices().is_empty());
+    }
+
+    #[test]
+    fn weighted_random_sampler_deterministic() {
+        let w = vec![1.0, 2.0, 3.0];
+        let a = WeightedRandomSampler::new(w.clone(), 50)
+            .with_seed(42)
+            .indices();
+        let b = WeightedRandomSampler::new(w, 50).with_seed(42).indices();
+        assert_eq!(a, b, "same seed must produce identical weighted samples");
+    }
+
+    #[test]
+    fn weighted_random_sampler_empty_weights() {
+        let s = WeightedRandomSampler::new(Vec::new(), 10).with_seed(42);
+        assert_eq!(s.len(), 10);
+        assert!(
+            s.indices().is_empty(),
+            "empty weights should yield empty indices"
+        );
+    }
+
+    #[test]
+    fn weighted_random_sampler_single_weight() {
+        let s = WeightedRandomSampler::new(vec![5.0], 20).with_seed(42);
+        let indices = s.indices();
+        assert_eq!(indices.len(), 20);
+        assert!(
+            indices.iter().all(|&i| i == 0),
+            "single weight = always index 0"
+        );
+    }
+
+    #[test]
+    fn weighted_random_sampler_infinity_weight_sanitized() {
+        let s = WeightedRandomSampler::new(vec![f64::INFINITY, 1.0], 50).with_seed(42);
+        let indices = s.indices();
+        assert_eq!(indices.len(), 50);
+        // Infinity is sanitized to 0, so only index 1 (weight 1.0) should appear
+        assert!(
+            indices.iter().all(|&i| i == 1),
+            "infinity weight should be sanitized to zero"
+        );
+    }
+
+    #[test]
+    fn weighted_random_sampler_zero_num_samples() {
+        let s = WeightedRandomSampler::new(vec![1.0, 2.0], 0).with_seed(42);
+        assert!(s.is_empty());
+        assert!(s.indices().is_empty());
+    }
+
+    #[test]
+    fn subset_random_sampler_deterministic() {
+        let indices = vec![10, 20, 30, 40, 50];
+        let a = SubsetRandomSampler::new(indices.clone())
+            .with_seed(77)
+            .indices();
+        let b = SubsetRandomSampler::new(indices).with_seed(77).indices();
+        assert_eq!(a, b, "same seed must produce identical shuffle");
+    }
+
+    #[test]
+    fn batch_sampler_from_subset() {
+        let subset = SubsetRandomSampler::new(vec![0, 1, 2, 3, 4]).with_seed(42);
+        let bs = BatchSampler::from_subset(&subset, 2, false);
+        let batches = bs.batches();
+        assert_eq!(batches.len(), 3); // ceil(5/2) = 3
+        let all: Vec<usize> = batches.into_iter().flatten().collect();
+        assert_eq!(all.len(), 5);
+    }
+
+    #[test]
+    fn batch_sampler_empty_indices() {
+        let bs = BatchSampler::new(Vec::new(), 3, false);
+        assert!(bs.is_empty());
+        assert_eq!(bs.len(), 0);
+        assert!(bs.batches().is_empty());
+    }
+
+    #[test]
+    fn batch_sampler_batch_size_zero() {
+        let bs = BatchSampler::new(vec![0, 1, 2], 0, false);
+        assert_eq!(bs.len(), 0);
+        assert!(bs.batches().is_empty());
+    }
+
+    #[test]
+    fn batch_sampler_exact_division() {
+        let seq = SequentialSampler::new(9);
+        let bs = BatchSampler::from_sequential(&seq, 3, false);
+        assert_eq!(bs.len(), 3);
+        let batches = bs.batches();
+        assert_eq!(batches.len(), 3);
+        assert_eq!(batches[0].len(), 3);
+        assert_eq!(batches[1].len(), 3);
+        assert_eq!(batches[2].len(), 3);
+    }
+
+    #[test]
+    fn batch_sampler_exact_division_drop_last_same() {
+        let seq = SequentialSampler::new(9);
+        let bs_keep = BatchSampler::from_sequential(&seq, 3, false);
+        let bs_drop = BatchSampler::from_sequential(&seq, 3, true);
+        // When evenly divisible, drop_last makes no difference
+        assert_eq!(bs_keep.len(), bs_drop.len());
+        assert_eq!(bs_keep.batches(), bs_drop.batches());
+    }
+
+    #[test]
+    fn dataloader_config_builder_chain() {
+        let config = DataLoaderConfig::new(32)
+            .with_shuffle(true)
+            .with_drop_last(true);
+        assert_eq!(config.batch_size, 32);
+        assert!(config.shuffle);
+        assert!(config.drop_last);
+    }
+
+    #[test]
+    fn dataloader_with_weighted_sampler() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ds = make_dataset(5, 1);
+        // Heavily weight index 0
+        let sampler = WeightedRandomSampler::new(vec![100.0, 0.0, 0.0, 0.0, 0.0], 10).with_seed(42);
+        let config = DataLoaderConfig::new(10);
+        let mut loader = DataLoader::with_indices(&ds, sampler.indices(), config);
+
+        let batch = loader.next_batch(&mut session).unwrap().unwrap();
+        let targets = session.tensor_values(batch.target().unwrap()).unwrap();
+        // All targets should be 0.0 since only index 0 has weight
+        assert!(
+            targets.iter().all(|&v| (v - 0.0).abs() < 1e-10),
+            "weighted sampler should only produce index 0, got targets: {targets:?}"
+        );
+    }
+
+    #[test]
+    fn random_split_partial_sum() {
+        // Split doesn't need to cover entire dataset
+        let ds = make_dataset(20, 1);
+        let splits = random_split(ds, &[5, 5], 42);
+        assert_eq!(splits.len(), 2);
+        assert_eq!(splits[0].len(), 5);
+        assert_eq!(splits[1].len(), 5);
+        // No overlap between the two splits
+        let set0: std::collections::HashSet<usize> = splits[0].indices().iter().copied().collect();
+        let set1: std::collections::HashSet<usize> = splits[1].indices().iter().copied().collect();
+        assert!(set0.is_disjoint(&set1), "partial splits must not overlap");
     }
 }
