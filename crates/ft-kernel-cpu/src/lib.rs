@@ -4012,7 +4012,7 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     // Extract eigenvalues from diagonal
     let mut eigen_pairs: Vec<(f64, usize)> = (0..n).map(|i| (a[i * n + i], i)).collect();
     // Sort ascending by eigenvalue
-    eigen_pairs.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
+    eigen_pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
 
     let eigenvalues: Vec<f64> = eigen_pairs.iter().map(|(val, _)| *val).collect();
     let mut eigenvectors = vec![0.0f64; n * n];
@@ -4229,7 +4229,7 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
 
     // Sort singular values in descending order
     let mut order: Vec<usize> = (0..k).collect();
-    order.sort_by(|&a, &b| singular_values[b].partial_cmp(&singular_values[a]).unwrap());
+    order.sort_by(|&a, &b| singular_values[b].total_cmp(&singular_values[a]));
 
     let s: Vec<f64> = order.iter().map(|&i| singular_values[i]).collect();
 
