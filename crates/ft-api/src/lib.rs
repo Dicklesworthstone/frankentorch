@@ -21202,7 +21202,7 @@ mod tests {
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             session.with_no_grad(|s| {
                 assert!(!s.is_grad_enabled());
-                panic!("boom");
+                std::panic::resume_unwind(Box::new("boom"));
             });
         }));
 
@@ -21222,7 +21222,7 @@ mod tests {
         let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             session.with_enable_grad(|s| {
                 assert!(s.is_grad_enabled());
-                panic!("boom");
+                std::panic::resume_unwind(Box::new("boom"));
             });
         }));
 
