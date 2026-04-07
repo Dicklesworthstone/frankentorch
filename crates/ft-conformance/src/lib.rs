@@ -12666,6 +12666,116 @@ json.loads(sys.stdin.read())
     }
 
     #[test]
+    fn custom_function_layer_trains_end_to_end_with_adam() {
+        use ft_api::FrankenTorchSession;
+        use ft_optim::{Adam, Optimizer};
+
+        fn custom_affine(
+            session: &mut FrankenTorchSession,
+            input: ft_autograd::TensorNodeId,
+            weight: ft_autograd::TensorNodeId,
+            bias: ft_autograd::TensorNodeId,
+        ) -> Result<ft_autograd::TensorNodeId, ft_autograd::AutogradError> {
+            session.tensor_apply_function(
+                &[input, weight, bias],
+                |ctx, inputs| {
+                    let (x_vals, x_shape) = &inputs[0];
+                    let (w_vals, w_shape) = &inputs[1];
+                    let (b_vals, b_shape) = &inputs[2];
+                    assert_eq!(w_shape.as_slice(), &[1]);
+                    assert_eq!(b_shape.as_slice(), &[1]);
+                    ctx.save_for_backward(x_vals.to_vec(), x_shape.to_vec());
+                    ctx.save_for_backward(w_vals.to_vec(), w_shape.to_vec());
+                    let output = x_vals.iter().map(|x| x * w_vals[0] + b_vals[0]).collect();
+                    Ok((output, x_shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let x_vals = &ctx.saved_tensors()[0];
+                    let weight_value = ctx.saved_tensors()[1][0];
+                    let grad_output = grad_outputs[0];
+
+                    let grad_input = ctx.needs_input_grad()[0]
+                        .then(|| grad_output.iter().map(|g| g * weight_value).collect());
+                    let grad_weight = ctx.needs_input_grad()[1].then(|| {
+                        vec![grad_output
+                            .iter()
+                            .zip(x_vals.iter())
+                            .map(|(g, x)| g * x)
+                            .sum()]
+                    });
+                    let grad_bias =
+                        ctx.needs_input_grad()[2].then(|| vec![grad_output.iter().sum()]);
+
+                    Ok(vec![grad_input, grad_weight, grad_bias])
+                },
+            )
+        }
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input_values = vec![-2.0, -1.0, 1.0, 2.0];
+        let target_values = vec![-5.0, -2.0, 4.0, 7.0];
+        let input = session
+            .tensor_variable(input_values, vec![4, 1], false)
+            .expect("input");
+        let targets = session
+            .tensor_variable(target_values.clone(), vec![4, 1], false)
+            .expect("targets");
+        let weight = session
+            .tensor_variable(vec![0.25], vec![1], true)
+            .expect("weight");
+        let bias = session
+            .tensor_variable(vec![0.0], vec![1], true)
+            .expect("bias");
+        let mut optimizer = Adam::new(vec![weight, bias], 0.05);
+
+        let initial_pred = custom_affine(&mut session, input, weight, bias).expect("initial pred");
+        let initial_loss = session.mse_loss(initial_pred, targets).expect("initial loss");
+        let initial_loss_val = session.tensor_values(initial_loss).expect("loss values")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..80 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let pred = custom_affine(&mut session, input, weight, bias).expect("pred");
+            let loss = session.mse_loss(pred, targets).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss values")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("step");
+        }
+
+        let eval_pred = session
+            .with_no_grad(|s| custom_affine(s, input, weight, bias))
+            .expect("eval pred");
+        let eval_loss = session.mse_loss(eval_pred, targets).expect("eval loss");
+        let eval_loss_val = session.tensor_values(eval_loss).expect("eval loss values")[0];
+
+        assert!(saw_loss_improvement, "custom layer training never improved the loss");
+        assert!(
+            eval_loss_val < initial_loss_val * 0.01,
+            "custom layer should reduce loss substantially: initial={initial_loss_val}, final={eval_loss_val}"
+        );
+        assert!(
+            !session
+                .tensor_requires_grad(eval_pred)
+                .expect("eval prediction requires_grad"),
+            "custom layer eval pass should respect no_grad"
+        );
+
+        let pred_values = session.tensor_values(eval_pred).expect("prediction values");
+        for (predicted, expected) in pred_values.iter().zip(target_values.iter()) {
+            assert!(
+                (predicted - expected).abs() < 0.2,
+                "prediction {predicted} should stay close to target {expected}"
+            );
+        }
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")

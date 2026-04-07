@@ -26448,6 +26448,72 @@ mod tests {
         assert_eq!(report.gradient(x).unwrap(), &[-3.0, -3.0]);
     }
 
+    #[test]
+    fn custom_function_inside_no_grad_does_not_record_on_tape() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, -2.0, 3.0], vec![3], true).unwrap();
+
+        s.no_grad_enter();
+        let y = s
+            .tensor_apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .unwrap();
+        s.no_grad_exit();
+
+        assert!(!s.tensor_requires_grad(y).unwrap());
+        assert!(s.tensor_grad_fn(y).unwrap().is_none());
+        let err = s
+            .tensor_backward(y)
+            .expect_err("custom function created inside no_grad must not support backward");
+        assert!(
+            matches!(err, AutogradError::TensorRootDoesNotRequireGrad { node } if node == y),
+            "unexpected backward error for no_grad custom function: {err:?}"
+        );
+    }
+
+    #[test]
+    fn nested_custom_functions_chain_gradients() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![3.0], vec![1], true).unwrap();
+
+        let doubled = s
+            .tensor_apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vec![vals[0] * 2.0], shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(vec![grad_outputs[0][0] * 2.0])]),
+            )
+            .unwrap();
+
+        let squared = s
+            .tensor_apply_function(
+                &[doubled],
+                |ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                    Ok((vec![vals[0] * vals[0]], shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let inner_value = ctx.saved_tensors()[0][0];
+                    Ok(vec![Some(vec![2.0 * inner_value * grad_outputs[0][0]])])
+                },
+            )
+            .unwrap();
+
+        assert_eq!(s.tensor_values(squared).unwrap(), vec![36.0]);
+
+        let report = s.tensor_backward(squared).unwrap();
+        assert_eq!(report.gradient(x).unwrap(), &[24.0]);
+    }
+
     // ── nonzero tests ─────────────────────────────────────────────────
 
     #[test]

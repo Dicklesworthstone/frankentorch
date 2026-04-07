@@ -17832,6 +17832,76 @@ mod tests {
         assert_eq!(label, "CustomFunction");
     }
 
+    #[test]
+    fn custom_function_respects_disabled_grad_tracking() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, -2.0], vec![2], true).expect("x");
+
+        tape.set_grad_enabled(false);
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    Ok((vals.to_vec(), shape.to_vec()))
+                },
+                |_ctx, grad_outputs| Ok(vec![Some(grad_outputs[0].to_vec())]),
+            )
+            .expect("custom function created with grad disabled");
+        tape.set_grad_enabled(true);
+
+        assert!(
+            !tape.tensor_requires_grad(y).expect("requires_grad query"),
+            "custom function created with grad disabled must not require gradients"
+        );
+        assert!(
+            tape.tensor_grad_fn(y).expect("grad_fn query").is_none(),
+            "custom function created with grad disabled must not record a grad_fn"
+        );
+
+        let err = tape
+            .backward(y)
+            .expect_err("backward from grad-disabled custom function must fail");
+        assert!(
+            matches!(err, AutogradError::TensorRootDoesNotRequireGrad { node } if node == y),
+            "unexpected error for grad-disabled custom function backward: {err:?}"
+        );
+    }
+
+    #[test]
+    fn custom_function_backward_matches_finite_difference() {
+        let mut tape = TensorTape::new();
+        let x_value = 1.75;
+        let x = tape.leaf(vec![x_value], vec![1], true).expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                    Ok((vec![vals[0].powi(3)], vec![1]))
+                },
+                |ctx, grad_outputs| {
+                    let x_saved = ctx.saved_tensors()[0][0];
+                    Ok(vec![Some(vec![3.0 * x_saved.powi(2) * grad_outputs[0][0]])])
+                },
+            )
+            .expect("cubic custom function");
+
+        let report = tape.backward(y).expect("backward");
+        let analytic_grad = report.gradient(x).expect("gradient exists")[0];
+
+        let eps = 1e-6;
+        let forward = |value: f64| value.powi(3);
+        let numerical_grad = (forward(x_value + eps) - forward(x_value - eps)) / (2.0 * eps);
+
+        assert!(
+            (analytic_grad - numerical_grad).abs() < 1e-4,
+            "custom function gradient should match finite difference: analytic={analytic_grad}, numerical={numerical_grad}"
+        );
+    }
+
     // ---- create_graph tests (bd-3dpn.3) ----
 
     #[test]

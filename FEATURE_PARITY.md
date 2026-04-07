@@ -11,6 +11,17 @@ This matrix tracks execution progress, not allowable scope reduction. Release re
 - `parity_green`
 - `parity_gap`
 
+## Parity Scope Declaration
+
+`parity_green` in this file means the current CPU eager-mode FrankenTorch slice is implemented and backed by conformance evidence. It does not mean the entire PyTorch platform surface is complete.
+
+Current phase scope covers:
+- CPU dense tensor execution
+- deterministic autograd and DAC evidence
+- CPU-first `ft-nn`, `ft-optim`, `ft-data`, `ft-serialize`, and `ft-conformance` integration
+
+Current phase does not yet cover several major PyTorch subsystems. Those are tracked explicitly in `Deferred Subsystems` below and must not be inferred from the green rows in the current CPU-first slice.
+
 ## Parity Matrix
 
 | Feature Family | Status | Notes |
@@ -30,7 +41,7 @@ This matrix tracks execution progress, not allowable scope reduction. Release re
 | Neural network modules (ft-nn) | parity_green | Module trait, LossModule trait, Linear, Bilinear, Conv1d, Conv2d, ConvTranspose1d, ReLU, Sigmoid, Tanh, GELU, SiLU, LeakyReLU, ELU, Mish, Softplus, Sequential, ModuleList, ModuleDict, ParameterList, ParameterDict, Dropout, LayerNorm, BatchNorm1d, BatchNorm2d, BatchNorm3d, GroupNorm, InstanceNorm1d, InstanceNorm2d, Embedding, MultiheadAttention, Softmax, LogSoftmax, Flatten, Identity, Unfold, Fold, AvgPool1d, MaxPool1d, MaxPool2d, AdaptiveAvgPool2d, LPPool1d, LPPool2d, Upsample1d, Upsample2d, ConstantPad1d, ConstantPad2d, ZeroPad2d, RNNCell, LSTMCell, GRUCell, PixelShuffle, PixelUnshuffle, CosineSimilarity, PairwiseDistance, Hardswish, Hardsigmoid, LogSigmoid, RReLU, MultiLabelMarginLoss, MSELoss, L1Loss, CrossEntropyLoss, NLLLoss, BCELoss, BCEWithLogitsLoss, SmoothL1Loss, HuberLoss, KLDivLoss |
 | Optimizers (ft-optim) | parity_green | Optimizer trait, SGD (momentum, weight_decay, nesterov), Adam (bias correction, weight_decay), AdamW, RMSprop, Adagrad, RAdam, SparseAdam; CyclicLR scheduler; clip_grad_norm_, clip_grad_value_ |
 | Advanced indexing | parity_green | index_select, gather, scatter, masked_fill (with backward for index_select, gather) |
-| Full PyTorch drop-in surface | parity_green | All tracked feature families in this ledger are green, the current beads backlog is empty, and the latest remote workspace validation (`cargo test/check/clippy`) passed cleanly |
+| Full PyTorch drop-in surface | parity_gap | Current parity evidence is limited to the CPU eager-mode slice. Major PyTorch subsystems remain deferred or only partially surfaced; see `Deferred Subsystems` below for explicit closure beads. |
 
 ## Detailed Operation Coverage
 
@@ -157,7 +168,23 @@ weight_norm_decompose, weight_norm_reconstruct, spectral_norm
 ### Dataset Utilities (torch.utils.data)
 Subset (Arc-based), random_split (deterministic seeded)
 
-## Current Green Scope
+## Deferred Subsystems
+
+| Subsystem | Status | Current truth | Closure bead |
+|---|---|---|---|
+| CUDA / GPU backend | not_started | `Device::Cuda` exists as metadata and device-guard validation, but real execution, dispatch, storage, and kernel coverage remain CPU-only | `frankentorch-c3d` |
+| Distributed training (`DDP` / `FSDP`) | not_started | No multi-rank process-group, collective communication, gradient sync, or parameter sharding surface exists in-tree | `frankentorch-82b` |
+| `TorchScript` / `torch.compile` / JIT graph execution | not_started | Execution is eager-only; there is no graph capture, compiled runtime, or TorchScript-like serialization/execution pipeline | `frankentorch-8zy` |
+| Quantization | not_started | No quantized tensor metadata, observers, or INT8 execution/export path is implemented | `frankentorch-4ak` |
+| Sparse tensors | not_started | Dense tensor paths exist, but sparse storage formats and sparse kernels are not implemented | `frankentorch-0tw` |
+| Mixed precision (`torch.amp`) | not_started | `F16` / `BF16` dtypes exist, but there is no autocast or gradient-scaling workflow | `frankentorch-iha` |
+| ONNX export | not_started | No ONNX tracing/export/interchange path exists | `frankentorch-iey` |
+| Gradient checkpointing | not_started | The tape does not yet expose a recompute-on-backward checkpointing facility | `frankentorch-plj` |
+| PyTorch-compatible custom autograd Function surface | parity_gap | Closure-based custom autograd exists via `FrankenTorchSession::tensor_apply_function(...)` and `TensorTape::apply_function(...)`, including `save_for_backward`, but the PyTorch-compatible `torch.autograd.Function` API surface is not exposed yet | `frankentorch-2er` |
+
+## Current Green Scope (CPU Eager-Mode Slice)
+
+The items below are the currently conformance-backed green slice. They should be read as CPU eager-mode evidence, not as proof that the deferred PyTorch subsystems above are already covered.
 
 - `crates/ft-conformance/fixtures/op_schema_cases.json`
 - `crates/ft-conformance/fixtures/scalar_autograd_cases.json`
@@ -197,6 +224,7 @@ Latest workspace evidence refreshed via remote validation:
 ## Gap Policy
 
 - Any `parity_gap` item must have explicit closure beads and dependencies.
+- Deferred subsystem omissions are not allowed: if a major PyTorch area is out of scope for the current slice, it must remain listed above with a tracking bead.
 - Temporary sequencing gaps are acceptable only with closure evidence plans.
 - Release sign-off requires `Full PyTorch drop-in surface` to be `parity_green`.
 
