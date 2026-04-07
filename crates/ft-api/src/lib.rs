@@ -238,9 +238,12 @@ impl FrankenTorchSession {
         F: FnOnce(&mut Self) -> R,
     {
         self.no_grad_enter();
-        let result = f(self);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.no_grad_exit();
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     /// Execute a closure with gradient tracking enabled (panic-safe RAII equivalent).
@@ -249,9 +252,12 @@ impl FrankenTorchSession {
         F: FnOnce(&mut Self) -> R,
     {
         self.enable_grad_enter();
-        let result = f(self);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(self)));
         self.enable_grad_exit();
-        result
+        match result {
+            Ok(result) => result,
+            Err(payload) => std::panic::resume_unwind(payload),
+        }
     }
 
     fn sync_grad_enabled(&mut self) {
@@ -21188,6 +21194,45 @@ mod tests {
         let report = session.backward(z).expect("backward should work");
         assert_eq!(report.gradient(x), Some(1.0));
         assert_eq!(report.gradient(y), Some(1.0));
+    }
+
+    #[test]
+    fn with_no_grad_restores_state_after_panic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.with_no_grad(|s| {
+                assert!(!s.is_grad_enabled());
+                panic!("boom");
+            });
+        }));
+
+        assert!(unwind.is_err());
+        assert!(
+            session.is_grad_enabled(),
+            "with_no_grad must restore grad state before resuming unwind"
+        );
+    }
+
+    #[test]
+    fn with_enable_grad_restores_outer_no_grad_after_panic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        session.no_grad_enter();
+        assert!(!session.is_grad_enabled());
+
+        let unwind = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            session.with_enable_grad(|s| {
+                assert!(s.is_grad_enabled());
+                panic!("boom");
+            });
+        }));
+
+        assert!(unwind.is_err());
+        assert!(
+            !session.is_grad_enabled(),
+            "with_enable_grad must restore the outer no_grad state before resuming unwind"
+        );
+        session.no_grad_exit();
+        assert!(session.is_grad_enabled());
     }
 
     #[test]
