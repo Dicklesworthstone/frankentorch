@@ -3,9 +3,8 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
+use ft_conformance::perf_slo::DEFAULT_REPORT_PATH;
 use serde::Deserialize;
-
-const DEFAULT_INPUT_PATH: &str = "artifacts/phase2c/performance/perf_slo_report_v1.json";
 
 #[derive(Debug, Clone)]
 struct CliArgs {
@@ -90,7 +89,7 @@ fn main() -> Result<(), String> {
 }
 
 fn parse_args() -> Result<CliArgs, String> {
-    let mut input_path = PathBuf::from(DEFAULT_INPUT_PATH);
+    let mut input_path = PathBuf::from(DEFAULT_REPORT_PATH);
     let mut args = std::env::args().skip(1);
     while let Some(arg) = args.next() {
         match arg.as_str() {

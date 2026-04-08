@@ -5,7 +5,10 @@ use serde::{Deserialize, Serialize};
 pub const REPORT_SCHEMA_VERSION: &str = "ft-perf-slo-report-v1";
 pub const GATE_SCHEMA_VERSION: &str = "ft-perf-slo-gate-v1";
 pub const DEFAULT_REPORT_PATH: &str = "artifacts/phase2c/performance/perf_slo_measurement_v1.json";
+pub const DEFAULT_SUMMARY_PATH: &str = "artifacts/phase2c/performance/PERF_SLO_MEASUREMENT_V1.md";
 pub const DEFAULT_BASELINE_PATH: &str = "artifacts/phase2c/performance/perf_slo_baseline_v1.json";
+pub const DEFAULT_BASELINE_SUMMARY_PATH: &str =
+    "artifacts/phase2c/performance/PERF_SLO_BASELINE_V1.md";
 pub const DEFAULT_GATE_OUTPUT_PATH: &str =
     "artifacts/phase2c/performance/perf_slo_gate_report_v1.json";
 

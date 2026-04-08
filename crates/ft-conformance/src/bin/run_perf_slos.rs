@@ -9,14 +9,12 @@ use std::time::Instant;
 use allocation_counter::{AllocationInfo, measure};
 use ft_api::FrankenTorchSession;
 use ft_autograd::TensorNodeId;
+use ft_conformance::perf_slo::{DEFAULT_REPORT_PATH, DEFAULT_SUMMARY_PATH, REPORT_SCHEMA_VERSION};
 use ft_core::{DenseTensor, Device, ExecutionMode};
 use ft_optim::{Adam, Optimizer};
 use ft_serialize::{load_state_dict, save_state_dict};
 use serde::{Deserialize, Serialize};
 
-const REPORT_SCHEMA_VERSION: &str = "ft-perf-slo-report-v1";
-const DEFAULT_OUTPUT_PATH: &str = "artifacts/phase2c/performance/perf_slo_report_v1.json";
-const DEFAULT_SUMMARY_PATH: &str = "artifacts/phase2c/performance/PERF_SLO_SUMMARY_V1.md";
 const DEFAULT_ITERATIONS: usize = 100;
 const DEFAULT_WARMUP_ITERATIONS: usize = 1;
 const CHECKPOINT_BYTES_PER_SECOND_TARGET: f64 = 350_000_000.0;
@@ -387,7 +385,7 @@ fn main() -> Result<(), String> {
 
 fn parse_args() -> Result<CliArgs, String> {
     let mut profile = RunProfile::Full;
-    let mut output_path = PathBuf::from(DEFAULT_OUTPUT_PATH);
+    let mut output_path = PathBuf::from(DEFAULT_REPORT_PATH);
     let mut summary_path = PathBuf::from(DEFAULT_SUMMARY_PATH);
     let mut baseline_path = None;
     let mut iterations = DEFAULT_ITERATIONS;
