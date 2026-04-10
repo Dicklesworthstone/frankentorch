@@ -12,7 +12,10 @@ use ft_autograd::{
     TensorSortOperationEvent, TensorTape, TensorTopKOperationEvent, TensorUnaryOperationEvent,
     UnaryOperationEvent,
 };
-use ft_core::{DType, DenseTensor, ExecutionMode, TensorCompatError, TensorMeta, TensorStorage};
+use ft_core::{
+    DType, DenseI64Tensor, DenseTensor, ExecutionMode, SparseCOOTensor, SparseCSRTensor,
+    SparseTensorError, TensorCompatError, TensorMeta, TensorStorage,
+};
 use ft_dispatch::{
     ComparisonDispatchDecision, ComparisonOp, UnaryDispatchDecision, UnaryOp,
     dispatch_scalar_comparison, dispatch_scalar_unary, dispatch_tensor_comparison_contiguous_f64,
@@ -13266,6 +13269,122 @@ impl FrankenTorchSession {
             format!("quantile input={} q={q} out={}", input.0, out.0),
         );
         Ok(out)
+    }
+
+    // ── Sparse Tensor Operations ───────────────────────────────────────────
+
+    /// Create a sparse COO tensor from coordinates and values.
+    ///
+    /// # Arguments
+    /// * `coords` - List of coordinate tuples, each of length equal to sparse_dim
+    /// * `values` - Values at each coordinate
+    /// * `dense_shape` - The full dense shape this sparse tensor represents
+    /// * `dtype` - Data type for the values
+    ///
+    /// # Example
+    /// ```ignore
+    /// // Create a 3x4 sparse matrix with two non-zero elements
+    /// let sparse = session.sparse_coo_tensor(
+    ///     &[vec![0, 1], vec![2, 3]], // row 0 col 1, row 2 col 3
+    ///     vec![1.0, 2.0],
+    ///     vec![3, 4],
+    ///     DType::F64,
+    /// )?;
+    /// ```
+    pub fn sparse_coo_tensor(
+        &self,
+        coords: &[Vec<i64>],
+        values: Vec<f64>,
+        dense_shape: Vec<usize>,
+        dtype: DType,
+    ) -> Result<SparseCOOTensor, SparseTensorError> {
+        SparseCOOTensor::from_coords(coords, values, dense_shape, dtype, ft_core::Device::Cpu)
+    }
+
+    /// Create a sparse COO tensor from indices and values tensors.
+    ///
+    /// # Arguments
+    /// * `indices` - Shape [sparse_dim, nnz], dtype I64
+    /// * `values` - Shape [nnz, *dense_dims]
+    /// * `dense_shape` - The full dense shape
+    /// * `coalesced` - Whether the indices are unique and sorted
+    pub fn sparse_coo_tensor_from_indices(
+        &self,
+        indices: DenseI64Tensor,
+        values: DenseTensor,
+        dense_shape: Vec<usize>,
+        coalesced: bool,
+    ) -> Result<SparseCOOTensor, SparseTensorError> {
+        SparseCOOTensor::new(indices, values, dense_shape, coalesced)
+    }
+
+    /// Create a sparse CSR tensor from CSR components.
+    ///
+    /// # Arguments
+    /// * `crow_indices` - Shape [nrows + 1], dtype I64 (row pointers)
+    /// * `col_indices` - Shape [nnz], dtype I64 (column indices)
+    /// * `values` - Shape [nnz]
+    /// * `shape` - [nrows, ncols]
+    pub fn sparse_csr_tensor(
+        &self,
+        crow_indices: DenseI64Tensor,
+        col_indices: DenseI64Tensor,
+        values: DenseTensor,
+        shape: [usize; 2],
+    ) -> Result<SparseCSRTensor, SparseTensorError> {
+        SparseCSRTensor::new(crow_indices, col_indices, values, shape)
+    }
+
+    /// Convert a dense tensor to sparse COO format.
+    ///
+    /// Only non-zero values are stored. The resulting sparse tensor has
+    /// sparse_dim equal to the tensor's rank (fully sparse).
+    pub fn tensor_to_sparse_coo(
+        &self,
+        input: TensorNodeId,
+    ) -> Result<SparseCOOTensor, AutogradError> {
+        let tensor = self.tensor_tape.tensor(input)?;
+        let shape = tensor.meta().shape().to_vec();
+        let values = tensor.contiguous_values_as_f64()?;
+
+        let strides = ft_core::contiguous_strides(&shape);
+        let mut coords = Vec::new();
+        let mut sparse_values = Vec::new();
+
+        for (linear_idx, &val) in values.iter().enumerate() {
+            if val != 0.0 {
+                // Convert linear index to multi-index
+                let mut coord = Vec::with_capacity(shape.len());
+                let mut remaining = linear_idx;
+                for &stride in &strides {
+                    coord.push((remaining / stride) as i64);
+                    remaining %= stride;
+                }
+                coords.push(coord);
+                sparse_values.push(val);
+            }
+        }
+
+        Ok(SparseCOOTensor::from_coords(
+            &coords,
+            sparse_values,
+            shape,
+            tensor.meta().dtype(),
+            tensor.meta().device(),
+        )?)
+    }
+
+    /// Convert a sparse COO tensor to dense format.
+    ///
+    /// Creates a new dense tensor filled with zeros except at the
+    /// sparse tensor's indexed positions.
+    pub fn sparse_coo_to_dense(&self, sparse: &SparseCOOTensor) -> Result<DenseTensor, SparseTensorError> {
+        sparse.to_dense()
+    }
+
+    /// Convert a sparse CSR tensor to dense format.
+    pub fn sparse_csr_to_dense(&self, sparse: &SparseCSRTensor) -> Result<DenseTensor, SparseTensorError> {
+        sparse.to_dense()
     }
 }
 

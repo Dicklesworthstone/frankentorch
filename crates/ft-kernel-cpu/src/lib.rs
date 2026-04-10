@@ -2,7 +2,10 @@
 
 use std::fmt;
 
-use ft_core::{Complex128, ScalarTensor, TensorCompatError, TensorMeta, ensure_compatible};
+use ft_core::{
+    Complex128, ScalarTensor, SparseCOOTensor, SparseTensorError, TensorCompatError, TensorMeta,
+    ensure_compatible,
+};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KernelError {
@@ -6543,9 +6546,201 @@ pub fn complex_from_real_imag(real: &[f64], imag: &[f64]) -> Result<Vec<Complex1
         .collect())
 }
 
+// ── Sparse Tensor Operations ───────────────────────────────────────────────
+
+/// Sparse-dense matrix multiply: sparse [M, K] @ dense [K, N] -> dense [M, N].
+///
+/// The sparse tensor must be 2D (sparse_dim == 2, no dense dimensions).
+/// The dense matrix must be contiguous.
+pub fn sparse_coo_matmul_dense_f64(
+    sparse: &SparseCOOTensor,
+    dense: &[f64],
+    dense_meta: &TensorMeta,
+) -> Result<Vec<f64>, SparseTensorError> {
+    // Validate sparse tensor is 2D matrix
+    if sparse.dense_shape().len() != 2 {
+        return Err(SparseTensorError::UnsupportedRank {
+            rank: sparse.dense_shape().len(),
+        });
+    }
+    if sparse.sparse_dim() != 2 {
+        return Err(SparseTensorError::SparseDimMismatch {
+            indices_sparse_dim: sparse.sparse_dim(),
+            expected: 2,
+        });
+    }
+
+    // Validate dense tensor is 2D matrix
+    if dense_meta.shape().len() != 2 {
+        return Err(SparseTensorError::UnsupportedRank {
+            rank: dense_meta.shape().len(),
+        });
+    }
+
+    let m = sparse.dense_shape()[0];
+    let k_sparse = sparse.dense_shape()[1];
+    let k_dense = dense_meta.shape()[0];
+    let n = dense_meta.shape()[1];
+
+    // Check inner dimensions match
+    if k_sparse != k_dense {
+        return Err(SparseTensorError::InvalidValuesShape {
+            expected: vec![k_sparse, n],
+            actual: vec![k_dense, n],
+        });
+    }
+
+    // Initialize output to zeros
+    let mut output = vec![0.0f64; m * n];
+
+    // Get sparse indices and values
+    let indices = sparse.indices();
+    let indices_storage = indices.storage();
+    let values = sparse.values();
+    let values_f64 = values.contiguous_values_as_f64()?;
+    let nnz = sparse.nnz();
+
+    // For each non-zero element in sparse matrix
+    // Indices layout: [sparse_dim, nnz], so indices_storage[dim * nnz + i]
+    for nz_idx in 0..nnz {
+        // Get row and column from indices tensor [2, nnz]
+        let row = indices_storage[0 * nnz + nz_idx] as usize;
+        let col = indices_storage[1 * nnz + nz_idx] as usize;
+
+        // Get the sparse value
+        let sparse_val = values_f64[nz_idx];
+
+        // Compute contribution to output row
+        // output[row, :] += sparse_val * dense[col, :]
+        for j in 0..n {
+            let dense_val = dense[col * n + j];
+            output[row * n + j] += sparse_val * dense_val;
+        }
+    }
+
+    Ok(output)
+}
+
+/// Coalesce a sparse COO tensor by summing duplicate indices.
+///
+/// Returns a new sparse tensor with sorted, unique indices.
+pub fn sparse_coo_coalesce(sparse: &SparseCOOTensor) -> Result<SparseCOOTensor, SparseTensorError> {
+    use std::collections::BTreeMap;
+
+    let nnz = sparse.nnz();
+    if nnz == 0 {
+        // Already coalesced (empty)
+        return SparseCOOTensor::new(
+            sparse.indices().clone(),
+            sparse.values().clone(),
+            sparse.dense_shape().to_vec(),
+            true,
+        );
+    }
+
+    let sparse_dim = sparse.sparse_dim();
+    let indices = sparse.indices();
+    let indices_storage = indices.storage();
+    let values = sparse.values();
+    let values_f64 = values.contiguous_values_as_f64()?;
+
+    // Build a map from coordinate tuple to summed value
+    let mut coord_to_value: BTreeMap<Vec<i64>, f64> = BTreeMap::new();
+
+    for nz_idx in 0..nnz {
+        let mut coord = Vec::with_capacity(sparse_dim);
+        for dim in 0..sparse_dim {
+            coord.push(indices_storage[dim * nnz + nz_idx]);
+        }
+
+        *coord_to_value.entry(coord).or_insert(0.0) += values_f64[nz_idx];
+    }
+
+    // Convert back to sparse tensor
+    let new_coords: Vec<Vec<i64>> = coord_to_value.keys().cloned().collect();
+    let new_values: Vec<f64> = coord_to_value.values().copied().collect();
+
+    SparseCOOTensor::from_coords(
+        &new_coords,
+        new_values,
+        sparse.dense_shape().to_vec(),
+        values.meta().dtype(),
+        sparse.device(),
+    )
+}
+
+/// Add two sparse COO tensors element-wise.
+///
+/// Both tensors must have the same shape. The result is coalesced.
+pub fn sparse_coo_add(
+    lhs: &SparseCOOTensor,
+    rhs: &SparseCOOTensor,
+) -> Result<SparseCOOTensor, SparseTensorError> {
+    // Validate shapes match
+    if lhs.dense_shape() != rhs.dense_shape() {
+        return Err(SparseTensorError::InvalidValuesShape {
+            expected: lhs.dense_shape().to_vec(),
+            actual: rhs.dense_shape().to_vec(),
+        });
+    }
+    if lhs.sparse_dim() != rhs.sparse_dim() {
+        return Err(SparseTensorError::SparseDimMismatch {
+            indices_sparse_dim: lhs.sparse_dim(),
+            expected: rhs.sparse_dim(),
+        });
+    }
+
+    let sparse_dim = lhs.sparse_dim();
+    let lhs_indices = lhs.indices();
+    let lhs_indices_storage = lhs_indices.storage();
+    let rhs_indices = rhs.indices();
+    let rhs_indices_storage = rhs_indices.storage();
+    let lhs_values = lhs.values().contiguous_values_as_f64()?;
+    let rhs_values = rhs.values().contiguous_values_as_f64()?;
+    let lhs_nnz = lhs.nnz();
+    let rhs_nnz = rhs.nnz();
+
+    // Combine all coordinates and values
+    let mut all_coords = Vec::new();
+    let mut all_values = Vec::new();
+
+    // Add lhs entries
+    for nz_idx in 0..lhs_nnz {
+        let mut coord = Vec::with_capacity(sparse_dim);
+        for dim in 0..sparse_dim {
+            coord.push(lhs_indices_storage[dim * lhs_nnz + nz_idx]);
+        }
+        all_coords.push(coord);
+        all_values.push(lhs_values[nz_idx]);
+    }
+
+    // Add rhs entries
+    for nz_idx in 0..rhs_nnz {
+        let mut coord = Vec::with_capacity(sparse_dim);
+        for dim in 0..sparse_dim {
+            coord.push(rhs_indices_storage[dim * rhs_nnz + nz_idx]);
+        }
+        all_coords.push(coord);
+        all_values.push(rhs_values[nz_idx]);
+    }
+
+    // Create combined tensor and coalesce
+    let combined = SparseCOOTensor::from_coords(
+        &all_coords,
+        all_values,
+        lhs.dense_shape().to_vec(),
+        lhs.values().meta().dtype(),
+        lhs.device(),
+    )?;
+
+    sparse_coo_coalesce(&combined)
+}
+
 #[cfg(test)]
 mod tests {
-    use ft_core::{Complex128, DType, Device, ScalarTensor, TensorCompatError, TensorMeta};
+    use ft_core::{
+        Complex128, DType, Device, ScalarTensor, SparseCOOTensor, TensorCompatError, TensorMeta,
+    };
 
     use super::{
         KernelError, abs_scalar, abs_tensor_contiguous_f64, acos_scalar,
@@ -6574,11 +6769,13 @@ mod tests {
         reciprocal_tensor_contiguous_f64, relu_scalar, relu_tensor_contiguous_f64,
         scatter_tensor_contiguous_f64, sigmoid_scalar, sigmoid_tensor_contiguous_f64, sign_scalar,
         sign_tensor_contiguous_f64, silu_scalar, silu_tensor_contiguous_f64, sinh_scalar,
-        sinh_tensor_contiguous_f64, softmax_dim_tensor_contiguous_f64, sqrt_scalar,
-        sqrt_tensor_contiguous_f64, stack_tensor_contiguous_f64, std_dim_tensor_contiguous_f64,
-        sub_scalar, sub_tensor_contiguous_f64, sum_dim_tensor_contiguous_f64,
-        sum_tensor_contiguous_f64, tanh_scalar, tanh_tensor_contiguous_f64, trunc_scalar,
-        trunc_tensor_contiguous_f64, var_dim_tensor_contiguous_f64,
+        sinh_tensor_contiguous_f64, softmax_dim_tensor_contiguous_f64,
+        sparse_coo_add, sparse_coo_coalesce, sparse_coo_matmul_dense_f64,
+        sqrt_scalar, sqrt_tensor_contiguous_f64, stack_tensor_contiguous_f64,
+        std_dim_tensor_contiguous_f64, sub_scalar, sub_tensor_contiguous_f64,
+        sum_dim_tensor_contiguous_f64, sum_tensor_contiguous_f64, tanh_scalar,
+        tanh_tensor_contiguous_f64, trunc_scalar, trunc_tensor_contiguous_f64,
+        var_dim_tensor_contiguous_f64,
     };
 
     #[test]
@@ -9961,6 +10158,91 @@ mod tests {
         assert_eq!(result[0], Complex128::new(1.0, 4.0));
         assert_eq!(result[1], Complex128::new(2.0, 5.0));
         assert_eq!(result[2], Complex128::new(3.0, 6.0));
+    }
+
+    // ── Sparse tensor kernel tests ────────────────────────────────────
+
+    #[test]
+    fn sparse_coo_matmul_dense_matches_dense_matmul() {
+        // sparse [2, 3] @ dense [3, 2] -> dense [2, 2]
+        // Sparse matrix:
+        // [[1, 0, 2],
+        //  [0, 3, 0]]
+        let sparse = SparseCOOTensor::from_coords(
+            &[vec![0, 0], vec![0, 2], vec![1, 1]],
+            vec![1.0, 2.0, 3.0],
+            vec![2, 3],
+            DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+
+        // Dense matrix:
+        // [[1, 2],
+        //  [3, 4],
+        //  [5, 6]]
+        let dense = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let dense_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+
+        let result = sparse_coo_matmul_dense_f64(&sparse, &dense, &dense_meta).unwrap();
+
+        // Expected: sparse @ dense
+        // row 0: 1*[1,2] + 0*[3,4] + 2*[5,6] = [1+10, 2+12] = [11, 14]
+        // row 1: 0*[1,2] + 3*[3,4] + 0*[5,6] = [9, 12]
+        assert_eq!(result, vec![11.0, 14.0, 9.0, 12.0]);
+    }
+
+    #[test]
+    fn sparse_coo_coalesce_sums_duplicates() {
+        // Create sparse tensor with duplicate indices
+        let sparse = SparseCOOTensor::from_coords(
+            &[vec![0, 0], vec![0, 0], vec![1, 1]], // (0,0) appears twice
+            vec![1.0, 2.0, 3.0],
+            vec![2, 2],
+            DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+
+        let coalesced = sparse_coo_coalesce(&sparse).unwrap();
+
+        // Should have only 2 unique entries: (0,0)=3.0, (1,1)=3.0
+        assert_eq!(coalesced.nnz(), 2);
+
+        // Convert to dense to verify values
+        let dense = coalesced.to_dense().unwrap();
+        let values = dense.contiguous_values_as_f64().unwrap();
+        // [[3, 0], [0, 3]]
+        assert_eq!(values, vec![3.0, 0.0, 0.0, 3.0]);
+    }
+
+    #[test]
+    fn sparse_coo_add_combines_tensors() {
+        // Create two sparse tensors
+        let a = SparseCOOTensor::from_coords(
+            &[vec![0, 0], vec![1, 1]],
+            vec![1.0, 2.0],
+            vec![2, 2],
+            DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+
+        let b = SparseCOOTensor::from_coords(
+            &[vec![0, 0], vec![0, 1]], // (0,0) overlaps with a
+            vec![3.0, 4.0],
+            vec![2, 2],
+            DType::F64,
+            Device::Cpu,
+        )
+        .unwrap();
+
+        let sum = sparse_coo_add(&a, &b).unwrap();
+
+        // Convert to dense to verify: [[4, 4], [0, 2]]
+        let dense = sum.to_dense().unwrap();
+        let values = dense.contiguous_values_as_f64().unwrap();
+        assert_eq!(values, vec![4.0, 4.0, 0.0, 2.0]);
     }
 
     // ── frankentorch-igu: Property-based kernel tests ─────────────────

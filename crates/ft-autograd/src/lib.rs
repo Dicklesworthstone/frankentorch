@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ft_core::{
-    DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, TensorMeta,
-    TensorStorage,
+    DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, SparseTensorError,
+    TensorMeta, TensorStorage,
 };
 use ft_dispatch::{
     AddmmDispatchDecision, BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError,
@@ -1151,6 +1151,7 @@ pub enum AutogradError {
     },
     GraphConsumed,
     TensorGraphConsumed,
+    SparseTensor(SparseTensorError),
 }
 
 impl fmt::Display for AutogradError {
@@ -1220,6 +1221,7 @@ impl fmt::Display for AutogradError {
                     "cannot run tensor backward: graph already consumed by a previous backward pass"
                 )
             }
+            Self::SparseTensor(error) => write!(f, "sparse tensor failure: {error}"),
         }
     }
 }
@@ -1229,6 +1231,12 @@ impl std::error::Error for AutogradError {}
 impl From<DenseTensorError> for AutogradError {
     fn from(value: DenseTensorError) -> Self {
         Self::DenseTensor(value)
+    }
+}
+
+impl From<SparseTensorError> for AutogradError {
+    fn from(value: SparseTensorError) -> Self {
+        Self::SparseTensor(value)
     }
 }
 
