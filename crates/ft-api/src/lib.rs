@@ -1833,8 +1833,66 @@ impl FrankenTorchSession {
         let shape = meta.shape().to_vec();
         let numel =
             Self::checked_shape_numel(&shape, "tensor factory shape volume overflow in rand_like")?;
-        let values: Vec<f64> = (0..numel).map(|_| self.rng.next_f64()).collect();
-        let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
+        let tensor = match meta.dtype() {
+            DType::F64 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(self.rng.next_f64());
+                }
+                DenseTensor::from_contiguous_values(values, shape, meta.device())?
+            }
+            DType::F32 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(self.rng.next_f64() as f32);
+                }
+                DenseTensor::from_contiguous_values_f32(values, shape, meta.device())?
+            }
+            DType::F16 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(Float16::from_f32(self.rng.next_f64() as f32));
+                }
+                DenseTensor::from_contiguous_values_f16(values, shape, meta.device())?
+            }
+            DType::BF16 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(BFloat16::from_f32(self.rng.next_f64() as f32));
+                }
+                DenseTensor::from_contiguous_values_bf16(values, shape, meta.device())?
+            }
+            DType::Complex64 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(Complex64::new(
+                        self.rng.next_f64() as f32,
+                        self.rng.next_f64() as f32,
+                    ));
+                }
+                DenseTensor::from_typed_storage(
+                    meta.clone(),
+                    TensorStorage::Complex64(Arc::new(values)),
+                )?
+            }
+            DType::Complex128 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(Complex128::new(self.rng.next_f64(), self.rng.next_f64()));
+                }
+                DenseTensor::from_typed_storage(
+                    meta.clone(),
+                    TensorStorage::Complex128(Arc::new(values)),
+                )?
+            }
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "rand_like: unsupported dtype",
+                    },
+                )));
+            }
+        };
         Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
     }
 
@@ -1850,8 +1908,69 @@ impl FrankenTorchSession {
             &shape,
             "tensor factory shape volume overflow in randn_like",
         )?;
-        let values: Vec<f64> = (0..numel).map(|_| self.rng.next_normal()).collect();
-        let tensor = DenseTensor::from_contiguous_values(values, shape, meta.device())?;
+        let tensor = match meta.dtype() {
+            DType::F64 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(self.rng.next_normal());
+                }
+                DenseTensor::from_contiguous_values(values, shape, meta.device())?
+            }
+            DType::F32 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(self.rng.next_normal() as f32);
+                }
+                DenseTensor::from_contiguous_values_f32(values, shape, meta.device())?
+            }
+            DType::F16 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(Float16::from_f32(self.rng.next_normal() as f32));
+                }
+                DenseTensor::from_contiguous_values_f16(values, shape, meta.device())?
+            }
+            DType::BF16 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(BFloat16::from_f32(self.rng.next_normal() as f32));
+                }
+                DenseTensor::from_contiguous_values_bf16(values, shape, meta.device())?
+            }
+            DType::Complex64 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(Complex64::new(
+                        self.rng.next_normal() as f32,
+                        self.rng.next_normal() as f32,
+                    ));
+                }
+                DenseTensor::from_typed_storage(
+                    meta.clone(),
+                    TensorStorage::Complex64(Arc::new(values)),
+                )?
+            }
+            DType::Complex128 => {
+                let mut values = Vec::with_capacity(numel);
+                for _ in 0..numel {
+                    values.push(Complex128::new(
+                        self.rng.next_normal(),
+                        self.rng.next_normal(),
+                    ));
+                }
+                DenseTensor::from_typed_storage(
+                    meta.clone(),
+                    TensorStorage::Complex128(Arc::new(values)),
+                )?
+            }
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "randn_like: unsupported dtype",
+                    },
+                )));
+            }
+        };
         Ok(self.tensor_tape.leaf_tensor(tensor, requires_grad))
     }
 
@@ -18374,6 +18493,21 @@ mod tests {
     }
 
     #[test]
+    fn rand_like_preserves_f32_dtype() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let template = s
+            .tensor_variable_f32(vec![0.0f32; 6], vec![2, 3], false)
+            .unwrap();
+        let r = s.rand_like(template, false).unwrap();
+        assert_eq!(s.tensor_dtype(r).unwrap(), DType::F32);
+        let vals = s.tensor_values_f32(r).unwrap();
+        assert_eq!(vals.len(), 6);
+        for &v in &vals {
+            assert!((0.0..1.0).contains(&v), "rand_like value {v} not in [0, 1)");
+        }
+    }
+
+    #[test]
     fn randn_like_matches_shape() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let template = s.tensor_variable(vec![0.0; 6], vec![2, 3], false).unwrap();
@@ -18381,6 +18515,18 @@ mod tests {
         let (vals, meta) = s.tensor_values_meta(r).unwrap();
         assert_eq!(meta.shape(), &[2, 3]);
         assert_eq!(vals.len(), 6);
+    }
+
+    #[test]
+    fn randn_like_preserves_f32_dtype() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let template = s
+            .tensor_variable_f32(vec![0.0f32; 4], vec![2, 2], false)
+            .unwrap();
+        let r = s.randn_like(template, false).unwrap();
+        assert_eq!(s.tensor_dtype(r).unwrap(), DType::F32);
+        let vals = s.tensor_values_f32(r).unwrap();
+        assert_eq!(vals.len(), 4);
     }
 
     #[test]
