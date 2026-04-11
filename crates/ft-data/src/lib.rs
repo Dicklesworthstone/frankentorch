@@ -252,14 +252,24 @@ impl RandomSampler {
     }
 
     pub fn len(&self) -> usize {
-        self.num_samples
+        if self.size == 0 {
+            return 0;
+        }
+        if self.replacement {
+            self.num_samples
+        } else {
+            self.num_samples.min(self.size)
+        }
     }
 
     pub fn is_empty(&self) -> bool {
-        self.num_samples == 0
+        self.len() == 0
     }
 
     pub fn indices(&self) -> Vec<usize> {
+        if self.size == 0 {
+            return Vec::new();
+        }
         let mut rng = SimpleRng::new(self.seed);
         if self.replacement {
             (0..self.num_samples)
@@ -268,7 +278,8 @@ impl RandomSampler {
         } else {
             let mut idx: Vec<usize> = (0..self.size).collect();
             rng.shuffle(&mut idx);
-            idx.truncate(self.num_samples);
+            let target = self.num_samples.min(self.size);
+            idx.truncate(target);
             idx
         }
     }
@@ -1661,6 +1672,28 @@ mod tests {
         let s = RandomSampler::new(0);
         assert!(s.is_empty());
         assert!(s.indices().is_empty());
+    }
+
+    #[test]
+    fn random_sampler_empty_with_replacement_returns_empty() {
+        let s = RandomSampler::new(0)
+            .with_replacement(true)
+            .with_num_samples(5)
+            .with_seed(7);
+        assert!(s.is_empty());
+        assert_eq!(s.len(), 0);
+        assert!(s.indices().is_empty());
+    }
+
+    #[test]
+    fn random_sampler_num_samples_clamped_without_replacement() {
+        let s = RandomSampler::new(3).with_num_samples(5).with_seed(123);
+        let indices = s.indices();
+        assert_eq!(indices.len(), 3);
+        assert_eq!(s.len(), 3);
+        let unique: std::collections::HashSet<usize> = indices.iter().copied().collect();
+        assert_eq!(unique.len(), 3);
+        assert!(indices.iter().all(|&i| i < 3));
     }
 
     #[test]
