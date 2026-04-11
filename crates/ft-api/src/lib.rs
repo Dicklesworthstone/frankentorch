@@ -5313,6 +5313,11 @@ impl FrankenTorchSession {
                 "conv_transpose1d: stride must be > 0",
             ));
         }
+        if output_padding >= stride {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose1d: output_padding must be < stride",
+            ));
+        }
         let input_shape = self.tensor_shape(input)?;
         let weight_shape = self.tensor_shape(weight)?;
         if input_shape.len() != 3 || weight_shape.len() != 3 {
@@ -5327,6 +5332,17 @@ impl FrankenTorchSession {
         let out_channels = weight_shape[1];
         let kernel_l = weight_shape[2];
 
+        if input_l == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose1d: input length must be > 0",
+            ));
+        }
+        if kernel_l == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose1d: kernel size must be > 0",
+            ));
+        }
+
         if in_channels != weight_shape[0] {
             return Err(Self::incompatible_tensor_args(
                 "conv_transpose1d: input channels do not match weight",
@@ -5336,8 +5352,36 @@ impl FrankenTorchSession {
         let input_vals = self.tensor_values(input)?;
         let weight_vals = self.tensor_values(weight)?;
 
-        let output_l = (input_l - 1) * stride - 2 * padding + kernel_l + output_padding;
-        let mut output = vec![0.0; batch_size * out_channels * output_l];
+        let span = Self::checked_mul(
+            input_l - 1,
+            stride,
+            "conv_transpose1d output length overflow",
+        )?;
+        let pad_total = Self::checked_mul(padding, 2, "conv_transpose1d padding overflow")?;
+        if span < pad_total {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose1d: output size underflow from padding",
+            ));
+        }
+        let base = span - pad_total;
+        let output_l =
+            Self::checked_add(base, kernel_l, "conv_transpose1d output length overflow")?;
+        let output_l = Self::checked_add(
+            output_l,
+            output_padding,
+            "conv_transpose1d output length overflow",
+        )?;
+        let output_len = Self::checked_mul(
+            batch_size,
+            out_channels,
+            "conv_transpose1d output size overflow",
+        )?;
+        let output_len = Self::checked_mul(
+            output_len,
+            output_l,
+            "conv_transpose1d output size overflow",
+        )?;
+        let mut output = vec![0.0; output_len];
 
         for n in 0..batch_size {
             for ic in 0..in_channels {
@@ -5391,6 +5435,11 @@ impl FrankenTorchSession {
                 "conv_transpose2d: stride must be > 0",
             ));
         }
+        if output_padding_h >= stride_h || output_padding_w >= stride_w {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose2d: output_padding must be < stride",
+            ));
+        }
 
         let input_shape = self.tensor_shape(input)?;
         let weight_shape = self.tensor_shape(weight)?;
@@ -5408,6 +5457,17 @@ impl FrankenTorchSession {
         let kernel_h = weight_shape[2];
         let kernel_w = weight_shape[3];
 
+        if input_h == 0 || input_w == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose2d: input spatial dims must be > 0",
+            ));
+        }
+        if kernel_h == 0 || kernel_w == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose2d: kernel size must be > 0",
+            ));
+        }
+
         if in_channels != weight_shape[0] {
             return Err(Self::incompatible_tensor_args(
                 "conv_transpose2d: input channels do not match weight",
@@ -5417,9 +5477,62 @@ impl FrankenTorchSession {
         let input_vals = self.tensor_values(input)?;
         let weight_vals = self.tensor_values(weight)?;
 
-        let output_h = (input_h - 1) * stride_h - 2 * padding_h + kernel_h + output_padding_h;
-        let output_w = (input_w - 1) * stride_w - 2 * padding_w + kernel_w + output_padding_w;
-        let mut output = vec![0.0; batch_size * out_channels * output_h * output_w];
+        let span_h = Self::checked_mul(
+            input_h - 1,
+            stride_h,
+            "conv_transpose2d output height overflow",
+        )?;
+        let pad_h = Self::checked_mul(padding_h, 2, "conv_transpose2d padding overflow")?;
+        if span_h < pad_h {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose2d: output height underflow from padding",
+            ));
+        }
+        let base_h = span_h - pad_h;
+        let output_h =
+            Self::checked_add(base_h, kernel_h, "conv_transpose2d output height overflow")?;
+        let output_h = Self::checked_add(
+            output_h,
+            output_padding_h,
+            "conv_transpose2d output height overflow",
+        )?;
+
+        let span_w = Self::checked_mul(
+            input_w - 1,
+            stride_w,
+            "conv_transpose2d output width overflow",
+        )?;
+        let pad_w = Self::checked_mul(padding_w, 2, "conv_transpose2d padding overflow")?;
+        if span_w < pad_w {
+            return Err(Self::incompatible_tensor_args(
+                "conv_transpose2d: output width underflow from padding",
+            ));
+        }
+        let base_w = span_w - pad_w;
+        let output_w =
+            Self::checked_add(base_w, kernel_w, "conv_transpose2d output width overflow")?;
+        let output_w = Self::checked_add(
+            output_w,
+            output_padding_w,
+            "conv_transpose2d output width overflow",
+        )?;
+
+        let output_len = Self::checked_mul(
+            batch_size,
+            out_channels,
+            "conv_transpose2d output size overflow",
+        )?;
+        let output_len = Self::checked_mul(
+            output_len,
+            output_h,
+            "conv_transpose2d output size overflow",
+        )?;
+        let output_len = Self::checked_mul(
+            output_len,
+            output_w,
+            "conv_transpose2d output size overflow",
+        )?;
+        let mut output = vec![0.0; output_len];
 
         for n in 0..batch_size {
             for ic in 0..in_channels {
