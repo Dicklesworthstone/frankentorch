@@ -845,6 +845,9 @@ fn st_dtype_to_ft(dtype: StDtype) -> Result<DType, TensorIOError> {
 struct TensorViewAdapter<'a> {
     tensor: &'a DenseTensor,
     st_dtype: StDtype,
+    storage_start: usize,
+    storage_end: usize,
+    data_len: usize,
 }
 
 impl st_tensor::View for TensorViewAdapter<'_> {
@@ -859,50 +862,114 @@ impl st_tensor::View for TensorViewAdapter<'_> {
     fn data(&self) -> Cow<'_, [u8]> {
         match self.tensor.typed_storage() {
             TensorStorage::F64(v) => {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let slice = &v[self.storage_start..self.storage_end];
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in slice {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
                 Cow::Owned(bytes)
             }
             TensorStorage::F32(v) => {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let slice = &v[self.storage_start..self.storage_end];
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in slice {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
                 Cow::Owned(bytes)
             }
             TensorStorage::F16(v) => {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let slice = &v[self.storage_start..self.storage_end];
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in slice {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
                 Cow::Owned(bytes)
             }
             TensorStorage::BF16(v) => {
-                let bytes: Vec<u8> = v.iter().flat_map(|x| x.to_le_bytes()).collect();
+                let slice = &v[self.storage_start..self.storage_end];
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in slice {
+                    bytes.extend_from_slice(&value.to_le_bytes());
+                }
                 Cow::Owned(bytes)
             }
             TensorStorage::Complex64(v) => {
-                let bytes: Vec<u8> = v
-                    .iter()
-                    .flat_map(|z| {
-                        let mut b = Vec::with_capacity(8);
-                        b.extend_from_slice(&z.re.to_le_bytes());
-                        b.extend_from_slice(&z.im.to_le_bytes());
-                        b
-                    })
-                    .collect();
+                let slice = &v[self.storage_start..self.storage_end];
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in slice {
+                    bytes.extend_from_slice(&value.re.to_le_bytes());
+                    bytes.extend_from_slice(&value.im.to_le_bytes());
+                }
                 Cow::Owned(bytes)
             }
             TensorStorage::Complex128(v) => {
-                let bytes: Vec<u8> = v
-                    .iter()
-                    .flat_map(|z| {
-                        let mut b = Vec::with_capacity(16);
-                        b.extend_from_slice(&z.re.to_le_bytes());
-                        b.extend_from_slice(&z.im.to_le_bytes());
-                        b
-                    })
-                    .collect();
+                let slice = &v[self.storage_start..self.storage_end];
+                let mut bytes = Vec::with_capacity(self.data_len);
+                for value in slice {
+                    bytes.extend_from_slice(&value.re.to_le_bytes());
+                    bytes.extend_from_slice(&value.im.to_le_bytes());
+                }
                 Cow::Owned(bytes)
             }
         }
     }
 
     fn data_len(&self) -> usize {
-        self.tensor.meta().numel() * self.tensor.meta().dtype().element_size()
+        self.data_len
+    }
+}
+
+impl<'a> TensorViewAdapter<'a> {
+    fn try_new(
+        tensor: &'a DenseTensor,
+        st_dtype: StDtype,
+        name: &str,
+    ) -> Result<Self, TensorIOError> {
+        let meta = tensor.meta();
+        if !meta.is_contiguous() {
+            return Err(TensorIOError::Corrupt {
+                reason: format!("safetensors requires contiguous tensor '{name}'"),
+            });
+        }
+
+        let numel = meta.numel();
+        if numel == usize::MAX {
+            return Err(TensorIOError::Corrupt {
+                reason: format!("safetensors shape overflow for tensor '{name}'"),
+            });
+        }
+
+        let storage_start = meta.storage_offset();
+        let storage_end =
+            storage_start
+                .checked_add(numel)
+                .ok_or_else(|| TensorIOError::Corrupt {
+                    reason: format!("safetensors storage span overflow for tensor '{name}'"),
+                })?;
+
+        let storage_len = tensor.typed_storage().len();
+        if storage_end > storage_len {
+            return Err(TensorIOError::Corrupt {
+                reason: format!(
+                    "safetensors storage span out of range for tensor '{name}': end={storage_end} len={storage_len}"
+                ),
+            });
+        }
+
+        let element_size = meta.dtype().element_size();
+        let data_len = numel
+            .checked_mul(element_size)
+            .ok_or_else(|| TensorIOError::Corrupt {
+                reason: format!("safetensors byte length overflow for tensor '{name}'"),
+            })?;
+
+        Ok(Self {
+            tensor,
+            st_dtype,
+            storage_start,
+            storage_end,
+            data_len,
+        })
     }
 }
 
@@ -922,7 +989,8 @@ pub fn save_safetensors<P: AsRef<Path>>(
         .iter()
         .map(|(name, tensor)| {
             let st_dtype = ft_dtype_to_st(tensor.meta().dtype())?;
-            Ok((name.clone(), TensorViewAdapter { tensor, st_dtype }))
+            let view = TensorViewAdapter::try_new(tensor, st_dtype, name)?;
+            Ok((name.clone(), view))
         })
         .collect::<Result<Vec<_>, TensorIOError>>()?;
 
@@ -2104,6 +2172,46 @@ mod tests {
         assert_eq!(
             loaded["w"].contiguous_values_f32().unwrap(),
             &[1.0f32, 2.0, 3.0]
+        );
+    }
+
+    #[test]
+    fn safetensors_respects_storage_offset() {
+        let path = std::env::temp_dir().join("ft_test_st_offset.safetensors");
+        let _ = std::fs::remove_file(&path);
+        let mut sd = BTreeMap::new();
+        let meta = TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu).with_storage_offset(1);
+        let t = DenseTensor::from_storage_f32(meta, vec![0.5f32, 1.25, 2.5]).unwrap();
+        sd.insert("x".to_string(), t);
+
+        save_safetensors(&sd, &path, None).unwrap();
+        let loaded = load_safetensors(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(
+            loaded["x"].contiguous_values_f32().unwrap(),
+            &[1.25f32, 2.5]
+        );
+    }
+
+    #[test]
+    fn safetensors_rejects_noncontiguous_tensor() {
+        let path = std::env::temp_dir().join("ft_test_st_noncontig.safetensors");
+        let _ = std::fs::remove_file(&path);
+        let mut sd = BTreeMap::new();
+        let meta =
+            TensorMeta::from_shape_and_strides(vec![2, 2], vec![3, 1], 0, DType::F64, Device::Cpu)
+                .unwrap();
+        let t = DenseTensor::from_storage(meta, vec![1.0, 2.0, 3.0, 4.0, 5.0]).unwrap();
+        sd.insert("x".to_string(), t);
+
+        let err = save_safetensors(&sd, &path, None).expect_err("noncontiguous must fail");
+        let msg = err.to_string();
+        let _ = std::fs::remove_file(&path);
+
+        assert!(
+            msg.contains("contiguous"),
+            "unexpected error message: {msg}"
         );
     }
 
