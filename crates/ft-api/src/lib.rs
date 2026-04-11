@@ -14073,18 +14073,25 @@ impl FrankenTorchSession {
         Self::validate_index_tensor_values(&input_shape, dim, &idx_vals)?;
         let dim_size = input_shape[dim];
 
-        // Compute strides
+        // Compute strides with overflow checks
         let mut strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
-            strides[d] = strides[d + 1] * input_shape[d + 1];
+            strides[d] = Self::checked_shape_numel(
+                &input_shape[d + 1..],
+                "scatter_reduce input stride shape overflow",
+            )?;
         }
 
         let mut idx_strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
-            idx_strides[d] = idx_strides[d + 1] * idx_shape[d + 1];
+            idx_strides[d] = Self::checked_shape_numel(
+                &idx_shape[d + 1..],
+                "scatter_reduce index stride shape overflow",
+            )?;
         }
 
-        let total_idx: usize = idx_shape.iter().product();
+        let total_idx =
+            Self::checked_shape_numel(&idx_shape, "scatter_reduce index shape volume overflow")?;
 
         let out = match input_dtype {
             DType::F64 => {
