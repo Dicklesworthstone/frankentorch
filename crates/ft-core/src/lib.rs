@@ -1675,23 +1675,21 @@ impl SparseCOOTensor {
             });
         }
 
-        // Validate indices are within bounds (only if coalesced, for performance)
-        if coalesced {
-            let indices_values = indices.storage();
-            for d in 0..sparse_dim {
-                let dim_size = dense_shape[d];
-                for i in 0..nnz {
-                    let idx = indices_values[d * nnz + i];
-                    if idx < 0 {
-                        return Err(SparseTensorError::NegativeIndex { dim: d, index: idx });
-                    }
-                    if (idx as usize) >= dim_size {
-                        return Err(SparseTensorError::IndexOutOfBounds {
-                            dim: d,
-                            index: idx,
-                            size: dim_size,
-                        });
-                    }
+        // Validate indices are within bounds even when not coalesced.
+        let indices_values = indices.storage();
+        for d in 0..sparse_dim {
+            let dim_size = dense_shape[d];
+            for i in 0..nnz {
+                let idx = indices_values[d * nnz + i];
+                if idx < 0 {
+                    return Err(SparseTensorError::NegativeIndex { dim: d, index: idx });
+                }
+                if (idx as usize) >= dim_size {
+                    return Err(SparseTensorError::IndexOutOfBounds {
+                        dim: d,
+                        index: idx,
+                        size: dim_size,
+                    });
                 }
             }
         }
@@ -3910,6 +3908,19 @@ mod tests {
         let values = DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu).unwrap();
 
         let result = SparseCOOTensor::new(indices, values, vec![3, 4], true);
+        assert!(matches!(
+            result,
+            Err(SparseTensorError::IndexOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_coo_uncoalesced_out_of_bounds_rejected() {
+        let indices =
+            DenseI64Tensor::from_contiguous_values(vec![5, 0], vec![2, 1], Device::Cpu).unwrap();
+        let values = DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu).unwrap();
+
+        let result = SparseCOOTensor::new(indices, values, vec![3, 4], false);
         assert!(matches!(
             result,
             Err(SparseTensorError::IndexOutOfBounds { .. })
