@@ -13733,7 +13733,7 @@ impl FrankenTorchSession {
             (v, m.shape().to_vec())
         };
         let ndim = shape.len();
-        if dimension >= ndim || size > shape[dimension] || step == 0 {
+        if dimension >= ndim || size == 0 || size > shape[dimension] || step == 0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "unfold: invalid dimension, size, or step",
@@ -13795,6 +13795,13 @@ impl FrankenTorchSession {
             let (v, m) = self.tensor_values_meta(input)?;
             (v, m.shape().to_vec())
         };
+        if !p.is_finite() || p <= 0.0 || !maxnorm.is_finite() || maxnorm <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "renorm: p and maxnorm must be finite and > 0",
+                },
+            )));
+        }
         if dim >= shape.len() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -26106,6 +26113,17 @@ mod tests {
     }
 
     #[test]
+    fn conv_transpose1d_rejects_output_padding_ge_stride() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0], vec![1, 1, 1], false).unwrap();
+        let weight = s.tensor_variable(vec![1.0], vec![1, 1, 1], false).unwrap();
+        assert!(
+            s.functional_conv_transpose1d(input, weight, None, 2, 0, 2)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn conv_transpose2d_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // [1, 1, 1, 1] with 2x2 kernel, stride 1 -> [1, 1, 2, 2]
@@ -26148,6 +26166,21 @@ mod tests {
     }
 
     // ── adaptive pooling tests ────────────────────────────────────────
+
+    #[test]
+    fn conv_transpose2d_rejects_output_padding_ge_stride() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0], vec![1, 1, 1, 1], false)
+            .unwrap();
+        let weight = s
+            .tensor_variable(vec![1.0], vec![1, 1, 1, 1], false)
+            .unwrap();
+        assert!(
+            s.functional_conv_transpose2d(input, weight, None, (2, 1), (0, 0), (2, 0))
+                .is_err()
+        );
+    }
 
     #[test]
     fn adaptive_avg_pool1d_basic() {
@@ -31855,6 +31888,7 @@ mod tests {
             .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
             .unwrap();
         assert!(s.tensor_unfold(x, 0, 5, 1).is_err());
+        assert!(s.tensor_unfold(x, 0, 0, 1).is_err());
         assert!(s.tensor_unfold(x, 0, 2, 0).is_err());
         assert!(s.tensor_unfold(x, 1, 2, 1).is_err());
     }
@@ -31878,6 +31912,18 @@ mod tests {
             .tensor_variable(vec![3.0, 4.0, 1.0, 0.0], vec![2, 2], false)
             .unwrap();
         assert!(s.tensor_renorm(x, 2.0, 2, 2.5).is_err());
+    }
+
+    #[test]
+    fn renorm_invalid_params_error() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![3.0, 4.0, 1.0, 0.0], vec![2, 2], false)
+            .unwrap();
+        assert!(s.tensor_renorm(x, 0.0, 0, 2.5).is_err());
+        assert!(s.tensor_renorm(x, -1.0, 0, 2.5).is_err());
+        assert!(s.tensor_renorm(x, 2.0, 0, 0.0).is_err());
+        assert!(s.tensor_renorm(x, 2.0, 0, -0.5).is_err());
     }
 
     #[test]
