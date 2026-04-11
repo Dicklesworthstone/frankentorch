@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::cmp::Ordering;
 use std::collections::BTreeSet;
 use std::fmt;
 use std::hash::Hasher;
@@ -399,7 +400,19 @@ fn validate_checkpoint(envelope: &CheckpointEnvelope) -> Result<(), SerializeErr
 
 fn normalize_entries(entries: &[SnapshotEntry]) -> Vec<SnapshotEntry> {
     let mut normalized = entries.to_vec();
-    normalized.sort_by_key(|entry| entry.node_id);
+    normalized.sort_by(|left, right| {
+        left.node_id
+            .cmp(&right.node_id)
+            .then_with(|| left.value.to_bits().cmp(&right.value.to_bits()))
+            .then_with(|| match (left.grad, right.grad) {
+                (None, None) => Ordering::Equal,
+                (None, Some(_)) => Ordering::Less,
+                (Some(_), None) => Ordering::Greater,
+                (Some(left_grad), Some(right_grad)) => {
+                    left_grad.to_bits().cmp(&right_grad.to_bits())
+                }
+            })
+    });
     normalized
 }
 
@@ -1187,6 +1200,7 @@ mod tests {
     use super::{
         CheckpointMode, DecodeMode, SerializeError, SnapshotEntry, decode_checkpoint,
         decode_snapshot, encode_checkpoint, encode_snapshot, generate_raptorq_sidecar,
+        normalize_entries,
     };
 
     fn det_seed(parts: &[u64]) -> u64 {
@@ -1606,6 +1620,39 @@ mod tests {
         assert_eq!(decoded, entries);
     }
 
+    #[test]
+    fn checkpoint_hash_is_order_invariant_with_duplicate_node_ids() {
+        let entries_a = vec![
+            SnapshotEntry {
+                node_id: 1,
+                value: 2.0,
+                grad: Some(1.0),
+            },
+            SnapshotEntry {
+                node_id: 1,
+                value: -3.0,
+                grad: None,
+            },
+            SnapshotEntry {
+                node_id: 2,
+                value: 4.0,
+                grad: Some(0.0),
+            },
+        ];
+        let entries_b = vec![
+            entries_a[1].clone(),
+            entries_a[0].clone(),
+            entries_a[2].clone(),
+        ];
+
+        let encoded_a = encode_checkpoint(entries_a.as_slice(), CheckpointMode::Strict)
+            .expect("strict encode should work");
+        let encoded_b = encode_checkpoint(entries_b.as_slice(), CheckpointMode::Strict)
+            .expect("strict encode should work");
+
+        assert_eq!(encoded_a, encoded_b);
+    }
+
     proptest! {
         #[test]
         fn prop_checkpoint_roundtrip_preserves_sorted_entries(
@@ -1615,8 +1662,7 @@ mod tests {
                 .expect("strict encode should work");
             let decoded =
                 decode_checkpoint(encoded.as_str(), DecodeMode::Strict).expect("decode must succeed");
-            let mut expected = entries.clone();
-            expected.sort_by_key(|entry| entry.node_id);
+            let expected = normalize_entries(entries.as_slice());
 
             prop_assert_eq!(&decoded.entries, &expected);
 
