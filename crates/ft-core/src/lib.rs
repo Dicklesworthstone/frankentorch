@@ -717,6 +717,7 @@ pub enum DenseTensorError {
     UnsupportedStorageAccess { dtype: DType },
     StorageSpanOverflow { storage_offset: usize, numel: usize },
     InsufficientStorage { needed: usize, actual: usize },
+    ShapeOverflow { shape: Vec<usize> },
 }
 
 impl fmt::Display for DenseTensorError {
@@ -745,6 +746,9 @@ impl fmt::Display for DenseTensorError {
                 f,
                 "dense tensor storage length is insufficient: needed={needed}, actual={actual}"
             ),
+            Self::ShapeOverflow { shape } => {
+                write!(f, "dense tensor shape volume overflow for shape={shape:?}")
+            }
         }
     }
 }
@@ -764,6 +768,24 @@ fn contiguous_required_len(meta: &TensorMeta) -> Result<usize, DenseTensorError>
             storage_offset: meta.storage_offset(),
             numel: meta.numel(),
         })
+}
+
+fn checked_shape_numel(shape: &[usize]) -> Result<usize, DenseTensorError> {
+    if shape.is_empty() {
+        return Ok(1);
+    }
+    let mut product = 1usize;
+    for &dim in shape {
+        if dim == 0 {
+            return Ok(0);
+        }
+        product = product
+            .checked_mul(dim)
+            .ok_or_else(|| DenseTensorError::ShapeOverflow {
+                shape: shape.to_vec(),
+            })?;
+    }
+    Ok(product)
 }
 
 impl DenseTensor {
@@ -1112,7 +1134,7 @@ impl DenseTensor {
         if !self.meta.is_contiguous() {
             return Err(DenseTensorError::UnsupportedLayout);
         }
-        let new_numel: usize = new_shape.iter().product();
+        let new_numel = checked_shape_numel(&new_shape)?;
         if new_numel != self.meta.numel() {
             return Err(DenseTensorError::InsufficientStorage {
                 needed: new_numel,
@@ -1771,7 +1793,7 @@ impl SparseCOOTensor {
     ///
     /// This allocates a new dense tensor with zeros and fills in the non-zero values.
     pub fn to_dense(&self) -> Result<DenseTensor, SparseTensorError> {
-        let numel: usize = self.dense_shape.iter().product();
+        let numel = checked_shape_numel(&self.dense_shape)?;
         let mut dense_data = vec![0.0f64; numel];
 
         let nnz = self.nnz();
@@ -1808,7 +1830,7 @@ impl SparseCOOTensor {
         } else {
             // Hybrid sparse-dense: values have shape [nnz, *dense_dims]
             let dense_dims = &self.dense_shape[self.sparse_dim..];
-            let dense_numel: usize = dense_dims.iter().product();
+            let dense_numel = checked_shape_numel(dense_dims)?;
 
             for i in 0..nnz {
                 let mut sparse_linear_idx = 0usize;
@@ -2025,7 +2047,11 @@ impl SparseCSRTensor {
     /// Convert this sparse CSR tensor to a dense tensor.
     pub fn to_dense(&self) -> Result<DenseTensor, SparseTensorError> {
         let [nrows, ncols] = self.shape;
-        let numel = nrows * ncols;
+        let numel = nrows
+            .checked_mul(ncols)
+            .ok_or_else(|| DenseTensorError::ShapeOverflow {
+                shape: vec![nrows, ncols],
+            })?;
         let mut dense_data = vec![0.0f64; numel];
 
         let crow_data = self.crow_indices.storage();
@@ -2380,6 +2406,35 @@ mod tests {
     fn numel_zero_dimension_short_circuits_before_overflow() {
         let meta = TensorMeta::from_shape(vec![usize::MAX, 2, 0], DType::F64, Device::Cpu);
         assert_eq!(meta.numel(), 0);
+    }
+
+    #[test]
+    fn dense_view_rejects_shape_overflow() {
+        let tensor = DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu).unwrap();
+        let err = tensor
+            .view(vec![usize::MAX, 2])
+            .expect_err("overflowing view shape must fail");
+        assert!(matches!(err, DenseTensorError::ShapeOverflow { .. }));
+    }
+
+    #[test]
+    fn sparse_coo_to_dense_rejects_shape_overflow() {
+        let coords = vec![vec![0, 0]];
+        let sparse = SparseCOOTensor::from_coords(
+            &coords,
+            vec![1.0],
+            vec![usize::MAX, 2],
+            DType::F64,
+            Device::Cpu,
+        )
+        .expect("sparse COO should build with oversized shape");
+        let err = sparse
+            .to_dense()
+            .expect_err("overflowing dense shape must fail");
+        assert!(matches!(
+            err,
+            SparseTensorError::DenseTensor(DenseTensorError::ShapeOverflow { .. })
+        ));
     }
 
     #[test]
