@@ -6051,6 +6051,166 @@ pub fn scatter_tensor_contiguous_f32(
     Ok(output)
 }
 
+/// Like `scatter_tensor_contiguous_f32` but **adds** `src` values instead of overwriting.
+pub fn scatter_add_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    index: &[f64],
+    index_meta: &TensorMeta,
+    src: &[f32],
+) -> Result<Vec<f32>, KernelError> {
+    ensure_unary_layout_and_storage_f32(input, meta)?;
+    ensure_unary_layout_and_storage(index, index_meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let idx_shape = index_meta.shape();
+    if idx_shape.len() != ndim {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: idx_shape.to_vec(),
+        });
+    }
+    for d in 0..ndim {
+        if d != dim && idx_shape[d] != shape[d] {
+            return Err(KernelError::ShapeMismatch {
+                lhs: shape.to_vec(),
+                rhs: idx_shape.to_vec(),
+            });
+        }
+    }
+    let src_numel = checked_shape_numel(idx_shape, "scatter_add_f32 overflow")?;
+    if src.len() < src_numel {
+        return Err(KernelError::InsufficientStorage {
+            side: "src",
+            needed: src_numel,
+            available: src.len(),
+        });
+    }
+    let numel = meta.numel();
+    if src_numel == 0 {
+        if numel == 0 {
+            return Ok(Vec::new());
+        }
+        let offset = meta.storage_offset();
+        return Ok(input[offset..offset + numel].to_vec());
+    }
+
+    let dim_size = shape[dim];
+    let idx_dim_size = idx_shape[dim];
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(idx_shape, dim, "scatter_add_f32 overflow")?;
+    if numel == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = meta.storage_offset();
+    let mut output = input[offset..offset + numel].to_vec();
+    let idx_offset = index_meta.storage_offset();
+    let index_data = &index[idx_offset..];
+    for outer in 0..outer_size {
+        for r in 0..idx_dim_size {
+            for inner in 0..inner_size {
+                let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
+                let selected = normalize_wrapped_index_value(index_data[idx_pos], dim_size)?;
+                let dst = outer * dim_size * inner_size + selected * inner_size + inner;
+                output[dst] += src[idx_pos];
+            }
+        }
+    }
+    Ok(output)
+}
+
+pub fn index_put_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+    indices: &[Vec<f64>],
+    values: &[f32],
+    accumulate: bool,
+) -> Result<Vec<f32>, KernelError> {
+    ensure_unary_layout_and_storage_f32(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+
+    if indices.is_empty() {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![0],
+        });
+    }
+
+    let num_indexed_dims = indices.len();
+    if num_indexed_dims > ndim {
+        return Err(KernelError::InvalidDimension {
+            dim: num_indexed_dims,
+            ndim,
+        });
+    }
+
+    let n_indices = indices[0].len();
+    for idx_tensor in &indices[1..] {
+        if idx_tensor.len() != n_indices {
+            return Err(KernelError::ShapeMismatch {
+                lhs: vec![n_indices],
+                rhs: vec![idx_tensor.len()],
+            });
+        }
+    }
+
+    let suffix_size = checked_shape_numel(
+        &shape[num_indexed_dims..],
+        "index_put suffix shape overflow",
+    )?;
+
+    let values_needed = checked_mul(n_indices, suffix_size, "index_put values shape overflow")?;
+    let scalar_broadcast = values.len() == 1 && values_needed > 1;
+    if !scalar_broadcast && values.len() < values_needed {
+        return Err(KernelError::InsufficientStorage {
+            side: "values",
+            needed: values_needed,
+            available: values.len(),
+        });
+    }
+
+    let offset = meta.storage_offset();
+    let numel = meta.numel();
+    if numel == 0 {
+        return Ok(Vec::new());
+    }
+    let mut output = input[offset..offset + numel].to_vec();
+
+    let mut indexed_strides = vec![0usize; num_indexed_dims];
+    for d in 0..num_indexed_dims {
+        indexed_strides[d] =
+            checked_shape_numel(&shape[d + 1..], "index_put stride shape overflow")?;
+    }
+
+    for i in 0..n_indices {
+        let mut base = 0usize;
+        for d in 0..num_indexed_dims {
+            let idx = normalize_wrapped_index_value(indices[d][i], shape[d])?;
+            base += idx * indexed_strides[d];
+        }
+
+        for s in 0..suffix_size {
+            let val = if scalar_broadcast {
+                values[0]
+            } else {
+                values[i * suffix_size + s]
+            };
+            if accumulate {
+                output[base + s] += val;
+            } else {
+                output[base + s] = val;
+            }
+        }
+    }
+
+    Ok(output)
+}
+
 pub fn masked_fill_tensor_contiguous_f32(
     input: &[f32],
     meta: &TensorMeta,

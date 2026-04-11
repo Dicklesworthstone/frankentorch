@@ -6477,7 +6477,33 @@ impl FrankenTorchSession {
         let index_data = self.tensor_tape.values(index)?;
         Self::validate_index_tensor_values(&input_shape, dim, &index_data)?;
         let index_shape = self.tensor_tape.tensor(index)?.meta().shape().to_vec();
-        let src_data = self.tensor_tape.values(src)?;
+        let input_dtype = self.tensor_tape.dtype(input)?;
+        let src_dtype = self.tensor_tape.dtype(src)?;
+        if src_dtype != input_dtype {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "scatter_add requires input and src to have matching dtypes",
+                }
+                .into(),
+            ));
+        }
+        let src_data = match input_dtype {
+            DType::F64 => self.tensor_tape.values(src)?,
+            DType::F32 => self
+                .tensor_tape
+                .values_f32(src)?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            _ => {
+                return Err(AutogradError::Dispatch(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "scatter_add requires f32 or f64 tensors",
+                    }
+                    .into(),
+                ));
+            }
+        };
         self.tensor_tape
             .scatter_add(input, dim, &index_data, index_shape, &src_data)
     }
@@ -6493,7 +6519,33 @@ impl FrankenTorchSession {
             .iter()
             .map(|&idx| self.tensor_tape.values(idx))
             .collect::<Result<_, _>>()?;
-        let vals_data = self.tensor_tape.values(values)?;
+        let input_dtype = self.tensor_tape.dtype(input)?;
+        let values_dtype = self.tensor_tape.dtype(values)?;
+        if values_dtype != input_dtype {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_put requires input and values to have matching dtypes",
+                }
+                .into(),
+            ));
+        }
+        let vals_data = match input_dtype {
+            DType::F64 => self.tensor_tape.values(values)?,
+            DType::F32 => self
+                .tensor_tape
+                .values_f32(values)?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            _ => {
+                return Err(AutogradError::Dispatch(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "index_put requires f32 or f64 tensors",
+                    }
+                    .into(),
+                ));
+            }
+        };
         self.tensor_tape
             .index_put(input, &idx_data, &vals_data, accumulate)
     }
@@ -6520,11 +6572,18 @@ impl FrankenTorchSession {
         index: TensorNodeId,
         src: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let mut result = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         let idx_vals = self.tensor_values(index)?;
-        let src_vals = self.tensor_values(src)?;
         let src_shape = self.tensor_shape(src)?;
+        let input_dtype = self.tensor_tape.dtype(input)?;
+        let src_dtype = self.tensor_tape.dtype(src)?;
+        if src_dtype != input_dtype {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_add requires input and src to have matching dtypes",
+                },
+            )));
+        }
 
         let ndim = shape.len();
         if dim >= ndim {
@@ -6540,37 +6599,81 @@ impl FrankenTorchSession {
         let inner: usize = shape[dim + 1..].iter().product();
         let src_dim_size = src_shape.get(dim).copied().unwrap_or(1);
 
-        for o in 0..outer {
-            for (si, &idx_f) in idx_vals.iter().enumerate() {
-                if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_add: index values must be finite non-negative integers",
-                        },
-                    )));
-                }
-                let idx = idx_f as usize;
-                if idx >= dim_size {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_add: index value out of range",
-                        },
-                    )));
-                }
-                if si >= src_dim_size {
-                    continue;
-                }
-                for i in 0..inner {
-                    let dst_offset = o * dim_size * inner + idx * inner + i;
-                    let src_offset = o * src_dim_size * inner + si * inner + i;
-                    if dst_offset < result.len() && src_offset < src_vals.len() {
-                        result[dst_offset] += src_vals[src_offset];
+        match input_dtype {
+            DType::F64 => {
+                let mut result = self.tensor_tape.values(input)?;
+                let src_vals = self.tensor_tape.values(src)?;
+                for o in 0..outer {
+                    for (si, &idx_f) in idx_vals.iter().enumerate() {
+                        if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_add: index values must be finite non-negative integers",
+                                },
+                            )));
+                        }
+                        let idx = idx_f as usize;
+                        if idx >= dim_size {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_add: index value out of range",
+                                },
+                            )));
+                        }
+                        if si >= src_dim_size {
+                            continue;
+                        }
+                        for i in 0..inner {
+                            let dst_offset = o * dim_size * inner + idx * inner + i;
+                            let src_offset = o * src_dim_size * inner + si * inner + i;
+                            if dst_offset < result.len() && src_offset < src_vals.len() {
+                                result[dst_offset] += src_vals[src_offset];
+                            }
+                        }
                     }
                 }
+                self.tensor_variable(result, shape, false)
             }
+            DType::F32 => {
+                let mut result = self.tensor_tape.values_f32(input)?;
+                let src_vals = self.tensor_tape.values_f32(src)?;
+                for o in 0..outer {
+                    for (si, &idx_f) in idx_vals.iter().enumerate() {
+                        if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_add: index values must be finite non-negative integers",
+                                },
+                            )));
+                        }
+                        let idx = idx_f as usize;
+                        if idx >= dim_size {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_add: index value out of range",
+                                },
+                            )));
+                        }
+                        if si >= src_dim_size {
+                            continue;
+                        }
+                        for i in 0..inner {
+                            let dst_offset = o * dim_size * inner + idx * inner + i;
+                            let src_offset = o * src_dim_size * inner + si * inner + i;
+                            if dst_offset < result.len() && src_offset < src_vals.len() {
+                                result[dst_offset] += src_vals[src_offset];
+                            }
+                        }
+                    }
+                }
+                self.tensor_variable_f32(result, shape, false)
+            }
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_add requires f32 or f64 tensors",
+                },
+            ))),
         }
-
-        self.tensor_variable(result, shape, false)
     }
 
     /// Copy `src` into `self` at positions specified by `index` along `dim`.
@@ -6583,11 +6686,18 @@ impl FrankenTorchSession {
         index: TensorNodeId,
         src: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let mut result = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         let idx_vals = self.tensor_values(index)?;
-        let src_vals = self.tensor_values(src)?;
         let src_shape = self.tensor_shape(src)?;
+        let input_dtype = self.tensor_tape.dtype(input)?;
+        let src_dtype = self.tensor_tape.dtype(src)?;
+        if src_dtype != input_dtype {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_copy requires input and src to have matching dtypes",
+                },
+            )));
+        }
 
         let ndim = shape.len();
         if dim >= ndim {
@@ -6603,37 +6713,81 @@ impl FrankenTorchSession {
         let inner: usize = shape[dim + 1..].iter().product();
         let src_dim_size = src_shape.get(dim).copied().unwrap_or(1);
 
-        for o in 0..outer {
-            for (si, &idx_f) in idx_vals.iter().enumerate() {
-                if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_copy: index values must be finite non-negative integers",
-                        },
-                    )));
-                }
-                let idx = idx_f as usize;
-                if idx >= dim_size {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_copy: index value out of range",
-                        },
-                    )));
-                }
-                if si >= src_dim_size {
-                    continue;
-                }
-                for i in 0..inner {
-                    let dst_offset = o * dim_size * inner + idx * inner + i;
-                    let src_offset = o * src_dim_size * inner + si * inner + i;
-                    if dst_offset < result.len() && src_offset < src_vals.len() {
-                        result[dst_offset] = src_vals[src_offset];
+        match input_dtype {
+            DType::F64 => {
+                let mut result = self.tensor_tape.values(input)?;
+                let src_vals = self.tensor_tape.values(src)?;
+                for o in 0..outer {
+                    for (si, &idx_f) in idx_vals.iter().enumerate() {
+                        if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_copy: index values must be finite non-negative integers",
+                                },
+                            )));
+                        }
+                        let idx = idx_f as usize;
+                        if idx >= dim_size {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_copy: index value out of range",
+                                },
+                            )));
+                        }
+                        if si >= src_dim_size {
+                            continue;
+                        }
+                        for i in 0..inner {
+                            let dst_offset = o * dim_size * inner + idx * inner + i;
+                            let src_offset = o * src_dim_size * inner + si * inner + i;
+                            if dst_offset < result.len() && src_offset < src_vals.len() {
+                                result[dst_offset] = src_vals[src_offset];
+                            }
+                        }
                     }
                 }
+                self.tensor_variable(result, shape, false)
             }
+            DType::F32 => {
+                let mut result = self.tensor_tape.values_f32(input)?;
+                let src_vals = self.tensor_tape.values_f32(src)?;
+                for o in 0..outer {
+                    for (si, &idx_f) in idx_vals.iter().enumerate() {
+                        if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_copy: index values must be finite non-negative integers",
+                                },
+                            )));
+                        }
+                        let idx = idx_f as usize;
+                        if idx >= dim_size {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_copy: index value out of range",
+                                },
+                            )));
+                        }
+                        if si >= src_dim_size {
+                            continue;
+                        }
+                        for i in 0..inner {
+                            let dst_offset = o * dim_size * inner + idx * inner + i;
+                            let src_offset = o * src_dim_size * inner + si * inner + i;
+                            if dst_offset < result.len() && src_offset < src_vals.len() {
+                                result[dst_offset] = src_vals[src_offset];
+                            }
+                        }
+                    }
+                }
+                self.tensor_variable_f32(result, shape, false)
+            }
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_copy requires f32 or f64 tensors",
+                },
+            ))),
         }
-
-        self.tensor_variable(result, shape, false)
     }
 
     /// Fill positions specified by `index` along `dim` with a scalar value.
@@ -6646,9 +6800,9 @@ impl FrankenTorchSession {
         index: TensorNodeId,
         value: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let mut result = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         let idx_vals = self.tensor_values(index)?;
+        let input_dtype = self.tensor_tape.dtype(input)?;
 
         let ndim = shape.len();
         if dim >= ndim {
@@ -6663,33 +6817,72 @@ impl FrankenTorchSession {
         let outer: usize = shape[..dim].iter().product();
         let inner: usize = shape[dim + 1..].iter().product();
 
-        for o in 0..outer {
-            for &idx_f in &idx_vals {
-                if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_fill: index values must be finite non-negative integers",
-                        },
-                    )));
-                }
-                let idx = idx_f as usize;
-                if idx >= dim_size {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "index_fill: index value out of range",
-                        },
-                    )));
-                }
-                for i in 0..inner {
-                    let offset = o * dim_size * inner + idx * inner + i;
-                    if offset < result.len() {
-                        result[offset] = value;
+        match input_dtype {
+            DType::F64 => {
+                let mut result = self.tensor_tape.values(input)?;
+                for o in 0..outer {
+                    for &idx_f in &idx_vals {
+                        if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_fill: index values must be finite non-negative integers",
+                                },
+                            )));
+                        }
+                        let idx = idx_f as usize;
+                        if idx >= dim_size {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_fill: index value out of range",
+                                },
+                            )));
+                        }
+                        for i in 0..inner {
+                            let offset = o * dim_size * inner + idx * inner + i;
+                            if offset < result.len() {
+                                result[offset] = value;
+                            }
+                        }
                     }
                 }
+                self.tensor_variable(result, shape, false)
             }
+            DType::F32 => {
+                let mut result = self.tensor_tape.values_f32(input)?;
+                let fill_value = value as f32;
+                for o in 0..outer {
+                    for &idx_f in &idx_vals {
+                        if !idx_f.is_finite() || idx_f < 0.0 || idx_f != idx_f.floor() {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_fill: index values must be finite non-negative integers",
+                                },
+                            )));
+                        }
+                        let idx = idx_f as usize;
+                        if idx >= dim_size {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "index_fill: index value out of range",
+                                },
+                            )));
+                        }
+                        for i in 0..inner {
+                            let offset = o * dim_size * inner + idx * inner + i;
+                            if offset < result.len() {
+                                result[offset] = fill_value;
+                            }
+                        }
+                    }
+                }
+                self.tensor_variable_f32(result, shape, false)
+            }
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "index_fill requires f32 or f64 tensors",
+                },
+            ))),
         }
-
-        self.tensor_variable(result, shape, false)
     }
 
     pub fn tensor_cat(
@@ -25690,6 +25883,32 @@ mod tests {
     }
 
     #[test]
+    fn index_add_1d_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable_f32(vec![0.0f32, 0.0, 0.0, 0.0], vec![4], false)
+            .unwrap();
+        let index = s.tensor_variable(vec![1.0, 3.0], vec![2], false).unwrap();
+        let src = s
+            .tensor_variable_f32(vec![10.0f32, 20.0], vec![2], false)
+            .unwrap();
+        let out = s.tensor_index_add(input, 0, index, src).unwrap();
+        let vals = s.tensor_values_f32(out).unwrap();
+        assert_eq!(vals, vec![0.0f32, 10.0, 0.0, 20.0]);
+    }
+
+    #[test]
+    fn index_add_rejects_dtype_mismatch() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+        let index = s.tensor_variable(vec![0.0, 1.0], vec![2], false).unwrap();
+        let src = s
+            .tensor_variable_f32(vec![1.0f32, 2.0], vec![2], false)
+            .unwrap();
+        assert!(s.tensor_index_add(input, 0, index, src).is_err());
+    }
+
+    #[test]
     fn index_copy_1d() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
@@ -25700,6 +25919,30 @@ mod tests {
         let out = s.tensor_index_copy(input, 0, index, src).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(vals, vec![1.0, 99.0, 3.0, 88.0]);
+    }
+
+    #[test]
+    fn index_copy_1d_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0], vec![4], false)
+            .unwrap();
+        let index = s.tensor_variable(vec![1.0, 3.0], vec![2], false).unwrap();
+        let src = s
+            .tensor_variable_f32(vec![99.0f32, 88.0], vec![2], false)
+            .unwrap();
+        let out = s.tensor_index_copy(input, 0, index, src).unwrap();
+        let vals = s.tensor_values_f32(out).unwrap();
+        assert_eq!(vals, vec![1.0f32, 99.0, 3.0, 88.0]);
+    }
+
+    #[test]
+    fn index_copy_rejects_dtype_mismatch() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let index = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let src = s.tensor_variable_f32(vec![9.0f32], vec![1], false).unwrap();
+        assert!(s.tensor_index_copy(input, 0, index, src).is_err());
     }
 
     #[test]
@@ -25714,6 +25957,20 @@ mod tests {
         let out = s.tensor_index_fill(input, 0, index, 0.0).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(vals, vec![0.0, 2.0, 0.0, 4.0, 0.0]);
+    }
+
+    #[test]
+    fn index_fill_1d_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0, 5.0], vec![5], false)
+            .unwrap();
+        let index = s
+            .tensor_variable(vec![0.0, 2.0, 4.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_index_fill(input, 0, index, 0.0).unwrap();
+        let vals = s.tensor_values_f32(out).unwrap();
+        assert_eq!(vals, vec![0.0f32, 2.0, 0.0, 4.0, 0.0]);
     }
 
     #[test]
@@ -27418,6 +27675,24 @@ mod tests {
     }
 
     #[test]
+    fn scatter_add_basic_accumulates_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable_f32(vec![0.0f32, 0.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let src = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0], vec![1, 3], false)
+            .unwrap();
+        let idx = s
+            .tensor_variable(vec![0.0, 1.0, 0.0], vec![1, 3], false)
+            .unwrap();
+        let result = s.tensor_scatter_add(input, 1, idx, src).unwrap();
+        assert_eq!(s.tensor_dtype(result).unwrap(), DType::F32);
+        let vals = s.tensor_values_f32(result).unwrap();
+        assert_eq!(vals, vec![4.0f32, 2.0, 0.0]);
+    }
+
+    #[test]
     fn scatter_add_multiple_to_same_position() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // All indices point to 0: input[0] += 1+2+3 = 6
@@ -27498,6 +27773,22 @@ mod tests {
         let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert_eq!(vals, vec![0.0, 10.0, 0.0, 30.0, 0.0]);
+    }
+
+    #[test]
+    fn index_put_basic_overwrite_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable_f32(vec![0.0f32; 5], vec![5], false)
+            .unwrap();
+        let idx = s.tensor_variable(vec![1.0, 3.0], vec![2], false).unwrap();
+        let values = s
+            .tensor_variable_f32(vec![10.0f32, 30.0], vec![2], false)
+            .unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        assert_eq!(s.tensor_dtype(result).unwrap(), DType::F32);
+        let vals = s.tensor_values_f32(result).unwrap();
+        assert_eq!(vals, vec![0.0f32, 10.0, 0.0, 30.0, 0.0]);
     }
 
     #[test]
