@@ -1456,6 +1456,8 @@ pub enum SparseTensorError {
     InvalidIndicesRank { expected: usize, actual: usize },
     /// Indices tensor has wrong dtype (must be I64).
     InvalidIndicesDType { actual: DType },
+    /// Indices tensor is on a different device than values.
+    DeviceMismatch { expected: Device, actual: Device },
     /// Indices sparse_dim doesn't match the dense shape.
     SparseDimMismatch {
         indices_sparse_dim: usize,
@@ -1499,6 +1501,12 @@ impl fmt::Display for SparseTensorError {
             }
             Self::InvalidIndicesDType { actual } => {
                 write!(f, "indices tensor has dtype {actual:?}, expected I64")
+            }
+            Self::DeviceMismatch { expected, actual } => {
+                write!(
+                    f,
+                    "sparse tensor device mismatch: expected {expected:?}, got {actual:?}"
+                )
             }
             Self::SparseDimMismatch {
                 indices_sparse_dim,
@@ -1659,6 +1667,14 @@ impl SparseCOOTensor {
             });
         }
 
+        let device = values.meta().device();
+        if indices.meta().device() != device {
+            return Err(SparseTensorError::DeviceMismatch {
+                expected: device,
+                actual: indices.meta().device(),
+            });
+        }
+
         // Validate indices are within bounds (only if coalesced, for performance)
         if coalesced {
             let indices_values = indices.storage();
@@ -1679,8 +1695,6 @@ impl SparseCOOTensor {
                 }
             }
         }
-
-        let device = values.meta().device();
 
         Ok(Self {
             id: NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed),
@@ -1969,6 +1983,20 @@ impl SparseCSRTensor {
             });
         }
 
+        let device = values.meta().device();
+        if crow_indices.meta().device() != device {
+            return Err(SparseTensorError::DeviceMismatch {
+                expected: device,
+                actual: crow_indices.meta().device(),
+            });
+        }
+        if col_indices.meta().device() != device {
+            return Err(SparseTensorError::DeviceMismatch {
+                expected: device,
+                actual: col_indices.meta().device(),
+            });
+        }
+
         // Validate crow_indices is monotonically increasing and within bounds.
         for i in 0..=nrows {
             let value = crow_data[i];
@@ -1991,8 +2019,6 @@ impl SparseCSRTensor {
                 return Err(SparseTensorError::ColIndexOutOfBounds { index: col, ncols });
             }
         }
-
-        let device = values.meta().device();
 
         Ok(Self {
             id: NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed),
@@ -3891,6 +3917,19 @@ mod tests {
     }
 
     #[test]
+    fn sparse_coo_device_mismatch() {
+        let indices =
+            DenseI64Tensor::from_contiguous_values(vec![0, 1], vec![2, 1], Device::Cpu).unwrap();
+        let values = DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cuda).unwrap();
+
+        let result = SparseCOOTensor::new(indices, values, vec![2, 2], true);
+        assert!(matches!(
+            result,
+            Err(SparseTensorError::DeviceMismatch { .. })
+        ));
+    }
+
+    #[test]
     fn sparse_csr_creation() {
         // Create a 3x4 sparse matrix:
         // [[1, 0, 2, 0],
@@ -3946,6 +3985,20 @@ mod tests {
         assert!(matches!(
             result,
             Err(SparseTensorError::ColIndexOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_csr_device_mismatch() {
+        let crow =
+            DenseI64Tensor::from_contiguous_values(vec![0, 1], vec![2], Device::Cuda).unwrap();
+        let col = DenseI64Tensor::from_contiguous_values(vec![0], vec![1], Device::Cpu).unwrap();
+        let values = DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu).unwrap();
+
+        let result = SparseCSRTensor::new(crow, col, values, [1, 2]);
+        assert!(matches!(
+            result,
+            Err(SparseTensorError::DeviceMismatch { .. })
         ));
     }
 
