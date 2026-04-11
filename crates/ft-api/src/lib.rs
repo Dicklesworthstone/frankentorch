@@ -28,6 +28,7 @@ const INPLACE_FLOAT_REASON: &str = "in-place mutation only supported for float32
 const INIT_FLOAT_REASON: &str = "initialization only supported for float32/float64 tensors";
 const PARAM_UPDATE_FLOAT_REASON: &str =
     "parameter update only supported for float32/float64 tensors";
+const NAN_TO_NUM_FLOAT_REASON: &str = "nan_to_num only supported for float32/float64 tensors";
 
 /// Deterministic xoshiro256++ PRNG for reproducible random tensor generation.
 #[derive(Debug, Clone)]
@@ -11229,7 +11230,7 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.nan_to_num(input, nan=0.0, posinf=None, neginf=None)`.
     /// When `posinf`/`neginf` are `None`, they default to the largest/smallest
-    /// finite representable value for f64.
+    /// finite representable value for the input dtype.
     pub fn tensor_nan_to_num(
         &mut self,
         input: TensorNodeId,
@@ -11237,39 +11238,74 @@ impl FrankenTorchSession {
         posinf: Option<f64>,
         neginf: Option<f64>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let posinf_val = posinf.unwrap_or(f64::MAX);
-        let neginf_val = neginf.unwrap_or(f64::MIN);
-
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
+        let meta = self.tensor_tape.tensor_meta(input)?.clone();
+        let shape = meta.shape().to_vec();
+        let out = match meta.dtype() {
+            DType::F64 => {
+                let posinf_val = posinf.unwrap_or(f64::MAX);
+                let neginf_val = neginf.unwrap_or(f64::MIN);
+                let storage = self.tensor_tape.values(input)?;
+                let values: Vec<f64> = storage
+                    .into_iter()
+                    .map(|v| {
+                        if v.is_nan() {
+                            nan
+                        } else if v == f64::INFINITY {
+                            posinf_val
+                        } else if v == f64::NEG_INFINITY {
+                            neginf_val
+                        } else {
+                            v
+                        }
+                    })
+                    .collect();
+                let out = self.tensor_tape.leaf(values, shape, false)?;
+                self.runtime.ledger_mut().record(
+                    EvidenceKind::Dispatch,
+                    format!(
+                        "nan_to_num input={} out={} nan={nan} posinf={posinf_val} neginf={neginf_val}",
+                        input.0, out.0
+                    ),
+                );
+                out
+            }
+            DType::F32 => {
+                let posinf_val = posinf.map(|v| v as f32).unwrap_or(f32::MAX);
+                let neginf_val = neginf.map(|v| v as f32).unwrap_or(f32::MIN);
+                let nan_val = nan as f32;
+                let storage = self.tensor_tape.values_f32(input)?;
+                let values: Vec<f32> = storage
+                    .into_iter()
+                    .map(|v| {
+                        if v.is_nan() {
+                            nan_val
+                        } else if v == f32::INFINITY {
+                            posinf_val
+                        } else if v == f32::NEG_INFINITY {
+                            neginf_val
+                        } else {
+                            v
+                        }
+                    })
+                    .collect();
+                let out = self.tensor_tape.leaf_f32(values, shape, false)?;
+                self.runtime.ledger_mut().record(
+                    EvidenceKind::Dispatch,
+                    format!(
+                        "nan_to_num input={} out={} nan={nan_val} posinf={posinf_val} neginf={neginf_val}",
+                        input.0, out.0
+                    ),
+                );
+                out
+            }
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: NAN_TO_NUM_FLOAT_REASON,
+                    },
+                )));
+            }
         };
-
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&v| {
-                if v.is_nan() {
-                    nan
-                } else if v == f64::INFINITY {
-                    posinf_val
-                } else if v == f64::NEG_INFINITY {
-                    neginf_val
-                } else {
-                    v
-                }
-            })
-            .collect();
-
-        let out = self
-            .tensor_tape
-            .leaf(values, meta.shape().to_vec(), false)?;
-        self.runtime.ledger_mut().record(
-            EvidenceKind::Dispatch,
-            format!(
-                "nan_to_num input={} out={} nan={nan} posinf={posinf_val} neginf={neginf_val}",
-                input.0, out.0
-            ),
-        );
         Ok(out)
     }
 
@@ -28772,6 +28808,22 @@ mod tests {
         let out = s.tensor_nan_to_num(x, 0.0, None, None).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(vals, &[1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn nan_to_num_f32_preserves_dtype_and_replaces() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(
+                vec![f32::NAN, f32::INFINITY, f32::NEG_INFINITY, 1.5],
+                vec![4],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_nan_to_num(x, 0.25, None, None).unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F32);
+        let vals = s.tensor_values_f32(out).unwrap();
+        assert_eq!(vals, &[0.25f32, f32::MAX, f32::MIN, 1.5]);
     }
 
     // ── logaddexp tests ─────────────────────────────────────────────────
