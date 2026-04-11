@@ -4675,8 +4675,10 @@ impl Module for Conv2d {
         } else {
             input
         };
-        let h_padded = h_in + 2 * self.padding_h;
-        let w_padded = w_in + 2 * self.padding_w;
+        let pad_h = checked_mul(self.padding_h, 2, "Conv2d padding height overflow")?;
+        let pad_w = checked_mul(self.padding_w, 2, "Conv2d padding width overflow")?;
+        let h_padded = checked_add(h_in, pad_h, "Conv2d padded height overflow")?;
+        let w_padded = checked_add(w_in, pad_w, "Conv2d padded width overflow")?;
 
         // Output spatial dimensions
         if h_padded < self.kernel_h || w_padded < self.kernel_w {
@@ -4686,18 +4688,32 @@ impl Module for Conv2d {
                 },
             )));
         }
-        let h_out = (h_padded - self.kernel_h) / self.stride_h + 1;
-        let w_out = (w_padded - self.kernel_w) / self.stride_w + 1;
+        let h_out = checked_add(
+            (h_padded - self.kernel_h) / self.stride_h,
+            1,
+            "Conv2d output height overflow",
+        )?;
+        let w_out = checked_add(
+            (w_padded - self.kernel_w) / self.stride_w,
+            1,
+            "Conv2d output width overflow",
+        )?;
 
         // Im2col: extract sliding 2D windows using narrow on dims 2 and 3
-        let ck = self.in_channels * self.kernel_h * self.kernel_w;
-        let mut patches = Vec::with_capacity(h_out * w_out);
+        let ck = checked_mul(
+            self.in_channels,
+            self.kernel_h,
+            "Conv2d kernel size overflow",
+        )?;
+        let ck = checked_mul(ck, self.kernel_w, "Conv2d kernel size overflow")?;
+        let patch_count = checked_mul(h_out, w_out, "Conv2d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for hi in 0..h_out {
-            let h_start = hi * self.stride_h;
+            let h_start = checked_mul(hi, self.stride_h, "Conv2d row start overflow")?;
             // narrow on dim 2 (height): [N, C_in, kH, w_padded]
             let row_slice = session.tensor_narrow(padded, 2, h_start, self.kernel_h)?;
             for wi in 0..w_out {
-                let w_start = wi * self.stride_w;
+                let w_start = checked_mul(wi, self.stride_w, "Conv2d col start overflow")?;
                 // narrow on dim 3 (width): [N, C_in, kH, kW]
                 let patch = session.tensor_narrow(row_slice, 3, w_start, self.kernel_w)?;
                 // reshape to [N, 1, C_in*kH*kW]
@@ -4816,19 +4832,32 @@ impl Module for MaxPool2d {
             )));
         }
 
-        let h_out = (h_in - self.kernel_h) / self.stride_h + 1;
-        let w_out = (w_in - self.kernel_w) / self.stride_w + 1;
+        let h_out = checked_add(
+            (h_in - self.kernel_h) / self.stride_h,
+            1,
+            "MaxPool2d output height overflow",
+        )?;
+        let w_out = checked_add(
+            (w_in - self.kernel_w) / self.stride_w,
+            1,
+            "MaxPool2d output width overflow",
+        )?;
 
         // Extract 2D patches, flatten spatial+kernel dims, take max
-        let nc = batch_size * channels;
-        let kk = self.kernel_h * self.kernel_w;
+        let nc = checked_mul(batch_size, channels, "MaxPool2d batch channel overflow")?;
+        let kk = checked_mul(
+            self.kernel_h,
+            self.kernel_w,
+            "MaxPool2d kernel size overflow",
+        )?;
 
-        let mut patches = Vec::with_capacity(h_out * w_out);
+        let patch_count = checked_mul(h_out, w_out, "MaxPool2d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for hi in 0..h_out {
-            let h_start = hi * self.stride_h;
+            let h_start = checked_mul(hi, self.stride_h, "MaxPool2d row start overflow")?;
             let row_slice = session.tensor_narrow(input, 2, h_start, self.kernel_h)?;
             for wi in 0..w_out {
-                let w_start = wi * self.stride_w;
+                let w_start = checked_mul(wi, self.stride_w, "MaxPool2d col start overflow")?;
                 // [N, C, kH, kW]
                 let patch = session.tensor_narrow(row_slice, 3, w_start, self.kernel_w)?;
                 // reshape to [N*C, kH*kW]
@@ -4915,14 +4944,25 @@ impl Module for AdaptiveAvgPool2d {
 
         // Collect output patches column by column: for each (oh, ow) compute start/end indices
         // using PyTorch's floor-division formula: start_i = floor(i * input_size / output_size)
-        let mut col_nodes = Vec::with_capacity(self.output_h * self.output_w);
+        let col_capacity = checked_mul(
+            self.output_h,
+            self.output_w,
+            "AdaptiveAvgPool2d output size overflow",
+        )?;
+        let mut col_nodes = Vec::with_capacity(col_capacity);
 
         for oh in 0..self.output_h {
             for ow in 0..self.output_w {
-                let h_start = (oh * h_in) / self.output_h;
-                let h_end = ((oh + 1) * h_in) / self.output_h;
-                let w_start = (ow * w_in) / self.output_w;
-                let w_end = ((ow + 1) * w_in) / self.output_w;
+                let oh_next = checked_add(oh, 1, "AdaptiveAvgPool2d output row overflow")?;
+                let ow_next = checked_add(ow, 1, "AdaptiveAvgPool2d output col overflow")?;
+                let h_start =
+                    checked_mul(oh, h_in, "AdaptiveAvgPool2d row start overflow")? / self.output_h;
+                let h_end = checked_mul(oh_next, h_in, "AdaptiveAvgPool2d row end overflow")?
+                    / self.output_h;
+                let w_start =
+                    checked_mul(ow, w_in, "AdaptiveAvgPool2d col start overflow")? / self.output_w;
+                let w_end = checked_mul(ow_next, w_in, "AdaptiveAvgPool2d col end overflow")?
+                    / self.output_w;
 
                 let kh = h_end - h_start;
                 let kw = w_end - w_start;
@@ -4932,7 +4972,8 @@ impl Module for AdaptiveAvgPool2d {
                 let hw_slice = session.tensor_narrow(h_slice, 3, w_start, kw)?;
 
                 // Reshape to [N, C, kh*kw] and mean over dim 2 → [N, C]
-                let flat = session.tensor_reshape(hw_slice, vec![n, c, kh * kw])?;
+                let kernel_area = checked_mul(kh, kw, "AdaptiveAvgPool2d kernel size overflow")?;
+                let flat = session.tensor_reshape(hw_slice, vec![n, c, kernel_area])?;
                 let pooled = session.tensor_mean_dim(flat, 2)?;
                 // Unsqueeze to [N, C, 1]
                 let col = session.tensor_unsqueeze(pooled, 2)?;
@@ -5039,48 +5080,69 @@ impl Module for AvgPool2d {
             input
         };
 
-        let h_padded = h_in + 2 * self.padding_h;
-        let w_padded = w_in + 2 * self.padding_w;
+        let pad_h = checked_mul(self.padding_h, 2, "AvgPool2d padding height overflow")?;
+        let pad_w = checked_mul(self.padding_w, 2, "AvgPool2d padding width overflow")?;
+        let h_padded = checked_add(h_in, pad_h, "AvgPool2d padded height overflow")?;
+        let w_padded = checked_add(w_in, pad_w, "AvgPool2d padded width overflow")?;
 
-        let h_out = if self.ceil_mode {
-            (h_padded - self.kernel_h).div_ceil(self.stride_h) + 1
+        if h_padded < self.kernel_h || w_padded < self.kernel_w {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "AvgPool2d input too small for given kernel_size and padding",
+                },
+            )));
+        }
+
+        let h_out_base = if self.ceil_mode {
+            (h_padded - self.kernel_h).div_ceil(self.stride_h)
         } else {
-            (h_padded - self.kernel_h) / self.stride_h + 1
+            (h_padded - self.kernel_h) / self.stride_h
         };
-        let w_out = if self.ceil_mode {
-            (w_padded - self.kernel_w).div_ceil(self.stride_w) + 1
+        let w_out_base = if self.ceil_mode {
+            (w_padded - self.kernel_w).div_ceil(self.stride_w)
         } else {
-            (w_padded - self.kernel_w) / self.stride_w + 1
+            (w_padded - self.kernel_w) / self.stride_w
         };
+        let h_out = checked_add(h_out_base, 1, "AvgPool2d output height overflow")?;
+        let w_out = checked_add(w_out_base, 1, "AvgPool2d output width overflow")?;
 
-        let nc = n * c;
+        let nc = checked_mul(n, c, "AvgPool2d batch channel overflow")?;
 
-        let mut patches = Vec::with_capacity(h_out * w_out);
+        let patch_count = checked_mul(h_out, w_out, "AvgPool2d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for hi in 0..h_out {
-            let h_start = hi * self.stride_h;
-            let h_end = (h_start + self.kernel_h).min(h_padded);
+            let h_start = checked_mul(hi, self.stride_h, "AvgPool2d row start overflow")?;
+            let h_end =
+                checked_add(h_start, self.kernel_h, "AvgPool2d row end overflow")?.min(h_padded);
             let kh_actual = h_end - h_start;
             let row_slice = session.tensor_narrow(padded, 2, h_start, kh_actual)?;
             for wi in 0..w_out {
-                let w_start = wi * self.stride_w;
-                let w_end = (w_start + self.kernel_w).min(w_padded);
+                let w_start = checked_mul(wi, self.stride_w, "AvgPool2d col start overflow")?;
+                let w_end = checked_add(w_start, self.kernel_w, "AvgPool2d col end overflow")?
+                    .min(w_padded);
                 let kw_actual = w_end - w_start;
 
                 let patch = session.tensor_narrow(row_slice, 3, w_start, kw_actual)?;
-                let flat = session.tensor_reshape(patch, vec![nc, kh_actual * kw_actual])?;
+                let kernel_area =
+                    checked_mul(kh_actual, kw_actual, "AvgPool2d kernel size overflow")?;
+                let flat = session.tensor_reshape(patch, vec![nc, kernel_area])?;
 
                 if self.count_include_pad || (self.padding_h == 0 && self.padding_w == 0) {
                     // Sum and divide by full kernel size
                     let sum = session.tensor_sum_dim(flat, 1)?;
-                    let divisor =
-                        session.full(vec![nc], (self.kernel_h * self.kernel_w) as f64, false)?;
+                    let full_kernel = checked_mul(
+                        self.kernel_h,
+                        self.kernel_w,
+                        "AvgPool2d full kernel size overflow",
+                    )?;
+                    let divisor = session.full(vec![nc], full_kernel as f64, false)?;
                     let avg = session.tensor_div(sum, divisor)?;
                     let shaped = session.tensor_reshape(avg, vec![n, c, 1])?;
                     patches.push(shaped);
                 } else {
                     // count_include_pad=false divides by the materialized patch size only.
                     let sum = session.tensor_sum_dim(flat, 1)?;
-                    let divisor = session.full(vec![nc], (kh_actual * kw_actual) as f64, false)?;
+                    let divisor = session.full(vec![nc], kernel_area as f64, false)?;
                     let avg = session.tensor_div(sum, divisor)?;
                     let shaped = session.tensor_reshape(avg, vec![n, c, 1])?;
                     patches.push(shaped);
@@ -5160,21 +5222,40 @@ impl Module for AvgPool3d {
             )));
         }
 
-        let d_out = (d_in - self.kernel_d) / self.stride_d + 1;
-        let h_out = (h_in - self.kernel_h) / self.stride_h + 1;
-        let w_out = (w_in - self.kernel_w) / self.stride_w + 1;
-        let nc = n * c;
-        let kkk = self.kernel_d * self.kernel_h * self.kernel_w;
+        let d_out = checked_add(
+            (d_in - self.kernel_d) / self.stride_d,
+            1,
+            "AvgPool3d output depth overflow",
+        )?;
+        let h_out = checked_add(
+            (h_in - self.kernel_h) / self.stride_h,
+            1,
+            "AvgPool3d output height overflow",
+        )?;
+        let w_out = checked_add(
+            (w_in - self.kernel_w) / self.stride_w,
+            1,
+            "AvgPool3d output width overflow",
+        )?;
+        let nc = checked_mul(n, c, "AvgPool3d batch channel overflow")?;
+        let kkk = checked_mul(
+            self.kernel_d,
+            self.kernel_h,
+            "AvgPool3d kernel size overflow",
+        )?;
+        let kkk = checked_mul(kkk, self.kernel_w, "AvgPool3d kernel size overflow")?;
 
-        let mut patches = Vec::with_capacity(d_out * h_out * w_out);
+        let hw_out = checked_mul(h_out, w_out, "AvgPool3d patch count overflow")?;
+        let patch_count = checked_mul(d_out, hw_out, "AvgPool3d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for di in 0..d_out {
-            let d_start = di * self.stride_d;
+            let d_start = checked_mul(di, self.stride_d, "AvgPool3d depth start overflow")?;
             let d_slice = session.tensor_narrow(input, 2, d_start, self.kernel_d)?;
             for hi in 0..h_out {
-                let h_start = hi * self.stride_h;
+                let h_start = checked_mul(hi, self.stride_h, "AvgPool3d row start overflow")?;
                 let h_slice = session.tensor_narrow(d_slice, 3, h_start, self.kernel_h)?;
                 for wi in 0..w_out {
-                    let w_start = wi * self.stride_w;
+                    let w_start = checked_mul(wi, self.stride_w, "AvgPool3d col start overflow")?;
                     let patch = session.tensor_narrow(h_slice, 4, w_start, self.kernel_w)?;
                     // [N, C, kD, kH, kW] -> [N*C, kD*kH*kW]
                     let flat = session.tensor_reshape(patch, vec![nc, kkk])?;
@@ -5257,21 +5338,40 @@ impl Module for MaxPool3d {
             )));
         }
 
-        let d_out = (d_in - self.kernel_d) / self.stride_d + 1;
-        let h_out = (h_in - self.kernel_h) / self.stride_h + 1;
-        let w_out = (w_in - self.kernel_w) / self.stride_w + 1;
-        let nc = n * c;
-        let kkk = self.kernel_d * self.kernel_h * self.kernel_w;
+        let d_out = checked_add(
+            (d_in - self.kernel_d) / self.stride_d,
+            1,
+            "MaxPool3d output depth overflow",
+        )?;
+        let h_out = checked_add(
+            (h_in - self.kernel_h) / self.stride_h,
+            1,
+            "MaxPool3d output height overflow",
+        )?;
+        let w_out = checked_add(
+            (w_in - self.kernel_w) / self.stride_w,
+            1,
+            "MaxPool3d output width overflow",
+        )?;
+        let nc = checked_mul(n, c, "MaxPool3d batch channel overflow")?;
+        let kkk = checked_mul(
+            self.kernel_d,
+            self.kernel_h,
+            "MaxPool3d kernel size overflow",
+        )?;
+        let kkk = checked_mul(kkk, self.kernel_w, "MaxPool3d kernel size overflow")?;
 
-        let mut patches = Vec::with_capacity(d_out * h_out * w_out);
+        let hw_out = checked_mul(h_out, w_out, "MaxPool3d patch count overflow")?;
+        let patch_count = checked_mul(d_out, hw_out, "MaxPool3d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for di in 0..d_out {
-            let d_start = di * self.stride_d;
+            let d_start = checked_mul(di, self.stride_d, "MaxPool3d depth start overflow")?;
             let d_slice = session.tensor_narrow(input, 2, d_start, self.kernel_d)?;
             for hi in 0..h_out {
-                let h_start = hi * self.stride_h;
+                let h_start = checked_mul(hi, self.stride_h, "MaxPool3d row start overflow")?;
                 let h_slice = session.tensor_narrow(d_slice, 3, h_start, self.kernel_h)?;
                 for wi in 0..w_out {
-                    let w_start = wi * self.stride_w;
+                    let w_start = checked_mul(wi, self.stride_w, "MaxPool3d col start overflow")?;
                     let patch = session.tensor_narrow(h_slice, 4, w_start, self.kernel_w)?;
                     let flat = session.tensor_reshape(patch, vec![nc, kkk])?;
                     let (max_vals, _) = session.tensor_max_dim(flat, 1)?;
@@ -5342,8 +5442,11 @@ impl Module for AdaptiveAvgPool1d {
 
         let mut slices = Vec::with_capacity(self.output_size);
         for i in 0..self.output_size {
-            let start = (i * l_in) / self.output_size;
-            let end = ((i + 1) * l_in) / self.output_size;
+            let i_next = checked_add(i, 1, "AdaptiveAvgPool1d output index overflow")?;
+            let start =
+                checked_mul(i, l_in, "AdaptiveAvgPool1d start overflow")? / self.output_size;
+            let end =
+                checked_mul(i_next, l_in, "AdaptiveAvgPool1d end overflow")? / self.output_size;
             let k = end - start;
             let patch = session.tensor_narrow(input, 2, start, k)?;
             let avg = session.tensor_mean_dim(patch, 2)?;
@@ -5418,28 +5521,50 @@ impl Module for AdaptiveAvgPool3d {
             return Ok(input);
         }
 
-        let nc = n * c;
-        let mut patches = Vec::with_capacity(self.output_d * self.output_h * self.output_w);
+        let nc = checked_mul(n, c, "AdaptiveAvgPool3d batch channel overflow")?;
+        let spatial_out = checked_mul(
+            self.output_d,
+            checked_mul(
+                self.output_h,
+                self.output_w,
+                "AdaptiveAvgPool3d output size overflow",
+            )?,
+            "AdaptiveAvgPool3d output size overflow",
+        )?;
+        let mut patches = Vec::with_capacity(spatial_out);
 
         for od in 0..self.output_d {
-            let d_start = (od * d_in) / self.output_d;
-            let d_end = ((od + 1) * d_in) / self.output_d;
+            let od_next = checked_add(od, 1, "AdaptiveAvgPool3d output depth overflow")?;
+            let d_start =
+                checked_mul(od, d_in, "AdaptiveAvgPool3d depth start overflow")? / self.output_d;
+            let d_end =
+                checked_mul(od_next, d_in, "AdaptiveAvgPool3d depth end overflow")? / self.output_d;
             let kd = d_end - d_start;
             let d_slice = session.tensor_narrow(input, 2, d_start, kd)?;
 
             for oh in 0..self.output_h {
-                let h_start = (oh * h_in) / self.output_h;
-                let h_end = ((oh + 1) * h_in) / self.output_h;
+                let oh_next = checked_add(oh, 1, "AdaptiveAvgPool3d output row overflow")?;
+                let h_start =
+                    checked_mul(oh, h_in, "AdaptiveAvgPool3d row start overflow")? / self.output_h;
+                let h_end = checked_mul(oh_next, h_in, "AdaptiveAvgPool3d row end overflow")?
+                    / self.output_h;
                 let kh = h_end - h_start;
                 let h_slice = session.tensor_narrow(d_slice, 3, h_start, kh)?;
 
                 for ow in 0..self.output_w {
-                    let w_start = (ow * w_in) / self.output_w;
-                    let w_end = ((ow + 1) * w_in) / self.output_w;
+                    let ow_next = checked_add(ow, 1, "AdaptiveAvgPool3d output col overflow")?;
+                    let w_start = checked_mul(ow, w_in, "AdaptiveAvgPool3d col start overflow")?
+                        / self.output_w;
+                    let w_end = checked_mul(ow_next, w_in, "AdaptiveAvgPool3d col end overflow")?
+                        / self.output_w;
                     let kw = w_end - w_start;
                     let patch = session.tensor_narrow(h_slice, 4, w_start, kw)?;
 
-                    let flat = session.tensor_reshape(patch, vec![nc, kd * kh * kw])?;
+                    let kernel_plane =
+                        checked_mul(kd, kh, "AdaptiveAvgPool3d kernel size overflow")?;
+                    let kernel_volume =
+                        checked_mul(kernel_plane, kw, "AdaptiveAvgPool3d kernel size overflow")?;
+                    let flat = session.tensor_reshape(patch, vec![nc, kernel_volume])?;
                     let avg = session.tensor_mean_dim(flat, 1)?;
                     let shaped = session.tensor_reshape(avg, vec![n, c, 1])?;
                     patches.push(shaped);
@@ -5507,8 +5632,11 @@ impl Module for AdaptiveMaxPool1d {
 
         let mut slices = Vec::with_capacity(self.output_size);
         for i in 0..self.output_size {
-            let start = (i * l_in) / self.output_size;
-            let end = ((i + 1) * l_in) / self.output_size;
+            let i_next = checked_add(i, 1, "AdaptiveMaxPool1d output index overflow")?;
+            let start =
+                checked_mul(i, l_in, "AdaptiveMaxPool1d start overflow")? / self.output_size;
+            let end =
+                checked_mul(i_next, l_in, "AdaptiveMaxPool1d end overflow")? / self.output_size;
             let k = end - start;
             let patch = session.tensor_narrow(input, 2, start, k)?;
             let (max_vals, _) = session.tensor_max_dim(patch, 2)?;
@@ -5575,22 +5703,34 @@ impl Module for AdaptiveMaxPool2d {
             )));
         }
 
-        let nc = n * c;
-        let mut patches = Vec::with_capacity(self.output_h * self.output_w);
+        let nc = checked_mul(n, c, "AdaptiveMaxPool2d batch channel overflow")?;
+        let spatial_out = checked_mul(
+            self.output_h,
+            self.output_w,
+            "AdaptiveMaxPool2d output size overflow",
+        )?;
+        let mut patches = Vec::with_capacity(spatial_out);
 
         for oh in 0..self.output_h {
-            let h_start = (oh * h_in) / self.output_h;
-            let h_end = ((oh + 1) * h_in) / self.output_h;
+            let oh_next = checked_add(oh, 1, "AdaptiveMaxPool2d output row overflow")?;
+            let h_start =
+                checked_mul(oh, h_in, "AdaptiveMaxPool2d row start overflow")? / self.output_h;
+            let h_end =
+                checked_mul(oh_next, h_in, "AdaptiveMaxPool2d row end overflow")? / self.output_h;
             let kh = h_end - h_start;
             let h_slice = session.tensor_narrow(input, 2, h_start, kh)?;
 
             for ow in 0..self.output_w {
-                let w_start = (ow * w_in) / self.output_w;
-                let w_end = ((ow + 1) * w_in) / self.output_w;
+                let ow_next = checked_add(ow, 1, "AdaptiveMaxPool2d output col overflow")?;
+                let w_start =
+                    checked_mul(ow, w_in, "AdaptiveMaxPool2d col start overflow")? / self.output_w;
+                let w_end = checked_mul(ow_next, w_in, "AdaptiveMaxPool2d col end overflow")?
+                    / self.output_w;
                 let kw = w_end - w_start;
                 let patch = session.tensor_narrow(h_slice, 3, w_start, kw)?;
 
-                let flat = session.tensor_reshape(patch, vec![nc, kh * kw])?;
+                let kernel_area = checked_mul(kh, kw, "AdaptiveMaxPool2d kernel size overflow")?;
+                let flat = session.tensor_reshape(patch, vec![nc, kernel_area])?;
                 let (max_vals, _) = session.tensor_max_dim(flat, 1)?;
                 let shaped = session.tensor_reshape(max_vals, vec![n, c, 1])?;
                 patches.push(shaped);
@@ -5660,28 +5800,50 @@ impl Module for AdaptiveMaxPool3d {
             )));
         }
 
-        let nc = n * c;
-        let mut patches = Vec::with_capacity(self.output_d * self.output_h * self.output_w);
+        let nc = checked_mul(n, c, "AdaptiveMaxPool3d batch channel overflow")?;
+        let spatial_out = checked_mul(
+            self.output_d,
+            checked_mul(
+                self.output_h,
+                self.output_w,
+                "AdaptiveMaxPool3d output size overflow",
+            )?,
+            "AdaptiveMaxPool3d output size overflow",
+        )?;
+        let mut patches = Vec::with_capacity(spatial_out);
 
         for od in 0..self.output_d {
-            let d_start = (od * d_in) / self.output_d;
-            let d_end = ((od + 1) * d_in) / self.output_d;
+            let od_next = checked_add(od, 1, "AdaptiveMaxPool3d output depth overflow")?;
+            let d_start =
+                checked_mul(od, d_in, "AdaptiveMaxPool3d depth start overflow")? / self.output_d;
+            let d_end =
+                checked_mul(od_next, d_in, "AdaptiveMaxPool3d depth end overflow")? / self.output_d;
             let kd = d_end - d_start;
             let d_slice = session.tensor_narrow(input, 2, d_start, kd)?;
 
             for oh in 0..self.output_h {
-                let h_start = (oh * h_in) / self.output_h;
-                let h_end = ((oh + 1) * h_in) / self.output_h;
+                let oh_next = checked_add(oh, 1, "AdaptiveMaxPool3d output row overflow")?;
+                let h_start =
+                    checked_mul(oh, h_in, "AdaptiveMaxPool3d row start overflow")? / self.output_h;
+                let h_end = checked_mul(oh_next, h_in, "AdaptiveMaxPool3d row end overflow")?
+                    / self.output_h;
                 let kh = h_end - h_start;
                 let h_slice = session.tensor_narrow(d_slice, 3, h_start, kh)?;
 
                 for ow in 0..self.output_w {
-                    let w_start = (ow * w_in) / self.output_w;
-                    let w_end = ((ow + 1) * w_in) / self.output_w;
+                    let ow_next = checked_add(ow, 1, "AdaptiveMaxPool3d output col overflow")?;
+                    let w_start = checked_mul(ow, w_in, "AdaptiveMaxPool3d col start overflow")?
+                        / self.output_w;
+                    let w_end = checked_mul(ow_next, w_in, "AdaptiveMaxPool3d col end overflow")?
+                        / self.output_w;
                     let kw = w_end - w_start;
                     let patch = session.tensor_narrow(h_slice, 4, w_start, kw)?;
 
-                    let flat = session.tensor_reshape(patch, vec![nc, kd * kh * kw])?;
+                    let kernel_plane =
+                        checked_mul(kd, kh, "AdaptiveMaxPool3d kernel size overflow")?;
+                    let kernel_volume =
+                        checked_mul(kernel_plane, kw, "AdaptiveMaxPool3d kernel size overflow")?;
+                    let flat = session.tensor_reshape(patch, vec![nc, kernel_volume])?;
                     let (max_vals, _) = session.tensor_max_dim(flat, 1)?;
                     let shaped = session.tensor_reshape(max_vals, vec![n, c, 1])?;
                     patches.push(shaped);
@@ -7032,9 +7194,12 @@ impl Module for Conv3d {
         } else {
             input
         };
-        let d_padded = d_in + 2 * self.padding_d;
-        let h_padded = h_in + 2 * self.padding_h;
-        let w_padded = w_in + 2 * self.padding_w;
+        let pad_d = checked_mul(self.padding_d, 2, "Conv3d padding depth overflow")?;
+        let pad_h = checked_mul(self.padding_h, 2, "Conv3d padding height overflow")?;
+        let pad_w = checked_mul(self.padding_w, 2, "Conv3d padding width overflow")?;
+        let d_padded = checked_add(d_in, pad_d, "Conv3d padded depth overflow")?;
+        let h_padded = checked_add(h_in, pad_h, "Conv3d padded height overflow")?;
+        let w_padded = checked_add(w_in, pad_w, "Conv3d padded width overflow")?;
 
         if d_padded < self.kernel_d || h_padded < self.kernel_h || w_padded < self.kernel_w {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -7043,22 +7208,41 @@ impl Module for Conv3d {
                 },
             )));
         }
-        let d_out = (d_padded - self.kernel_d) / self.stride_d + 1;
-        let h_out = (h_padded - self.kernel_h) / self.stride_h + 1;
-        let w_out = (w_padded - self.kernel_w) / self.stride_w + 1;
+        let d_out = checked_add(
+            (d_padded - self.kernel_d) / self.stride_d,
+            1,
+            "Conv3d output depth overflow",
+        )?;
+        let h_out = checked_add(
+            (h_padded - self.kernel_h) / self.stride_h,
+            1,
+            "Conv3d output height overflow",
+        )?;
+        let w_out = checked_add(
+            (w_padded - self.kernel_w) / self.stride_w,
+            1,
+            "Conv3d output width overflow",
+        )?;
 
         // Im2col: extract sliding 3D windows
-        let ck = self.in_channels * self.kernel_d * self.kernel_h * self.kernel_w;
-        let spatial_out = d_out * h_out * w_out;
+        let ck = checked_mul(
+            self.in_channels,
+            self.kernel_d,
+            "Conv3d kernel size overflow",
+        )?;
+        let ck = checked_mul(ck, self.kernel_h, "Conv3d kernel size overflow")?;
+        let ck = checked_mul(ck, self.kernel_w, "Conv3d kernel size overflow")?;
+        let hw_out = checked_mul(h_out, w_out, "Conv3d patch count overflow")?;
+        let spatial_out = checked_mul(d_out, hw_out, "Conv3d patch count overflow")?;
         let mut patches = Vec::with_capacity(spatial_out);
         for di in 0..d_out {
-            let d_start = di * self.stride_d;
+            let d_start = checked_mul(di, self.stride_d, "Conv3d depth start overflow")?;
             let depth_slice = session.tensor_narrow(padded, 2, d_start, self.kernel_d)?;
             for hi in 0..h_out {
-                let h_start = hi * self.stride_h;
+                let h_start = checked_mul(hi, self.stride_h, "Conv3d row start overflow")?;
                 let row_slice = session.tensor_narrow(depth_slice, 3, h_start, self.kernel_h)?;
                 for wi in 0..w_out {
-                    let w_start = wi * self.stride_w;
+                    let w_start = checked_mul(wi, self.stride_w, "Conv3d col start overflow")?;
                     let patch = session.tensor_narrow(row_slice, 4, w_start, self.kernel_w)?;
                     let flat = session.tensor_reshape(patch, vec![batch_size, 1, ck])?;
                     patches.push(flat);
@@ -7182,9 +7366,16 @@ impl ConvTranspose2d {
         }
 
         // Weight shape: [in_channels, out_channels, kH, kW]
-        let fan_in = in_channels * kh * kw;
+        let fan_in = checked_mul(in_channels, kh, "ConvTranspose2d fan_in overflow")?;
+        let fan_in = checked_mul(fan_in, kw, "ConvTranspose2d fan_in overflow")?;
         let bound = 1.0 / (fan_in as f64).sqrt();
-        let numel = in_channels * out_channels * kh * kw;
+        let numel = checked_mul(
+            in_channels,
+            out_channels,
+            "ConvTranspose2d weight size overflow",
+        )?;
+        let numel = checked_mul(numel, kh, "ConvTranspose2d weight size overflow")?;
+        let numel = checked_mul(numel, kw, "ConvTranspose2d weight size overflow")?;
 
         let w_rand = session.rand(vec![numel], false)?;
         let w_scale = session.full(vec![numel], 2.0 * bound, false)?;
@@ -7268,10 +7459,55 @@ impl Module for ConvTranspose2d {
         let w_in = input_shape[3];
 
         // Output dimensions
-        let h_out =
-            (h_in - 1) * self.stride_h - 2 * self.padding_h + self.kernel_h + self.output_padding_h;
-        let w_out =
-            (w_in - 1) * self.stride_w - 2 * self.padding_w + self.kernel_w + self.output_padding_w;
+        if h_in == 0 || w_in == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d requires non-empty spatial dimensions",
+                },
+            )));
+        }
+
+        let h_span = checked_mul(
+            h_in - 1,
+            self.stride_h,
+            "ConvTranspose2d output height overflow",
+        )?;
+        let w_span = checked_mul(
+            w_in - 1,
+            self.stride_w,
+            "ConvTranspose2d output width overflow",
+        )?;
+        let pad_h = checked_mul(self.padding_h, 2, "ConvTranspose2d padding overflow")?;
+        let pad_w = checked_mul(self.padding_w, 2, "ConvTranspose2d padding overflow")?;
+        if h_span < pad_h || w_span < pad_w {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ConvTranspose2d output size underflow from padding",
+                },
+            )));
+        }
+        let h_base = h_span - pad_h;
+        let w_base = w_span - pad_w;
+        let h_out = checked_add(
+            h_base,
+            self.kernel_h,
+            "ConvTranspose2d output height overflow",
+        )?;
+        let h_out = checked_add(
+            h_out,
+            self.output_padding_h,
+            "ConvTranspose2d output height overflow",
+        )?;
+        let w_out = checked_add(
+            w_base,
+            self.kernel_w,
+            "ConvTranspose2d output width overflow",
+        )?;
+        let w_out = checked_add(
+            w_out,
+            self.output_padding_w,
+            "ConvTranspose2d output width overflow",
+        )?;
 
         // Transposed convolution via col2im approach (autograd-friendly).
         // For each output position, we gather contributions from overlapping
@@ -7280,11 +7516,17 @@ impl Module for ConvTranspose2d {
         // weight shape: [in_channels, out_channels, kH, kW]
         // Reshape to [in_channels, out_channels * kH * kW], transpose to
         // [out_channels * kH * kW, in_channels]
-        let ok = self.out_channels * self.kernel_h * self.kernel_w;
+        let ok = checked_mul(
+            self.out_channels,
+            self.kernel_h,
+            "ConvTranspose2d kernel size overflow",
+        )?;
+        let ok = checked_mul(ok, self.kernel_w, "ConvTranspose2d kernel size overflow")?;
         // input: [N, C_in, H_in, W_in] -> flatten spatial: [N, C_in, H_in*W_in]
         // -> transpose: [N, H_in*W_in, C_in]
+        let spatial_in = checked_mul(h_in, w_in, "ConvTranspose2d input spatial overflow")?;
         let x_flat =
-            session.tensor_reshape(input, vec![batch_size, self.in_channels, h_in * w_in])?;
+            session.tensor_reshape(input, vec![batch_size, self.in_channels, spatial_in])?;
         let x_flat = session.tensor_transpose(x_flat, 1, 2)?; // [N, H_in*W_in, C_in]
 
         // weight: [in_channels, out_channels, kH, kW] -> [in_channels, ok]
@@ -7376,8 +7618,17 @@ impl Module for ConvTranspose2d {
                     }
                     let zero_row =
                         session.zeros(vec![batch_size, self.out_channels, 1, w_in], false)?;
-                    let mut interleaved =
-                        Vec::with_capacity(h_in + (h_in - 1) * (self.stride_h - 1));
+                    let interleaved_len = if h_in == 0 {
+                        0
+                    } else {
+                        let gaps = checked_mul(
+                            h_in - 1,
+                            self.stride_h - 1,
+                            "ConvTranspose2d interleave height overflow",
+                        )?;
+                        checked_add(h_in, gaps, "ConvTranspose2d interleave height overflow")?
+                    };
+                    let mut interleaved = Vec::with_capacity(interleaved_len);
                     for (i, row) in rows.iter().enumerate() {
                         interleaved.push(*row);
                         if i < h_in - 1 {
@@ -7389,7 +7640,12 @@ impl Module for ConvTranspose2d {
                     upsampled = session.tensor_cat(&interleaved, 2)?;
                 }
                 let up_h = if h_in > 0 {
-                    (h_in - 1) * self.stride_h + 1
+                    let span = checked_mul(
+                        h_in - 1,
+                        self.stride_h,
+                        "ConvTranspose2d upsample height overflow",
+                    )?;
+                    checked_add(span, 1, "ConvTranspose2d upsample height overflow")?
                 } else {
                     0
                 };
@@ -7403,8 +7659,17 @@ impl Module for ConvTranspose2d {
                     }
                     let zero_col =
                         session.zeros(vec![batch_size, self.out_channels, up_h, 1], false)?;
-                    let mut interleaved =
-                        Vec::with_capacity(w_in + (w_in - 1) * (self.stride_w - 1));
+                    let interleaved_len = if w_in == 0 {
+                        0
+                    } else {
+                        let gaps = checked_mul(
+                            w_in - 1,
+                            self.stride_w - 1,
+                            "ConvTranspose2d interleave width overflow",
+                        )?;
+                        checked_add(w_in, gaps, "ConvTranspose2d interleave width overflow")?
+                    };
+                    let mut interleaved = Vec::with_capacity(interleaved_len);
                     for (i, col) in cols.iter().enumerate() {
                         interleaved.push(*col);
                         if i < w_in - 1 {
@@ -7416,7 +7681,12 @@ impl Module for ConvTranspose2d {
                     upsampled = session.tensor_cat(&interleaved, 3)?;
                 }
                 let up_w = if w_in > 0 {
-                    (w_in - 1) * self.stride_w + 1
+                    let span = checked_mul(
+                        w_in - 1,
+                        self.stride_w,
+                        "ConvTranspose2d upsample width overflow",
+                    )?;
+                    checked_add(span, 1, "ConvTranspose2d upsample width overflow")?
                 } else {
                     0
                 };
@@ -8270,14 +8540,12 @@ impl LSTM {
         }
 
         let num_directions: usize = if bidirectional { 2 } else { 1 };
-        let mut cells = Vec::with_capacity(num_layers * num_directions);
+        let total_layers = checked_mul(num_layers, num_directions, "LSTM layer count overflow")?;
+        let mut cells = Vec::with_capacity(total_layers);
+        let hidden_dir = checked_mul(hidden_size, num_directions, "LSTM hidden size overflow")?;
 
         for layer in 0..num_layers {
-            let layer_input_size = if layer == 0 {
-                input_size
-            } else {
-                hidden_size * num_directions
-            };
+            let layer_input_size = if layer == 0 { input_size } else { hidden_dir };
 
             // Forward direction cell
             cells.push(LSTMCell::new(session, layer_input_size, hidden_size)?);
@@ -8355,7 +8623,8 @@ impl LSTM {
         }
 
         // Initialize hidden/cell states: [num_layers * num_directions, batch, hidden_size]
-        let total_layers = self.num_layers * num_directions;
+        let total_layers =
+            checked_mul(self.num_layers, num_directions, "LSTM state size overflow")?;
         let state_shape = vec![total_layers, batch_size, self.hidden_size];
 
         let h_init = match h_0 {
@@ -8386,7 +8655,7 @@ impl LSTM {
 
         for layer in 0..self.num_layers {
             // Forward direction
-            let fwd_cell_idx = layer * num_directions;
+            let fwd_cell_idx = checked_mul(layer, num_directions, "LSTM cell index overflow")?;
             let fwd_h0 = h_states[fwd_cell_idx];
             let fwd_c0 = c_states[fwd_cell_idx];
 
@@ -8640,14 +8909,12 @@ impl GRU {
         }
 
         let num_directions: usize = if bidirectional { 2 } else { 1 };
-        let mut cells = Vec::with_capacity(num_layers * num_directions);
+        let total_layers = checked_mul(num_layers, num_directions, "GRU layer count overflow")?;
+        let mut cells = Vec::with_capacity(total_layers);
+        let hidden_dir = checked_mul(hidden_size, num_directions, "GRU hidden size overflow")?;
 
         for layer in 0..num_layers {
-            let layer_input_size = if layer == 0 {
-                input_size
-            } else {
-                hidden_size * num_directions
-            };
+            let layer_input_size = if layer == 0 { input_size } else { hidden_dir };
 
             cells.push(GRUCell::new(session, layer_input_size, hidden_size)?);
 
@@ -8717,7 +8984,7 @@ impl GRU {
             )));
         }
 
-        let total_layers = self.num_layers * num_directions;
+        let total_layers = checked_mul(self.num_layers, num_directions, "GRU state size overflow")?;
         let state_shape = vec![total_layers, batch_size, self.hidden_size];
 
         let h_init = match h_0 {
@@ -8732,7 +8999,7 @@ impl GRU {
         let mut layer_input = time_steps;
 
         for layer in 0..self.num_layers {
-            let fwd_cell_idx = layer * num_directions;
+            let fwd_cell_idx = checked_mul(layer, num_directions, "GRU cell index overflow")?;
             let fwd_h0 = h_states[fwd_cell_idx];
 
             let (fwd_outputs, fwd_h_n) = self.run_direction(
@@ -8981,14 +9248,12 @@ impl RNN {
         }
 
         let num_directions: usize = if bidirectional { 2 } else { 1 };
-        let mut cells = Vec::with_capacity(num_layers * num_directions);
+        let total_layers = checked_mul(num_layers, num_directions, "RNN layer count overflow")?;
+        let mut cells = Vec::with_capacity(total_layers);
+        let hidden_dir = checked_mul(hidden_size, num_directions, "RNN hidden size overflow")?;
 
         for layer in 0..num_layers {
-            let layer_input_size = if layer == 0 {
-                input_size
-            } else {
-                hidden_size * num_directions
-            };
+            let layer_input_size = if layer == 0 { input_size } else { hidden_dir };
 
             cells.push(RNNCell::new(
                 session,
@@ -9068,7 +9333,7 @@ impl RNN {
             )));
         }
 
-        let total_layers = self.num_layers * num_directions;
+        let total_layers = checked_mul(self.num_layers, num_directions, "RNN state size overflow")?;
         let state_shape = vec![total_layers, batch_size, self.hidden_size];
 
         let h_init = match h_0 {
@@ -9083,7 +9348,7 @@ impl RNN {
         let mut layer_input = time_steps;
 
         for layer in 0..self.num_layers {
-            let fwd_cell_idx = layer * num_directions;
+            let fwd_cell_idx = checked_mul(layer, num_directions, "RNN cell index overflow")?;
             let fwd_h0 = h_states[fwd_cell_idx];
 
             let (fwd_outputs, fwd_h_n) = self.run_direction(
@@ -11466,16 +11731,41 @@ impl Module for LPPool1d {
         }
 
         let (batch, channels, length) = (shape[0], shape[1], shape[2]);
-        let out_len = (length - self.kernel_size) / self.stride + 1;
-        let mut output = Vec::with_capacity(batch * channels * out_len);
+        if self.kernel_size == 0 || self.stride == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LPPool1d kernel_size and stride must be > 0",
+                },
+            )));
+        }
+        if length < self.kernel_size {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LPPool1d input smaller than kernel_size",
+                },
+            )));
+        }
+        let out_len = checked_add(
+            (length - self.kernel_size) / self.stride,
+            1,
+            "LPPool1d output length overflow",
+        )?;
+        let batch_channels = checked_mul(batch, channels, "LPPool1d output size overflow")?;
+        let output_len = checked_mul(batch_channels, out_len, "LPPool1d output size overflow")?;
+        let mut output = Vec::with_capacity(output_len);
+        let channel_stride = checked_mul(channels, length, "LPPool1d index overflow")?;
 
         for b in 0..batch {
+            let base_b = checked_mul(b, channel_stride, "LPPool1d index overflow")?;
             for c in 0..channels {
+                let base_c = checked_mul(c, length, "LPPool1d index overflow")?;
+                let base = checked_add(base_b, base_c, "LPPool1d index overflow")?;
                 for i in 0..out_len {
-                    let start = i * self.stride;
+                    let start = checked_mul(i, self.stride, "LPPool1d window start overflow")?;
                     let mut lp_sum = 0.0_f64;
                     for k in 0..self.kernel_size {
-                        let idx = b * channels * length + c * length + start + k;
+                        let offset = checked_add(start, k, "LPPool1d index overflow")?;
+                        let idx = checked_add(base, offset, "LPPool1d index overflow")?;
                         lp_sum += vals[idx].abs().powf(self.norm_type);
                     }
                     output.push(lp_sum.powf(1.0 / self.norm_type));
@@ -11542,20 +11832,53 @@ impl Module for LPPool2d {
         let (batch, channels, h, w) = (shape[0], shape[1], shape[2], shape[3]);
         let (kh, kw) = self.kernel_size;
         let (sh, sw) = self.stride;
-        let oh = (h - kh) / sh + 1;
-        let ow = (w - kw) / sw + 1;
-        let mut output = Vec::with_capacity(batch * channels * oh * ow);
+        if kh == 0 || kw == 0 || sh == 0 || sw == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LPPool2d kernel_size and stride must be > 0",
+                },
+            )));
+        }
+        if h < kh || w < kw {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "LPPool2d input smaller than kernel_size",
+                },
+            )));
+        }
+        let oh = checked_add((h - kh) / sh, 1, "LPPool2d output height overflow")?;
+        let ow = checked_add((w - kw) / sw, 1, "LPPool2d output width overflow")?;
+        let batch_channels = checked_mul(batch, channels, "LPPool2d output size overflow")?;
+        let spatial_out = checked_mul(oh, ow, "LPPool2d output size overflow")?;
+        let output_len = checked_mul(batch_channels, spatial_out, "LPPool2d output size overflow")?;
+        let mut output = Vec::with_capacity(output_len);
+        let spatial = checked_mul(h, w, "LPPool2d index overflow")?;
+        let channel_stride = checked_mul(channels, spatial, "LPPool2d index overflow")?;
 
         for b in 0..batch {
+            let base_b = checked_mul(b, channel_stride, "LPPool2d index overflow")?;
             for c in 0..channels {
+                let base_c = checked_mul(c, spatial, "LPPool2d index overflow")?;
+                let base = checked_add(base_b, base_c, "LPPool2d index overflow")?;
                 for i in 0..oh {
                     for j in 0..ow {
                         let mut lp_sum = 0.0_f64;
                         for ki in 0..kh {
                             for kj in 0..kw {
-                                let row = i * sh + ki;
-                                let col = j * sw + kj;
-                                let idx = b * channels * h * w + c * h * w + row * w + col;
+                                let row = checked_add(
+                                    checked_mul(i, sh, "LPPool2d row index overflow")?,
+                                    ki,
+                                    "LPPool2d row index overflow",
+                                )?;
+                                let col = checked_add(
+                                    checked_mul(j, sw, "LPPool2d col index overflow")?,
+                                    kj,
+                                    "LPPool2d col index overflow",
+                                )?;
+                                let row_offset = checked_mul(row, w, "LPPool2d index overflow")?;
+                                let offset =
+                                    checked_add(row_offset, col, "LPPool2d index overflow")?;
+                                let idx = checked_add(base, offset, "LPPool2d index overflow")?;
                                 lp_sum += vals[idx].abs().powf(self.norm_type);
                             }
                         }

@@ -2065,11 +2065,13 @@ impl FrankenTorchSession {
             )));
         }
 
-        let mut result = Vec::with_capacity(batch * num_samples);
+        let result_len = Self::checked_mul(batch, num_samples, "multinomial output size overflow")?;
+        let mut result = Vec::with_capacity(result_len);
 
         for b in 0..batch {
-            let base = b * num_categories;
-            let mut weights: Vec<f64> = vals[base..base + num_categories].to_vec();
+            let base = Self::checked_mul(b, num_categories, "multinomial index overflow")?;
+            let end = Self::checked_add(base, num_categories, "multinomial index overflow")?;
+            let mut weights: Vec<f64> = vals[base..end].to_vec();
             for &weight in &weights {
                 if !weight.is_finite() || weight < 0.0 {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -3903,7 +3905,8 @@ impl FrankenTorchSession {
         generate(&vals, n, r, 0, &mut current, &mut combos, with_replacement);
 
         let num_combos = combos.len();
-        let mut result = Vec::with_capacity(num_combos * r);
+        let total = Self::checked_mul(num_combos, r, "combinations output size overflow")?;
+        let mut result = Vec::with_capacity(total);
         for combo in &combos {
             result.extend_from_slice(combo);
         }
@@ -4877,8 +4880,17 @@ impl FrankenTorchSession {
         }
         let num_emb = w_shape[0];
         let emb_dim = w_shape[1];
+        let expected = Self::checked_mul(num_emb, emb_dim, "embedding weight shape overflow")?;
+        if w_vals.len() != expected {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding: weight values length does not match shape",
+                },
+            )));
+        }
 
-        let mut result = Vec::with_capacity(indices.len() * emb_dim);
+        let out_len = Self::checked_mul(indices.len(), emb_dim, "embedding output size overflow")?;
+        let mut result = Vec::with_capacity(out_len);
         for &idx_f in &indices {
             if idx_f < 0.0 {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -4902,8 +4914,9 @@ impl FrankenTorchSession {
                     },
                 )));
             }
-            let start = idx * emb_dim;
-            result.extend_from_slice(&w_vals[start..start + emb_dim]);
+            let start = Self::checked_mul(idx, emb_dim, "embedding index overflow")?;
+            let end = Self::checked_add(start, emb_dim, "embedding index overflow")?;
+            result.extend_from_slice(&w_vals[start..end]);
         }
 
         let mut out_shape = input_shape;
@@ -5100,23 +5113,29 @@ impl FrankenTorchSession {
         } else {
             input
         };
-        let padded_h = input_h + 2 * padding_h;
-        let padded_w = input_w + 2 * padding_w;
+        let pad_h = Self::checked_mul(padding_h, 2, "conv2d padding overflow")?;
+        let pad_w = Self::checked_mul(padding_w, 2, "conv2d padding overflow")?;
+        let padded_h = Self::checked_add(input_h, pad_h, "conv2d padding overflow")?;
+        let padded_w = Self::checked_add(input_w, pad_w, "conv2d padding overflow")?;
         if padded_h < kernel_h || padded_w < kernel_w {
             return Err(Self::incompatible_tensor_args(
                 "conv2d: input too small for kernel size and padding",
             ));
         }
 
-        let output_h = (padded_h - kernel_h) / stride_h + 1;
-        let output_w = (padded_w - kernel_w) / stride_w + 1;
-        let patch_width = in_channels * kernel_h * kernel_w;
-        let mut patches = Vec::with_capacity(output_h * output_w);
+        let output_h = (padded_h - kernel_h) / stride_h;
+        let output_h = Self::checked_add(output_h, 1, "conv2d output height overflow")?;
+        let output_w = (padded_w - kernel_w) / stride_w;
+        let output_w = Self::checked_add(output_w, 1, "conv2d output width overflow")?;
+        let patch_width = Self::checked_mul(in_channels, kernel_h, "conv2d patch width overflow")?;
+        let patch_width = Self::checked_mul(patch_width, kernel_w, "conv2d patch width overflow")?;
+        let patch_count = Self::checked_mul(output_h, output_w, "conv2d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for out_h in 0..output_h {
-            let row_start = out_h * stride_h;
+            let row_start = Self::checked_mul(out_h, stride_h, "conv2d row start overflow")?;
             let row_slice = self.tensor_narrow(padded, 2, row_start, kernel_h)?;
             for out_w in 0..output_w {
-                let col_start = out_w * stride_w;
+                let col_start = Self::checked_mul(out_w, stride_w, "conv2d col start overflow")?;
                 let patch = self.tensor_narrow(row_slice, 3, col_start, kernel_w)?;
                 let flat = self.tensor_reshape(patch, vec![batch_size, 1, patch_width])?;
                 patches.push(flat);
@@ -5198,8 +5217,10 @@ impl FrankenTorchSession {
         let weight_vals = self.tensor_values(weight)?;
 
         let padded_d = input_d + 2 * padding_d;
-        let padded_h = input_h + 2 * padding_h;
-        let padded_w = input_w + 2 * padding_w;
+        let pad_h = Self::checked_mul(padding_h, 2, "avg_pool2d padding overflow")?;
+        let pad_w = Self::checked_mul(padding_w, 2, "avg_pool2d padding overflow")?;
+        let padded_h = Self::checked_add(input_h, pad_h, "avg_pool2d padding overflow")?;
+        let padded_w = Self::checked_add(input_w, pad_w, "avg_pool2d padding overflow")?;
         let output_d = (padded_d - kernel_d) / stride_d + 1;
         let output_h = (padded_h - kernel_h) / stride_h + 1;
         let output_w = (padded_w - kernel_w) / stride_w + 1;
@@ -5551,16 +5572,24 @@ impl FrankenTorchSession {
             ));
         }
 
-        let output_h = (input_h - kernel_h) / stride_h + 1;
-        let output_w = (input_w - kernel_w) / stride_w + 1;
-        let flat_width = kernel_h * kernel_w;
-        let flattened_channels = batch_size * channels;
-        let mut patches = Vec::with_capacity(output_h * output_w);
+        let output_h = (input_h - kernel_h) / stride_h;
+        let output_h = Self::checked_add(output_h, 1, "max_pool2d output height overflow")?;
+        let output_w = (input_w - kernel_w) / stride_w;
+        let output_w = Self::checked_add(output_w, 1, "max_pool2d output width overflow")?;
+        let flat_width = Self::checked_mul(kernel_h, kernel_w, "max_pool2d kernel size overflow")?;
+        let flattened_channels = Self::checked_mul(
+            batch_size,
+            channels,
+            "max_pool2d flattened channels overflow",
+        )?;
+        let patch_count = Self::checked_mul(output_h, output_w, "max_pool2d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for out_h in 0..output_h {
-            let row_start = out_h * stride_h;
+            let row_start = Self::checked_mul(out_h, stride_h, "max_pool2d row start overflow")?;
             let row_slice = self.tensor_narrow(input, 2, row_start, kernel_h)?;
             for out_w in 0..output_w {
-                let col_start = out_w * stride_w;
+                let col_start =
+                    Self::checked_mul(out_w, stride_w, "max_pool2d col start overflow")?;
                 let patch = self.tensor_narrow(row_slice, 3, col_start, kernel_w)?;
                 let flat = self.tensor_reshape(patch, vec![flattened_channels, flat_width])?;
                 let (max_vals, _) = self.tensor_max_dim(flat, 1)?;
@@ -5619,36 +5648,49 @@ impl FrankenTorchSession {
         }
 
         let output_h = if ceil_mode {
-            (padded_h - kernel_h).div_ceil(stride_h) + 1
+            (padded_h - kernel_h).div_ceil(stride_h)
         } else {
-            (padded_h - kernel_h) / stride_h + 1
+            (padded_h - kernel_h) / stride_h
         };
+        let output_h = Self::checked_add(output_h, 1, "avg_pool2d output height overflow")?;
         let output_w = if ceil_mode {
-            (padded_w - kernel_w).div_ceil(stride_w) + 1
+            (padded_w - kernel_w).div_ceil(stride_w)
         } else {
-            (padded_w - kernel_w) / stride_w + 1
+            (padded_w - kernel_w) / stride_w
         };
+        let output_w = Self::checked_add(output_w, 1, "avg_pool2d output width overflow")?;
 
-        let flattened_channels = batch_size * channels;
-        let full_kernel_area = (kernel_h * kernel_w) as f64;
-        let mut patches = Vec::with_capacity(output_h * output_w);
+        let flattened_channels = Self::checked_mul(
+            batch_size,
+            channels,
+            "avg_pool2d flattened channels overflow",
+        )?;
+        let kernel_area = Self::checked_mul(kernel_h, kernel_w, "avg_pool2d kernel area overflow")?;
+        let full_kernel_area = kernel_area as f64;
+        let patch_count = Self::checked_mul(output_h, output_w, "avg_pool2d patch count overflow")?;
+        let mut patches = Vec::with_capacity(patch_count);
         for out_h in 0..output_h {
-            let row_start = out_h * stride_h;
-            let row_end = (row_start + kernel_h).min(padded_h);
+            let row_start = Self::checked_mul(out_h, stride_h, "avg_pool2d row start overflow")?;
+            let row_end = Self::checked_add(row_start, kernel_h, "avg_pool2d row end overflow")?
+                .min(padded_h);
             let row_len = row_end - row_start;
             let row_slice = self.tensor_narrow(padded, 2, row_start, row_len)?;
             for out_w in 0..output_w {
-                let col_start = out_w * stride_w;
-                let col_end = (col_start + kernel_w).min(padded_w);
+                let col_start =
+                    Self::checked_mul(out_w, stride_w, "avg_pool2d col start overflow")?;
+                let col_end =
+                    Self::checked_add(col_start, kernel_w, "avg_pool2d col end overflow")?
+                        .min(padded_w);
                 let col_len = col_end - col_start;
                 let patch = self.tensor_narrow(row_slice, 3, col_start, col_len)?;
-                let flat =
-                    self.tensor_reshape(patch, vec![flattened_channels, row_len * col_len])?;
+                let flat_len =
+                    Self::checked_mul(row_len, col_len, "avg_pool2d patch size overflow")?;
+                let flat = self.tensor_reshape(patch, vec![flattened_channels, flat_len])?;
                 let sum = self.tensor_sum_dim(flat, 1)?;
                 let divisor = if count_include_pad || (padding_h == 0 && padding_w == 0) {
                     self.full(vec![flattened_channels], full_kernel_area, false)?
                 } else {
-                    self.full(vec![flattened_channels], (row_len * col_len) as f64, false)?
+                    self.full(vec![flattened_channels], flat_len as f64, false)?
                 };
                 let avg = self.tensor_div(sum, divisor)?;
                 let avg = self.tensor_reshape(avg, vec![batch_size, channels, 1])?;
@@ -5680,14 +5722,24 @@ impl FrankenTorchSession {
         }
         let (n, c, l_in) = (shape[0], shape[1], shape[2]);
         let l_out = output_size;
-        let mut output = Vec::with_capacity(n * c * l_out);
+        let out_numel = Self::checked_mul(n, c, "adaptive_avg_pool1d output size overflow")?;
+        let out_numel =
+            Self::checked_mul(out_numel, l_out, "adaptive_avg_pool1d output size overflow")?;
+        let mut output = Vec::with_capacity(out_numel);
 
         for b in 0..n {
             for ch in 0..c {
-                let base = (b * c + ch) * l_in;
+                let bc = Self::checked_mul(b, c, "adaptive_avg_pool1d base overflow")?;
+                let bc = Self::checked_add(bc, ch, "adaptive_avg_pool1d base overflow")?;
+                let base = Self::checked_mul(bc, l_in, "adaptive_avg_pool1d base overflow")?;
                 for ol in 0..l_out {
-                    let start = (ol * l_in) / l_out;
-                    let end = ((ol + 1) * l_in) / l_out;
+                    let start_num =
+                        Self::checked_mul(ol, l_in, "adaptive_avg_pool1d index overflow")?;
+                    let start = start_num / l_out;
+                    let next = Self::checked_add(ol, 1, "adaptive_avg_pool1d index overflow")?;
+                    let end_num =
+                        Self::checked_mul(next, l_in, "adaptive_avg_pool1d index overflow")?;
+                    let end = end_num / l_out;
                     let count = end - start;
                     let sum: f64 = (start..end).map(|i| storage[base + i]).sum();
                     output.push(sum / count as f64);
@@ -5718,18 +5770,40 @@ impl FrankenTorchSession {
         }
         let (n, c, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
         let (h_out, w_out) = output_size;
-        let mut output = Vec::with_capacity(n * c * h_out * w_out);
+        let out_numel = Self::checked_mul(n, c, "adaptive_avg_pool2d output size overflow")?;
+        let out_numel =
+            Self::checked_mul(out_numel, h_out, "adaptive_avg_pool2d output size overflow")?;
+        let out_numel =
+            Self::checked_mul(out_numel, w_out, "adaptive_avg_pool2d output size overflow")?;
+        let mut output = Vec::with_capacity(out_numel);
 
         for b in 0..n {
             for ch in 0..c {
-                let base = (b * c + ch) * h_in * w_in;
+                let bc = Self::checked_mul(b, c, "adaptive_avg_pool2d base overflow")?;
+                let bc = Self::checked_add(bc, ch, "adaptive_avg_pool2d base overflow")?;
+                let base = Self::checked_mul(bc, h_in, "adaptive_avg_pool2d base overflow")?;
+                let base = Self::checked_mul(base, w_in, "adaptive_avg_pool2d base overflow")?;
                 for oh in 0..h_out {
-                    let h_start = (oh * h_in) / h_out;
-                    let h_end = ((oh + 1) * h_in) / h_out;
+                    let h_start_num =
+                        Self::checked_mul(oh, h_in, "adaptive_avg_pool2d index overflow")?;
+                    let h_start = h_start_num / h_out;
+                    let next = Self::checked_add(oh, 1, "adaptive_avg_pool2d index overflow")?;
+                    let h_end_num =
+                        Self::checked_mul(next, h_in, "adaptive_avg_pool2d index overflow")?;
+                    let h_end = h_end_num / h_out;
                     for ow in 0..w_out {
-                        let w_start = (ow * w_in) / w_out;
-                        let w_end = ((ow + 1) * w_in) / w_out;
-                        let count = (h_end - h_start) * (w_end - w_start);
+                        let w_start_num =
+                            Self::checked_mul(ow, w_in, "adaptive_avg_pool2d index overflow")?;
+                        let w_start = w_start_num / w_out;
+                        let next = Self::checked_add(ow, 1, "adaptive_avg_pool2d index overflow")?;
+                        let w_end_num =
+                            Self::checked_mul(next, w_in, "adaptive_avg_pool2d index overflow")?;
+                        let w_end = w_end_num / w_out;
+                        let count = Self::checked_mul(
+                            h_end - h_start,
+                            w_end - w_start,
+                            "adaptive_avg_pool2d count overflow",
+                        )?;
                         let mut sum = 0.0;
                         for h in h_start..h_end {
                             for w in w_start..w_end {
@@ -8166,6 +8240,20 @@ impl FrankenTorchSession {
         })
     }
 
+    fn checked_add(
+        lhs: usize,
+        rhs: usize,
+        overflow_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        lhs.checked_add(rhs).ok_or({
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: overflow_reason,
+                },
+            ))
+        })
+    }
+
     fn checked_square_numel(
         n: usize,
         overflow_reason: &'static str,
@@ -10030,7 +10118,9 @@ impl FrankenTorchSession {
                     }
                     let batch: usize = vals.len() / last_dim;
                     let new_last = last_dim - 1;
-                    let mut result = Vec::with_capacity(batch * new_last);
+                    let result_len =
+                        Self::checked_mul(batch, new_last, "diff output size overflow")?;
+                    let mut result = Vec::with_capacity(result_len);
                     for b in 0..batch {
                         let base = b * last_dim;
                         for i in 0..new_last {
@@ -10065,7 +10155,9 @@ impl FrankenTorchSession {
                     }
                     let batch: usize = vals.len() / last_dim;
                     let new_last = last_dim - 1;
-                    let mut result = Vec::with_capacity(batch * new_last);
+                    let result_len =
+                        Self::checked_mul(batch, new_last, "diff output size overflow")?;
+                    let mut result = Vec::with_capacity(result_len);
                     for b in 0..batch {
                         let base = b * last_dim;
                         for i in 0..new_last {
@@ -10347,7 +10439,8 @@ impl FrankenTorchSession {
                 )));
             }
             let num_vals = val_shape[1];
-            let mut indices = Vec::with_capacity(batch * num_vals);
+            let total = Self::checked_mul(batch, num_vals, "searchsorted output size overflow")?;
+            let mut indices = Vec::with_capacity(total);
             if let (Some(seq_vals), Some(val_vals)) = (seq_f64, val_f64) {
                 for b in 0..batch {
                     let seq_slice = &seq_vals[b * seq_len..(b + 1) * seq_len];
@@ -14016,10 +14109,13 @@ impl FrankenTorchSession {
             )));
         }
 
-        let mut result = Vec::with_capacity(m * n);
-        for i in 0..m {
-            for j in 0..n {
-                result.push(beta * input_vals[i * n + j] + alpha * v1[i] * v2[j]);
+        let total = Self::checked_mul(m, n, "addr output size overflow")?;
+        let mut result = Vec::with_capacity(total);
+        for (i, &v1_val) in v1.iter().enumerate() {
+            let base = Self::checked_mul(i, n, "addr index overflow")?;
+            for (j, &v2_val) in v2.iter().enumerate() {
+                let idx = Self::checked_add(base, j, "addr index overflow")?;
+                result.push(beta * input_vals[idx] + alpha * v1_val * v2_val);
             }
         }
 
@@ -14111,12 +14207,17 @@ impl FrankenTorchSession {
         let a_outer: usize = a_vals.len() / a_last;
         let b_outer: usize = b_vals.len() / b_last;
 
-        let mut result = Vec::with_capacity(a_outer * b_outer);
+        let total = Self::checked_mul(a_outer, b_outer, "inner output size overflow")?;
+        let mut result = Vec::with_capacity(total);
         for i in 0..a_outer {
             for j in 0..b_outer {
                 let mut dot = 0.0;
+                let a_base = Self::checked_mul(i, a_last, "inner index overflow")?;
+                let b_base = Self::checked_mul(j, b_last, "inner index overflow")?;
                 for k in 0..a_last {
-                    dot += a_vals[i * a_last + k] * b_vals[j * b_last + k];
+                    let a_idx = Self::checked_add(a_base, k, "inner index overflow")?;
+                    let b_idx = Self::checked_add(b_base, k, "inner index overflow")?;
+                    dot += a_vals[a_idx] * b_vals[b_idx];
                 }
                 result.push(dot);
             }

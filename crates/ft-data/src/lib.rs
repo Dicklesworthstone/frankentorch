@@ -21,6 +21,13 @@ fn checked_shape_numel(shape: &[usize], reason: &'static str) -> Result<usize, A
     Ok(product)
 }
 
+fn checked_mul(lhs: usize, rhs: usize, reason: &'static str) -> Result<usize, AutogradError> {
+    lhs.checked_mul(rhs)
+        .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+            ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+        )))
+}
+
 // ── Data Item ────────────────────────────────────────────────────────────
 
 /// A single data sample returned by a `Dataset`.
@@ -676,7 +683,8 @@ fn collate(
         }
 
         // Stack along batch dimension: new shape = [batch_size] ++ sample_shape
-        let mut batched_values = Vec::with_capacity(batch_size * sample_numel);
+        let batch_numel = checked_mul(batch_size, sample_numel, "DataLoader: batch size overflow")?;
+        let mut batched_values = Vec::with_capacity(batch_numel);
         for sample in samples {
             let (_, ref vals, _) = sample.tensors[tensor_idx];
             batched_values.extend_from_slice(vals);
