@@ -27,10 +27,11 @@ use ft_dispatch::{
 };
 use ft_kernel_cpu::{
     argmax_dim_tensor_contiguous_f64, argmin_dim_tensor_contiguous_f64,
-    gather_tensor_contiguous_f64, index_put_tensor_contiguous_f64,
-    index_select_tensor_contiguous_f64, masked_fill_tensor_contiguous_f64,
-    max_dim_tensor_contiguous_f64, min_dim_tensor_contiguous_f64,
-    scatter_add_tensor_contiguous_f64, scatter_tensor_contiguous_f64, where_tensor_contiguous_f64,
+    gather_tensor_contiguous_f32, gather_tensor_contiguous_f64, index_put_tensor_contiguous_f64,
+    index_select_tensor_contiguous_f32, index_select_tensor_contiguous_f64,
+    masked_fill_tensor_contiguous_f64, max_dim_tensor_contiguous_f64,
+    min_dim_tensor_contiguous_f64, scatter_add_tensor_contiguous_f64,
+    scatter_tensor_contiguous_f32, scatter_tensor_contiguous_f64, where_tensor_contiguous_f64,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -7261,25 +7262,48 @@ impl TensorTape {
         dim: usize,
         indices: &[f64],
     ) -> Result<TensorNodeId, AutogradError> {
-        let (values, input_shape, output_shape, output_dtype, output_device, requires_grad) = {
+        let (storage, input_shape, output_shape, output_dtype, output_device, requires_grad) = {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
-            let values = index_select_tensor_contiguous_f64(
-                &input_node.tensor.contiguous_values_as_f64()?,
-                &meta,
-                dim,
-                indices,
-            )
-            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let storage = match meta.dtype() {
+                DType::F64 => {
+                    let values = index_select_tensor_contiguous_f64(
+                        &input_node.tensor.contiguous_values_as_f64()?,
+                        &meta,
+                        dim,
+                        indices,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    TensorStorage::F64(Arc::new(values))
+                }
+                DType::F32 => {
+                    let values = index_select_tensor_contiguous_f32(
+                        input_node.tensor.contiguous_values_f32()?,
+                        &meta,
+                        dim,
+                        indices,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    TensorStorage::F32(Arc::new(values))
+                }
+                _ => {
+                    return Err(AutogradError::Dispatch(
+                        DispatchKeyError::IncompatibleSet {
+                            reason: "index_select requires f32 or f64 tensors",
+                        }
+                        .into(),
+                    ));
+                }
+            };
             let input_shape = meta.shape().to_vec();
             let mut out_shape = input_shape.clone();
             out_shape[dim] = indices.len();
             (
-                values,
+                storage,
                 input_shape,
                 out_shape,
-                DType::F64,
+                meta.dtype(),
                 meta.device(),
                 requires_grad,
             )
@@ -7288,9 +7312,9 @@ impl TensorTape {
         let indices_owned = indices.to_vec();
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
+            tensor: DenseTensor::from_typed_storage(
                 ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
-                values,
+                storage,
             )?,
             requires_grad,
             op: TensorNodeOp::IndexSelect {
@@ -7310,25 +7334,49 @@ impl TensorTape {
         index: &[f64],
         index_shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (values, input_shape, output_dtype, output_device, requires_grad) = {
+        let (storage, input_shape, output_dtype, output_device, requires_grad) = {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
             let idx_meta =
                 ft_core::TensorMeta::from_shape(index_shape.clone(), meta.dtype(), meta.device());
-            let values = gather_tensor_contiguous_f64(
-                &input_node.tensor.contiguous_values_as_f64()?,
-                &meta,
-                dim,
-                index,
-                &idx_meta,
-            )
-            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let storage = match meta.dtype() {
+                DType::F64 => {
+                    let values = gather_tensor_contiguous_f64(
+                        &input_node.tensor.contiguous_values_as_f64()?,
+                        &meta,
+                        dim,
+                        index,
+                        &idx_meta,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    TensorStorage::F64(Arc::new(values))
+                }
+                DType::F32 => {
+                    let values = gather_tensor_contiguous_f32(
+                        input_node.tensor.contiguous_values_f32()?,
+                        &meta,
+                        dim,
+                        index,
+                        &idx_meta,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    TensorStorage::F32(Arc::new(values))
+                }
+                _ => {
+                    return Err(AutogradError::Dispatch(
+                        DispatchKeyError::IncompatibleSet {
+                            reason: "gather requires f32 or f64 tensors",
+                        }
+                        .into(),
+                    ));
+                }
+            };
             let input_shape = meta.shape().to_vec();
             (
-                values,
+                storage,
                 input_shape,
-                DType::F64,
+                meta.dtype(),
                 meta.device(),
                 requires_grad,
             )
@@ -7337,9 +7385,9 @@ impl TensorTape {
         let index_owned = index.to_vec();
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
+            tensor: DenseTensor::from_typed_storage(
                 ft_core::TensorMeta::from_shape(index_shape.clone(), output_dtype, output_device),
-                values,
+                storage,
             )?,
             requires_grad,
             op: TensorNodeOp::Gather {
@@ -7361,26 +7409,52 @@ impl TensorTape {
         index_shape: Vec<usize>,
         src: &[f64],
     ) -> Result<TensorNodeId, AutogradError> {
-        let (values, input_shape, output_dtype, output_device, requires_grad) = {
+        let (storage, input_shape, output_dtype, output_device, requires_grad) = {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
             let idx_meta =
                 ft_core::TensorMeta::from_shape(index_shape.clone(), meta.dtype(), meta.device());
-            let values = scatter_tensor_contiguous_f64(
-                &input_node.tensor.contiguous_values_as_f64()?,
-                &meta,
-                dim,
-                index,
-                &idx_meta,
-                src,
-            )
-            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+            let storage = match meta.dtype() {
+                DType::F64 => {
+                    let values = scatter_tensor_contiguous_f64(
+                        &input_node.tensor.contiguous_values_as_f64()?,
+                        &meta,
+                        dim,
+                        index,
+                        &idx_meta,
+                        src,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    TensorStorage::F64(Arc::new(values))
+                }
+                DType::F32 => {
+                    let src_f32: Vec<f32> = src.iter().map(|&v| v as f32).collect();
+                    let values = scatter_tensor_contiguous_f32(
+                        input_node.tensor.contiguous_values_f32()?,
+                        &meta,
+                        dim,
+                        index,
+                        &idx_meta,
+                        &src_f32,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    TensorStorage::F32(Arc::new(values))
+                }
+                _ => {
+                    return Err(AutogradError::Dispatch(
+                        DispatchKeyError::IncompatibleSet {
+                            reason: "scatter requires f32 or f64 tensors",
+                        }
+                        .into(),
+                    ));
+                }
+            };
             let input_shape = meta.shape().to_vec();
             (
-                values,
+                storage,
                 input_shape,
-                DType::F64,
+                meta.dtype(),
                 meta.device(),
                 requires_grad,
             )
@@ -7389,9 +7463,9 @@ impl TensorTape {
         let index_owned = index.to_vec();
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
+            tensor: DenseTensor::from_typed_storage(
                 ft_core::TensorMeta::from_shape(input_shape.clone(), output_dtype, output_device),
-                values,
+                storage,
             )?,
             requires_grad,
             op: TensorNodeOp::Scatter {

@@ -6435,7 +6435,33 @@ impl FrankenTorchSession {
         let index_data = self.tensor_tape.values(index)?;
         Self::validate_index_tensor_values(&input_shape, dim, &index_data)?;
         let index_shape = self.tensor_tape.tensor(index)?.meta().shape().to_vec();
-        let src_data = self.tensor_tape.values(src)?;
+        let input_dtype = self.tensor_tape.dtype(input)?;
+        let src_dtype = self.tensor_tape.dtype(src)?;
+        if src_dtype != input_dtype {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "scatter requires input and src to have matching dtypes",
+                }
+                .into(),
+            ));
+        }
+        let src_data = match input_dtype {
+            DType::F64 => self.tensor_tape.values(src)?,
+            DType::F32 => self
+                .tensor_tape
+                .values_f32(src)?
+                .into_iter()
+                .map(f64::from)
+                .collect(),
+            _ => {
+                return Err(AutogradError::Dispatch(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "scatter requires f32 or f64 tensors",
+                    }
+                    .into(),
+                ));
+            }
+        };
         self.tensor_tape
             .scatter(input, dim, &index_data, index_shape, &src_data)
     }
@@ -17734,6 +17760,23 @@ mod tests {
     }
 
     #[test]
+    fn session_tensor_index_select_f32_preserves_dtype() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .expect("x");
+        let indices = session
+            .tensor_variable(vec![1.0, 0.0], vec![2], false)
+            .expect("indices");
+        let y = session
+            .tensor_index_select(x, 0, indices)
+            .expect("index_select");
+        assert_eq!(session.tensor_dtype(y).expect("dtype"), DType::F32);
+        let vals = session.tensor_values_f32(y).expect("values");
+        assert_eq!(vals, vec![4.0f32, 5.0, 6.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
     fn session_tensor_index_select_rejects_nan_indices() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -17794,6 +17837,21 @@ mod tests {
     }
 
     #[test]
+    fn session_tensor_gather_dim1_f32_preserves_dtype() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .expect("x");
+        let index = session
+            .tensor_variable(vec![0.0, 2.0, 1.0, 0.0], vec![2, 2], false)
+            .expect("index");
+        let y = session.tensor_gather(x, 1, index).expect("gather");
+        assert_eq!(session.tensor_dtype(y).expect("dtype"), DType::F32);
+        let vals = session.tensor_values_f32(y).expect("values");
+        assert_eq!(vals, vec![1.0f32, 3.0, 5.0, 4.0]);
+    }
+
+    #[test]
     fn session_tensor_gather_rejects_fractional_indices() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -17838,6 +17896,24 @@ mod tests {
         let y = session.tensor_scatter(x, 1, index, src).expect("scatter");
         let vals = session.tensor_values(y).expect("values");
         assert_eq!(vals, vec![10.0, 0.0, 20.0, 40.0, 30.0, 0.0]);
+    }
+
+    #[test]
+    fn session_tensor_scatter_dim1_f32_preserves_dtype() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(vec![0.0f32; 6], vec![2, 3], false)
+            .expect("x");
+        let index = session
+            .tensor_variable(vec![0.0, 2.0, 1.0, 0.0], vec![2, 2], false)
+            .expect("index");
+        let src = session
+            .tensor_variable_f32(vec![10.0f32, 20.0, 30.0, 40.0], vec![2, 2], false)
+            .expect("src");
+        let y = session.tensor_scatter(x, 1, index, src).expect("scatter");
+        assert_eq!(session.tensor_dtype(y).expect("dtype"), DType::F32);
+        let vals = session.tensor_values_f32(y).expect("values");
+        assert_eq!(vals, vec![10.0f32, 0.0, 20.0, 40.0, 30.0, 0.0]);
     }
 
     #[test]
