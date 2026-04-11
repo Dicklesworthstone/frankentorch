@@ -3,6 +3,24 @@
 use ft_api::FrankenTorchSession;
 use ft_autograd::{AutogradError, TensorNodeId};
 
+fn checked_shape_numel(shape: &[usize], reason: &'static str) -> Result<usize, AutogradError> {
+    if shape.is_empty() {
+        return Ok(1);
+    }
+    let mut product = 1usize;
+    for &dim in shape {
+        if dim == 0 {
+            return Ok(0);
+        }
+        product = product
+            .checked_mul(dim)
+            .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+            )))?;
+    }
+    Ok(product)
+}
+
 // ── Data Item ────────────────────────────────────────────────────────────
 
 /// A single data sample returned by a `Dataset`.
@@ -615,7 +633,8 @@ fn collate(
         let (ref name, _, ref first_shape) = samples[0].tensors[tensor_idx];
 
         // Validate all samples have matching shapes for this tensor
-        let sample_numel: usize = first_shape.iter().product();
+        let sample_numel =
+            checked_shape_numel(first_shape, "DataLoader: sample shape volume overflow")?;
         let first_values_len = samples[0].tensors[tensor_idx].1.len();
         if first_values_len != sample_numel {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(

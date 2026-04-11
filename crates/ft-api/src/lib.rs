@@ -10173,7 +10173,14 @@ impl FrankenTorchSession {
             repeats,
             "repeat_interleave: output size overflow",
         )?;
-        let mut result = Vec::with_capacity(capacity);
+        let mut result = Vec::new();
+        result.try_reserve_exact(capacity).map_err(|_| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "repeat_interleave: output size overflow",
+                },
+            ))
+        })?;
         for &v in &vals {
             for _ in 0..repeats {
                 result.push(v);
@@ -24390,6 +24397,16 @@ mod tests {
         assert_eq!(vals, vec![1.0, 2.0]);
     }
 
+    #[test]
+    fn repeat_interleave_rejects_overflow() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let err = s
+            .tensor_repeat_interleave(t, usize::MAX)
+            .expect_err("overflow should fail closed");
+        assert!(format!("{err}").contains("repeat_interleave: output size overflow"));
+    }
+
     // ── block_diag tests ───────────────────────────────────────────────
 
     #[test]
@@ -25585,6 +25602,16 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         // Circular: [3, 4, 1, 2, 3, 4, 1, 2]
         assert_eq!(vals, vec![3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn pad_mode_rejects_shape_overflow() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let err = s
+            .tensor_pad_mode(input, &[usize::MAX, 0], "reflect", 0.0)
+            .expect_err("overflow should fail closed");
+        assert!(format!("{err}").contains("pad: output shape overflow"));
     }
 
     #[test]
