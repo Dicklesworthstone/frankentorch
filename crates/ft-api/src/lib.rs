@@ -10960,6 +10960,13 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        if out_channels % groups != 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "init_dirac_ requires groups to evenly divide out_channels",
+                },
+            )));
+        }
         let out_channels_per_group = out_channels / groups;
         let min_dim = out_channels_per_group.min(in_channels);
         let numel: usize = shape.iter().product();
@@ -22760,6 +22767,16 @@ mod tests {
         // Everything else should be 0
         let sum: f64 = vals.iter().sum();
         assert!((sum - 2.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn init_dirac_rejects_non_divisible_groups() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // out_channels=3, groups=2 is invalid
+        let t = s
+            .tensor_variable(vec![0.0; 18], vec![3, 2, 3], true)
+            .unwrap();
+        assert!(s.init_dirac_(t, 2).is_err());
     }
 
     #[test]
