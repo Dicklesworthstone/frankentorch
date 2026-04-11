@@ -7103,6 +7103,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         offset: i64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let dtype = self.tensor_dtype(input)?;
+        if !matches!(dtype, DType::F64 | DType::F32) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_diagonal requires f32 or f64 tensors",
+                },
+            )));
+        }
         let shape = self.tensor_shape(input)?;
         if shape.len() != 2 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
@@ -7117,27 +7125,50 @@ impl FrankenTorchSession {
         let (row_start, col_start, diag_len) = if offset >= 0 {
             let col_start = offset as usize;
             if col_start >= n {
-                let empty = self.tensor_variable(vec![], vec![0], false)?;
-                return Ok(empty);
+                return match dtype {
+                    DType::F64 => self.tensor_variable(vec![], vec![0], false),
+                    DType::F32 => self.tensor_variable_f32(vec![], vec![0], false),
+                    _ => unreachable!("dtype checked above"),
+                };
             }
             let diag_len = m.min(n - col_start);
             (0, col_start, diag_len)
         } else {
             let row_start = (-offset) as usize;
             if row_start >= m {
-                let empty = self.tensor_variable(vec![], vec![0], false)?;
-                return Ok(empty);
+                return match dtype {
+                    DType::F64 => self.tensor_variable(vec![], vec![0], false),
+                    DType::F32 => self.tensor_variable_f32(vec![], vec![0], false),
+                    _ => unreachable!("dtype checked above"),
+                };
             }
             let diag_len = n.min(m - row_start);
             (row_start, 0, diag_len)
         };
         // Extract diagonal elements using index_select on flattened tensor
-        let vals = self.tensor_tape.values(input)?;
-        let mut diag_vals = Vec::with_capacity(diag_len);
-        for i in 0..diag_len {
-            diag_vals.push(vals[(row_start + i) * n + col_start + i]);
+        match dtype {
+            DType::F64 => {
+                let vals = self.tensor_tape.values(input)?;
+                let mut diag_vals = Vec::with_capacity(diag_len);
+                for i in 0..diag_len {
+                    diag_vals.push(vals[(row_start + i) * n + col_start + i]);
+                }
+                self.tensor_variable(diag_vals, vec![diag_len], false)
+            }
+            DType::F32 => {
+                let vals = self.tensor_tape.values_f32(input)?;
+                let mut diag_vals = Vec::with_capacity(diag_len);
+                for i in 0..diag_len {
+                    diag_vals.push(vals[(row_start + i) * n + col_start + i]);
+                }
+                self.tensor_variable_f32(diag_vals, vec![diag_len], false)
+            }
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_diagonal requires f32 or f64 tensors",
+                },
+            ))),
         }
-        self.tensor_variable(diag_vals, vec![diag_len], false)
     }
 
     pub fn tensor_values(&self, node: TensorNodeId) -> Result<Vec<f64>, AutogradError> {
@@ -9691,24 +9722,66 @@ impl FrankenTorchSession {
         values: TensorNodeId,
         right: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let seq_vals = self.tensor_values(sorted_sequence)?;
         let seq_shape = self.tensor_shape(sorted_sequence)?;
-        let val_vals = self.tensor_values(values)?;
         let val_shape = self.tensor_shape(values)?;
+        let seq_dtype = self.tensor_dtype(sorted_sequence)?;
+        let val_dtype = self.tensor_dtype(values)?;
+
+        let (seq_f64, seq_f32, val_f64, val_f32) = match (seq_dtype, val_dtype) {
+            (DType::F64, DType::F64) => (
+                Some(self.tensor_values(sorted_sequence)?),
+                None,
+                Some(self.tensor_values(values)?),
+                None,
+            ),
+            (DType::F32, DType::F32) => (
+                None,
+                Some(self.tensor_values_f32(sorted_sequence)?),
+                None,
+                Some(self.tensor_values_f32(values)?),
+            ),
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "searchsorted requires matching f32 or f64 tensors",
+                    },
+                )));
+            }
+        };
 
         if seq_shape.len() == 1 {
             // 1-D sorted sequence: search for each value
-            let n = seq_vals.len();
-            let indices: Vec<f64> = val_vals
-                .iter()
-                .map(|&v| {
-                    if right {
-                        upper_bound(&seq_vals, v, n) as f64
-                    } else {
-                        lower_bound(&seq_vals, v, n) as f64
-                    }
-                })
-                .collect();
+            let indices: Vec<f64> = if let (Some(seq_vals), Some(val_vals)) = (seq_f64, val_f64) {
+                let n = seq_vals.len();
+                val_vals
+                    .iter()
+                    .map(|&v| {
+                        if right {
+                            upper_bound(&seq_vals, v, n) as f64
+                        } else {
+                            lower_bound(&seq_vals, v, n) as f64
+                        }
+                    })
+                    .collect()
+            } else if let (Some(seq_vals), Some(val_vals)) = (seq_f32, val_f32) {
+                let n = seq_vals.len();
+                val_vals
+                    .iter()
+                    .map(|&v| {
+                        if right {
+                            upper_bound_f32(&seq_vals, v, n) as f64
+                        } else {
+                            lower_bound_f32(&seq_vals, v, n) as f64
+                        }
+                    })
+                    .collect()
+            } else {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "searchsorted: failed to resolve storage",
+                    },
+                )));
+            };
             self.tensor_tape.leaf(indices, val_shape, false)
         } else if seq_shape.len() == 2 && val_shape.len() == 2 {
             // 2-D batched: seq [B, S], values [B, V]
@@ -9723,17 +9796,38 @@ impl FrankenTorchSession {
             }
             let num_vals = val_shape[1];
             let mut indices = Vec::with_capacity(batch * num_vals);
-            for b in 0..batch {
-                let seq_slice = &seq_vals[b * seq_len..(b + 1) * seq_len];
-                for v_idx in 0..num_vals {
-                    let v = val_vals[b * num_vals + v_idx];
-                    let idx = if right {
-                        upper_bound(seq_slice, v, seq_len)
-                    } else {
-                        lower_bound(seq_slice, v, seq_len)
-                    };
-                    indices.push(idx as f64);
+            if let (Some(seq_vals), Some(val_vals)) = (seq_f64, val_f64) {
+                for b in 0..batch {
+                    let seq_slice = &seq_vals[b * seq_len..(b + 1) * seq_len];
+                    for v_idx in 0..num_vals {
+                        let v = val_vals[b * num_vals + v_idx];
+                        let idx = if right {
+                            upper_bound(seq_slice, v, seq_len)
+                        } else {
+                            lower_bound(seq_slice, v, seq_len)
+                        };
+                        indices.push(idx as f64);
+                    }
                 }
+            } else if let (Some(seq_vals), Some(val_vals)) = (seq_f32, val_f32) {
+                for b in 0..batch {
+                    let seq_slice = &seq_vals[b * seq_len..(b + 1) * seq_len];
+                    for v_idx in 0..num_vals {
+                        let v = val_vals[b * num_vals + v_idx];
+                        let idx = if right {
+                            upper_bound_f32(seq_slice, v, seq_len)
+                        } else {
+                            lower_bound_f32(seq_slice, v, seq_len)
+                        };
+                        indices.push(idx as f64);
+                    }
+                }
+            } else {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "searchsorted: failed to resolve storage",
+                    },
+                )));
             }
             self.tensor_tape.leaf(indices, val_shape, false)
         } else {
@@ -14244,9 +14338,39 @@ fn lower_bound(sorted: &[f64], value: f64, n: usize) -> usize {
     lo
 }
 
+/// Binary search: leftmost insertion position (lower_bound) for f32.
+fn lower_bound_f32(sorted: &[f32], value: f32, n: usize) -> usize {
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if sorted[mid] < value {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
 /// Binary search: rightmost insertion position (upper_bound).
 /// Returns the index i such that all elements before i are <= value.
 fn upper_bound(sorted: &[f64], value: f64, n: usize) -> usize {
+    let mut lo = 0usize;
+    let mut hi = n;
+    while lo < hi {
+        let mid = lo + (hi - lo) / 2;
+        if sorted[mid] <= value {
+            lo = mid + 1;
+        } else {
+            hi = mid;
+        }
+    }
+    lo
+}
+
+/// Binary search: rightmost insertion position (upper_bound) for f32.
+fn upper_bound_f32(sorted: &[f32], value: f32, n: usize) -> usize {
     let mut lo = 0usize;
     let mut hi = n;
     while lo < hi {
@@ -21759,6 +21883,21 @@ mod tests {
         assert_eq!(vm1, vec![4.0, 8.0]);
     }
 
+    #[test]
+    fn session_tensor_diagonal_f32() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(
+                vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                vec![3, 3],
+                false,
+            )
+            .expect("x");
+        let d0 = session.tensor_diagonal(x, 0).expect("d0");
+        let v0 = session.tensor_values_f32(d0).expect("v0");
+        assert_eq!(v0, vec![1.0f32, 5.0, 9.0]);
+    }
+
     // ---- argsort tests ----
 
     #[test]
@@ -27864,6 +28003,20 @@ mod tests {
         let result = s.tensor_searchsorted(sorted, values, false).unwrap();
         let vals = s.tensor_values(result).unwrap();
         // lower_bound: 0->0, 2->1, 4->2, 6->3, 8->4
+        assert_eq!(vals, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn searchsorted_basic_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let sorted = s
+            .tensor_variable_f32(vec![1.0f32, 3.0, 5.0, 7.0], vec![4], false)
+            .unwrap();
+        let values = s
+            .tensor_variable_f32(vec![0.0f32, 2.0, 4.0, 6.0, 8.0], vec![5], false)
+            .unwrap();
+        let result = s.tensor_searchsorted(sorted, values, false).unwrap();
+        let vals = s.tensor_values(result).unwrap();
         assert_eq!(vals, vec![0.0, 1.0, 2.0, 3.0, 4.0]);
     }
 
