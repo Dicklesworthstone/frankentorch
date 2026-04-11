@@ -1842,7 +1842,7 @@ impl SparseCOOTensor {
                     }
                     linear_idx += (idx as usize) * strides[d];
                 }
-                dense_data[linear_idx] = values_data[i];
+                dense_data[linear_idx] += values_data[i];
             }
         } else {
             // Hybrid sparse-dense: values have shape [nnz, *dense_dims]
@@ -1864,7 +1864,7 @@ impl SparseCOOTensor {
                 }
                 // Copy the dense slice
                 for j in 0..dense_numel {
-                    dense_data[sparse_linear_idx + j] = values_data[i * dense_numel + j];
+                    dense_data[sparse_linear_idx + j] += values_data[i * dense_numel + j];
                 }
             }
         }
@@ -3882,6 +3882,40 @@ mod tests {
         let dense = sparse.to_dense().unwrap();
 
         let expected = vec![1.0, 0.0, 2.0, 0.0, 3.0, 0.0];
+        let actual = dense.contiguous_values().unwrap();
+        assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn sparse_coo_to_dense_sums_duplicate_indices() {
+        // Duplicate entry at (0, 1) should accumulate.
+        let coords = vec![vec![0, 1], vec![0, 1]];
+        let values = vec![1.0, 2.5];
+
+        let sparse =
+            SparseCOOTensor::from_coords(&coords, values, vec![2, 2], DType::F64, Device::Cpu)
+                .unwrap();
+
+        let dense = sparse.to_dense().unwrap();
+        let expected = vec![0.0, 3.5, 0.0, 0.0];
+        let actual = dense.contiguous_values().unwrap();
+        assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn sparse_coo_to_dense_sums_duplicate_dense_blocks() {
+        // Duplicate entry at (0, 1, :) should accumulate elementwise.
+        let indices =
+            DenseI64Tensor::from_contiguous_values(vec![0, 0, 1, 1], vec![2, 2], Device::Cpu)
+                .unwrap();
+        let values =
+            DenseTensor::from_contiguous_values(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], Device::Cpu)
+                .unwrap();
+
+        let sparse = SparseCOOTensor::new(indices, values, vec![2, 2, 2], false).unwrap();
+        let dense = sparse.to_dense().unwrap();
+
+        let expected = vec![0.0, 0.0, 4.0, 6.0, 0.0, 0.0, 0.0, 0.0];
         let actual = dense.contiguous_values().unwrap();
         assert_eq!(actual, expected.as_slice());
     }
