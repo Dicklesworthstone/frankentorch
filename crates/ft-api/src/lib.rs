@@ -13799,6 +13799,14 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        if vals.iter().any(|v| v.is_nan()) {
+            let out = self.tensor_tape.leaf(vec![f64::NAN], vec![1], false)?;
+            self.runtime.ledger_mut().record(
+                EvidenceKind::Dispatch,
+                format!("quantile input={} q={q} out={} nan=true", input.0, out.0),
+            );
+            return Ok(out);
+        }
 
         let mut sorted = vals.clone();
         sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
@@ -29382,6 +29390,17 @@ mod tests {
         let x = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
         assert!(s.tensor_quantile(x, 1.5).is_err());
         assert!(s.tensor_quantile(x, -0.1).is_err());
+    }
+
+    #[test]
+    fn quantile_propagates_nan() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, f64::NAN, 3.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_quantile(x, 0.5).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert!(vals[0].is_nan(), "quantile should propagate NaN");
     }
 
     // ── clip_grad_norm_ tests ───────────────────────────────────────────
