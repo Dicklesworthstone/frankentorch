@@ -2688,8 +2688,10 @@ impl FrankenTorchSession {
         // Special case: dims=0 is outer product-like (no contraction)
         if dims == 0 {
             // Reshape a to [..., 1] and b to [1, ...], then matmul
-            let a_total: usize = a_shape.iter().product();
-            let b_total: usize = b_shape.iter().product();
+            let a_total =
+                Self::checked_shape_numel(&a_shape, "tensordot: lhs shape volume overflow")?;
+            let b_total =
+                Self::checked_shape_numel(&b_shape, "tensordot: rhs shape volume overflow")?;
             let a_flat = self.tensor_reshape(a, vec![a_total, 1])?;
             let b_flat = self.tensor_reshape(b, vec![1, b_total])?;
             let result = self.tensor_matmul(a_flat, b_flat)?;
@@ -2699,12 +2701,21 @@ impl FrankenTorchSession {
         }
 
         // Reshape a: [free_a..., contract...] -> [prod(free_a), prod(contract)]
-        let free_a: usize = a_shape[..a_ndim - dims].iter().product();
-        let contract: usize = a_shape[a_ndim - dims..].iter().product();
+        let free_a = Self::checked_shape_numel(
+            &a_shape[..a_ndim - dims],
+            "tensordot: free lhs shape volume overflow",
+        )?;
+        let contract = Self::checked_shape_numel(
+            &a_shape[a_ndim - dims..],
+            "tensordot: contract shape volume overflow",
+        )?;
         let a_2d = self.tensor_reshape(a, vec![free_a, contract])?;
 
         // Reshape b: [contract..., free_b...] -> [prod(contract), prod(free_b)]
-        let free_b: usize = b_shape[dims..].iter().product();
+        let free_b = Self::checked_shape_numel(
+            &b_shape[dims..],
+            "tensordot: free rhs shape volume overflow",
+        )?;
         let b_2d = self.tensor_reshape(b, vec![contract, free_b])?;
 
         // Matmul: [free_a, contract] @ [contract, free_b] -> [free_a, free_b]
@@ -2735,7 +2746,13 @@ impl FrankenTorchSession {
             (1, 1) => {
                 // 1D kron: outer product then flatten
                 let outer = self.tensor_outer(a, b)?;
-                let total = a_shape[0] * b_shape[0];
+                let total = a_shape[0]
+                    .checked_mul(b_shape[0])
+                    .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "kron: output shape overflow",
+                        },
+                    )))?;
                 self.tensor_reshape(outer, vec![total])
             }
             (2, 2) => {
@@ -2744,8 +2761,28 @@ impl FrankenTorchSession {
                 let (mb, nb) = (b_shape[0], b_shape[1]);
                 let a_vals = self.tensor_values(a)?;
                 let b_vals = self.tensor_values(b)?;
-                let mut result = vec![0.0f64; (ma * mb) * (na * nb)];
-                let out_cols = na * nb;
+                let out_rows = ma.checked_mul(mb).ok_or(AutogradError::Dispatch(
+                    ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "kron: output row shape overflow",
+                        },
+                    ),
+                ))?;
+                let out_cols = na.checked_mul(nb).ok_or(AutogradError::Dispatch(
+                    ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "kron: output col shape overflow",
+                        },
+                    ),
+                ))?;
+                let total = out_rows
+                    .checked_mul(out_cols)
+                    .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "kron: output shape volume overflow",
+                        },
+                    )))?;
+                let mut result = vec![0.0f64; total];
                 for ia in 0..ma {
                     for ja in 0..na {
                         let a_val = a_vals[ia * na + ja];
@@ -2758,7 +2795,7 @@ impl FrankenTorchSession {
                         }
                     }
                 }
-                self.tensor_variable(result, vec![ma * mb, na * nb], false)
+                self.tensor_variable(result, vec![out_rows, out_cols], false)
             }
             _ => {
                 // General case: pad shorter tensor dimensions to match
@@ -3780,9 +3817,25 @@ impl FrankenTorchSession {
         }
 
         let n_tensors = all_vals.len();
-        let total_rows: usize = all_vals.iter().map(|v| v.len()).product();
+        let mut total_rows = 1usize;
+        for vals in &all_vals {
+            total_rows = total_rows
+                .checked_mul(vals.len())
+                .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "cartesian_prod: total row count overflow",
+                    },
+                )))?;
+        }
 
-        let mut result = Vec::with_capacity(total_rows * n_tensors);
+        let capacity = total_rows
+            .checked_mul(n_tensors)
+            .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cartesian_prod: output size overflow",
+                },
+            )))?;
+        let mut result = Vec::with_capacity(capacity);
         let mut indices = vec![0usize; n_tensors];
 
         for _ in 0..total_rows {
@@ -4731,8 +4784,9 @@ impl FrankenTorchSession {
         }
 
         let dim_size = shape[dim];
-        let outer: usize = shape[..dim].iter().product();
-        let inner: usize = shape[dim + 1..].iter().product();
+        let outer = Self::checked_shape_numel(&shape[..dim], "normalize: outer shape overflow")?;
+        let inner =
+            Self::checked_shape_numel(&shape[dim + 1..], "normalize: inner shape overflow")?;
         let mut result = vals.clone();
 
         for o in 0..outer {
@@ -4779,7 +4833,7 @@ impl FrankenTorchSession {
         }
         if p >= 1.0 {
             let shape = self.tensor_shape(input)?;
-            let numel: usize = shape.iter().product();
+            let numel = Self::checked_shape_numel(&shape, "dropout: shape volume overflow")?;
             return self.tensor_variable(vec![0.0; numel], shape, false);
         }
 
@@ -5711,7 +5765,11 @@ impl FrankenTorchSession {
         }
         let (n, c, d_in, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
         let (d_out, h_out, w_out) = output_size;
-        let mut output = Vec::with_capacity(n * c * d_out * h_out * w_out);
+        let output_len = Self::checked_shape_numel(
+            &[n, c, d_out, h_out, w_out],
+            "adaptive_avg_pool3d: output shape volume overflow",
+        )?;
+        let mut output = Vec::with_capacity(output_len);
 
         for b in 0..n {
             for ch in 0..c {
@@ -5767,7 +5825,10 @@ impl FrankenTorchSession {
             ));
         }
 
-        let normalized_numel: usize = normalized_shape.iter().product();
+        let normalized_numel = Self::checked_shape_numel(
+            &normalized_shape,
+            "layer_norm: normalized shape volume overflow",
+        )?;
         if normalized_numel == 0 {
             return Err(Self::incompatible_tensor_args(
                 "layer_norm: normalized_shape must not contain zero dimensions",
@@ -5785,10 +5846,13 @@ impl FrankenTorchSession {
 
         self.validate_optional_affine(weight, bias, &normalized_shape, "layer_norm")?;
 
-        let batch_numel: usize = if start == 0 {
+        let batch_numel = if start == 0 {
             1
         } else {
-            input_shape[..start].iter().product()
+            Self::checked_shape_numel(
+                &input_shape[..start],
+                "layer_norm: batch shape volume overflow",
+            )?
         };
         let flat = self.tensor_reshape(input, vec![batch_numel, normalized_numel])?;
         let mean = self.tensor_mean_dim(flat, 1)?;
@@ -5861,12 +5925,19 @@ impl FrankenTorchSession {
         self.validate_optional_affine(weight, bias, &[channels], "group_norm")?;
 
         let channels_per_group = channels / num_groups;
-        let spatial: usize = if input_shape.len() > 2 {
-            input_shape[2..].iter().product()
+        let spatial = if input_shape.len() > 2 {
+            Self::checked_shape_numel(&input_shape[2..], "group_norm: spatial shape overflow")?
         } else {
             1
         };
-        let group_numel = channels_per_group * spatial;
+        let group_numel =
+            channels_per_group
+                .checked_mul(spatial)
+                .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "group_norm: group size overflow",
+                    },
+                )))?;
         let reshaped = self.tensor_reshape(input, vec![batch_size, num_groups, group_numel])?;
         let mean = self.tensor_mean_dim(reshaped, 2)?;
         let mean = self.tensor_unsqueeze(mean, 2)?;
@@ -6656,8 +6727,9 @@ impl FrankenTorchSession {
         }
 
         let dim_size = shape[dim];
-        let outer: usize = shape[..dim].iter().product();
-        let inner: usize = shape[dim + 1..].iter().product();
+        let outer = Self::checked_shape_numel(&shape[..dim], "index_add: outer shape overflow")?;
+        let inner =
+            Self::checked_shape_numel(&shape[dim + 1..], "index_add: inner shape overflow")?;
         let src_dim_size = src_shape[dim];
         if src_dim_size != index_len {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -6802,8 +6874,9 @@ impl FrankenTorchSession {
         }
 
         let dim_size = shape[dim];
-        let outer: usize = shape[..dim].iter().product();
-        let inner: usize = shape[dim + 1..].iter().product();
+        let outer = Self::checked_shape_numel(&shape[..dim], "index_copy: outer shape overflow")?;
+        let inner =
+            Self::checked_shape_numel(&shape[dim + 1..], "index_copy: inner shape overflow")?;
         let src_dim_size = src_shape[dim];
         if src_dim_size != index_len {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -6922,8 +6995,9 @@ impl FrankenTorchSession {
         }
 
         let dim_size = shape[dim];
-        let outer: usize = shape[..dim].iter().product();
-        let inner: usize = shape[dim + 1..].iter().product();
+        let outer = Self::checked_shape_numel(&shape[..dim], "index_fill: outer shape overflow")?;
+        let inner =
+            Self::checked_shape_numel(&shape[dim + 1..], "index_fill: inner shape overflow")?;
         let dim_size_i = isize::try_from(dim_size).map_err(|_| {
             AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -8076,6 +8150,20 @@ impl FrankenTorchSession {
             product = next;
         }
         Ok(product)
+    }
+
+    fn checked_mul(
+        lhs: usize,
+        rhs: usize,
+        overflow_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        lhs.checked_mul(rhs).ok_or({
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: overflow_reason,
+                },
+            ))
+        })
     }
 
     fn checked_square_numel(
@@ -9783,11 +9871,12 @@ impl FrankenTorchSession {
         // Compute strides for index decomposition
         let mut strides = vec![1usize; ndim];
         for i in (0..ndim.saturating_sub(1)).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
+            strides[i] =
+                Self::checked_mul(strides[i + 1], shape[i + 1], "nonzero: stride overflow")?;
         }
 
         let mut indices = Vec::new();
-        let numel: usize = shape.iter().product();
+        let numel = Self::checked_shape_numel(&shape, "nonzero: shape volume overflow")?;
         if let Some(values) = values_f64 {
             for (flat_idx, &val) in values.iter().enumerate().take(numel) {
                 if val != 0.0 || val.is_nan() {
@@ -9842,11 +9931,15 @@ impl FrankenTorchSession {
 
         let mut strides = vec![1usize; ndim];
         for i in (0..ndim.saturating_sub(1)).rev() {
-            strides[i] = strides[i + 1] * shape[i + 1];
+            strides[i] = Self::checked_mul(
+                strides[i + 1],
+                shape[i + 1],
+                "nonzero_as_tuple: stride overflow",
+            )?;
         }
 
         let mut per_dim_indices: Vec<Vec<f64>> = vec![Vec::new(); ndim];
-        let numel: usize = shape.iter().product();
+        let numel = Self::checked_shape_numel(&shape, "nonzero_as_tuple: shape volume overflow")?;
         if let Some(values) = values_f64 {
             for (flat_idx, &val) in values.iter().enumerate().take(numel) {
                 if val != 0.0 || val.is_nan() {
@@ -10075,7 +10168,12 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let mut result = Vec::with_capacity(vals.len() * repeats);
+        let capacity = Self::checked_mul(
+            vals.len(),
+            repeats,
+            "repeat_interleave: output size overflow",
+        )?;
+        let mut result = Vec::with_capacity(capacity);
         for &v in &vals {
             for _ in 0..repeats {
                 result.push(v);
@@ -10096,8 +10194,10 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let input_shape = self.tensor_shape(input)?;
         let mask_shape = self.tensor_shape(mask)?;
-        let input_numel: usize = input_shape.iter().product();
-        let mask_numel: usize = mask_shape.iter().product();
+        let input_numel =
+            Self::checked_shape_numel(&input_shape, "masked_select: input shape overflow")?;
+        let mask_numel =
+            Self::checked_shape_numel(&mask_shape, "masked_select: mask shape overflow")?;
         if input_numel != mask_numel {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -10131,7 +10231,8 @@ impl FrankenTorchSession {
                 let grad_out = grad_outputs[0];
                 let mask_data = &ctx.saved_tensors()[0];
                 let input_shape = &ctx.saved_shapes()[0];
-                let input_numel: usize = input_shape.iter().product();
+                let input_numel =
+                    Self::checked_shape_numel(input_shape, "masked_select: input shape overflow")?;
 
                 let mut grad_input = vec![0.0f64; input_numel];
                 let mut grad_idx = 0;
@@ -10491,10 +10592,23 @@ impl FrankenTorchSession {
         }
 
         // Build output shape
+        let overflow_error = || {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "pad: output shape overflow",
+                },
+            ))
+        };
+
         let mut out_shape = shape.to_vec();
         for i in 0..num_pad_dims {
             let dim = ndim - 1 - i;
-            out_shape[dim] = shape[dim] + padding[i * 2] + padding[i * 2 + 1];
+            let pad_total = padding[i * 2]
+                .checked_add(padding[i * 2 + 1])
+                .ok_or_else(overflow_error)?;
+            out_shape[dim] = shape[dim]
+                .checked_add(pad_total)
+                .ok_or_else(overflow_error)?;
         }
 
         // Build per-dim pad_before
@@ -10506,7 +10620,7 @@ impl FrankenTorchSession {
             pad_after[dim] = padding[i * 2 + 1];
         }
 
-        let out_numel: usize = out_shape.iter().product();
+        let out_numel = Self::checked_shape_numel(&out_shape, "pad: output shape volume overflow")?;
         let out_strides = ft_core::contiguous_strides(&out_shape);
         let in_strides = ft_core::contiguous_strides(shape);
 
@@ -11476,9 +11590,20 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let receptive_field: usize = shape[2..].iter().product();
-        let fan_in = shape[1] * receptive_field;
-        let fan_out = shape[0] * receptive_field;
+        let receptive_field = Self::checked_shape_numel(
+            &shape[2..],
+            "calculate_fan_in_and_fan_out: receptive field overflow",
+        )?;
+        let fan_in = Self::checked_mul(
+            shape[1],
+            receptive_field,
+            "calculate_fan_in_and_fan_out: fan_in overflow",
+        )?;
+        let fan_out = Self::checked_mul(
+            shape[0],
+            receptive_field,
+            "calculate_fan_in_and_fan_out: fan_out overflow",
+        )?;
         Ok((fan_in, fan_out))
     }
 
@@ -11599,10 +11724,11 @@ impl FrankenTorchSession {
         }
         let out_channels_per_group = out_channels / groups;
         let min_dim = out_channels_per_group.min(in_channels);
-        let numel: usize = shape.iter().product();
+        let numel = Self::checked_shape_numel(&shape, "init_dirac_: shape volume overflow")?;
         let mut values = vec![0.0; numel];
         let spatial: Vec<usize> = shape[2..].to_vec();
-        let spatial_numel: usize = spatial.iter().product();
+        let spatial_numel =
+            Self::checked_shape_numel(&spatial, "init_dirac_: spatial shape overflow")?;
 
         for g in 0..groups {
             for d in 0..min_dim {
@@ -11610,13 +11736,38 @@ impl FrankenTorchSession {
                 let ic = d;
                 // Center index in each spatial dimension
                 let mut center_offset = 0usize;
-                let mut stride = 1;
+                let mut stride = 1usize;
                 for &s in spatial.iter().rev() {
-                    center_offset += (s / 2) * stride;
-                    stride *= s;
+                    let offset =
+                        Self::checked_mul(s / 2, stride, "init_dirac_: center offset overflow")?;
+                    center_offset = center_offset.checked_add(offset).ok_or({
+                        AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "init_dirac_: center offset overflow",
+                            },
+                        ))
+                    })?;
+                    stride = Self::checked_mul(stride, s, "init_dirac_: spatial stride overflow")?;
                 }
-                let flat_idx =
-                    oc * (in_channels * spatial_numel) + ic * spatial_numel + center_offset;
+                let channel_stride = Self::checked_mul(
+                    in_channels,
+                    spatial_numel,
+                    "init_dirac_: spatial span overflow",
+                )?;
+                let base =
+                    Self::checked_mul(oc, channel_stride, "init_dirac_: flat index overflow")?;
+                let ic_offset =
+                    Self::checked_mul(ic, spatial_numel, "init_dirac_: flat index overflow")?;
+                let flat_idx = base
+                    .checked_add(ic_offset)
+                    .and_then(|value| value.checked_add(center_offset))
+                    .ok_or({
+                        AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "init_dirac_: flat index overflow",
+                            },
+                        ))
+                    })?;
                 if flat_idx < numel {
                     values[flat_idx] = 1.0;
                 }
@@ -11748,7 +11899,8 @@ impl FrankenTorchSession {
             )));
         }
         let rows = shape[0];
-        let cols: usize = shape[1..].iter().product();
+        let cols =
+            Self::checked_shape_numel(&shape[1..], "init_orthogonal_: column shape overflow")?;
 
         // Generate a random matrix and compute QR
         let flat_shape = if rows >= cols {
@@ -11778,7 +11930,9 @@ impl FrankenTorchSession {
 
         // If rows < cols, transpose Q
         let final_values = if rows < cols {
-            let mut transposed = vec![0.0; rows * cols];
+            let transposed_len =
+                Self::checked_mul(rows, cols, "init_orthogonal_: transpose buffer overflow")?;
+            let mut transposed = vec![0.0; transposed_len];
             for i in 0..cols {
                 for j in 0..rows {
                     transposed[j * cols + i] = q_fixed[i * rows + j];
@@ -11790,7 +11944,7 @@ impl FrankenTorchSession {
         };
 
         // Apply gain and reshape to original tensor shape
-        let numel: usize = shape.iter().product();
+        let numel = Self::checked_shape_numel(&shape, "init_orthogonal_: shape volume overflow")?;
         let scaled: Vec<f64> = final_values[..numel].iter().map(|&v| v * gain).collect();
         self.update_tensor_values_for_float(tensor, scaled, INIT_FLOAT_REASON)?;
         self.record_tensor_in_place_operation(
@@ -11829,7 +11983,7 @@ impl FrankenTorchSession {
         let cols = shape[1];
         let num_zeros_per_col = (sparsity * rows as f64).ceil() as usize;
         let num_zeros_per_col = num_zeros_per_col.min(rows);
-        let numel = rows * cols;
+        let numel = Self::checked_mul(rows, cols, "init_sparse_: shape volume overflow")?;
         let mut values = vec![0.0; numel];
 
         // Fill with normal values, then zero out `num_zeros_per_col` entries per column
@@ -12399,9 +12553,11 @@ impl FrankenTorchSession {
         let mut result = vec![0.0_f64; storage.len()];
 
         // Compute strides for iteration
-        let outer_size: usize = shape[..dim].iter().product();
+        let outer_size =
+            Self::checked_shape_numel(&shape[..dim], "logcumsumexp: outer shape overflow")?;
         let dim_size = shape[dim];
-        let inner_size: usize = shape[dim + 1..].iter().product();
+        let inner_size =
+            Self::checked_shape_numel(&shape[dim + 1..], "logcumsumexp: inner shape overflow")?;
 
         for outer in 0..outer_size {
             for inner in 0..inner_size {
@@ -12720,9 +12876,12 @@ impl FrankenTorchSession {
         out_spatial: &[usize],
     ) -> Result<TensorNodeId, AutogradError> {
         let spatial_dims = in_spatial.len();
-        let out_numel: usize = out_spatial.iter().product();
-        let in_numel: usize = in_spatial.iter().product();
-        let total = batch * channels * out_numel;
+        let out_numel =
+            Self::checked_shape_numel(out_spatial, "interpolate: output spatial shape overflow")?;
+        let in_numel =
+            Self::checked_shape_numel(in_spatial, "interpolate: input spatial shape overflow")?;
+        let bc = Self::checked_mul(batch, channels, "interpolate: output size overflow")?;
+        let total = Self::checked_mul(bc, out_numel, "interpolate: output size overflow")?;
         let mut values = Vec::with_capacity(total);
 
         for b in 0..batch {
@@ -13222,10 +13381,13 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let outer_size: usize = shape[..dim].iter().product();
+        let outer_size =
+            Self::checked_shape_numel(&shape[..dim], "logsumexp: outer shape overflow")?;
         let dim_size = shape[dim];
-        let inner_size: usize = shape[dim + 1..].iter().product();
-        let mut result = Vec::with_capacity(outer_size * inner_size);
+        let inner_size =
+            Self::checked_shape_numel(&shape[dim + 1..], "logsumexp: inner shape overflow")?;
+        let out_len = Self::checked_mul(outer_size, inner_size, "logsumexp: output size overflow")?;
+        let mut result = Vec::with_capacity(out_len);
         for outer in 0..outer_size {
             for inner in 0..inner_size {
                 let mut max_val = f64::NEG_INFINITY;
@@ -13310,11 +13472,13 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let outer_size: usize = shape[..dim].iter().product();
+        let outer_size = Self::checked_shape_numel(&shape[..dim], "aminmax: outer shape overflow")?;
         let dim_size = shape[dim];
-        let inner_size: usize = shape[dim + 1..].iter().product();
-        let mut mins = Vec::with_capacity(outer_size * inner_size);
-        let mut maxs = Vec::with_capacity(outer_size * inner_size);
+        let inner_size =
+            Self::checked_shape_numel(&shape[dim + 1..], "aminmax: inner shape overflow")?;
+        let out_len = Self::checked_mul(outer_size, inner_size, "aminmax: output size overflow")?;
+        let mut mins = Vec::with_capacity(out_len);
+        let mut maxs = Vec::with_capacity(out_len);
         for outer in 0..outer_size {
             for inner in 0..inner_size {
                 let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
@@ -13366,7 +13530,8 @@ impl FrankenTorchSession {
         let n_windows = (shape[dimension] - size) / step + 1;
         let mut strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
-            strides[d] = strides[d + 1] * shape[d + 1];
+            strides[d] =
+                Self::checked_mul(strides[d + 1], shape[d + 1], "unfold: stride overflow")?;
         }
         let mut out_shape = shape.clone();
         out_shape[dimension] = n_windows;
@@ -13374,9 +13539,13 @@ impl FrankenTorchSession {
         let out_ndim = out_shape.len();
         let mut out_strides = vec![1usize; out_ndim];
         for d in (0..out_ndim - 1).rev() {
-            out_strides[d] = out_strides[d + 1] * out_shape[d + 1];
+            out_strides[d] = Self::checked_mul(
+                out_strides[d + 1],
+                out_shape[d + 1],
+                "unfold: output stride overflow",
+            )?;
         }
-        let out_numel: usize = out_shape.iter().product();
+        let out_numel = Self::checked_shape_numel(&out_shape, "unfold: output shape overflow")?;
         let mut result = vec![0.0; out_numel];
         for (flat_out, slot) in result.iter_mut().enumerate().take(out_numel) {
             let mut remaining = flat_out;
@@ -13421,8 +13590,9 @@ impl FrankenTorchSession {
             )));
         }
         let dim_size = shape[dim];
-        let outer_size: usize = shape[..dim].iter().product();
-        let inner_size: usize = shape[dim + 1..].iter().product();
+        let outer_size = Self::checked_shape_numel(&shape[..dim], "renorm: outer shape overflow")?;
+        let inner_size =
+            Self::checked_shape_numel(&shape[dim + 1..], "renorm: inner shape overflow")?;
         let mut result = vals.clone();
         for d in 0..dim_size {
             let mut norm = 0.0_f64;
@@ -13667,7 +13837,7 @@ impl FrankenTorchSession {
             if out_shape.is_empty() {
                 out_shape.push(1);
             }
-            let numel: usize = out_shape.iter().product();
+            let numel = Self::checked_shape_numel(&out_shape, "trapezoid: output shape overflow")?;
             return self.tensor_tape.leaf(vec![0.0; numel], out_shape, false);
         }
 
@@ -13677,10 +13847,13 @@ impl FrankenTorchSession {
             None
         };
 
-        let outer_size: usize = y_shape[..dim].iter().product();
-        let inner_size: usize = y_shape[dim + 1..].iter().product();
+        let outer_size =
+            Self::checked_shape_numel(&y_shape[..dim], "trapezoid: outer shape overflow")?;
+        let inner_size =
+            Self::checked_shape_numel(&y_shape[dim + 1..], "trapezoid: inner shape overflow")?;
 
-        let mut result = Vec::with_capacity(outer_size * inner_size);
+        let out_len = Self::checked_mul(outer_size, inner_size, "trapezoid: output size overflow")?;
+        let mut result = Vec::with_capacity(out_len);
 
         for outer in 0..outer_size {
             for inner in 0..inner_size {
@@ -13751,11 +13924,27 @@ impl FrankenTorchSession {
             None
         };
 
-        let outer_size: usize = y_shape[..dim].iter().product();
-        let inner_size: usize = y_shape[dim + 1..].iter().product();
+        let outer_size = Self::checked_shape_numel(
+            &y_shape[..dim],
+            "cumulative_trapezoid: outer shape overflow",
+        )?;
+        let inner_size = Self::checked_shape_numel(
+            &y_shape[dim + 1..],
+            "cumulative_trapezoid: inner shape overflow",
+        )?;
         let out_dim_size = dim_size - 1;
 
-        let mut result = Vec::with_capacity(outer_size * out_dim_size * inner_size);
+        let outer_len = Self::checked_mul(
+            outer_size,
+            out_dim_size,
+            "cumulative_trapezoid: output size overflow",
+        )?;
+        let out_len = Self::checked_mul(
+            outer_len,
+            inner_size,
+            "cumulative_trapezoid: output size overflow",
+        )?;
+        let mut result = Vec::with_capacity(out_len);
 
         for outer in 0..outer_size {
             for d in 0..out_dim_size {
