@@ -12,11 +12,11 @@ fn checked_shape_numel(shape: &[usize], reason: &'static str) -> Result<usize, A
         if dim == 0 {
             return Ok(0);
         }
-        product = product
-            .checked_mul(dim)
-            .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
-            )))?;
+        product = product.checked_mul(dim).ok_or(AutogradError::Dispatch(
+            ft_dispatch::DispatchError::Key(ft_dispatch::DispatchKeyError::IncompatibleSet {
+                reason,
+            }),
+        ))?;
     }
     Ok(product)
 }

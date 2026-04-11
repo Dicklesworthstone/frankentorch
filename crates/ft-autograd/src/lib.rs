@@ -7606,7 +7606,10 @@ impl TensorTape {
             };
             let shape = meta.shape();
             let num_indexed = indices.len();
-            let suffix: usize = shape[num_indexed..].iter().product();
+            let suffix = Self::checked_shape_numel(
+                &shape[num_indexed..],
+                "index_put suffix shape overflow",
+            )?;
             let input_shape = shape.to_vec();
             (
                 output_storage,
@@ -8894,10 +8897,14 @@ impl TensorTape {
         let mut out_shape = shape.clone();
         for i in 0..num_pad_dims {
             let dim = ndim - 1 - i;
-            out_shape[dim] = shape[dim] + padding[i * 2] + padding[i * 2 + 1];
+            let padded =
+                Self::checked_add_usize(shape[dim], padding[i * 2], "pad output shape overflow")?;
+            let padded =
+                Self::checked_add_usize(padded, padding[i * 2 + 1], "pad output shape overflow")?;
+            out_shape[dim] = padded;
         }
 
-        let out_numel: usize = out_shape.iter().product();
+        let out_numel = Self::checked_shape_numel(&out_shape, "pad output shape volume overflow")?;
         let mut output = vec![value; out_numel];
 
         // Compute strides
@@ -8912,7 +8919,7 @@ impl TensorTape {
         }
 
         // Copy input values into padded output
-        let in_numel: usize = shape.iter().product();
+        let in_numel = Self::checked_shape_numel(&shape, "pad input shape volume overflow")?;
         let mut coords = vec![0usize; ndim];
         for (flat_in, &val) in storage.iter().enumerate().take(in_numel) {
             let mut rem = flat_in;
@@ -11912,7 +11919,10 @@ impl TensorTape {
 
                         let mut indexed_strides = vec![0usize; num_indexed];
                         for d in 0..num_indexed {
-                            indexed_strides[d] = input_shape[d + 1..].iter().product();
+                            indexed_strides[d] = Self::checked_shape_numel(
+                                &input_shape[d + 1..],
+                                "index_put backward stride overflow",
+                            )?;
                         }
 
                         for i in 0..n_indices {
@@ -12087,7 +12097,10 @@ impl TensorTape {
                     // the incoming gradient, discarding gradient on padded elements.
                     let ndim = original_shape.len();
                     let num_pad_dims = padding.len() / 2;
-                    let in_numel: usize = original_shape.iter().product();
+                    let in_numel = Self::checked_shape_numel(
+                        original_shape,
+                        "pad backward input shape overflow",
+                    )?;
                     let in_strides = ft_core::contiguous_strides(original_shape);
 
                     let out_shape = self.nodes[node_id.0].tensor.meta().shape();
@@ -12392,7 +12405,8 @@ impl TensorTape {
 
         // Initial gradient: ones_like(root) with requires_grad=true
         let root_shape = self.nodes[root.0].tensor.meta().shape().to_vec();
-        let root_numel: usize = root_shape.iter().product();
+        let root_numel =
+            Self::checked_shape_numel(&root_shape, "create_graph root shape overflow")?;
         let root_grad = self.leaf(vec![1.0; root_numel], root_shape, true)?;
         grad_nodes[root.0] = Some(root_grad);
 
@@ -12492,7 +12506,10 @@ impl TensorTape {
                 TensorNodeOp::Pow { input, exponent } => {
                     // d(x^n)/dx = n * x^(n-1) * grad
                     let exp_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let exp_numel: usize = exp_shape.iter().product();
+                    let exp_numel = Self::checked_shape_numel(
+                        &exp_shape,
+                        "pow backward exponent shape overflow",
+                    )?;
                     let exp_node =
                         self.leaf(vec![exponent; exp_numel], exp_shape.clone(), false)?;
                     let exp_m1_node =
@@ -12558,7 +12575,7 @@ impl TensorTape {
                 TensorNodeOp::Sqrt { input } => {
                     // d(sqrt(x))/dx = 0.5/sqrt(x) * grad = grad / (2*sqrt(x))
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let numel: usize = shape.iter().product();
+                    let numel = Self::checked_shape_numel(&shape, "sqrt backward shape overflow")?;
                     let two = self.leaf(vec![2.0; numel], shape, false)?;
                     let two_sqrt = self.cg_mul(two, node_id)?;
                     let grad_in = self.cg_div(incoming_id, two_sqrt)?;
@@ -12586,7 +12603,8 @@ impl TensorTape {
                 TensorNodeOp::Square { input } => {
                     // d(x^2)/dx = 2x * grad
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let numel: usize = shape.iter().product();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "square backward shape overflow")?;
                     let two = self.leaf(vec![2.0; numel], shape, false)?;
                     let two_x = self.cg_mul(two, input)?;
                     let grad_in = self.cg_mul(incoming_id, two_x)?;
@@ -12604,7 +12622,10 @@ impl TensorTape {
                     // The incoming grad is scalar-shaped. We expand it via a
                     // Sum backward node so the standard backward can handle it.
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let input_numel: usize = input_shape.iter().product();
+                    let input_numel = Self::checked_shape_numel(
+                        &input_shape,
+                        "sum backward input shape overflow",
+                    )?;
                     let incoming_val = self.nodes[incoming_id.0]
                         .tensor
                         .contiguous_values_as_f64()?[0];
@@ -12639,7 +12660,8 @@ impl TensorTape {
                 TensorNodeOp::Sigmoid { input } => {
                     // d(sigmoid(x))/dx = sigmoid(x)*(1-sigmoid(x))*grad
                     let shape = self.nodes[node_id.0].tensor.meta().shape().to_vec();
-                    let numel: usize = shape.iter().product();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "sigmoid backward shape overflow")?;
                     let ones = self.leaf(vec![1.0; numel], shape, false)?;
                     let one_minus_sig = self.cg_sub(ones, node_id)?;
                     let sig_deriv = self.cg_mul(node_id, one_minus_sig)?;
@@ -12655,7 +12677,7 @@ impl TensorTape {
                 TensorNodeOp::Tanh { input } => {
                     // d(tanh(x))/dx = (1-tanh(x)^2)*grad
                     let shape = self.nodes[node_id.0].tensor.meta().shape().to_vec();
-                    let numel: usize = shape.iter().product();
+                    let numel = Self::checked_shape_numel(&shape, "tanh backward shape overflow")?;
                     let ones = self.leaf(vec![1.0; numel], shape, false)?;
                     let tanh_sq = self.cg_mul(node_id, node_id)?;
                     let one_minus_sq = self.cg_sub(ones, tanh_sq)?;
@@ -13489,6 +13511,15 @@ impl TensorTape {
         overflow_reason: &'static str,
     ) -> Result<usize, AutogradError> {
         lhs.checked_mul(rhs)
+            .ok_or_else(|| Self::shape_overflow_error(overflow_reason))
+    }
+
+    fn checked_add_usize(
+        lhs: usize,
+        rhs: usize,
+        overflow_reason: &'static str,
+    ) -> Result<usize, AutogradError> {
+        lhs.checked_add(rhs)
             .ok_or_else(|| Self::shape_overflow_error(overflow_reason))
     }
 

@@ -29,6 +29,22 @@ fn checked_next_step_count(
         .ok_or_else(|| optimizer_state_error(overflow_reason))
 }
 
+fn checked_shape_numel(
+    shape: &[usize],
+    overflow_reason: &'static str,
+) -> Result<usize, AutogradError> {
+    let mut product = 1usize;
+    for dim in shape.iter().copied() {
+        if dim == 0 {
+            return Ok(0);
+        }
+        product = product
+            .checked_mul(dim)
+            .ok_or_else(|| optimizer_state_error(overflow_reason))?;
+    }
+    Ok(product)
+}
+
 fn ensure_grad_len_matches_param(
     node: TensorNodeId,
     expected: usize,
@@ -4941,7 +4957,7 @@ impl GradScaler {
         }
         let loss_shape = session.tensor_shape(loss)?;
         // Build a same-shape tensor filled with the scale factor
-        let numel: usize = loss_shape.iter().product::<usize>().max(1);
+        let numel = checked_shape_numel(&loss_shape, "loss scale shape overflow")?;
         let scale_tensor = session.tensor_variable(vec![self.scale; numel], loss_shape, false)?;
         session.tensor_mul(loss, scale_tensor)
     }

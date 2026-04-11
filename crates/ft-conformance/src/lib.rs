@@ -5168,7 +5168,8 @@ fn run_tensor_init_case(
     mode: ExecutionMode,
 ) -> Result<TensorInitCaseReport, String> {
     let mut session = FrankenTorchSession::new(mode);
-    let numel = case.shape.iter().product();
+    let numel = checked_shape_numel(&case.shape)
+        .map_err(|error| format!("init target shape overflow for '{}': {error}", case.name))?;
     let target = session
         .tensor_variable(vec![0.0; numel], case.shape.clone(), false)
         .map_err(|error| format!("init target build failed for '{}': {error}", case.name))?;

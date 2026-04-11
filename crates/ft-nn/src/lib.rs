@@ -7,6 +7,34 @@ use ft_autograd::{AutogradError, FunctionCtx, TensorNodeId};
 use ft_core::{DType, DenseTensor, DenseTensorError};
 use ft_dispatch::{DispatchError, DispatchKeyError};
 
+fn overflow_error(reason: &'static str) -> AutogradError {
+    AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
+        reason,
+    }))
+}
+
+fn checked_mul(a: usize, b: usize, reason: &'static str) -> Result<usize, AutogradError> {
+    a.checked_mul(b).ok_or(overflow_error(reason))
+}
+
+fn checked_add(a: usize, b: usize, reason: &'static str) -> Result<usize, AutogradError> {
+    a.checked_add(b).ok_or(overflow_error(reason))
+}
+
+fn checked_shape_numel(shape: &[usize], reason: &'static str) -> Result<usize, AutogradError> {
+    if shape.is_empty() {
+        return Ok(1);
+    }
+    let mut product = 1usize;
+    for &dim in shape {
+        if dim == 0 {
+            return Ok(0);
+        }
+        product = checked_mul(product, dim, reason)?;
+    }
+    Ok(product)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleRegistrationError {
     InvalidName {
@@ -972,7 +1000,10 @@ impl Bilinear {
         let batch = if x1_shape.len() == 1 {
             1
         } else {
-            x1_shape[..x1_shape.len() - 1].iter().product()
+            checked_shape_numel(
+                &x1_shape[..x1_shape.len() - 1],
+                "bilinear: batch shape overflow",
+            )?
         };
 
         let x1_last = *x1_shape.last().unwrap_or(&0);
@@ -987,7 +1018,8 @@ impl Bilinear {
         }
 
         // y[b, k] = sum_i sum_j x1[b, i] * W[k, i, j] * x2[b, j]
-        let mut result = vec![0.0f64; batch * out];
+        let out_len = checked_mul(batch, out, "bilinear: output size overflow")?;
+        let mut result = vec![0.0f64; out_len];
         for b in 0..batch {
             for k in 0..out {
                 let mut val = 0.0f64;
@@ -1508,7 +1540,10 @@ impl LayerNorm {
             )));
         }
 
-        let norm_numel: usize = normalized_shape.iter().product();
+        let norm_numel = checked_shape_numel(
+            &normalized_shape,
+            "LayerNorm normalized_shape volume overflow",
+        )?;
         if norm_numel == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -1590,12 +1625,15 @@ impl Module for LayerNorm {
             }
         }
 
-        let batch_numel: usize = if start == 0 {
+        let batch_numel = if start == 0 {
             1
         } else {
-            input_shape[..start].iter().product()
+            checked_shape_numel(&input_shape[..start], "LayerNorm batch shape overflow")?
         };
-        let norm_numel: usize = self.normalized_shape.iter().product();
+        let norm_numel = checked_shape_numel(
+            &self.normalized_shape,
+            "LayerNorm normalized_shape volume overflow",
+        )?;
 
         // Flatten to [batch_numel, norm_numel] for uniform reduction
         let flat = session.tensor_reshape(input, vec![batch_numel, norm_numel])?;
@@ -1878,12 +1916,14 @@ impl Module for Dropout3d {
             return session.tensor_mul(input, zeros);
         }
         let (n, c) = (shape[0], shape[1]);
-        let spatial: usize = shape[2..].iter().product();
-        let channel_rand = session.rand(vec![n * c], false)?;
+        let spatial = checked_shape_numel(&shape[2..], "Dropout3d spatial shape overflow")?;
+        let channels = checked_mul(n, c, "Dropout3d channel size overflow")?;
+        let channel_rand = session.rand(vec![channels], false)?;
         let channel_rand_vals = session.tensor_values(channel_rand)?;
         let scale = 1.0 / (1.0 - self.p);
-        let mut mask_data = vec![0.0f64; n * c * spatial];
-        for nc in 0..(n * c) {
+        let mask_len = checked_mul(channels, spatial, "Dropout3d mask size overflow")?;
+        let mut mask_data = vec![0.0f64; mask_len];
+        for nc in 0..channels {
             let keep = if channel_rand_vals[nc] > self.p {
                 scale
             } else {
@@ -1956,7 +1996,7 @@ impl Module for AlphaDropout {
             let (_, meta) = session.tensor_values_meta(input)?;
             meta.shape().to_vec()
         };
-        let numel: usize = shape.iter().product();
+        let numel = checked_shape_numel(&shape, "AlphaDropout input shape overflow")?;
         let input_vals = session.tensor_values(input)?;
 
         // For alpha dropout, we need to affine transform to preserve mean/variance
@@ -2065,7 +2105,7 @@ impl Module for Embedding {
             meta.shape().to_vec()
         };
 
-        let total: usize = input_shape.iter().product();
+        let total = checked_shape_numel(&input_shape, "Embedding input shape overflow")?;
 
         // Flatten indices to 1D for index_select
         let flat_indices = session.tensor_reshape(input, vec![total])?;
@@ -3414,8 +3454,8 @@ impl Module for PReLU {
                     },
                 )));
             }
-            let spatial: usize = if input_shape.len() >= 2 {
-                input_shape[2..].iter().product()
+            let spatial = if input_shape.len() >= 2 {
+                checked_shape_numel(&input_shape[2..], "PReLU spatial shape overflow")?
             } else {
                 1
             };
@@ -3424,11 +3464,22 @@ impl Module for PReLU {
             } else {
                 1
             };
+            let batch_stride = checked_mul(channels, spatial, "PReLU channel spatial overflow")?;
+            let expected = checked_mul(batch, batch_stride, "PReLU input shape volume overflow")?;
+            if expected != input_vals.len() {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "PReLU input values length mismatch",
+                    },
+                )));
+            }
 
             for b in 0..batch {
+                let base = b * batch_stride;
                 for (c, &a) in weight_vals.iter().enumerate().take(channels) {
+                    let channel_base = base + c * spatial;
                     for s in 0..spatial {
-                        let idx = b * channels * spatial + c * spatial + s;
+                        let idx = channel_base + s;
                         let x = input_vals[idx];
                         output.push(if x >= 0.0 { x } else { a * x });
                     }
@@ -4056,12 +4107,13 @@ impl Module for GroupNorm {
 
         let channels_per_group = channels / self.num_groups;
         // Compute spatial size (product of dims after N, C)
-        let spatial: usize = if input_shape.len() > 2 {
-            input_shape[2..].iter().product()
+        let spatial = if input_shape.len() > 2 {
+            checked_shape_numel(&input_shape[2..], "GroupNorm spatial shape overflow")?
         } else {
             1
         };
-        let group_numel = channels_per_group * spatial;
+        let group_numel =
+            checked_mul(channels_per_group, spatial, "GroupNorm group size overflow")?;
 
         // Reshape to [N, num_groups, channels_per_group * spatial] for per-group normalization
         let reshaped =
@@ -4162,7 +4214,10 @@ impl RMSNorm {
         normalized_shape: Vec<usize>,
         eps: f64,
     ) -> Result<Self, AutogradError> {
-        let total: usize = normalized_shape.iter().product();
+        let total = checked_shape_numel(
+            &normalized_shape,
+            "RMSNorm normalized_shape volume overflow",
+        )?;
         let weight = session.tensor_variable(vec![1.0; total], normalized_shape.clone(), true)?;
         Ok(Self {
             normalized_shape,
@@ -4187,7 +4242,10 @@ impl Module for RMSNorm {
         let vals = session.tensor_values(input)?;
         let input_shape = session.tensor_shape(input)?;
 
-        let norm_dims: usize = self.normalized_shape.iter().product();
+        let norm_dims = checked_shape_numel(
+            &self.normalized_shape,
+            "RMSNorm normalized_shape volume overflow",
+        )?;
         let ndim = input_shape.len();
         let norm_ndim = self.normalized_shape.len();
 
@@ -4210,8 +4268,31 @@ impl Module for RMSNorm {
             }
         }
 
+        if norm_dims == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RMSNorm normalized_shape must not contain zero dimensions",
+                },
+            )));
+        }
+
         let w_vals = session.tensor_values(self.weight)?;
-        let batch_dims: usize = input_shape[..ndim - norm_ndim].iter().product();
+        let batch_dims = if ndim == norm_ndim {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - norm_ndim],
+                "RMSNorm batch shape overflow",
+            )?
+        };
+        let expected = checked_mul(batch_dims, norm_dims, "RMSNorm input shape overflow")?;
+        if expected != vals.len() {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RMSNorm input values length mismatch",
+                },
+            )));
+        }
 
         let mut result = vec![0.0f64; vals.len()];
 
@@ -10306,7 +10387,7 @@ impl HingeEmbeddingLoss {
         let input_vals = session.tensor_values(input)?;
         let target_vals = session.tensor_values(target)?;
         let shape = session.tensor_shape(input)?;
-        let numel: usize = shape.iter().product();
+        let numel = checked_shape_numel(&shape, "HingeEmbeddingLoss input shape overflow")?;
         let mut result = vec![0.0f64; numel];
         for i in 0..numel {
             if target_vals[i] > 0.0 {
@@ -11816,9 +11897,22 @@ impl Module for ReflectionPad1d {
         }
 
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 1].iter().product();
-        let new_l = l + self.padding_left + self.padding_right;
-        let mut output = Vec::with_capacity(batch_dims * new_l);
+        let batch_dims = if ndim == 1 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 1],
+                "ReflectionPad1d batch shape overflow",
+            )?
+        };
+        let pad_total = checked_add(
+            self.padding_left,
+            self.padding_right,
+            "ReflectionPad1d padding overflow",
+        )?;
+        let new_l = checked_add(l, pad_total, "ReflectionPad1d output length overflow")?;
+        let output_len = checked_mul(batch_dims, new_l, "ReflectionPad1d output size overflow")?;
+        let mut output = Vec::with_capacity(output_len);
 
         for b in 0..batch_dims {
             let row = &vals[b * l..(b + 1) * l];
@@ -11892,13 +11986,37 @@ impl Module for ReflectionPad2d {
         }
 
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 2].iter().product();
-        let new_h = h + self.pad_top + self.pad_bottom;
-        let new_w = w + self.pad_left + self.pad_right;
-        let mut output = Vec::with_capacity(batch_dims * new_h * new_w);
+        let batch_dims = if ndim == 2 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 2],
+                "ReflectionPad2d batch shape overflow",
+            )?
+        };
+        let pad_h = checked_add(
+            self.pad_top,
+            self.pad_bottom,
+            "ReflectionPad2d padding overflow",
+        )?;
+        let pad_w = checked_add(
+            self.pad_left,
+            self.pad_right,
+            "ReflectionPad2d padding overflow",
+        )?;
+        let new_h = checked_add(h, pad_h, "ReflectionPad2d output height overflow")?;
+        let new_w = checked_add(w, pad_w, "ReflectionPad2d output width overflow")?;
+        let output_plane = checked_mul(new_h, new_w, "ReflectionPad2d output size overflow")?;
+        let output_len = checked_mul(
+            batch_dims,
+            output_plane,
+            "ReflectionPad2d output size overflow",
+        )?;
+        let mut output = Vec::with_capacity(output_len);
+        let input_plane = checked_mul(h, w, "ReflectionPad2d input shape overflow")?;
 
         for b in 0..batch_dims {
-            let plane = &vals[b * h * w..(b + 1) * h * w];
+            let plane = &vals[b * input_plane..(b + 1) * input_plane];
             for row_out in 0..new_h {
                 let src_row = if row_out < self.pad_top {
                     self.pad_top - row_out
@@ -11963,11 +12081,31 @@ impl Module for ReplicationPad1d {
         if self.padding_left == 0 && self.padding_right == 0 {
             return Ok(input);
         }
+        if l == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReplicationPad1d: input length is zero",
+                },
+            )));
+        }
 
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 1].iter().product();
-        let new_l = l + self.padding_left + self.padding_right;
-        let mut output = Vec::with_capacity(batch_dims * new_l);
+        let batch_dims = if ndim == 1 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 1],
+                "ReplicationPad1d batch shape overflow",
+            )?
+        };
+        let pad_total = checked_add(
+            self.padding_left,
+            self.padding_right,
+            "ReplicationPad1d padding overflow",
+        )?;
+        let new_l = checked_add(l, pad_total, "ReplicationPad1d output length overflow")?;
+        let output_len = checked_mul(batch_dims, new_l, "ReplicationPad1d output size overflow")?;
+        let mut output = Vec::with_capacity(output_len);
 
         for b in 0..batch_dims {
             let row = &vals[b * l..(b + 1) * l];
@@ -12028,14 +12166,47 @@ impl Module for ReplicationPad2d {
 
         let h = input_shape[ndim - 2];
         let w = input_shape[ndim - 1];
+        if (h == 0 || w == 0)
+            && (self.pad_top > 0 || self.pad_bottom > 0 || self.pad_left > 0 || self.pad_right > 0)
+        {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReplicationPad2d: input spatial dims are zero",
+                },
+            )));
+        }
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 2].iter().product();
-        let new_h = h + self.pad_top + self.pad_bottom;
-        let new_w = w + self.pad_left + self.pad_right;
-        let mut output = Vec::with_capacity(batch_dims * new_h * new_w);
+        let batch_dims = if ndim == 2 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 2],
+                "ReplicationPad2d batch shape overflow",
+            )?
+        };
+        let pad_h = checked_add(
+            self.pad_top,
+            self.pad_bottom,
+            "ReplicationPad2d padding overflow",
+        )?;
+        let pad_w = checked_add(
+            self.pad_left,
+            self.pad_right,
+            "ReplicationPad2d padding overflow",
+        )?;
+        let new_h = checked_add(h, pad_h, "ReplicationPad2d output height overflow")?;
+        let new_w = checked_add(w, pad_w, "ReplicationPad2d output width overflow")?;
+        let output_plane = checked_mul(new_h, new_w, "ReplicationPad2d output size overflow")?;
+        let output_len = checked_mul(
+            batch_dims,
+            output_plane,
+            "ReplicationPad2d output size overflow",
+        )?;
+        let mut output = Vec::with_capacity(output_len);
+        let input_plane = checked_mul(h, w, "ReplicationPad2d input shape overflow")?;
 
         for b in 0..batch_dims {
-            let plane = &vals[b * h * w..(b + 1) * h * w];
+            let plane = &vals[b * input_plane..(b + 1) * input_plane];
             for row_out in 0..new_h {
                 let src_row = if row_out < self.pad_top {
                     0
@@ -12112,15 +12283,60 @@ impl Module for ReplicationPad3d {
         let d = input_shape[ndim - 3];
         let h = input_shape[ndim - 2];
         let w = input_shape[ndim - 1];
+        if (d == 0 || h == 0 || w == 0)
+            && (self.pad_front > 0
+                || self.pad_back > 0
+                || self.pad_top > 0
+                || self.pad_bottom > 0
+                || self.pad_left > 0
+                || self.pad_right > 0)
+        {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "ReplicationPad3d: input spatial dims are zero",
+                },
+            )));
+        }
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 3].iter().product();
-        let new_d = d + self.pad_front + self.pad_back;
-        let new_h = h + self.pad_top + self.pad_bottom;
-        let new_w = w + self.pad_left + self.pad_right;
-        let mut output = Vec::with_capacity(batch_dims * new_d * new_h * new_w);
+        let batch_dims = if ndim == 3 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 3],
+                "ReplicationPad3d batch shape overflow",
+            )?
+        };
+        let pad_d = checked_add(
+            self.pad_front,
+            self.pad_back,
+            "ReplicationPad3d padding overflow",
+        )?;
+        let pad_h = checked_add(
+            self.pad_top,
+            self.pad_bottom,
+            "ReplicationPad3d padding overflow",
+        )?;
+        let pad_w = checked_add(
+            self.pad_left,
+            self.pad_right,
+            "ReplicationPad3d padding overflow",
+        )?;
+        let new_d = checked_add(d, pad_d, "ReplicationPad3d output depth overflow")?;
+        let new_h = checked_add(h, pad_h, "ReplicationPad3d output height overflow")?;
+        let new_w = checked_add(w, pad_w, "ReplicationPad3d output width overflow")?;
+        let output_plane = checked_mul(new_h, new_w, "ReplicationPad3d output size overflow")?;
+        let output_vol = checked_mul(new_d, output_plane, "ReplicationPad3d output size overflow")?;
+        let output_len = checked_mul(
+            batch_dims,
+            output_vol,
+            "ReplicationPad3d output size overflow",
+        )?;
+        let mut output = Vec::with_capacity(output_len);
+        let input_plane = checked_mul(h, w, "ReplicationPad3d input shape overflow")?;
+        let input_vol = checked_mul(d, input_plane, "ReplicationPad3d input shape overflow")?;
 
         for b in 0..batch_dims {
-            let vol = &vals[b * d * h * w..(b + 1) * d * h * w];
+            let vol = &vals[b * input_vol..(b + 1) * input_vol];
             for di in 0..new_d {
                 let src_d = di.saturating_sub(self.pad_front).min(d - 1);
                 for ri in 0..new_h {
@@ -12176,11 +12392,31 @@ impl Module for CircularPad1d {
         if self.padding_left == 0 && self.padding_right == 0 {
             return Ok(input);
         }
+        if l == 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "CircularPad1d: input length is zero",
+                },
+            )));
+        }
 
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 1].iter().product();
-        let new_l = l + self.padding_left + self.padding_right;
-        let mut output = Vec::with_capacity(batch_dims * new_l);
+        let batch_dims = if ndim == 1 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 1],
+                "CircularPad1d batch shape overflow",
+            )?
+        };
+        let pad_total = checked_add(
+            self.padding_left,
+            self.padding_right,
+            "CircularPad1d padding overflow",
+        )?;
+        let new_l = checked_add(l, pad_total, "CircularPad1d output length overflow")?;
+        let output_len = checked_mul(batch_dims, new_l, "CircularPad1d output size overflow")?;
+        let mut output = Vec::with_capacity(output_len);
 
         for b in 0..batch_dims {
             let row = &vals[b * l..(b + 1) * l];
@@ -12246,14 +12482,47 @@ impl Module for CircularPad2d {
 
         let h = input_shape[ndim - 2];
         let w = input_shape[ndim - 1];
+        if (h == 0 || w == 0)
+            && (self.pad_top > 0 || self.pad_bottom > 0 || self.pad_left > 0 || self.pad_right > 0)
+        {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "CircularPad2d: input spatial dims are zero",
+                },
+            )));
+        }
         let vals = session.tensor_values(input)?;
-        let batch_dims: usize = input_shape[..ndim - 2].iter().product();
-        let new_h = h + self.pad_top + self.pad_bottom;
-        let new_w = w + self.pad_left + self.pad_right;
-        let mut output = Vec::with_capacity(batch_dims * new_h * new_w);
+        let batch_dims = if ndim == 2 {
+            1
+        } else {
+            checked_shape_numel(
+                &input_shape[..ndim - 2],
+                "CircularPad2d batch shape overflow",
+            )?
+        };
+        let pad_h = checked_add(
+            self.pad_top,
+            self.pad_bottom,
+            "CircularPad2d padding overflow",
+        )?;
+        let pad_w = checked_add(
+            self.pad_left,
+            self.pad_right,
+            "CircularPad2d padding overflow",
+        )?;
+        let new_h = checked_add(h, pad_h, "CircularPad2d output height overflow")?;
+        let new_w = checked_add(w, pad_w, "CircularPad2d output width overflow")?;
+        let output_plane = checked_mul(new_h, new_w, "CircularPad2d output size overflow")?;
+        let output_len = checked_mul(
+            batch_dims,
+            output_plane,
+            "CircularPad2d output size overflow",
+        )?;
+        let mut output = Vec::with_capacity(output_len);
+        let input_plane = checked_mul(h, w, "CircularPad2d input shape overflow")?;
 
         for b in 0..batch_dims {
-            let plane = &vals[b * h * w..(b + 1) * h * w];
+            let plane = &vals[b * input_plane..(b + 1) * input_plane];
             for row_out in 0..new_h {
                 let src_row = ((row_out as isize - self.pad_top as isize) % h as isize + h as isize)
                     as usize
@@ -12511,6 +12780,14 @@ pub fn pack_padded_sequence(
     let shape = session.tensor_shape(input)?;
     let storage = session.tensor_values(input)?;
 
+    if shape.len() < 2 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: input must be at least 2-D",
+            },
+        )));
+    }
+
     let (max_len, batch_size) = if batch_first {
         (shape[1], shape[0])
     } else {
@@ -12552,7 +12829,28 @@ pub fn pack_padded_sequence(
     }
 
     // Feature size (product of dimensions after [T, B] or [B, T])
-    let feature_size: usize = shape[2..].iter().product::<usize>().max(1);
+    let mut feature_size =
+        checked_shape_numel(&shape[2..], "pack_padded_sequence feature shape overflow")?;
+    if feature_size == 0 {
+        feature_size = 1;
+    }
+    let expected = checked_mul(
+        batch_size,
+        max_len,
+        "pack_padded_sequence input shape overflow",
+    )?;
+    let expected = checked_mul(
+        expected,
+        feature_size,
+        "pack_padded_sequence input shape overflow",
+    )?;
+    if expected != storage.len() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: input storage length mismatch",
+            },
+        )));
+    }
 
     // Compute batch_sizes: at timestep t, how many sequences are still active
     let mut batch_sizes = Vec::with_capacity(max_len);
@@ -12634,7 +12932,37 @@ pub fn pad_packed_sequence(
         .collect();
 
     // Build padded output
-    let total = batch_size * out_len * feature_size;
+    let mut expected_steps = 0usize;
+    for &bs in &packed.batch_sizes {
+        expected_steps = checked_add(
+            expected_steps,
+            bs,
+            "pad_packed_sequence packed batch_sizes overflow",
+        )?;
+    }
+    let expected_elems = checked_mul(
+        expected_steps,
+        feature_size,
+        "pad_packed_sequence packed data overflow",
+    )?;
+    if expected_elems != packed_data.len() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: packed data length mismatch",
+            },
+        )));
+    }
+
+    let total = checked_mul(
+        batch_size,
+        out_len,
+        "pad_packed_sequence output size overflow",
+    )?;
+    let total = checked_mul(
+        total,
+        feature_size,
+        "pad_packed_sequence output size overflow",
+    )?;
     let mut output = vec![padding_value; total];
 
     let mut data_offset = 0;
@@ -12699,10 +13027,15 @@ pub fn pad_sequence(
     }
 
     let feature_shape = &shapes[0][1..];
-    let feature_size: usize = feature_shape.iter().product::<usize>().max(1);
+    let mut feature_size =
+        checked_shape_numel(feature_shape, "pad_sequence feature shape overflow")?;
+    if feature_size == 0 {
+        feature_size = 1;
+    }
     let batch_size = sequences.len();
 
-    let total = batch_size * max_len * feature_size;
+    let total = checked_mul(batch_size, max_len, "pad_sequence output size overflow")?;
+    let total = checked_mul(total, feature_size, "pad_sequence output size overflow")?;
     let mut output = vec![padding_value; total];
 
     for (b, &seq) in sequences.iter().enumerate() {
@@ -12754,9 +13087,26 @@ pub fn weight_norm_decompose(
     }
 
     let values = session.tensor_values(weight)?;
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "weight_norm: shape volume overflow")?;
     let dim_size = shape[dim];
-    let inner: usize = shape[dim + 1..].iter().product::<usize>().max(1);
+    if dim_size == 0 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "weight_norm: dimension size must be > 0",
+            },
+        )));
+    }
+    let mut inner = checked_shape_numel(&shape[dim + 1..], "weight_norm: inner shape overflow")?;
+    if inner == 0 {
+        inner = 1;
+    }
+    if numel != values.len() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "weight_norm: input values length mismatch",
+            },
+        )));
+    }
 
     let mut norms = vec![0.0; dim_size];
     for (i, &v) in values.iter().enumerate().take(numel) {
@@ -12782,11 +13132,42 @@ pub fn weight_norm_reconstruct(
     dim: usize,
 ) -> Result<TensorNodeId, AutogradError> {
     let v_shape = session.tensor_shape(v)?;
+    if dim >= v_shape.len() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "weight_norm: dim out of range",
+            },
+        )));
+    }
     let v_values = session.tensor_values(v)?;
     let g_values = session.tensor_values(g)?;
-    let numel: usize = v_shape.iter().product();
+    let numel = checked_shape_numel(&v_shape, "weight_norm: shape volume overflow")?;
     let dim_size = v_shape[dim];
-    let inner: usize = v_shape[dim + 1..].iter().product::<usize>().max(1);
+    if dim_size == 0 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "weight_norm: dimension size must be > 0",
+            },
+        )));
+    }
+    if g_values.len() != dim_size {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "weight_norm: magnitude length mismatch",
+            },
+        )));
+    }
+    if numel != v_values.len() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "weight_norm: input values length mismatch",
+            },
+        )));
+    }
+    let mut inner = checked_shape_numel(&v_shape[dim + 1..], "weight_norm: inner shape overflow")?;
+    if inner == 0 {
+        inner = 1;
+    }
 
     let mut norms = vec![0.0; dim_size];
     for (i, &val) in v_values.iter().enumerate().take(numel) {
@@ -12814,7 +13195,14 @@ pub fn spectral_norm(
     weight: TensorNodeId,
 ) -> Result<f64, AutogradError> {
     let shape = session.tensor_shape(weight)?;
-    let numel: usize = shape.iter().product();
+    if shape.is_empty() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "spectral_norm requires at least 1 dimension",
+            },
+        )));
+    }
+    let numel = checked_shape_numel(&shape, "spectral_norm shape overflow")?;
     if numel == 0 {
         return Ok(0.0);
     }
@@ -12836,7 +13224,7 @@ pub fn init_constant_(
     val: f64,
 ) -> Result<TensorNodeId, AutogradError> {
     let shape = session.tensor_shape(tensor)?;
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "init_constant_: shape volume overflow")?;
     let new_values = vec![val; numel];
     session.tensor_update_param_values(tensor, new_values)?;
     Ok(tensor)
@@ -12866,7 +13254,7 @@ pub fn init_uniform_(
     b: f64,
 ) -> Result<TensorNodeId, AutogradError> {
     let shape = session.tensor_shape(tensor)?;
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "init_uniform_: shape volume overflow")?;
     // Generate uniform [0,1) then scale to [a, b)
     let rand_node = session.rand(vec![numel], false)?;
     let rand_vals = session.tensor_values(rand_node)?;
@@ -12883,7 +13271,7 @@ pub fn init_normal_(
     std: f64,
 ) -> Result<TensorNodeId, AutogradError> {
     let shape = session.tensor_shape(tensor)?;
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "init_normal_: shape volume overflow")?;
     let randn_node = session.randn(vec![numel], false)?;
     let randn_vals = session.tensor_values(randn_node)?;
     let new_values: Vec<f64> = randn_vals.iter().map(|&v| mean + std * v).collect();
@@ -12903,12 +13291,13 @@ pub fn init_trunc_normal_(
     b: f64,
 ) -> Result<TensorNodeId, AutogradError> {
     let shape = session.tensor_shape(tensor)?;
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "init_trunc_normal_: shape volume overflow")?;
     let mut values = Vec::with_capacity(numel);
     // Generate in batches, rejecting out-of-range samples
     let mut remaining = numel;
     while remaining > 0 {
-        let batch_size = remaining * 2 + 64; // over-generate
+        let batch_size = checked_mul(remaining, 2, "init_trunc_normal_: batch overflow")?;
+        let batch_size = checked_add(batch_size, 64, "init_trunc_normal_: batch overflow")?;
         let randn_node = session.randn(vec![batch_size], false)?;
         let randn_vals = session.tensor_values(randn_node)?;
         for &v in &randn_vals {
@@ -12940,7 +13329,8 @@ pub fn init_eye_(
         )));
     }
     let (rows, cols) = (shape[0], shape[1]);
-    let mut values = vec![0.0; rows * cols];
+    let numel = checked_mul(rows, cols, "init_eye_: shape volume overflow")?;
+    let mut values = vec![0.0; numel];
     let diag_len = rows.min(cols);
     for i in 0..diag_len {
         values[i * cols + i] = 1.0;
@@ -12972,9 +13362,10 @@ fn calculate_fan_in_fan_out(shape: &[usize]) -> Result<(usize, usize), AutogradE
         fan_in = shape[1];
         fan_out = shape[0];
     } else {
-        let receptive_field: usize = shape[2..].iter().product();
-        fan_in = shape[1] * receptive_field;
-        fan_out = shape[0] * receptive_field;
+        let receptive_field =
+            checked_shape_numel(&shape[2..], "fan_in/fan_out receptive field overflow")?;
+        fan_in = checked_mul(shape[1], receptive_field, "fan_in overflow")?;
+        fan_out = checked_mul(shape[0], receptive_field, "fan_out overflow")?;
     }
     Ok((fan_in, fan_out))
 }
@@ -13079,7 +13470,7 @@ pub fn init_orthogonal_(
         )));
     }
     let rows = shape[0];
-    let cols: usize = shape[1..].iter().product();
+    let cols = checked_shape_numel(&shape[1..], "orthogonal_: column shape overflow")?;
 
     // Generate random matrix and compute QR
     let rand_node = session.randn(vec![rows, cols], false)?;
@@ -13092,7 +13483,7 @@ pub fn init_orthogonal_(
     let q_rows = q_shape[0];
     let q_cols = q_shape[1];
 
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "orthogonal_: shape volume overflow")?;
     let mut values = vec![0.0; numel];
 
     // Copy Q into the result, scaling by gain
@@ -13126,6 +13517,7 @@ pub fn init_sparse_(
     }
     let (rows, cols) = (shape[0], shape[1]);
     let num_zeros_per_col = (rows as f64 * sparsity).ceil() as usize;
+    let matrix_len = checked_mul(rows, cols, "sparse_: shape volume overflow")?;
 
     // Start with normal-distributed values
     init_normal_(session, tensor, 0.0, std)?;
@@ -13133,8 +13525,15 @@ pub fn init_sparse_(
 
     // For each column, zero out a random selection of rows
     // Use a simple deterministic approach based on session RNG
-    let rand_node = session.rand(vec![rows * cols], false)?;
+    let rand_node = session.rand(vec![matrix_len], false)?;
     let rand_vals = session.tensor_values(rand_node)?;
+    if rand_vals.len() != matrix_len {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "sparse_: random buffer length mismatch",
+            },
+        )));
+    }
 
     for j in 0..cols {
         // Collect (random_key, row_index) for this column, sort by key, zero the top entries
@@ -13167,18 +13566,22 @@ pub fn init_dirac_(
             },
         )));
     }
-    let numel: usize = shape.iter().product();
+    let numel = checked_shape_numel(&shape, "dirac_: shape volume overflow")?;
     let mut values = vec![0.0; numel];
 
     let out_channels = shape[0];
     let in_channels = shape[1];
     let min_channels = out_channels.min(in_channels);
-    let spatial: usize = shape[2..].iter().product();
+    let spatial = checked_shape_numel(&shape[2..], "dirac_: spatial shape overflow")?;
     let center = spatial / 2; // center of the spatial kernel
+    let channel_stride = checked_mul(in_channels, spatial, "dirac_: channel stride overflow")?;
 
     for i in 0..min_channels {
         // For channel pair (i, i), set the center spatial element to 1.0
-        let offset = i * in_channels * spatial + i * spatial + center;
+        let base = checked_mul(i, channel_stride, "dirac_: offset overflow")?;
+        let inner = checked_mul(i, spatial, "dirac_: offset overflow")?;
+        let offset = checked_add(base, inner, "dirac_: offset overflow")?;
+        let offset = checked_add(offset, center, "dirac_: offset overflow")?;
         if offset < numel {
             values[offset] = 1.0;
         }
