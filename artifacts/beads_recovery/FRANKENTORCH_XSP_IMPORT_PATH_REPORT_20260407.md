@@ -66,6 +66,59 @@ The question was which write path reintroduced the anomaly after a clean `VACUUM
    - The old blocked-cache pages are not returned to the freelist correctly.
    - This leaves orphaned pages that `integrity_check` reports as `never used`.
 
+## 2026-04-27 z2w revalidation
+
+`frankentorch-z2w` repeated the recovery probe after `Dicklesworthstone/beads_rust#224` was
+closed. The installed tool was:
+
+- `br version 0.1.38 (release) (v0.1.38@8c5b245)`
+- upstream #224 fix commit cited in the issue: `08a1a90`
+- GitHub compare result: local `8c5b245` is 8 commits ahead of `08a1a90`
+
+Two inputs were tested from the clean vacuumed DB
+`.beads/beads.db.vacuum_c84_20260407T013244Z`:
+
+1. Archived xsp JSONL fixture:
+   `artifacts/beads_recovery/c84_snapshot_20260407T013033Z/issues.jsonl`
+2. Current repo JSONL:
+   `.beads/issues.jsonl`
+
+Results:
+
+- archived fixture: `br sync --import-only --json`, plain `br list --json`, plain
+  `br ready --json`, and plain `br show frankentorch-xsp --json` all preserved
+  `PRAGMA integrity_check = ok`; page count stayed `89`, freelist count stayed `0`
+- current JSONL: `br info --json`, `br doctor`, `br sync --status --json`,
+  `br list --json --no-auto-import`, and `br ready --json --no-auto-import` preserved
+  `PRAGMA integrity_check = ok`; page count stayed `89`, freelist count stayed `0`
+- current JSONL import or auto-import paths still failed the orthogonal SQLite
+  `PRAGMA integrity_check`:
+  - `br sync --import-only --json`
+  - plain `br list --json`
+  - plain `br ready --json`
+  - plain `br show frankentorch-z2w --json`
+  - plain `br update frankentorch-z2w --status in_progress --json`
+- the current-JSONL failure signature changed from orphaned old rootpages to:
+  - page count `89 -> 109`
+  - freelist count `0 -> 4`
+  - `integrity_check`: `Tree 12 page 12: free space corruption`
+  - `blocked_issues_cache` and `idx_blocked_cache_blocked_at` rootpages stayed at `19` and `56`
+
+Interpretation:
+
+- The original #224 `blocked_issues_cache` drop/create rootpage churn appears fixed for the
+  archived xsp fixture.
+- Importing the current repo JSONL into the same clean vacuumed DB still creates an integrity
+  warning visible to the orthogonal SQLite checker, even though `br doctor` reports its internal
+  `sqlite.integrity_check` as OK.
+- The local `--no-auto-import` recovery rule remains necessary for freshly vacuumed recovery DBs
+  until this residual current-JSONL import corruption is understood.
+
+Revalidation artifacts were generated under:
+
+- `artifacts/beads_recovery/z2w_revalidation_20260427T204133Z/results.json`
+- `artifacts/beads_recovery/z2w_revalidation_20260427T204133Z/archived_jsonl_results.json`
+
 ## Reproduction summary
 
 ### Probe matrix
@@ -98,12 +151,12 @@ Observed result:
 
 ## Operational guidance
 
-Until the upstream bug is fixed:
+Until the residual current-JSONL import corruption is fixed:
 
-- treat the import path as the corrupting operation
+- treat the import path as unsafe for freshly vacuumed recovery DBs
 - use `--no-auto-import` when inspecting a known-good vacuumed recovery DB
 - prefer `br doctor` or `br info` for non-mutating diagnostics on recovered DBs
-- assume any command that auto-imports can reintroduce the warning
+- assume any command that auto-imports can reintroduce an integrity warning
 
 ## Local recovery playbook
 
@@ -134,7 +187,7 @@ when logical issue data remains usable.
 
 ## Upstream escalation
 
-The issue is now escalated upstream in `beads_rust`:
+The original issue was escalated upstream in `beads_rust`:
 
 - `Dicklesworthstone/beads_rust#224`
 - https://github.com/Dicklesworthstone/beads_rust/issues/224
@@ -146,11 +199,16 @@ The upstream report includes:
 - exact `integrity_check` failure output
 - the current local workaround (`--no-auto-import` on recovered DBs)
 
+On 2026-04-27, `frankentorch-z2w` added fresh upstream evidence: the archived reproducer passes
+with `br 0.1.38`, but importing the current FrankenTorch JSONL still leaves orthogonal SQLite
+`PRAGMA integrity_check` reporting `Tree 12 page 12: free space corruption`.
+
 ## Remaining work
 
-This investigation isolated the failing class of operations and escalated it upstream, but it did
-not fix the underlying writer/import implementation in `beads_rust` / frankensqlite. Remaining
-follow-up should track:
+This investigation isolated the original failing class of operations and the z2w pass narrowed the
+residual failure to current-JSONL import behavior. Remaining follow-up should track:
 
-- validating the upstream fix against the archived xsp probe matrix
-- removing the temporary `--no-auto-import` recovery restriction once the fix is confirmed
+- determining why the current FrankenTorch JSONL import still produces orthogonal SQLite
+  free-space corruption while the archived xsp JSONL passes
+- removing the temporary `--no-auto-import` recovery restriction only after both archived and
+  current-JSONL recovery imports preserve orthogonal `PRAGMA integrity_check = ok`

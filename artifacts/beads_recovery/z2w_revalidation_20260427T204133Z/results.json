@@ -1,0 +1,614 @@
+{
+  "schema_version": "frankentorch-z2w-revalidation-v1",
+  "generated_on": "2026-04-27",
+  "bead": "frankentorch-z2w",
+  "br_version": "{\"version\":\"0.1.38\",\"build\":\"release\",\"commit\":\"8c5b245da2f8d1db45c5d10596871a481412657b\",\"branch\":\"v0.1.38\",\"rust_version\":\"1.95.0-nightly\",\"target\":\"x86_64-unknown-linux-gnu\",\"features\":[\"self_update\"]}",
+  "source_clean_db": ".beads/beads.db.vacuum_c84_20260407T013244Z",
+  "source_jsonl": ".beads/issues.jsonl",
+  "upstream_issue": {
+    "url": "https://github.com/Dicklesworthstone/beads_rust/issues/224",
+    "observed_state": "CLOSED",
+    "observed_closed_at": "2026-04-09T00:26:23Z"
+  },
+  "results": [
+    {
+      "case": "baseline",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": null,
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "info_json",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "info",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"database_path\": \"/data/projects/frankentorch/artifacts/beads_recovery/z2w_revalidation_20260427T204133Z/cases/info_json/.beads/beads.db\",\n  \"beads_dir\": \"/data/projects/frankentorch/artifacts/beads_recovery/z2w_revalidation_20260427T204133Z/cases/info_json/.beads\",\n  \"mode\": \"direct\",\n  \"daemon_connected\": false,\n  \"daemon_fallback_reason\": \"no-daemon\",\n  \"daemon_detail\": \"br runs in direct mode only\",\n  \"issue_count\": 106,\n  \"config\": {\n    \"issue_prefix\": \"frankentorch\"\n  },\n  \"db_size\": 364544,\n  \"jsonl_path\": \"/data/projects/frankentorch/artifacts/beads_recovery/z2w_revalidation_20260427T204133Z/cases/info_json/.beads/issues.jsonl\",\n  \"jsonl_size\": 141585\n}\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "doctor",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "doctor"
+        ],
+        "returncode": 0,
+        "stdout_head": "br doctor\nOK jsonl.merge_artifacts\nOK sync_jsonl_path: JSONL path is within sync allowlist\nOK sync_conflict_markers: No merge conflict markers found\nOK jsonl.parse: Parsed 154 records\nOK db.recovery_artifacts\nOK db.sidecars\nOK schema.tables\nOK schema.columns\nOK db.recoverable_anomalies\nOK db.null_defaults\nOK sqlite.integrity_check\nWARN counts.db_vs_jsonl: DB and JSONL counts differ\nOK sync.metadata: External changes pending import\nOK db.write_probe: Rollback-only issue write succeeded for frankentorch-0bi\nWARN sqlite3.integrity_check: sqlite3 not available; skipping orthogonal integrity validation\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "sync_status",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "sync",
+          "--status",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"dirty_count\": 0,\n  \"last_import_time\": \"2026-04-07T01:31:46.513356868+00:00\",\n  \"jsonl_content_hash\": \"10552dfaa05de36441af92e18e05cadf6090d890411268f0544c4af3b1380f70\",\n  \"jsonl_exists\": true,\n  \"jsonl_newer\": true,\n  \"db_newer\": false\n}\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "list_no_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "list",
+          "--json",
+          "--no-auto-import"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"issues\": [\n    {\n      \"id\": \"frankentorch-g7f\",\n      \"title\": \"ft-data dataloader initial shuffle parity\",\n      \"description\": \"DataLoader with DataLoaderConfig::with_shuffle(true) preserves sequential order on first epoch until reset() is called. PyTorch-observable behavior expects the first epoch to be shuffled as well. Fix construction-time behavior and add regression coverage in ft-data.\",\n      \"status\": \"in_progress\",\n      \"priority\": 1,\n      \"issue_type\": \"bug\",\n      \"created_at\": \"2026-04-07T01:24:12.805969180Z\",\n      \"created_by\": \"ubuntu\",\n      \"updated_at\": \"2026-04-07T01:24:24.350088229Z\",\n      \"source_repo\": \".\",\n      \"compaction_level\": 0,\n      \"original_size\": 0,\n      \"dependency_count\": 0,\n      \"dependent_count\": 0\n    },\n    {\n      \"id\": \"frankentorch-c84\",\n      \"title\": \"Diagnose residual beads integrity-check warning\",\n      \"status\": \"in_progress\",\n      \"priority\": 2,\n      \"issue_type\": \"bug\",\n      \"created_at\": \"2026-04-07T01:27:54.222375196Z\",\n      \"created_by\": \"ubuntu\",\n      \"updated_at\": \"2026-04-07T01:27:58.971587454Z\",\n      \"source_repo\": \".\",\n      \"compaction_level\": 0,\n      \"original_size\": 0,\n      \"dependency_count\": 0,\n      \"dependent_count\": 0\n    }\n  ],\n  \"total\": 2,\n  \"limit\": 50,\n  \"offset\": 0,\n  \"has_more\": false\n}\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "ready_no_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "ready",
+          "--json",
+          "--no-auto-import"
+        ],
+        "returncode": 0,
+        "stdout_head": "[]\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "sync_import_only",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "sync",
+          "--import-only",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"created\": 48,\n  \"updated\": 2,\n  \"skipped\": 104,\n  \"tombstone_skipped\": 0,\n  \"orphans_removed\": 0,\n  \"blocked_cache_rebuilt\": true\n}\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "*** in database main ***\nTree 12 page 12: free space corruption",
+          "wrong # of entries in index idx_metadata_key"
+        ],
+        "page_count": 109,
+        "freelist_count": 4,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": false,
+      "page_delta": 20,
+      "freelist_delta": 4
+    },
+    {
+      "case": "list_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "list",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"issues\": [\n    {\n      \"id\": \"frankentorch-vws\",\n      \"title\": \"Validate performance SLOs from spec against actual measurements\",\n      \"description\": \"COMPREHENSIVE_SPEC_FOR_FRANKENTORCH_V1.md \u00a717 defines 8 performance budgets that have NEVER been measured:\\n\\n| Path | Workload | Budget |\\n|---|---|---|\\n| elementwise forward | 100M elements | p95 <= 200 ms |\\n| backward pass | representative autograd graphs | p95 <= 1.35x forward baseline |\\n| matmul core | medium dense matrices | p95 <= 240 ms |\\n| optimizer step | 10M params Adam | p95 <= 130 ms |\\n| checkpoint save/load | 2 GB model state | throughput >= 350 MB/s |\\n| memory footprint | training step profile | peak RSS regression <= +8% |\\n| allocation churn | backward-heavy trace | alloc count regression <= +10% |\\n| tail stability | benchmark families | p99 regression <= +7% |\\n\\nThe spec's M4 milestone (Hardening) requires performance gates to pass. Currently we have exactly one benchmark (scalar DAC microbench, p95=4698ns) which doesn't cover any of the 8 SLOs.\\n\\nImplementation plan:\\n1. Create a benchmark binary in ft-conformance (or a new crate) that runs each of the 8 workloads\\n2. For each: run 100 iterations, compute p50/p95/p99, compare against the budget\\n3. Emit structured JSON results to artifacts/phase2c/performance/\\n4. Create a gate script that reads the JSON and fails if any SLO is exceeded\\n5. Document whether FrankenTorch meets, exceeds, or fails each budget\\n\\nKey consideration: We're CPU-only and pure Rust with no BLAS \u2014 we may not meet matmul or elementwise budgets for 100M elements. That's OK \u2014 the goal is to MEASURE and know where we stand, then document realistic budgets.\\n\\nTests:\\n- Benchmark binary should be runnable via: rch exec -- cargo run -p ft-conformance --bin run_perf_slos\\n- JSON output should be machine-readable and diffable\\n- Gate script should exit 0 (pass) or 1 (fail) with human-readable report\",\n      \"status\": \"in_progress\",\n      \"priority\": 1,\n      \"issue_type\": \"task\",\n      \"created_at\": \"2026-04-07T04:17:24.426519762Z\",\n      \"created_by\": \"ubuntu\",\n      \"updated_at\": \"2026-04-07T20:07:53.847148434Z\",\n      \"source_repo\": \".\",\n      \"compaction_level\": 0,\n      \"original_size\": 0,\n      \"dependency_count\": 0,\n      \"dependent_count\": 1\n    },\n    {\n      \"id\": \"frankentorch-wze\",\n      \"title\": \"Escalate blocked_issues_cache import-path page leak and preserve safe tracker workflow\",\n      \"description\": \"Follow-up to frankentorch-xsp.\\n\\nInvestigation isolated the integrity regression to the import path: explicit `br sync --import-only` and any command that auto-imports current JSONL into a clean vacuumed DB. The stable signature is blocked_issues_cache churn: old blocked-cache table/index pages become `PRAGMA integrity_check` `never used` pages after import/rebuild.\\n\\nSafe on a clean vacuumed DB: `br info`, `br doctor`, `br sync --status`, and commands with `--no-auto-import`.\\n\\nArtifacts:\\n- artifacts/beads_recovery/FRANKENTORCH_XSP_IMPORT_PATH_REPORT_20260407.md\\n- artifacts/beads_recovery/xsp_probe_20260407T025948Z/results.json\\n- artifacts/beads_recovery/xsp_import_focus_20260407T030054Z/results.json\\n- artifacts/beads_recovery/xsp_repeat_import_20260407T030112Z/results.json\\n- artifacts/beads_recovery/xsp_sequence_20260407T030136Z/results.json\\n\\nNext work:\\n1. Escalate the import-path / blocked-cache page leak upstream in beads_rust or frankensqlite.\\n2. Preserve a local recovery playbook that warns agents to avoid auto-import on freshly vacuumed recovery DBs until the upstream fix lands.\\n3. Re-validate the workaround after the upstream fix by repeating the xsp probe matrix.\",\n      \"status\": \"open\",\n      \"priority\": 1,\n      \"issue_type\": \"task\",\n      \"created_at\": \"2026-04-07T03:04:23.139752494Z\",\n      \"created_by\": \"ubuntu\",\n      \"updated_at\": \"2026-04-07T03:05:03.896531775Z\",\n      \"source_repo\": \".\",\n      \"compaction_level\": 0,\n      \"original_size\": 0,\n      \"dependency_count\": 0,\n      \"depend",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "*** in database main ***\nTree 12 page 12: free space corruption",
+          "wrong # of entries in index idx_metadata_key"
+        ],
+        "page_count": 109,
+        "freelist_count": 4,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": false,
+      "page_delta": 20,
+      "freelist_delta": 4
+    },
+    {
+      "case": "ready_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "ready",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "[\n  {\n    \"created_at\": \"2026-04-07T03:04:23.139752494Z\",\n    \"created_by\": \"ubuntu\",\n    \"description\": \"Follow-up to frankentorch-xsp.\\n\\nInvestigation isolated the integrity regression to the import path: explicit `br sync --import-only` and any command that auto-imports current JSONL into a clean vacuumed DB. The stable signature is blocked_issues_cache churn: old blocked-cache table/index pages become `PRAGMA integrity_check` `never used` pages after import/rebuild.\\n\\nSafe on a clean vacuumed DB: `br info`, `br doctor`, `br sync --status`, and commands with `--no-auto-import`.\\n\\nArtifacts:\\n- artifacts/beads_recovery/FRANKENTORCH_XSP_IMPORT_PATH_REPORT_20260407.md\\n- artifacts/beads_recovery/xsp_probe_20260407T025948Z/results.json\\n- artifacts/beads_recovery/xsp_import_focus_20260407T030054Z/results.json\\n- artifacts/beads_recovery/xsp_repeat_import_20260407T030112Z/results.json\\n- artifacts/beads_recovery/xsp_sequence_20260407T030136Z/results.json\\n\\nNext work:\\n1. Escalate the import-path / blocked-cache page leak upstream in beads_rust or frankensqlite.\\n2. Preserve a local recovery playbook that warns agents to avoid auto-import on freshly vacuumed recovery DBs until the upstream fix lands.\\n3. Re-validate the workaround after the upstream fix by repeating the xsp probe matrix.\",\n    \"id\": \"frankentorch-wze\",\n    \"issue_type\": \"task\",\n    \"priority\": 1,\n    \"status\": \"open\",\n    \"title\": \"Escalate blocked_issues_cache import-path page leak and preserve safe tracker workflow\",\n    \"updated_at\": \"2026-04-07T03:05:03.896531775Z\"\n  },\n  {\n    \"created_at\": \"2026-04-07T04:18:09.970716552Z\",\n    \"created_by\": \"ubuntu\",\n    \"description\": \"torch.cuda.amp (Automatic Mixed Precision) is used in virtually every modern training pipeline. Even on CPU, F16/BF16 mixed precision can be useful for inference and for testing AMP workflows before moving to GPU.\\n\\nSince FrankenTorch already supports F16 and BF16 dtypes in ft-core, the infrastructure exists \u2014 what's missing is the autocast and grad scaling machinery.\\n\\nImplementation plan:\\n1. Add an AutocastContext to ft-api that tracks whether autocast is active and the target dtype\\n2. Add session.autocast_enter(dtype) / session.autocast_exit() (matching no_grad pattern)\\n3. Add session.with_autocast(dtype, closure) panic-safe wrapper\\n4. When autocast is active: matmul, linear, conv operations auto-downcast inputs to the target dtype (F16/BF16), then upcast output back to F32\\n5. Add a GradScaler struct in ft-optim that:\\n   a. Scales loss by a factor before backward (prevents F16 underflow)\\n   b. Unscales gradients before optimizer step\\n   c. Checks for inf/nan in gradients, skipping the update if found\\n   d. Adjusts scale factor dynamically based on overflow frequency\\n\\nKey: The autocast policy (which ops to cast) should match PyTorch's known-safe list \u2014 matmul, linear, conv are safe; softmax, layernorm, loss functions should stay in F32.\\n\\nTests:\\n- Unit test: autocast context enters/exits correctly, respects nesting\\n- Unit test: matmul inside autocast uses F16, outside uses F32\\n- Unit test: GradScaler scales loss and unscales gradients\\n- Unit test: GradScaler skips update on inf gradients\\n- E2E test: train a linear model with autocast + GradScaler, verify convergence\\n- Panic-safety: with_autocast restores state on unwind\",\n    \"id\": \"frankentorch-iha\",\n    \"issue_type\": \"feature\",\n    \"priority\": 2,\n    \"status\": \"open\",\n    \"title\": \"Add mixed precision support (torch.amp equivalent)\",\n    \"updated_at\": \"2026-04-07T04:18:09.970716552Z\"\n  },\n  {\n    \"created_at\": \"2026-04-07T04:18:38.229580914Z\",\n    \"created_by\": \"ubuntu\",\n    \"description\": \"PyTorch's quantization allows running models with INT8 weights for faster inference and smaller model size. This is increasingly important for edge deployment.\\n\\nImplementation plan (CPU quantization only):\\n1. Add quantized dtypes to ft-core: QInt8, QUInt8 (with scale and zero_point metadata)\\n2. Add QuantizedTensorMeta exten",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "*** in database main ***\nTree 12 page 12: free space corruption",
+          "wrong # of entries in index idx_metadata_key"
+        ],
+        "page_count": 109,
+        "freelist_count": 4,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": false,
+      "page_delta": 20,
+      "freelist_delta": 4
+    },
+    {
+      "case": "show_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "show",
+          "frankentorch-z2w",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "[\n  {\n    \"id\": \"frankentorch-z2w\",\n    \"title\": \"Revalidate beads recovery workflow after beads_rust#224 is fixed\",\n    \"description\": \"Follow-up to frankentorch-wze.\\\\n\\\\nOnce Dicklesworthstone/beads_rust#224 lands, rerun the archived xsp probe matrix against a freshly vacuumed recovery DB and confirm whether the blocked_issues_cache import path still leaks old pages.\\\\n\\\\nAcceptance:\\\\n1. Repeat the recovery probe matrix using the existing artifacts/beads_recovery/xsp_* fixtures as the reference workflow.\\\\n2. Verify whether br sync --import-only --json and formerly auto-importing commands keep PRAGMA integrity_check clean.\\\\n3. If clean, remove the temporary --no-auto-import recovery warning from AGENTS.md and the recovery report.\\\\n4. If not clean, update the upstream issue with fresh findings and keep the local workaround in place.\",\n    \"status\": \"in_progress\",\n    \"priority\": 2,\n    \"issue_type\": \"task\",\n    \"created_at\": \"2026-04-08T19:11:23.755208071Z\",\n    \"created_by\": \"ubuntu\",\n    \"updated_at\": \"2026-04-27T20:41:16.154076862Z\",\n    \"external_ref\": \"https://github.com/Dicklesworthstone/beads_rust/issues/224\",\n    \"source_repo\": \".\",\n    \"compaction_level\": 0,\n    \"original_size\": 0\n  }\n]\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "*** in database main ***\nTree 12 page 12: free space corruption",
+          "wrong # of entries in index idx_metadata_key"
+        ],
+        "page_count": 109,
+        "freelist_count": 4,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": false,
+      "page_delta": 20,
+      "freelist_delta": 4
+    },
+    {
+      "case": "update_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "--actor",
+          "BoldFrog",
+          "update",
+          "frankentorch-z2w",
+          "--status",
+          "in_progress",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "[\n  {\n    \"id\": \"frankentorch-z2w\",\n    \"title\": \"Revalidate beads recovery workflow after beads_rust#224 is fixed\",\n    \"status\": \"in_progress\",\n    \"priority\": 2,\n    \"updated_at\": \"2026-04-27T20:42:44.694742249Z\"\n  }\n]\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "*** in database main ***\nTree 12 page 12: free space corruption",
+          "wrong # of entries in index idx_metadata_key"
+        ],
+        "page_count": 109,
+        "freelist_count": 4,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": false,
+      "page_delta": 20,
+      "freelist_delta": 4
+    }
+  ]
+}

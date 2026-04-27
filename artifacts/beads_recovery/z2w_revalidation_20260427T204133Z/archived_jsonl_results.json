@@ -1,0 +1,273 @@
+{
+  "schema_version": "frankentorch-z2w-archived-jsonl-revalidation-v1",
+  "generated_on": "2026-04-27",
+  "bead": "frankentorch-z2w",
+  "br_version": "{\"version\":\"0.1.38\",\"build\":\"release\",\"commit\":\"8c5b245da2f8d1db45c5d10596871a481412657b\",\"branch\":\"v0.1.38\",\"rust_version\":\"1.95.0-nightly\",\"target\":\"x86_64-unknown-linux-gnu\",\"features\":[\"self_update\"]}",
+  "source_clean_db": ".beads/beads.db.vacuum_c84_20260407T013244Z",
+  "source_jsonl": "artifacts/beads_recovery/c84_snapshot_20260407T013033Z/issues.jsonl",
+  "results": [
+    {
+      "case": "archived_baseline",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": null,
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "archived_sync_import_only",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "sync",
+          "--import-only",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"created\": 0,\n  \"updated\": 0,\n  \"skipped\": 0,\n  \"tombstone_skipped\": 0,\n  \"orphans_removed\": 0,\n  \"blocked_cache_rebuilt\": false\n}\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "archived_list_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "list",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "{\n  \"issues\": [\n    {\n      \"id\": \"frankentorch-g7f\",\n      \"title\": \"ft-data dataloader initial shuffle parity\",\n      \"description\": \"DataLoader with DataLoaderConfig::with_shuffle(true) preserves sequential order on first epoch until reset() is called. PyTorch-observable behavior expects the first epoch to be shuffled as well. Fix construction-time behavior and add regression coverage in ft-data.\",\n      \"status\": \"in_progress\",\n      \"priority\": 1,\n      \"issue_type\": \"bug\",\n      \"created_at\": \"2026-04-07T01:24:12.805969180Z\",\n      \"created_by\": \"ubuntu\",\n      \"updated_at\": \"2026-04-07T01:24:24.350088229Z\",\n      \"source_repo\": \".\",\n      \"compaction_level\": 0,\n      \"original_size\": 0,\n      \"dependency_count\": 0,\n      \"dependent_count\": 0\n    },\n    {\n      \"id\": \"frankentorch-c84\",\n      \"title\": \"Diagnose residual beads integrity-check warning\",\n      \"status\": \"in_progress\",\n      \"priority\": 2,\n      \"issue_type\": \"bug\",\n      \"created_at\": \"2026-04-07T01:27:54.222375196Z\",\n      \"created_by\": \"ubuntu\",\n      \"updated_at\": \"2026-04-07T01:27:58.971587454Z\",\n      \"source_repo\": \".\",\n      \"compaction_level\": 0,\n      \"original_size\": 0,\n      \"dependency_count\": 0,\n      \"dependent_count\": 0\n    }\n  ],\n  \"total\": 2,\n  \"limit\": 50,\n  \"offset\": 0,\n  \"has_more\": false\n}\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "archived_ready_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "ready",
+          "--json"
+        ],
+        "returncode": 0,
+        "stdout_head": "[]\n",
+        "stderr_head": ""
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    },
+    {
+      "case": "archived_show_auto_import",
+      "before": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "command_result": {
+        "command": [
+          "br",
+          "show",
+          "frankentorch-xsp",
+          "--json"
+        ],
+        "returncode": 3,
+        "stdout_head": "",
+        "stderr_head": "{\n  \"error\": {\n    \"code\": \"ISSUE_NOT_FOUND\",\n    \"message\": \"Issue not found: frankentorch-xsp\",\n    \"hint\": \"Run 'br list' to see available issues.\",\n    \"retryable\": false,\n    \"context\": {\n      \"searched_id\": \"frankentorch-xsp\"\n    }\n  }\n}\n"
+      },
+      "after": {
+        "integrity_check": [
+          "ok"
+        ],
+        "page_count": 89,
+        "freelist_count": 0,
+        "blocked_cache_rootpages": [
+          {
+            "name": "blocked_issues_cache",
+            "type": "table",
+            "rootpage": 19
+          },
+          {
+            "name": "idx_blocked_cache_blocked_at",
+            "type": "index",
+            "rootpage": 56
+          }
+        ]
+      },
+      "integrity_preserved": true,
+      "page_delta": 0,
+      "freelist_delta": 0
+    }
+  ]
+}
