@@ -2041,10 +2041,15 @@ impl Module for AlphaDropout {
 ///
 /// Weight has shape `[num_embeddings, embedding_dim]`, initialized from N(0,1).
 /// Input should contain integer indices (stored as f64).
+///
+/// When `sparse=true`, the backward pass produces sparse gradients (COO format)
+/// containing only the rows that were accessed during the forward pass. This is
+/// more memory-efficient for large vocabularies with small batch sizes.
 pub struct Embedding {
     weight: TensorNodeId,
     num_embeddings: usize,
     embedding_dim: usize,
+    sparse: bool,
 }
 
 impl Embedding {
@@ -2053,6 +2058,20 @@ impl Embedding {
         session: &mut FrankenTorchSession,
         num_embeddings: usize,
         embedding_dim: usize,
+    ) -> Result<Self, AutogradError> {
+        Self::with_options(session, num_embeddings, embedding_dim, false)
+    }
+
+    /// Create a new Embedding with sparse gradient mode.
+    ///
+    /// When `sparse=true`, the backward pass produces sparse gradients (COO format)
+    /// that only contain the rows accessed during the forward pass. Use this with
+    /// `SparseAdam` optimizer for efficient training of large embedding tables.
+    pub fn with_options(
+        session: &mut FrankenTorchSession,
+        num_embeddings: usize,
+        embedding_dim: usize,
+        sparse: bool,
     ) -> Result<Self, AutogradError> {
         if num_embeddings == 0 || embedding_dim == 0 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -2072,6 +2091,7 @@ impl Embedding {
             weight,
             num_embeddings,
             embedding_dim,
+            sparse,
         })
     }
 
@@ -2091,6 +2111,12 @@ impl Embedding {
     #[must_use]
     pub fn embedding_dim(&self) -> usize {
         self.embedding_dim
+    }
+
+    /// Returns true if this embedding uses sparse gradients.
+    #[must_use]
+    pub fn is_sparse(&self) -> bool {
+        self.sparse
     }
 }
 

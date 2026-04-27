@@ -4791,7 +4791,7 @@ impl Optimizer for SparseAdam {
     fn step(
         &mut self,
         session: &mut FrankenTorchSession,
-        _report: &TensorBackwardReport,
+        report: &TensorBackwardReport,
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         let t = checked_next_step_count(self.step_count, "sparse_adam step counter overflow")?;
@@ -4800,7 +4800,24 @@ impl Optimizer for SparseAdam {
         let bias_correction1 = adam_bias_correction(self.beta1, t);
         let bias_correction2 = adam_bias_correction(self.beta2, t);
 
-        for (i, &param) in self.params.iter().enumerate() {
+        let num_params = self.params.len();
+        for i in 0..num_params {
+            let param = self.params[i];
+
+            // Check for sparse gradient in the report first (more efficient)
+            if let Some(sparse_grad) = report.sparse_gradient(param) {
+                self.step_sparse_gradient(
+                    session,
+                    param,
+                    i,
+                    sparse_grad,
+                    bias_correction1,
+                    bias_correction2,
+                )?;
+                continue;
+            }
+
+            // Fall back to dense gradient from session
             let grad = match load_param_gradient(session, param)? {
                 Some(g) => g,
                 None => continue,
@@ -4845,6 +4862,92 @@ impl Optimizer for SparseAdam {
 
     fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
         zero_param_gradients(session, &self.params)
+    }
+}
+
+impl SparseAdam {
+    /// Process a sparse COO gradient more efficiently by iterating only
+    /// over the non-zero entries rather than the full parameter space.
+    fn step_sparse_gradient(
+        &mut self,
+        session: &mut FrankenTorchSession,
+        param: TensorNodeId,
+        param_idx: usize,
+        sparse_grad: &ft_core::SparseCOOTensor,
+        bias_correction1: f64,
+        bias_correction2: f64,
+    ) -> Result<(), AutogradError> {
+        let param_values = session.tensor_values(param)?;
+        let param_numel = param_values.len();
+
+        // Initialize moment buffers if needed
+        let m = self.m[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
+        let v = self.v[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
+
+        // Get the sparse indices and values
+        let indices = sparse_grad.indices();
+        let indices_storage = indices.storage();
+        let values_tensor = sparse_grad.values();
+        let grad_values = values_tensor.typed_storage().to_f64_vec();
+
+        let nnz = sparse_grad.nnz();
+        let sparse_dim = sparse_grad.sparse_dim();
+        let dense_shape = sparse_grad.dense_shape();
+
+        // Build update vector (sparse: only touched indices)
+        let mut update = vec![0.0; param_numel];
+
+        // For each non-zero entry in the sparse gradient
+        for nz_idx in 0..nnz {
+            // Compute the flat index from sparse coordinates
+            let mut flat_idx = 0usize;
+            let mut stride = 1usize;
+            for d in (0..sparse_dim).rev() {
+                let coord = indices_storage[d * nnz + nz_idx];
+                if coord < 0 || (coord as usize) >= dense_shape[d] {
+                    continue; // Skip invalid indices
+                }
+                flat_idx += (coord as usize) * stride;
+                stride *= dense_shape[d];
+            }
+
+            // Get the gradient value (handle dense dimensions if any)
+            let grad_val = if sparse_dim < dense_shape.len() {
+                // Has dense dimensions - grad_values is [nnz, *dense_dims]
+                // For embedding: sparse_dim=1, dense_dims=[embedding_dim]
+                // Each entry in grad_values corresponds to one row
+                let embedding_dim = dense_shape.get(1).copied().unwrap_or(1);
+                for emb_idx in 0..embedding_dim {
+                    let g_idx = nz_idx * embedding_dim + emb_idx;
+                    let p_idx = flat_idx * embedding_dim + emb_idx;
+                    if g_idx < grad_values.len() && p_idx < param_numel {
+                        let g = grad_values[g_idx];
+                        if g != 0.0 {
+                            m[p_idx] = self.beta1 * m[p_idx] + (1.0 - self.beta1) * g;
+                            v[p_idx] = self.beta2 * v[p_idx] + (1.0 - self.beta2) * g * g;
+                            let m_hat = m[p_idx] / bias_correction1;
+                            let v_hat = v[p_idx] / bias_correction2;
+                            update[p_idx] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                        }
+                    }
+                }
+                continue; // Already processed all dense dims
+            } else if nz_idx < grad_values.len() {
+                grad_values[nz_idx]
+            } else {
+                continue;
+            };
+
+            if flat_idx < param_numel && grad_val != 0.0 {
+                m[flat_idx] = self.beta1 * m[flat_idx] + (1.0 - self.beta1) * grad_val;
+                v[flat_idx] = self.beta2 * v[flat_idx] + (1.0 - self.beta2) * grad_val * grad_val;
+                let m_hat = m[flat_idx] / bias_correction1;
+                let v_hat = v[flat_idx] / bias_correction2;
+                update[flat_idx] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+            }
+        }
+
+        apply_param_update(session, param, &update)
     }
 }
 

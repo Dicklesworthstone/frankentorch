@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ft_core::{
-    DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, SparseTensorError,
-    TensorMeta, TensorStorage,
+    DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, SparseCOOTensor,
+    SparseTensorError, TensorMeta, TensorStorage,
 };
 use ft_dispatch::{
     AddmmDispatchDecision, BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError,
@@ -1050,9 +1050,74 @@ pub struct TensorBackwardStep {
     pub rule: &'static str,
 }
 
+/// A gradient value that can be either dense or sparse.
+///
+/// Sparse gradients are produced by operations like `Embedding` with `sparse=True`,
+/// where only a subset of indices receive gradient contributions. Using sparse
+/// gradients avoids allocating and iterating over the full parameter size.
+#[derive(Debug, Clone, PartialEq)]
+pub enum GradientValue {
+    /// Dense gradient as a flat f64 vector.
+    Dense(Vec<f64>),
+    /// Sparse gradient in COO format. Indices are the parameter indices that
+    /// received gradient contributions, values are the gradient magnitudes.
+    /// Boxed to avoid large enum variant size disparity.
+    Sparse(Box<SparseCOOTensor>),
+}
+
+impl GradientValue {
+    /// Returns the dense gradient if this is a dense value, None otherwise.
+    #[must_use]
+    pub fn as_dense(&self) -> Option<&[f64]> {
+        match self {
+            Self::Dense(v) => Some(v),
+            Self::Sparse(_) => None,
+        }
+    }
+
+    /// Returns the sparse gradient if this is a sparse value, None otherwise.
+    #[must_use]
+    pub fn as_sparse(&self) -> Option<&SparseCOOTensor> {
+        match self {
+            Self::Dense(_) => None,
+            Self::Sparse(s) => Some(s),
+        }
+    }
+
+    /// Returns true if this is a sparse gradient.
+    #[must_use]
+    pub fn is_sparse(&self) -> bool {
+        matches!(self, Self::Sparse(_))
+    }
+
+    /// Convert to dense representation. For sparse gradients, this allocates
+    /// and scatters values into a dense vector.
+    pub fn to_dense(&self, numel: usize) -> Result<Vec<f64>, SparseTensorError> {
+        match self {
+            Self::Dense(v) => Ok(v.clone()),
+            Self::Sparse(sparse) => {
+                let dense_tensor = sparse.to_dense()?;
+                let values: Vec<f64> = dense_tensor.typed_storage().to_f64_vec();
+                if values.len() != numel {
+                    let mut result = vec![0.0; numel];
+                    for (i, &v) in values.iter().enumerate() {
+                        if i < numel {
+                            result[i] = v;
+                        }
+                    }
+                    Ok(result)
+                } else {
+                    Ok(values)
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorBackwardReport {
     gradients: Vec<Option<Vec<f64>>>,
+    sparse_gradients: Vec<Option<SparseCOOTensor>>,
     gradient_nodes: Vec<Option<TensorNodeId>>,
     pub steps: Vec<TensorBackwardStep>,
     pub telemetry: TensorSchedulerTelemetry,
@@ -1069,6 +1134,32 @@ impl TensorBackwardReport {
     #[must_use]
     pub fn gradients(&self) -> &[Option<Vec<f64>>] {
         &self.gradients
+    }
+
+    /// Get the sparse gradient for a node, if one exists.
+    #[must_use]
+    pub fn sparse_gradient(&self, node: TensorNodeId) -> Option<&SparseCOOTensor> {
+        self.sparse_gradients
+            .get(node.0)
+            .and_then(|entry| entry.as_ref())
+    }
+
+    /// Get the gradient as a `GradientValue`, checking sparse first then dense.
+    #[must_use]
+    pub fn gradient_value(&self, node: TensorNodeId) -> Option<GradientValue> {
+        if let Some(sparse) = self.sparse_gradient(node) {
+            return Some(GradientValue::Sparse(Box::new(sparse.clone())));
+        }
+        self.gradient(node)
+            .map(|g| GradientValue::Dense(g.to_vec()))
+    }
+
+    /// Returns true if the gradient for this node is sparse.
+    #[must_use]
+    pub fn is_sparse_gradient(&self, node: TensorNodeId) -> bool {
+        self.sparse_gradients
+            .get(node.0)
+            .is_some_and(|entry| entry.is_some())
     }
 
     /// When `create_graph=True` was used, returns the gradient as a tensor
@@ -1106,6 +1197,7 @@ impl TensorBackwardReport {
             .collect();
         Self {
             gradients: scaled_gradients,
+            sparse_gradients: self.sparse_gradients.clone(),
             gradient_nodes: self.gradient_nodes.clone(),
             steps: self.steps.clone(),
             telemetry: self.telemetry.clone(),
@@ -12368,6 +12460,7 @@ impl TensorTape {
         }
 
         Ok(TensorBackwardReport {
+            sparse_gradients: vec![None; gradients.len()],
             gradients,
             gradient_nodes: vec![None; self.nodes.len()],
             steps,
@@ -12735,7 +12828,7 @@ impl TensorTape {
 
         // Extract gradient values and node IDs for leaves
         let num_original = orig_node_count;
-        let gradients = (0..num_original)
+        let gradients: Vec<Option<Vec<f64>>> = (0..num_original)
             .map(|idx| {
                 if self.nodes[idx].requires_grad && reachable[idx] {
                     grad_nodes[idx].map(|gid| {
@@ -12792,6 +12885,7 @@ impl TensorTape {
         };
 
         Ok(TensorBackwardReport {
+            sparse_gradients: vec![None; gradients.len()],
             gradients,
             gradient_nodes: gradient_node_results,
             steps,
