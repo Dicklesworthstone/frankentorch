@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ft_core::{
-    DType, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor, SparseCOOTensor,
-    SparseTensorError, TensorMeta, TensorStorage,
+    DType, DenseI64Tensor, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor,
+    SparseCOOTensor, SparseTensorError, TensorMeta, TensorStorage,
 };
 use ft_dispatch::{
     AddmmDispatchDecision, BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError,
@@ -570,6 +570,12 @@ enum TensorNodeOp {
         dim: usize,
         indices: Vec<f64>,
         input_shape: Vec<usize>,
+        /// When true, the input's gradient is materialised as a sparse COO
+        /// tensor (sparse_dim=1, dim=0 only) and surfaced via
+        /// `TensorBackwardReport::sparse_gradient`. Used by `Embedding`
+        /// with `sparse=true` to feed `SparseAdam` without scanning the
+        /// full embedding table.
+        sparse: bool,
     },
     Gather {
         input: TensorNodeId,
@@ -7355,6 +7361,28 @@ impl TensorTape {
         dim: usize,
         indices: &[f64],
     ) -> Result<TensorNodeId, AutogradError> {
+        self.index_select_inner(input, dim, indices, false)
+    }
+
+    /// Like `index_select`, but the input's gradient is emitted as a
+    /// `SparseCOOTensor` (sparse_dim=1) on the backward report. Only valid
+    /// for `dim=0`; passing any other dim falls back to a dense gradient.
+    pub fn index_select_sparse(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        indices: &[f64],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.index_select_inner(input, dim, indices, dim == 0)
+    }
+
+    fn index_select_inner(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        indices: &[f64],
+        sparse: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
         let (storage, input_shape, output_shape, output_dtype, output_device, requires_grad) = {
             let input_node = self.node(input)?;
             let requires_grad = input_node.requires_grad && self.grad_enabled;
@@ -7415,6 +7443,7 @@ impl TensorTape {
                 dim,
                 indices: indices_owned,
                 input_shape,
+                sparse,
             },
         });
         Ok(out)
@@ -9366,6 +9395,10 @@ impl TensorTape {
             })
             .collect::<Vec<_>>();
         grads[root.0] = vec![1.0; self.nodes[root.0].tensor.meta().numel()];
+        // Tracks IndexSelect inputs that requested a sparse-gradient surfacing.
+        // Populated at the end with a SparseCOOTensor extracted from the
+        // dense gradient (sparse_dim=1, dim=0).
+        let mut sparse_grad_requested: Vec<bool> = vec![false; self.nodes.len()];
 
         let mut queue = TensorReadyQueue::with_capacity(self.nodes.len().max(1));
         queue.push(root);
@@ -11781,6 +11814,7 @@ impl TensorTape {
                     dim,
                     ref indices,
                     ref input_shape,
+                    sparse,
                 } => {
                     // Backward: scatter_add the gradient back to original positions.
                     let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
@@ -11829,6 +11863,9 @@ impl TensorTape {
                         }
                     }
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    if sparse && dim == 0 {
+                        sparse_grad_requested[input.0] = true;
+                    }
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -12459,13 +12496,71 @@ impl TensorTape {
             self.consumed_boundary = self.nodes.len();
         }
 
+        let mut sparse_gradients: Vec<Option<SparseCOOTensor>> = vec![None; gradients.len()];
+        for idx in 0..sparse_gradients.len() {
+            if !sparse_grad_requested[idx] {
+                continue;
+            }
+            let Some(dense_grad) = gradients[idx].as_deref() else {
+                continue;
+            };
+            let shape = self.nodes[idx].tensor.meta().shape().to_vec();
+            let device = self.nodes[idx].tensor.meta().device();
+            sparse_gradients[idx] =
+                Some(Self::build_sparse_grad_dim0(dense_grad, &shape, device)?);
+        }
+
         Ok(TensorBackwardReport {
-            sparse_gradients: vec![None; gradients.len()],
+            sparse_gradients,
             gradients,
             gradient_nodes: vec![None; self.nodes.len()],
             steps,
             telemetry,
         })
+    }
+
+    /// Build a `SparseCOOTensor` (sparse_dim=1) from a dense gradient
+    /// laid out as `[shape[0], shape[1..]]`. Rows whose elements are all
+    /// zero are dropped. Used to surface sparse gradients from
+    /// `IndexSelect` (e.g., embedding tables) without scanning the full
+    /// dense parameter when applying `SparseAdam`.
+    fn build_sparse_grad_dim0(
+        dense_grad: &[f64],
+        shape: &[usize],
+        device: Device,
+    ) -> Result<SparseCOOTensor, AutogradError> {
+        if shape.is_empty() {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "sparse gradient requires rank>=1 input shape",
+                }
+                .into(),
+            ));
+        }
+        let num_rows = shape[0];
+        let row_stride: usize = shape[1..].iter().product();
+        let mut nz_rows: Vec<usize> = Vec::new();
+        for r in 0..num_rows {
+            let row = &dense_grad[r * row_stride..(r + 1) * row_stride];
+            if row.iter().any(|v| *v != 0.0) {
+                nz_rows.push(r);
+            }
+        }
+        let nnz = nz_rows.len();
+        let indices_flat: Vec<i64> = nz_rows.iter().map(|&r| r as i64).collect();
+        let indices = DenseI64Tensor::from_contiguous_values(indices_flat, vec![1, nnz], device)
+            .map_err(AutogradError::DenseTensor)?;
+        let mut values_flat: Vec<f64> = Vec::with_capacity(nnz * row_stride);
+        for &r in &nz_rows {
+            values_flat.extend_from_slice(&dense_grad[r * row_stride..(r + 1) * row_stride]);
+        }
+        let mut values_shape: Vec<usize> = Vec::with_capacity(shape.len());
+        values_shape.push(nnz);
+        values_shape.extend_from_slice(&shape[1..]);
+        let values = DenseTensor::from_contiguous_values(values_flat, values_shape, device)
+            .map_err(AutogradError::DenseTensor)?;
+        SparseCOOTensor::new(indices, values, shape.to_vec(), true)
+            .map_err(AutogradError::SparseTensor)
     }
 
     /// Backward pass that records gradient computation as new graph nodes,

@@ -6777,6 +6777,23 @@ impl FrankenTorchSession {
         self.tensor_tape.index_select(input, dim, &indices_data)
     }
 
+    /// Like `tensor_index_select`, but the input's gradient is also
+    /// surfaced as a sparse COO tensor on the backward report
+    /// (`TensorBackwardReport::sparse_gradient`). Only meaningful for
+    /// `dim=0`; other dims fall back to the standard dense gradient.
+    pub fn tensor_index_select_sparse(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        indices: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let indices_data = self.tensor_tape.values(indices)?;
+        Self::validate_index_tensor_values(&input_shape, dim, &indices_data)?;
+        self.tensor_tape
+            .index_select_sparse(input, dim, &indices_data)
+    }
+
     pub fn tensor_gather(
         &mut self,
         input: TensorNodeId,

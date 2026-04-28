@@ -9291,6 +9291,85 @@ mod tests {
         assert!(opt.step(&mut session, &report).is_err());
     }
 
+    #[test]
+    fn sparse_adam_with_sparse_embedding_only_updates_touched_rows() {
+        use ft_nn::{Embedding, Module};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let num_embeddings = 6;
+        let embedding_dim = 4;
+        let emb =
+            Embedding::with_options(&mut session, num_embeddings, embedding_dim, true)
+                .expect("sparse embedding");
+        let weight = emb.weight();
+
+        let weights_before = session.tensor_values(weight).expect("values").to_vec();
+
+        // Touch rows 1 and 4 only.
+        let indices = session
+            .tensor_variable(vec![1.0, 4.0], vec![2], false)
+            .expect("indices");
+        let mut opt = SparseAdam::new(vec![weight], 0.1);
+
+        let y = emb.forward(&mut session, indices).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(
+            report.is_sparse_gradient(weight),
+            "sparse=true Embedding must surface sparse gradient"
+        );
+
+        opt.step(&mut session, &report).expect("sparse_adam step");
+
+        let weights_after = session.tensor_values(weight).expect("values").to_vec();
+
+        for row in 0..num_embeddings {
+            let start = row * embedding_dim;
+            let end = start + embedding_dim;
+            let touched = row == 1 || row == 4;
+            let row_changed = (start..end)
+                .any(|i| (weights_before[i] - weights_after[i]).abs() > 1e-12);
+            assert_eq!(
+                row_changed, touched,
+                "row {row}: changed={row_changed}, expected_changed={touched}"
+            );
+        }
+    }
+
+    #[test]
+    fn sparse_adam_dense_embedding_still_works() {
+        // Regression: a dense (sparse=false) Embedding must still be
+        // trainable by SparseAdam via the dense fallback path.
+        use ft_nn::{Embedding, Module};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let emb = Embedding::new(&mut session, 4, 2).expect("dense embedding");
+        let weight = emb.weight();
+        let before = session.tensor_values(weight).expect("values").to_vec();
+
+        let indices = session
+            .tensor_variable(vec![2.0], vec![1], false)
+            .expect("indices");
+        let mut opt = SparseAdam::new(vec![weight], 0.1);
+        let y = emb.forward(&mut session, indices).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(
+            !report.is_sparse_gradient(weight),
+            "sparse=false Embedding must not surface sparse gradient"
+        );
+
+        opt.step(&mut session, &report).expect("sparse_adam step");
+        let after = session.tensor_values(weight).expect("values").to_vec();
+        // Touched row 2 must change.
+        let row_start = 2 * 2;
+        let row_changed = (row_start..row_start + 2)
+            .any(|i| (before[i] - after[i]).abs() > 1e-12);
+        assert!(row_changed, "row 2 should be updated");
+    }
+
     // ── CyclicLR Tests ──────────────────────────────────────────────────
 
     #[test]

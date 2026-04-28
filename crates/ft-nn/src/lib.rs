@@ -2137,7 +2137,11 @@ impl Module for Embedding {
         let flat_indices = session.tensor_reshape(input, vec![total])?;
 
         // index_select(weight, dim=0, flat_indices) -> [total, embedding_dim]
-        let selected = session.tensor_index_select(self.weight, 0, flat_indices)?;
+        let selected = if self.sparse {
+            session.tensor_index_select_sparse(self.weight, 0, flat_indices)?
+        } else {
+            session.tensor_index_select(self.weight, 0, flat_indices)?
+        };
 
         // Reshape to [*input_shape, embedding_dim]
         let mut out_shape = input_shape;
@@ -15097,6 +15101,72 @@ mod tests {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         assert!(Embedding::new(&mut session, 0, 3).is_err());
         assert!(Embedding::new(&mut session, 3, 0).is_err());
+    }
+
+    #[test]
+    fn embedding_sparse_backward_emits_sparse_grad() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let emb = Embedding::with_options(&mut session, 5, 3, true).expect("embedding");
+        assert!(emb.is_sparse());
+
+        // Use indices [1, 3, 1] — row 1 appears twice so its gradient
+        // contribution is summed.
+        let indices = session
+            .tensor_variable(vec![1.0, 3.0, 1.0], vec![3], false)
+            .expect("indices");
+        let y = emb.forward(&mut session, indices).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        let sparse = report
+            .sparse_gradient(emb.weight())
+            .expect("sparse gradient should be populated when sparse=true");
+
+        assert_eq!(sparse.sparse_dim(), 1);
+        assert_eq!(sparse.dense_shape(), &[5usize, 3]);
+        assert_eq!(sparse.nnz(), 2, "only rows 1 and 3 should be present");
+
+        let idx_storage = sparse.indices().storage().to_vec();
+        let mut nz_rows: Vec<i64> = idx_storage.clone();
+        nz_rows.sort_unstable();
+        assert_eq!(nz_rows, vec![1, 3]);
+
+        // Verify per-row gradient magnitudes: row 1 selected twice -> 2.0,
+        // row 3 selected once -> 1.0.
+        let values = sparse.values().typed_storage().to_f64_vec();
+        for (i, &row) in idx_storage.iter().enumerate() {
+            let row_vals = &values[i * 3..(i + 1) * 3];
+            let expected = if row == 1 { 2.0 } else { 1.0 };
+            for &v in row_vals {
+                assert!(
+                    (v - expected).abs() < 1e-12,
+                    "row {row}: expected {expected}, got {v}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn embedding_dense_backward_omits_sparse_grad() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let emb = Embedding::new(&mut session, 4, 2).expect("embedding");
+        assert!(!emb.is_sparse());
+
+        let indices = session
+            .tensor_variable(vec![0.0, 2.0], vec![2], false)
+            .expect("indices");
+        let y = emb.forward(&mut session, indices).expect("forward");
+        let loss = session.tensor_sum(y).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+
+        assert!(
+            report.sparse_gradient(emb.weight()).is_none(),
+            "sparse=false embedding must not produce a sparse gradient"
+        );
+        assert!(
+            session.tensor_gradient(&report, emb.weight()).is_some(),
+            "dense gradient must still be present"
+        );
     }
 
     // ---- Softmax / LogSoftmax module tests ----
