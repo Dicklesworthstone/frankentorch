@@ -12740,7 +12740,13 @@ json.loads(sys.stdin.read())
         let mut best_loss = initial_loss_val;
         let mut saw_loss_improvement = false;
 
-        for _ in 0..80 {
+        // 80 steps was right at the convergence boundary for this two-param
+        // affine fit (truth: w=3, b=1; init: w=0.25, b=0.0; lr=0.05) — the
+        // worst element landed at |delta|≈0.22 vs the 0.2 threshold below,
+        // so the test failed deterministically on a clean main checkout
+        // (frankentorch-mbl). 200 steps gives Adam comfortable headroom
+        // without inflating runtime.
+        for _ in 0..200 {
             optimizer.zero_grad(&mut session).expect("zero_grad");
             let pred = custom_affine(&mut session, input, weight, bias).expect("pred");
             let loss = session.mse_loss(pred, targets).expect("loss");
