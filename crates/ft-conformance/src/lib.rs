@@ -12796,6 +12796,107 @@ json.loads(sys.stdin.read())
     }
 
     #[test]
+    fn torch_fmod_remainder_sign_matrix_conformance() {
+        // Lock down the full sign matrix for fmod (truncating, sign of
+        // dividend) vs remainder (flooring, sign of divisor) — these
+        // are the two distinct PyTorch divmod families and trivially
+        // easy to swap by accident.
+        //
+        // Reference table (verified against torch.fmod / torch.remainder):
+        //
+        //   lhs   rhs   fmod   remainder
+        //    7     3      1        1
+        //   -7     3     -1        2
+        //    7    -3      1       -2
+        //   -7    -3     -1       -1
+        //    6     3      0        0
+        //   -6     3     -0        0
+        //    3.5   1.5   0.5      0.5
+        //   -3.5   1.5  -0.5      1.0
+        //    3.5  -1.5   0.5     -1.0
+        //   -3.5  -1.5  -0.5     -0.5
+        //    0     5      0        0
+        use ft_api::FrankenTorchSession;
+
+        let lhs_data: Vec<f64> = vec![
+            7.0, -7.0, 7.0, -7.0, 6.0, -6.0, 3.5, -3.5, 3.5, -3.5, 0.0,
+        ];
+        let rhs_data: Vec<f64> = vec![
+            3.0, 3.0, -3.0, -3.0, 3.0, 3.0, 1.5, 1.5, -1.5, -1.5, 5.0,
+        ];
+        let expected_fmod: Vec<f64> = vec![
+            1.0, -1.0, 1.0, -1.0, 0.0, 0.0, 0.5, -0.5, 0.5, -0.5, 0.0,
+        ];
+        let expected_remainder: Vec<f64> = vec![
+            1.0, 2.0, -2.0, -1.0, 0.0, 0.0, 0.5, 1.0, -1.0, -0.5, 0.0,
+        ];
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let n = lhs_data.len();
+        let lhs = session
+            .tensor_variable(lhs_data.clone(), vec![n], false)
+            .expect("lhs");
+        let rhs = session
+            .tensor_variable(rhs_data.clone(), vec![n], false)
+            .expect("rhs");
+
+        let fmod_out = session.tensor_fmod(lhs, rhs).expect("tensor_fmod");
+        let fmod_vals = session.tensor_values(fmod_out).expect("fmod values");
+        for (i, (got, want)) in fmod_vals.iter().zip(expected_fmod.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "fmod[{i}]({}, {}) = {got}, expected {want}",
+                lhs_data[i],
+                rhs_data[i]
+            );
+        }
+
+        let rem_out = session
+            .tensor_remainder(lhs, rhs)
+            .expect("tensor_remainder");
+        let rem_vals = session.tensor_values(rem_out).expect("rem values");
+        for (i, (got, want)) in rem_vals.iter().zip(expected_remainder.iter()).enumerate() {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "remainder[{i}]({}, {}) = {got}, expected {want}",
+                lhs_data[i],
+                rhs_data[i]
+            );
+        }
+    }
+
+    #[test]
+    fn torch_fmod_remainder_zero_divisor_returns_nan() {
+        // PyTorch parity: torch.fmod(x, 0) and torch.remainder(x, 0)
+        // both yield NaN (no error). Documents the contract that a
+        // zero divisor must not panic and must not silently return 0.
+        use ft_api::FrankenTorchSession;
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let lhs = session
+            .tensor_variable(vec![5.0, -5.0, 0.0], vec![3], false)
+            .expect("lhs");
+        let zero = session
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false)
+            .expect("rhs");
+
+        let fmod_out = session.tensor_fmod(lhs, zero).expect("tensor_fmod");
+        for &v in session.tensor_values(fmod_out).expect("fmod vals").iter() {
+            assert!(v.is_nan(), "fmod with zero divisor must yield NaN, got {v}");
+        }
+
+        let rem_out = session
+            .tensor_remainder(lhs, zero)
+            .expect("tensor_remainder");
+        for &v in session.tensor_values(rem_out).expect("rem vals").iter() {
+            assert!(
+                v.is_nan(),
+                "remainder with zero divisor must yield NaN, got {v}"
+            );
+        }
+    }
+
+    #[test]
     fn custom_function_layer_trains_end_to_end_with_adam() {
         use ft_api::FrankenTorchSession;
         use ft_optim::{Adam, Optimizer};
