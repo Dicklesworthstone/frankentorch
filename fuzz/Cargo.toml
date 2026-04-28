@@ -1,0 +1,21 @@
+[package]
+name = "frankentorch-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2024"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+ft-serialize = { path = "../crates/ft-serialize" }
+libfuzzer-sys = "0.4.7"
+
+[[bin]]
+name = "ft_serialize_state_dict"
+path = "fuzz_targets/ft_serialize_state_dict.rs"
+test = false
+doc = false
+bench = false
+
+[workspace]
