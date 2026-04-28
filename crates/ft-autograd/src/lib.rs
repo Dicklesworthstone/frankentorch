@@ -12921,23 +12921,28 @@ impl TensorTape {
             }
         }
 
-        // Extract gradient values and node IDs for leaves
+        // Extract gradient values and node IDs for leaves. Propagate
+        // tensor-read errors as AutogradError instead of silently
+        // collapsing them to an empty gradient (frankentorch-aba) —
+        // a malformed gradient buffer must surface at the backward
+        // boundary, never become a fake "missing" report entry.
         let num_original = orig_node_count;
-        let gradients: Vec<Option<Vec<f64>>> = (0..num_original)
-            .map(|idx| {
-                if self.nodes[idx].requires_grad && reachable[idx] {
-                    grad_nodes[idx].map(|gid| {
-                        self.nodes[gid.0]
-                            .tensor
-                            .contiguous_values_as_f64()
-                            .unwrap_or_default()
-                            .to_vec()
-                    })
+        let mut gradients: Vec<Option<Vec<f64>>> = Vec::with_capacity(num_original);
+        for idx in 0..num_original {
+            if self.nodes[idx].requires_grad && reachable[idx] {
+                if let Some(gid) = grad_nodes[idx] {
+                    let vals = self.nodes[gid.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    gradients.push(Some(vals));
                 } else {
-                    None
+                    gradients.push(None);
                 }
-            })
-            .collect();
+            } else {
+                gradients.push(None);
+            }
+        }
 
         let mut gradient_node_results = vec![None; num_original];
         for (idx, gn) in grad_nodes.into_iter().enumerate() {
@@ -12946,7 +12951,11 @@ impl TensorTape {
             }
         }
 
-        // Persist leaf gradients
+        // Persist leaf gradients. Surface read errors instead of
+        // dropping the gradient on the floor (frankentorch-aba); a
+        // silently empty `vals` would leave persistent_grads untouched
+        // on the second and later backward passes, breaking
+        // accumulation contracts.
         for (idx, grad_opt) in gradient_node_results.iter().enumerate() {
             if let Some(gid) = grad_opt
                 && self.nodes[idx].op == TensorNodeOp::Leaf
@@ -12955,8 +12964,7 @@ impl TensorTape {
                 let vals = self.nodes[gid.0]
                     .tensor
                     .contiguous_values_as_f64()
-                    .unwrap_or_default()
-                    .to_vec();
+                    .map_err(AutogradError::DenseTensor)?;
                 self.persistent_grads
                     .entry(idx)
                     .and_modify(|existing: &mut Vec<f64>| {
