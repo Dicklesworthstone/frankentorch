@@ -497,6 +497,7 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "ft-core",
+ "insta",
  "proptest",
  "safetensors",
  "serde",

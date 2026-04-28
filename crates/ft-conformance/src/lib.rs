@@ -9037,35 +9037,49 @@ fn run_legacy_oracle_script_with_timeout(
         }
     };
 
-    let overflow_flag = Arc::new(AtomicBool::new(false));
-    let stdout_overflow = Arc::clone(&overflow_flag);
+    let stdout_overflow = Arc::new(AtomicBool::new(false));
+    let stdout_reader_overflow = Arc::clone(&stdout_overflow);
     let stdout_reader = std::thread::spawn(move || {
         read_stream_capped(
             stdout,
             MAX_LEGACY_ORACLE_STDOUT_BYTES,
-            stdout_overflow.as_ref(),
+            stdout_reader_overflow.as_ref(),
             "stdout",
         )
     });
-    let stderr_overflow = Arc::clone(&overflow_flag);
+    let stderr_overflow = Arc::new(AtomicBool::new(false));
+    let stderr_reader_overflow = Arc::clone(&stderr_overflow);
     let stderr_reader = std::thread::spawn(move || {
         read_stream_capped(
             stderr,
             MAX_LEGACY_ORACLE_STDERR_BYTES,
-            stderr_overflow.as_ref(),
+            stderr_reader_overflow.as_ref(),
             "stderr",
         )
     });
 
-    let wait_result =
-        wait_for_legacy_oracle_exit(&mut child, overflow_flag.as_ref(), timeout_millis);
+    let status = wait_for_legacy_oracle_exit(
+        &mut child,
+        stdout_overflow.as_ref(),
+        stderr_overflow.as_ref(),
+        timeout_millis,
+    )?;
+    if stdout_overflow.load(Ordering::Relaxed) {
+        return Err(format!(
+            "legacy oracle stdout exceeds max bytes: max={MAX_LEGACY_ORACLE_STDOUT_BYTES}"
+        ));
+    }
+    if stderr_overflow.load(Ordering::Relaxed) {
+        return Err(format!(
+            "legacy oracle stderr exceeds max bytes: max={MAX_LEGACY_ORACLE_STDERR_BYTES}"
+        ));
+    }
     let stdout_capture = stdout_reader
         .join()
         .map_err(|_| "legacy oracle stdout reader thread panicked".to_string())??;
     let stderr_capture = stderr_reader
         .join()
         .map_err(|_| "legacy oracle stderr reader thread panicked".to_string())??;
-    let status = wait_result?;
 
     validate_legacy_oracle_stream_bounds(stdout_capture.total_bytes, stderr_capture.total_bytes)?;
     if !status.success() {
@@ -9083,13 +9097,16 @@ fn run_legacy_oracle_script_with_timeout(
 
 fn wait_for_legacy_oracle_exit(
     child: &mut Child,
-    overflow_flag: &AtomicBool,
+    stdout_overflow: &AtomicBool,
+    stderr_overflow: &AtomicBool,
     timeout_millis: u64,
 ) -> Result<ExitStatus, String> {
     let started_at = Instant::now();
     let mut killed_for_overflow = false;
     loop {
-        if overflow_flag.load(Ordering::Relaxed) && !killed_for_overflow {
+        if (stdout_overflow.load(Ordering::Relaxed) || stderr_overflow.load(Ordering::Relaxed))
+            && !killed_for_overflow
+        {
             terminate_and_reap_child(child);
             killed_for_overflow = true;
         }
@@ -10249,7 +10266,7 @@ mod tests {
     use std::path::PathBuf;
     use std::process::{Command, Stdio};
     use std::sync::atomic::{AtomicBool, Ordering};
-    use std::time::{SystemTime, UNIX_EPOCH};
+    use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
     #[cfg(feature = "fuzz")]
     use ft_core::{DType, Device, TensorMeta};
@@ -12480,7 +12497,8 @@ mod tests {
             .spawn()
             .expect("sleep subprocess should spawn");
         let overflow = AtomicBool::new(false);
-        let err = super::wait_for_legacy_oracle_exit(&mut child, &overflow, 5)
+        let stderr_overflow = AtomicBool::new(false);
+        let err = super::wait_for_legacy_oracle_exit(&mut child, &overflow, &stderr_overflow, 5)
             .expect_err("long-running subprocess should time out");
         assert!(err.contains("timed out after 5ms"));
         assert!(
@@ -12526,6 +12544,50 @@ print(json.dumps({"ok": True}))
             super::run_legacy_oracle_script_with_timeout(&config, script, &json!({"x": 1}), 5)
                 .expect_err("stalled oracle process must time out");
         assert!(err.contains("timed out after 5ms"));
+    }
+
+    #[test]
+    fn run_legacy_oracle_script_timeout_does_not_join_inherited_pipe_reader() {
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let python_available = Command::new(&python)
+            .arg("-c")
+            .arg("import json, subprocess")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !python_available {
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let script = r#"
+import json
+import subprocess
+import sys
+import time
+json.loads(sys.stdin.read())
+subprocess.Popen([sys.executable, "-c", "import time; time.sleep(1.2)"])
+time.sleep(1.0)
+print(json.dumps({"ok": True}))
+"#;
+
+        let started_at = Instant::now();
+        let err =
+            super::run_legacy_oracle_script_with_timeout(&config, script, &json!({"x": 1}), 100)
+                .expect_err("stalled oracle process must time out");
+        let elapsed = started_at.elapsed();
+        assert!(err.contains("timed out after 100ms"));
+        assert!(
+            elapsed < Duration::from_millis(800),
+            "oracle timeout should not wait for inherited pipe handles: elapsed={elapsed:?}"
+        );
     }
 
     #[test]
