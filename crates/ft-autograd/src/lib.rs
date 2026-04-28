@@ -16072,11 +16072,18 @@ mod tests {
 
     #[test]
     fn scalar_sign_forward_zero() {
-        // Rust signum(+0.0) = 1.0 (not 0.0 like PyTorch)
+        // PyTorch parity (frankentorch-wfyq): torch.sign(0.0) = 0.0
+        // and torch.sign(-0.0) = 0.0. Rust's f64::signum returns ±1.0
+        // for ±0.0, but the kernel layer overrides that.
         let mut tape = Tape::new();
         let x = tape.leaf(0.0, true);
         let (y, _) = tape.sign(x, ExecutionMode::Strict).expect("sign");
-        assert_eq!(tape.value(y).expect("value"), 1.0);
+        assert_eq!(tape.value(y).expect("value"), 0.0);
+
+        let mut tape = Tape::new();
+        let x = tape.leaf(-0.0, true);
+        let (y, _) = tape.sign(x, ExecutionMode::Strict).expect("sign");
+        assert_eq!(tape.value(y).expect("value"), 0.0);
     }
 
     #[test]
@@ -16163,14 +16170,15 @@ mod tests {
 
     #[test]
     fn tensor_sign_forward() {
+        // PyTorch parity (frankentorch-wfyq): both signed zeros map to
+        // +0.0, not ±1.0.
         let mut tape = TensorTape::new();
-        // Rust signum(+0.0) = 1.0
         let x = tape
-            .leaf(vec![-3.0, 0.0, 5.0, -1.0], vec![4], true)
+            .leaf(vec![-3.0, 0.0, -0.0, 5.0, -1.0], vec![5], true)
             .expect("leaf");
         let (y, _) = tape.sign(x, ExecutionMode::Strict).expect("sign");
         let vals = tape.values(y).expect("values");
-        assert_eq!(vals, &[-1.0, 1.0, 1.0, -1.0]);
+        assert_eq!(vals, &[-1.0, 0.0, 0.0, 1.0, -1.0]);
     }
 
     #[test]

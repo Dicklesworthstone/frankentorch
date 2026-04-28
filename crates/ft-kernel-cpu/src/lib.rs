@@ -175,8 +175,25 @@ pub fn expm1_scalar(input: &ScalarTensor) -> ScalarTensor {
     input.with_value(input.value().exp_m1())
 }
 
+/// PyTorch parity: `torch.sign` maps both signed zeros to +0.0,
+/// propagates NaN, and returns ±1.0 only for non-zero finite values.
+/// Rust's `f64::signum` instead returns ±1.0 for ±0.0 (IEEE 754
+/// sign-bit semantics), which is observably different — fix it once
+/// here so every dispatch backend sees the same semantics.
+fn torch_sign_f64(value: f64) -> f64 {
+    if value.is_nan() {
+        f64::NAN
+    } else if value == 0.0 {
+        0.0
+    } else if value > 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 pub fn sign_scalar(input: &ScalarTensor) -> ScalarTensor {
-    input.with_value(input.value().signum())
+    input.with_value(torch_sign_f64(input.value()))
 }
 
 pub fn trunc_scalar(input: &ScalarTensor) -> ScalarTensor {
@@ -863,7 +880,7 @@ pub fn sign_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_contiguous_f64(input, meta, |value| value.signum())
+    unary_contiguous_f64(input, meta, torch_sign_f64)
 }
 
 pub fn trunc_tensor_contiguous_f64(
@@ -4762,6 +4779,19 @@ fn round_ties_even_f32(value: f32) -> f32 {
     value.round_ties_even()
 }
 
+/// F32 companion to `torch_sign_f64` — see that function for rationale.
+fn torch_sign_f32(value: f32) -> f32 {
+    if value.is_nan() {
+        f32::NAN
+    } else if value == 0.0 {
+        0.0
+    } else if value > 0.0 {
+        1.0
+    } else {
+        -1.0
+    }
+}
+
 // ── Macro-generated simple f32 unary kernels ────────────────────────────
 
 macro_rules! define_unary_f32 {
@@ -4796,7 +4826,7 @@ define_unary_f32!(log2_tensor_contiguous_f32, f32::log2);
 define_unary_f32!(log10_tensor_contiguous_f32, f32::log10);
 define_unary_f32!(log1p_tensor_contiguous_f32, f32::ln_1p);
 define_unary_f32!(expm1_tensor_contiguous_f32, f32::exp_m1);
-define_unary_f32!(sign_tensor_contiguous_f32, f32::signum);
+define_unary_f32!(sign_tensor_contiguous_f32, torch_sign_f32);
 define_unary_f32!(trunc_tensor_contiguous_f32, f32::trunc);
 define_unary_f32!(frac_tensor_contiguous_f32, f32::fract);
 define_unary_f32!(asin_tensor_contiguous_f32, f32::asin);
@@ -9187,22 +9217,44 @@ mod tests {
 
     #[test]
     fn sign_scalar_returns_expected_value() {
+        // PyTorch parity (frankentorch-wfyq): torch.sign maps both
+        // signed zeros to +0.0, propagates NaN, and returns ±1.0 only
+        // for non-zero finite values. Rust's f64::signum returns ±1.0
+        // for ±0.0 (IEEE 754 sign-bit semantics) — we override.
         let pos = ScalarTensor::new(5.0, DType::F64, Device::Cpu);
         let neg = ScalarTensor::new(-3.0, DType::F64, Device::Cpu);
+        let pos_zero = ScalarTensor::new(0.0, DType::F64, Device::Cpu);
         let neg_zero = ScalarTensor::new(-0.0, DType::F64, Device::Cpu);
         assert_eq!(sign_scalar(&pos).value(), 1.0);
         assert_eq!(sign_scalar(&neg).value(), -1.0);
-        // Rust signum: +0.0 → 1.0, -0.0 → -1.0 (IEEE 754 sign bit)
-        assert_eq!(sign_scalar(&neg_zero).value(), -1.0);
+        assert_eq!(sign_scalar(&pos_zero).value(), 0.0);
+        assert_eq!(sign_scalar(&neg_zero).value(), 0.0);
+    }
+
+    #[test]
+    fn sign_scalar_propagates_nan() {
+        let nan = ScalarTensor::new(f64::NAN, DType::F64, Device::Cpu);
+        assert!(sign_scalar(&nan).value().is_nan());
     }
 
     #[test]
     fn sign_tensor_contiguous_returns_expected_values() {
-        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
-        let input = vec![3.0, -2.0, -0.0, -0.5];
+        // PyTorch parity (frankentorch-wfyq): both signed zeros map to
+        // +0.0; non-zero negatives stay -1.0.
+        let meta = TensorMeta::from_shape(vec![5], DType::F64, Device::Cpu);
+        let input = vec![3.0, -2.0, -0.0, 0.0, -0.5];
         let out = sign_tensor_contiguous_f64(&input, &meta).expect("sign should succeed");
-        // Rust signum: +3.0→1.0, -2.0→-1.0, -0.0→-1.0, -0.5→-1.0
-        assert_eq!(out, vec![1.0, -1.0, -1.0, -1.0]);
+        assert_eq!(out, vec![1.0, -1.0, 0.0, 0.0, -1.0]);
+    }
+
+    #[test]
+    fn sign_tensor_contiguous_propagates_nan() {
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let input = vec![f64::NAN, 1.0, -1.0];
+        let out = sign_tensor_contiguous_f64(&input, &meta).expect("sign should succeed");
+        assert!(out[0].is_nan());
+        assert_eq!(out[1], 1.0);
+        assert_eq!(out[2], -1.0);
     }
 
     // ---- trunc ----
