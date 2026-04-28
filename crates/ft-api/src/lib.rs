@@ -4536,6 +4536,116 @@ impl FrankenTorchSession {
         self.tensor_clamp(input, f64::NEG_INFINITY, max_val)
     }
 
+    /// Per-tensor affine quantization: `q = clamp(round(x/scale) + zero_point, qmin, qmax)`.
+    ///
+    /// Output values are integers in `[qmin, qmax]` but stored in the input
+    /// dtype — this is the "fake quantization" representation used by
+    /// PyTorch for quantization-aware training and post-training
+    /// quantization. `tensor_round` uses a straight-through estimator on
+    /// the backward pass, so gradients flow through as if quantization
+    /// were the identity.
+    ///
+    /// # Errors
+    /// - `scale` must be finite and `> 0.0`
+    /// - `qmin` must be `< qmax`
+    pub fn tensor_quantize_per_tensor(
+        &mut self,
+        input: TensorNodeId,
+        scale: f64,
+        zero_point: i64,
+        qmin: i64,
+        qmax: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        Self::validate_qparams(scale, zero_point, qmin, qmax)?;
+        let inv_scale = self.full_like(input, 1.0 / scale, false)?;
+        let scaled = self.tensor_mul(input, inv_scale)?;
+        let rounded = self.tensor_round(scaled)?;
+        let zp = self.full_like(rounded, zero_point as f64, false)?;
+        let shifted = self.tensor_add(rounded, zp)?;
+        #[allow(clippy::cast_precision_loss)]
+        let lo = qmin as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let hi = qmax as f64;
+        self.tensor_clamp(shifted, lo, hi)
+    }
+
+    /// Per-tensor affine dequantization: `x = (q - zero_point) * scale`.
+    ///
+    /// # Errors
+    /// - `scale` must be finite and `> 0.0`
+    pub fn tensor_dequantize_per_tensor(
+        &mut self,
+        quantized: TensorNodeId,
+        scale: f64,
+        zero_point: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_dequantize_per_tensor: scale must be finite and > 0",
+                }
+                .into(),
+            ));
+        }
+        let zp = self.full_like(quantized, zero_point as f64, false)?;
+        let shifted = self.tensor_sub(quantized, zp)?;
+        let scale_t = self.full_like(shifted, scale, false)?;
+        self.tensor_mul(shifted, scale_t)
+    }
+
+    /// Fake-quantize: `dequantize(quantize_per_tensor(x))`. Simulates
+    /// the precision loss of `[qmin, qmax]` quantization while keeping
+    /// values in the input dtype. The composition is differentiable
+    /// (round is straight-through), making this suitable for QAT.
+    ///
+    /// # Errors
+    /// - `scale` must be finite and `> 0.0`
+    /// - `qmin` must be `< qmax`
+    pub fn tensor_fake_quantize_per_tensor(
+        &mut self,
+        input: TensorNodeId,
+        scale: f64,
+        zero_point: i64,
+        qmin: i64,
+        qmax: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let q = self.tensor_quantize_per_tensor(input, scale, zero_point, qmin, qmax)?;
+        self.tensor_dequantize_per_tensor(q, scale, zero_point)
+    }
+
+    fn validate_qparams(
+        scale: f64,
+        zero_point: i64,
+        qmin: i64,
+        qmax: i64,
+    ) -> Result<(), AutogradError> {
+        if !scale.is_finite() || scale <= 0.0 {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_quantize_per_tensor: scale must be finite and > 0",
+                }
+                .into(),
+            ));
+        }
+        if qmin >= qmax {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_quantize_per_tensor: qmin must be < qmax",
+                }
+                .into(),
+            ));
+        }
+        if zero_point < qmin || zero_point > qmax {
+            return Err(AutogradError::Dispatch(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensor_quantize_per_tensor: zero_point must lie in [qmin, qmax]",
+                }
+                .into(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn isnan(&mut self, input: NodeId) -> Result<NodeId, AutogradError> {
         self.scalar_float_classify(UnaryOp::IsNan, input)
     }

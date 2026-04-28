@@ -13944,6 +13944,175 @@ pub fn init_dirac_(
     Ok(tensor)
 }
 
+/// Quantization parameters for an affine quantization scheme:
+/// `q = clamp(round(x/scale) + zero_point, qmin, qmax)`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct QParams {
+    pub scale: f64,
+    pub zero_point: i64,
+    pub qmin: i64,
+    pub qmax: i64,
+}
+
+impl QParams {
+    /// QInt8: signed 8-bit, range `[-128, 127]`.
+    #[must_use]
+    pub const fn qint8_range() -> (i64, i64) {
+        (-128, 127)
+    }
+
+    /// QUInt8: unsigned 8-bit, range `[0, 255]`.
+    #[must_use]
+    pub const fn quint8_range() -> (i64, i64) {
+        (0, 255)
+    }
+}
+
+/// Running min/max observer used for post-training quantization
+/// calibration. Equivalent to `torch.ao.quantization.MinMaxObserver`.
+///
+/// Call [`MinMaxObserver::observe`] over representative inputs, then
+/// [`MinMaxObserver::compute_qparams`] to derive the affine
+/// `(scale, zero_point)` for [`FrankenTorchSession::tensor_quantize_per_tensor`]
+/// and [`FrankenTorchSession::tensor_fake_quantize_per_tensor`].
+#[derive(Debug, Clone, Copy)]
+pub struct MinMaxObserver {
+    min: f64,
+    max: f64,
+    qmin: i64,
+    qmax: i64,
+    initialized: bool,
+}
+
+impl MinMaxObserver {
+    /// Create a new observer with explicit `[qmin, qmax]` bounds.
+    ///
+    /// # Errors
+    /// `qmin` must be `< qmax`.
+    pub fn new(qmin: i64, qmax: i64) -> Result<Self, AutogradError> {
+        if qmin >= qmax {
+            return Err(AutogradError::Dispatch(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "MinMaxObserver: qmin must be < qmax",
+                }
+                .into(),
+            ));
+        }
+        Ok(Self {
+            min: f64::INFINITY,
+            max: f64::NEG_INFINITY,
+            qmin,
+            qmax,
+            initialized: false,
+        })
+    }
+
+    /// Convenience constructor for QInt8 (range `[-128, 127]`).
+    pub fn qint8() -> Self {
+        let (qmin, qmax) = QParams::qint8_range();
+        // Constructor invariants are satisfied: -128 < 127.
+        Self::new(qmin, qmax).expect("qint8 range is valid")
+    }
+
+    /// Convenience constructor for QUInt8 (range `[0, 255]`).
+    pub fn quint8() -> Self {
+        let (qmin, qmax) = QParams::quint8_range();
+        Self::new(qmin, qmax).expect("quint8 range is valid")
+    }
+
+    /// Update running min/max from `input`'s current values.
+    ///
+    /// Non-finite entries are skipped (they cannot meaningfully
+    /// participate in linear quantization). If every entry is
+    /// non-finite, the observer remains uninitialized.
+    pub fn observe(
+        &mut self,
+        session: &FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        let values = session.tensor_values(input)?;
+        for &v in values.iter() {
+            if !v.is_finite() {
+                continue;
+            }
+            if !self.initialized {
+                self.min = v;
+                self.max = v;
+                self.initialized = true;
+            } else {
+                if v < self.min {
+                    self.min = v;
+                }
+                if v > self.max {
+                    self.max = v;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// True if at least one finite value has been observed.
+    #[must_use]
+    pub fn is_initialized(&self) -> bool {
+        self.initialized
+    }
+
+    /// Observed minimum (or `+inf` if uninitialized).
+    #[must_use]
+    pub fn min(&self) -> f64 {
+        self.min
+    }
+
+    /// Observed maximum (or `-inf` if uninitialized).
+    #[must_use]
+    pub fn max(&self) -> f64 {
+        self.max
+    }
+
+    /// Reset the observer to its uninitialized state.
+    pub fn reset(&mut self) {
+        self.min = f64::INFINITY;
+        self.max = f64::NEG_INFINITY;
+        self.initialized = false;
+    }
+
+    /// Derive `(scale, zero_point)` from the observed range.
+    ///
+    /// Uses the standard PyTorch affine formula:
+    /// `scale = max(max - min, eps) / (qmax - qmin)`,
+    /// `zero_point = clamp(round(qmin - min/scale), qmin, qmax)`.
+    ///
+    /// Returns `None` if no finite values have been observed.
+    #[must_use]
+    pub fn compute_qparams(&self) -> Option<QParams> {
+        if !self.initialized {
+            return None;
+        }
+        // Extend the observed range to include 0 — required so that the
+        // floating-point zero is exactly representable in the quantized
+        // domain (matches PyTorch's MinMaxObserver behaviour).
+        let lo = self.min.min(0.0);
+        let hi = self.max.max(0.0);
+        let span = (hi - lo).max(f64::EPSILON);
+        #[allow(clippy::cast_precision_loss)]
+        let qrange = (self.qmax - self.qmin) as f64;
+        let scale = span / qrange;
+        #[allow(clippy::cast_precision_loss)]
+        let qmin_f = self.qmin as f64;
+        #[allow(clippy::cast_precision_loss)]
+        let qmax_f = self.qmax as f64;
+        let zp_f = (qmin_f - lo / scale).round().clamp(qmin_f, qmax_f);
+        #[allow(clippy::cast_possible_truncation)]
+        let zero_point = zp_f as i64;
+        Some(QParams {
+            scale,
+            zero_point,
+            qmin: self.qmin,
+            qmax: self.qmax,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use ft_api::FrankenTorchSession;
@@ -15167,6 +15336,224 @@ mod tests {
             session.tensor_gradient(&report, emb.weight()).is_some(),
             "dense gradient must still be present"
         );
+    }
+
+    // ---- Quantization tests (frankentorch-4ak) ----
+
+    #[test]
+    fn quantize_dequantize_roundtrip_recovers_within_scale() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_vals = vec![-2.0, -1.0, 0.0, 0.5, 1.0, 2.5];
+        let x = session
+            .tensor_variable(x_vals.clone(), vec![6], false)
+            .expect("variable");
+        let scale = 0.05;
+        let zero_point = 0i64;
+        let (qmin, qmax) = QParams::qint8_range();
+
+        let q = session
+            .tensor_quantize_per_tensor(x, scale, zero_point, qmin, qmax)
+            .expect("quantize");
+        let q_vals = session.tensor_values(q).expect("q vals").to_vec();
+        for &qv in &q_vals {
+            assert!((qv.fract().abs() < 1e-9), "quantized values must be integral, got {qv}");
+            assert!(
+                qv >= qmin as f64 && qv <= qmax as f64,
+                "quantized {qv} outside [{qmin}, {qmax}]"
+            );
+        }
+
+        let dq = session
+            .tensor_dequantize_per_tensor(q, scale, zero_point)
+            .expect("dequantize");
+        let dq_vals = session.tensor_values(dq).expect("dq vals").to_vec();
+        for (orig, recovered) in x_vals.iter().zip(dq_vals.iter()) {
+            assert!(
+                (orig - recovered).abs() <= scale,
+                "round-trip drift {} > scale {}", (orig - recovered).abs(), scale
+            );
+        }
+    }
+
+    #[test]
+    fn quantize_clamps_out_of_range_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // With scale=1.0, zero_point=0, qmin=-128, qmax=127 the input
+        // 1000.0 should clamp to 127 and -1000.0 should clamp to -128.
+        let x = session
+            .tensor_variable(vec![1000.0, -1000.0, 50.0], vec![3], false)
+            .expect("variable");
+        let q = session
+            .tensor_quantize_per_tensor(x, 1.0, 0, -128, 127)
+            .expect("quantize");
+        let vals = session.tensor_values(q).expect("vals").to_vec();
+        assert!((vals[0] - 127.0).abs() < 1e-9, "high clamp: got {}", vals[0]);
+        assert!((vals[1] + 128.0).abs() < 1e-9, "low clamp: got {}", vals[1]);
+        assert!((vals[2] - 50.0).abs() < 1e-9, "in-range: got {}", vals[2]);
+    }
+
+    #[test]
+    fn quantize_rejects_invalid_qparams() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], false)
+            .expect("variable");
+        // scale = 0
+        assert!(session
+            .tensor_quantize_per_tensor(x, 0.0, 0, -128, 127)
+            .is_err());
+        // scale negative
+        assert!(session
+            .tensor_quantize_per_tensor(x, -0.1, 0, -128, 127)
+            .is_err());
+        // scale NaN
+        assert!(session
+            .tensor_quantize_per_tensor(x, f64::NAN, 0, -128, 127)
+            .is_err());
+        // qmin >= qmax
+        assert!(session
+            .tensor_quantize_per_tensor(x, 1.0, 0, 5, 5)
+            .is_err());
+        // zero_point outside [qmin, qmax]
+        assert!(session
+            .tensor_quantize_per_tensor(x, 1.0, 200, -128, 127)
+            .is_err());
+        // dequantize with scale = 0
+        assert!(session.tensor_dequantize_per_tensor(x, 0.0, 0).is_err());
+    }
+
+    #[test]
+    fn fake_quantize_recovers_within_scale_and_is_idempotent() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_vals = vec![-1.5, -0.7, 0.0, 0.33, 1.0];
+        let x = session
+            .tensor_variable(x_vals.clone(), vec![5], false)
+            .expect("variable");
+        let scale = 0.05;
+        let zp = 0i64;
+        let (qmin, qmax) = QParams::qint8_range();
+
+        let fq = session
+            .tensor_fake_quantize_per_tensor(x, scale, zp, qmin, qmax)
+            .expect("fake-quantize");
+        let fq_vals = session.tensor_values(fq).expect("vals").to_vec();
+        for (orig, recovered) in x_vals.iter().zip(fq_vals.iter()) {
+            assert!(
+                (orig - recovered).abs() <= scale,
+                "fake-quantize drift {} > scale {}", (orig - recovered).abs(), scale
+            );
+        }
+
+        // Idempotence: applying fake-quantize twice yields the same result.
+        let fq2 = session
+            .tensor_fake_quantize_per_tensor(fq, scale, zp, qmin, qmax)
+            .expect("second fake-quantize");
+        let fq2_vals = session.tensor_values(fq2).expect("vals2").to_vec();
+        for (a, b) in fq_vals.iter().zip(fq2_vals.iter()) {
+            assert!(
+                (a - b).abs() < 1e-9,
+                "fake_quantize must be idempotent: {a} vs {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn min_max_observer_tracks_range_and_computes_qparams() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut obs = MinMaxObserver::quint8();
+        assert!(!obs.is_initialized());
+        assert!(obs.compute_qparams().is_none());
+
+        let a = session
+            .tensor_variable(vec![-1.0, 0.5, 2.0], vec![3], false)
+            .expect("a");
+        let b = session
+            .tensor_variable(vec![3.5, -2.0], vec![2], false)
+            .expect("b");
+        obs.observe(&session, a).expect("observe a");
+        obs.observe(&session, b).expect("observe b");
+        assert!(obs.is_initialized());
+        assert!((obs.min() - (-2.0)).abs() < 1e-12);
+        assert!((obs.max() - 3.5).abs() < 1e-12);
+
+        let qp = obs.compute_qparams().expect("qparams");
+        let (qmin, qmax) = QParams::quint8_range();
+        assert_eq!(qp.qmin, qmin);
+        assert_eq!(qp.qmax, qmax);
+        // span widens to include 0: lo=-2, hi=3.5 -> span=5.5; scale=5.5/255
+        let expected_scale = 5.5 / 255.0;
+        assert!(
+            (qp.scale - expected_scale).abs() < 1e-12,
+            "scale {} != expected {}", qp.scale, expected_scale
+        );
+        // zero_point = round(0 - lo/scale) = round(2/scale) clamped into [0,255]
+        let expected_zp = (2.0 / expected_scale).round().clamp(0.0, 255.0) as i64;
+        assert_eq!(qp.zero_point, expected_zp);
+    }
+
+    #[test]
+    fn min_max_observer_skips_non_finite_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut obs = MinMaxObserver::qint8();
+        let x = session
+            .tensor_variable(
+                vec![f64::NAN, f64::INFINITY, f64::NEG_INFINITY],
+                vec![3],
+                false,
+            )
+            .expect("x");
+        obs.observe(&session, x).expect("observe");
+        assert!(
+            !obs.is_initialized(),
+            "all-non-finite input must leave observer uninitialized"
+        );
+
+        let y = session
+            .tensor_variable(vec![1.0, f64::NAN, 5.0], vec![3], false)
+            .expect("y");
+        obs.observe(&session, y).expect("observe y");
+        assert!(obs.is_initialized());
+        assert!((obs.min() - 1.0).abs() < 1e-12);
+        assert!((obs.max() - 5.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn min_max_observer_rejects_invalid_range() {
+        assert!(MinMaxObserver::new(5, 5).is_err());
+        assert!(MinMaxObserver::new(10, 3).is_err());
+        assert!(MinMaxObserver::new(-128, 127).is_ok());
+    }
+
+    #[test]
+    fn observer_drives_calibrated_fake_quantize() {
+        // E2E flow: observer -> qparams -> fake_quantize.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut obs = MinMaxObserver::qint8();
+
+        let calib = session
+            .tensor_variable(
+                vec![-2.0, -1.0, 0.0, 1.0, 2.0, 3.0],
+                vec![6],
+                false,
+            )
+            .expect("calib");
+        obs.observe(&session, calib).expect("observe");
+        let qp = obs.compute_qparams().expect("qparams");
+
+        let test_vals = vec![-1.5, 0.25, 2.5];
+        let x = session
+            .tensor_variable(test_vals.clone(), vec![3], false)
+            .expect("x");
+        let fq = session
+            .tensor_fake_quantize_per_tensor(x, qp.scale, qp.zero_point, qp.qmin, qp.qmax)
+            .expect("fake-quantize");
+        let fq_vals = session.tensor_values(fq).expect("vals");
+        for (orig, recovered) in test_vals.iter().zip(fq_vals.iter()) {
+            assert!(
+                (orig - recovered).abs() <= qp.scale,
+                "calibrated drift {} > scale {}", (orig - recovered).abs(), qp.scale
+            );
+        }
     }
 
     // ---- Softmax / LogSoftmax module tests ----
