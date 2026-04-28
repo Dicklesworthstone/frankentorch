@@ -10431,13 +10431,27 @@ impl FrankenTorchSession {
                 for _ in 0..n {
                     let vals = self.tensor_values(current)?;
                     let shape = self.tensor_shape(current)?;
-                    if vals.is_empty() || vals.len() < 2 {
-                        return self.tensor_variable(vec![], vec![0], false);
+                    // PyTorch errors on rank-0 input ("diff expects input
+                    // to be at least one-dimensional"). Match that.
+                    if shape.is_empty() {
+                        return Err(AutogradError::Dispatch(
+                            ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "diff: input must have at least one dimension",
+                                },
+                            ),
+                        ));
                     }
-                    // Flatten diff for 1-D; for multi-dim diff along last axis
-                    let last_dim = *shape.last().unwrap_or(&0);
+                    let last_dim = *shape.last().expect("shape non-empty checked above");
                     if last_dim < 2 {
-                        return self.tensor_variable(vec![], vec![0], false);
+                        // PyTorch parity: [3, 1] -> [3, 0], not [0]. Preserve
+                        // every leading dim and reduce only the last one
+                        // (frankentorch-rjn4).
+                        let mut out_shape = shape.clone();
+                        if let Some(last) = out_shape.last_mut() {
+                            *last = 0;
+                        }
+                        return self.tensor_variable(vec![], out_shape, false);
                     }
                     let batch: usize = vals.len() / last_dim;
                     let new_last = last_dim - 1;
@@ -10469,12 +10483,22 @@ impl FrankenTorchSession {
                 for _ in 0..n {
                     let vals = self.tensor_values_f32(current)?;
                     let shape = self.tensor_shape(current)?;
-                    if vals.is_empty() || vals.len() < 2 {
-                        return self.tensor_variable_f32(vec![], vec![0], false);
+                    if shape.is_empty() {
+                        return Err(AutogradError::Dispatch(
+                            ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "diff: input must have at least one dimension",
+                                },
+                            ),
+                        ));
                     }
-                    let last_dim = *shape.last().unwrap_or(&0);
+                    let last_dim = *shape.last().expect("shape non-empty checked above");
                     if last_dim < 2 {
-                        return self.tensor_variable_f32(vec![], vec![0], false);
+                        let mut out_shape = shape.clone();
+                        if let Some(last) = out_shape.last_mut() {
+                            *last = 0;
+                        }
+                        return self.tensor_variable_f32(vec![], out_shape, false);
                     }
                     let batch: usize = vals.len() / last_dim;
                     let new_last = last_dim - 1;
@@ -24797,6 +24821,48 @@ mod tests {
         let t = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
         let out = s.tensor_diff(t, 0).unwrap();
         assert_eq!(out, t);
+    }
+
+    #[test]
+    fn diff_preserves_leading_dims_when_last_dim_lt_2() {
+        // PyTorch parity (frankentorch-rjn4): diff(zeros(3, 1)) -> [3, 0],
+        // not [0]. Leading batch dims must be preserved when the last dim
+        // collapses to zero.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3, 1], false)
+            .unwrap();
+        let out = s.tensor_diff(t, 1).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![3, 0]);
+        assert!(s.tensor_values(out).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_preserves_leading_dims_when_last_dim_lt_2_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0], vec![2, 2, 1], false)
+            .unwrap();
+        let out = s.tensor_diff(t, 1).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![2, 2, 0]);
+        assert!(s.tensor_values_f32(out).unwrap().is_empty());
+    }
+
+    #[test]
+    fn diff_rejects_rank_zero_input() {
+        // PyTorch parity: rank-0 input is an error, not a silent [0].
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![5.0], vec![], false).unwrap();
+        assert!(s.tensor_diff(t, 1).is_err());
+    }
+
+    #[test]
+    fn diff_rejects_rank_zero_input_f32() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable_f32(vec![5.0f32], vec![], false)
+            .unwrap();
+        assert!(s.tensor_diff(t, 1).is_err());
     }
 
     // ── cummax / cummin tests ──────────────────────────────────────────
