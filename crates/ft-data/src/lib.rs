@@ -794,10 +794,10 @@ impl NormalizeTransform {
 
 impl Transform for NormalizeTransform {
     fn apply(&self, mut item: DataItem) -> DataItem {
-        for (name, values, _shape) in &mut item.tensors {
+        for (name, values, shape) in &mut item.tensors {
             if name == &self.tensor_name && !self.mean.is_empty() {
                 let channels = self.mean.len();
-                if values.len() % channels != 0 {
+                if shape.first().copied() != Some(channels) || values.len() % channels != 0 {
                     continue;
                 }
                 let channel_size = values.len() / channels;
@@ -1505,6 +1505,21 @@ mod tests {
         // Channel 1: (30-30)/10=0, (40-30)/10=1
         assert!((vals[2] - 0.0).abs() < 1e-10);
         assert!((vals[3] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn normalize_transform_respects_declared_channel_dimension() {
+        let item = DataItem::single("input", vec![10.0, 20.0, 30.0, 40.0], vec![1, 2, 2]);
+        let t = NormalizeTransform::new("input", vec![10.0, 30.0], vec![10.0, 10.0])
+            .expect("transform");
+
+        let result = t.apply(item);
+
+        assert_eq!(
+            result.tensors[0].1,
+            vec![10.0, 20.0, 30.0, 40.0],
+            "stats for two channels must not be applied to a one-channel tensor"
+        );
     }
 
     #[test]
