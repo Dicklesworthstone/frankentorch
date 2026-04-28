@@ -12768,6 +12768,34 @@ json.loads(sys.stdin.read())
     }
 
     #[test]
+    fn torch_round_half_even_public_api_conformance() {
+        use ft_api::FrankenTorchSession;
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![-2.5, -1.5, -0.5, 0.5, 1.5, 2.5], vec![6], false)
+            .expect("round input");
+        let rounded = session.tensor_round(input).expect("tensor_round");
+        let values = session.tensor_values(rounded).expect("round values");
+
+        assert_eq!(values, vec![-2.0, -2.0, -0.0, 0.0, 2.0, 2.0]);
+        assert!(values[2].is_sign_negative());
+
+        let scalar = session.variable(2.5, false);
+        let scalar_rounded = session.round(scalar).expect("round scalar");
+        assert_eq!(session.value(scalar_rounded).expect("scalar value"), 2.0);
+
+        let neg_half = session.variable(-0.5, false);
+        let neg_half_rounded = session.round(neg_half).expect("round negative half");
+        assert!(
+            session
+                .value(neg_half_rounded)
+                .expect("negative half value")
+                .is_sign_negative()
+        );
+    }
+
+    #[test]
     fn custom_function_layer_trains_end_to_end_with_adam() {
         use ft_api::FrankenTorchSession;
         use ft_optim::{Adam, Optimizer};
