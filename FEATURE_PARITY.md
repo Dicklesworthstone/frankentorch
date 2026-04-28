@@ -175,11 +175,11 @@ Subset (Arc-based), random_split (deterministic seeded)
 | CUDA / GPU backend | not_started | `Device::Cuda` exists as metadata and device-guard validation, but real execution, dispatch, storage, and kernel coverage remain CPU-only | `frankentorch-c3d` |
 | Distributed training (`DDP` / `FSDP`) | not_started | No multi-rank process-group, collective communication, gradient sync, or parameter sharding surface exists in-tree | `frankentorch-82b` |
 | `TorchScript` / `torch.compile` / JIT graph execution | not_started | Execution is eager-only; there is no graph capture, compiled runtime, or TorchScript-like serialization/execution pipeline | `frankentorch-8zy` |
-| Quantization | not_started | No quantized tensor metadata, observers, or INT8 execution/export path is implemented | `frankentorch-4ak` |
-| Sparse tensors | not_started | Dense tensor paths exist, but sparse storage formats and sparse kernels are not implemented | `frankentorch-0tw` |
-| Mixed precision (`torch.amp`) | not_started | `F16` / `BF16` dtypes exist, but there is no autocast or gradient-scaling workflow | `frankentorch-iha` |
+| Quantization | parity_partial | Fake-quantize MVP shipped (`tensor_quantize_per_tensor` / `tensor_dequantize_per_tensor` / `tensor_fake_quantize_per_tensor`, `MinMaxObserver`, `QParams`). QInt8/QUInt8 storage dtypes, `QuantizedLinear`, and per-channel quantization remain deferred. | `frankentorch-4ak` (closed, MVP) → `frankentorch-hpg` (deferred, dtype + module follow-up) |
+| Sparse tensors | parity_partial | Sparse COO/CSR storage in ft-core, sparse kernels (matmul/coalesce/add) in ft-kernel-cpu, sparse-gradient surface from `Embedding(sparse=true)` + `IndexSelect` consumed by `SparseAdam`. Broader sparse coverage (sparse-sparse ops, CSC, BSR, ufuncs) remains gapped. | `frankentorch-0tw` (closed, MVP) |
+| Mixed precision (`torch.amp`) | parity_partial | Autocast context + `GradScaler` shipped. F16/BF16 forward already supported; backward currently runs in F64. | `frankentorch-iha` (closed) |
 | ONNX export | not_started | No ONNX tracing/export/interchange path exists | `frankentorch-iey` |
-| Gradient checkpointing | not_started | The tape does not yet expose a recompute-on-backward checkpointing facility | `frankentorch-plj` |
+| Gradient checkpointing | parity_partial | `session.checkpoint(...)` exposes recompute-on-backward; broader API surface (use_reentrant, distributed-aware) deferred. | `frankentorch-plj` (closed) |
 | PyTorch-compatible custom autograd Function surface | parity_gap | Closure-based custom autograd exists via `FrankenTorchSession::tensor_apply_function(...)` and `TensorTape::apply_function(...)`, including `save_for_backward`, but the PyTorch-compatible `torch.autograd.Function` API surface is not exposed yet | `frankentorch-2er` |
 
 ## Current Green Scope (CPU Eager-Mode Slice)
