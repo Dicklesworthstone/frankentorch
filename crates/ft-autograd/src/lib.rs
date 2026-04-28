@@ -12506,8 +12506,7 @@ impl TensorTape {
             };
             let shape = self.nodes[idx].tensor.meta().shape().to_vec();
             let device = self.nodes[idx].tensor.meta().device();
-            sparse_gradients[idx] =
-                Some(Self::build_sparse_grad_dim0(dense_grad, &shape, device)?);
+            sparse_gradients[idx] = Some(Self::build_sparse_grad_dim0(dense_grad, &shape, device)?);
         }
 
         Ok(TensorBackwardReport {
@@ -13888,7 +13887,8 @@ mod tests {
 
     use super::{
         AutogradError, BackwardOptions, NodeId, ReentrantPolicy, SchedulerTelemetry, Tape,
-        TensorHookHandle, TensorNode, TensorNodeId, TensorNodeOp, TensorTape,
+        TensorBackwardStep, TensorHookHandle, TensorNode, TensorNodeId, TensorNodeOp,
+        TensorSchedulerTelemetry, TensorTape,
     };
 
     fn as_u64(value: usize) -> u64 {
@@ -14049,6 +14049,127 @@ mod tests {
                 "property log missing required key '{key}'"
             );
         }
+    }
+
+    fn render_scheduler_property_log(log: &BTreeMap<String, String>) -> String {
+        log.iter()
+            .map(|(key, value)| format!("{key}={value}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn scheduler_property_log_golden_snapshot() {
+        let mut tape = Tape::new();
+        let lhs = tape.leaf(2.0, true);
+        let rhs = tape.leaf(-3.0, true);
+        let (sum, _) = tape
+            .add(lhs, rhs, ExecutionMode::Strict)
+            .expect("add should succeed");
+        let (root, _) = tape
+            .mul(sum, lhs, ExecutionMode::Strict)
+            .expect("mul should succeed");
+        let report = tape.backward(root).expect("backward should succeed");
+        let log = build_scheduler_property_log(
+            "scheduler_property_log_golden_snapshot",
+            ExecutionMode::Strict,
+            0x5a17_0000_0000_0001,
+            &report.telemetry,
+            "scheduler_property_log_contract_stable",
+        );
+
+        assert_scheduler_log_contract(&log);
+        insta::assert_snapshot!(
+            "scheduler_property_log",
+            render_scheduler_property_log(&log)
+        );
+    }
+
+    fn render_tensor_scheduler_log(
+        test_id: &str,
+        mode: ExecutionMode,
+        telemetry: &TensorSchedulerTelemetry,
+        report_steps: &[TensorBackwardStep],
+    ) -> String {
+        // Mirrors render_scheduler_property_log but for the tensor-tape
+        // backward path. Stable-sorted, with no time-varying fields, so
+        // it is safe to lock as an insta golden.
+        let mode_label = match mode {
+            ExecutionMode::Strict => "strict",
+            ExecutionMode::Hardened => "hardened",
+        };
+        let exec = telemetry
+            .execution_order
+            .iter()
+            .map(|n| n.0.to_string())
+            .collect::<Vec<_>>()
+            .join(",");
+        let deps = telemetry
+            .dependency_snapshot
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(",");
+        let rules = report_steps
+            .iter()
+            .map(|s| format!("{}:{}", s.node.0, s.rule))
+            .collect::<Vec<_>>()
+            .join("|");
+        let mut lines = vec![
+            format!("test_id={test_id}"),
+            format!("mode={mode_label}"),
+            format!("execution_order={exec}"),
+            format!("queue_pushes={}", telemetry.queue_pushes),
+            format!("queue_pops={}", telemetry.queue_pops),
+            format!("max_queue_len={}", telemetry.max_queue_len),
+            format!("dependency_snapshot={deps}"),
+            format!("reentrant_depth={}", telemetry.reentrant_depth),
+            format!(
+                "reentrant_guard_triggered={}",
+                telemetry.reentrant_guard_triggered
+            ),
+            format!(
+                "hardened_fallback_used={}",
+                telemetry.hardened_fallback_used
+            ),
+            format!("step_count={}", report_steps.len()),
+            format!("step_rules={rules}"),
+        ];
+        lines.sort();
+        lines.join("\n")
+    }
+
+    #[test]
+    fn tensor_scheduler_telemetry_locked_by_golden() {
+        // Lock the tensor-tape backward scheduler determinism contract
+        // for a canonical (a+b)*(a*b) graph at rank 1. Any change to
+        // execution_order, queue accounting, or per-step rules will
+        // surface as a snapshot diff and must be reviewed.
+        let mut tape = TensorTape::new();
+        let a = tape
+            .leaf(vec![1.0, 2.0, 3.0], vec![3], true)
+            .expect("leaf a");
+        let b = tape
+            .leaf(vec![4.0, 5.0, 6.0], vec![3], true)
+            .expect("leaf b");
+        let (sum, _) = tape
+            .add(a, b, ExecutionMode::Strict)
+            .expect("add should succeed");
+        let (prod, _) = tape
+            .mul(a, b, ExecutionMode::Strict)
+            .expect("mul should succeed");
+        let (root, _) = tape
+            .mul(sum, prod, ExecutionMode::Strict)
+            .expect("root mul should succeed");
+
+        let report = tape.backward(root).expect("tensor backward should succeed");
+        let rendered = render_tensor_scheduler_log(
+            "tensor_scheduler_telemetry_locked_by_golden",
+            ExecutionMode::Strict,
+            &report.telemetry,
+            &report.steps,
+        );
+        insta::assert_snapshot!("tensor_scheduler_telemetry_golden", rendered);
     }
 
     #[test]
@@ -15619,8 +15740,29 @@ mod tests {
         let mut tape = Tape::new();
         let x = tape.leaf(2.5, true);
         let (y, _) = tape.round(x, ExecutionMode::Strict).expect("round");
-        // f64::round() uses round-half-away-from-zero: 2.5 -> 3.0
-        assert_eq!(tape.value(y).expect("value"), 3.0);
+        // PyTorch parity: torch.round uses banker's rounding
+        // (ties-to-even). 2.5 rounds to 2.0, not 3.0. The kernel layer
+        // was updated in frankentorch-vk5; this test was stale.
+        assert_eq!(tape.value(y).expect("value"), 2.0);
+    }
+
+    #[test]
+    fn scalar_round_forward_ties_to_even_negative() {
+        // Companion check on the negative side: -2.5 -> -2.0 (toward
+        // even), not -3.0.
+        let mut tape = Tape::new();
+        let x = tape.leaf(-2.5, true);
+        let (y, _) = tape.round(x, ExecutionMode::Strict).expect("round");
+        assert_eq!(tape.value(y).expect("value"), -2.0);
+    }
+
+    #[test]
+    fn scalar_round_forward_ties_to_even_odd_floor() {
+        // 3.5 ties between 3 and 4; banker's rounding selects 4 (even).
+        let mut tape = Tape::new();
+        let x = tape.leaf(3.5, true);
+        let (y, _) = tape.round(x, ExecutionMode::Strict).expect("round");
+        assert_eq!(tape.value(y).expect("value"), 4.0);
     }
 
     #[test]

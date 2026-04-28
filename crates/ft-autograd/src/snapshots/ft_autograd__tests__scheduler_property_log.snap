@@ -1,0 +1,28 @@
+---
+source: crates/ft-autograd/src/lib.rs
+expression: "render_scheduler_property_log(&log)"
+---
+artifact_refs=artifacts/phase2c/FT-P2C-004/fixture_manifest.json
+dependency_snapshot=2,1,1,0
+duration_ms=0
+env_fingerprint=det64:ft-autograd-test
+execution_order=3,2,1,0
+fixture_id=ft_autograd_property_generated
+hardened_fallback_used=false
+input_digest=det64:a9bfab1eb0b1c609
+max_queue_len=2
+mode=strict
+outcome=pass
+output_digest=det64:5cad8f6cb05f15e7
+packet_id=FT-P2C-004
+queue_pops=4
+queue_pushes=4
+reason_code=scheduler_property_log_contract_stable
+reentrant_depth=0
+reentrant_guard_triggered=false
+replay_command=cargo test -p ft-autograd -- --nocapture
+scenario_id=autograd_scheduler_property/strict:scheduler_property_log_golden_snapshot
+seed=6491657387877859329
+suite_id=ft_autograd_property
+test_id=scheduler_property_log_golden_snapshot
+ts_utc=1970-01-01T00:00:00Z

@@ -1,0 +1,16 @@
+---
+source: crates/ft-autograd/src/lib.rs
+expression: rendered
+---
+dependency_snapshot=2,2,1,1,0
+execution_order=4,3,2,1,0
+hardened_fallback_used=false
+max_queue_len=2
+mode=strict
+queue_pops=5
+queue_pushes=5
+reentrant_depth=0
+reentrant_guard_triggered=false
+step_count=5
+step_rules=4:d(a*b)/da=b; d(a*b)/db=a|3:d(a*b)/da=b; d(a*b)/db=a|2:d(a+b)/da=1; d(a+b)/db=1|1:leaf|0:leaf
+test_id=tensor_scheduler_telemetry_locked_by_golden
