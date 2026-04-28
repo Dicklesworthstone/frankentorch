@@ -15,7 +15,7 @@ use ft_autograd::{
 use ft_core::{
     BFloat16, Complex64, Complex128, DType, DenseI64Tensor, DenseTensor, ExecutionMode, Float16,
     SparseCOOTensor, SparseCSRTensor, SparseTensorError, TensorCompatError, TensorMeta,
-    TensorStorage,
+    TensorStorage, contiguous_strides,
 };
 use ft_dispatch::{
     ComparisonDispatchDecision, ComparisonOp, UnaryDispatchDecision, UnaryOp,
@@ -2772,31 +2772,42 @@ impl FrankenTorchSession {
             return self.tensor_variable(Vec::new(), out_shape, false);
         }
 
-        let decode_coords = |mut index: usize, shape: &[usize]| {
-            let mut coords = vec![0usize; shape.len()];
-            for dim in (0..shape.len()).rev() {
-                let size = shape[dim];
-                coords[dim] = index % size;
-                index /= size;
-            }
-            coords
-        };
+        // Precompute contiguous strides for the aligned shapes ONCE before the
+        // hot loop (frankentorch-ys3y). The earlier implementation allocated a
+        // fresh `Vec<usize>` of length `rank` on every iteration of the
+        // doubly-nested loop via a `decode_coords` closure, which made a 2D x
+        // 2D kron of N x N inputs do O(N^4) Vec allocations. With strides in
+        // hand we can decompose `a_linear` and `b_linear` into per-dim
+        // coordinates with simple integer division and recombine into
+        // `out_linear` without any per-iteration heap activity.
+        //
+        // All bounds below are mathematically guaranteed to fit in `usize`:
+        // for any valid (a_linear, b_linear), each dim's `out_coord` is in
+        // `[0, out_shape[dim])`, and the running `out_linear` stays in
+        // `[0, total)` (already validated to fit in `usize` above). We keep
+        // checked arithmetic anyway to match the surrounding hardening style
+        // and to fail closed on any future invariant violation.
+        let a_strides = contiguous_strides(&a_aligned);
+        let b_strides = contiguous_strides(&b_aligned);
 
         let mut result = vec![0.0f64; total];
         for (a_linear, &a_val) in a_vals.iter().enumerate() {
-            let a_coords = decode_coords(a_linear, &a_aligned);
             for (b_linear, &b_val) in b_vals.iter().enumerate() {
-                let b_coords = decode_coords(b_linear, &b_aligned);
                 let mut out_linear = 0usize;
                 for dim in 0..rank {
+                    // contiguous_strides guarantees stride >= 1 for every dim
+                    // when the shape is non-empty, and we already short-
+                    // circuited when `total == 0`.
+                    let a_coord = (a_linear / a_strides[dim]) % a_aligned[dim];
+                    let b_coord = (b_linear / b_strides[dim]) % b_aligned[dim];
                     let scaled_a = Self::checked_mul(
-                        a_coords[dim],
+                        a_coord,
                         b_aligned[dim],
                         "kron: output coordinate overflow",
                     )?;
                     let out_coord = Self::checked_add(
                         scaled_a,
-                        b_coords[dim],
+                        b_coord,
                         "kron: output coordinate overflow",
                     )?;
                     out_linear = Self::checked_add(
@@ -28012,6 +28023,57 @@ mod tests {
                     "kron(I,I)[{i},{j}] = {}, expected {expected}",
                     vals[i * 4 + j]
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn kron_4d_matches_explicit_index_decomposition() {
+        // Lock the post-frankentorch-ys3y stride-based output layout for a
+        // non-trivial 4D shape that exercises every (a_strides, b_strides)
+        // path simultaneously. Reference values are computed by the explicit
+        // out[(ia*mb+ib, ja*nb+jb, ka*lb+kb, la*ob+lb_idx)] = a[ia,ja,ka,la] *
+        // b[ib,jb,kb,lb_idx] formula, which is what torch.kron returns.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a_shape = vec![2, 1, 2, 1];
+        let b_shape = vec![1, 2, 1, 2];
+        let a_numel: usize = a_shape.iter().product();
+        let b_numel: usize = b_shape.iter().product();
+        let a_data: Vec<f64> = (0..a_numel).map(|i| (i as f64) + 1.0).collect();
+        let b_data: Vec<f64> = (0..b_numel).map(|i| (i as f64) + 10.0).collect();
+        let a = s.tensor_variable(a_data.clone(), a_shape.clone(), false).unwrap();
+        let b = s.tensor_variable(b_data.clone(), b_shape.clone(), false).unwrap();
+
+        let k = s.tensor_kron(a, b).unwrap();
+        let vals = s.tensor_values(k).unwrap();
+        let shape = s.tensor_shape(k).unwrap();
+        // shape = [2*1, 1*2, 2*1, 1*2] = [2, 2, 2, 2].
+        assert_eq!(shape, vec![2, 2, 2, 2]);
+        assert_eq!(vals.len(), 16);
+
+        // Recompute reference via the textbook formula so the regression
+        // catches any future stride miscomputation.
+        // a_shape=[2,1,2,1], a row-major: a[ia,0,ka,0] = a_data[ia*2 + ka].
+        // b_shape=[1,2,1,2], b row-major: b[0,jb,0,lb] = b_data[jb*2 + lb].
+        // out_shape=[2,2,2,2], out row-major: out[oi,oj,ok,ol] at oi*8+oj*4+ok*2+ol.
+        for ia in 0..a_shape[0] {
+            for jb in 0..b_shape[1] {
+                for ka in 0..a_shape[2] {
+                    for lb in 0..b_shape[3] {
+                        let a_idx = ia * 2 + ka;
+                        let b_idx = jb * 2 + lb;
+                        let expected = a_data[a_idx] * b_data[b_idx];
+                        // Output coords (a leading-padded dim is 1, so the
+                        // a-side contributes 0 at those slots; symmetrically
+                        // for the b dims that are 1 in b_shape).
+                        let out_idx = ia * 8 + jb * 4 + ka * 2 + lb;
+                        assert!(
+                            (vals[out_idx] - expected).abs() < 1e-12,
+                            "kron 4D mismatch at ({ia},{jb},{ka},{lb}): got {} expected {expected}",
+                            vals[out_idx]
+                        );
+                    }
+                }
             }
         }
     }
