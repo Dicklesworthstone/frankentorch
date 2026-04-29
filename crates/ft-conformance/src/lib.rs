@@ -18705,14 +18705,16 @@ print(json.dumps({"qr": out}))
                 0.0, 0.0, 5.0,
             ], 3, 3),
             ("scalar_1x1", vec![5.0], 1, 1),
-            // NB rank_deficient_3x3 ([[1,2,3],[4,5,6],[7,8,9]]) is
-            // intentionally omitted: FrankenTorch's SVD leaves U
-            // columns for zero singular values as all-zeros instead
-            // of completing the orthonormal basis, so U^T U != I_k
-            // on rank-deficient inputs. Tracked under
-            // frankentorch-zs8a; reconstruction U @ diag(S) @ Vh ≈ A
-            // is fine in that case but the orthonormality invariant
-            // fails. Re-enable this case after zs8a is fixed.
+            // Rank-deficient 3x3 — rows are linearly dependent so the
+            // matrix has rank 2 (third singular value is 0). Both
+            // numpy and FrankenTorch (post-zs8a fix) complete the
+            // U basis with a unit vector orthogonal to the column
+            // space, so U^T U = I_3 holds and reconstruction is fine.
+            ("rank_deficient_3x3", vec![
+                1.0, 2.0, 3.0,
+                4.0, 5.0, 6.0,
+                7.0, 8.0, 9.0,
+            ], 3, 3),
         ];
 
         let payload = json!({
@@ -18966,10 +18968,16 @@ print(json.dumps({"svd": out}))
             ], 2, 4),
             // 1x1 scalar.
             ("scalar_1x1_nonzero", vec![5.0], 1, 1),
-            // Rank-deficient is intentionally omitted because it
-            // exercises the SVD basis-completion path that's tracked
-            // under frankentorch-zs8a; pinv from a malformed U would
-            // give a wrong A+. Re-enable after zs8a is fixed.
+            // Rank-deficient 3x3 — pinv via SVD with the
+            // post-zs8a-fix basis completion now produces a valid
+            // pseudoinverse: zero singular values get reciprocals of
+            // 0 (zeroed out), so the completed-basis U columns
+            // contribute nothing to A+ and the result matches numpy.
+            ("rank_deficient_3x3", vec![
+                1.0, 2.0, 3.0,
+                4.0, 5.0, 6.0,
+                7.0, 8.0, 9.0,
+            ], 3, 3),
         ];
 
         let payload = json!({

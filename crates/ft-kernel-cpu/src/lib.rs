@@ -4547,17 +4547,45 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
                 u[i * u_cols + new_j] = work[i * n + old_j] / norm;
             }
         }
+        // else: leave zero — completed in the unified pass below.
     }
 
-    // If full_matrices and m > k, extend U to orthonormal basis
-    if full_matrices && m > k {
-        // Gram-Schmidt to fill remaining columns
-        for j in k..m {
-            // Start with standard basis vector e_j
+    // Complete the orthonormal basis: any column of U that is still
+    // zero (either because the corresponding singular value is below
+    // tol — rank-deficient input — or because we are in full_matrices
+    // mode and m > k so columns k..m start unfilled) gets a unit
+    // vector orthogonal to all previously-set columns via
+    // Gram-Schmidt. Required for U to satisfy U^T U = I_{u_cols},
+    // which numpy / torch.linalg.svd / scipy all guarantee. Tracked
+    // under frankentorch-zs8a — previously the rank-deficient path
+    // left those columns as zeros and reduced-mode SVD failed
+    // U^T U = I on rank-deficient matrices.
+    for j in 0..u_cols {
+        // Check if column j is currently zero (norm < tol).
+        let mut existing_norm_sq = 0.0f64;
+        for i in 0..m {
+            let v = u[i * u_cols + j];
+            existing_norm_sq += v * v;
+        }
+        if existing_norm_sq > tol * tol {
+            continue;
+        }
+
+        // Try standard basis vectors e_0, e_1, ... e_{m-1} until one
+        // produces a non-degenerate residual after Gram-Schmidt. In
+        // a rank-r system with m-r missing columns, at most r of the
+        // basis vectors can lie entirely in the existing column span,
+        // so a fresh one is always available within m tries.
+        for seed in 0..m {
             let mut col = vec![0.0f64; m];
-            col[j] = 1.0;
-            // Orthogonalize against existing columns
-            for prev in 0..j {
+            col[seed] = 1.0;
+            // Orthogonalize against all previously-set columns of u
+            // (this includes both already-normalized SVD columns and
+            // any earlier basis-completion columns we just filled).
+            for prev in 0..u_cols {
+                if prev == j {
+                    continue;
+                }
                 let mut dot = 0.0;
                 for i in 0..m {
                     dot += col[i] * u[i * u_cols + prev];
@@ -4566,8 +4594,7 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
                     col[i] -= dot * u[i * u_cols + prev];
                 }
             }
-            // Normalize
-            let mut norm = 0.0;
+            let mut norm = 0.0f64;
             for item in col.iter().take(m) {
                 norm += item * item;
             }
@@ -4576,6 +4603,7 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
                 for i in 0..m {
                     u[i * u_cols + j] = col[i] / norm;
                 }
+                break;
             }
         }
     }
