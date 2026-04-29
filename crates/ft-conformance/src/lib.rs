@@ -15569,6 +15569,289 @@ print(json.dumps(out))
     }
 
     #[test]
+    fn torch_vector_norm_numpy_subprocess_conformance() {
+        // Lock the FrankenTorch vector p-norm against numpy.linalg.norm,
+        // which is the canonical reference torch.linalg.vector_norm
+        // wraps in its CPU kernel.
+        //
+        // FrankenTorch's norm kernel (ft-kernel-cpu::norm_tensor_contiguous_f64)
+        // dispatches:
+        //   p =  inf    -> max|x|
+        //   p = -inf    -> min|x|
+        //   p =  0      -> count of nonzeros
+        //   p =  1      -> pairwise_sum_map(|x|)
+        //   p =  2      -> sqrt(pairwise_sum_map(x^2))
+        //   p =  other  -> pow(pairwise_sum_map(|x|^p), 1/p)
+        //
+        // Each branch has different precision behaviour:
+        //   - inf / -inf / 0 are exact (no fp arithmetic beyond abs)
+        //   - p = 1, 2 use pairwise summation (O(log N · ε))
+        //   - generic p adds two libm pow() calls and accumulates
+        //     |x|^p, which is sensitive to overflow when |x| > 1 and
+        //     p is large, and to underflow when |x| < 1 and p large
+        //
+        // The oracle calls numpy.linalg.norm directly so the reference
+        // is exactly the formula PyTorch / NumPy use. Tolerance is per
+        // p-branch — 0 ULPs for the exact branches, ~16 ULPs for the
+        // pairwise-summed L1 / L2, and ~64 ULPs for the generic-p
+        // branch where the pow + pow chain accumulates rounding.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let numpy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !numpy_available {
+            eprintln!(
+                "torch_vector_norm_numpy_subprocess_conformance: python3/numpy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Build a battery of input vectors covering the regimes that
+        // each p-branch is sensitive to. Each entry: (label, values).
+        let cases: Vec<(&str, Vec<f64>)> = vec![
+            // --- Trivial / structural ---
+            ("single_zero", vec![0.0]),
+            ("single_one", vec![1.0]),
+            ("single_neg_one", vec![-1.0]),
+            ("all_zeros_8", vec![0.0; 8]),
+            ("all_ones_8", vec![1.0; 8]),
+            ("all_neg_ones_8", vec![-1.0; 8]),
+            // --- Mixed signs / standard ranges ---
+            (
+                "small_signed",
+                vec![1.0, -2.0, 3.0, -4.0, 5.0, -6.0, 7.0, -8.0],
+            ),
+            (
+                "fractional",
+                vec![0.5, -0.25, 0.125, -0.0625, 0.03125, -1.5, 2.5, -3.5],
+            ),
+            // --- Sparsity exercises p = 0 ---
+            (
+                "mostly_zeros",
+                vec![0.0, 0.0, 1.5, 0.0, -2.5, 0.0, 0.0, 3.5, 0.0, 0.0],
+            ),
+            // --- Subnormal handling ---
+            (
+                "subnormals",
+                vec![5e-324, -5e-324, f64::MIN_POSITIVE, -f64::MIN_POSITIVE],
+            ),
+            // --- Overflow risk for L2: x^2 must not overflow ---
+            //   (1e150)^2 = 1e300 which is in-range; (1e300)^2 overflows.
+            ("overflow_l2_safe", vec![1e150, -1e150]),
+            // --- Underflow risk for L2: x^2 underflows to 0 ---
+            ("underflow_l2", vec![1e-200, -1e-200]),
+            // --- Generic p sensitivity: |x|^p for p=3 is fine in
+            //     mid-range but cubes large values → overflow.
+            //     Stay within safe range to test generic path. ---
+            (
+                "generic_p_midrange",
+                vec![1.5, -2.5, 0.75, -1.25, 2.0, -3.0, 0.5, -0.1],
+            ),
+            // --- Length-1 vector (each branch must handle this) ---
+            ("len1_pos", vec![3.7]),
+            ("len1_neg", vec![-3.7]),
+            // --- Repeated values (tie-breaking irrelevant for norms) ---
+            ("repeated", vec![2.5; 16]),
+            // --- Wide dynamic range (max-abs and min-abs differ a lot) ---
+            (
+                "wide_range",
+                vec![1e-10, 1.0, 1e10, -1e-10, -1.0, -1e10, 1e-5, 1e5],
+            ),
+            // --- Long vector (exercise pairwise summation tree depth) ---
+            (
+                "long_alternating",
+                (0..256)
+                    .map(|i| if i % 2 == 0 { 0.7 } else { -0.7 })
+                    .collect(),
+            ),
+            // --- Empty: torch returns 0 by convention; numpy raises
+            //     ValueError on zero-length, so we exercise the empty
+            //     path through FrankenTorch only and expect 0.0
+            //     regardless of p. We skip the oracle for empty.
+        ];
+
+        // The p values to sweep. Note: numpy.linalg.norm accepts these
+        // as `ord` (with `np.inf` / `-np.inf`); FrankenTorch accepts
+        // `f64` with `f64::INFINITY` / `f64::NEG_INFINITY`.
+        let p_values: Vec<f64> = vec![
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            0.0,
+            0.5,
+            1.0,
+            2.0,
+            3.0,
+        ];
+
+        // ULP tolerance per p branch. The exact branches (inf, -inf,
+        // 0) are integer-valued or trivially derived from comparisons,
+        // so they should match bit-exactly. The summed branches (1, 2)
+        // accumulate pairwise rounding. The generic branch chains
+        // pow() twice over a sum.
+        let ulp_tolerance = |p: f64| -> u64 {
+            if p.is_infinite() || p == 0.0 {
+                0
+            } else if p == 1.0 || p == 2.0 {
+                16
+            } else {
+                64
+            }
+        };
+
+        // Encode payload: list of (label, values_bits, p_bits).
+        let cases_payload: Vec<serde_json::Value> = cases
+            .iter()
+            .flat_map(|(label, vals)| {
+                let bits: Vec<String> = vals.iter().map(|v| v.to_bits().to_string()).collect();
+                p_values.iter().map(move |p| {
+                    json!({
+                        "label": label,
+                        "values": &bits,
+                        "p_bits": p.to_bits().to_string(),
+                    })
+                })
+            })
+            .collect();
+
+        let payload = json!({ "cases": cases_payload });
+
+        let total_count = cases.len() * p_values.len();
+        assert!(
+            total_count >= 50,
+            "vector_norm conformance must have >= 50 total comparisons, got {total_count}",
+        );
+
+        // Python oracle: numpy.linalg.norm. Returns f64 bits per case.
+        let script = r#"
+import json, struct, sys
+import numpy as np
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+req = json.loads(sys.stdin.read())
+out = []
+for case in req["cases"]:
+    vals = np.array([from_bits(b) for b in case["values"]], dtype=np.float64)
+    p = from_bits(case["p_bits"])
+    if p == float("inf"):
+        ord_arg = np.inf
+    elif p == float("-inf"):
+        ord_arg = -np.inf
+    else:
+        ord_arg = p
+    result = np.linalg.norm(vals, ord=ord_arg)
+    out.append({"label": case["label"], "p_bits": case["p_bits"], "norm_bits": to_bits(result)})
+print(json.dumps({"results": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_vector_norm_numpy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let results = response
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include results array");
+        assert_eq!(results.len(), total_count);
+
+        let approx_eq = |a: f64, b: f64, max_ulps: u64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            if a.is_infinite() || b.is_infinite() || a.is_nan() || b.is_nan() {
+                return false;
+            }
+            if a.is_sign_negative() != b.is_sign_negative() {
+                return false;
+            }
+            a.to_bits().abs_diff(b.to_bits()) <= max_ulps
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+        let mut idx = 0usize;
+        for (label, vals) in &cases {
+            let n = vals.len();
+            let xt = session
+                .tensor_variable(vals.clone(), vec![n], false)
+                .expect("xt");
+            for &p in &p_values {
+                let result_obj = &results[idx];
+                idx += 1;
+                let want = f64::from_bits(
+                    result_obj["norm_bits"]
+                        .as_str()
+                        .unwrap()
+                        .parse::<u64>()
+                        .unwrap(),
+                );
+                let got_id = session.tensor_norm(xt, p).expect("tensor_norm");
+                let got_vec = session.tensor_values(got_id).expect("tensor_values");
+                assert_eq!(
+                    got_vec.len(),
+                    1,
+                    "tensor_norm output must be a 1-element tensor"
+                );
+                let got = got_vec[0];
+                let max_ulps = ulp_tolerance(p);
+                if !approx_eq(got, want, max_ulps) {
+                    mismatches.push(format!(
+                        "tensor_norm({label:?}, p={p}) = {got:?} (bits 0x{:016x}) but numpy returned {want:?} (bits 0x{:016x}) — > {max_ulps} ULP apart",
+                        got.to_bits(),
+                        want.to_bits()
+                    ));
+                }
+            }
+        }
+
+        // Empty-vector path: FrankenTorch returns 0.0 for any p (see
+        // norm_tensor_contiguous_f64's `numel == 0` short-circuit).
+        // numpy raises on zero-length so we don't oracle it; we just
+        // verify the FrankenTorch contract.
+        let empty = session
+            .tensor_variable(Vec::<f64>::new(), vec![0], false)
+            .expect("empty tensor");
+        for &p in &p_values {
+            let got_id = session.tensor_norm(empty, p).expect("empty tensor_norm");
+            let got = session.tensor_values(got_id).expect("empty values")[0];
+            assert_eq!(
+                got, 0.0,
+                "tensor_norm of empty must return 0.0 for any p, got {got} at p={p}"
+            );
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "vector_norm numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_gelu_exact_libm_subprocess_conformance() {
         // Lock the precision contract for GELU (the exact erf-form, which
         // is PyTorch's default `approximate="none"`).
