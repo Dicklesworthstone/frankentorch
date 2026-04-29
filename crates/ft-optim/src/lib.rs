@@ -1780,9 +1780,16 @@ impl StepLR {
     /// * `last_epoch` - The index of the last epoch. Use -1 to start fresh.
     pub fn new(optimizer: &dyn Optimizer, step_size: usize) -> Self {
         let initial_lr = optimizer.get_lr();
+        // step_size=0 would integer-divide by zero in `compute_lr_at_epoch`
+        // (`epoch / step_size` at the integer-division site) and panic on
+        // the very first `.step()` call. Match the defensive `.max(1)`
+        // pattern that `CosineAnnealingLR`, `OneCycleLR`, and
+        // `CosineAnnealingWarmRestarts` already use for their analogous
+        // periodicity parameters: a zero period is meaningless, so collapse
+        // it to the smallest valid period (decay every epoch).
         Self {
             initial_lr,
-            step_size,
+            step_size: step_size.max(1),
             gamma: 0.1,
             last_epoch: -1,
             last_lr: initial_lr,
@@ -3800,6 +3807,14 @@ impl CyclicLR {
     /// * `step_size_up` - Number of iterations in the increasing half of a cycle.
     pub fn new(optimizer: &dyn Optimizer, base_lr: f64, max_lr: f64, step_size_up: usize) -> Self {
         let _ = optimizer;
+        // step_size_up=0 (and the default step_size_down=step_size_up=0)
+        // make `compute_lr` divide by zero in two places: the integer
+        // `iteration / total_size` panics, and the float
+        // `iteration as f64 / step_size_up as f64` produces inf which
+        // poisons the rest of the formula. Collapse to the smallest
+        // valid period of 1 — same defensive `.max(1)` pattern used by
+        // `CosineAnnealingLR`, `OneCycleLR`, and `CosineAnnealingWarmRestarts`.
+        let step_size_up = step_size_up.max(1);
         Self {
             base_lr,
             max_lr,
@@ -3814,7 +3829,11 @@ impl CyclicLR {
 
     #[must_use]
     pub fn step_size_down(mut self, size: usize) -> Self {
-        self.step_size_down = size;
+        // Same `.max(1)` guard as in `new` — otherwise
+        // `total_size = step_size_up + step_size_down` could still drop to
+        // an unsafe value if a caller chains `.step_size_down(0)` after a
+        // valid construction.
+        self.step_size_down = size.max(1);
         self
     }
 
