@@ -13022,31 +13022,31 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.special.logit(input, eps)`.
     /// Values are clamped to [eps, 1 - eps] if eps is provided.
+    ///
+    /// Composes through tensor_clamp / tensor_sub / tensor_div /
+    /// tensor_log so the autograd tape carries gradients through the
+    /// input. Previously this extracted tensor_values and rebuilt a
+    /// requires_grad=false leaf, severing the tape silently — same
+    /// pattern recently fixed across the activation / index_* /
+    /// scatter_* family. Tracked under frankentorch-1tax.
     pub fn tensor_logit(
         &mut self,
         input: TensorNodeId,
         eps: Option<f64>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
+        let shape = self.tensor_shape(input)?;
+        let clamped = if let Some(e) = eps {
+            self.tensor_clamp(input, e, 1.0 - e)?
+        } else {
+            input
         };
-
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| {
-                let clamped = if let Some(e) = eps {
-                    x.clamp(e, 1.0 - e)
-                } else {
-                    x
-                };
-                (clamped / (1.0 - clamped)).ln()
-            })
-            .collect();
-
-        let out = self
-            .tensor_tape
-            .leaf(values, meta.shape().to_vec(), false)?;
+        // 1 - x via a constant tensor + tensor_sub. Using
+        // tensor_sub_scalar would also work; the explicit
+        // construction keeps autograd tracking on `clamped`.
+        let ones = self.full(shape, 1.0, false)?;
+        let one_minus_x = self.tensor_sub(ones, clamped)?;
+        let ratio = self.tensor_div(clamped, one_minus_x)?;
+        let out = self.tensor_log(ratio)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("logit in={} out={}", input.0, out.0),
@@ -29636,6 +29636,40 @@ mod tests {
         // With eps=0.01, inputs are clamped to [0.01, 0.99]
         assert!(vals[0].is_finite(), "logit(0) with eps should be finite");
         assert!(vals[2].is_finite(), "logit(1) with eps should be finite");
+    }
+
+    #[test]
+    fn logit_propagates_gradients_through_input() {
+        // tensor_logit was severed-autograd before frankentorch-1tax:
+        // it extracted values and rebuilt a fresh requires_grad=false
+        // leaf, dropping the gradient. After composition through
+        // tensor_clamp + tensor_sub + tensor_div + tensor_log,
+        // gradients flow correctly.
+        //
+        // d/dx logit(x) = 1 / (x * (1 - x))
+        //
+        // For input [0.25, 0.5, 0.75] with sum loss:
+        //   grad[0] = 1 / (0.25 * 0.75) = 5.333...
+        //   grad[1] = 1 / (0.5 * 0.5) = 4.0
+        //   grad[2] = 1 / (0.75 * 0.25) = 5.333...
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.25, 0.5, 0.75], vec![3], true)
+            .unwrap();
+        let result = s.tensor_logit(input, None).unwrap();
+        let loss = s.tensor_sum(result).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("logit must propagate gradient through the input");
+        let expect = |x: f64| 1.0 / (x * (1.0 - x));
+        for (i, (&g, &x)) in grad.iter().zip([0.25, 0.5, 0.75].iter()).enumerate() {
+            let want = expect(x);
+            assert!(
+                (g - want).abs() < 1e-12,
+                "logit grad[{i}] = {g}, expected 1/(x*(1-x)) = {want} for x={x}"
+            );
+        }
     }
 
     #[test]
