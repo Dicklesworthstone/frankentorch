@@ -9353,6 +9353,48 @@ mod tests {
     }
 
     #[test]
+    fn log_softmax_preserves_precision_at_large_magnitudes() {
+        // Regression test for frankentorch-ebrb. The log_softmax
+        // kernel previously computed
+        //     output[i] = x[i] - (max + log(sum(exp(x - max))))
+        // which suffers catastrophic cancellation at large magnitudes
+        // (e.g. logits ~1000): max + log(sum) collapses ~1000-magnitude
+        // values to a ~−O(1) result, wiping ~13 mantissa digits. The
+        // fix rearranges to (x[i] - max) - log(sum(exp(x - max))),
+        // which keeps both intermediates near the result magnitude.
+        //
+        // Reference values are the analytical scipy answers — at
+        // x = [1000, 1001, 1002], log_softmax should equal
+        //     ([-2, -1, 0]) - log(e^-2 + e^-1 + 1)
+        //   = ([-2, -1, 0]) - log(0.13534 + 0.36788 + 1.0)
+        //   ≈ [-2.4076059644443804, -1.4076059644443804, -0.4076059644443804]
+        // The pre-fix kernel returned -2.4076059644444285 etc. (~1000
+        // ULPs off). Lock the new envelope to <= 16 ULPs absolute,
+        // which catches a regression to the old algebra without being
+        // brittle to libm exp/log rounding.
+        let meta = TensorMeta::from_shape(vec![1, 3], DType::F64, Device::Cpu);
+        let input = vec![1000.0, 1001.0, 1002.0];
+        let out = log_softmax_dim_tensor_contiguous_f64(&input, &meta, 1)
+            .expect("log_softmax large magnitude");
+        let expected = [
+            -2.4076059644443804_f64,
+            -1.4076059644443804,
+            -0.4076059644443804,
+        ];
+        for i in 0..3 {
+            let bits_diff = out[i].to_bits().abs_diff(expected[i].to_bits());
+            assert!(
+                bits_diff <= 16,
+                "log_softmax[{i}]={} bits=0x{:016x}, expected={} bits=0x{:016x}, ULP diff={bits_diff}",
+                out[i],
+                out[i].to_bits(),
+                expected[i],
+                expected[i].to_bits(),
+            );
+        }
+    }
+
+    #[test]
     fn softmax_dim_invalid_dim() {
         let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
         let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
