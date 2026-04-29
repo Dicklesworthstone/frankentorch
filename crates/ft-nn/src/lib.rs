@@ -1169,7 +1169,28 @@ impl Module for Unfold {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let vals = session.tensor_values(input)?;
+        // Compose Unfold through autograd primitives so the backward
+        // pass actually flows through the input. The previous
+        // implementation read tensor_values, computed the gather in
+        // plain f64 math, and rebuilt a fresh leaf with
+        // requires_grad=false — silently severing the tape.
+        //
+        // Strategy:
+        //   1. Pad input with zeros along H and W (so out-of-bounds
+        //      reads in the kernel sweep become legitimate zero
+        //      reads from the padded buffer).
+        //   2. Flatten the padded input to 1-D.
+        //   3. Build a static index tensor mapping each (batch, row,
+        //      col_idx) output position to the corresponding flat
+        //      padded-input index.
+        //   4. tensor_gather along dim 0 with that index → flat output.
+        //   5. Reshape to [N, block_size, L].
+        //
+        // tensor_pad / tensor_reshape / tensor_gather all have
+        // backward kernels in ft-autograd, so the resulting graph is
+        // fully differentiable — gather's backward is exactly the
+        // scatter_add that Fold computes, which is the analytical
+        // transpose of Unfold.
         let shape = session.tensor_shape(input)?;
         if shape.len() != 4 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -1183,31 +1204,51 @@ impl Module for Unfold {
         let l = out_h * out_w;
         let block_size = c * self.kernel_h * self.kernel_w;
 
-        let mut output = vec![0.0f64; n * block_size * l];
+        let padded_h = h + 2 * self.padding_h;
+        let padded_w = w + 2 * self.padding_w;
 
+        // Step 1: Pad along H and W. tensor_pad uses [left, right]
+        // per dim, innermost-first → [pad_w, pad_w, pad_h, pad_h]
+        // for a [N, C, H, W] tensor.
+        let padded_input = if self.padding_h > 0 || self.padding_w > 0 {
+            session.tensor_pad(
+                input,
+                &[
+                    self.padding_w,
+                    self.padding_w,
+                    self.padding_h,
+                    self.padding_h,
+                ],
+                0.0,
+            )?
+        } else {
+            input
+        };
+
+        // Step 2: Flatten to 1-D.
+        let flat_total = n * c * padded_h * padded_w;
+        let flat_padded = session.tensor_reshape(padded_input, vec![flat_total])?;
+
+        // Step 3: Build the gather index. The output [N, block_size, L]
+        // is laid out contiguously, so iterate batch → row → col_idx in
+        // lexicographic order to match. row decomposes as
+        // (ci, kh_idx, kw_idx) and col_idx as (oh, ow).
+        let out_numel = n * block_size * l;
+        let mut index_vals = Vec::with_capacity(out_numel);
         for batch in 0..n {
-            for oh in 0..out_h {
-                for ow in 0..out_w {
-                    let col_idx = oh * out_w + ow;
-                    for ci in 0..c {
-                        for kh in 0..self.kernel_h {
-                            for kw in 0..self.kernel_w {
-                                let ih = oh * self.stride_h + kh * self.dilation_h;
-                                let iw = ow * self.stride_w + kw * self.dilation_w;
-                                let row =
-                                    ci * self.kernel_h * self.kernel_w + kh * self.kernel_w + kw;
-                                let val = if ih >= self.padding_h
-                                    && ih < h + self.padding_h
-                                    && iw >= self.padding_w
-                                    && iw < w + self.padding_w
-                                {
-                                    let src_h = ih - self.padding_h;
-                                    let src_w = iw - self.padding_w;
-                                    vals[batch * c * h * w + ci * h * w + src_h * w + src_w]
-                                } else {
-                                    0.0
-                                };
-                                output[batch * block_size * l + row * l + col_idx] = val;
+            for ci in 0..c {
+                for kh in 0..self.kernel_h {
+                    for kw in 0..self.kernel_w {
+                        for oh in 0..out_h {
+                            for ow in 0..out_w {
+                                let ih_pad = oh * self.stride_h + kh * self.dilation_h;
+                                let iw_pad = ow * self.stride_w + kw * self.dilation_w;
+                                let flat = batch * c * padded_h * padded_w
+                                    + ci * padded_h * padded_w
+                                    + ih_pad * padded_w
+                                    + iw_pad;
+                                #[allow(clippy::cast_precision_loss)]
+                                index_vals.push(flat as f64);
                             }
                         }
                     }
@@ -1215,7 +1256,13 @@ impl Module for Unfold {
             }
         }
 
-        session.tensor_variable(output, vec![n, block_size, l], false)
+        let index = session.tensor_variable(index_vals, vec![out_numel], false)?;
+
+        // Step 4: Gather flat-padded values at the computed positions.
+        let gathered = session.tensor_gather(flat_padded, 0, index)?;
+
+        // Step 5: Reshape to [N, block_size, L].
+        session.tensor_reshape(gathered, vec![n, block_size, l])
     }
 
     fn parameters(&self) -> Vec<TensorNodeId> {
@@ -1302,6 +1349,30 @@ impl Module for Fold {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        // Fold is the analytical transpose of Unfold (scatter_add into
+        // a [N, C, H, W] buffer with overlap accumulation). Wiring it
+        // through the autograd tape requires scatter_add to back-
+        // propagate gradients through its `src` argument — which the
+        // current ft-autograd ScatterAdd op does NOT do (it only
+        // back-propagates to the destination buffer). Until that
+        // capability lands, attempting to compose Fold via scatter_add
+        // would produce a graph that silently zeroes gradients to the
+        // input, which is exactly the bug we are fixing.
+        //
+        // Bridge until then: fail loud when the caller passes a
+        // tensor that requires gradient. Forward-only callers (the
+        // dominant existing use case, and the only one exercised by
+        // the existing tests) keep working bit-for-bit; gradient
+        // callers get a clear error instead of silently-zeroed
+        // gradients into upstream parameters.
+        if session.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "fold: backward through Fold is not yet supported (composition via tensor_scatter_add cannot back-propagate through `src` until the ScatterAdd autograd op tracks src). Detach the input or use Conv2d's transpose path instead",
+                },
+            )));
+        }
+
         let vals = session.tensor_values(input)?;
         let shape = session.tensor_shape(input)?;
         if shape.len() != 3 {
@@ -17573,6 +17644,99 @@ mod tests {
             .unwrap();
         let unfold = Unfold::new((2, 2));
         assert!(unfold.forward(&mut session, input).is_err());
+    }
+
+    #[test]
+    fn unfold_propagates_gradients() {
+        // Regression test: Unfold used to read tensor_values and
+        // rebuild a fresh leaf with requires_grad=false, severing the
+        // tape so any backward through it silently zeroed gradients.
+        // After the gather/pad/reshape composition fix, gradients
+        // flow through the input.
+        //
+        // Analytical derivative: Unfold is a linear gather, so
+        // dL/d(input)[i, j, p, q] = sum over every output position
+        // that copies input[i, j, p, q]. For a sum-loss target,
+        // every output cell contributes 1 to its source input, so
+        // dL/d(input) is the count of times (i, j, p, q) was visited
+        // by the kernel sweep — i.e. the Fold of an all-ones tensor
+        // shaped like the unfold output.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 1x1x3x3 input, 2x2 kernel, stride=1, no padding/dilation.
+        // Each interior pixel is visited multiple times by the
+        // sliding window; corners are visited once.
+        let data = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0];
+        let input = session
+            .tensor_variable(data, vec![1, 1, 3, 3], true)
+            .unwrap();
+        let unfold = Unfold::new((2, 2));
+        let unfolded = unfold.forward(&mut session, input).unwrap();
+        let loss = session.tensor_sum(unfolded).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let grad = session
+            .tensor_gradient(&report, input)
+            .expect("input gradient must be tracked through Unfold");
+
+        // For a 3x3 input with 2x2 kernel, stride=1: out_h = out_w = 2,
+        // L = 4. The kernel sweep visits each input cell as follows:
+        //
+        //   corners (0,0), (0,2), (2,0), (2,2)        → 1 visit each
+        //   edges   (0,1), (1,0), (1,2), (2,1)        → 2 visits each
+        //   center  (1,1)                              → 4 visits
+        //
+        // Sum-loss → dL/d(input) = visit count per cell.
+        #[rustfmt::skip]
+        let expected = vec![
+            1.0, 2.0, 1.0,
+            2.0, 4.0, 2.0,
+            1.0, 2.0, 1.0,
+        ];
+        for (i, (g, e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-10,
+                "Unfold grad[{i}] = {g}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn fold_rejects_requires_grad_input_loudly() {
+        // Regression test: Fold used to silently sever the autograd
+        // tape (read tensor_values, rebuild leaf with
+        // requires_grad=false). The forward output was numerically
+        // correct, but any backward downstream of Fold would silently
+        // zero the gradient flowing into upstream parameters.
+        //
+        // Until the ft-autograd ScatterAdd op learns to back-propagate
+        // through `src` (which would let Fold compose through
+        // tensor_scatter_add the same way Unfold composes through
+        // tensor_gather), the safe behavior is to fail loud rather
+        // than silently corrupt training. This test locks that contract.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data: Vec<f64> = (0..16).map(|i| (i as f64) * 0.5 + 1.0).collect();
+        let input = session
+            .tensor_variable(data, vec![1, 4, 4], true)
+            .unwrap();
+        let fold = Fold::new((3, 3), (2, 2));
+        let err = fold.forward(&mut session, input).expect_err(
+            "Fold must reject requires_grad=true inputs until backward is implemented",
+        );
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("backward through Fold is not yet supported"),
+            "Fold rejection should explain the gradient-tracking limitation, got {msg}"
+        );
+
+        // Forward path on a non-tracked tensor still works.
+        let data2: Vec<f64> = (0..16).map(|i| (i as f64) * 0.5 + 1.0).collect();
+        let untracked = session
+            .tensor_variable(data2, vec![1, 4, 4], false)
+            .unwrap();
+        let folded = fold
+            .forward(&mut session, untracked)
+            .expect("Fold forward must still work on detached inputs");
+        let shape = session.tensor_shape(folded).unwrap();
+        assert_eq!(shape, vec![1, 1, 3, 3]);
     }
 
     // ── ParameterList / ParameterDict Tests ──────────────────────────
