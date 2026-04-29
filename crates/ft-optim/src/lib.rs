@@ -2773,7 +2773,7 @@ impl LRScheduler for ReduceLROnPlateau {
     }
 
     fn step_with_metric(&mut self, optimizer: &mut dyn Optimizer, metric: f64) {
-        self.last_epoch += 1;
+        self.last_epoch = next_scheduler_epoch(self.last_epoch);
         self.last_lr = optimizer.get_lr();
 
         if !self.initialized {
@@ -8348,6 +8348,27 @@ mod tests {
         scheduler.step_with_metric(&mut opt, 1.0); // baseline
         scheduler.step_with_metric(&mut opt, f64::NAN); // no improvement -> reduce
         assert!((opt.get_lr() - 0.5).abs() < 1e-12);
+    }
+
+    #[test]
+    fn reduce_on_plateau_saturates_loaded_max_last_epoch_on_metric_step() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut scheduler = ReduceLROnPlateau::new(&opt).factor(0.5).patience(0);
+
+        scheduler.load_state_dict(SchedulerState {
+            last_epoch: i64::MAX,
+            last_lrs: vec![1.0],
+            extra: Vec::new(),
+        });
+
+        scheduler.step_with_metric(&mut opt, 1.0);
+
+        assert_eq!(scheduler.state_dict().last_epoch, i64::MAX);
+        assert!(opt.get_lr().is_finite());
     }
 
     #[test]
