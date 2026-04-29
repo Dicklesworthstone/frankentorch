@@ -504,6 +504,7 @@ const FT_DTYPE_TAG_F64: u8 = 0;
 const FT_DTYPE_TAG_F32: u8 = 1;
 const FT_DTYPE_TAG_F16: u8 = 2;
 const FT_DTYPE_TAG_BF16: u8 = 3;
+const FT_MIN_NATIVE_TENSOR_HEADER_BYTES: usize = 8 + 8 + 1; // key_len + ndim + dtype tag
 
 /// Errors from tensor state dict save/load operations.
 #[derive(Debug, Clone, PartialEq)]
@@ -738,10 +739,13 @@ pub fn load_state_dict_from_bytes(
         });
     }
 
-    // Number of tensors — bound by remaining bytes (each tensor needs ≥21 bytes minimum)
+    // Number of tensors — bound by the smallest possible per-tensor header.
+    // Value bytes and shape dimensions are validated after parsing each tensor;
+    // this early guard must stay conservative so valid compact tensors (for
+    // example F16 scalar tensors under an empty key) are not rejected.
     let num_tensors = read_usize(data, &mut pos, "tensor count")?;
     let remaining = data.len().saturating_sub(pos);
-    let min_tensor_bytes = 21usize;
+    let min_tensor_bytes = FT_MIN_NATIVE_TENSOR_HEADER_BYTES;
     let max_possible = remaining / min_tensor_bytes;
     if num_tensors > max_possible {
         return Err(TensorIOError::Corrupt {
@@ -2227,6 +2231,28 @@ mod tests {
             loaded["half"].typed_storage().as_f16().unwrap(),
             vals.as_slice()
         );
+    }
+
+    #[test]
+    fn native_format_round_trips_f16_scalar_with_empty_key() {
+        let mut sd = BTreeMap::new();
+        let value = Float16::from_f32(1.5);
+        let meta = TensorMeta::from_shape(vec![], DType::F16, Device::Cpu);
+        let tensor = DenseTensor::from_storage_f16(meta, vec![value]).unwrap();
+        sd.insert(String::new(), tensor);
+
+        let bytes = super::encode_state_dict_to_bytes(&sd).unwrap();
+        assert_eq!(
+            bytes.len() - 16,
+            19,
+            "regression input must stay below the old 21-byte tensor lower bound"
+        );
+
+        let loaded = load_state_dict_from_bytes(&bytes).unwrap();
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[""].meta().dtype(), DType::F16);
+        assert!(loaded[""].meta().shape().is_empty());
+        assert_eq!(loaded[""].typed_storage().as_f16().unwrap(), &[value]);
     }
 
     #[test]
