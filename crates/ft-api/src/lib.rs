@@ -3458,14 +3458,25 @@ impl FrankenTorchSession {
     ) -> Result<(TensorNodeId, Option<TensorNodeId>, Option<TensorNodeId>), AutogradError> {
         let vals = self.tensor_values(input)?;
 
-        // Collect unique values preserving first-occurrence order
+        // Collect unique values preserving first-occurrence order.
+        //
+        // Use IEEE 754 `==` to match torch.unique / numpy.unique:
+        //   * 0.0 == -0.0 is true → merged (PyTorch behaviour)
+        //   * NaN == NaN is false → every NaN is its own unique entry
+        //   * Distinct subnormals (e.g. 5e-324 vs 1e-323) compare !=
+        //     and stay distinct
+        //
+        // The previous heuristic `(u - v).abs() < f64::EPSILON ||
+        // (u.is_nan() && v.is_nan())` silently merged any pair of
+        // values within machine epsilon — incorrectly fusing
+        // subnormals whose absolute distance is well below f64::EPSILON
+        // — and merged every NaN bit pattern into one entry, both of
+        // which violate the "Equivalent to torch.unique" contract.
         let mut unique_vals: Vec<f64> = Vec::new();
         let mut inverse_indices: Vec<usize> = Vec::with_capacity(vals.len());
 
         for &v in &vals {
-            let pos = unique_vals
-                .iter()
-                .position(|&u| (u - v).abs() < f64::EPSILON || (u.is_nan() && v.is_nan()));
+            let pos = unique_vals.iter().position(|&u| u == v);
             match pos {
                 Some(idx) => inverse_indices.push(idx),
                 None => {
@@ -25055,6 +25066,78 @@ mod tests {
         let (u, _, _) = s.tensor_unique(t, true, false, false).unwrap();
         let vals = s.tensor_values(u).unwrap();
         assert_eq!(vals, vec![1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn unique_keeps_distinct_subnormals() {
+        // Regression test: tensor_unique used to compare values via
+        // (u - v).abs() < f64::EPSILON, which silently merged any pair
+        // of values whose absolute distance fell below machine epsilon.
+        // For subnormal-magnitude values this fuses obviously distinct
+        // entries (e.g. 5e-324 and 1e-323 differ by 5e-324, well below
+        // f64::EPSILON ≈ 2.22e-16). PyTorch / numpy use exact ==
+        // equality and keep them distinct.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![5e-324, 1e-323, 5e-324, 0.0], vec![4], false)
+            .unwrap();
+        let (u, _, counts) = s.tensor_unique(t, true, false, true).unwrap();
+        let u_vals = s.tensor_values(u).unwrap();
+        let c_vals = s.tensor_values(counts.unwrap()).unwrap();
+        // Sorted (total_cmp): [0.0, 5e-324, 1e-323] — three distinct
+        // values, with 5e-324 appearing twice.
+        assert_eq!(u_vals, vec![0.0, 5e-324, 1e-323]);
+        assert_eq!(c_vals, vec![1.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn unique_treats_zero_and_negzero_as_equal() {
+        // PyTorch parity: 0.0 == -0.0 under IEEE 754, so they merge
+        // into a single unique entry. (The choice between which
+        // representation lands in the output is implementation-
+        // defined; FrankenTorch keeps the first occurrence.)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![-0.0, 0.0, 1.0, -0.0], vec![4], false)
+            .unwrap();
+        let (u, _, _) = s.tensor_unique(t, false, false, false).unwrap();
+        let vals = s.tensor_values(u).unwrap();
+        assert_eq!(vals.len(), 2);
+        // First-seen order: -0.0 first, then 1.0.
+        assert!(vals[0] == 0.0); // bit-pattern is -0.0 but value-equal to 0.0
+        assert!(vals[1] == 1.0);
+    }
+
+    #[test]
+    fn unique_keeps_each_nan_distinct() {
+        // PyTorch / numpy parity: NaN != NaN under IEEE 754, so each
+        // NaN entry is its own unique value. The previous heuristic
+        // had a special-case `u.is_nan() && v.is_nan()` branch that
+        // merged every NaN into one entry, violating that contract.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(
+                vec![f64::NAN, 1.0, f64::NAN, 2.0, f64::NAN],
+                vec![5],
+                false,
+            )
+            .unwrap();
+        // Use unsorted to make the assertion deterministic — sorting
+        // NaN against finite values uses total_cmp which puts NaN at
+        // the end but the relative order of multiple NaNs depends on
+        // their bit patterns.
+        let (u, _, _) = s.tensor_unique(t, false, false, false).unwrap();
+        let vals = s.tensor_values(u).unwrap();
+        // Each NaN is distinct → 5 unique entries.
+        assert_eq!(vals.len(), 5);
+        let nan_count = vals.iter().filter(|v| v.is_nan()).count();
+        assert_eq!(
+            nan_count, 3,
+            "all 3 NaN entries must be preserved as distinct uniques"
+        );
+        // The two finite entries are 1.0 and 2.0.
+        let finite: Vec<f64> = vals.iter().copied().filter(|v| !v.is_nan()).collect();
+        assert_eq!(finite, vec![1.0, 2.0]);
     }
 
     #[test]
