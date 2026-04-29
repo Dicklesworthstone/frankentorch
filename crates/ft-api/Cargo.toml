@@ -10,6 +10,7 @@ ft-core = { workspace = true }
 ft-dispatch = { workspace = true }
 ft-kernel-cpu = { workspace = true }
 ft-runtime = { workspace = true }
+libm = { workspace = true }
 
 [lints]
 workspace = true

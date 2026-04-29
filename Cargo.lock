@@ -384,6 +384,7 @@ dependencies = [
  "ft-dispatch",
  "ft-kernel-cpu",
  "ft-runtime",
+ "libm",
 ]
 
 [[package]]

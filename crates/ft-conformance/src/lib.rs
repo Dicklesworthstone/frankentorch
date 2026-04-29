@@ -14155,6 +14155,228 @@ print(json.dumps({"erf": erf_out, "erfc": erfc_out}))
     }
 
     #[test]
+    fn torch_lgamma_libm_subprocess_conformance() {
+        // Lock the precision contract for lgamma (log-Gamma).
+        //
+        // The previous implementation was a hand-rolled Stirling
+        // asymptotic series with B_2..B_10 Bernoulli coefficients and
+        // a recurrence reduction up to z >= 8. It was accurate enough
+        // for the existing 1e-6 / 1e-8 unit-test tolerances but
+        // diverged from libm by several ULPs in the worst case.
+        // PyTorch's torch.lgamma / torch.special.gammaln wrap libm
+        // lgamma, so this oracle locks the upstream parity to within
+        // a small ULP bound.
+        //
+        // Companion to the erf / erfc / atan2 / pow / expm1+log1p
+        // subprocess conformance harnesses: same ULP-tolerant pattern
+        // (Rust libm crate vs platform glibc may disagree by ≤ 2 ULP
+        // and both are within the C99 / IEEE 754 contract).
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let python_available = Command::new("python3")
+            .arg("-c")
+            .arg("import math, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !python_available {
+            eprintln!(
+                "torch_lgamma_libm_subprocess_conformance: python3 not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Boundary + interior matrix. lgamma is symmetric-with-poles
+        // about the integers <= 0, has minima between consecutive
+        // integers in the positive reals, and grows like z*ln(z) for
+        // large z. Cover the regions where the old recurrence-Stirling
+        // implementation accumulated the most rounding error.
+        let inputs: Vec<f64> = vec![
+            // Trivial: lgamma(1) = lgamma(2) = 0.
+            1.0,
+            2.0,
+            // Half-integers: lgamma(0.5) = ln(sqrt(pi)).
+            0.5,
+            1.5,
+            2.5,
+            3.5,
+            4.5,
+            // Small positive — recurrence shift was the main error
+            // accumulator in the old impl.
+            0.1,
+            0.2,
+            0.3,
+            0.7,
+            0.9,
+            // Mid-range positive.
+            3.0,
+            4.0,
+            5.0,
+            7.0,
+            7.999_999,
+            8.0,
+            8.000_001,
+            // Stirling-direct regime (z >= 8).
+            10.0,
+            20.0,
+            50.0,
+            100.0,
+            1000.0,
+            // Negative non-integer (reflection formula path).
+            -0.5,
+            -1.5,
+            -2.5,
+            -3.5,
+            -0.1,
+            -0.9,
+            -1.1,
+            -1.999_999,
+            -2.000_001,
+            // Negative non-integer with large magnitude.
+            -10.5,
+            -20.5,
+            -100.5,
+            // Very small positive (close to the pole at 0).
+            1e-3,
+            1e-7,
+            1e-15,
+            f64::MIN_POSITIVE,
+            // Large magnitude positive — Stirling regime.
+            1e6,
+            1e10,
+            1e100,
+            // Boundaries: lgamma(±0) = +inf; lgamma(neg integer) = +inf.
+            0.0,
+            -0.0,
+            -1.0,
+            -2.0,
+            -10.0,
+            // Inf / NaN.
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            // Transcendental constants.
+            std::f64::consts::PI,
+            std::f64::consts::E,
+            std::f64::consts::SQRT_2,
+        ];
+        assert!(
+            inputs.len() >= 50,
+            "lgamma conformance matrix must have at least 50 inputs, got {}",
+            inputs.len()
+        );
+
+        let input_bits: Vec<String> = inputs.iter().map(|v| v.to_bits().to_string()).collect();
+        let payload = json!({ "inputs": input_bits });
+
+        // Python oracle: ctypes-load libm and call lgamma directly.
+        // Note: glibc exposes both `lgamma` (which uses an internal
+        // signgam global — not thread-safe) and `lgamma_r` (which
+        // returns the sign through an out-pointer). FrankenTorch
+        // returns the value only; `lgamma` from libm gives the same
+        // |value|, and we don't need the sign component for
+        // log|Gamma(x)|. Call libm.lgamma directly.
+        let script = r#"
+import ctypes, ctypes.util, json, struct, sys
+
+libm_name = ctypes.util.find_library("m") or "libm.so.6"
+libm = ctypes.CDLL(libm_name)
+libm.lgamma.restype = ctypes.c_double
+libm.lgamma.argtypes = [ctypes.c_double]
+
+req = json.loads(sys.stdin.read())
+out = []
+for x_bits_s in req["inputs"]:
+    x = struct.unpack("<d", struct.pack("<Q", int(x_bits_s)))[0]
+    r = libm.lgamma(x)
+    out.append(str(struct.unpack("<Q", struct.pack("<d", r))[0]))
+print(json.dumps({"lgamma": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_lgamma_libm_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let lgamma_results = response
+            .get("lgamma")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include lgamma array");
+        assert_eq!(lgamma_results.len(), inputs.len());
+
+        // 16-ULP tolerance — wider than the erf/erfc harness's 2 ULP
+        // because lgamma's reflection formula path (negative
+        // non-integer arguments) accumulates several rounding errors
+        // through ln(pi/|sin(pi*x)|) - lgamma(1-x) intermediates,
+        // and Rust's libm crate diverges from glibc by up to ~8 ULP
+        // there (verified empirically: lgamma(-2.5) lands at 8 ULP).
+        // 16 ULP ≈ 1e-15 absolute on a 1.0-magnitude result — well
+        // within "high quality libm" precision and still tight enough
+        // to catch the multi-percent regression the previous
+        // hand-rolled Stirling implementation would have introduced
+        // had its precision drifted further.
+        const MAX_ULPS: u64 = 16;
+        let approx_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            if a.is_infinite() || b.is_infinite() || a.is_nan() || b.is_nan() {
+                return false;
+            }
+            if a.is_sign_negative() != b.is_sign_negative() {
+                return false;
+            }
+            a.to_bits().abs_diff(b.to_bits()) <= MAX_ULPS
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        // Tensor batch path drives the whole input matrix in one call
+        // (lgamma is exposed as `tensor_gammaln` in ft-api; there is
+        // no scalar-API gammaln surface as of this commit).
+        let xt = session
+            .tensor_variable(inputs.clone(), vec![inputs.len()], false)
+            .expect("xt");
+        let lt = session.tensor_gammaln(xt).expect("tensor_gammaln");
+        let lv = session.tensor_values(lt).expect("lgamma vals");
+
+        for (i, x) in inputs.iter().enumerate() {
+            let oracle =
+                f64::from_bits(lgamma_results[i].as_str().unwrap().parse::<u64>().unwrap());
+            if !approx_eq(lv[i], oracle) {
+                mismatches.push(format!(
+                    "tensor_gammaln({x:?})[{i}] = {:?} (bits 0x{:016x}) but libm returned {oracle:?} (bits 0x{:016x}) — > {MAX_ULPS} ULP apart",
+                    lv[i],
+                    lv[i].to_bits(),
+                    oracle.to_bits()
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "lgamma libm conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_fmod_remainder_sign_matrix_conformance() {
         // Lock down the full sign matrix for fmod (truncating, sign of
         // dividend) vs remainder (flooring, sign of divisor) — these

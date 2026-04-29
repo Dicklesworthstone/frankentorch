@@ -15581,52 +15581,18 @@ fn erfinv_approx(x: f64) -> f64 {
     sign * (((t1 * t1 - t2).sqrt() - t1).sqrt())
 }
 
-/// Log-gamma via Stirling's asymptotic series with recurrence reduction.
-///
-/// For large x, uses the asymptotic expansion. For small x, uses the recurrence
-/// lgamma(x) = lgamma(x+1) - ln(x) to shift the argument up.
+/// Log-gamma via the pure-Rust `libm` crate (~1 ULP precision across
+/// the whole f64 domain). The previous implementation was a manual
+/// Stirling asymptotic series using B_2..B_10 coefficients with a
+/// recurrence-reduction to z >= 8 — accurate enough that the existing
+/// tests passed with 1e-6 / 1e-8 tolerances, but several ULPs off
+/// from libm in the worst case. PyTorch's `torch.lgamma` (and
+/// `torch.special.gammaln`) wraps libm `lgamma`, so routing through
+/// libm gives upstream parity. See the matching erf fix for the same
+/// pattern; conformance is locked by
+/// `torch_lgamma_libm_subprocess_conformance` in ft-conformance.
 fn lgamma_approx(x: f64) -> f64 {
-    if x.is_nan() || x.is_infinite() {
-        if x == f64::INFINITY {
-            return f64::INFINITY;
-        }
-        return f64::NAN;
-    }
-    if x <= 0.0 && x == x.floor() {
-        return f64::INFINITY; // poles at non-positive integers
-    }
-
-    // Reflection formula for x < 0
-    if x < 0.0 {
-        let sin_val = (std::f64::consts::PI * x).sin().abs();
-        if sin_val == 0.0 {
-            return f64::INFINITY;
-        }
-        return (std::f64::consts::PI / sin_val).ln() - lgamma_approx(1.0 - x);
-    }
-
-    // Recurrence: shift x up until x >= 8 for good Stirling convergence
-    let mut shift = 0.0;
-    let mut z = x;
-    while z < 8.0 {
-        shift -= z.ln();
-        z += 1.0;
-    }
-
-    // Stirling's asymptotic series for lgamma(z) when z >= 8:
-    // lgamma(z) = (z-0.5)*ln(z) - z + 0.5*ln(2*pi) + sum B_{2k}/(2k*(2k-1)*z^{2k-1})
-    let inv_z = 1.0 / z;
-    let inv_z2 = inv_z * inv_z;
-    let stirling = (z - 0.5) * z.ln() - z
-        + 0.5 * (2.0 * std::f64::consts::PI).ln()
-        + inv_z
-            * (1.0 / 12.0
-                + inv_z2
-                    * (-1.0 / 360.0
-                        + inv_z2
-                            * (1.0 / 1260.0 + inv_z2 * (-1.0 / 1680.0 + inv_z2 * 1.0 / 1188.0))));
-
-    stirling + shift
+    libm::lgamma(x)
 }
 
 /// Digamma (psi) function approximation.
