@@ -13183,32 +13183,47 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.special.polygamma(n, input)`.
     /// Only n=0 (digamma) and n=1 (trigamma) are directly supported.
+    ///
+    /// Wraps polygamma_approx in a tensor_apply_function with the
+    /// backward d/dx polygamma(n, x) = polygamma(n+1, x), same
+    /// pattern as gammaln / digamma autograd wiring (7cc0b45 /
+    /// 86fb29d). Tracked under frankentorch-1tax.
     pub fn tensor_polygamma(
         &mut self,
         n: u32,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_tape.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "polygamma: autograd is not supported",
-                },
-            )));
-        }
         if n == 0 {
             return self.tensor_digamma(input);
         }
-
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
-        };
-
-        let values: Vec<f64> = storage.iter().map(|&x| polygamma_approx(n, x)).collect();
-
-        let out = self
-            .tensor_tape
-            .leaf(values, meta.shape().to_vec(), false)?;
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals.iter().map(|&x| polygamma_approx(n, x)).collect();
+                Ok((values, shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "polygamma backward: incoming gradient length mismatch",
+                        },
+                    )));
+                }
+                let next_order = n + 1;
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| go * polygamma_approx(next_order, x))
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("polygamma n={n} in={} out={}", input.0, out.0),
@@ -13220,40 +13235,67 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.special.multigammaln(input, p)`.
     /// Computes: log(pi^{p*(p-1)/4} * prod_{i=1}^{p} Gamma(input - (i-1)/2))
+    ///
+    /// Wraps lgamma_approx in a tensor_apply_function with the
+    /// analytical backward
+    ///     d/dx multigammaln(x, p) = sum_{i=0..p-1} digamma(x - i/2)
+    /// computed via digamma_approx. Tracked under frankentorch-1tax.
     pub fn tensor_multigammaln(
         &mut self,
         input: TensorNodeId,
         p: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_tape.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "multigammaln: autograd is not supported",
-                },
-            )));
-        }
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
-        };
-
         let log_pi = std::f64::consts::PI.ln();
+        #[allow(clippy::cast_precision_loss)]
         let constant = (p * (p - 1)) as f64 / 4.0 * log_pi;
 
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| {
-                let mut sum = constant;
-                for i in 0..p {
-                    sum += lgamma_approx(x - i as f64 / 2.0);
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals
+                    .iter()
+                    .map(|&x| {
+                        let mut sum = constant;
+                        for i in 0..p {
+                            #[allow(clippy::cast_precision_loss)]
+                            let shift = i as f64 / 2.0;
+                            sum += lgamma_approx(x - shift);
+                        }
+                        sum
+                    })
+                    .collect();
+                Ok((values, shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "multigammaln backward: incoming gradient length mismatch",
+                        },
+                    )));
                 }
-                sum
-            })
-            .collect();
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| {
+                        let mut deriv = 0.0_f64;
+                        for i in 0..p {
+                            #[allow(clippy::cast_precision_loss)]
+                            let shift = i as f64 / 2.0;
+                            deriv += digamma_approx(x - shift);
+                        }
+                        go * deriv
+                    })
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
 
-        let out = self
-            .tensor_tape
-            .leaf(values, meta.shape().to_vec(), false)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("multigammaln p={p} in={} out={}", input.0, out.0),
@@ -30194,6 +30236,70 @@ mod tests {
             (vals[0] - expected).abs() < 0.01,
             "trigamma(1) ≈ {expected}, got {}",
             vals[0]
+        );
+    }
+
+    #[test]
+    fn polygamma_propagates_gradient_via_next_order() {
+        // Regression test for frankentorch-1tax: tensor_polygamma
+        // (n >= 1) used to fail-loud reject tracked inputs. After
+        // wrapping in tensor_apply_function with a polygamma_approx(n+1, x)
+        // backward, gradients flow through.
+        //
+        // d/dx polygamma(n, x) = polygamma(n + 1, x).
+        //
+        // For n = 1 (trigamma) at x = 2:
+        //   d/dx trigamma(2) = polygamma(2, 2) = -2 * (zeta(3) - 1)
+        //                     ≈ -0.40411380631918857
+        // Loose 5e-3 tolerance reflects polygamma_approx's envelope
+        // (the same precision regime the trigamma forward test uses).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let out = s.tensor_polygamma(1, input).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("polygamma must propagate gradient via next-order backward");
+        let expected = -2.0 * (1.202_056_903_159_594_3 - 1.0); // -2*(zeta(3)-1)
+        assert!(
+            (grad[0] - expected).abs() < 5e-3,
+            "polygamma(1) grad at x=2 = {}, expected polygamma(2, 2) = {expected}",
+            grad[0]
+        );
+    }
+
+    #[test]
+    fn multigammaln_propagates_gradient_via_digamma_sum() {
+        // Regression test for frankentorch-1tax. d/dx multigammaln(x, p)
+        // = sum_{i=0..p-1} digamma(x - i/2). Verify via finite
+        // differences (loose since both digamma and the sum
+        // accumulate hand-rolled approximation error).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let p = 3;
+        let x = 5.0;
+        let input = s.tensor_variable(vec![x], vec![1], true).unwrap();
+        let out = s.tensor_multigammaln(input, p).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("multigammaln must propagate gradient via digamma-sum backward");
+
+        // Finite-difference reference using the public forward path.
+        let h = 1e-5;
+        let fwd = |xv: f64| -> f64 {
+            let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
+            let inp = sess.tensor_variable(vec![xv], vec![1], false).unwrap();
+            let result = sess.tensor_multigammaln(inp, p).unwrap();
+            sess.tensor_values(result).unwrap()[0]
+        };
+        let fd = (fwd(x + h) - fwd(x - h)) / (2.0 * h);
+
+        assert!(
+            (grad[0] - fd).abs() < 1e-4,
+            "multigammaln grad at x={x}, p={p} = {}, finite-diff = {fd}",
+            grad[0]
         );
     }
 
