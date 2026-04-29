@@ -16567,6 +16567,201 @@ print(json.dumps({"digamma": out}))
     }
 
     #[test]
+    fn torch_linalg_det_numpy_subprocess_conformance() {
+        // Lock FrankenTorch's tensor_linalg_det against
+        // numpy.linalg.det. Both compute the determinant via an LU
+        // factorization and should agree to within the conditioning
+        // bound. Files closure for one slice of frankentorch-c36b
+        // (the umbrella linalg conformance bead).
+        //
+        // Companion to torch_vector_norm_numpy_subprocess_conformance
+        // — same numpy oracle pattern, but for a square-matrix
+        // function with a singular-vs-nonsingular surface.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let numpy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !numpy_available {
+            eprintln!(
+                "torch_linalg_det_numpy_subprocess_conformance: python3/numpy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Each case: (label, flat_row_major, n) — the matrix is n×n.
+        let cases: Vec<(&str, Vec<f64>, usize)> = vec![
+            // Identity → det = 1.
+            ("identity_3x3", vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 3),
+            ("identity_5x5", {
+                let mut m = vec![0.0; 25];
+                for i in 0..5 { m[i * 5 + i] = 1.0; }
+                m
+            }, 5),
+            // Scaled identity → det = scale^n.
+            ("scaled_identity_3x3", vec![2.0, 0.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 2.0], 3),
+            // Diagonal → det = product of diag.
+            ("diagonal_4x4", {
+                let mut m = vec![0.0; 16];
+                m[0] = 2.0; m[5] = 3.0; m[10] = 5.0; m[15] = 7.0;
+                m
+            }, 4),
+            // 2x2 specific matrices.
+            ("matrix_2x2_pos_det", vec![1.0, 2.0, 3.0, 4.0], 2),
+            ("matrix_2x2_neg_det", vec![1.0, 4.0, 3.0, 2.0], 2),
+            ("matrix_2x2_zero_det", vec![1.0, 2.0, 2.0, 4.0], 2),
+            // 3x3 with known determinant.
+            ("matrix_3x3_general", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 10.0], 3),
+            // Singular: row 2 = 2 * row 0.
+            ("singular_3x3", vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 2.0, 4.0, 6.0], 3),
+            // Upper triangular (det = product of diag).
+            ("upper_triangular_4x4", vec![
+                2.0, 1.0, 1.0, 1.0,
+                0.0, 3.0, 2.0, 1.0,
+                0.0, 0.0, 5.0, 3.0,
+                0.0, 0.0, 0.0, 7.0,
+            ], 4),
+            // Lower triangular.
+            ("lower_triangular_4x4", vec![
+                2.0, 0.0, 0.0, 0.0,
+                1.0, 3.0, 0.0, 0.0,
+                1.0, 2.0, 5.0, 0.0,
+                1.0, 1.0, 3.0, 7.0,
+            ], 4),
+            // Permutation (det = ±1).
+            ("permutation_3x3", vec![
+                0.0, 1.0, 0.0,
+                0.0, 0.0, 1.0,
+                1.0, 0.0, 0.0,
+            ], 3),
+            // Negative entries.
+            ("negative_entries_3x3", vec![
+                -1.0,  2.0, -3.0,
+                 4.0, -5.0,  6.0,
+                -7.0,  8.0, -9.0,
+            ], 3),
+            // Scaled matrix where the determinant magnitude scales
+            // as scale^n.
+            ("scaled_2x2", vec![10.0, 0.0, 0.0, 10.0], 2),
+            // Hilbert-like matrix (notoriously ill-conditioned but
+            // small enough that LU is still accurate).
+            ("hilbert_3x3", {
+                let mut m = vec![0.0; 9];
+                for i in 0..3 {
+                    for j in 0..3 {
+                        m[i * 3 + j] = 1.0 / ((i + j + 1) as f64);
+                    }
+                }
+                m
+            }, 3),
+            // 1x1 trivial.
+            ("scalar_1x1", vec![7.5], 1),
+            ("scalar_neg_1x1", vec![-3.0], 1),
+        ];
+
+        let cases_payload: Vec<serde_json::Value> = cases
+            .iter()
+            .map(|(label, vals, n)| {
+                let bits: Vec<String> = vals.iter().map(|v| v.to_bits().to_string()).collect();
+                json!({
+                    "label": label,
+                    "values": bits,
+                    "n": n,
+                })
+            })
+            .collect();
+        let payload = json!({ "cases": cases_payload });
+
+        let script = r#"
+import json, struct, sys
+import numpy as np
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+req = json.loads(sys.stdin.read())
+out = []
+for case in req["cases"]:
+    n = int(case["n"])
+    arr = np.array([from_bits(b) for b in case["values"]], dtype=np.float64).reshape(n, n)
+    det = float(np.linalg.det(arr))
+    out.append({"label": case["label"], "det_bits": to_bits(det)})
+print(json.dumps({"results": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_linalg_det_numpy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let results = response
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include results array");
+        assert_eq!(results.len(), cases.len());
+
+        // det via LU is accurate to machine precision for well-
+        // conditioned matrices, but the Hilbert matrix and any
+        // case with cancellation pushes the relative error up.
+        // Use a relative tolerance — 1e-9 still rejects sign flips
+        // and order-of-magnitude regressions while accommodating
+        // rounding on the harder cases.
+        const REL_TOL: f64 = 1e-9;
+        let approx_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() <= REL_TOL * scale
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+        for (i, (label, vals, n)) in cases.iter().enumerate() {
+            let result_obj = &results[i];
+            let want = f64::from_bits(
+                result_obj["det_bits"].as_str().unwrap().parse::<u64>().unwrap(),
+            );
+            let xt = session
+                .tensor_variable(vals.clone(), vec![*n, *n], false)
+                .expect("xt");
+            let got = session.tensor_linalg_det(xt).expect("tensor_linalg_det");
+            if !approx_eq(got, want) {
+                mismatches.push(format!(
+                    "tensor_linalg_det({label}) = {got:?} but numpy returned {want:?} — relative error > {REL_TOL}"
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "linalg.det numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_gelu_exact_libm_subprocess_conformance() {
         // Lock the precision contract for GELU (the exact erf-form, which
         // is PyTorch's default `approximate="none"`).
