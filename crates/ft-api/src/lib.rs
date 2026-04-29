@@ -13429,26 +13429,26 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.logcumsumexp(input, dim)`.
     /// Computes `log(cumsum(exp(input), dim))` in a numerically stable way.
+    ///
+    /// Wraps the stable forward in a `tensor_apply_function` so that
+    /// the autograd tape carries gradients through the input. The
+    /// analytical derivative for `y[i] = log(sum_{j<=i} exp(x[j]))` is
+    ///     dy[i]/dx[k] = exp(x[k] - y[i])  if k <= i, else 0
+    /// so the vector–Jacobian product is
+    ///     dL/dx[k] = sum_{i>=k} dL/dy[i] * exp(x[k] - y[i])
+    /// which is bounded since `x[k] <= y[i]` for `i >= k`. Both `x`
+    /// and `y` are saved for backward. Tracked under
+    /// frankentorch-1tax — same severed-autograd pattern recently
+    /// fixed for gammaln / digamma / polygamma / multigammaln /
+    /// erfinv.
     pub fn tensor_logcumsumexp(
         &mut self,
         input: TensorNodeId,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_tape.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "logcumsumexp: autograd is not supported",
-                },
-            )));
-        }
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
-        };
-
-        let shape = meta.shape();
-        let ndim = shape.len();
-
+        // Validate dim up front before delegating to apply_function so
+        // the error path matches the previous fail-loud behavior.
+        let ndim = self.tensor_tape.tensor(input)?.meta().shape().len();
         if dim >= ndim {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -13457,38 +13457,101 @@ impl FrankenTorchSession {
             )));
         }
 
-        let mut result = vec![0.0_f64; storage.len()];
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, shape) = inputs[0];
 
-        // Compute strides for iteration
-        let outer_size =
-            Self::checked_shape_numel(&shape[..dim], "logcumsumexp: outer shape overflow")?;
-        let dim_size = shape[dim];
-        let inner_size =
-            Self::checked_shape_numel(&shape[dim + 1..], "logcumsumexp: inner shape overflow")?;
+                let outer_size =
+                    Self::checked_shape_numel(&shape[..dim], "logcumsumexp: outer shape overflow")?;
+                let dim_size = shape[dim];
+                let inner_size = Self::checked_shape_numel(
+                    &shape[dim + 1..],
+                    "logcumsumexp: inner shape overflow",
+                )?;
 
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut running_max = f64::NEG_INFINITY;
-                let mut running_sum = 0.0_f64;
-
-                for d in 0..dim_size {
-                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    let val = storage[idx];
-
-                    if val > running_max {
-                        // Rescale running_sum to new max
-                        running_sum = running_sum * (running_max - val).exp() + 1.0;
-                        running_max = val;
-                    } else {
-                        running_sum += (val - running_max).exp();
+                let mut result = vec![0.0_f64; vals.len()];
+                for outer in 0..outer_size {
+                    for inner in 0..inner_size {
+                        let mut running_max = f64::NEG_INFINITY;
+                        let mut running_sum = 0.0_f64;
+                        for d in 0..dim_size {
+                            let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                            let val = vals[idx];
+                            if val > running_max {
+                                running_sum = running_sum * (running_max - val).exp() + 1.0;
+                                running_max = val;
+                            } else {
+                                running_sum += (val - running_max).exp();
+                            }
+                            result[idx] = running_max + running_sum.ln();
+                        }
                     }
-
-                    result[idx] = running_max + running_sum.ln();
                 }
-            }
-        }
 
-        let out = self.tensor_tape.leaf(result, shape.to_vec(), false)?;
+                // Save x, then y, both as flat tensors with the full
+                // shape — the backward needs to walk the same dim.
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                ctx.save_for_backward(result.clone(), shape.to_vec());
+                Ok((result, shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_y = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let saved_shapes = ctx.saved_shapes();
+                let x_vals = &saved[0];
+                let y_vals = &saved[1];
+                let shape = &saved_shapes[0];
+
+                if grad_y.len() != y_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "logcumsumexp backward: incoming gradient length mismatch",
+                        },
+                    )));
+                }
+
+                let outer_size = Self::checked_shape_numel(
+                    &shape[..dim],
+                    "logcumsumexp backward: outer shape overflow",
+                )?;
+                let dim_size = shape[dim];
+                let inner_size = Self::checked_shape_numel(
+                    &shape[dim + 1..],
+                    "logcumsumexp backward: inner shape overflow",
+                )?;
+
+                let mut grad_x = vec![0.0_f64; x_vals.len()];
+                for outer in 0..outer_size {
+                    for inner in 0..inner_size {
+                        // Reverse cumulative form: walk the dim
+                        // backwards accumulating dL/dy[i] * exp(-y[i])
+                        // and at each k multiply by exp(x[k]). All
+                        // values of `x[k] - y[i]` are <= 0, so no
+                        // overflow; underflow goes to 0 correctly.
+                        // We use the direct O(D^2) sum to avoid the
+                        // precision pitfalls of an explicit reverse
+                        // cumsum of `grad_y[i] * exp(-y[i])` when
+                        // y[i] is large.
+                        for k in 0..dim_size {
+                            let k_idx = outer * dim_size * inner_size + k * inner_size + inner;
+                            let xk = x_vals[k_idx];
+                            let mut acc = 0.0_f64;
+                            for i in k..dim_size {
+                                let i_idx =
+                                    outer * dim_size * inner_size + i * inner_size + inner;
+                                let yi = y_vals[i_idx];
+                                acc += grad_y[i_idx] * (xk - yi).exp();
+                            }
+                            grad_x[k_idx] = acc;
+                        }
+                    }
+                }
+
+                Ok(vec![Some(grad_x)])
+            },
+        )?;
+
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("logcumsumexp input={} dim={dim} out={}", input.0, out.0),
@@ -33149,6 +33212,84 @@ mod tests {
         let out = s.tensor_logcumsumexp(x, 0).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert!((vals[0] - 42.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn logcumsumexp_propagates_gradient_via_reverse_cumsum() {
+        // Regression test for frankentorch-1tax: tensor_logcumsumexp
+        // used to fail-loud reject tracked inputs. After wrapping in
+        // tensor_apply_function with the analytical backward, the
+        // gradient of `y[i] = log(sum_{j<=i} exp(x[j]))` w.r.t. x[k]
+        // for k<=i is `exp(x[k] - y[i])`, so under sum-loss the
+        // gradient at x[k] is `sum_{i>=k} exp(x[k] - y[i])`.
+        //
+        // Concretely for x = [1.0, 2.0, 3.0]:
+        //   y[0] = 1
+        //   y[1] = log(e + e^2)
+        //   y[2] = log(e + e^2 + e^3)
+        // grad[0] = e^(1 - y[0]) + e^(1 - y[1]) + e^(1 - y[2])
+        // grad[1] =                e^(2 - y[1]) + e^(2 - y[2])
+        // grad[2] =                               e^(3 - y[2])
+        // Cumulative form: y[i] = log S_i with S_i = sum_{j<=i} e^{x_j},
+        // so e^(x[k] - y[i]) = e^{x_k} / S_i. Therefore grad[k] is
+        // exactly e^{x_k} * sum_{i>=k} 1/S_i.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xs = vec![1.0_f64, 2.0, 3.0];
+        let input = s.tensor_variable(xs.clone(), vec![3], true).unwrap();
+        let out = s.tensor_logcumsumexp(input, 0).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("logcumsumexp must propagate gradient via reverse-cumsum backward");
+
+        // Reference computation in plain f64.
+        let s0 = xs[0].exp();
+        let s1 = xs[0].exp() + xs[1].exp();
+        let s2 = xs[0].exp() + xs[1].exp() + xs[2].exp();
+        let inv_s = [1.0 / s0, 1.0 / s1, 1.0 / s2];
+        let expected = [
+            xs[0].exp() * (inv_s[0] + inv_s[1] + inv_s[2]),
+            xs[1].exp() * (inv_s[1] + inv_s[2]),
+            xs[2].exp() * inv_s[2],
+        ];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "logcumsumexp grad[{i}] = {g}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn logcumsumexp_gradient_stable_for_large_values() {
+        // The reverse-cumsum backward must stay finite when y[i] is
+        // large: we use exp(x[k] - y[i]) which is in [0, 1] for
+        // i >= k, so no overflow regardless of magnitude. Sanity check
+        // with x = [100, 100, 100] under sum loss — by symmetry the
+        // gradient is [1.0, 1.0, 1.0] (each x[k] contributes 1/(D-k)
+        // worth at each downstream y, summing to a harmonic-style
+        // sum that simplifies to 1 via S_i = (i+1)*e^{100}).
+        //   grad[k] = e^{100} * sum_{i>=k} 1/((i+1)*e^{100})
+        //           = sum_{i>=k} 1/(i+1)
+        //   D=3: grad = [1 + 1/2 + 1/3, 1/2 + 1/3, 1/3]
+        //             = [11/6, 5/6, 1/3]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![100.0, 100.0, 100.0], vec![3], true)
+            .unwrap();
+        let out = s.tensor_logcumsumexp(input, 0).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, input).unwrap();
+        let expected = [11.0 / 6.0, 5.0 / 6.0, 1.0 / 3.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(g.is_finite(), "logcumsumexp grad[{i}] must be finite");
+            assert!(
+                (g - e).abs() < 1e-12,
+                "logcumsumexp grad[{i}] at large x = {g}, expected {e}"
+            );
+        }
     }
 
     // ── tile tests ──────────────────────────────────────────────────────
