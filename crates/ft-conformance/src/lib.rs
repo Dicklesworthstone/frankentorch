@@ -16567,6 +16567,175 @@ print(json.dumps({"digamma": out}))
     }
 
     #[test]
+    fn torch_polygamma_scipy_subprocess_conformance() {
+        // Lock FrankenTorch's tensor_polygamma against
+        // scipy.special.polygamma. The reference is
+        //     polygamma(n, x) = (-1)^(n+1) * n! * sum_{k=0}^∞ 1/(x+k)^(n+1)
+        // implemented in FrankenTorch via numerical differentiation of
+        // digamma_approx (recurrence shift to large x then 5-term
+        // Bernoulli asymptotic expansion). Sister harness to
+        // torch_digamma_scipy_subprocess_conformance — same scipy
+        // oracle, same fail-loud assertion structure. Files closure
+        // for one slice of frankentorch-b5of (the "torch.special
+        // functions lack subprocess conformance" tracking bead).
+        //
+        // Tolerance is significantly looser than digamma because
+        // polygamma_approx introduces an extra cascade of finite
+        // differences on top of digamma's already ~1e-13 absolute
+        // error; the empirical regime is ~5e-5 absolute on small
+        // integer x. The unit-test tolerance was already bumped to
+        // 1e-4 for the same reason — see polygamma_known_values
+        // history.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let scipy_available = Command::new("python3")
+            .arg("-c")
+            .arg("from scipy import special; import json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !scipy_available {
+            eprintln!(
+                "torch_polygamma_scipy_subprocess_conformance: python3/scipy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // (order, x) pairs covering: trigamma (n=1) and tetragamma
+        // (n=2) — the orders most commonly used in practice (Fisher
+        // information, variance of log-Gamma) — at small / medium /
+        // large positive x where polygamma_approx is well-behaved.
+        // Skip non-positive x (the recurrence + Bernoulli expansion
+        // diverges); skip very small x (1/x^(n+1) blows up the
+        // forward error). Each call uses a length-1 input tensor so
+        // the test exercises the full per-element path.
+        let cases: Vec<(u32, f64)> = vec![
+            // trigamma (n=1)
+            (1, 1.0),
+            (1, 1.5),
+            (1, 2.0),
+            (1, 3.0),
+            (1, 5.0),
+            (1, 7.999_999_999),
+            (1, 8.0),
+            (1, 8.000_000_001),
+            (1, 10.0),
+            (1, 50.0),
+            (1, 100.0),
+            (1, std::f64::consts::E),
+            (1, std::f64::consts::PI),
+            // tetragamma (n=2)
+            (2, 1.0),
+            (2, 2.0),
+            (2, 3.0),
+            (2, 5.0),
+            (2, 8.0),
+            (2, 10.0),
+            (2, 100.0),
+            (2, std::f64::consts::PI),
+        ];
+
+        let payload = json!({
+            "cases": cases.iter().map(|(n, x)| {
+                json!({"n": u64::from(*n), "x_bits": x.to_bits().to_string()})
+            }).collect::<Vec<_>>()
+        });
+
+        let script = r#"
+import json, struct, sys
+from scipy import special
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+req = json.loads(sys.stdin.read())
+out = []
+for case in req["cases"]:
+    n = int(case["n"])
+    x = from_bits(case["x_bits"])
+    try:
+        y = float(special.polygamma(n, x))
+    except Exception:
+        y = float("nan")
+    out.append(to_bits(y))
+print(json.dumps({"polygamma": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_polygamma_scipy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let results = response
+            .get("polygamma")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include polygamma array");
+        assert_eq!(results.len(), cases.len());
+
+        // Empirical envelope of polygamma_approx vs scipy: ~5e-5
+        // absolute on small integer x. Use absolute tolerance with a
+        // floor and a relative tolerance for large-magnitude outputs
+        // (polygamma blows up at small x, so e.g. polygamma(2, 1) ≈
+        // -2.404 is small but polygamma(1, 1) = π²/6 ≈ 1.645).
+        const ABS_TOL: f64 = 5e-5;
+        const REL_TOL: f64 = 1e-4;
+        let approx_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            if a.is_infinite() || b.is_infinite() || a.is_nan() || b.is_nan() {
+                return false;
+            }
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() <= ABS_TOL || (a - b).abs() <= REL_TOL * scale
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        for (i, (n, x)) in cases.iter().enumerate() {
+            let want = f64::from_bits(results[i].as_str().unwrap().parse::<u64>().unwrap());
+            let xt = session
+                .tensor_variable(vec![*x], vec![1], false)
+                .expect("xt");
+            let got_id = session.tensor_polygamma(*n, xt).expect("tensor_polygamma");
+            let got = session.tensor_values(got_id).expect("got")[0];
+            if !approx_eq(got, want) {
+                mismatches.push(format!(
+                    "tensor_polygamma(n={n}, x={x:?}) = {got:?} (bits 0x{:016x}) but scipy returned {want:?} (bits 0x{:016x}) — abs diff {:e} > tol {ABS_TOL:e}",
+                    got.to_bits(),
+                    want.to_bits(),
+                    (got - want).abs()
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "polygamma scipy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_linalg_det_numpy_subprocess_conformance() {
         // Lock FrankenTorch's tensor_linalg_det against
         // numpy.linalg.det. Both compute the determinant via an LU

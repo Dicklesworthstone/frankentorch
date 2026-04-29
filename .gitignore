@@ -46,6 +46,7 @@ rch-install/
 .agent-mail-project-id
 target-codex*/
 target_*/
+target-local/
 
 # Local legacy-oracle mirrors (too large for source repo)
 /legacy_*/
