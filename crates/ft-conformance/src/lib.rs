@@ -18904,6 +18904,178 @@ print(json.dumps({"svd": out}))
     }
 
     #[test]
+    fn torch_linalg_pinv_numpy_subprocess_conformance() {
+        // Lock FrankenTorch's tensor_linalg_pinv against
+        // numpy.linalg.pinv. The Moore-Penrose pseudoinverse is unique
+        // (no sign ambiguity, unlike U / Vh in SVD), so element-wise
+        // comparison against numpy is meaningful. Both implementations
+        // build A+ via SVD: A+ = V @ diag(1/S) @ U^T (with small
+        // singular values zeroed for the rank-deficient case).
+        //
+        // Sister harness to the svd / inv / solve / qr / cholesky /
+        // det / slogdet harnesses. Files closure for the pinverse
+        // slice of frankentorch-c36b.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let numpy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !numpy_available {
+            eprintln!(
+                "torch_linalg_pinv_numpy_subprocess_conformance: python3/numpy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        type PinvCase = (&'static str, Vec<f64>, usize, usize);
+        let cases: Vec<PinvCase> = vec![
+            // Square nonsingular → pinv = inv.
+            ("square_3x3_nonsingular", vec![1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0], 3, 3),
+            ("identity_4x4", {
+                let mut m = vec![0.0; 16];
+                for i in 0..4 { m[i * 4 + i] = 1.0; }
+                m
+            }, 4, 4),
+            ("scaled_identity_3x3", vec![3.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 3.0], 3, 3),
+            // Diagonal → pinv = reciprocal-diagonal.
+            ("diagonal_4x4", {
+                let mut m = vec![0.0; 16];
+                m[0] = 2.0; m[5] = 4.0; m[10] = 5.0; m[15] = 8.0;
+                m
+            }, 4, 4),
+            // Tall full column rank → A+ = (A^T A)^-1 A^T.
+            ("tall_4x2_full_rank", vec![
+                1.0, 2.0,
+                3.0, 4.0,
+                5.0, 6.0,
+                7.0, 8.0,
+            ], 4, 2),
+            // Wide full row rank → A+ = A^T (A A^T)^-1.
+            ("wide_2x4_full_rank", vec![
+                1.0, 2.0, 3.0, 4.0,
+                5.0, 6.0, 7.0, 8.0,
+            ], 2, 4),
+            // 1x1 scalar.
+            ("scalar_1x1_nonzero", vec![5.0], 1, 1),
+            // Rank-deficient is intentionally omitted because it
+            // exercises the SVD basis-completion path that's tracked
+            // under frankentorch-zs8a; pinv from a malformed U would
+            // give a wrong A+. Re-enable after zs8a is fixed.
+        ];
+
+        let payload = json!({
+            "cases": cases.iter().map(|(label, vals, m, n)| {
+                json!({
+                    "label": *label,
+                    "m": *m as u64,
+                    "n": *n as u64,
+                    "values_bits": vals.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>()
+        });
+
+        let script = r#"
+import json, struct, sys
+import numpy as np
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+req = json.loads(sys.stdin.read())
+out = []
+for case in req["cases"]:
+    m = int(case["m"])
+    n = int(case["n"])
+    vals = [from_bits(s) for s in case["values_bits"]]
+    A = np.array(vals, dtype=np.float64).reshape(m, n)
+    Ap = np.linalg.pinv(A)
+    out.append({
+        "label": case["label"],
+        "values_bits": [to_bits(v) for v in Ap.flatten().tolist()],
+    })
+print(json.dumps({"pinv": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_linalg_pinv_numpy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let results = response
+            .get("pinv")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include pinv array");
+        assert_eq!(results.len(), cases.len());
+
+        // Pinv accumulates SVD + reciprocal + matmul; allow 1e-8
+        // relative since the conditioning of (A^T A) for tall matrices
+        // doubles the SVD error envelope.
+        const REL_TOL: f64 = 1e-8;
+        let elem_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() <= REL_TOL * scale
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        for (i, (label, vals, m, n)) in cases.iter().enumerate() {
+            let result_obj = &results[i];
+            let want: Vec<f64> = result_obj["values_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect();
+
+            let xt = session
+                .tensor_variable(vals.clone(), vec![*m, *n], false)
+                .expect("xt");
+            let ap_id = session.tensor_linalg_pinv(xt).expect("tensor_linalg_pinv");
+            let got = session.tensor_values(ap_id).expect("got");
+            assert_eq!(got.len(), want.len(), "{label}: shape mismatch");
+
+            for (idx, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+                if !elem_eq(g, w) {
+                    mismatches.push(format!(
+                        "tensor_linalg_pinv({label})[{idx}] = {g} but numpy returned {w} — relative error > {REL_TOL}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "linalg.pinv numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_gelu_exact_libm_subprocess_conformance() {
         // Lock the precision contract for GELU (the exact erf-form, which
         // is PyTorch's default `approximate="none"`).
