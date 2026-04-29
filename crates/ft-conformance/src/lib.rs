@@ -19076,6 +19076,229 @@ print(json.dumps({"pinv": out}))
     }
 
     #[test]
+    fn torch_linalg_eigh_numpy_subprocess_conformance() {
+        // Lock FrankenTorch's tensor_linalg_eigh against
+        // numpy.linalg.eigh. eigh returns (eigenvalues, eigenvectors)
+        // for a symmetric (or Hermitian) matrix. Eigenvalues are
+        // unique (sorted ascending) and compare element-wise.
+        // Eigenvectors have per-column sign ambiguity — different
+        // LAPACK builds flip column signs — so we verify structural
+        // invariants instead:
+        //   (1) eigenvalues  ≈ numpy           (element-wise)
+        //   (2) Q^T @ Q      ≈ I_n              (orthonormality)
+        //   (3) Q diag(λ) Q^T ≈ A               (reconstruction)
+        // Files closure for the eigh slice of frankentorch-c36b.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let numpy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !numpy_available {
+            eprintln!(
+                "torch_linalg_eigh_numpy_subprocess_conformance: python3/numpy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Each case: (label, flat_row_major, n) — the matrix is n×n
+        // and must be symmetric.
+        let cases: Vec<(&str, Vec<f64>, usize)> = vec![
+            // Identity → eigenvalues all 1.
+            ("identity_3x3", vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0], 3),
+            // Diagonal → eigenvalues are diagonal entries (sorted).
+            ("diagonal_4x4", {
+                let mut m = vec![0.0; 16];
+                m[0] = 5.0; m[5] = 2.0; m[10] = 8.0; m[15] = 1.0;
+                m
+            }, 4),
+            // Scaled identity → eigenvalues all == scale.
+            ("scaled_identity_3x3", vec![3.0, 0.0, 0.0, 0.0, 3.0, 0.0, 0.0, 0.0, 3.0], 3),
+            // Symmetric tridiagonal SPD.
+            ("spd_tridiag_4x4", vec![
+                4.0, 1.0, 0.0, 0.0,
+                1.0, 4.0, 1.0, 0.0,
+                0.0, 1.0, 4.0, 1.0,
+                0.0, 0.0, 1.0, 4.0,
+            ], 4),
+            // Symmetric with mixed-sign eigenvalues.
+            ("symmetric_2x2_mixed", vec![1.0, 2.0, 2.0, -1.0], 2),
+            // Symmetric 3x3 with repeated eigenvalues (degenerate).
+            ("symmetric_3x3_repeated", vec![
+                2.0, 0.0, 0.0,
+                0.0, 2.0, 0.0,
+                0.0, 0.0, 1.0,
+            ], 3),
+            // 1x1 scalar (eigenvalue = the scalar itself).
+            ("scalar_1x1", vec![3.0], 1),
+            // 2x2 symmetric with real distinct eigenvalues.
+            ("symmetric_2x2", vec![4.0, 1.0, 1.0, 3.0], 2),
+        ];
+
+        let payload = json!({
+            "cases": cases.iter().map(|(label, vals, n)| {
+                json!({
+                    "label": *label,
+                    "n": *n as u64,
+                    "values_bits": vals.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>()
+        });
+
+        let script = r#"
+import json, struct, sys
+import numpy as np
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+req = json.loads(sys.stdin.read())
+out = []
+for case in req["cases"]:
+    n = int(case["n"])
+    vals = [from_bits(s) for s in case["values_bits"]]
+    A = np.array(vals, dtype=np.float64).reshape(n, n)
+    w, V = np.linalg.eigh(A)
+    A_recon = V @ np.diag(w) @ V.T
+    QtQ = V.T @ V
+    out.append({
+        "label": case["label"],
+        "evals_bits": [to_bits(v) for v in w.tolist()],
+        "a_recon_bits": [to_bits(v) for v in A_recon.flatten().tolist()],
+        "qtq_bits": [to_bits(v) for v in QtQ.flatten().tolist()],
+    })
+print(json.dumps({"eigh": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_linalg_eigh_numpy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let results = response
+            .get("eigh")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include eigh array");
+        assert_eq!(results.len(), cases.len());
+
+        const REL_TOL: f64 = 1e-9;
+        let elem_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() <= REL_TOL * scale
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        for (i, (label, vals, n)) in cases.iter().enumerate() {
+            let result_obj = &results[i];
+            let want_evals: Vec<f64> = result_obj["evals_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect();
+            let want_recon: Vec<f64> = result_obj["a_recon_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect();
+            let want_qtq: Vec<f64> = result_obj["qtq_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect();
+
+            let xt = session
+                .tensor_variable(vals.clone(), vec![*n, *n], false)
+                .expect("xt");
+            let (evals_id, evecs_id) = session
+                .tensor_linalg_eigh(xt)
+                .expect("tensor_linalg_eigh");
+            let evals = session.tensor_values(evals_id).expect("evals");
+            let evecs = session.tensor_values(evecs_id).expect("evecs");
+
+            // (1) Eigenvalues match element-wise.
+            for (idx, (&g, &w)) in evals.iter().zip(want_evals.iter()).enumerate() {
+                if !elem_eq(g, w) {
+                    mismatches.push(format!(
+                        "tensor_linalg_eigh({label}) evals[{idx}] = {g} but numpy returned {w}"
+                    ));
+                }
+            }
+
+            // (2) Q^T Q ≈ I_n.
+            let mut got_qtq = vec![0.0_f64; *n * *n];
+            for ki in 0..*n {
+                for kj in 0..*n {
+                    let mut acc = 0.0_f64;
+                    for row in 0..*n {
+                        acc += evecs[row * *n + ki] * evecs[row * *n + kj];
+                    }
+                    got_qtq[ki * *n + kj] = acc;
+                }
+            }
+            for (idx, (&g, &w)) in got_qtq.iter().zip(want_qtq.iter()).enumerate() {
+                if !elem_eq(g, w) {
+                    mismatches.push(format!(
+                        "tensor_linalg_eigh({label}) Q^T@Q[{idx}] = {g} but numpy returned {w}"
+                    ));
+                }
+            }
+
+            // (3) Reconstruction: V diag(λ) V^T ≈ A.
+            let mut got_recon = vec![0.0_f64; *n * *n];
+            for row in 0..*n {
+                for col in 0..*n {
+                    let mut acc = 0.0_f64;
+                    for kk in 0..*n {
+                        acc += evecs[row * *n + kk] * evals[kk] * evecs[col * *n + kk];
+                    }
+                    got_recon[row * *n + col] = acc;
+                }
+            }
+            for (idx, (&g, &w)) in got_recon.iter().zip(want_recon.iter()).enumerate() {
+                if !elem_eq(g, w) {
+                    mismatches.push(format!(
+                        "tensor_linalg_eigh({label}) Q@diag(λ)@Q^T[{idx}] = {g} but numpy returned {w}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "linalg.eigh numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_gelu_exact_libm_subprocess_conformance() {
         // Lock the precision contract for GELU (the exact erf-form, which
         // is PyTorch's default `approximate="none"`).
