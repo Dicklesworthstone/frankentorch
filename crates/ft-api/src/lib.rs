@@ -15581,6 +15581,16 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.quantile(input, q)`.
     /// `q` should be in [0, 1]. Uses linear interpolation between data points.
+    ///
+    /// Composes through `tensor_reshape`, `tensor_sort`,
+    /// `tensor_narrow`, and `tensor_lerp` so the autograd tape
+    /// carries gradients through the input. The lo and hi
+    /// interpolation positions are picked out by narrow whose
+    /// backward scatters the incoming gradient back through the sort
+    /// permutation, landing on whichever original input positions
+    /// held those order statistics. Previously this extracted
+    /// `tensor_values` and rebuilt a fresh `requires_grad=false`
+    /// leaf, severing the tape. Tracked under frankentorch-1tax.
     pub fn tensor_quantile(
         &mut self,
         input: TensorNodeId,
@@ -15593,9 +15603,9 @@ impl FrankenTorchSession {
                 },
             )));
         }
-
-        let vals = self.tensor_values(input)?;
-        let n = vals.len();
+        let shape = self.tensor_shape(input)?;
+        let n =
+            Self::checked_shape_numel(&shape, "quantile: input shape volume overflow")?;
         if n == 0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15603,7 +15613,15 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        if vals.iter().any(|v| v.is_nan()) {
+
+        // PyTorch propagates NaN through quantile: any NaN in the
+        // input yields NaN output. Detect that up-front via a
+        // values peek (no autograd contract — the result is
+        // constant NaN regardless of input position) and short-
+        // circuit so the autograd composition below doesn't have
+        // to reason about NaN through partial_cmp.
+        let vals_for_nan_check = self.tensor_values(input)?;
+        if vals_for_nan_check.iter().any(|v| v.is_nan()) {
             let out = self.tensor_tape.leaf(vec![f64::NAN], vec![1], false)?;
             self.runtime.ledger_mut().record(
                 EvidenceKind::Dispatch,
@@ -15612,20 +15630,36 @@ impl FrankenTorchSession {
             return Ok(out);
         }
 
-        let mut sorted = vals.clone();
-        sorted.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+        let flat = self.tensor_reshape(input, vec![n])?;
+        let (sorted, _indices) = self.tensor_sort(flat, 0, false)?;
 
-        let result = if n == 1 {
-            sorted[0]
+        if n == 1 {
+            // Trivial: only one value, narrow returns it directly.
+            let out = self.tensor_narrow(sorted, 0, 0, 1)?;
+            self.runtime.ledger_mut().record(
+                EvidenceKind::Dispatch,
+                format!("quantile input={} q={q} out={}", input.0, out.0),
+            );
+            return Ok(out);
+        }
+
+        #[allow(clippy::cast_precision_loss)]
+        let idx = q * (n - 1) as f64;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let lo = idx.floor() as usize;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        let hi = idx.ceil() as usize;
+        let frac = idx - lo as f64;
+
+        let out = if lo == hi {
+            // No interpolation needed (q is exactly an index).
+            self.tensor_narrow(sorted, 0, lo, 1)?
         } else {
-            let idx = q * (n - 1) as f64;
-            let lo = idx.floor() as usize;
-            let hi = idx.ceil() as usize;
-            let frac = idx - lo as f64;
-            sorted[lo] * (1.0 - frac) + sorted[hi] * frac
+            let lo_val = self.tensor_narrow(sorted, 0, lo, 1)?;
+            let hi_val = self.tensor_narrow(sorted, 0, hi, 1)?;
+            self.tensor_lerp(lo_val, hi_val, frac)?
         };
 
-        let out = self.tensor_tape.leaf(vec![result], vec![1], false)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("quantile input={} q={q} out={}", input.0, out.0),
@@ -33103,6 +33137,47 @@ mod tests {
         let out = s.tensor_quantile(x, 0.5).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert!(vals[0].is_nan(), "quantile should propagate NaN");
+    }
+
+    #[test]
+    fn quantile_propagates_gradients_to_input() {
+        // Regression test for frankentorch-1tax: tensor_quantile used
+        // to extract values and rebuild a fresh requires_grad=false
+        // leaf, severing the tape. After the
+        // reshape+sort+narrow+lerp composition, gradients flow back
+        // to the input position(s) that hold the order statistic(s)
+        // being interpolated.
+        //
+        // For a sorted input [1, 2, 3, 4] with q=0.5, the median is
+        // (sorted[1] + sorted[2]) / 2 = (2 + 3) / 2 = 2.5. With the
+        // sorted permutation being identity here, narrow lands on
+        // positions 1 and 2, lerp blends them with weight 0.5, and
+        // backward through (lerp-of-narrow-of-sort) routes:
+        //   d output / d sorted[1] = 0.5
+        //   d output / d sorted[2] = 0.5
+        //   sort backward then maps these back to original positions.
+        //
+        // For sum loss (incoming grad = 1) on a 1-element output:
+        //   grad[i] = 0.5 if input[i] is the (n-1)*q-th or
+        //               (n-1)*q+1-th order statistic
+        //   grad[i] = 0   otherwise
+        //
+        // For input = [1, 2, 3, 4] (already sorted), q = 0.5:
+        //   idx = 1.5 → lo=1, hi=2, frac=0.5
+        //   lo_val = sorted[1] = 2 (was input[1])
+        //   hi_val = sorted[2] = 3 (was input[2])
+        //   grad = [0, 0.5, 0.5, 0]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let out = s.tensor_quantile(x, 0.5).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("quantile must propagate gradient to input order statistics");
+        assert_eq!(grad, &[0.0, 0.5, 0.5, 0.0]);
     }
 
     // ── clip_grad_norm_ tests ───────────────────────────────────────────
