@@ -8128,18 +8128,15 @@ mod tests {
         // Lock the matmul dot-product precision contract for K > 128
         // (where pairwise summation diverges from the prior naive
         // sequential accumulator). The test computes the inner
-        // product of two unit vectors of length K = 4096 — the dot
-        // should be exactly 1.0 (sum of K · (1/K)² = 1/K, scaled by
-        // K). Sequential drift on a 4k-element dot product is
-        // O(K · ε) ≈ 1e-12; pairwise drift is O(log K · ε) ≈ 3e-15.
-        let k = 4096usize;
-        // Construct lhs = ones(1, K), rhs = ones(K, 1). Inner product
-        // is K = 4096 exactly. Sum-of-K-ones is exact in f64 (each
-        // step adds 1.0 to a running integer; no rounding) so this
-        // input doesn't actually distinguish pairwise from sequential.
-        // Use a non-trivial pattern instead: lhs[i] = 1/sqrt(K),
-        // rhs[i] = 1/sqrt(K). Inner product = 1.0 analytically; the
-        // f64 round-trip drift is what we measure.
+        // product of two unit vectors of length K = 10_001. This is
+        // intentionally not a power-of-two square: with K = 4096,
+        // 1/sqrt(K) is exactly 1/64 and the old sequential accumulator
+        // also returns exactly 1.0. Sequential drift on this input is
+        // ~1e-13, while pairwise drift is O(log K · ε).
+        let k = 10_001usize;
+        // Use a non-trivial pattern: lhs[i] = 1/sqrt(K), rhs[i] =
+        // 1/sqrt(K). Inner product = 1.0 analytically; the f64
+        // round-trip drift is what we measure.
         #[allow(clippy::cast_precision_loss)]
         let recip = 1.0 / (k as f64).sqrt();
         let lhs: Vec<f64> = vec![recip; k];
@@ -8153,10 +8150,9 @@ mod tests {
 
         let drift = (out[0] - 1.0).abs();
         // Pairwise locks the dot product to within ~5 ULP of 1.0 on
-        // this 4k-element input. The prior naive sequential
-        // accumulator was loose by ~30 ULP (~7e-15) — within the
-        // tolerance of any sensible precision test, but not bit-stable
-        // against torch BLAS which uses pairwise / blocked sums.
+        // this 10_001-element input. The prior naive sequential
+        // accumulator was loose by ~1e-13, so this assertion now
+        // distinguishes the pairwise path from the old accumulator.
         assert!(
             drift < 1e-14,
             "matmul dot-product drift {drift:e} > 1e-14 tolerance (got {}, expected 1.0)",
@@ -8166,12 +8162,12 @@ mod tests {
 
     #[test]
     fn dot_tensor_contiguous_pairwise_precision_at_large_n() {
-        // Dot product with N = 4096 unit vectors. Same precision
+        // Dot product with N = 10_001 unit vectors. Same precision
         // contract as the matmul test: pairwise locks the result
         // within ~5 ULPs of the analytical 1.0; the prior naive
-        // sequential accumulator drifted ~7e-15 (~30 ULPs) on this
+        // sequential accumulator drifted ~1e-13 on this
         // input.
-        let n = 4096usize;
+        let n = 10_001usize;
         #[allow(clippy::cast_precision_loss)]
         let recip = 1.0 / (n as f64).sqrt();
         let lhs: Vec<f64> = vec![recip; n];
@@ -8193,11 +8189,11 @@ mod tests {
     fn bmm_tensor_contiguous_pairwise_precision_at_large_k() {
         // Batched matmul precision contract — identical pattern to
         // the matmul test, exercised across 3 batch elements with
-        // K = 4096 to confirm the pairwise scratch is correctly
+        // K = 10_001 to confirm the pairwise scratch is correctly
         // reused across batch iterations. The analytical truth for
         // each batch element is 1.0.
         let batch = 3usize;
-        let k = 4096usize;
+        let k = 10_001usize;
         #[allow(clippy::cast_precision_loss)]
         let recip = 1.0 / (k as f64).sqrt();
         let lhs: Vec<f64> = vec![recip; batch * k];
