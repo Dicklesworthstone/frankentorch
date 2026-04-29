@@ -1,0 +1,2 @@
+sub.Tensor(Tensor self, Tensor other) -> Tensor
+AutogradCPU

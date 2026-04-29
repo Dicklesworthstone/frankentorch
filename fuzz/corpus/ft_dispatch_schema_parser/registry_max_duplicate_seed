@@ -1,0 +1,2 @@
+max.Tensor(Tensor self, Tensor other) -> Tensor
+CPU,AutogradCPU

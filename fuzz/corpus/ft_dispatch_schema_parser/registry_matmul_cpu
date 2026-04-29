@@ -1,0 +1,2 @@
+aten::matmul.Tensor(Tensor self, Tensor other) -> Tensor
+CPU

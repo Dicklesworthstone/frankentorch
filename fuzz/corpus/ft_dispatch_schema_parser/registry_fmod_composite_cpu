@@ -1,0 +1,2 @@
+fmod.Tensor(Tensor self, Tensor other) -> Tensor
+CompositeImplicitAutograd CPU

@@ -1,0 +1,2 @@
+mul.Tensor(Tensor self, Tensor other) -> Tensor
+CompositeExplicitAutograd CPU

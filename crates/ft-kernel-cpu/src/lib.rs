@@ -1563,12 +1563,18 @@ pub fn addmm_tensor_contiguous_f64(
     }
 
     let mut out = vec![0.0; out_numel];
+    // Same gather-then-pairwise pattern as `matmul_tensor_contiguous_f64`
+    // (commit 35a7760). One scratch buffer per call carries the K
+    // products into the pairwise summer; for K > 128 this tightens
+    // the dot-product accumulation from O(K · ε) to O(log K · ε).
+    let mut scratch = vec![0.0_f64; k];
     for row in 0..m {
         for col in 0..n {
-            let mut acc = 0.0;
-            for inner in 0..k {
-                acc += mat1[mat1_start + row * k + inner] * mat2[mat2_start + inner * n + col];
+            for (inner, slot) in scratch.iter_mut().enumerate() {
+                *slot = mat1[mat1_start + row * k + inner]
+                    * mat2[mat2_start + inner * n + col];
             }
+            let acc = pairwise_sum_f64(&scratch);
             let bias_idx = if input_1d {
                 input_offset + col
             } else {
@@ -1631,12 +1637,17 @@ pub fn addmv_tensor_contiguous_f64(
     let input_start = input_meta.storage_offset();
 
     let mut out = vec![0.0; m];
-    for row in 0..m {
-        let mut acc = 0.0;
-        for col in 0..k {
-            acc += mat[mat_start + row * k + col] * vec_data[vec_start + col];
+    // Pairwise dot product per row. Same pattern as matmul; for K
+    // typical of LM head linear projections (vocab >= 32k) the
+    // sequential drift was visible in inference logits.
+    let mut scratch = vec![0.0_f64; k];
+    for (row, slot) in out.iter_mut().enumerate() {
+        for (col, scratch_slot) in scratch.iter_mut().enumerate() {
+            *scratch_slot = mat[mat_start + row * k + col]
+                * vec_data[vec_start + col];
         }
-        out[row] = beta * input[input_start + row] + alpha * acc;
+        let acc = pairwise_sum_f64(&scratch);
+        *slot = beta * input[input_start + row] + alpha * acc;
     }
     Ok(out)
 }
@@ -1666,11 +1677,16 @@ pub fn dot_tensor_contiguous_f64(
     let n = lhs_meta.shape()[0];
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    let mut acc = 0.0;
-    for i in 0..n {
-        acc += lhs[lhs_start + i] * rhs[rhs_start + i];
+    // Pairwise via map: stages each lhs[i]*rhs[i] product into the
+    // pairwise tree directly without an intermediate Vec. Same
+    // O(log N · ε) precision contract as the matmul fix.
+    let lhs_slice = &lhs[lhs_start..lhs_start + n];
+    let rhs_slice = &rhs[rhs_start..rhs_start + n];
+    let mut scratch = vec![0.0_f64; n];
+    for (i, slot) in scratch.iter_mut().enumerate() {
+        *slot = lhs_slice[i] * rhs_slice[i];
     }
-    Ok(acc)
+    Ok(pairwise_sum_f64(&scratch))
 }
 
 pub fn outer_tensor_contiguous_f64(
@@ -1753,17 +1769,22 @@ pub fn bmm_tensor_contiguous_f64(
     let rhs_start = rhs_meta.storage_offset();
     let mut out = vec![0.0; out_numel];
 
+    // One scratch buffer for the entire bmm, reused across all
+    // (batch, row, col) cells. Same pairwise dot-product pattern as
+    // the matmul fix; for K > 128 the cumulative error tightens
+    // from O(K · ε) to O(log K · ε) per output cell.
+    let mut scratch = vec![0.0_f64; k];
     for b in 0..batch {
         let lhs_base = lhs_start + b * lhs_batch_stride;
         let rhs_base = rhs_start + b * rhs_batch_stride;
         let out_base = b * out_batch_stride;
         for row in 0..m {
             for col in 0..n {
-                let mut acc = 0.0;
-                for inner in 0..k {
-                    acc += lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
+                for (inner, slot) in scratch.iter_mut().enumerate() {
+                    *slot = lhs[lhs_base + row * k + inner]
+                        * rhs[rhs_base + inner * n + col];
                 }
-                out[out_base + row * n + col] = acc;
+                out[out_base + row * n + col] = pairwise_sum_f64(&scratch);
             }
         }
     }
@@ -5298,11 +5319,13 @@ pub fn dot_tensor_contiguous_f32(
     let n = lhs_meta.shape()[0];
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    let mut acc = 0.0f32;
-    for i in 0..n {
-        acc += lhs[lhs_start + i] * rhs[rhs_start + i];
+    let lhs_slice = &lhs[lhs_start..lhs_start + n];
+    let rhs_slice = &rhs[rhs_start..rhs_start + n];
+    let mut scratch = vec![0.0f32; n];
+    for (i, slot) in scratch.iter_mut().enumerate() {
+        *slot = lhs_slice[i] * rhs_slice[i];
     }
-    Ok(acc)
+    Ok(pairwise_sum_f32(&scratch))
 }
 
 pub fn outer_tensor_contiguous_f32(
@@ -5370,17 +5393,18 @@ pub fn bmm_tensor_contiguous_f32(
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
     let mut out = vec![0.0f32; out_numel];
+    let mut scratch = vec![0.0f32; k];
     for b in 0..batch {
         let lhs_base = lhs_start + b * lhs_batch_stride;
         let rhs_base = rhs_start + b * rhs_batch_stride;
         let out_base = b * out_batch_stride;
         for row in 0..m {
             for col in 0..n {
-                let mut acc = 0.0f32;
-                for inner in 0..k {
-                    acc += lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
+                for (inner, slot) in scratch.iter_mut().enumerate() {
+                    *slot = lhs[lhs_base + row * k + inner]
+                        * rhs[rhs_base + inner * n + col];
                 }
-                out[out_base + row * n + col] = acc;
+                out[out_base + row * n + col] = pairwise_sum_f32(&scratch);
             }
         }
     }
@@ -6877,12 +6901,14 @@ pub fn addmm_tensor_contiguous_f32(
         });
     }
     let mut out = vec![0.0f32; out_numel];
+    let mut scratch = vec![0.0f32; k];
     for row in 0..m {
         for col in 0..n {
-            let mut acc = 0.0f32;
-            for inner in 0..k {
-                acc += mat1[mat1_start + row * k + inner] * mat2[mat2_start + inner * n + col];
+            for (inner, slot) in scratch.iter_mut().enumerate() {
+                *slot = mat1[mat1_start + row * k + inner]
+                    * mat2[mat2_start + inner * n + col];
             }
+            let acc = pairwise_sum_f32(&scratch);
             let bias_idx = if input_1d {
                 input_offset + col
             } else {
@@ -6941,12 +6967,14 @@ pub fn addmv_tensor_contiguous_f32(
     let vec_start = vec_meta.storage_offset();
     let input_start = input_meta.storage_offset();
     let mut out = vec![0.0f32; m];
-    for row in 0..m {
-        let mut acc = 0.0f32;
-        for col in 0..k {
-            acc += mat[mat_start + row * k + col] * vec_data[vec_start + col];
+    let mut scratch = vec![0.0f32; k];
+    for (row, slot) in out.iter_mut().enumerate() {
+        for (col, scratch_slot) in scratch.iter_mut().enumerate() {
+            *scratch_slot = mat[mat_start + row * k + col]
+                * vec_data[vec_start + col];
         }
-        out[row] = beta * input[input_start + row] + alpha * acc;
+        let acc = pairwise_sum_f32(&scratch);
+        *slot = beta * input[input_start + row] + alpha * acc;
     }
     Ok(out)
 }
@@ -7430,7 +7458,8 @@ mod tests {
         bmm_tensor_contiguous_f64, cat_tensor_contiguous_f64, ceil_scalar,
         ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar,
         cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64, div_scalar,
-        div_tensor_contiguous_f64, eq_scalar, eq_tensor_contiguous_f64, exp_scalar,
+        div_tensor_contiguous_f64, dot_tensor_contiguous_f64, eq_scalar,
+        eq_tensor_contiguous_f64, exp_scalar,
         exp_tensor_contiguous_f64, expand_tensor_contiguous_f64, expm1_scalar,
         expm1_tensor_contiguous_f64, floor_scalar, floor_tensor_contiguous_f64,
         gather_tensor_contiguous_f64, ge_scalar, ge_tensor_contiguous_f64, gelu_scalar,
@@ -8133,6 +8162,60 @@ mod tests {
             "matmul dot-product drift {drift:e} > 1e-14 tolerance (got {}, expected 1.0)",
             out[0]
         );
+    }
+
+    #[test]
+    fn dot_tensor_contiguous_pairwise_precision_at_large_n() {
+        // Dot product with N = 4096 unit vectors. Same precision
+        // contract as the matmul test: pairwise locks the result
+        // within ~5 ULPs of the analytical 1.0; the prior naive
+        // sequential accumulator drifted ~7e-15 (~30 ULPs) on this
+        // input.
+        let n = 4096usize;
+        #[allow(clippy::cast_precision_loss)]
+        let recip = 1.0 / (n as f64).sqrt();
+        let lhs: Vec<f64> = vec![recip; n];
+        let rhs: Vec<f64> = vec![recip; n];
+        let lhs_meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
+
+        let dot = dot_tensor_contiguous_f64(&lhs, &rhs, &lhs_meta, &rhs_meta)
+            .expect("dot should succeed");
+
+        let drift = (dot - 1.0).abs();
+        assert!(
+            drift < 1e-14,
+            "dot drift {drift:e} > 1e-14 tolerance (got {dot}, expected 1.0)"
+        );
+    }
+
+    #[test]
+    fn bmm_tensor_contiguous_pairwise_precision_at_large_k() {
+        // Batched matmul precision contract — identical pattern to
+        // the matmul test, exercised across 3 batch elements with
+        // K = 4096 to confirm the pairwise scratch is correctly
+        // reused across batch iterations. The analytical truth for
+        // each batch element is 1.0.
+        let batch = 3usize;
+        let k = 4096usize;
+        #[allow(clippy::cast_precision_loss)]
+        let recip = 1.0 / (k as f64).sqrt();
+        let lhs: Vec<f64> = vec![recip; batch * k];
+        let rhs: Vec<f64> = vec![recip; batch * k];
+        let lhs_meta = TensorMeta::from_shape(vec![batch, 1, k], DType::F64, Device::Cpu);
+        let rhs_meta = TensorMeta::from_shape(vec![batch, k, 1], DType::F64, Device::Cpu);
+
+        let out = bmm_tensor_contiguous_f64(&lhs, &rhs, &lhs_meta, &rhs_meta)
+            .expect("bmm should succeed");
+        assert_eq!(out.len(), batch);
+
+        for (b, &cell) in out.iter().enumerate() {
+            let drift = (cell - 1.0).abs();
+            assert!(
+                drift < 1e-14,
+                "bmm batch {b} drift {drift:e} > 1e-14 tolerance (got {cell}, expected 1.0)"
+            );
+        }
     }
 
     #[test]

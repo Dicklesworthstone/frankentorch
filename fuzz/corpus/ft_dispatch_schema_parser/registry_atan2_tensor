@@ -1,0 +1,2 @@
+aten::atan2.Tensor(Tensor self, Tensor other) -> Tensor
+CPU

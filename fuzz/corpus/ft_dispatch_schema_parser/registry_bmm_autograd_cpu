@@ -1,0 +1,2 @@
+bmm.Tensor(Tensor self, Tensor mat2) -> Tensor
+CPU|AutogradCPU

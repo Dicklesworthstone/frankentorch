@@ -1,0 +1,2 @@
+aten::min.out(Tensor self, Tensor other, *, Tensor(a!) out) -> Tensor(a!)
+CPU BackendSelect
