@@ -15563,25 +15563,15 @@ fn cubic_weight(x: f64) -> f64 {
     }
 }
 
-/// Inverse error function with libm-quality precision (~1 ULP across
-/// the f64 domain).
+/// Inverse error function with Boost/SciPy-style f64 rational approximations.
 ///
-/// libm does NOT expose `erfinv` — it isn't a C99 standard function.
-/// Previously this used Winitzki's a=0.147 approximation alone, which
-/// has a max absolute error of ~1.3e-3 (single-precision territory).
-/// PyTorch's `torch.erfinv` uses libm-quality precision via Boost-
-/// style rational approximations.
-///
-/// Bridge to libm-quality without porting Boost: take Winitzki as a
-/// 1e-3-accurate initial guess, then refine via Newton-Raphson on
-/// `libm::erf`. The NR iteration is
-///
-///     y_{n+1} = y_n - (erf(y_n) - x) / (2 / sqrt(pi) * exp(-y_n^2))
-///
-/// which converges quadratically: after 2 steps from a 1e-3 starting
-/// point we land within ~1e-15 (limited only by `libm::erf`'s own ~1
-/// ULP error). Verified against `scipy.special.erfinv` in the
-/// `torch_erfinv_scipy_subprocess_conformance` harness.
+/// libm does not expose `erfinv`, and refining a rough guess through
+/// `libm::erf` is not enough in the far tails: `erf(y)` can round back
+/// to the input before `y` is close to the inverse. Use the same
+/// 64-bit approximation structure as Boost.Math instead, which is also
+/// the family of algorithms SciPy and PyTorch rely on for this surface.
+/// Coefficients below are adapted from Boost.Math's `erf_inv`
+/// implementation (Boost Software License 1.0).
 fn erfinv_approx(x: f64) -> f64 {
     if x.is_nan() {
         return f64::NAN;
@@ -15602,27 +15592,209 @@ fn erfinv_approx(x: f64) -> f64 {
         return x; // preserves the sign of ±0.0.
     }
 
-    // Winitzki initial guess (a = 0.147; max abs error ~1.3e-3).
-    let a = 0.147;
-    let ln_term = (1.0 - x * x).ln();
-    let t1 = 2.0 / (std::f64::consts::PI * a) + ln_term / 2.0;
-    let t2 = ln_term / a;
     let sign = if x < 0.0 { -1.0 } else { 1.0 };
-    let mut y = sign * (((t1 * t1 - t2).sqrt() - t1).sqrt());
+    let p = x.abs();
+    let q = 1.0 - p;
+    sign * erfinv_positive_approx(p, q)
+}
 
-    // Newton-Raphson refinement against the high-precision libm::erf.
-    // Two iterations from ~1e-3 -> ~1e-6 -> ~1e-12 (final precision
-    // capped by libm::erf's own ~1 ULP error).
-    let two_over_sqrt_pi = 2.0 / std::f64::consts::PI.sqrt();
-    for _ in 0..2 {
-        let err = libm::erf(y) - x;
-        let derivative = two_over_sqrt_pi * libm::exp(-y * y);
-        if derivative == 0.0 || !derivative.is_finite() {
-            break;
-        }
-        y -= err / derivative;
+fn eval_poly_f64(x: f64, coefficients: &[f64]) -> f64 {
+    let mut value = 0.0;
+    for &coefficient in coefficients.iter().rev() {
+        value = value * x + coefficient;
     }
-    y
+    value
+}
+
+fn erfinv_positive_approx(p: f64, q: f64) -> f64 {
+    if p <= 0.5 {
+        const Y: f64 = 0.089_131_474_494_934_08;
+        const P: [f64; 8] = [
+            -0.000_508_781_949_658_280_7,
+            -0.008_368_748_197_417_368,
+            0.033_480_662_540_974_46,
+            -0.012_692_614_766_297_403,
+            -0.036_563_797_141_176_27,
+            0.021_987_868_111_116_89,
+            0.008_226_878_746_769_157,
+            -0.005_387_729_650_712_429,
+        ];
+        const Q: [f64; 10] = [
+            1.0,
+            -0.970_005_043_303_290_6,
+            -1.565_745_582_341_758_5,
+            1.562_215_583_984_230_2,
+            0.662_328_840_472_003,
+            -0.712_289_023_415_428_5,
+            -0.052_739_638_234_009_97,
+            0.079_528_368_734_157_17,
+            -0.002_333_937_593_741_9,
+            0.000_886_216_390_456_424_7,
+        ];
+        let g = p * (p + 10.0);
+        let r = eval_poly_f64(p, &P) / eval_poly_f64(p, &Q);
+        return g * (Y + r);
+    }
+
+    if q >= 0.25 {
+        const Y: f64 = 2.249_481_201_171_875;
+        const P: [f64; 9] = [
+            -0.202_433_508_355_938_76,
+            0.105_264_680_699_391_71,
+            8.370_503_283_431_2,
+            17.644_729_840_837_4,
+            -18.851_064_805_871_426,
+            -44.638_232_444_178_7,
+            17.445_385_985_570_865,
+            21.129_465_544_834_05,
+            -3.671_922_547_077_293_5,
+        ];
+        const Q: [f64; 9] = [
+            1.0,
+            6.242_641_248_542_475,
+            3.971_343_795_334_387,
+            -28.660_818_049_98,
+            -20.143_263_468_048_52,
+            48.560_921_310_873_994,
+            10.826_866_735_546_016,
+            -22.643_693_341_313_97,
+            1.721_147_657_612_002_8,
+        ];
+        let g = (-2.0 * q.ln()).sqrt();
+        let xs = q - 0.25;
+        let r = eval_poly_f64(xs, &P) / eval_poly_f64(xs, &Q);
+        return g / (Y + r);
+    }
+
+    let tail = (-q.ln()).sqrt();
+    if tail < 3.0 {
+        const Y: f64 = 0.807_220_458_984_375;
+        const P: [f64; 11] = [
+            -0.131_102_781_679_951_9,
+            -0.163_794_047_193_317_05,
+            0.117_030_156_341_995_25,
+            0.387_079_738_972_604_34,
+            0.337_785_538_912_035_9,
+            0.142_869_534_408_157_16,
+            0.029_015_791_000_532_906,
+            0.002_145_589_953_888_052_6,
+            -0.000_000_679_465_575_181_126_4,
+            0.000_000_028_522_533_178_221_705,
+            -0.000_000_000_681_149_956_853_777,
+        ];
+        const Q: [f64; 8] = [
+            1.0,
+            3.466_254_072_425_672_6,
+            5.381_683_457_070_068,
+            4.778_465_929_458_438,
+            2.593_019_216_236_202_5,
+            0.848_854_343_457_902,
+            0.152_264_338_295_331_78,
+            0.011_059_242_293_464_891,
+        ];
+        let xs = tail - 1.125;
+        return tail * (Y + eval_poly_f64(xs, &P) / eval_poly_f64(xs, &Q));
+    }
+
+    if tail < 6.0 {
+        const Y: f64 = 0.939_955_711_364_746_1;
+        const P: [f64; 9] = [
+            -0.035_035_378_718_317_8,
+            -0.002_224_265_292_134_479_4,
+            0.018_557_330_651_423_107,
+            0.009_508_047_013_259_196,
+            0.001_871_234_928_195_592_3,
+            0.000_157_544_617_424_960_55,
+            0.000_004_604_698_905_843_18,
+            -0.000_000_000_230_404_776_911_882_6,
+            0.000_000_000_002_663_392_274_257_82,
+        ];
+        const Q: [f64; 7] = [
+            1.0,
+            1.365_334_981_755_406_2,
+            0.762_059_164_553_623_4,
+            0.220_091_105_764_131_25,
+            0.034_158_914_367_094_77,
+            0.002_638_616_766_570_16,
+            0.000_076_467_529_230_279_45,
+        ];
+        let xs = tail - 3.0;
+        return tail * (Y + eval_poly_f64(xs, &P) / eval_poly_f64(xs, &Q));
+    }
+
+    if tail < 18.0 {
+        const Y: f64 = 0.983_628_273_010_253_9;
+        const P: [f64; 9] = [
+            -0.016_743_100_507_663_373,
+            -0.001_129_514_387_455_802_8,
+            0.001_056_288_621_524_929,
+            0.000_209_386_317_487_588_07,
+            0.000_014_962_478_375_834_237,
+            0.000_000_449_696_789_927_706_5,
+            0.000_000_004_625_961_635_228_786,
+            -0.000_000_000_000_028_112_873_562_883_18,
+            0.000_000_000_000_000_099_055_709_973_310_33,
+        ];
+        const Q: [f64; 7] = [
+            1.0,
+            0.591_429_344_886_417_5,
+            0.138_151_865_749_083_3,
+            0.016_074_608_709_367_65,
+            0.000_964_011_807_005_165_5,
+            0.000_027_533_547_476_472_604,
+            0.000_000_282_243_172_016_108,
+        ];
+        let xs = tail - 6.0;
+        return tail * (Y + eval_poly_f64(xs, &P) / eval_poly_f64(xs, &Q));
+    }
+
+    if tail < 44.0 {
+        const Y: f64 = 0.997_145_652_770_996_1;
+        const P: [f64; 8] = [
+            -0.002_497_821_279_189_813,
+            -0.000_007_791_907_192_290_54,
+            0.000_025_472_303_741_302_746,
+            0.000_001_623_977_773_425_109_2,
+            0.000_000_039_634_101_130_480_12,
+            0.000_000_000_411_632_831_190_944_2,
+            0.000_000_000_001_455_962_867_186_750_4,
+            -0.000_000_000_000_000_001_167_650_123_971_842_7,
+        ];
+        const Q: [f64; 7] = [
+            1.0,
+            0.207_123_112_214_422_52,
+            0.016_941_083_812_097_59,
+            0.000_690_538_265_622_684_6,
+            0.000_014_500_735_981_823_263,
+            0.000_000_144_437_756_628_144_16,
+            0.000_000_000_509_761_276_599_778_5,
+        ];
+        let xs = tail - 18.0;
+        return tail * (Y + eval_poly_f64(xs, &P) / eval_poly_f64(xs, &Q));
+    }
+
+    const Y: f64 = 0.999_413_490_295_410_2;
+    const P: [f64; 8] = [
+        -0.000_539_042_911_019_078_6,
+        -0.000_000_283_987_590_047_277_2,
+        0.000_000_899_465_114_892_291_5,
+        0.000_000_022_934_585_926_592_085,
+        0.000_000_000_225_561_444_863_500_15,
+        0.000_000_000_000_947_846_627_503_022_7,
+        0.000_000_000_000_001_358_801_301_089_248_6,
+        -0.000_000_000_000_000_000_000_348_890_393_399_948_9,
+    ];
+    const Q: [f64; 7] = [
+        1.0,
+        0.084_574_623_400_189_94,
+        0.002_820_929_847_262_647,
+        0.000_046_829_292_194_089_42,
+        0.000_000_399_968_812_193_862_1,
+        0.000_000_001_618_092_908_879_044_8,
+        0.000_000_000_002_315_586_083_102_596,
+    ];
+    let xs = tail - 44.0;
+    tail * (Y + eval_poly_f64(xs, &P) / eval_poly_f64(xs, &Q))
 }
 
 /// Log-gamma via the pure-Rust `libm` crate (~1 ULP precision across
@@ -28907,6 +29079,44 @@ mod tests {
         let vals = s.tensor_values(result).unwrap();
         assert!(vals[0] == f64::NEG_INFINITY);
         assert!(vals[1] == f64::INFINITY);
+    }
+
+    #[test]
+    fn erfinv_tail_values_match_boost_reference() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let next_before_one = f64::from_bits(0x3fefffffffffffff);
+        let inputs = vec![
+            0.999_999_999,
+            -0.999_999_999,
+            0.999_999_999_999,
+            -0.999_999_999_999,
+            1.0 - 1e-15,
+            -(1.0 - 1e-15),
+            next_before_one,
+            -next_before_one,
+        ];
+        let expected = [
+            4.320_005_388_105_362,
+            -4.320_005_388_105_362,
+            5.042_031_898_572_696,
+            -5.042_031_898_572_696,
+            5.675_915_739_744_712,
+            -5.675_915_739_744_712,
+            5.863_584_748_755_168,
+            -5.863_584_748_755_168,
+        ];
+        let input = s
+            .tensor_variable(inputs.clone(), vec![inputs.len()], false)
+            .unwrap();
+        let result = s.tensor_erfinv(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+
+        for ((x, got), want) in inputs.iter().zip(vals.iter()).zip(expected.iter()) {
+            assert!(
+                (got - want).abs() <= 2e-14,
+                "erfinv({x:?}) = {got:?}, want {want:?}"
+            );
+        }
     }
 
     #[test]

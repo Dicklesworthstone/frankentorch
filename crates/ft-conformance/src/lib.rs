@@ -13792,12 +13792,8 @@ print(json.dumps({"expm1": expm1_out, "log1p": log1p_out}))
             let rust_log1p = x.ln_1p();
             // FrankenTorch scalar API.
             let x_var = session.variable(*x, false);
-            let ft_expm1 = session
-                .expm1(x_var)
-                .expect("session.expm1");
-            let ft_log1p = session
-                .log1p(x_var)
-                .expect("session.log1p");
+            let ft_expm1 = session.expm1(x_var).expect("session.expm1");
+            let ft_log1p = session.log1p(x_var).expect("session.log1p");
             let ft_expm1_val = session.value(ft_expm1).expect("expm1 value");
             let ft_log1p_val = session.value(ft_log1p).expect("log1p value");
 
@@ -13844,18 +13840,14 @@ print(json.dumps({"expm1": expm1_out, "log1p": log1p_out}))
             .collect();
         let xs: Vec<f64> = finite_subset.iter().map(|(_, x)| *x).collect();
         let n = xs.len();
-        let xt = session
-            .tensor_variable(xs, vec![n], false)
-            .expect("xt");
+        let xt = session.tensor_variable(xs, vec![n], false).expect("xt");
         let et = session.tensor_expm1(xt).expect("tensor_expm1");
         let lt = session.tensor_log1p(xt).expect("tensor_log1p");
         let ev = session.tensor_values(et).expect("ev");
         let lv = session.tensor_values(lt).expect("lv");
         for (k, (i, x)) in finite_subset.iter().enumerate() {
-            let expm1_oracle =
-                f64::from_bits(expm1_results[*i].as_str().unwrap().parse().unwrap());
-            let log1p_oracle =
-                f64::from_bits(log1p_results[*i].as_str().unwrap().parse().unwrap());
+            let expm1_oracle = f64::from_bits(expm1_results[*i].as_str().unwrap().parse().unwrap());
+            let log1p_oracle = f64::from_bits(log1p_results[*i].as_str().unwrap().parse().unwrap());
             if !bit_eq(ev[k], expm1_oracle) {
                 mismatches.push(format!(
                     "tensor_expm1({x:?})[{k}] = {:?} (bits 0x{:016x}) but oracle {expm1_oracle:?}",
@@ -14184,9 +14176,7 @@ print(json.dumps({"erf": erf_out, "erfc": erfc_out}))
             .map(|s| s.success())
             .unwrap_or(false);
         if !python_available {
-            eprintln!(
-                "torch_lgamma_libm_subprocess_conformance: python3 not available, skipping"
-            );
+            eprintln!("torch_lgamma_libm_subprocess_conformance: python3 not available, skipping");
             return;
         }
 
@@ -14380,25 +14370,21 @@ print(json.dumps({"lgamma": out}))
     fn torch_erfinv_scipy_subprocess_conformance() {
         // Lock the inverse error function precision contract.
         //
-        // The previous implementation used Winitzki's a=0.147
-        // approximation alone (max abs error ~1.3e-3 — single
-        // precision territory). The current implementation uses
-        // Winitzki as a 1e-3-accurate initial guess and refines via
-        // two Newton-Raphson iterations on `libm::erf`, landing
-        // within ~1e-12 of scipy.special.erfinv (which itself uses
-        // Boost-style rational approximations and is the precise
-        // upstream reference for torch.erfinv).
+        // The implementation uses Boost-style f64 rational
+        // approximations and should stay within ~1e-12 of
+        // scipy.special.erfinv (which itself uses Boost-style
+        // rational approximations and is the precise upstream
+        // reference for torch.erfinv).
         //
         // Companion to the erf/erfc/lgamma/atan2/pow/expm1+log1p
         // subprocess conformance harnesses. Tolerance bumped to a
         // (16-ULP OR 5e-13 absolute, whichever is greater) bound
         // because:
-        //   * libm has no erfinv — we synthesise it from libm::erf
-        //     via Newton-Raphson, so the precision floor is set by
-        //     erf's ~1 ULP error doubled-up through the NR step.
-        //   * scipy uses a different approximation (Boost rational)
-        //     that can disagree with our NR-on-libm-erf result by a
-        //     handful of ULPs across the entire f64 domain.
+        //   * libm has no erfinv, so this is a pure rational
+        //     approximation rather than a direct platform call.
+        //   * scipy uses its own Boost-derived implementation that
+        //     can disagree with our coefficients by a handful of ULPs
+        //     across the entire f64 domain.
         // 5e-13 absolute keeps the test useful at extreme |x| (where
         // erfinv goes to ±inf and ULP comparisons stop being
         // meaningful) while still catching multi-ULP regressions in
@@ -14477,6 +14463,14 @@ print(json.dumps({"lgamma": out}))
             -0.999,
             0.999_999,
             -0.999_999,
+            0.999_999_999,
+            -0.999_999_999,
+            0.999_999_999_999,
+            -0.999_999_999_999,
+            1.0 - 1e-15,
+            -(1.0 - 1e-15),
+            f64::from_bits(0x3fefffffffffffff),
+            -f64::from_bits(0x3fefffffffffffff),
             // Out-of-domain: |x| > 1 must yield NaN (or ±inf at the
             // exact boundary, which we already cover above).
             1.000_000_000_001,
@@ -14621,9 +14615,7 @@ print(json.dumps({"erfinv": out}))
             .map(|s| s.success())
             .unwrap_or(false);
         if !python_available {
-            eprintln!(
-                "torch_trig_libm_subprocess_conformance: python3 not available, skipping"
-            );
+            eprintln!("torch_trig_libm_subprocess_conformance: python3 not available, skipping");
             return;
         }
 
@@ -14709,12 +14701,15 @@ print(json.dumps({"erfinv": out}))
             "trig conformance must have >= 50 total comparisons, got {total_count}",
         );
 
-        let inputs_bits: Vec<String> =
-            inputs.iter().map(|v| v.to_bits().to_string()).collect();
-        let asin_bits: Vec<String> =
-            asin_inputs.iter().map(|v| v.to_bits().to_string()).collect();
-        let atan_bits: Vec<String> =
-            atan_inputs.iter().map(|v| v.to_bits().to_string()).collect();
+        let inputs_bits: Vec<String> = inputs.iter().map(|v| v.to_bits().to_string()).collect();
+        let asin_bits: Vec<String> = asin_inputs
+            .iter()
+            .map(|v| v.to_bits().to_string())
+            .collect();
+        let atan_bits: Vec<String> = atan_inputs
+            .iter()
+            .map(|v| v.to_bits().to_string())
+            .collect();
         let payload = json!({
             "trig": inputs_bits,
             "asin_acos": asin_bits,
