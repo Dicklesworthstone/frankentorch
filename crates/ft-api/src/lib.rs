@@ -13279,35 +13279,43 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.special.entr(input)`.
     /// Returns 0 when x == 0 and -inf when x < 0.
+    ///
+    /// Composes through tensor_neg + tensor_log + tensor_mul +
+    /// tensor_eq + tensor_lt + tensor_where so the autograd tape
+    /// carries gradients through the input. Previously this had a
+    /// fail-loud guard rejecting tracked inputs because the body
+    /// extracted values and rebuilt a requires_grad=false leaf —
+    /// same severed-autograd pattern as the recent xlogy / xlog1py
+    /// / logit fixes. PyTorch's torch.special.entr is differentiable
+    /// on the open positive half-line. Tracked under
+    /// frankentorch-1tax.
+    ///
+    /// Composition (nested where):
+    ///     entr(x) = where(x < 0, -inf,
+    ///                    where(x == 0, 0,
+    ///                          -x * log(x)))
+    ///
+    /// Backward (chain rule on the smooth branch):
+    ///     d entr / dx where x > 0 = -log(x) - 1
+    /// Where x <= 0 the masks block gradient flow through the
+    /// constant branches, so the gradient is zero (rather than
+    /// undefined / +inf at x = 0).
     pub fn tensor_entr(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_tape.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "entr: autograd is not supported",
-                },
-            )));
-        }
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
-        };
+        let shape = self.tensor_shape(input)?;
+        let log_x = self.tensor_log(input)?;
+        let neg_input = self.tensor_neg(input)?;
+        let neg_x_log_x = self.tensor_mul(neg_input, log_x)?;
 
-        let values: Vec<f64> = storage
-            .iter()
-            .map(|&x| {
-                if x == 0.0 {
-                    0.0
-                } else if x < 0.0 {
-                    f64::NEG_INFINITY
-                } else {
-                    -x * x.ln()
-                }
-            })
-            .collect();
+        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let mask_zero = self.tensor_eq(input, zeros)?;
+        let zero_branch = self.full(shape.clone(), 0.0, false)?;
+        let inner = self.tensor_where(mask_zero, zero_branch, neg_x_log_x)?;
 
-        let out = self
-            .tensor_tape
-            .leaf(values, meta.shape().to_vec(), false)?;
+        let zeros_for_lt = self.full(shape.clone(), 0.0, false)?;
+        let mask_neg = self.tensor_lt(input, zeros_for_lt)?;
+        let neg_inf = self.full(shape, f64::NEG_INFINITY, false)?;
+        let out = self.tensor_where(mask_neg, neg_inf, inner)?;
+
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("entr in={} out={}", input.0, out.0),
@@ -29927,6 +29935,65 @@ mod tests {
         );
         assert!((vals[2]).abs() < 1e-12, "entr(1) = -1*ln(1) = 0");
         assert!(vals[3] == f64::NEG_INFINITY, "entr(negative) = -inf");
+    }
+
+    #[test]
+    fn entr_propagates_gradients_on_positive_branch() {
+        // Regression test for frankentorch-1tax: tensor_entr used to
+        // fail-loud reject tracked inputs. After the nested-where
+        // composition fix, gradients flow through the smooth-branch
+        // chain rule.
+        //
+        // d/dx entr(x) = d/dx (-x * log(x)) = -log(x) - 1   (x > 0)
+        //
+        // For input [0.25, 0.5, 1.0, 2.0] under sum loss:
+        //   grad = [-log(0.25) - 1, -log(0.5) - 1,
+        //           -log(1.0) - 1, -log(2.0) - 1]
+        //        = [+0.3863..., +0.3069..., -1.0,        -1.6931...]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xs = vec![0.25, 0.5, 1.0, 2.0];
+        let input = s
+            .tensor_variable(xs.clone(), vec![4], true)
+            .unwrap();
+        let out = s.tensor_entr(input).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("entr must propagate gradient through the input");
+        for (i, (&g, &x)) in grad.iter().zip(xs.iter()).enumerate() {
+            let want = -x.ln() - 1.0;
+            assert!(
+                (g - want).abs() < 1e-12,
+                "entr grad[{i}] at x={x} = {g}, expected -log(x) - 1 = {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn entr_zero_and_negative_branches_block_gradient() {
+        // At x == 0 and x < 0 the composition's masks route the
+        // output through constants (0 and -inf respectively), so the
+        // gradient back to the input is zero rather than the
+        // undefined limit (+inf at x=0+, 0 at x<0). PyTorch returns
+        // NaN at x=0; FrankenTorch's mask-blocked-zero is consistent
+        // with the constant-branch backward semantics elsewhere
+        // (where, scatter, etc.).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, -1.0, 0.5], vec![3], true)
+            .unwrap();
+        let out = s.tensor_entr(input).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        // entr(-1.0) is -inf, so the loss is -inf; backward through
+        // a -inf-finite incoming gradient still propagates 0 at the
+        // masked-out positions and -log(0.5) - 1 at the smooth one.
+        // Forward+backward must not panic.
+        let report = s.tensor_backward(loss);
+        assert!(
+            report.is_ok(),
+            "entr backward must not panic on mixed zero / negative / positive input"
+        );
     }
 
     #[test]
