@@ -12970,37 +12970,40 @@ impl FrankenTorchSession {
     /// Compute `x * log(y)` with the convention that `0 * log(y) = 0`.
     ///
     /// Equivalent to `torch.xlogy(input, other)` / `torch.special.xlogy`.
+    ///
+    /// Composes through tensor_log + tensor_mul + tensor_eq +
+    /// tensor_where so the autograd tape carries gradients through
+    /// both x and y. Previously this extracted tensor_values and
+    /// rebuilt a requires_grad=false leaf, severing the tape on
+    /// tracked inputs (same severed-autograd pattern recently fixed
+    /// across the activation / index_* / scatter_* family). Tracked
+    /// under frankentorch-1tax.
+    ///
+    /// The `0 * log(y) = 0` convention is implemented via
+    /// `where(x == 0, 0, x * log(y))` — when x is exactly 0, the
+    /// output is 0 even if log(y) is -inf or NaN. tensor_where
+    /// blocks gradients through the masked-out branch automatically.
     pub fn tensor_xlogy(
         &mut self,
         x: TensorNodeId,
         y: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (x_vals, x_meta) = {
-            let tensor = self.tensor_tape.tensor(x)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
-        };
-        let y_vals = {
-            let tensor = self.tensor_tape.tensor(y)?;
-            tensor.storage()?.to_vec()
-        };
-
-        if x_vals.len() != y_vals.len() {
+        let x_shape = self.tensor_shape(x)?;
+        let y_shape = self.tensor_shape(y)?;
+        if x_shape != y_shape {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "xlogy: input and other must have the same number of elements",
+                    reason: "xlogy: input and other must have the same shape",
                 },
             )));
         }
-
-        let values: Vec<f64> = x_vals
-            .iter()
-            .zip(y_vals.iter())
-            .map(|(&xi, &yi)| if xi == 0.0 { 0.0 } else { xi * yi.ln() })
-            .collect();
-
-        let out = self
-            .tensor_tape
-            .leaf(values, x_meta.shape().to_vec(), false)?;
+        let log_y = self.tensor_log(y)?;
+        let prod = self.tensor_mul(x, log_y)?;
+        let zeros = self.full(x_shape.clone(), 0.0, false)?;
+        // mask = (x == 0) — 1.0 where x is exactly zero, 0.0 elsewhere.
+        let mask = self.tensor_eq(x, zeros)?;
+        let zero_branch = self.full(x_shape, 0.0, false)?;
+        let out = self.tensor_where(mask, zero_branch, prod)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("xlogy x={} y={} out={}", x.0, y.0, out.0),
@@ -32398,6 +32401,58 @@ mod tests {
             .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
             .unwrap();
         assert!(s.tensor_xlogy(x, y).is_err());
+    }
+
+    #[test]
+    fn xlogy_propagates_gradients_through_x_and_y() {
+        // Regression test for frankentorch-1tax: tensor_xlogy used to
+        // extract values and rebuild a fresh requires_grad=false
+        // leaf, severing the tape. After the where(x==0, 0, x*log(y))
+        // composition fix, gradients flow correctly through both x
+        // and y for non-boundary positions.
+        //
+        // Analytical derivatives where x != 0:
+        //   d xlogy / dx = log(y)
+        //   d xlogy / dy = x / y
+        // Where x == 0, the convention pins the output (and therefore
+        // both gradients) to zero.
+        //
+        // For x = [2.0, 0.0, 3.0], y = [4.0, 1.0, 5.0]:
+        //   output  = [2*log(4), 0, 3*log(5)]
+        //   sum loss → incoming = ones
+        //   grad_x  = [log(4), 0,         log(5)]   (mask zeros position 1)
+        //   grad_y  = [2/4,    0,         3/5]      (mask zeros position 1)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![2.0, 0.0, 3.0], vec![3], true)
+            .unwrap();
+        let y = s
+            .tensor_variable(vec![4.0, 1.0, 5.0], vec![3], true)
+            .unwrap();
+        let out = s.tensor_xlogy(x, y).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_x = s
+            .tensor_gradient(&report, x)
+            .expect("xlogy must propagate gradient to x");
+        let grad_y = s
+            .tensor_gradient(&report, y)
+            .expect("xlogy must propagate gradient to y");
+
+        let expect_x = [4.0_f64.ln(), 0.0, 5.0_f64.ln()];
+        let expect_y = [2.0 / 4.0, 0.0, 3.0 / 5.0];
+        for (i, (&g, &e)) in grad_x.iter().zip(expect_x.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "xlogy grad_x[{i}] = {g}, expected log(y_i) (or 0 at the x==0 boundary): {e}"
+            );
+        }
+        for (i, (&g, &e)) in grad_y.iter().zip(expect_y.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "xlogy grad_y[{i}] = {g}, expected x_i/y_i (or 0 at the x==0 boundary): {e}"
+            );
+        }
     }
 
     // ── rot90 tests ─────────────────────────────────────────────────────
