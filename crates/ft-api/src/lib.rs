@@ -13089,24 +13089,44 @@ impl FrankenTorchSession {
     /// Element-wise natural logarithm of the absolute value of the gamma function.
     ///
     /// Equivalent to `torch.special.gammaln(input)` / `torch.lgamma(input)`.
+    ///
+    /// Wraps the libm `lgamma` (via `lgamma_approx`) in a custom
+    /// `tensor_apply_function` so the autograd tape carries gradients
+    /// through the input. The analytical derivative is
+    /// `d/dx lgamma(x) = digamma(x)`, computed via `digamma_approx`
+    /// in the backward closure. Tracked under frankentorch-1tax —
+    /// previously this had a fail-loud guard rejecting tracked
+    /// inputs because the body just computed values and rebuilt a
+    /// requires_grad=false leaf.
     pub fn tensor_gammaln(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_tape.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "gammaln: autograd is not supported",
-                },
-            )));
-        }
-        let (storage, meta) = {
-            let tensor = self.tensor_tape.tensor(input)?;
-            (tensor.storage()?.to_vec(), tensor.meta().clone())
-        };
-
-        let values: Vec<f64> = storage.iter().map(|&x| lgamma_approx(x)).collect();
-
-        let out = self
-            .tensor_tape
-            .leaf(values, meta.shape().to_vec(), false)?;
+        let out = self.tensor_apply_function(
+            &[input],
+            |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                // Save x for the digamma backward.
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals.iter().map(|&x| lgamma_approx(x)).collect();
+                Ok((values, shape.to_vec()))
+            },
+            |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "gammaln backward: incoming gradient length mismatch",
+                        },
+                    )));
+                }
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| go * digamma_approx(x))
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("gammaln in={} out={}", input.0, out.0),
@@ -29841,10 +29861,48 @@ mod tests {
     }
 
     #[test]
-    fn gammaln_rejects_grad_input() {
+    fn gammaln_propagates_gradient_via_digamma() {
+        // Regression test for frankentorch-1tax: tensor_gammaln used
+        // to fail-loud reject tracked inputs because the body just
+        // ran libm::lgamma and rebuilt a requires_grad=false leaf.
+        // After wrapping in tensor_apply_function with a digamma
+        // backward, gradients flow through the input.
+        //
+        // d/dx lgamma(x) = digamma(x).
+        // For input [1.0, 2.0, 3.0, 4.0] under sum loss:
+        //   grad[i] = digamma(x_i)
+        //   = [-gamma_euler, 1 - gamma_euler, 1.5 - gamma_euler,
+        //      11/6 - gamma_euler]
+        // Equivalently: digamma(1) = -γ ≈ -0.5772; digamma(n) for
+        // integer n: H_{n-1} - γ where H_k is the k-th harmonic number.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let input = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
-        assert!(s.tensor_gammaln(input).is_err());
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let out = s.tensor_gammaln(input).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("gammaln must propagate gradient via digamma backward");
+
+        let euler = 0.577_215_664_901_532_9_f64;
+        let expected = [
+            -euler,
+            1.0 - euler,
+            1.5 - euler,
+            (1.0 + 0.5 + 1.0 / 3.0) - euler,
+        ];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            // digamma_approx error envelope (~1e-13 absolute on the
+            // smooth interior — matches the bound the scipy
+            // conformance test uses for digamma).
+            assert!(
+                (g - e).abs() < 1e-9,
+                "gammaln grad[{i}] at x={} = {g}, expected digamma(x) = {e}",
+                [1.0, 2.0, 3.0, 4.0][i]
+            );
+        }
     }
 
     #[test]
