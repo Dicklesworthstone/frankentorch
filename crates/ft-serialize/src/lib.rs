@@ -2935,4 +2935,67 @@ mod tests {
         assert_eq!(loaded["deep"].meta().shape(), &[1, 1, 1, 1, 2]);
         assert_eq!(loaded["deep"].contiguous_values().unwrap(), &[7.0, 8.0]);
     }
+
+    /// Replay every fuzz-corpus seed for the checkpoint decoder and
+    /// require that none of them panic. The fuzz target itself
+    /// (`fuzz/fuzz_targets/ft_serialize_checkpoint.rs`) makes the same
+    /// guarantee for libFuzzer-generated mutations, but those binaries
+    /// only build under `cargo fuzz` (nightly + libfuzzer-sys runtime).
+    /// Running the same seeds through a plain `cargo test` keeps the
+    /// corpus from silently rotting and gives non-fuzz CI lanes a
+    /// regression net for any future panic introduced into
+    /// `decode_checkpoint` / `decode_snapshot`.
+    #[test]
+    fn checkpoint_decoder_corpus_seeds_do_not_panic() {
+        let manifest_dir =
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let corpus_dir = manifest_dir
+            .join("..")
+            .join("..")
+            .join("fuzz")
+            .join("corpus")
+            .join("ft_serialize_checkpoint");
+
+        let entries = match std::fs::read_dir(&corpus_dir) {
+            Ok(entries) => entries,
+            Err(error) => {
+                // Corpus directory absent (e.g. published-crates build that
+                // ships only `crates/`). Skip rather than fail.
+                eprintln!(
+                    "checkpoint_decoder_corpus_seeds_do_not_panic: corpus dir not found at {} ({error}); skipping",
+                    corpus_dir.display()
+                );
+                return;
+            }
+        };
+
+        let mut seeds_seen = 0usize;
+        for entry in entries {
+            let entry = entry.expect("corpus dir read_dir entry");
+            let path = entry.path();
+            if !path.is_file() {
+                continue;
+            }
+            let bytes = std::fs::read(&path).expect("corpus seed read");
+            let Ok(text) = std::str::from_utf8(&bytes) else {
+                // Corpus seeds are JSON text; non-UTF-8 means the file
+                // was truncated by an editor or a binary blob slipped
+                // in. Either way the fuzz target itself short-circuits
+                // on non-UTF-8, so we mirror that here.
+                continue;
+            };
+            // Both decoder modes plus the snapshot wrapper — same
+            // surface as the fuzz target.
+            let _ = super::decode_checkpoint(text, super::DecodeMode::Strict);
+            let _ = super::decode_checkpoint(text, super::DecodeMode::Hardened);
+            let _ = super::decode_snapshot(text);
+            seeds_seen += 1;
+        }
+
+        assert!(
+            seeds_seen >= 12,
+            "expected at least 12 corpus seeds, walked {seeds_seen} in {}",
+            corpus_dir.display()
+        );
+    }
 }

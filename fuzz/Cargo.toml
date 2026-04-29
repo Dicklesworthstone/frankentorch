@@ -41,4 +41,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_serialize_checkpoint"
+path = "fuzz_targets/ft_serialize_checkpoint.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]

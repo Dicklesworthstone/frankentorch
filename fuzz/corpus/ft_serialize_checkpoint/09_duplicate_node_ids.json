@@ -1,0 +1,1 @@
+{"schema_version":1,"mode":"hardened","entries":[{"node_id":7,"value":1.0,"grad":null},{"node_id":7,"value":2.0,"grad":null},{"node_id":7,"value":3.0,"grad":1.0}],"source_hash":"x"}
