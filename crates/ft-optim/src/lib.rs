@@ -90,6 +90,10 @@ fn powi_exponent_saturating(value: usize) -> i32 {
     i32::try_from(value).unwrap_or(i32::MAX)
 }
 
+fn next_scheduler_epoch(last_epoch: i64) -> i64 {
+    last_epoch.saturating_add(1)
+}
+
 fn load_param_gradient(
     session: &FrankenTorchSession,
     param: TensorNodeId,
@@ -1842,7 +1846,7 @@ impl LRScheduler for StepLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         let new_epoch = match epoch {
             Some(e) => e,
-            None => self.last_epoch + 1,
+            None => next_scheduler_epoch(self.last_epoch),
         };
         self.last_epoch = new_epoch;
         let new_lr = self.compute_lr_at_epoch(new_epoch);
@@ -1976,7 +1980,7 @@ impl LRScheduler for MultiStepLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         let new_epoch = match epoch {
             Some(e) => e,
-            None => self.last_epoch + 1,
+            None => next_scheduler_epoch(self.last_epoch),
         };
         self.last_epoch = new_epoch;
         let new_lr = self.compute_lr_at_epoch(new_epoch);
@@ -2126,7 +2130,7 @@ impl LRScheduler for CosineAnnealingLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         let new_epoch = match epoch {
             Some(e) => e,
-            None => self.last_epoch + 1,
+            None => next_scheduler_epoch(self.last_epoch),
         };
         self.last_epoch = new_epoch;
         let new_lr = self.compute_lr_at_epoch(new_epoch);
@@ -2275,7 +2279,7 @@ impl LRScheduler for CosineAnnealingWarmRestarts {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         let new_epoch = match epoch {
             Some(e) => e,
-            None => self.last_epoch + 1,
+            None => next_scheduler_epoch(self.last_epoch),
         };
         self.last_epoch = new_epoch;
 
@@ -2407,7 +2411,7 @@ impl LRScheduler for ExponentialLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         let new_epoch = match epoch {
             Some(e) => e,
-            None => self.last_epoch + 1,
+            None => next_scheduler_epoch(self.last_epoch),
         };
         self.last_epoch = new_epoch;
         let new_lr = self.compute_lr_at_epoch(new_epoch);
@@ -2543,7 +2547,7 @@ impl LRScheduler for LinearLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
         let new_epoch = match epoch {
             Some(e) => e,
-            None => self.last_epoch + 1,
+            None => next_scheduler_epoch(self.last_epoch),
         };
         self.last_epoch = new_epoch;
         let new_lr = self.compute_lr_at_epoch(new_epoch);
@@ -2764,7 +2768,7 @@ impl ReduceLROnPlateau {
 
 impl LRScheduler for ReduceLROnPlateau {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        self.last_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         self.last_lr = optimizer.get_lr();
     }
 
@@ -2980,7 +2984,7 @@ impl LambdaLR {
 
 impl LRScheduler for LambdaLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        let new_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         self.last_epoch = new_epoch;
         let new_lr = self.compute_lr_at_epoch(new_epoch);
         let old_lr = self.last_lr;
@@ -3071,7 +3075,7 @@ impl SequentialLR {
 
 impl LRScheduler for SequentialLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        let new_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         self.last_epoch = new_epoch;
         let (index, local_epoch) = self.active_index_and_local_epoch(new_epoch);
         self.schedulers[index].step(optimizer, Some(local_epoch));
@@ -3151,7 +3155,7 @@ impl ChainedScheduler {
 
 impl LRScheduler for ChainedScheduler {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        let new_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         self.last_epoch = new_epoch;
 
         let mut factor = 1.0;
@@ -3426,7 +3430,7 @@ impl OneCycleLR {
 
 impl LRScheduler for OneCycleLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        let new_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         self.last_epoch = new_epoch;
 
         let (new_lr, new_momentum) = self.compute_values_at_step(new_epoch.max(0) as usize);
@@ -3569,7 +3573,7 @@ impl PolynomialLR {
 
 impl LRScheduler for PolynomialLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        self.last_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         let e = self.last_epoch.max(0) as usize;
         let lr = if e >= self.total_iters {
             0.0
@@ -3653,7 +3657,7 @@ impl ConstantLR {
 
 impl LRScheduler for ConstantLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        self.last_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         let e = self.last_epoch.max(0) as usize;
         let lr = if e < self.total_iters {
             self.initial_lr * self.factor
@@ -3731,7 +3735,7 @@ impl MultiplicativeLR {
 
 impl LRScheduler for MultiplicativeLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        let new_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        let new_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         self.last_epoch = new_epoch;
 
         if new_epoch == 0 {
@@ -3871,7 +3875,7 @@ impl CyclicLR {
 
 impl LRScheduler for CyclicLR {
     fn step(&mut self, optimizer: &mut dyn Optimizer, epoch: Option<i64>) {
-        self.last_epoch = epoch.unwrap_or(self.last_epoch + 1);
+        self.last_epoch = epoch.unwrap_or(next_scheduler_epoch(self.last_epoch));
         let lr = self.compute_lr(self.iteration);
         optimizer.set_lr(lr);
         self.last_lr = lr;
@@ -7579,6 +7583,22 @@ mod tests {
     }
 
     #[test]
+    fn step_lr_saturates_max_last_epoch_on_auto_step() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut opt = SGD::new(vec![x], 0.1);
+        let mut scheduler = StepLR::new(&opt, 1).gamma(0.5).last_epoch(i64::MAX);
+
+        scheduler.step(&mut opt, None);
+
+        let lr = opt.get_lr();
+        assert!(lr.is_finite(), "lr should remain finite, got {lr}");
+        assert_eq!(scheduler.state_dict().last_epoch, i64::MAX);
+    }
+
+    #[test]
     fn step_lr_with_sgd_integration() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -9587,6 +9607,34 @@ mod tests {
                 .map(|(_, value)| *value),
             Some(usize::MAX as f64)
         );
+    }
+
+    #[test]
+    fn cyclic_lr_saturates_loaded_max_last_epoch_on_auto_step() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("variable");
+        let mut opt = SGD::new(vec![x], 0.1);
+        let mut scheduler = CyclicLR::new(&opt, 0.001, 0.01, 1);
+
+        scheduler.load_state_dict(SchedulerState {
+            last_epoch: i64::MAX,
+            last_lrs: vec![0.001],
+            extra: vec![
+                ("base_lr".to_owned(), 0.001),
+                ("max_lr".to_owned(), 0.01),
+                ("step_size_up".to_owned(), 1.0),
+                ("step_size_down".to_owned(), 1.0),
+                ("iteration".to_owned(), 0.0),
+            ],
+        });
+
+        scheduler.step(&mut opt, None);
+
+        let lr = opt.get_lr();
+        assert!(lr.is_finite(), "lr should remain finite, got {lr}");
+        assert_eq!(scheduler.state_dict().last_epoch, i64::MAX);
     }
 
     #[test]
