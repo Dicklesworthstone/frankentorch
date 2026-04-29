@@ -1378,8 +1378,7 @@ pub fn sum_dim_tensor_contiguous_f64(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             output[outer * inner_size + inner] = pairwise_sum_f64(&scratch);
         }
@@ -1571,8 +1570,7 @@ pub fn addmm_tensor_contiguous_f64(
     for row in 0..m {
         for col in 0..n {
             for (inner, slot) in scratch.iter_mut().enumerate() {
-                *slot = mat1[mat1_start + row * k + inner]
-                    * mat2[mat2_start + inner * n + col];
+                *slot = mat1[mat1_start + row * k + inner] * mat2[mat2_start + inner * n + col];
             }
             let acc = pairwise_sum_f64(&scratch);
             let bias_idx = if input_1d {
@@ -1643,8 +1641,7 @@ pub fn addmv_tensor_contiguous_f64(
     let mut scratch = vec![0.0_f64; k];
     for (row, slot) in out.iter_mut().enumerate() {
         for (col, scratch_slot) in scratch.iter_mut().enumerate() {
-            *scratch_slot = mat[mat_start + row * k + col]
-                * vec_data[vec_start + col];
+            *scratch_slot = mat[mat_start + row * k + col] * vec_data[vec_start + col];
         }
         let acc = pairwise_sum_f64(&scratch);
         *slot = beta * input[input_start + row] + alpha * acc;
@@ -1781,8 +1778,7 @@ pub fn bmm_tensor_contiguous_f64(
         for row in 0..m {
             for col in 0..n {
                 for (inner, slot) in scratch.iter_mut().enumerate() {
-                    *slot = lhs[lhs_base + row * k + inner]
-                        * rhs[rhs_base + inner * n + col];
+                    *slot = lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
                 }
                 out[out_base + row * n + col] = pairwise_sum_f64(&scratch);
             }
@@ -1902,8 +1898,7 @@ pub fn var_dim_tensor_contiguous_f64(
             // Gather the strided values for this (outer, inner) into
             // contiguous scratch.
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             let mean = pairwise_sum_f64(&scratch) / n_div;
             let var_sum = pairwise_sum_map_f64(&scratch, |x| {
@@ -2094,10 +2089,7 @@ pub fn softmax_dim_tensor_contiguous_f64(
             let start = outer * reduce_size;
             let end = start + reduce_size;
             let in_slice = &data[start..end];
-            let max_val = in_slice
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let max_val = in_slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             for (out, &x) in output[start..end].iter_mut().zip(in_slice.iter()) {
                 *out = (x - max_val).exp();
             }
@@ -2117,8 +2109,7 @@ pub fn softmax_dim_tensor_contiguous_f64(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             for v in scratch.iter_mut() {
@@ -2126,8 +2117,7 @@ pub fn softmax_dim_tensor_contiguous_f64(
             }
             let sum = pairwise_sum_f64(&scratch);
             for (r, &exp_x) in scratch.iter().enumerate() {
-                output[outer * reduce_size * inner_size + r * inner_size + inner] =
-                    exp_x / sum;
+                output[outer * reduce_size * inner_size + r * inner_size + inner] = exp_x / sum;
             }
         }
     }
@@ -2165,10 +2155,7 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
             let start = outer * reduce_size;
             let end = start + reduce_size;
             let in_slice = &data[start..end];
-            let max_val = in_slice
-                .iter()
-                .copied()
-                .fold(f64::NEG_INFINITY, f64::max);
+            let max_val = in_slice.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let sum_exp = pairwise_sum_map_f64(in_slice, |x| (x - max_val).exp());
             let log_sum_exp = max_val + sum_exp.ln();
             for (out, &x) in output[start..end].iter_mut().zip(in_slice.iter()) {
@@ -2182,15 +2169,13 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
             let sum_exp = pairwise_sum_map_f64(&scratch, |x| (x - max_val).exp());
             let log_sum_exp = max_val + sum_exp.ln();
             for (r, &x) in scratch.iter().enumerate() {
-                output[outer * reduce_size * inner_size + r * inner_size + inner] =
-                    x - log_sum_exp;
+                output[outer * reduce_size * inner_size + r * inner_size + inner] = x - log_sum_exp;
             }
         }
     }
@@ -5219,8 +5204,7 @@ pub fn sum_dim_tensor_contiguous_f32(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             output[outer * inner_size + inner] = pairwise_sum_f32(&scratch);
         }
@@ -5285,8 +5269,7 @@ pub fn matmul_tensor_contiguous_f32(
         let lhs_row_base = lhs_start + row * k;
         for col in 0..n {
             for (inner, slot) in scratch.iter_mut().enumerate() {
-                *slot = lhs[lhs_row_base + inner]
-                    * rhs[rhs_start + inner * n + col];
+                *slot = lhs[lhs_row_base + inner] * rhs[rhs_start + inner * n + col];
             }
             out[out_row_base + col] = pairwise_sum_f32(&scratch);
         }
@@ -5400,8 +5383,7 @@ pub fn bmm_tensor_contiguous_f32(
         for row in 0..m {
             for col in 0..n {
                 for (inner, slot) in scratch.iter_mut().enumerate() {
-                    *slot = lhs[lhs_base + row * k + inner]
-                        * rhs[rhs_base + inner * n + col];
+                    *slot = lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
                 }
                 out[out_base + row * n + col] = pairwise_sum_f32(&scratch);
             }
@@ -5504,8 +5486,7 @@ pub fn var_dim_tensor_contiguous_f32(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             let mean = pairwise_sum_f32(&scratch) / n_div;
             let var_sum = pairwise_sum_map_f32(&scratch, |x| {
@@ -5684,10 +5665,7 @@ pub fn softmax_dim_tensor_contiguous_f32(
             let start = outer * reduce_size;
             let end = start + reduce_size;
             let in_slice = &data[start..end];
-            let max_val = in_slice
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max_val = in_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             for (out, &x) in output[start..end].iter_mut().zip(in_slice.iter()) {
                 *out = (x - max_val).exp();
             }
@@ -5703,8 +5681,7 @@ pub fn softmax_dim_tensor_contiguous_f32(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             let max_val = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             for v in scratch.iter_mut() {
@@ -5712,8 +5689,7 @@ pub fn softmax_dim_tensor_contiguous_f32(
             }
             let sum = pairwise_sum_f32(&scratch);
             for (r, &exp_x) in scratch.iter().enumerate() {
-                output[outer * reduce_size * inner_size + r * inner_size + inner] =
-                    exp_x / sum;
+                output[outer * reduce_size * inner_size + r * inner_size + inner] = exp_x / sum;
             }
         }
     }
@@ -5747,10 +5723,7 @@ pub fn log_softmax_dim_tensor_contiguous_f32(
             let start = outer * reduce_size;
             let end = start + reduce_size;
             let in_slice = &data[start..end];
-            let max_val = in_slice
-                .iter()
-                .copied()
-                .fold(f32::NEG_INFINITY, f32::max);
+            let max_val = in_slice.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let sum_exp = pairwise_sum_map_f32(in_slice, |x| (x - max_val).exp());
             let log_sum_exp = max_val + sum_exp.ln();
             for (out, &x) in output[start..end].iter_mut().zip(in_slice.iter()) {
@@ -5764,15 +5737,13 @@ pub fn log_softmax_dim_tensor_contiguous_f32(
     for outer in 0..outer_size {
         for inner in 0..inner_size {
             for r in 0..reduce_size {
-                scratch[r] =
-                    data[outer * reduce_size * inner_size + r * inner_size + inner];
+                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
             let max_val = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
             let sum_exp = pairwise_sum_map_f32(&scratch, |x| (x - max_val).exp());
             let log_sum_exp = max_val + sum_exp.ln();
             for (r, &x) in scratch.iter().enumerate() {
-                output[outer * reduce_size * inner_size + r * inner_size + inner] =
-                    x - log_sum_exp;
+                output[outer * reduce_size * inner_size + r * inner_size + inner] = x - log_sum_exp;
             }
         }
     }
@@ -6904,8 +6875,7 @@ pub fn addmm_tensor_contiguous_f32(
     for row in 0..m {
         for col in 0..n {
             for (inner, slot) in scratch.iter_mut().enumerate() {
-                *slot = mat1[mat1_start + row * k + inner]
-                    * mat2[mat2_start + inner * n + col];
+                *slot = mat1[mat1_start + row * k + inner] * mat2[mat2_start + inner * n + col];
             }
             let acc = pairwise_sum_f32(&scratch);
             let bias_idx = if input_1d {
@@ -6969,8 +6939,7 @@ pub fn addmv_tensor_contiguous_f32(
     let mut scratch = vec![0.0f32; k];
     for (row, slot) in out.iter_mut().enumerate() {
         for (col, scratch_slot) in scratch.iter_mut().enumerate() {
-            *scratch_slot = mat[mat_start + row * k + col]
-                * vec_data[vec_start + col];
+            *scratch_slot = mat[mat_start + row * k + col] * vec_data[vec_start + col];
         }
         let acc = pairwise_sum_f32(&scratch);
         *slot = beta * input[input_start + row] + alpha * acc;
@@ -7457,9 +7426,8 @@ mod tests {
         bmm_tensor_contiguous_f64, cat_tensor_contiguous_f64, ceil_scalar,
         ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar,
         cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64, div_scalar,
-        div_tensor_contiguous_f64, dot_tensor_contiguous_f64, eq_scalar,
-        eq_tensor_contiguous_f64, exp_scalar,
-        exp_tensor_contiguous_f64, expand_tensor_contiguous_f64, expm1_scalar,
+        div_tensor_contiguous_f64, dot_tensor_contiguous_f64, eq_scalar, eq_tensor_contiguous_f64,
+        exp_scalar, exp_tensor_contiguous_f64, expand_tensor_contiguous_f64, expm1_scalar,
         expm1_tensor_contiguous_f64, floor_scalar, floor_tensor_contiguous_f64,
         gather_tensor_contiguous_f64, ge_scalar, ge_tensor_contiguous_f64, gelu_scalar,
         gelu_tensor_contiguous_f64, gt_scalar, gt_tensor_contiguous_f64,
@@ -7471,10 +7439,9 @@ mod tests {
         max_dim_tensor_contiguous_f64, max_scalar, max_tensor_contiguous_f64,
         mean_dim_tensor_contiguous_f64, mean_tensor_contiguous_f64, min_dim_tensor_contiguous_f64,
         min_scalar, min_tensor_contiguous_f64, mul_scalar, mul_tensor_contiguous_f64,
-        norm_tensor_contiguous_f64,
         narrow_tensor_contiguous_f64, ne_scalar, ne_tensor_contiguous_f64, neg_scalar,
-        neg_tensor_contiguous_f64, outer_tensor_contiguous_f64, pow_scalar,
-        pow_tensor_contiguous_f64, prod_dim_tensor_contiguous_f64, reciprocal_scalar,
+        neg_tensor_contiguous_f64, norm_tensor_contiguous_f64, outer_tensor_contiguous_f64,
+        pow_scalar, pow_tensor_contiguous_f64, prod_dim_tensor_contiguous_f64, reciprocal_scalar,
         reciprocal_tensor_contiguous_f64, relu_scalar, relu_tensor_contiguous_f64,
         scatter_tensor_contiguous_f32, scatter_tensor_contiguous_f64, sigmoid_scalar,
         sigmoid_tensor_contiguous_f64, sign_scalar, sign_tensor_contiguous_f64, silu_scalar,
@@ -7872,7 +7839,9 @@ mod tests {
         // agree with the naive sum for a small simple input where
         // accumulation order does not matter.
         for n in [127usize, 128, 129, 200, 256, 257, 512, 1000] {
-            let input: Vec<f64> = (0..n).map(|i| f64::from(u32::try_from(i).unwrap())).collect();
+            let input: Vec<f64> = (0..n)
+                .map(|i| f64::from(u32::try_from(i).unwrap()))
+                .collect();
             let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
             let got = sum_tensor_contiguous_f64(&input, &meta).expect("sum should succeed");
             #[allow(clippy::cast_precision_loss)]
@@ -7905,12 +7874,9 @@ mod tests {
         let input = vec![value; n];
         let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
 
-        let l1 =
-            norm_tensor_contiguous_f64(&input, &meta, 1.0).expect("l1 norm should succeed");
-        let l2 =
-            norm_tensor_contiguous_f64(&input, &meta, 2.0).expect("l2 norm should succeed");
-        let l3 =
-            norm_tensor_contiguous_f64(&input, &meta, 3.0).expect("l3 norm should succeed");
+        let l1 = norm_tensor_contiguous_f64(&input, &meta, 1.0).expect("l1 norm should succeed");
+        let l2 = norm_tensor_contiguous_f64(&input, &meta, 2.0).expect("l2 norm should succeed");
+        let l3 = norm_tensor_contiguous_f64(&input, &meta, 3.0).expect("l3 norm should succeed");
 
         // L1 = sum(|x|) = N · 0.1 = 104857.6 exactly.
         let l1_truth = (n as f64) * value;
@@ -7958,8 +7924,7 @@ mod tests {
             .map(|k| f64::from(u32::try_from(k).unwrap()))
             .collect();
         let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
-        let var = var_dim_tensor_contiguous_f64(&input, &meta, 0)
-            .expect("var_dim should succeed");
+        let var = var_dim_tensor_contiguous_f64(&input, &meta, 0).expect("var_dim should succeed");
         assert_eq!(var.len(), 1);
 
         #[allow(clippy::cast_precision_loss)]
@@ -8000,8 +7965,7 @@ mod tests {
             }
         }
         let meta = TensorMeta::from_shape(vec![b, d], DType::F64, Device::Cpu);
-        let out = sum_dim_tensor_contiguous_f64(&input, &meta, 1)
-            .expect("sum_dim should succeed");
+        let out = sum_dim_tensor_contiguous_f64(&input, &meta, 1).expect("sum_dim should succeed");
         assert_eq!(out.len(), b);
         for (k, &row_sum) in out.iter().enumerate() {
             #[allow(clippy::cast_precision_loss)]
@@ -8032,8 +7996,7 @@ mod tests {
             input.push(0.2);
         }
         let meta = TensorMeta::from_shape(vec![d, b], DType::F64, Device::Cpu);
-        let out = sum_dim_tensor_contiguous_f64(&input, &meta, 0)
-            .expect("sum_dim should succeed");
+        let out = sum_dim_tensor_contiguous_f64(&input, &meta, 0).expect("sum_dim should succeed");
         assert_eq!(out.len(), b);
         #[allow(clippy::cast_precision_loss)]
         let truth_col0 = (d as f64) * 0.1;
