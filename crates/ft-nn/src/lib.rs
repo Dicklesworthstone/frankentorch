@@ -7,10 +7,14 @@ use ft_autograd::{AutogradError, FunctionCtx, TensorNodeId};
 use ft_core::{DType, DenseTensor, DenseTensorError};
 use ft_dispatch::{DispatchError, DispatchKeyError};
 
-fn overflow_error(reason: &'static str) -> AutogradError {
+fn incompatible_error(reason: &'static str) -> AutogradError {
     AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
         reason,
     }))
+}
+
+fn overflow_error(reason: &'static str) -> AutogradError {
+    incompatible_error(reason)
 }
 
 fn checked_mul(a: usize, b: usize, reason: &'static str) -> Result<usize, AutogradError> {
@@ -1169,6 +1173,18 @@ impl Module for Unfold {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.kernel_h == 0
+            || self.kernel_w == 0
+            || self.dilation_h == 0
+            || self.dilation_w == 0
+            || self.stride_h == 0
+            || self.stride_w == 0
+        {
+            return Err(incompatible_error(
+                "unfold: kernel_size, dilation, and stride dimensions must be greater than zero",
+            ));
+        }
+
         // Compose Unfold through autograd primitives so the backward
         // pass actually flows through the input. The previous
         // implementation read tensor_values, computed the gather in
@@ -1349,6 +1365,18 @@ impl Module for Fold {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.kernel_h == 0
+            || self.kernel_w == 0
+            || self.dilation_h == 0
+            || self.dilation_w == 0
+            || self.stride_h == 0
+            || self.stride_w == 0
+        {
+            return Err(incompatible_error(
+                "fold: kernel_size, dilation, and stride dimensions must be greater than zero",
+            ));
+        }
+
         let shape = session.tensor_shape(input)?;
         if shape.len() != 3 {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -5174,6 +5202,12 @@ impl Module for AvgPool2d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.kernel_h == 0 || self.kernel_w == 0 || self.stride_h == 0 || self.stride_w == 0 {
+            return Err(incompatible_error(
+                "AvgPool2d kernel_size and stride dimensions must be greater than zero",
+            ));
+        }
+
         let input_shape = {
             let (_, meta) = session.tensor_values_meta(input)?;
             meta.shape().to_vec()
@@ -17698,6 +17732,54 @@ mod tests {
     }
 
     #[test]
+    fn unfold_rejects_zero_kernel_stride_and_dilation() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+
+        assert!(Unfold::new((0, 2)).forward(&mut session, input).is_err());
+        assert!(
+            Unfold::new((2, 2))
+                .stride((0, 1))
+                .forward(&mut session, input)
+                .is_err()
+        );
+        assert!(
+            Unfold::new((2, 2))
+                .dilation((0, 1))
+                .forward(&mut session, input)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn fold_rejects_zero_kernel_stride_and_dilation() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4, 1], false)
+            .unwrap();
+
+        assert!(
+            Fold::new((2, 2), (0, 2))
+                .forward(&mut session, input)
+                .is_err()
+        );
+        assert!(
+            Fold::new((2, 2), (2, 2))
+                .stride((0, 1))
+                .forward(&mut session, input)
+                .is_err()
+        );
+        assert!(
+            Fold::new((2, 2), (2, 2))
+                .dilation((0, 1))
+                .forward(&mut session, input)
+                .is_err()
+        );
+    }
+
+    #[test]
     fn unfold_propagates_gradients() {
         // Regression test: Unfold used to read tensor_values and
         // rebuild a fresh leaf with requires_grad=false, severing the
@@ -21594,6 +21676,17 @@ mod tests {
         assert!((vals[2] - 11.5).abs() < 1e-10);
         // bottom-right: mean(11,12,15,16) = 13.5
         assert!((vals[3] - 13.5).abs() < 1e-10);
+    }
+
+    #[test]
+    fn avgpool2d_rejects_zero_kernel_without_panicking() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let pool = AvgPool2d::new((0, 2), (0, 2), (0, 0), false, true);
+
+        assert!(pool.forward(&mut session, input).is_err());
     }
 
     #[test]
