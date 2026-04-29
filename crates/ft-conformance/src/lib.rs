@@ -15684,26 +15684,22 @@ print(json.dumps(out))
         // The p values to sweep. Note: numpy.linalg.norm accepts these
         // as `ord` (with `np.inf` / `-np.inf`); FrankenTorch accepts
         // `f64` with `f64::INFINITY` / `f64::NEG_INFINITY`.
-        let p_values: Vec<f64> = vec![
-            f64::INFINITY,
-            f64::NEG_INFINITY,
-            0.0,
-            0.5,
-            1.0,
-            2.0,
-            3.0,
-        ];
+        let p_values: Vec<f64> = vec![f64::INFINITY, f64::NEG_INFINITY, 0.0, 0.5, 1.0, 2.0, 3.0];
 
         // ULP tolerance per p branch. The exact branches (inf, -inf,
         // 0) are integer-valued or trivially derived from comparisons,
-        // so they should match bit-exactly. The summed branches (1, 2)
-        // accumulate pairwise rounding. The generic branch chains
-        // pow() twice over a sum.
+        // so they should match bit-exactly. The summed L1 branch
+        // accumulates pairwise rounding. L2 performs a summed square
+        // reduction plus a sqrt, and NumPy's BLAS/libm route can drift
+        // just past 16 ULPs on long rows, so it gets a small extra
+        // cushion. The generic branch chains pow() twice over a sum.
         let ulp_tolerance = |p: f64| -> u64 {
             if p.is_infinite() || p == 0.0 {
                 0
-            } else if p == 1.0 || p == 2.0 {
+            } else if p == 1.0 {
                 16
+            } else if p == 2.0 {
+                32
             } else {
                 64
             }
@@ -15759,15 +15755,9 @@ for case in req["cases"]:
 print(json.dumps({"results": out}))
 "#;
 
-        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
-            Ok(value) => value,
-            Err(error) => {
-                eprintln!(
-                    "torch_vector_norm_numpy_subprocess_conformance: oracle invocation failed ({error}); skipping"
-                );
-                return;
-            }
-        };
+        let response = super::run_legacy_oracle_script(&config, script, &payload).expect(
+            "torch_vector_norm_numpy_subprocess_conformance: oracle invocation must succeed after python3/numpy availability check",
+        );
 
         let results = response
             .get("results")
