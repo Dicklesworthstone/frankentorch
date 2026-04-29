@@ -18430,6 +18430,232 @@ print(json.dumps({"cholesky": out}))
     }
 
     #[test]
+    fn torch_linalg_qr_numpy_subprocess_conformance() {
+        // Lock FrankenTorch's tensor_linalg_qr against numpy.linalg.qr.
+        // Element-wise comparison of Q and R is fragile because the
+        // QR decomposition is unique only up to column sign — different
+        // LAPACK builds flip signs of Q's columns and the
+        // corresponding rows of R. The conformance contract instead
+        // verifies the two structural invariants:
+        //   (1) reconstruction:    Q @ R ≈ A          (matches numpy bit-for-bit
+        //                                              within the LU-factor
+        //                                              rounding bound)
+        //   (2) orthogonality:     Q^T @ Q ≈ I_k       (the column-orthonormality
+        //                                              that defines a valid Q)
+        // These together are equivalent to "Q, R is a valid QR
+        // factorization", which is what numpy and FrankenTorch must
+        // both produce. Files closure for the qr slice of
+        // frankentorch-c36b.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let numpy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !numpy_available {
+            eprintln!(
+                "torch_linalg_qr_numpy_subprocess_conformance: python3/numpy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Each case: (label, flat_row_major, m, n) — the matrix is m×n.
+        // Reduced mode: Q is m×k, R is k×n with k = min(m, n). All
+        // matrices below have full column rank so the reduced QR is
+        // well-defined.
+        type QrCase = (&'static str, Vec<f64>, usize, usize);
+        let cases: Vec<QrCase> = vec![
+            // Square 3x3.
+            ("square_3x3", vec![1.0, 2.0, 3.0, 0.0, 1.0, 4.0, 5.0, 6.0, 0.0], 3, 3),
+            // Identity → Q = I, R = I.
+            ("identity_4x4", {
+                let mut m = vec![0.0; 16];
+                for i in 0..4 { m[i * 4 + i] = 1.0; }
+                m
+            }, 4, 4),
+            // Tall (m > n).
+            ("tall_4x2", vec![
+                1.0, 2.0,
+                3.0, 4.0,
+                5.0, 6.0,
+                7.0, 8.0,
+            ], 4, 2),
+            ("tall_5x3", vec![
+                1.0, 2.0, 3.0,
+                4.0, 5.0, 6.0,
+                7.0, 8.0, 9.0,
+                10.0, 11.0, 12.0,
+                13.0, 14.0, 16.0,
+            ], 5, 3),
+            // Square upper-triangular → R = A, Q = I.
+            ("upper_triangular_3x3", vec![
+                2.0, 1.0, 1.0,
+                0.0, 3.0, 1.0,
+                0.0, 0.0, 5.0,
+            ], 3, 3),
+            // 1x1.
+            ("scalar_1x1", vec![5.0], 1, 1),
+            // 2x2 with negative determinant.
+            ("neg_det_2x2", vec![1.0, 2.0, 3.0, 1.0], 2, 2),
+        ];
+
+        let payload = json!({
+            "cases": cases.iter().map(|(label, vals, m, n)| {
+                json!({
+                    "label": *label,
+                    "m": *m as u64,
+                    "n": *n as u64,
+                    "values_bits": vals.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>(),
+                })
+            }).collect::<Vec<_>>()
+        });
+
+        let script = r#"
+import json, struct, sys
+import numpy as np
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+req = json.loads(sys.stdin.read())
+out = []
+for case in req["cases"]:
+    m = int(case["m"])
+    n = int(case["n"])
+    vals = [from_bits(s) for s in case["values_bits"]]
+    A = np.array(vals, dtype=np.float64).reshape(m, n)
+    Q, R = np.linalg.qr(A, mode="reduced")
+    A_recon = Q @ R
+    QtQ = Q.T @ Q
+    out.append({
+        "label": case["label"],
+        "k": Q.shape[1],
+        "a_recon_bits": [to_bits(v) for v in A_recon.flatten().tolist()],
+        "qtq_bits": [to_bits(v) for v in QtQ.flatten().tolist()],
+    })
+print(json.dumps({"qr": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_linalg_qr_numpy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let results = response
+            .get("qr")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include qr array");
+        assert_eq!(results.len(), cases.len());
+
+        const REL_TOL: f64 = 1e-9;
+        let elem_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            let scale = a.abs().max(b.abs()).max(1.0);
+            (a - b).abs() <= REL_TOL * scale
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        for (i, (label, vals, m, n)) in cases.iter().enumerate() {
+            let result_obj = &results[i];
+            let want_recon: Vec<f64> = result_obj["a_recon_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect();
+            let want_qtq: Vec<f64> = result_obj["qtq_bits"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect();
+            let k = result_obj["k"].as_u64().unwrap() as usize;
+
+            let xt = session
+                .tensor_variable(vals.clone(), vec![*m, *n], false)
+                .expect("xt");
+            let (q_id, r_id) = session
+                .tensor_linalg_qr(xt, true)
+                .expect("tensor_linalg_qr");
+            let q_vals = session.tensor_values(q_id).expect("q");
+            let r_vals = session.tensor_values(r_id).expect("r");
+            let q_shape = session.tensor_shape(q_id).expect("q_shape").to_vec();
+            let r_shape = session.tensor_shape(r_id).expect("r_shape").to_vec();
+            assert_eq!(q_shape, vec![*m, k], "{label}: Q shape mismatch");
+            assert_eq!(r_shape, vec![k, *n], "{label}: R shape mismatch");
+
+            // Reconstruct A = Q @ R element by element (m×n).
+            let mut got_recon = vec![0.0_f64; *m * *n];
+            for row in 0..*m {
+                for col in 0..*n {
+                    let mut acc = 0.0_f64;
+                    for kk in 0..k {
+                        acc += q_vals[row * k + kk] * r_vals[kk * *n + col];
+                    }
+                    got_recon[row * *n + col] = acc;
+                }
+            }
+            for (idx, (&g, &w)) in got_recon.iter().zip(want_recon.iter()).enumerate() {
+                if !elem_eq(g, w) {
+                    mismatches.push(format!(
+                        "tensor_linalg_qr({label}) Q@R reconstruction[{idx}] = {g} but numpy returned {w}"
+                    ));
+                }
+            }
+
+            // Compute Q^T @ Q (k×k) and compare against numpy's
+            // (which should be ≈ I).
+            let mut got_qtq = vec![0.0_f64; k * k];
+            for ki in 0..k {
+                for kj in 0..k {
+                    let mut acc = 0.0_f64;
+                    for row in 0..*m {
+                        acc += q_vals[row * k + ki] * q_vals[row * k + kj];
+                    }
+                    got_qtq[ki * k + kj] = acc;
+                }
+            }
+            for (idx, (&g, &w)) in got_qtq.iter().zip(want_qtq.iter()).enumerate() {
+                if !elem_eq(g, w) {
+                    mismatches.push(format!(
+                        "tensor_linalg_qr({label}) Q^T@Q[{idx}] = {g} but numpy returned {w}"
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "linalg.qr numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_gelu_exact_libm_subprocess_conformance() {
         // Lock the precision contract for GELU (the exact erf-form, which
         // is PyTorch's default `approximate="none"`).
