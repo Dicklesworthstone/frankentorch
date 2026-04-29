@@ -1565,6 +1565,7 @@ pub fn addmm_tensor_contiguous_f64(
             rhs: vec![m, n],
         });
     }
+    ensure_storage_len(input, input_meta, "input")?;
 
     let mut out = vec![0.0; out_numel];
     // Same gather-then-pairwise pattern as `matmul_tensor_contiguous_f64`
@@ -6871,6 +6872,7 @@ pub fn addmm_tensor_contiguous_f32(
             rhs: vec![m, n],
         });
     }
+    ensure_storage_len_f32(input, input_meta, "input")?;
     let mut out = vec![0.0f32; out_numel];
     let mut scratch = vec![0.0f32; k];
     for row in 0..m {
@@ -8449,6 +8451,68 @@ mod tests {
             err,
             KernelError::ShapeOverflow {
                 context: "matmul output shape multiplication overflow"
+            }
+        ));
+    }
+
+    #[test]
+    fn addmm_tensor_contiguous_rejects_insufficient_input_storage() {
+        let input_meta =
+            TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu).with_storage_offset(1);
+        let mat1_meta = TensorMeta::from_shape(vec![1, 2], DType::F64, Device::Cpu);
+        let mat2_meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
+        let input = vec![10.0, 11.0];
+        let mat1 = vec![1.0, 2.0];
+        let mat2 = vec![3.0, 4.0, 5.0, 6.0];
+
+        let err = super::addmm_tensor_contiguous_f64(
+            &input,
+            &mat1,
+            &mat2,
+            &input_meta,
+            &mat1_meta,
+            &mat2_meta,
+            1.0,
+            1.0,
+        )
+        .expect_err("insufficient input storage must fail closed");
+        assert!(matches!(
+            err,
+            KernelError::InsufficientStorage {
+                side: "input",
+                needed: 3,
+                available: 2
+            }
+        ));
+    }
+
+    #[test]
+    fn addmm_tensor_contiguous_f32_rejects_insufficient_input_storage() {
+        let input_meta =
+            TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu).with_storage_offset(1);
+        let mat1_meta = TensorMeta::from_shape(vec![1, 2], DType::F32, Device::Cpu);
+        let mat2_meta = TensorMeta::from_shape(vec![2, 2], DType::F32, Device::Cpu);
+        let input = vec![10.0f32, 11.0];
+        let mat1 = vec![1.0f32, 2.0];
+        let mat2 = vec![3.0f32, 4.0, 5.0, 6.0];
+
+        let err = super::addmm_tensor_contiguous_f32(
+            &input,
+            &mat1,
+            &mat2,
+            &input_meta,
+            &mat1_meta,
+            &mat2_meta,
+            1.0,
+            1.0,
+        )
+        .expect_err("insufficient input storage must fail closed");
+        assert!(matches!(
+            err,
+            KernelError::InsufficientStorage {
+                side: "input",
+                needed: 3,
+                available: 2
             }
         ));
     }
