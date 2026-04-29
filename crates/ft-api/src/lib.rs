@@ -15489,15 +15489,28 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.mode(input)`.
     /// Returns `(values, indices)` as a pair of tensors.
     /// Input must have at least one dimension and a non-zero last dimension.
+    ///
+    /// The values tensor composes through `tensor_gather` so the
+    /// autograd tape carries gradients through the input — backward
+    /// scatter-adds the incoming gradient at whichever input position
+    /// holds the mode value. Previously this extracted tensor_values,
+    /// computed both arrays in plain f64, and rebuilt fresh
+    /// requires_grad=false leaves, severing the tape. Tracked under
+    /// frankentorch-1tax. (The indices output is intrinsically
+    /// non-differentiable, so it stays as a constant leaf — same
+    /// convention as torch.mode.)
+    ///
+    /// Forward also switches the per-run-length comparison from
+    /// `(a - b).abs() < f64::EPSILON` to IEEE `==`, matching the
+    /// `tensor_unique` parity fix for value-binning behaviour. Among
+    /// values that PyTorch / numpy treat as distinct (e.g. subnormals
+    /// 5e-324 vs 1e-323), the previous heuristic would fuse them
+    /// into a single run.
     pub fn tensor_mode(
         &mut self,
         input: TensorNodeId,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
-        let (vals, shape) = {
-            let (v, m) = self.tensor_values_meta(input)?;
-            (v, m.shape().to_vec())
-        };
-
+        let shape = self.tensor_shape(input)?;
         if shape.is_empty() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15505,14 +15518,7 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let last_dim =
-            *shape
-                .last()
-                .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "mode: missing last dimension",
-                    },
-                )))?;
+        let last_dim = shape[shape.len() - 1];
         if last_dim == 0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15520,14 +15526,16 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        let vals = self.tensor_values(input)?;
         let outer: usize = vals.len() / last_dim;
 
-        let mut mode_vals = Vec::with_capacity(outer);
-        let mut mode_idxs = Vec::with_capacity(outer);
-
+        // Compute the mode position in each outer slice. The position
+        // is non-differentiable (sort + count), so this stays in
+        // plain f64; the autograd composition then uses gather on
+        // these pre-computed indices to extract values from `input`.
+        let mut mode_idxs: Vec<f64> = Vec::with_capacity(outer);
         for o in 0..outer {
             let slice = &vals[o * last_dim..(o + 1) * last_dim];
-            // Sort and find the value with the longest run
             let mut sorted: Vec<(f64, usize)> = slice
                 .iter()
                 .copied()
@@ -15536,36 +15544,51 @@ impl FrankenTorchSession {
                 .collect();
             sorted.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(std::cmp::Ordering::Equal));
 
-            let mut best_val = sorted[0].0;
             let mut best_idx = sorted[0].1;
             let mut best_count = 1usize;
             let mut cur_count = 1usize;
-
             for i in 1..sorted.len() {
-                if (sorted[i].0 - sorted[i - 1].0).abs() < f64::EPSILON {
+                if sorted[i].0 == sorted[i - 1].0 {
                     cur_count += 1;
                 } else {
                     cur_count = 1;
                 }
                 if cur_count > best_count {
                     best_count = cur_count;
-                    best_val = sorted[i].0;
                     best_idx = sorted[i].1;
                 }
             }
-
-            mode_vals.push(best_val);
+            #[allow(clippy::cast_precision_loss)]
             mode_idxs.push(best_idx as f64);
         }
 
-        let out_shape = if shape.len() > 1 {
+        // Build a same-rank index tensor that selects the mode
+        // position along the last dim of `input`. tensor_gather
+        // requires the index to have the same rank as the input
+        // with size 1 along the gathered dim and matching sizes
+        // elsewhere.
+        let mut index_shape: Vec<usize> = shape[..shape.len() - 1].to_vec();
+        index_shape.push(1);
+        let dim = shape.len() - 1;
+        let index_node = self
+            .tensor_tape
+            .leaf(mode_idxs.clone(), index_shape, false)?;
+        let gathered = self.tensor_gather(input, dim, index_node)?;
+
+        // Output shape: rank-1 input keeps shape [1] (matching the
+        // pre-fix contract); rank >= 2 squeezes the last dim away.
+        let vals_out = if shape.len() > 1 {
+            self.tensor_squeeze(gathered, dim)?
+        } else {
+            gathered
+        };
+
+        let idxs_shape = if shape.len() > 1 {
             shape[..shape.len() - 1].to_vec()
         } else {
             vec![1]
         };
-
-        let vals_out = self.tensor_tape.leaf(mode_vals, out_shape.clone(), false)?;
-        let idxs_out = self.tensor_tape.leaf(mode_idxs, out_shape, false)?;
+        let idxs_out = self.tensor_tape.leaf(mode_idxs, idxs_shape, false)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!(
@@ -33081,6 +33104,54 @@ mod tests {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s.tensor_variable(Vec::new(), vec![2, 0], false).unwrap();
         assert!(s.tensor_mode(x).is_err());
+    }
+
+    #[test]
+    fn mode_propagates_gradient_to_winning_position() {
+        // Regression test for frankentorch-1tax: tensor_mode used to
+        // extract values and rebuild a fresh requires_grad=false
+        // leaf, severing the tape. After the gather composition fix,
+        // backward through the values output scatter-adds the
+        // incoming gradient at whichever input position holds the
+        // mode value (the indices output is intrinsically non-
+        // differentiable).
+        //
+        // For input [1.0, 2.0, 2.0, 3.0]:
+        //   mode = 2.0, located at sorted-position 1 in the existing
+        //   tie-break logic (first index that hits max-count). After
+        //   sort stability via partial_cmp the chosen index is the
+        //   first occurrence of 2.0 in the original array, which is
+        //   position 1.
+        // Sum loss over the (1,)-shaped output → grad at the mode
+        // position is 1.0; everywhere else 0.0.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 2.0, 3.0], vec![4], true)
+            .unwrap();
+        let (vals, _idxs) = s.tensor_mode(x).unwrap();
+        let loss = s.tensor_sum(vals).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("mode must propagate gradient through the input via gather");
+        // Exactly one position gets the gradient (the chosen mode
+        // position). The other positions are 0 because gather only
+        // routes back to the indexed slot.
+        let nonzero: Vec<(usize, f64)> = grad
+            .iter()
+            .enumerate()
+            .filter(|&(_, &g)| g != 0.0)
+            .map(|(i, &g)| (i, g))
+            .collect();
+        assert_eq!(nonzero.len(), 1, "exactly one nonzero grad position; got {nonzero:?}");
+        let (i, g) = nonzero[0];
+        assert_eq!(g, 1.0, "the chosen mode position should receive gradient 1.0");
+        // Confirm the chosen position holds value 2.0 (the actual mode).
+        let xs = [1.0, 2.0, 2.0, 3.0];
+        assert_eq!(
+            xs[i], 2.0,
+            "gradient should land on a position holding the mode value"
+        );
     }
 
     // ── quantile tests ──────────────────────────────────────────────────
