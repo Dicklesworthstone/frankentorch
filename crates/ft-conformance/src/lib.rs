@@ -14377,6 +14377,217 @@ print(json.dumps({"lgamma": out}))
     }
 
     #[test]
+    fn torch_erfinv_scipy_subprocess_conformance() {
+        // Lock the inverse error function precision contract.
+        //
+        // The previous implementation used Winitzki's a=0.147
+        // approximation alone (max abs error ~1.3e-3 — single
+        // precision territory). The current implementation uses
+        // Winitzki as a 1e-3-accurate initial guess and refines via
+        // two Newton-Raphson iterations on `libm::erf`, landing
+        // within ~1e-12 of scipy.special.erfinv (which itself uses
+        // Boost-style rational approximations and is the precise
+        // upstream reference for torch.erfinv).
+        //
+        // Companion to the erf/erfc/lgamma/atan2/pow/expm1+log1p
+        // subprocess conformance harnesses. Tolerance bumped to a
+        // (16-ULP OR 5e-13 absolute, whichever is greater) bound
+        // because:
+        //   * libm has no erfinv — we synthesise it from libm::erf
+        //     via Newton-Raphson, so the precision floor is set by
+        //     erf's ~1 ULP error doubled-up through the NR step.
+        //   * scipy uses a different approximation (Boost rational)
+        //     that can disagree with our NR-on-libm-erf result by a
+        //     handful of ULPs across the entire f64 domain.
+        // 5e-13 absolute keeps the test useful at extreme |x| (where
+        // erfinv goes to ±inf and ULP comparisons stop being
+        // meaningful) while still catching multi-ULP regressions in
+        // the smooth interior.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let scipy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import scipy.special, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !scipy_available {
+            eprintln!(
+                "torch_erfinv_scipy_subprocess_conformance: python3/scipy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // erfinv is defined on (-1, 1) with poles at the boundary.
+        // Cover the smooth interior, the tails near ±1, exact
+        // boundaries, and ±0 for the sign-of-zero path. We also
+        // include a few NaN-domain inputs (|x|>1) to lock the
+        // out-of-domain semantics.
+        let inputs: Vec<f64> = vec![
+            // Trivial / boundary.
+            0.0,
+            -0.0,
+            1.0,
+            -1.0,
+            // Smooth interior — near the origin.
+            0.1,
+            -0.1,
+            0.25,
+            -0.25,
+            0.5,
+            -0.5,
+            0.75,
+            -0.75,
+            0.9,
+            -0.9,
+            // Sweep across the full domain.
+            0.01,
+            -0.01,
+            0.05,
+            -0.05,
+            0.15,
+            -0.15,
+            0.2,
+            -0.2,
+            0.3,
+            -0.3,
+            0.4,
+            -0.4,
+            0.6,
+            -0.6,
+            0.7,
+            -0.7,
+            0.8,
+            -0.8,
+            0.85,
+            -0.85,
+            0.95,
+            -0.95,
+            // Tails — erfinv grows like sqrt(-ln(1-|x|)) here.
+            0.99,
+            -0.99,
+            0.999,
+            -0.999,
+            0.999_999,
+            -0.999_999,
+            // Out-of-domain: |x| > 1 must yield NaN (or ±inf at the
+            // exact boundary, which we already cover above).
+            1.000_000_000_001,
+            -1.000_000_000_001,
+            // Transcendental constants in-range.
+            std::f64::consts::FRAC_1_PI,
+            -std::f64::consts::FRAC_1_PI,
+            std::f64::consts::FRAC_2_PI,
+            std::f64::consts::FRAC_1_SQRT_2,
+            // NaN propagation.
+            f64::NAN,
+        ];
+        assert!(
+            inputs.len() >= 50,
+            "erfinv conformance matrix must have at least 50 inputs, got {}",
+            inputs.len()
+        );
+
+        let input_bits: Vec<String> = inputs.iter().map(|v| v.to_bits().to_string()).collect();
+        let payload = json!({ "inputs": input_bits });
+
+        // Python oracle: scipy.special.erfinv (Boost-style precision).
+        // For inputs outside [-1, 1] scipy returns NaN; for ±1 it
+        // returns ±inf — both match the FrankenTorch contract.
+        let script = r#"
+import json, struct, sys
+import scipy.special as sp
+
+req = json.loads(sys.stdin.read())
+out = []
+for x_bits_s in req["inputs"]:
+    x = struct.unpack("<d", struct.pack("<Q", int(x_bits_s)))[0]
+    r = float(sp.erfinv(x))
+    out.append(str(struct.unpack("<Q", struct.pack("<d", r))[0]))
+print(json.dumps({"erfinv": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_erfinv_scipy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let oracle_results = response
+            .get("erfinv")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include erfinv array");
+        assert_eq!(oracle_results.len(), inputs.len());
+
+        // Mixed tolerance: 16 ULPs OR 5e-13 absolute, whichever is
+        // looser. ULP comparison degrades for very large magnitudes
+        // (the tails near ±1 push erfinv into the multi-magnitude
+        // range) so absolute tolerance picks up the slack there.
+        const MAX_ULPS: u64 = 16;
+        const ABS_TOL: f64 = 5e-13;
+        let approx_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            if a.is_infinite() || b.is_infinite() || a.is_nan() || b.is_nan() {
+                return false;
+            }
+            // Absolute tolerance check first — handles any magnitude.
+            if (a - b).abs() <= ABS_TOL {
+                return true;
+            }
+            if a.is_sign_negative() != b.is_sign_negative() {
+                return false;
+            }
+            a.to_bits().abs_diff(b.to_bits()) <= MAX_ULPS
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        // tensor_erfinv is the public surface. There's no scalar API
+        // erfinv in ft-api as of this commit.
+        let xt = session
+            .tensor_variable(inputs.clone(), vec![inputs.len()], false)
+            .expect("xt");
+        let yt = session.tensor_erfinv(xt).expect("tensor_erfinv");
+        let yv = session.tensor_values(yt).expect("erfinv vals");
+
+        for (i, x) in inputs.iter().enumerate() {
+            let oracle =
+                f64::from_bits(oracle_results[i].as_str().unwrap().parse::<u64>().unwrap());
+            if !approx_eq(yv[i], oracle) {
+                mismatches.push(format!(
+                    "tensor_erfinv({x:?})[{i}] = {:?} (bits 0x{:016x}) but scipy returned {oracle:?} (bits 0x{:016x}) — > {MAX_ULPS} ULPs and > {ABS_TOL:e} absolute apart",
+                    yv[i],
+                    yv[i].to_bits(),
+                    oracle.to_bits()
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "erfinv scipy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_fmod_remainder_sign_matrix_conformance() {
         // Lock down the full sign matrix for fmod (truncating, sign of
         // dividend) vs remainder (flooring, sign of divisor) — these
