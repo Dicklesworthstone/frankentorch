@@ -12582,6 +12582,41 @@ impl FrankenTorchSession {
         a: TensorNodeId,
         b: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        let (a_vals, a_meta) = {
+            let t = self.tensor_tape.tensor(a)?;
+            (t.storage()?.to_vec(), t.meta().clone())
+        };
+        let (b_vals, b_shape) = {
+            let t = self.tensor_tape.tensor(b)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        if a_meta.shape() != b_shape.as_slice() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "logaddexp: inputs must have the same shape",
+                },
+            )));
+        }
+        if a_vals
+            .iter()
+            .chain(b_vals.iter())
+            .any(|value| !value.is_finite())
+        {
+            let values = a_vals
+                .iter()
+                .zip(b_vals.iter())
+                .map(|(&ai, &bi)| Self::stable_logaddexp_value(ai, bi))
+                .collect::<Vec<_>>();
+            let out = self
+                .tensor_tape
+                .leaf(values, a_meta.shape().to_vec(), false)?;
+            self.runtime.ledger_mut().record(
+                EvidenceKind::Dispatch,
+                format!("logaddexp a={} b={} out={} nonfinite=true", a.0, b.0, out.0),
+            );
+            return Ok(out);
+        }
+
         // max(a, b) + log(exp(a - max(a,b)) + exp(b - max(a,b)))
         // = max(a,b) + log1p(exp(-|a - b|))
         let m = self.tensor_max(a, b)?;
@@ -12610,15 +12645,15 @@ impl FrankenTorchSession {
             let t = self.tensor_tape.tensor(a)?;
             (t.storage()?.to_vec(), t.meta().clone())
         };
-        let b_vals = {
+        let (b_vals, b_shape) = {
             let t = self.tensor_tape.tensor(b)?;
-            t.storage()?.to_vec()
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
         };
 
-        if a_vals.len() != b_vals.len() {
+        if a_meta.shape() != b_shape.as_slice() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "logaddexp2: inputs must have the same number of elements",
+                    reason: "logaddexp2: inputs must have the same shape",
                 },
             )));
         }
@@ -12626,10 +12661,7 @@ impl FrankenTorchSession {
         let values: Vec<f64> = a_vals
             .iter()
             .zip(b_vals.iter())
-            .map(|(&ai, &bi)| {
-                let m = ai.max(bi);
-                m + (2.0_f64.powf(ai - m) + 2.0_f64.powf(bi - m)).log2()
-            })
+            .map(|(&ai, &bi)| Self::stable_logaddexp2_value(ai, bi))
             .collect();
 
         let out = self
@@ -12640,6 +12672,28 @@ impl FrankenTorchSession {
             format!("logaddexp2 a={} b={} out={}", a.0, b.0, out.0),
         );
         Ok(out)
+    }
+
+    fn stable_logaddexp_value(a: f64, b: f64) -> f64 {
+        if a.is_nan() || b.is_nan() {
+            return f64::NAN;
+        }
+        let m = a.max(b);
+        if m.is_infinite() {
+            return m;
+        }
+        m + ((a - m).exp() + (b - m).exp()).ln()
+    }
+
+    fn stable_logaddexp2_value(a: f64, b: f64) -> f64 {
+        if a.is_nan() || b.is_nan() {
+            return f64::NAN;
+        }
+        let m = a.max(b);
+        if m.is_infinite() {
+            return m;
+        }
+        m + (2.0_f64.powf(a - m) + 2.0_f64.powf(b - m)).log2()
     }
 
     // ── xlogy ───────────────────────────────────────────────────────────

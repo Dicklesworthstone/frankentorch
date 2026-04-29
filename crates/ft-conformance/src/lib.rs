@@ -13141,6 +13141,449 @@ print(json.dumps({"results": out}))
     }
 
     #[test]
+    fn torch_pow_ieee754_subprocess_conformance() {
+        // Subprocess diff test for pow: FrankenTorch's `pow(x, exponent)`
+        // (which calls Rust's `f64::powf`, which calls platform libm
+        // `pow`) must match Python's `math.pow` (also libm `pow`)
+        // bit-for-bit on every IEEE 754 / C99 edge case the spec calls
+        // out. PyTorch's `torch.pow(scalar, exp)` wraps the same libm
+        // `pow`, so this oracle doubles as the upstream PyTorch parity
+        // check.
+        //
+        // Companion to `torch_atan2_ieee754_subprocess_conformance`: same
+        // pattern, different op family (binary float -> float with very
+        // different NaN/zero/inf semantics from atan2).
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let python_available = Command::new("python3")
+            .arg("-c")
+            .arg("import math, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !python_available {
+            eprintln!("torch_pow_ieee754_subprocess_conformance: python3 not available, skipping");
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Boundary matrix — every distinct IEEE 754 / C99 pow case the
+        // spec calls out, plus interior smoothness checks.
+        //
+        // Spec contract (C99 7.12.7.4 / IEEE 754-2008):
+        //   pow(x,    ±0  ) = 1            for ANY x  (including NaN)
+        //   pow(±1,   ±inf) = 1
+        //   pow(0,    y > 0) = +0
+        //   pow(0,    y < 0) = +inf  (or DBZ)
+        //   pow(-0,   y < 0 odd int)  = -inf
+        //   pow(-0,   y > 0 odd int)  = -0
+        //   pow(0,    +inf) = +0
+        //   pow(0,    -inf) = +inf
+        //   pow(+inf, y > 0) = +inf
+        //   pow(+inf, y < 0) = +0
+        //   pow(-inf, y odd int positive) = -inf
+        //   pow(x, NaN) = NaN  (except pow(1, NaN) = 1 and pow(_, ±0) = 1)
+        //   pow(NaN, y) = NaN  (except pow(NaN, ±0) = 1)
+        //   pow(x < 0, non-integer y) = NaN
+        let pairs: Vec<(f64, f64)> = vec![
+            // pow(x, 0) = 1 for any x.
+            (2.0, 0.0),
+            (-2.0, 0.0),
+            (0.0, 0.0),
+            (-0.0, 0.0),
+            (f64::INFINITY, 0.0),
+            (f64::NEG_INFINITY, 0.0),
+            (f64::NAN, 0.0),
+            (1.0, 0.0),
+            // pow(x, -0) = 1 for any x.
+            (2.0, -0.0),
+            (-2.0, -0.0),
+            (f64::NAN, -0.0),
+            // pow(±1, ±inf) = 1.
+            (1.0, f64::INFINITY),
+            (1.0, f64::NEG_INFINITY),
+            (-1.0, f64::INFINITY),
+            (-1.0, f64::NEG_INFINITY),
+            // pow(1, NaN) = 1.
+            (1.0, f64::NAN),
+            // pow(0, positive) = +0; pow(0, negative) = +inf.
+            (0.0, 1.0),
+            (0.0, 0.5),
+            (0.0, -1.0),
+            (0.0, -0.5),
+            (0.0, f64::INFINITY),
+            (0.0, f64::NEG_INFINITY),
+            // pow(-0, integer odd negative) = -inf, integer odd positive = -0.
+            (-0.0, 3.0),
+            (-0.0, -3.0),
+            (-0.0, 2.0),
+            (-0.0, -2.0),
+            (-0.0, 0.5),
+            // pow(+inf, ±) = +inf or +0.
+            (f64::INFINITY, 1.0),
+            (f64::INFINITY, -1.0),
+            (f64::INFINITY, 0.5),
+            (f64::INFINITY, -0.5),
+            (f64::INFINITY, f64::INFINITY),
+            (f64::INFINITY, f64::NEG_INFINITY),
+            // pow(-inf, integer / non-integer / inf).
+            (f64::NEG_INFINITY, 3.0),
+            (f64::NEG_INFINITY, 2.0),
+            (f64::NEG_INFINITY, -3.0),
+            (f64::NEG_INFINITY, -2.0),
+            (f64::NEG_INFINITY, 0.5),
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            // pow(negative, non-integer) = NaN.
+            (-2.0, 0.5),
+            (-3.0, 1.5),
+            (-1.0, 0.5),
+            // pow(NaN, finite non-zero) = NaN.
+            (f64::NAN, 1.0),
+            (f64::NAN, -1.0),
+            (f64::NAN, 0.5),
+            (f64::NAN, f64::INFINITY),
+            (f64::NAN, f64::NAN),
+            // pow(finite, NaN) = NaN (except pow(1, NaN) above).
+            (2.0, f64::NAN),
+            (-1.0, f64::NAN),
+            (0.0, f64::NAN),
+            // pow(finite, ±inf) for |base| >1 / <1.
+            (2.0, f64::INFINITY),
+            (2.0, f64::NEG_INFINITY),
+            (0.5, f64::INFINITY),
+            (0.5, f64::NEG_INFINITY),
+            (-0.5, f64::INFINITY),
+            (-2.0, f64::INFINITY),
+            // Interior smoothness — generic positive base, integer & fractional exp.
+            (2.0, 2.0),
+            (2.0, -2.0),
+            (3.0, 0.5),
+            (10.0, -3.0),
+            (1e-10, 2.0),
+            (1e10, 0.5),
+            // Subnormal base.
+            (f64::MIN_POSITIVE, 2.0),
+            (f64::MIN_POSITIVE, 0.5),
+        ];
+        assert!(
+            pairs.len() >= 50,
+            "pow conformance matrix must have at least 50 inputs, got {}",
+            pairs.len()
+        );
+
+        let pair_bits: Vec<[String; 2]> = pairs
+            .iter()
+            .map(|(b, e)| [b.to_bits().to_string(), e.to_bits().to_string()])
+            .collect();
+        let payload = json!({ "pairs": pair_bits });
+
+        // Python oracle: bypass `math.pow` (which raises ValueError on
+        // pow(0, negative) and pow(-0, negative_int) — a Python wrapper
+        // deviation from the C99 / IEEE 754 spec where those cases
+        // return ±inf). Call the platform libm `pow` directly through
+        // ctypes — that's the same C function PyTorch's `torch.pow`
+        // wraps, so this is the precise upstream oracle.
+        let script = r#"
+import ctypes, ctypes.util, json, struct, sys
+
+libm_name = ctypes.util.find_library("m") or "libm.so.6"
+libm = ctypes.CDLL(libm_name)
+libm.pow.restype = ctypes.c_double
+libm.pow.argtypes = [ctypes.c_double, ctypes.c_double]
+
+req = json.loads(sys.stdin.read())
+out = []
+for b_bits_s, e_bits_s in req["pairs"]:
+    b = struct.unpack("<d", struct.pack("<Q", int(b_bits_s)))[0]
+    e = struct.unpack("<d", struct.pack("<Q", int(e_bits_s)))[0]
+    r = libm.pow(b, e)
+    r_bits = struct.unpack("<Q", struct.pack("<d", r))[0]
+    out.append(str(r_bits))
+print(json.dumps({"results": out}))
+"#;
+
+        let response = super::run_legacy_oracle_script(&config, script, &payload)
+            .expect("torch_pow_ieee754_subprocess_conformance: oracle invocation must succeed");
+
+        let results = response
+            .get("results")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include results array");
+        assert_eq!(
+            results.len(),
+            pairs.len(),
+            "oracle returned {} results for {} inputs",
+            results.len(),
+            pairs.len()
+        );
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // Bit-equality with NaN-payload tolerance (IEEE 754 doesn't
+        // require a unique canonical NaN encoding, and platform libm vs
+        // Rust libstd may legitimately disagree on payload).
+        let bit_eq = |a: f64, b: f64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                true
+            } else {
+                a.to_bits() == b.to_bits()
+            }
+        };
+
+        let mut mismatches = Vec::<String>::new();
+        for (i, (base, exponent)) in pairs.iter().enumerate() {
+            let oracle_bits: u64 = results[i].as_str().expect("string").parse().expect("u64");
+            let oracle = f64::from_bits(oracle_bits);
+
+            // Rust f64 path.
+            let rust_direct = base.powf(*exponent);
+            // FrankenTorchSession scalar pow.
+            let base_var = session.variable(*base, false);
+            let ft_scalar = session.pow(base_var, *exponent).expect("session.pow");
+            let ft_scalar_val = session.value(ft_scalar).expect("value");
+
+            if !bit_eq(rust_direct, oracle) {
+                mismatches.push(format!(
+                    "rust f64::powf({base:?}, {exponent:?}) = {rust_direct:?} (bits 0x{:016x}) but libm/python returned {oracle:?} (bits 0x{:016x})",
+                    rust_direct.to_bits(),
+                    oracle_bits
+                ));
+            }
+            if !bit_eq(ft_scalar_val, oracle) {
+                mismatches.push(format!(
+                    "FrankenTorchSession::pow({base:?}, {exponent:?}) = {ft_scalar_val:?} (bits 0x{:016x}) but libm/python returned {oracle:?} (bits 0x{:016x})",
+                    ft_scalar_val.to_bits(),
+                    oracle_bits
+                ));
+            }
+        }
+
+        // Tensor path: exercise on the finite-base subset (the tensor pow
+        // surface accepts a scalar exponent, so we batch all pairs that
+        // share a finite base and reuse the same scalar exponent per
+        // call). Iterate per pair to avoid mixing exponents in a batch.
+        for (i, (base, exponent)) in pairs.iter().enumerate() {
+            if !base.is_finite() && !base.is_nan() {
+                // Skip ±inf bases for the tensor batch path — it's the
+                // same code path bit-equality-tested via the scalar
+                // case above; the tensor batch test exists to catch
+                // batch-vector regressions.
+                continue;
+            }
+            let oracle_bits: u64 = results[i].as_str().unwrap().parse().unwrap();
+            let oracle = f64::from_bits(oracle_bits);
+
+            let t = session
+                .tensor_variable(vec![*base], vec![1], false)
+                .expect("tensor_variable");
+            let pow_t = session.tensor_pow(t, *exponent).expect("tensor_pow");
+            let vals = session.tensor_values(pow_t).expect("tensor values");
+            assert_eq!(vals.len(), 1);
+            if !bit_eq(vals[0], oracle) {
+                mismatches.push(format!(
+                    "tensor_pow([{base:?}], {exponent:?})[0] = {:?} (bits 0x{:016x}) but oracle {oracle:?} (bits 0x{:016x})",
+                    vals[0],
+                    vals[0].to_bits(),
+                    oracle_bits
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "pow IEEE 754 conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
+    fn torch_logaddexp_numpy_subprocess_conformance() {
+        // Subprocess differential test: NumPy's logaddexp/logaddexp2
+        // exposes the same IEEE 754 value contract PyTorch follows for
+        // scalar/tensor float inputs, including NaN and infinity handling.
+        // Encode f64 values by bits so non-finite cases survive JSON.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let numpy_available = Command::new("python3")
+            .arg("-c")
+            .arg("import json, numpy, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !numpy_available {
+            eprintln!(
+                "torch_logaddexp_numpy_subprocess_conformance: python3/numpy unavailable, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        let finite_values = [
+            -1000.0, -100.0, -20.0, -2.0, -0.0, 0.0, 0.5, 1.0, 2.0, 20.0, 100.0, 1000.0,
+        ];
+        let mut pairs = Vec::<(f64, f64)>::new();
+        for (i, a) in finite_values.iter().enumerate() {
+            for b in finite_values.iter().skip(i % 4).step_by(4) {
+                pairs.push((*a, *b));
+            }
+        }
+        pairs.extend([
+            (f64::INFINITY, f64::INFINITY),
+            (f64::INFINITY, 1.0),
+            (1.0, f64::INFINITY),
+            (f64::NEG_INFINITY, f64::NEG_INFINITY),
+            (f64::NEG_INFINITY, -2.0),
+            (-2.0, f64::NEG_INFINITY),
+            (f64::INFINITY, f64::NEG_INFINITY),
+            (f64::NEG_INFINITY, f64::INFINITY),
+            (f64::NAN, 1.0),
+            (1.0, f64::NAN),
+            (f64::NAN, f64::NAN),
+            (f64::NAN, f64::INFINITY),
+            (f64::INFINITY, f64::NAN),
+            (5e-324, -5e-324),
+            (f64::MIN_POSITIVE, -f64::MIN_POSITIVE),
+            (-f64::MIN_POSITIVE, f64::MIN_POSITIVE),
+        ]);
+        assert!(
+            pairs.len() >= 50,
+            "logaddexp conformance matrix must have at least 50 inputs, got {}",
+            pairs.len()
+        );
+
+        let pair_bits: Vec<[String; 2]> = pairs
+            .iter()
+            .map(|(a, b)| [a.to_bits().to_string(), b.to_bits().to_string()])
+            .collect();
+        let payload = json!({ "pairs": pair_bits });
+
+        let script = r#"
+import json, numpy as np, struct, sys
+
+req = json.loads(sys.stdin.read())
+logaddexp = []
+logaddexp2 = []
+for a_bits_s, b_bits_s in req["pairs"]:
+    a = struct.unpack("<d", struct.pack("<Q", int(a_bits_s)))[0]
+    b = struct.unpack("<d", struct.pack("<Q", int(b_bits_s)))[0]
+    r1 = np.logaddexp(np.float64(a), np.float64(b)).item()
+    r2 = np.logaddexp2(np.float64(a), np.float64(b)).item()
+    logaddexp.append(str(struct.unpack("<Q", struct.pack("<d", r1))[0]))
+    logaddexp2.append(str(struct.unpack("<Q", struct.pack("<d", r2))[0]))
+print(json.dumps({"logaddexp": logaddexp, "logaddexp2": logaddexp2}))
+"#;
+
+        let response = super::run_legacy_oracle_script(&config, script, &payload)
+            .expect("numpy logaddexp oracle must run after availability check");
+        let expected_logaddexp = response
+            .get("logaddexp")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include logaddexp array");
+        let expected_logaddexp2 = response
+            .get("logaddexp2")
+            .and_then(serde_json::Value::as_array)
+            .expect("oracle response must include logaddexp2 array");
+        assert_eq!(expected_logaddexp.len(), pairs.len());
+        assert_eq!(expected_logaddexp2.len(), pairs.len());
+
+        let parse_bits = |value: &serde_json::Value| -> f64 {
+            let bits = value
+                .as_str()
+                .expect("oracle bit pattern must be a string")
+                .parse::<u64>()
+                .expect("oracle bit pattern must parse as u64");
+            f64::from_bits(bits)
+        };
+        let expected_logaddexp: Vec<f64> = expected_logaddexp.iter().map(parse_bits).collect();
+        let expected_logaddexp2: Vec<f64> = expected_logaddexp2.iter().map(parse_bits).collect();
+
+        let close_enough = |actual: f64, expected: f64| -> bool {
+            if actual.is_nan() && expected.is_nan() {
+                return true;
+            }
+            if actual.is_infinite() || expected.is_infinite() {
+                return actual.to_bits() == expected.to_bits();
+            }
+            let scale = expected.abs().max(1.0);
+            (actual - expected).abs() <= 1e-12 * scale
+        };
+
+        let a_values: Vec<f64> = pairs.iter().map(|(a, _)| *a).collect();
+        let b_values: Vec<f64> = pairs.iter().map(|(_, b)| *b).collect();
+        let n = pairs.len();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        let a = session
+            .tensor_variable(a_values.clone(), vec![n], false)
+            .expect("a tensor");
+        let b = session
+            .tensor_variable(b_values.clone(), vec![n], false)
+            .expect("b tensor");
+        let logaddexp = session.tensor_logaddexp(a, b).expect("tensor_logaddexp");
+        let logaddexp_values = session.tensor_values(logaddexp).expect("logaddexp values");
+
+        let a = session
+            .tensor_variable(a_values.clone(), vec![n], false)
+            .expect("a tensor");
+        let b = session
+            .tensor_variable(b_values.clone(), vec![n], false)
+            .expect("b tensor");
+        let logaddexp2 = session.tensor_logaddexp2(a, b).expect("tensor_logaddexp2");
+        let logaddexp2_values = session
+            .tensor_values(logaddexp2)
+            .expect("logaddexp2 values");
+
+        let mut mismatches = Vec::<String>::new();
+        for (i, ((actual, expected), (a, b))) in logaddexp_values
+            .iter()
+            .zip(expected_logaddexp.iter())
+            .zip(pairs.iter())
+            .enumerate()
+        {
+            if !close_enough(*actual, *expected) {
+                mismatches.push(format!(
+                    "logaddexp[{i}]({a:?}, {b:?}) = {actual:?} (bits 0x{:016x}) expected {expected:?} (bits 0x{:016x})",
+                    actual.to_bits(),
+                    expected.to_bits()
+                ));
+            }
+        }
+        for (i, ((actual, expected), (a, b))) in logaddexp2_values
+            .iter()
+            .zip(expected_logaddexp2.iter())
+            .zip(pairs.iter())
+            .enumerate()
+        {
+            if !close_enough(*actual, *expected) {
+                mismatches.push(format!(
+                    "logaddexp2[{i}]({a:?}, {b:?}) = {actual:?} (bits 0x{:016x}) expected {expected:?} (bits 0x{:016x})",
+                    actual.to_bits(),
+                    expected.to_bits()
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "logaddexp/logaddexp2 conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_fmod_remainder_sign_matrix_conformance() {
         // Lock down the full sign matrix for fmod (truncating, sign of
         // dividend) vs remainder (flooring, sign of divisor) — these
