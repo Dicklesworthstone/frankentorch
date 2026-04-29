@@ -7111,7 +7111,7 @@ impl FrankenTorchSession {
             }
         };
         self.tensor_tape
-            .index_put(input, &idx_data, &vals_data, accumulate)
+            .index_put(input, values, &idx_data, &vals_data, accumulate)
     }
 
     pub fn tensor_masked_fill(
@@ -29579,6 +29579,98 @@ mod tests {
         assert!((vals[2] - 3.0).abs() < 1e-10);
         assert!((vals[3] - 34.0).abs() < 1e-10); // 4 + 30
         assert!((vals[4] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn index_put_backward_propagates_to_values() {
+        // Regression test: ft-autograd IndexPut used to drop the
+        // gradient that should flow into `values` (the same severed-
+        // autograd pattern Scatter / ScatterAdd had until 5d4b5a1 /
+        // 56c5165). Now grad_values is a structured gather of incoming
+        // at the indexed positions.
+        //
+        // For a 5-elt input with indices [1, 3] and tracked values
+        // [10.0, 30.0] in non-accumulate mode:
+        //   output = [in0, 10, in2, 30, in4]
+        //   sum loss → incoming = ones
+        //   grad_values = [incoming[1], incoming[3]] = [1.0, 1.0]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], false)
+            .unwrap();
+        let idx = s
+            .tensor_variable(vec![1.0, 3.0], vec![2], false)
+            .unwrap();
+        let values = s
+            .tensor_variable(vec![10.0, 30.0], vec![2], true)
+            .unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        let loss = s.tensor_sum(result).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, values)
+            .expect("index_put must propagate gradient to values");
+        assert_eq!(grad, &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn index_put_backward_propagates_to_input_and_values() {
+        // Both prongs at once. With non-accumulate and indices [1, 3]
+        // overwriting positions 1 and 3 of a length-5 input:
+        //   grad_input = [1, 0, 1, 0, 1]  (overwritten slots zeroed)
+        //   grad_values = [1, 1]          (gathered at idx [1,3])
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], true)
+            .unwrap();
+        let idx = s
+            .tensor_variable(vec![1.0, 3.0], vec![2], false)
+            .unwrap();
+        let values = s
+            .tensor_variable(vec![10.0, 30.0], vec![2], true)
+            .unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, false).unwrap();
+        let loss = s.tensor_sum(result).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let input_grad = s
+            .tensor_gradient(&report, input)
+            .expect("index_put must preserve gradient at non-overwritten positions");
+        let values_grad = s
+            .tensor_gradient(&report, values)
+            .expect("index_put must gather output gradient into values");
+        assert_eq!(input_grad, &[1.0, 0.0, 1.0, 0.0, 1.0]);
+        assert_eq!(values_grad, &[1.0, 1.0]);
+    }
+
+    #[test]
+    fn index_put_accumulate_backward_passes_through_to_both() {
+        // accumulate=true: input is preserved (output = input + adds),
+        // so grad_input = incoming unchanged, AND grad_values is still
+        // a structured gather. Repeated indices [1, 1, 3] mean the
+        // gather double-counts incoming[1] for the two values
+        // contributing to position 1 — matching PyTorch's accumulate
+        // semantics.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], true)
+            .unwrap();
+        let idx = s
+            .tensor_variable(vec![1.0, 1.0, 3.0], vec![3], false)
+            .unwrap();
+        let values = s
+            .tensor_variable(vec![10.0, 20.0, 30.0], vec![3], true)
+            .unwrap();
+        let result = s.tensor_index_put(input, &[idx], values, true).unwrap();
+        let loss = s.tensor_sum(result).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let input_grad = s
+            .tensor_gradient(&report, input)
+            .expect("index_put accumulate must preserve gradient to input");
+        let values_grad = s
+            .tensor_gradient(&report, values)
+            .expect("index_put accumulate must gather output gradient into values");
+        assert_eq!(input_grad, &[1.0, 1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(values_grad, &[1.0, 1.0, 1.0]);
     }
 
     #[test]

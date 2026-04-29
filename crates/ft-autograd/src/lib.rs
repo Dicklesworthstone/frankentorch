@@ -615,6 +615,15 @@ enum TensorNodeOp {
     },
     IndexPut {
         input: TensorNodeId,
+        // `values` is the tensor whose elements get written into
+        // (or accumulated into, for accumulate=true) the output at the
+        // positions specified by `indices`. Backward must gather the
+        // incoming gradient at those positions to recover dL/d(values).
+        // Without tracking values here, callers that built it as a
+        // tracked tensor would silently get zero gradients flowing back
+        // — the same bug Scatter / ScatterAdd had before they were
+        // fixed in 5d4b5a1 / 56c5165.
+        values: TensorNodeId,
         indices: Vec<Vec<f64>>,
         input_shape: Vec<usize>,
         accumulate: bool,
@@ -7706,13 +7715,16 @@ impl TensorTape {
     pub fn index_put(
         &mut self,
         input: TensorNodeId,
+        values: TensorNodeId,
         indices: &[Vec<f64>],
-        values: &[f64],
+        values_data: &[f64],
         accumulate: bool,
     ) -> Result<TensorNodeId, AutogradError> {
         let (output_storage, input_shape, output_dtype, output_device, requires_grad, suffix_size) = {
             let input_node = self.node(input)?;
-            let requires_grad = input_node.requires_grad && self.grad_enabled;
+            let values_requires_grad = self.node(values)?.requires_grad;
+            let requires_grad =
+                (input_node.requires_grad || values_requires_grad) && self.grad_enabled;
             let meta = input_node.tensor.meta().clone();
             let output_storage = match meta.dtype() {
                 DType::F64 => {
@@ -7721,7 +7733,7 @@ impl TensorTape {
                         &input_data,
                         &meta,
                         indices,
-                        values,
+                        values_data,
                         accumulate,
                     )
                     .map_err(|e| AutogradError::Dispatch(e.into()))?;
@@ -7729,7 +7741,7 @@ impl TensorTape {
                 }
                 DType::F32 => {
                     let input_data = input_node.tensor.contiguous_values_f32()?;
-                    let values_f32: Vec<f32> = values.iter().map(|&v| v as f32).collect();
+                    let values_f32: Vec<f32> = values_data.iter().map(|&v| v as f32).collect();
                     let output_values = index_put_tensor_contiguous_f32(
                         input_data,
                         &meta,
@@ -7776,6 +7788,7 @@ impl TensorTape {
             requires_grad,
             op: TensorNodeOp::IndexPut {
                 input,
+                values,
                 indices: indices_owned,
                 input_shape,
                 accumulate,
@@ -12093,46 +12106,64 @@ impl TensorTape {
                 }
                 TensorNodeOp::IndexPut {
                     input,
+                    values,
                     ref indices,
                     ref input_shape,
                     accumulate,
                     suffix_size,
                 } => {
-                    // For non-accumulate: zero out positions that were overwritten
-                    // For accumulate: gradient passes through unchanged
+                    // grad_input:
+                    //   accumulate=true: passthrough — output[i] = input[i] +
+                    //     contributions, so dL/d(input) = dL/d(output).
+                    //   accumulate=false: zero out the overwritten positions
+                    //     since they no longer hold the original value.
+                    //
+                    // grad_values: regardless of accumulate, each
+                    //   values[i, ...s] was either copied or added to
+                    //   output[base_i + s], so dL/d(values[i, ...s]) =
+                    //   dL/d(output[base_i + s]) — a structured gather.
                     let input_numel = Self::checked_shape_numel(
                         input_shape,
                         "index_put backward input shape volume overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, input_numel, incoming.len())?;
 
+                    let n_indices = indices.first().map_or(0, Vec::len);
+                    let num_indexed = indices.len();
+
+                    let mut indexed_strides = vec![0usize; num_indexed];
+                    for d in 0..num_indexed {
+                        indexed_strides[d] = Self::checked_shape_numel(
+                            &input_shape[d + 1..],
+                            "index_put backward stride overflow",
+                        )?;
+                    }
+
+                    // Precompute the flat base offset into `output` for
+                    // each of the n_indices joined index tuples — this
+                    // is the same offset arithmetic the forward used,
+                    // and we'll reuse it for both prongs.
+                    let mut bases = Vec::with_capacity(n_indices);
+                    for i in 0..n_indices {
+                        let mut base = 0usize;
+                        for d in 0..num_indexed {
+                            let idx = Self::normalize_wrapped_index_float(
+                                indices[d][i],
+                                input_shape[d],
+                                "index_put backward received invalid index value",
+                                "index_put backward received out-of-bounds index value",
+                                "index_put backward index conversion overflow",
+                            )?;
+                            base += idx * indexed_strides[d];
+                        }
+                        bases.push(base);
+                    }
+
                     if accumulate {
                         Self::accumulate_tensor_gradient(input, &mut grads[input.0], &incoming)?;
                     } else {
                         let mut contrib = incoming.to_vec();
-                        let n_indices = indices[0].len();
-                        let num_indexed = indices.len();
-
-                        let mut indexed_strides = vec![0usize; num_indexed];
-                        for d in 0..num_indexed {
-                            indexed_strides[d] = Self::checked_shape_numel(
-                                &input_shape[d + 1..],
-                                "index_put backward stride overflow",
-                            )?;
-                        }
-
-                        for i in 0..n_indices {
-                            let mut base = 0usize;
-                            for d in 0..num_indexed {
-                                let idx = Self::normalize_wrapped_index_float(
-                                    indices[d][i],
-                                    input_shape[d],
-                                    "index_put backward received invalid index value",
-                                    "index_put backward received out-of-bounds index value",
-                                    "index_put backward index conversion overflow",
-                                )?;
-                                base += idx * indexed_strides[d];
-                            }
+                        for &base in &bases {
                             for s in 0..suffix_size {
                                 contrib[base + s] = 0.0;
                             }
@@ -12141,10 +12172,27 @@ impl TensorTape {
                     }
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
+                    // Gather incoming at the same positions to recover
+                    // dL/d(values). values has flat shape [n_indices *
+                    // suffix_size] in the order the forward iterated.
+                    let values_numel = n_indices.saturating_mul(suffix_size);
+                    let mut values_grad = Vec::with_capacity(values_numel);
+                    for &base in &bases {
+                        for s in 0..suffix_size {
+                            values_grad.push(incoming[base + s]);
+                        }
+                    }
+                    Self::accumulate_tensor_gradient(
+                        values,
+                        &mut grads[values.0],
+                        &values_grad,
+                    )?;
+                    Self::complete_dependency(&mut pending, values, &mut queue)?;
+
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: incoming.len(),
-                        rule: "d(index_put(x))/dx",
+                        rule: "d(index_put(x,v))/d(x,v)=(passthrough_or_zeroed,gather)",
                     });
                 }
                 TensorNodeOp::Flip { input, ref dims } => {
@@ -13487,7 +13535,6 @@ impl TensorTape {
                 | TensorNodeOp::MinDim { input, .. }
                 | TensorNodeOp::IndexSelect { input, .. }
                 | TensorNodeOp::Gather { input, .. }
-                | TensorNodeOp::IndexPut { input, .. }
                 | TensorNodeOp::Sort { input, .. }
                 | TensorNodeOp::TopK { input, .. }
                 | TensorNodeOp::Flip { input, .. }
@@ -13505,6 +13552,14 @@ impl TensorTape {
                     // value source); reverse-mode must reach src too.
                     stack.push(input);
                     stack.push(src);
+                }
+                TensorNodeOp::IndexPut { input, values, .. } => {
+                    // index_put has two tracked tensor inputs: the
+                    // destination buffer and the values being written.
+                    // Reverse-mode must reach values so the gather-
+                    // backward in the IndexPut step actually flows.
+                    stack.push(input);
+                    stack.push(values);
                 }
                 TensorNodeOp::Cat { ref inputs, .. } | TensorNodeOp::Stack { ref inputs, .. } => {
                     for &id in inputs {
@@ -13645,7 +13700,6 @@ impl TensorTape {
                 | TensorNodeOp::MinDim { input, .. }
                 | TensorNodeOp::IndexSelect { input, .. }
                 | TensorNodeOp::Gather { input, .. }
-                | TensorNodeOp::IndexPut { input, .. }
                 | TensorNodeOp::Sort { input, .. }
                 | TensorNodeOp::TopK { input, .. }
                 | TensorNodeOp::Flip { input, .. }
@@ -13663,6 +13717,13 @@ impl TensorTape {
                     // by the reverse-mode planner.
                     pending[input.0] = pending[input.0].saturating_add(1);
                     pending[src.0] = pending[src.0].saturating_add(1);
+                }
+                TensorNodeOp::IndexPut { input, values, .. } => {
+                    // index_put has two tracked tensor inputs (the
+                    // destination buffer and the values being written);
+                    // both back-edges must be counted.
+                    pending[input.0] = pending[input.0].saturating_add(1);
+                    pending[values.0] = pending[values.0].saturating_add(1);
                 }
                 TensorNodeOp::Cat { ref inputs, .. } | TensorNodeOp::Stack { ref inputs, .. } => {
                     for &id in inputs {
