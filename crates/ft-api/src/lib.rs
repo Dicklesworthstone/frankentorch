@@ -7768,13 +7768,6 @@ impl FrankenTorchSession {
         output_size: Vec<usize>,
         align_corners: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_tape.tensor_requires_grad(theta)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "affine_grid: autograd is not supported",
-                },
-            )));
-        }
         if output_size.len() != 4 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -7808,6 +7801,91 @@ impl FrankenTorchSession {
         let output_shape = vec![batch, out_h, out_w, 2];
         let numel =
             Self::checked_shape_numel(&output_shape, "affine_grid output shape volume overflow")?;
+
+        // Autograd path: tensor_apply_function works on f64. Only
+        // exposed for F64 theta — F32 theta with requires_grad=true
+        // still hits the existing fail-loud guard below to preserve
+        // dtype semantics. The forward is linear in theta (each grid
+        // cell is t00*x + t01*y + t02 / t10*x + t11*y + t12), so the
+        // backward is just the same accumulator with grad_grid in
+        // place of the constant 1. Tracked under frankentorch-bfj5
+        // (child of frankentorch-3v6e).
+        if matches!(theta_tensor.typed_storage(), TensorStorage::F64(_))
+            && self.tensor_tape.tensor_requires_grad(theta)?
+        {
+            let out_h_c = out_h;
+            let out_w_c = out_w;
+            let batch_c = batch;
+            let output_shape_c = output_shape.clone();
+            let align_corners_c = align_corners;
+            let out_id = self.tensor_apply_function(
+                &[theta],
+                move |_ctx, inputs| {
+                    let (theta_vals, _shape) = inputs[0];
+                    let mut grid = Vec::with_capacity(numel);
+                    for n in 0..batch_c {
+                        let base = n * 6;
+                        let t00 = theta_vals[base];
+                        let t01 = theta_vals[base + 1];
+                        let t02 = theta_vals[base + 2];
+                        let t10 = theta_vals[base + 3];
+                        let t11 = theta_vals[base + 4];
+                        let t12 = theta_vals[base + 5];
+                        for h in 0..out_h_c {
+                            let y = Self::affine_grid_axis_coordinate(h, out_h_c, align_corners_c);
+                            for w in 0..out_w_c {
+                                let x =
+                                    Self::affine_grid_axis_coordinate(w, out_w_c, align_corners_c);
+                                grid.push(t00 * x + t01 * y + t02);
+                                grid.push(t10 * x + t11 * y + t12);
+                            }
+                        }
+                    }
+                    Ok((grid, output_shape_c.clone()))
+                },
+                move |_ctx, grad_outputs| {
+                    let grad_grid = grad_outputs[0];
+                    // grad_theta has shape [batch, 2, 3], flat layout.
+                    let mut grad_theta = vec![0.0_f64; batch_c * 2 * 3];
+                    for n in 0..batch_c {
+                        let base = n * 6;
+                        for h in 0..out_h_c {
+                            let y = Self::affine_grid_axis_coordinate(h, out_h_c, align_corners_c);
+                            for w in 0..out_w_c {
+                                let x =
+                                    Self::affine_grid_axis_coordinate(w, out_w_c, align_corners_c);
+                                let cell = (n * out_h_c * out_w_c + h * out_w_c + w) * 2;
+                                let g0 = grad_grid[cell];
+                                let g1 = grad_grid[cell + 1];
+                                grad_theta[base] += g0 * x;
+                                grad_theta[base + 1] += g0 * y;
+                                grad_theta[base + 2] += g0;
+                                grad_theta[base + 3] += g1 * x;
+                                grad_theta[base + 4] += g1 * y;
+                                grad_theta[base + 5] += g1;
+                            }
+                        }
+                    }
+                    Ok(vec![Some(grad_theta)])
+                },
+            )?;
+            self.runtime.ledger_mut().record(
+                EvidenceKind::Dispatch,
+                format!(
+                    "affine_grid theta={} out={} align_corners={align_corners} (autograd)",
+                    theta.0, out_id.0
+                ),
+            );
+            return Ok(out_id);
+        }
+
+        if self.tensor_tape.tensor_requires_grad(theta)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "affine_grid: autograd is only supported for F64 theta",
+                },
+            )));
+        }
 
         match theta_tensor.typed_storage() {
             TensorStorage::F32(values) => {
@@ -32648,13 +32726,15 @@ mod tests {
     }
 
     #[test]
-    fn tensor_affine_grid_and_grid_sample_fail_closed_for_grad_inputs() {
+    fn tensor_grid_sample_fails_closed_for_grad_inputs() {
+        // grid_sample autograd is still tracked under
+        // frankentorch-3v6e (a separate child bead). This test
+        // locks the current fail-loud guard so the gap stays
+        // explicit. Removed the affine_grid half — that path
+        // now supports autograd (frankentorch-bfj5 fix). See
+        // tensor_affine_grid_propagates_gradient_through_theta
+        // for the new positive test.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let theta = s
-            .tensor_variable(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![1, 2, 3], true)
-            .unwrap();
-        assert!(s.tensor_affine_grid(theta, vec![1, 1, 2, 2], true).is_err());
-
         let input = s
             .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
             .unwrap();
@@ -32671,6 +32751,47 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn tensor_affine_grid_propagates_gradient_through_theta() {
+        // Regression test for frankentorch-bfj5: tensor_affine_grid
+        // used to fail-loud reject requires_grad=true theta. After
+        // wrapping in tensor_apply_function with the analytical
+        // backward, gradients flow through theta.
+        //
+        // Math: grid[n,h,w,0] = t00*x_w + t01*y_h + t02
+        //       grid[n,h,w,1] = t10*x_w + t11*y_h + t12
+        // so under sum loss, grad[t00] = sum x_w over all (h,w),
+        // grad[t01] = sum y_h, grad[t02] = #cells (since each cell
+        // contributes 1 * 1 = 1), and similarly for the second row.
+        //
+        // For output_size [1, 1, 2, 2] with align_corners=true, the
+        // axis coordinates are evenly spaced [-1.0, 1.0]. So:
+        //   sum of x_w over (h,w) = 2 * (-1 + 1) = 0
+        //   sum of y_h over (h,w) = 2 * (-1 + 1) = 0
+        //   #cells = 4
+        // Both rows of theta should see grad = [0, 0, 4].
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let theta = s
+            .tensor_variable(vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0], vec![1, 2, 3], true)
+            .unwrap();
+        let grid = s
+            .tensor_affine_grid(theta, vec![1, 1, 2, 2], true)
+            .expect("affine_grid must accept tracked theta");
+        let loss = s.tensor_sum(grid).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_theta = s
+            .tensor_gradient(&report, theta)
+            .expect("affine_grid must propagate gradient via linear backward");
+
+        let expected = [0.0_f64, 0.0, 4.0, 0.0, 0.0, 4.0];
+        for (i, (&g, &e)) in grad_theta.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "affine_grid grad_theta[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
