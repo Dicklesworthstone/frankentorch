@@ -10993,10 +10993,18 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
-        let vals = self.tensor_values(input)?;
+        // Wrap the values branch in tensor_apply_function with the
+        // argmax-routing backward; the indices branch is integer-
+        // valued and correctly non-differentiable. Tracked under
+        // frankentorch-wkkw — previously this body extracted values,
+        // computed cum_vals + cum_idx in plain f64, and rebuilt both
+        // as requires_grad=false leaves, silently severing autograd
+        // through the values branch.
         let shape = self.tensor_shape(input)?;
-        let n = vals.len();
-        let mut cum_vals = Vec::with_capacity(n);
+        let n = Self::checked_shape_numel(&shape, "cummax: shape volume overflow")?;
+
+        // Compute cum_idx upfront (non-grad, integer-routing only).
+        let vals = self.tensor_values(input)?;
         let mut cum_idx = Vec::with_capacity(n);
         let mut max_val = f64::NEG_INFINITY;
         let mut max_idx = 0usize;
@@ -11005,10 +11013,30 @@ impl FrankenTorchSession {
                 max_val = v;
                 max_idx = i;
             }
-            cum_vals.push(max_val);
             cum_idx.push(max_idx as f64);
         }
-        let values = self.tensor_variable(cum_vals, shape.clone(), false)?;
+        let cum_idx_for_bwd: Vec<usize> = cum_idx.iter().map(|&v| v as usize).collect();
+        let cum_idx_for_fwd = cum_idx_for_bwd.clone();
+        let shape_clone = shape.clone();
+
+        let values = self.tensor_apply_function(
+            &[input],
+            move |_ctx, inputs| {
+                let (vals, _shape) = inputs[0];
+                // Forward: gather x[cum_idx[i]] for each i.
+                let cum_vals: Vec<f64> =
+                    cum_idx_for_fwd.iter().map(|&k| vals[k]).collect();
+                Ok((cum_vals, shape_clone.clone()))
+            },
+            move |_ctx, grad_outputs| {
+                let grad_y = grad_outputs[0];
+                let mut grad_in = vec![0.0_f64; n];
+                for (i, &k) in cum_idx_for_bwd.iter().enumerate() {
+                    grad_in[k] += grad_y[i];
+                }
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
         let indices = self.tensor_variable(cum_idx, shape, false)?;
         Ok((values, indices))
     }
@@ -11021,10 +11049,12 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
-        let vals = self.tensor_values(input)?;
+        // Sister of tensor_cummax — same argmax-routing backward via
+        // tensor_apply_function. Tracked under frankentorch-wkkw.
         let shape = self.tensor_shape(input)?;
-        let n = vals.len();
-        let mut cum_vals = Vec::with_capacity(n);
+        let n = Self::checked_shape_numel(&shape, "cummin: shape volume overflow")?;
+
+        let vals = self.tensor_values(input)?;
         let mut cum_idx = Vec::with_capacity(n);
         let mut min_val = f64::INFINITY;
         let mut min_idx = 0usize;
@@ -11033,10 +11063,29 @@ impl FrankenTorchSession {
                 min_val = v;
                 min_idx = i;
             }
-            cum_vals.push(min_val);
             cum_idx.push(min_idx as f64);
         }
-        let values = self.tensor_variable(cum_vals, shape.clone(), false)?;
+        let cum_idx_for_bwd: Vec<usize> = cum_idx.iter().map(|&v| v as usize).collect();
+        let cum_idx_for_fwd = cum_idx_for_bwd.clone();
+        let shape_clone = shape.clone();
+
+        let values = self.tensor_apply_function(
+            &[input],
+            move |_ctx, inputs| {
+                let (vals, _shape) = inputs[0];
+                let cum_vals: Vec<f64> =
+                    cum_idx_for_fwd.iter().map(|&k| vals[k]).collect();
+                Ok((cum_vals, shape_clone.clone()))
+            },
+            move |_ctx, grad_outputs| {
+                let grad_y = grad_outputs[0];
+                let mut grad_in = vec![0.0_f64; n];
+                for (i, &k) in cum_idx_for_bwd.iter().enumerate() {
+                    grad_in[k] += grad_y[i];
+                }
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
         let indices = self.tensor_variable(cum_idx, shape, false)?;
         Ok((values, indices))
     }
@@ -26506,6 +26555,75 @@ mod tests {
         let idx = s.tensor_values(idx_id).unwrap();
         assert_eq!(vals, vec![5.0, 3.0, 3.0, 1.0, 1.0]);
         assert_eq!(idx, vec![0.0, 1.0, 1.0, 3.0, 3.0]);
+    }
+
+    #[test]
+    fn cummax_propagates_gradient_via_argmax_routing() {
+        // Regression test for frankentorch-wkkw. tensor_cummax used
+        // to extract values, compute cum_vals + cum_idx in plain
+        // f64, and rebuild both as requires_grad=false leaves —
+        // silently severing autograd through the values branch.
+        // After wrapping the values branch in tensor_apply_function
+        // with argmax-routing backward, gradients flow.
+        //
+        // For x = [3, 1, 4, 1, 5]:
+        //   cum_max = [3, 3, 4, 4, 5]
+        //   cum_idx = [0, 0, 2, 2, 4]
+        // Under sum loss (grad_y = [1, 1, 1, 1, 1]):
+        //   grad_x[k] = sum over i where cum_idx[i] == k of grad_y[i]
+        //   grad_x[0] = 2 (i=0 and i=1 route to 0)
+        //   grad_x[1] = 0
+        //   grad_x[2] = 2 (i=2 and i=3 route to 2)
+        //   grad_x[3] = 0
+        //   grad_x[4] = 1 (only i=4)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![3.0, 1.0, 4.0, 1.0, 5.0], vec![5], true)
+            .unwrap();
+        let (vals_id, _idx_id) = s.tensor_cummax(x).unwrap();
+        let loss = s.tensor_sum(vals_id).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("tensor_cummax must propagate gradient via argmax routing");
+        let expected = [2.0_f64, 0.0, 2.0, 0.0, 1.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "cummax grad[{i}] = {g}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn cummin_propagates_gradient_via_argmin_routing() {
+        // Sister regression test for cummin. Same backward pattern.
+        // For x = [5, 3, 4, 1, 2]:
+        //   cum_min = [5, 3, 3, 1, 1]
+        //   cum_idx = [0, 1, 1, 3, 3]
+        // Under sum loss:
+        //   grad_x[0] = 1 (only i=0)
+        //   grad_x[1] = 2 (i=1 and i=2)
+        //   grad_x[2] = 0
+        //   grad_x[3] = 2 (i=3 and i=4)
+        //   grad_x[4] = 0
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![5.0, 3.0, 4.0, 1.0, 2.0], vec![5], true)
+            .unwrap();
+        let (vals_id, _idx_id) = s.tensor_cummin(x).unwrap();
+        let loss = s.tensor_sum(vals_id).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("tensor_cummin must propagate gradient via argmin routing");
+        let expected = [1.0_f64, 2.0, 0.0, 2.0, 0.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "cummin grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     // ── repeat_interleave tests ────────────────────────────────────────
