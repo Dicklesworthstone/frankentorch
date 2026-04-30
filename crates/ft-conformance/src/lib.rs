@@ -20035,6 +20035,210 @@ print(json.dumps({"softmax": out}))
     }
 
     #[test]
+    fn torch_activations_scipy_subprocess_conformance() {
+        // Lock FrankenTorch's sigmoid / tanh / silu / mish against
+        // scipy.special.expit (sigmoid), numpy.tanh, and numpy
+        // compositions for silu / mish. These are the workhorse
+        // activations behind binary classification (sigmoid),
+        // RNN/LSTM (tanh), transformer FFN (silu = x*sigmoid(x)),
+        // and detection / vision (mish = x*tanh(softplus(x))).
+        //
+        // Files closure for frankentorch-2xxj. Sister harness to
+        // torch_gelu_exact_libm_subprocess_conformance and
+        // torch_softplus_libm_subprocess_conformance — same libm /
+        // scipy oracle, ULP-tolerant comparator, fail-loud structure.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let scipy_available = Command::new("python3")
+            .arg("-c")
+            .arg("from scipy import special; import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !scipy_available {
+            eprintln!(
+                "torch_activations_scipy_subprocess_conformance: python3/scipy/numpy not available, skipping"
+            );
+            return;
+        }
+
+        let mut config = HarnessConfig::default_paths();
+        config.legacy_oracle_python = Some(std::path::PathBuf::from("python3"));
+
+        // Cover negative / zero / positive / large saturation / ±inf
+        // / NaN. The saturation cases (±50) verify that sigmoid/tanh
+        // collapse cleanly without overflow in the underlying exp.
+        let inputs: Vec<f64> = vec![
+            // Standard interior.
+            -10.0, -5.0, -2.0, -1.0, -0.5, -0.1,
+            -1e-3, -1e-15,
+            0.0, -0.0,
+            1e-15, 1e-3,
+            0.1, 0.5, 1.0, 2.0, 5.0, 10.0,
+            // Transcendental constants.
+            std::f64::consts::E,
+            std::f64::consts::PI,
+            std::f64::consts::LN_2,
+            std::f64::consts::SQRT_2,
+            // Saturation.
+            -50.0, -100.0, -700.0,
+            50.0, 100.0, 700.0,
+            // Inf / NaN.
+            f64::NEG_INFINITY,
+            f64::INFINITY,
+            f64::NAN,
+        ];
+
+        let input_bits: Vec<String> = inputs.iter().map(|v| v.to_bits().to_string()).collect();
+        let payload = json!({ "inputs": input_bits });
+
+        let script = r#"
+import json, struct, sys
+import numpy as np
+from scipy import special
+
+def from_bits(s):
+    return struct.unpack("<d", struct.pack("<Q", int(s)))[0]
+
+def to_bits(v):
+    return str(struct.unpack("<Q", struct.pack("<d", float(v)))[0])
+
+def silu(x):
+    # x * sigmoid(x). Use special.expit for the sigmoid.
+    return float(x) * float(special.expit(x))
+
+def mish(x):
+    # x * tanh(softplus(x)) = x * tanh(log(1 + exp(x)))
+    sp = np.log1p(np.exp(x))
+    return float(x) * float(np.tanh(sp))
+
+req = json.loads(sys.stdin.read())
+sigm, tanh_, silu_, mish_ = [], [], [], []
+for x_bits_s in req["inputs"]:
+    x = from_bits(x_bits_s)
+    try: sigm.append(to_bits(float(special.expit(x))))
+    except Exception: sigm.append(to_bits(float("nan")))
+    try: tanh_.append(to_bits(float(np.tanh(x))))
+    except Exception: tanh_.append(to_bits(float("nan")))
+    try: silu_.append(to_bits(silu(x)))
+    except Exception: silu_.append(to_bits(float("nan")))
+    try: mish_.append(to_bits(mish(x)))
+    except Exception: mish_.append(to_bits(float("nan")))
+print(json.dumps({"sigmoid": sigm, "tanh": tanh_, "silu": silu_, "mish": mish_}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(value) => value,
+            Err(error) => {
+                eprintln!(
+                    "torch_activations_scipy_subprocess_conformance: oracle invocation failed ({error}); skipping"
+                );
+                return;
+            }
+        };
+
+        let parse_arr = |k: &'static str| -> Vec<f64> {
+            response
+                .get(k)
+                .and_then(serde_json::Value::as_array)
+                .expect("oracle response must include the requested key")
+                .iter()
+                .map(|v| f64::from_bits(v.as_str().unwrap().parse::<u64>().unwrap()))
+                .collect()
+        };
+        let want_sig = parse_arr("sigmoid");
+        let want_tanh = parse_arr("tanh");
+        let want_silu = parse_arr("silu");
+        let want_mish = parse_arr("mish");
+        assert_eq!(want_sig.len(), inputs.len());
+
+        // sigmoid/tanh from libm should match within ~1 ULP. silu
+        // adds one mul, mish adds tanh + softplus + mul. Allow 16 ULP
+        // for the composed silu/mish; 4 ULP for sigmoid/tanh proper.
+        let approx_eq = |a: f64, b: f64, ulp_tol: u64| -> bool {
+            if a.is_nan() && b.is_nan() {
+                return true;
+            }
+            if a == b {
+                return true;
+            }
+            if a.is_infinite() != b.is_infinite()
+                || a.is_nan() != b.is_nan()
+                || a.is_sign_negative() != b.is_sign_negative()
+            {
+                return false;
+            }
+            if (a - b).abs() <= 1e-15 {
+                return true;
+            }
+            a.to_bits().abs_diff(b.to_bits()) <= ulp_tol
+        };
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut mismatches = Vec::<String>::new();
+
+        for (i, x) in inputs.iter().enumerate() {
+            let xt = session
+                .tensor_variable(vec![*x], vec![1], false)
+                .expect("xt");
+
+            let sg = session.tensor_sigmoid(xt).expect("sigmoid");
+            let got = session.tensor_values(sg).expect("got")[0];
+            if !approx_eq(got, want_sig[i], 4) {
+                mismatches.push(format!(
+                    "tensor_sigmoid({x:?}) = {got:?} (bits 0x{:016x}) but scipy.special.expit returned {:?} (bits 0x{:016x})",
+                    got.to_bits(),
+                    want_sig[i],
+                    want_sig[i].to_bits()
+                ));
+            }
+
+            let th = session.tensor_tanh(xt).expect("tanh");
+            let got = session.tensor_values(th).expect("got")[0];
+            if !approx_eq(got, want_tanh[i], 4) {
+                mismatches.push(format!(
+                    "tensor_tanh({x:?}) = {got:?} (bits 0x{:016x}) but numpy.tanh returned {:?} (bits 0x{:016x})",
+                    got.to_bits(),
+                    want_tanh[i],
+                    want_tanh[i].to_bits()
+                ));
+            }
+
+            let sl = session.tensor_silu(xt).expect("silu");
+            let got = session.tensor_values(sl).expect("got")[0];
+            if !approx_eq(got, want_silu[i], 16) {
+                mismatches.push(format!(
+                    "tensor_silu({x:?}) = {got:?} (bits 0x{:016x}) but x*expit(x) = {:?} (bits 0x{:016x})",
+                    got.to_bits(),
+                    want_silu[i],
+                    want_silu[i].to_bits()
+                ));
+            }
+
+            let ms = session.tensor_mish(xt).expect("mish");
+            let got = session.tensor_values(ms).expect("got")[0];
+            if !approx_eq(got, want_mish[i], 16) {
+                mismatches.push(format!(
+                    "tensor_mish({x:?}) = {got:?} (bits 0x{:016x}) but x*tanh(softplus(x)) = {:?} (bits 0x{:016x})",
+                    got.to_bits(),
+                    want_mish[i],
+                    want_mish[i].to_bits()
+                ));
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "activation scipy/numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_gelu_exact_libm_subprocess_conformance() {
         // Lock the precision contract for GELU (the exact erf-form, which
         // is PyTorch's default `approximate="none"`).
