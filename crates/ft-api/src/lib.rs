@@ -10459,10 +10459,7 @@ impl FrankenTorchSession {
         p: f64,
         margin: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_vals = self.tensor_values(input)?;
-        let target_vals = self.tensor_values(target)?;
         let shape = self.tensor_shape(input)?;
-
         if shape.len() != 2 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -10470,39 +10467,50 @@ impl FrankenTorchSession {
                 },
             )));
         }
-
         let (batch, classes) = (shape[0], shape[1]);
-        let mut total_loss = 0.0;
 
-        for (i, &tgt) in target_vals.iter().enumerate().take(batch) {
-            let y = Self::exact_nonnegative_index_to_usize(
-                tgt,
-                "multi_margin_loss targets must be finite non-negative integer indices",
-            )?;
-            if y >= classes {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "multi_margin_loss target index out of bounds",
-                    },
-                )));
-            }
-            let base = i * classes;
-            let score_y = input_vals[base + y];
-            let mut sample_loss = 0.0;
-            for j in 0..classes {
-                if j == y {
-                    continue;
-                }
-                let diff = margin - score_y + input_vals[base + j];
-                if diff > 0.0 {
-                    sample_loss += diff.powf(p);
-                }
-            }
-            total_loss += sample_loss / classes as f64;
-        }
+        // Compose through autograd primitives. The forward formula is
+        //     loss = mean over batch of [sum_{j != y_i} relu(margin - x[i, y_i] + x[i, j])^p / classes]
+        // We assemble it as
+        //   mask_y       = one_hot(target, classes)              [batch, classes]
+        //   mask_others  = 1 - mask_y                            [batch, classes]
+        //   score_y_b    = expand(unsqueeze(sum(x * mask_y, 1)), [batch, classes])
+        //   diff         = (margin scalar) + (x - score_y_b)
+        //   per_elem     = relu(diff) * mask_others              (zero at j == y)
+        //   per_elem_p   = per_elem^p
+        //   per_sample   = sum(per_elem_p, dim=1) / classes
+        //   loss         = mean(per_sample)
+        // All ops are autograd-aware. Tracked under frankentorch-x9cr —
+        // previously this body extracted values, computed the
+        // accumulator in plain f64, and rebuilt a non-grad leaf.
+        //
+        // one_hot validates that target entries are finite non-negative
+        // integer indices in [0, classes), so we don't need a manual
+        // pre-check.
+        let mask_y = self.one_hot(target, classes)?;
+        let ones = self.full(vec![batch, classes], 1.0, false)?;
+        let mask_others = self.tensor_sub(ones, mask_y)?;
 
-        let mean_loss = total_loss / batch as f64;
-        self.tensor_variable(vec![mean_loss], vec![1], false)
+        let score_y_per_elem = self.tensor_mul(input, mask_y)?;
+        let score_y = self.tensor_sum_dim(score_y_per_elem, 1)?; // [batch]
+        let score_y_kd = self.tensor_unsqueeze(score_y, 1)?; // [batch, 1]
+        let score_y_b = self.tensor_expand(score_y_kd, vec![batch, classes])?;
+
+        let margin_t = self.full(vec![batch, classes], margin, false)?;
+        let x_minus_y = self.tensor_sub(input, score_y_b)?;
+        let diff = self.tensor_add(x_minus_y, margin_t)?;
+
+        let clamped = self.tensor_relu(diff)?;
+        let masked = self.tensor_mul(clamped, mask_others)?;
+
+        // tensor_pow(_, p) supports general f64 exponents; for p == 1
+        // we'd duplicate work but the result is correct.
+        let powered = self.tensor_pow(masked, p)?;
+
+        let per_sample_sum = self.tensor_sum_dim(powered, 1)?; // [batch]
+        let classes_t = self.full(vec![batch], classes as f64, false)?;
+        let per_sample = self.tensor_div(per_sample_sum, classes_t)?;
+        self.tensor_mean(per_sample)
     }
 
     /// Multi-label soft margin loss.
@@ -28003,6 +28011,64 @@ mod tests {
         let val = s.tensor_values(loss).unwrap()[0];
         // max(0, 1-0+3) = 4, / 2 classes = 2
         assert!((val - 2.0).abs() < 1e-10, "expected 2.0, got {val}");
+    }
+
+    #[test]
+    fn multi_margin_loss_propagates_gradient_through_input() {
+        // Regression test for frankentorch-x9cr.
+        // multi_margin_loss used to extract values, accumulate the
+        // per-sample sum in plain f64, and rebuild a
+        // requires_grad=false leaf — silently severing autograd for
+        // multi-class margin training paths. After composing through
+        // one_hot + relu + pow + sum_dim + mean (all autograd-aware),
+        // gradients flow.
+        //
+        // For input = [[0.0, 3.0]], target = [0], p=1, margin=1:
+        //   diff matrix = margin + (input - score_y_b)
+        //                = 1 + ([[0, 3]] - [[0, 0]])
+        //                = [[1, 4]]
+        //   relu(diff)  = [[1, 4]]
+        //   masked      = [[1, 4]] * [[0, 1]]    (mask_others)
+        //                = [[0, 4]]
+        //   powered     = [[0, 4]]   (^1)
+        //   per_sample  = (0 + 4) / 2 = 2.0
+        //   loss        = mean over batch = 2.0 ✓ (matches existing test)
+        //
+        // Backward: d loss / d input.
+        //   loss = (1/batch) * (1/classes) * sum over batch i, j of
+        //          relu(margin - x[i, y_i] + x[i, j])^p * mask_others[i, j]
+        // With p=1, the relu sub-gradient is 1 where diff > 0, 0
+        // where diff < 0, and 0 at the boundary by FrankenTorch
+        // convention.
+        //
+        // For our example (batch=1, classes=2, target=[0]):
+        //   d loss / d x[0, 0] = (1/2) * d/dx[0,0] of sum_j relu(diff[0, j]) * mask_others[0, j]
+        //   Only j=1 contributes: diff[0, 1] = margin - x[0,0] + x[0,1] = 1 - 0 + 3 = 4
+        //     relu'(4) = 1; ∂diff[0,1]/∂x[0,0] = -1 (subtract score_y)
+        //     contribution: 1 * (-1) * 1 = -1
+        //   So d loss / d x[0, 0] = -1/2 = -0.5
+        //
+        //   d loss / d x[0, 1] = (1/2) * d/dx[0,1] of sum_j relu(diff[0, j]) * mask_others[0, j]
+        //   j=1 contributes: ∂diff[0,1]/∂x[0,1] = +1
+        //     contribution: 1 * 1 * 1 = 1
+        //   So d loss / d x[0, 1] = 1/2 = 0.5
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![0.0, 3.0], vec![1, 2], true)
+            .unwrap();
+        let target = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let loss = s.multi_margin_loss(input, target, 1.0, 1.0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("multi_margin_loss must propagate gradient through input");
+        let expected = [-0.5_f64, 0.5];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "multi_margin_loss grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
