@@ -11290,16 +11290,21 @@ impl FrankenTorchSession {
 
         // Smoothed cross-entropy:
         // loss = (1 - s) * nll_loss(log_probs, targets) + s * (-mean(log_probs))
+        // Compose through tensor_lerp so the autograd tape carries
+        // gradients to log_probs (and hence back to logits). The
+        // previous body extracted scalar values + rebuilt a
+        // requires_grad=false leaf, silently severing autograd for
+        // the label-smoothing training path. Tracked under
+        // frankentorch-ilwr.
         let nll = self.nll_loss(log_probs, targets)?;
         let uniform_loss = {
             let neg_log_probs = self.tensor_neg(log_probs)?;
             self.tensor_mean(neg_log_probs)?
         };
-
-        let nll_vals = self.tensor_values(nll)?;
-        let uniform_vals = self.tensor_values(uniform_loss)?;
-        let blended = (1.0 - label_smoothing) * nll_vals[0] + label_smoothing * uniform_vals[0];
-        self.tensor_variable(vec![blended], vec![1], false)
+        // tensor_lerp(start, end, w) = start * (1 - w) + end * w
+        // → blended = nll * (1 - s) + uniform_loss * s, exactly the
+        // smoothed-CE definition.
+        self.tensor_lerp(nll, uniform_loss, label_smoothing)
     }
 
     /// Return indices that would sort the tensor along a dimension.
@@ -22268,6 +22273,56 @@ mod tests {
         assert!(
             vs > v0,
             "label smoothing should increase loss for confident predictions: {v0} vs {vs}"
+        );
+    }
+
+    #[test]
+    fn cross_entropy_with_smoothing_propagates_gradient_through_logits() {
+        // Regression test for frankentorch-ilwr.
+        // cross_entropy_loss_with_smoothing previously extracted
+        // scalar values from nll and uniform_loss, computed the
+        // (1 - s) * nll + s * uniform blend in plain f64, and
+        // rebuilt a requires_grad=false leaf — silently severing
+        // autograd for the entire label-smoothing training path.
+        // After replacing the scalar arithmetic with tensor_lerp
+        // (which is autograd-aware), gradients flow back to logits.
+        //
+        // Sanity test: confident logits with label_smoothing=0.1
+        // should still produce a non-zero gradient on the logits,
+        // pointing the wrong-class entries down (less mass) and the
+        // correct-class entry's gradient adjusted by the smoothing
+        // factor. We just check non-zero finite gradient — exact
+        // values depend on the smoothing formula and would be
+        // brittle to assert exactly.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let logits = s
+            .tensor_variable(vec![5.0, 0.0, 0.0], vec![1, 3], true)
+            .unwrap();
+        let targets = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let loss = s
+            .cross_entropy_loss_with_smoothing(logits, targets, 0.1)
+            .unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, logits)
+            .expect("CE-with-smoothing must propagate gradient through logits");
+        assert_eq!(grad.len(), 3);
+        assert!(
+            grad.iter().all(|g| g.is_finite()),
+            "CE-with-smoothing gradient must be finite, got {grad:?}"
+        );
+        // At least one entry should be meaningfully non-zero.
+        assert!(
+            grad.iter().any(|&g| g.abs() > 1e-6),
+            "CE-with-smoothing gradient should be non-zero, got {grad:?}"
+        );
+        // Gradient should sum to ~0 (since softmax probabilities sum
+        // to 1 and the gradient through log_softmax has the form
+        // softmax - target_distribution, both summing to 1).
+        let total: f64 = grad.iter().sum();
+        assert!(
+            total.abs() < 1e-10,
+            "CE-with-smoothing gradient should sum to 0, got {total}"
         );
     }
 
