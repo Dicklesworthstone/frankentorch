@@ -15482,8 +15482,6 @@ impl FrankenTorchSession {
         a: TensorNodeId,
         b: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let a_vals = self.tensor_values(a)?;
-        let b_vals = self.tensor_values(b)?;
         let a_shape = self.tensor_shape(a)?;
         let b_shape = self.tensor_shape(b)?;
 
@@ -15495,41 +15493,57 @@ impl FrankenTorchSession {
             )));
         }
 
-        // For 1-D: simple dot product
+        // Compose through autograd-aware primitives so gradients flow.
+        // Previously this body extracted values + rebuilt a non-grad
+        // leaf — same severed-autograd pattern fixed for the linalg
+        // / cross / diag_embed / matrix_norm cluster. Tracked under
+        // frankentorch-ytlg.
+        //
+        // 1-D × 1-D → dot product (delegated to tensor_dot, which is
+        // autograd-aware via the tape).
         if a_shape.len() == 1 && b_shape.len() == 1 {
-            if a_vals.len() != b_vals.len() {
+            if a_shape[0] != b_shape[0] {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
                         reason: "inner: 1-D tensors must have same length",
                     },
                 )));
             }
-            let dot: f64 = a_vals.iter().zip(b_vals.iter()).map(|(&x, &y)| x * y).sum();
-            let out = self.tensor_tape.leaf(vec![dot], vec![1], false)?;
+            let dot = self.tensor_dot(a, b)?;
             self.runtime.ledger_mut().record(
                 EvidenceKind::Dispatch,
-                format!("inner a={} b={} out={}", a.0, b.0, out.0),
+                format!("inner a={} b={} out={}", a.0, b.0, dot.0),
             );
-            return Ok(out);
+            // tensor_dot returns a 0-D scalar; preserve the prior
+            // [1]-shape contract.
+            let dot_shape = self.tensor_shape(dot)?;
+            return if dot_shape == [1] {
+                Ok(dot)
+            } else if dot_shape.is_empty() {
+                self.tensor_unsqueeze(dot, 0)
+            } else {
+                self.tensor_reshape(dot, vec![1])
+            };
         }
 
-        // For higher dimensions, last dim of a must match last dim of b
-        let a_last =
-            *a_shape
-                .last()
-                .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "inner: missing last dimension on lhs",
-                    },
-                )))?;
-        let b_last =
-            *b_shape
-                .last()
-                .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "inner: missing last dimension on rhs",
-                    },
-                )))?;
+        // Higher-D: contract along the last axis. Reshape both inputs
+        // to 2-D (outer, last) and compute matmul(a_flat, b_flat.T)
+        // → (a_outer, b_outer), then reshape to the inner output
+        // shape. matmul + transpose + reshape are all autograd-aware.
+        let a_last = *a_shape.last().ok_or(AutogradError::Dispatch(
+            ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "inner: missing last dimension on lhs",
+                },
+            ),
+        ))?;
+        let b_last = *b_shape.last().ok_or(AutogradError::Dispatch(
+            ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "inner: missing last dimension on rhs",
+                },
+            ),
+        ))?;
         if a_last == 0 || b_last == 0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15545,32 +15559,22 @@ impl FrankenTorchSession {
             )));
         }
 
-        let a_outer: usize = a_vals.len() / a_last;
-        let b_outer: usize = b_vals.len() / b_last;
+        let a_numel = Self::checked_shape_numel(&a_shape, "inner: lhs shape volume overflow")?;
+        let b_numel = Self::checked_shape_numel(&b_shape, "inner: rhs shape volume overflow")?;
+        let a_outer = a_numel / a_last;
+        let b_outer = b_numel / b_last;
 
-        let total = Self::checked_mul(a_outer, b_outer, "inner output size overflow")?;
-        let mut result = Vec::with_capacity(total);
-        for i in 0..a_outer {
-            for j in 0..b_outer {
-                let mut dot = 0.0;
-                let a_base = Self::checked_mul(i, a_last, "inner index overflow")?;
-                let b_base = Self::checked_mul(j, b_last, "inner index overflow")?;
-                for k in 0..a_last {
-                    let a_idx = Self::checked_add(a_base, k, "inner index overflow")?;
-                    let b_idx = Self::checked_add(b_base, k, "inner index overflow")?;
-                    dot += a_vals[a_idx] * b_vals[b_idx];
-                }
-                result.push(dot);
-            }
-        }
+        let a_flat = self.tensor_reshape(a, vec![a_outer, a_last])?;
+        let b_flat = self.tensor_reshape(b, vec![b_outer, b_last])?;
+        let b_t = self.tensor_transpose(b_flat, 0, 1)?;
+        let prod = self.tensor_matmul(a_flat, b_t)?; // shape [a_outer, b_outer]
 
         let mut out_shape: Vec<usize> = a_shape[..a_shape.len() - 1].to_vec();
         out_shape.extend_from_slice(&b_shape[..b_shape.len() - 1]);
         if out_shape.is_empty() {
             out_shape.push(1);
         }
-
-        let out = self.tensor_tape.leaf(result, out_shape, false)?;
+        let out = self.tensor_reshape(prod, out_shape)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("inner a={} b={} out={}", a.0, b.0, out.0),
@@ -35148,6 +35152,37 @@ mod tests {
         let a = s.tensor_variable(vec![1.0], vec![], false).unwrap();
         let b = s.tensor_variable(vec![2.0], vec![], false).unwrap();
         assert!(s.tensor_inner(a, b).is_err());
+    }
+
+    #[test]
+    fn inner_1d_propagates_gradient_via_dot() {
+        // Regression test for frankentorch-ytlg. tensor_inner used to
+        // extract values, compute the dot product in plain f64, and
+        // rebuild a requires_grad=false leaf. After delegating to
+        // tensor_dot (autograd-aware via tape), gradients flow to
+        // both inputs.
+        //
+        // For a = [1, 2, 3], b = [4, 5, 6]:
+        //   c = sum a*b = 4 + 10 + 18 = 32
+        //   grad_a = grad_c * b = b = [4, 5, 6]
+        //   grad_b = grad_c * a = a = [1, 2, 3]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true).unwrap();
+        let b = s.tensor_variable(vec![4.0, 5.0, 6.0], vec![3], true).unwrap();
+        let c = s.tensor_inner(a, b).unwrap();
+        let report = s.tensor_backward(c).unwrap();
+        let grad_a = s
+            .tensor_gradient(&report, a)
+            .expect("inner must propagate gradient through a");
+        let grad_b = s
+            .tensor_gradient(&report, b)
+            .expect("inner must propagate gradient through b");
+        for (i, (&g, &e)) in grad_a.iter().zip([4.0_f64, 5.0, 6.0].iter()).enumerate() {
+            assert!((g - e).abs() < 1e-12, "inner grad_a[{i}] = {g}, expected {e}");
+        }
+        for (i, (&g, &e)) in grad_b.iter().zip([1.0_f64, 2.0, 3.0].iter()).enumerate() {
+            assert!((g - e).abs() < 1e-12, "inner grad_b[{i}] = {g}, expected {e}");
+        }
     }
 
     // ── hstack / vstack / dstack / split tests ──────────────────────────
