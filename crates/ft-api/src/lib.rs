@@ -4171,7 +4171,6 @@ impl FrankenTorchSession {
         r: usize,
         with_replacement: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let vals = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         if shape.len() != 1 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -4180,46 +4179,67 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        let n = shape[0];
 
-        let n = vals.len();
-        let mut combos: Vec<Vec<f64>> = Vec::new();
-        let mut current = Vec::with_capacity(r);
+        // Pre-compute the index-mapping: combo_indices is a flat list
+        // of (input_position) for each (combo, slot_in_combo) cell of
+        // the output. Use the same recursive enumeration as before
+        // but track indices instead of values. The mapping is then
+        // captured by the forward (gather) and backward (scatter)
+        // closures in tensor_apply_function. Tracked under
+        // frankentorch-d214 — previously this body extracted values,
+        // built the output in plain f64, and rebuilt a non-grad leaf.
+        let mut combo_indices: Vec<usize> = Vec::new();
+        let mut current_indices: Vec<usize> = Vec::with_capacity(r);
 
-        fn generate(
-            vals: &[f64],
+        fn generate_idx(
             n: usize,
             r: usize,
             start: usize,
-            current: &mut Vec<f64>,
-            combos: &mut Vec<Vec<f64>>,
+            current: &mut Vec<usize>,
+            out: &mut Vec<usize>,
             with_replacement: bool,
         ) {
             if current.len() == r {
-                combos.push(current.clone());
+                out.extend_from_slice(current);
                 return;
             }
             for i in start..n {
-                current.push(vals[i]);
+                current.push(i);
                 let next = if with_replacement { i } else { i + 1 };
-                generate(vals, n, r, next, current, combos, with_replacement);
+                generate_idx(n, r, next, current, out, with_replacement);
                 current.pop();
             }
         }
 
-        generate(&vals, n, r, 0, &mut current, &mut combos, with_replacement);
+        generate_idx(n, r, 0, &mut current_indices, &mut combo_indices, with_replacement);
 
-        let num_combos = combos.len();
+        let num_combos = combo_indices.len().checked_div(r).unwrap_or(1);
         let total = Self::checked_mul(num_combos, r, "combinations output size overflow")?;
-        let mut result = Vec::with_capacity(total);
-        for combo in &combos {
-            result.extend_from_slice(combo);
-        }
 
         if num_combos == 0 {
-            self.tensor_variable(vec![], vec![0, r], false)
-        } else {
-            self.tensor_variable(result, vec![num_combos, r], false)
+            return self.tensor_variable(vec![], vec![0, r], false);
         }
+
+        let mapping_for_fwd = combo_indices.clone();
+        let mapping_for_bwd = combo_indices;
+        self.tensor_apply_function(
+            &[input],
+            move |_ctx, inputs| {
+                let (vals, _shape) = inputs[0];
+                let result: Vec<f64> = mapping_for_fwd.iter().map(|&i| vals[i]).collect();
+                Ok((result, vec![num_combos, r]))
+            },
+            move |_ctx, grad_outputs| {
+                let g = grad_outputs[0];
+                let mut grad_in = vec![0.0_f64; n];
+                for (out_pos, &in_pos) in mapping_for_bwd.iter().enumerate() {
+                    grad_in[in_pos] += g[out_pos];
+                }
+                let _ = total; // keep total in scope for size validation above
+                Ok(vec![Some(grad_in)])
+            },
+        )
     }
 
     /// Compute batched pairwise distance between two sets of vectors.
@@ -28978,6 +28998,38 @@ mod tests {
         let result = s.tensor_combinations(input, 2, false).unwrap();
         let shape = s.tensor_shape(result).unwrap();
         assert_eq!(shape, vec![0, 2]); // C(1,2) = 0
+    }
+
+    #[test]
+    fn combinations_propagates_gradient_via_scatter() {
+        // Regression test for frankentorch-d214. tensor_combinations
+        // used to extract values, build the combinatorial output in
+        // plain f64, and rebuild a non-grad leaf. After wrapping in
+        // tensor_apply_function with scatter backward, gradients
+        // flow.
+        //
+        // For input = [10, 20, 30], r=2 (no replacement):
+        //   Combos: (0,1), (0,2), (1,2) → output = [[10,20], [10,30], [20,30]]
+        // Under sum loss:
+        //   Each input element appears in C(n-1, r-1) = C(2, 1) = 2 rows.
+        //   grad_input = [2, 2, 2].
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![10.0, 20.0, 30.0], vec![3], true)
+            .unwrap();
+        let out = s.tensor_combinations(x, 2, false).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("tensor_combinations must propagate gradient via scatter");
+        let expected = [2.0_f64, 2.0, 2.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "combinations grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     // ── cross / vecdot / diag_embed tests (bd-2drq.9) ─────────────────
