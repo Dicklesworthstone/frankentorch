@@ -3458,23 +3458,50 @@ impl FrankenTorchSession {
         let k = shape[0];
         let abs_offset = offset.unsigned_abs() as usize;
         let n = Self::checked_add(k, abs_offset, "diag_embed: output size overflow")?;
-        let vals = self.tensor_values(input)?;
         let numel = Self::checked_mul(n, n, "diag_embed: output size overflow")?;
         let _ = Self::checked_mul(
             numel,
             std::mem::size_of::<f64>(),
             "diag_embed: output size overflow",
         )?;
-        let mut result = vec![0.0f64; numel];
-        for (i, &v) in vals.iter().enumerate().take(k) {
-            let (row, col) = if offset >= 0 {
-                (i, i + abs_offset)
-            } else {
-                (i + abs_offset, i)
-            };
-            result[row * n + col] = v;
-        }
-        self.tensor_variable(result, vec![n, n], false)
+
+        // Forward is purely linear in the input — output[row, col] is
+        // input[i] when (row, col) is on the requested diagonal,
+        // 0 otherwise. Backward extracts the diagonal:
+        //     grad_input[i] = grad_output[row, col]
+        // for the same (row, col) the forward used. Wrap in
+        // tensor_apply_function with this analytical backward.
+        // Tracked under frankentorch-d180.
+        let positive_offset = offset >= 0;
+        self.tensor_apply_function(
+            &[input],
+            move |_ctx, inputs| {
+                let (vals, _in_shape) = inputs[0];
+                let mut result = vec![0.0_f64; n * n];
+                for (i, &v) in vals.iter().enumerate().take(k) {
+                    let (row, col) = if positive_offset {
+                        (i, i + abs_offset)
+                    } else {
+                        (i + abs_offset, i)
+                    };
+                    result[row * n + col] = v;
+                }
+                Ok((result, vec![n, n]))
+            },
+            move |_ctx, grad_outputs| {
+                let grad_y = grad_outputs[0];
+                let mut grad_in = vec![0.0_f64; k];
+                for (i, slot) in grad_in.iter_mut().enumerate().take(k) {
+                    let (row, col) = if positive_offset {
+                        (i, i + abs_offset)
+                    } else {
+                        (i + abs_offset, i)
+                    };
+                    *slot = grad_y[row * n + col];
+                }
+                Ok(vec![Some(grad_in)])
+            },
+        )
     }
 
     /// Return unique elements from a 1D tensor.
@@ -28151,6 +28178,62 @@ mod tests {
         ];
         for (i, (&v, &e)) in vals.iter().zip(expected.iter()).enumerate() {
             assert!((v - e).abs() < 1e-12, "diag[{i}] = {v}, expected {e}");
+        }
+    }
+
+    #[test]
+    fn diag_embed_propagates_gradient_via_diagonal_extraction() {
+        // Regression test for frankentorch-d180. tensor_diag_embed
+        // used to extract values, build the embedded matrix in plain
+        // f64, and rebuild a requires_grad=false leaf — same severed-
+        // autograd pattern recently fixed for cross / matrix_norm
+        // etc. After wrapping in tensor_apply_function with the
+        // diagonal-extraction backward, gradients flow.
+        //
+        // For input [a, b, c] embedded on the main diagonal of a 3x3:
+        //   output = [[a, 0, 0], [0, b, 0], [0, 0, c]]
+        //   ∂output[i,j]/∂input[k] = δ_ik δ_jk (only when i == j == k)
+        // Under sum loss the gradient on the input is just [1, 1, 1]
+        // (each input element appears exactly once on the diagonal).
+        // For a sub-diagonal (offset=-1) embedding of [a, b]:
+        //   output[1,0] = a, output[2,1] = b
+        // and grad_input under sum loss is [1, 1].
+        //
+        // To make the test more interesting (catch index-routing
+        // bugs), use grad_output ≠ all-ones via a weighted sum:
+        // multiply by a 1-D weight, then sum.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let v = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        let d = s.tensor_diag_embed(v, 0).unwrap();
+        // Pick weights that make grad_y[i,j] vary so the test catches
+        // wrong (row, col) routing.
+        let weights = s
+            .tensor_variable(
+                vec![
+                    1.0, 2.0, 3.0,
+                    4.0, 5.0, 6.0,
+                    7.0, 8.0, 9.0,
+                ],
+                vec![3, 3],
+                false,
+            )
+            .unwrap();
+        let weighted = s.tensor_mul(d, weights).unwrap();
+        let loss = s.tensor_sum(weighted).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, v)
+            .expect("diag_embed must propagate gradient via diagonal extraction");
+        // ∂loss/∂v[i] = weights[i, i] (main-diagonal embedding)
+        // = [weights[0,0], weights[1,1], weights[2,2]] = [1, 5, 9]
+        let expected = [1.0_f64, 5.0, 9.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "diag_embed grad[{i}] = {g}, expected {e}"
+            );
         }
     }
 
