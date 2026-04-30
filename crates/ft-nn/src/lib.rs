@@ -11975,10 +11975,7 @@ impl LossModule for MultiLabelMarginLoss {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let x = session.tensor_values(input)?;
-        let y = session.tensor_values(target)?;
         let shape = session.tensor_shape(input)?;
-
         if shape.is_empty() {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -11986,58 +11983,73 @@ impl LossModule for MultiLabelMarginLoss {
                 },
             )));
         }
-
         let c = *shape.last().unwrap();
-        let batch_size = x.len() / c;
-        let mut losses = Vec::with_capacity(batch_size);
+        let batch_size = checked_shape_numel(
+            &shape[..shape.len() - 1],
+            "MultiLabelMarginLoss batch shape overflow",
+        )?
+        .max(1);
 
-        for b in 0..batch_size {
-            let offset = b * c;
-            let mut sample_loss = 0.0;
-            let mut count = 0;
-            for i in 0..c {
-                if y[offset + i] > 0.5 {
-                    // This is a target class
-                    for j in 0..c {
-                        if y[offset + j] <= 0.5 {
-                            // Not a target class
-                            let margin = 1.0 - (x[offset + i] - x[offset + j]);
-                            if margin > 0.0 {
-                                sample_loss += margin;
-                            }
-                            count += 1;
-                        }
-                    }
-                }
-            }
-            losses.push(if count > 0 {
-                sample_loss / c as f64
-            } else {
-                0.0
-            });
-        }
+        // Compose through autograd primitives. Tracked under
+        // frankentorch-r38w (child of cq0b).
+        // Reshape input and target to [batch, c] and build the pair-
+        // wise difference tensor [batch, c, c] via broadcasting
+        // unsqueeze + sub. Mask by target_mask outer non_target_mask,
+        // apply relu and divide by C.
+        let input_flat = session.tensor_reshape(input, vec![batch_size, c])?;
+        let target_flat = session.tensor_reshape(target, vec![batch_size, c])?;
+
+        // Build target_mask (1 where y > 0.5) and non_target_mask
+        // (1 where y <= 0.5). Use the f64 values directly (the body
+        // expects target to be a binary {0, 1} mask).
+        let target_vals = session.tensor_values(target_flat)?;
+        let target_mask_vals: Vec<f64> = target_vals
+            .iter()
+            .map(|&v| if v > 0.5 { 1.0 } else { 0.0 })
+            .collect();
+        let non_target_mask_vals: Vec<f64> =
+            target_mask_vals.iter().map(|&v| 1.0 - v).collect();
+        let target_mask = session.tensor_variable(target_mask_vals, vec![batch_size, c], false)?;
+        let non_target_mask =
+            session.tensor_variable(non_target_mask_vals, vec![batch_size, c], false)?;
+
+        // x_i has shape [batch, c, 1]; x_j has shape [batch, 1, c].
+        let x_i = session.tensor_unsqueeze(input_flat, 2)?;
+        let x_j = session.tensor_unsqueeze(input_flat, 1)?;
+        let x_i_b = session.tensor_expand(x_i, vec![batch_size, c, c])?;
+        let x_j_b = session.tensor_expand(x_j, vec![batch_size, c, c])?;
+        let pair_diff = session.tensor_sub(x_i_b, x_j_b)?;
+        // margin_ij = 1 - (x_i - x_j)
+        let ones3d = session.full(vec![batch_size, c, c], 1.0, false)?;
+        let margin_pair = session.tensor_sub(ones3d, pair_diff)?;
+        let relu_margin = session.tensor_relu(margin_pair)?;
+        // pair_mask = target_mask_i * non_target_mask_j
+        let t_i = session.tensor_unsqueeze(target_mask, 2)?;
+        let nt_j = session.tensor_unsqueeze(non_target_mask, 1)?;
+        let t_i_b = session.tensor_expand(t_i, vec![batch_size, c, c])?;
+        let nt_j_b = session.tensor_expand(nt_j, vec![batch_size, c, c])?;
+        let pair_mask = session.tensor_mul(t_i_b, nt_j_b)?;
+        let masked = session.tensor_mul(relu_margin, pair_mask)?;
+
+        // Sum over j (dim=2) then over i (dim=1) → [batch]; divide by C.
+        let sum_j = session.tensor_sum_dim(masked, 2)?; // [batch, c]
+        let sum_ij = session.tensor_sum_dim(sum_j, 1)?; // [batch]
+        let c_t = session.full(vec![batch_size], c as f64, false)?;
+        let per_sample = session.tensor_div(sum_ij, c_t)?;
 
         match self.reduction {
             Reduction::None => {
-                let out_shape = if shape.len() > 1 {
-                    shape[..shape.len() - 1].to_vec()
+                if shape.len() == 1 {
+                    // Match the prior behavior: return a [1] tensor
+                    // since the input was a single sample.
+                    Ok(per_sample)
                 } else {
-                    vec![1]
-                };
-                session.tensor_variable(losses, out_shape, false)
+                    let out_shape = shape[..shape.len() - 1].to_vec();
+                    session.tensor_reshape(per_sample, out_shape)
+                }
             }
-            Reduction::Mean => {
-                let mean = if losses.is_empty() {
-                    0.0
-                } else {
-                    losses.iter().sum::<f64>() / losses.len() as f64
-                };
-                session.tensor_variable(vec![mean], vec![1], false)
-            }
-            Reduction::Sum => {
-                let sum = losses.iter().sum::<f64>();
-                session.tensor_variable(vec![sum], vec![1], false)
-            }
+            Reduction::Mean => session.tensor_mean(per_sample),
+            Reduction::Sum => session.tensor_sum(per_sample),
         }
     }
 }
