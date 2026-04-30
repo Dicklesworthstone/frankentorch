@@ -10509,10 +10509,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_vals = self.tensor_values(input)?;
-        let target_vals = self.tensor_values(target)?;
         let shape = self.tensor_shape(input)?;
-
         if shape.len() != 2 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -10521,26 +10518,18 @@ impl FrankenTorchSession {
             )));
         }
 
-        let (batch, classes) = (shape[0], shape[1]);
-        let mut total_loss = 0.0;
-
-        for i in 0..batch {
-            let mut sample_loss = 0.0;
-            for j in 0..classes {
-                let idx = i * classes + j;
-                let x = input_vals[idx];
-                let t = target_vals[idx];
-                // Numerically stable BCE with logits per element:
-                // -[t * log(sigmoid(x)) + (1-t) * log(1-sigmoid(x))]
-                // = max(x, 0) - x*t + log(1 + exp(-|x|))
-                let bce = x.max(0.0) - x * t + (1.0 + (-x.abs()).exp()).ln();
-                sample_loss += bce;
-            }
-            total_loss += sample_loss / classes as f64;
-        }
-
-        let mean_loss = total_loss / batch as f64;
-        self.tensor_variable(vec![mean_loss], vec![1], false)
+        // For a 2-D input [batch, classes] the per-element BCE-with-
+        // logits formula
+        //     bce(x, t) = max(x, 0) - x*t + log1p(exp(-|x|))
+        // averaged over both dims yields mean over all (i, j) of bce —
+        // exactly what bce_with_logits_loss computes via composition
+        // through autograd primitives. Delegating preserves the
+        // numerical-stability log1p(exp(-|x|)) form while keeping
+        // the autograd tape intact. Tracked under frankentorch-4liu.
+        // Previously this body extracted values, computed the
+        // accumulator in plain f64, and rebuilt a non-grad leaf —
+        // silently severing the tape.
+        self.bce_with_logits_loss(input, target)
     }
 
     /// Negative log likelihood loss.
@@ -28017,6 +28006,51 @@ mod tests {
         let loss = s.multilabel_soft_margin_loss(input, target).unwrap();
         let val = s.tensor_values(loss).unwrap()[0];
         assert!(val < 0.01, "well-classified should have low loss: {val}");
+    }
+
+    #[test]
+    fn multilabel_soft_margin_loss_propagates_gradient_via_bce_with_logits() {
+        // Regression test for frankentorch-4liu.
+        // multilabel_soft_margin_loss used to extract values, sum
+        // the per-element BCE-with-logits in plain f64, and rebuild
+        // a requires_grad=false leaf — silently severing autograd
+        // for multi-label classification training. After delegating
+        // to bce_with_logits_loss (autograd-aware via composition
+        // through tensor_relu + tensor_abs + tensor_log1p +
+        // tensor_mean), gradients flow to logits.
+        //
+        // Test at x = ±1 (away from the relu/abs corner at 0) so
+        // the smooth derivative is unambiguous. For BCE-with-logits:
+        //   d bce(x, t) / dx = sigmoid(x) - t      (smooth interior)
+        // For input = [[1.0, -1.0]], target = [[1.0, 0.0]]:
+        //   d/dx_0 = sigmoid(1)  - 1 = 0.7311 - 1 = -0.2689
+        //   d/dx_1 = sigmoid(-1) - 0 = 0.2689
+        // After mean over 2 elements (1/2 factor):
+        //   grad_logits = [[-0.13447, 0.13447]]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let logits = s
+            .tensor_variable(vec![1.0, -1.0], vec![1, 2], true)
+            .unwrap();
+        let targets = s
+            .tensor_variable(vec![1.0, 0.0], vec![1, 2], false)
+            .unwrap();
+        let loss = s.multilabel_soft_margin_loss(logits, targets).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, logits)
+            .expect("multilabel_soft_margin_loss must propagate gradient through logits");
+
+        let sigmoid = |x: f64| 1.0 / (1.0 + (-x).exp());
+        let expected = [
+            (sigmoid(1.0) - 1.0) / 2.0,
+            (sigmoid(-1.0) - 0.0) / 2.0,
+        ];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "multilabel_soft_margin_loss grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     // ── conv3d and conv_transpose tests ────────────────────────────────
