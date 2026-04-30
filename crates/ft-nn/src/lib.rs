@@ -11769,10 +11769,7 @@ impl LossModule for FocalLoss {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let logits = session.tensor_values(input)?;
-        let targets = session.tensor_values(target)?;
         let input_shape = session.tensor_shape(input)?;
-
         if input_shape.is_empty() {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -11782,49 +11779,50 @@ impl LossModule for FocalLoss {
         }
 
         let num_classes = *input_shape.last().unwrap();
-        let batch: usize = logits.len() / num_classes;
-
-        let mut losses = vec![0.0f64; batch];
-
-        for b in 0..batch {
-            let class_idx = targets[b] as usize;
-            if class_idx >= num_classes {
+        let last_dim = input_shape.len() - 1;
+        // Validate target indices via session.tensor_values (target is
+        // a non-differentiable label tensor). We still rebuild a
+        // non-grad index leaf below for tensor_gather.
+        let target_vals = session.tensor_values(target)?;
+        let batch = target_vals.len();
+        for &t in &target_vals {
+            let class_idx = t as usize;
+            if !t.is_finite() || t < 0.0 || t.fract() != 0.0 || class_idx >= num_classes {
                 return Err(AutogradError::Dispatch(DispatchError::Key(
                     DispatchKeyError::IncompatibleSet {
                         reason: "FocalLoss: target class index out of range",
                     },
                 )));
             }
-
-            // Softmax for numerical stability
-            let offset = b * num_classes;
-            let mut max_logit = f64::NEG_INFINITY;
-            for c in 0..num_classes {
-                if logits[offset + c] > max_logit {
-                    max_logit = logits[offset + c];
-                }
-            }
-            let mut sum_exp = 0.0f64;
-            for c in 0..num_classes {
-                sum_exp += (logits[offset + c] - max_logit).exp();
-            }
-            let log_sum_exp = max_logit + sum_exp.ln();
-            let log_pt = logits[offset + class_idx] - log_sum_exp;
-            let pt = log_pt.exp();
-
-            losses[b] = -self.alpha * (1.0 - pt).powf(self.gamma) * log_pt;
         }
 
+        // Compose through autograd primitives. Tracked under
+        // frankentorch-kxcz (child of cq0b).
+        // Math: -alpha * (1 - p_t)^gamma * log(p_t)
+        //   p_t = softmax(logits)[target_idx]
+        //   log_pt = log_softmax(logits)[target_idx]    (gather)
+        //   pt = exp(log_pt)
+        let log_probs = session.tensor_log_softmax(input, last_dim)?;
+        // Build the index tensor in the shape [..., 1] (matching log_probs
+        // with the last dim as size 1) so tensor_gather collects one entry
+        // per sample.
+        let mut index_shape = input_shape.clone();
+        index_shape[last_dim] = 1;
+        let index = session.tensor_variable(target_vals, index_shape.clone(), false)?;
+        let gathered = session.tensor_gather(log_probs, last_dim, index)?;
+        let log_pt = session.tensor_squeeze(gathered, last_dim)?; // shape [batch]
+        let pt = session.tensor_exp(log_pt)?;
+        let ones = session.full(vec![batch], 1.0, false)?;
+        let one_minus_pt = session.tensor_sub(ones, pt)?;
+        let focal_factor = session.tensor_pow(one_minus_pt, self.gamma)?;
+        let weighted = session.tensor_mul(focal_factor, log_pt)?;
+        let alpha_t = session.full(vec![batch], -self.alpha, false)?;
+        let per_sample = session.tensor_mul(alpha_t, weighted)?; // [batch]
+
         match self.reduction {
-            Reduction::None => session.tensor_variable(losses, vec![batch], false),
-            Reduction::Mean => {
-                let mean = losses.iter().sum::<f64>() / batch as f64;
-                session.tensor_variable(vec![mean], vec![1], false)
-            }
-            Reduction::Sum => {
-                let sum = losses.iter().sum::<f64>();
-                session.tensor_variable(vec![sum], vec![1], false)
-            }
+            Reduction::None => Ok(per_sample),
+            Reduction::Mean => session.tensor_mean(per_sample),
+            Reduction::Sum => session.tensor_sum(per_sample),
         }
     }
 }
