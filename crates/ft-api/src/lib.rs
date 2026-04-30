@@ -15189,10 +15189,7 @@ impl FrankenTorchSession {
         dim: usize,
         maxnorm: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, shape) = {
-            let (v, m) = self.tensor_values_meta(input)?;
-            (v, m.shape().to_vec())
-        };
+        let shape = self.tensor_shape(input)?;
         if !p.is_finite() || p <= 0.0 || !maxnorm.is_finite() || maxnorm <= 0.0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15200,38 +15197,61 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        if dim >= shape.len() {
+        let n = shape.len();
+        if dim >= n {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "renorm: dimension out of range",
                 },
             )));
         }
+
+        // Compose through autograd primitives. The closed-form scale
+        // per slice is
+        //     scale_d = maxnorm / max(norm_d, maxnorm)
+        // which equals 1 when norm_d <= maxnorm and maxnorm/norm_d
+        // otherwise. Tracked under frankentorch-go4q. Previously this
+        // body extracted values, conditionally scaled in plain f64,
+        // and rebuilt a non-grad leaf — silently severing autograd
+        // through embedding-regularization paths
+        // (torch.nn.Embedding(max_norm=...)).
+        //
+        // Strategy: permute `dim` to position 0, reshape to
+        // [dim_size, other_size], compute per-row L_p norm, scale
+        // each row, then reshape + permute back.
+        let total = Self::checked_shape_numel(&shape, "renorm: shape volume overflow")?;
         let dim_size = shape[dim];
-        let outer_size = Self::checked_shape_numel(&shape[..dim], "renorm: outer shape overflow")?;
-        let inner_size =
-            Self::checked_shape_numel(&shape[dim + 1..], "renorm: inner shape overflow")?;
-        let mut result = vals.clone();
-        for d in 0..dim_size {
-            let mut norm = 0.0_f64;
-            for outer in 0..outer_size {
-                for inner in 0..inner_size {
-                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    norm += vals[idx].abs().powf(p);
-                }
-            }
-            norm = norm.powf(1.0 / p);
-            if norm > maxnorm {
-                let scale = maxnorm / norm;
-                for outer in 0..outer_size {
-                    for inner in 0..inner_size {
-                        let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                        result[idx] *= scale;
-                    }
-                }
-            }
+        let other_size = total / dim_size;
+
+        // Build the swap-(0, dim) permutation. swap is its own inverse.
+        let mut perm: Vec<usize> = (0..n).collect();
+        perm.swap(0, dim);
+        let permuted_shape: Vec<usize> = perm.iter().map(|&i| shape[i]).collect();
+
+        let permuted = if dim == 0 {
+            input
+        } else {
+            self.tensor_permute(input, perm.clone())?
+        };
+        let flat = self.tensor_reshape(permuted, vec![dim_size, other_size])?;
+
+        let abs_x = self.tensor_abs(flat)?;
+        let pow_x = self.tensor_pow(abs_x, p)?;
+        let sum_x = self.tensor_sum_dim(pow_x, 1)?; // [dim_size]
+        let norm = self.tensor_pow(sum_x, 1.0 / p)?; // [dim_size]
+        let denom = self.tensor_clamp_min(norm, maxnorm)?; // [dim_size]
+        let max_t = self.full(vec![dim_size], maxnorm, false)?;
+        let scale = self.tensor_div(max_t, denom)?; // [dim_size]
+        let scale_kd = self.tensor_unsqueeze(scale, 1)?; // [dim_size, 1]
+        let scale_b = self.tensor_expand(scale_kd, vec![dim_size, other_size])?;
+        let scaled = self.tensor_mul(flat, scale_b)?;
+
+        let unflat = self.tensor_reshape(scaled, permuted_shape)?;
+        if dim == 0 {
+            Ok(unflat)
+        } else {
+            self.tensor_permute(unflat, perm)
         }
-        self.tensor_tape.leaf(result, shape, false)
     }
 
     /// Test if each element is in a set of test values. Returns 0.0/1.0 mask.
@@ -36292,6 +36312,63 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         assert!((vals[0] - 1.5).abs() < 1e-10);
         assert!((vals[2] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn renorm_propagates_gradient_through_input() {
+        // Regression test for frankentorch-go4q. tensor_renorm used
+        // to extract values, conditionally scale in plain f64, and
+        // rebuild a non-grad leaf — silently severing autograd
+        // through embedding-regularization paths. After composing
+        // through permute/reshape/abs/pow/sum_dim/clamp/div/mul
+        // primitives, gradients flow.
+        //
+        // For x = [[3, 4], [1, 0]] (shape [2, 2]) with p=2, dim=0,
+        // maxnorm=2.5:
+        //   row 0 norm = sqrt(9 + 16) = 5  > 2.5 → scale = 0.5
+        //   row 1 norm = sqrt(1 + 0) = 1   <= 2.5 → scale = 1
+        //   out = [[1.5, 2.0], [1.0, 0.0]]
+        // Sanity check: the gradient should be finite and non-zero
+        // throughout (the row-0 entries pass through a scaling
+        // factor that depends on x, the row-1 entries pass through
+        // the identity branch).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![3.0, 4.0, 1.0, 0.0], vec![2, 2], true)
+            .unwrap();
+        let out = s.tensor_renorm(x, 2.0, 0, 2.5).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("tensor_renorm must propagate gradient");
+        assert_eq!(grad.len(), 4);
+        assert!(
+            grad.iter().all(|g| g.is_finite()),
+            "renorm gradient must be finite, got {grad:?}"
+        );
+        // For row 1 (norm <= maxnorm, identity branch under sum loss):
+        //   d sum(x_row_1) / d x_row_1 = 1
+        // So grad[2] = 1 (x[1,0] unscaled identity contributes 1 to sum)
+        // and grad[3] = 1 (x[1,1] = 0).
+        assert!(
+            (grad[2] - 1.0).abs() < 1e-12,
+            "renorm grad[2] (row 1 identity) = {}, expected 1",
+            grad[2]
+        );
+        assert!(
+            (grad[3] - 1.0).abs() < 1e-12,
+            "renorm grad[3] (row 1 identity) = {}, expected 1",
+            grad[3]
+        );
+        // For row 0 (norm > maxnorm), gradient is more involved
+        // (chain through the scale factor) — assert non-zero finite.
+        assert!(
+            grad[0].abs() > 1e-9 && grad[1].abs() > 1e-9,
+            "renorm grad on scaled row should be non-zero, got {} {}",
+            grad[0],
+            grad[1]
+        );
     }
 
     #[test]
