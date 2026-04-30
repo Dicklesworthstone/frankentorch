@@ -3961,7 +3961,6 @@ impl FrankenTorchSession {
         n: Option<usize>,
         increasing: bool,
     ) -> Result<TensorNodeId, AutogradError> {
-        let vals = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         if shape.len() != 1 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -3985,16 +3984,57 @@ impl FrankenTorchSession {
             std::mem::size_of::<f64>(),
             "vander: output size overflow",
         )?;
-        let mut data = vec![0.0f64; numel];
 
-        for i in 0..rows {
-            for j in 0..cols {
-                let exp = if increasing { j } else { cols - 1 - j };
-                data[i * cols + j] = vals[i].powi(exp as i32);
-            }
-        }
-
-        self.tensor_variable(data, vec![rows, cols], false)
+        // Forward: output[i, j] = x[i]^exp_j   where
+        //     exp_j = j if increasing else cols-1-j.
+        // Backward (each row depends only on x[i]):
+        //     d output[i, j] / d x[i] = exp_j * x[i]^(exp_j - 1)   (0 when exp_j == 0)
+        //     grad_input[i] = sum_j grad_output[i, j] * exp_j * x[i]^(exp_j - 1)
+        // Save x for backward. Tracked under frankentorch-j3kg.
+        self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, _in_shape) = inputs[0];
+                if vals.len() != rows {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "vander: input length mismatch",
+                        },
+                    )));
+                }
+                let mut data = vec![0.0_f64; numel];
+                for i in 0..rows {
+                    for j in 0..cols {
+                        let exp = if increasing { j } else { cols - 1 - j };
+                        data[i * cols + j] = vals[i].powi(exp as i32);
+                    }
+                }
+                ctx.save_for_backward(vals.to_vec(), vec![rows]);
+                Ok((data, vec![rows, cols]))
+            },
+            move |ctx, grad_outputs| {
+                let grad_y = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                let mut grad_in = vec![0.0_f64; rows];
+                for i in 0..rows {
+                    let xi = x_vals[i];
+                    let mut acc = 0.0_f64;
+                    for j in 0..cols {
+                        let exp = if increasing { j } else { cols - 1 - j };
+                        if exp == 0 {
+                            // d x^0 / dx = 0; constant column contributes nothing.
+                            continue;
+                        }
+                        let power = (exp - 1) as i32;
+                        let coeff = exp as f64;
+                        acc += grad_y[i * cols + j] * coeff * xi.powi(power);
+                    }
+                    grad_in[i] = acc;
+                }
+                Ok(vec![Some(grad_in)])
+            },
+        )
     }
 
     /// Create a complex tensor from magnitude and phase angle.
@@ -26402,6 +26442,40 @@ mod tests {
         let t = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
         let big = i32::MAX as usize + 1;
         assert!(s.tensor_vander(t, Some(big), false).is_err());
+    }
+
+    #[test]
+    fn vander_propagates_gradient_via_polynomial_backward() {
+        // Regression test for frankentorch-j3kg. tensor_vander used
+        // to extract values, build the Vandermonde matrix in plain
+        // f64, and rebuild a requires_grad=false leaf — same severed-
+        // autograd pattern recently fixed for cross / diag_embed /
+        // block_diag / matrix_norm. After wrapping in
+        // tensor_apply_function with the polynomial backward
+        //     d output[i, j] / d input[i] = exp_j * input[i]^(exp_j - 1)
+        // gradients flow.
+        //
+        // For x = [2, 3] with N=4 increasing=false, output rows are
+        // [x^3, x^2, x^1, x^0] = [[8, 4, 2, 1], [27, 9, 3, 1]].
+        // Under sum loss the gradient is
+        //   grad[i] = 3*x[i]^2 + 2*x[i] + 1 + 0  (the x^0 column adds 0)
+        //   x=2:   3*4 + 2*2 + 1 = 12 + 4 + 1 = 17
+        //   x=3:   3*9 + 2*3 + 1 = 27 + 6 + 1 = 34
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+        let out = s.tensor_vander(t, Some(4), false).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, t)
+            .expect("vander must propagate gradient via polynomial backward");
+        let expected = [17.0_f64, 34.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "vander grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     // ── cdist tests ────────────────────────────────────────────────────
