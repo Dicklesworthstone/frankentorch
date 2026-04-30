@@ -13617,41 +13617,27 @@ pub fn pad_sequence(
         shapes.push(s);
     }
 
-    let feature_shape = &shapes[0][1..];
-    let mut feature_size =
-        checked_shape_numel(feature_shape, "pad_sequence feature shape overflow")?;
-    if feature_size == 0 {
-        feature_size = 1;
-    }
-    let batch_size = sequences.len();
-
-    let total = checked_mul(batch_size, max_len, "pad_sequence output size overflow")?;
-    let total = checked_mul(total, feature_size, "pad_sequence output size overflow")?;
-    let mut output = vec![padding_value; total];
-
+    // Compose via tensor_pad + tensor_stack so gradients flow back to
+    // every input sequence. Tracked under frankentorch-7oyn. Previous
+    // body extracted tensor_values + rebuilt a non-grad leaf, severing
+    // autograd through every variable-length training pipeline.
+    let ndim = shapes[0].len();
+    let mut padded: Vec<TensorNodeId> = Vec::with_capacity(sequences.len());
     for (b, &seq) in sequences.iter().enumerate() {
-        let vals = session.tensor_values(seq)?;
         let seq_len = shapes[b][0];
-        for t in 0..seq_len {
-            let src_offset = t * feature_size;
-            let dst_offset = if batch_first {
-                (b * max_len + t) * feature_size
-            } else {
-                (t * batch_size + b) * feature_size
-            };
-            output[dst_offset..dst_offset + feature_size]
-                .copy_from_slice(&vals[src_offset..src_offset + feature_size]);
+        if seq_len == max_len {
+            padded.push(seq);
+        } else {
+            // tensor_pad uses innermost-first ordering. To pad only
+            // dim 0 on the right, place (max_len - seq_len) at the
+            // last pair of `padding`. Earlier pairs are zero.
+            let mut padding: Vec<usize> = vec![0; 2 * ndim];
+            padding[2 * ndim - 1] = max_len - seq_len;
+            padded.push(session.tensor_pad(seq, &padding, padding_value)?);
         }
     }
-
-    let mut out_shape = if batch_first {
-        vec![batch_size, max_len]
-    } else {
-        vec![max_len, batch_size]
-    };
-    out_shape.extend_from_slice(feature_shape);
-
-    session.tensor_variable(output, out_shape, false)
+    let stack_dim = if batch_first { 0 } else { 1 };
+    session.tensor_stack(&padded, stack_dim)
 }
 
 // ── torch.nn.utils.weight_norm / spectral_norm ────────────────────────────
@@ -24472,6 +24458,47 @@ mod tests {
         let vals = s.tensor_values(padded).unwrap();
         // t=0: [1, 3], t=1: [2, 4], t=2: [-1, 5]
         assert_eq!(vals, vec![1.0, 3.0, 2.0, 4.0, -1.0, 5.0]);
+    }
+
+    #[test]
+    fn pad_sequence_propagates_gradients_to_inputs() {
+        // Regression for frankentorch-7oyn: previous body extracted
+        // tensor_values + rebuilt a non-grad leaf, severing gradients
+        // from every variable-length training pipeline.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let seq1 = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        let seq2 = s.tensor_variable(vec![4.0, 5.0], vec![2], true).unwrap();
+        let seq3 = s.tensor_variable(vec![6.0], vec![1], true).unwrap();
+
+        let padded = pad_sequence(&mut s, &[seq1, seq2, seq3], true, 0.0).unwrap();
+        let loss = s.tensor_sum(padded).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        // Each input position is referenced exactly once in the
+        // padded output, so its gradient w.r.t. sum(padded) is 1.0.
+        let g1 = s.tensor_gradient(&report, seq1).expect("seq1 grad");
+        let g2 = s.tensor_gradient(&report, seq2).expect("seq2 grad");
+        let g3 = s.tensor_gradient(&report, seq3).expect("seq3 grad");
+        assert_eq!(g1, &vec![1.0, 1.0, 1.0]);
+        assert_eq!(g2, &vec![1.0, 1.0]);
+        assert_eq!(g3, &vec![1.0]);
+    }
+
+    #[test]
+    fn pad_sequence_time_first_propagates_gradients() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let seq1 = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let seq2 = s
+            .tensor_variable(vec![3.0, 4.0, 5.0], vec![3], true)
+            .unwrap();
+        let padded = pad_sequence(&mut s, &[seq1, seq2], false, -1.0).unwrap();
+        let loss = s.tensor_sum(padded).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let g1 = s.tensor_gradient(&report, seq1).expect("seq1 grad");
+        let g2 = s.tensor_gradient(&report, seq2).expect("seq2 grad");
+        assert_eq!(g1, &vec![1.0, 1.0]);
+        assert_eq!(g2, &vec![1.0, 1.0, 1.0]);
     }
 
     // ── nn.init Tests ──────────────────────────────────────────────────
