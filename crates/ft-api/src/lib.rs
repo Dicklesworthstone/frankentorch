@@ -15080,10 +15080,7 @@ impl FrankenTorchSession {
         size: usize,
         step: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, shape) = {
-            let (v, m) = self.tensor_values_meta(input)?;
-            (v, m.shape().to_vec())
-        };
+        let shape = self.tensor_shape(input)?;
         let ndim = shape.len();
         if dimension >= ndim || size == 0 || size > shape[dimension] || step == 0 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -15092,6 +15089,13 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        // Pre-compute the (flat_out -> in_flat) gather table; both
+        // the forward and backward closures use the same mapping.
+        // The forward gathers vals[in_flat] into result[flat_out];
+        // the backward scatters grad_output[flat_out] into
+        // grad_input[in_flat] (accumulating overlaps from
+        // step < size).
+        // Tracked under frankentorch-hc18.
         let n_windows = (shape[dimension] - size) / step + 1;
         let mut strides = vec![1usize; ndim];
         for d in (0..ndim - 1).rev() {
@@ -15111,8 +15115,11 @@ impl FrankenTorchSession {
             )?;
         }
         let out_numel = Self::checked_shape_numel(&out_shape, "unfold: output shape overflow")?;
-        let mut result = vec![0.0; out_numel];
-        for (flat_out, slot) in result.iter_mut().enumerate().take(out_numel) {
+        let in_numel = Self::checked_shape_numel(&shape, "unfold: input shape overflow")?;
+
+        // Build the gather table once.
+        let mut gather: Vec<usize> = Vec::with_capacity(out_numel);
+        for flat_out in 0..out_numel {
             let mut remaining = flat_out;
             let mut coords = vec![0usize; out_ndim];
             for d in 0..out_ndim {
@@ -15128,9 +15135,28 @@ impl FrankenTorchSession {
                 };
                 in_flat += c * strides[d];
             }
-            *slot = vals[in_flat];
+            gather.push(in_flat);
         }
-        self.tensor_tape.leaf(result, out_shape, false)
+        let gather_for_fwd = gather.clone();
+        let gather_for_bwd = gather;
+        let out_shape_clone = out_shape.clone();
+
+        self.tensor_apply_function(
+            &[input],
+            move |_ctx, inputs| {
+                let (vals, _shape) = inputs[0];
+                let result: Vec<f64> = gather_for_fwd.iter().map(|&k| vals[k]).collect();
+                Ok((result, out_shape_clone.clone()))
+            },
+            move |_ctx, grad_outputs| {
+                let g = grad_outputs[0];
+                let mut grad_in = vec![0.0_f64; in_numel];
+                for (flat_out, &in_flat) in gather_for_bwd.iter().enumerate() {
+                    grad_in[in_flat] += g[flat_out];
+                }
+                Ok(vec![Some(grad_in)])
+            },
+        )
     }
 
     /// Renormalize sub-tensors so their p-norm <= maxnorm.
@@ -36157,6 +36183,42 @@ mod tests {
             .unwrap();
         let out = s.tensor_unfold(x, 0, 2, 2).unwrap();
         assert_eq!(s.tensor_shape(out).unwrap(), &[2, 2]);
+    }
+
+    #[test]
+    fn unfold_propagates_gradient_via_scatter() {
+        // Regression test for frankentorch-hc18. tensor_unfold used
+        // to extract values, gather windows in plain f64, and
+        // rebuild a non-grad leaf — silently severing autograd.
+        // After wrapping in tensor_apply_function with the
+        // scatter backward, gradients flow.
+        //
+        // For x = [1, 2, 3, 4], unfold(dim=0, size=3, step=1):
+        //   out shape is [2, 3]: rows are [1,2,3] and [2,3,4]
+        //   gather mapping: out[0,0]=x[0], out[0,1]=x[1], out[0,2]=x[2],
+        //                   out[1,0]=x[1], out[1,1]=x[2], out[1,2]=x[3]
+        //   Under sum loss: grad_x[k] = count of (flat_out → k)
+        //     x[0]: 1 (only out[0,0])
+        //     x[1]: 2 (out[0,1] and out[1,0])
+        //     x[2]: 2 (out[0,2] and out[1,1])
+        //     x[3]: 1 (only out[1,2])
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let out = s.tensor_unfold(x, 0, 3, 1).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("tensor_unfold must propagate gradient via scatter");
+        let expected = [1.0_f64, 2.0, 2.0, 1.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "unfold grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
