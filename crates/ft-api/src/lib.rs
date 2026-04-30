@@ -15788,14 +15788,18 @@ impl FrankenTorchSession {
         beta: f64,
         alpha: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_vals = self.tensor_values(input)?;
-        let v1 = self.tensor_values(vec1)?;
-        let v2 = self.tensor_values(vec2)?;
+        let v1_shape = self.tensor_shape(vec1)?;
+        let v2_shape = self.tensor_shape(vec2)?;
         let input_shape = self.tensor_shape(input)?;
-
-        let m = v1.len();
-        let n = v2.len();
-
+        if v1_shape.len() != 1 || v2_shape.len() != 1 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "addr: vec1 and vec2 must be 1-D",
+                },
+            )));
+        }
+        let m = v1_shape[0];
+        let n = v2_shape[0];
         if input_shape != [m, n] {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15804,17 +15808,15 @@ impl FrankenTorchSession {
             )));
         }
 
-        let total = Self::checked_mul(m, n, "addr output size overflow")?;
-        let mut result = Vec::with_capacity(total);
-        for (i, &v1_val) in v1.iter().enumerate() {
-            let base = Self::checked_mul(i, n, "addr index overflow")?;
-            for (j, &v2_val) in v2.iter().enumerate() {
-                let idx = Self::checked_add(base, j, "addr index overflow")?;
-                result.push(beta * input_vals[idx] + alpha * v1_val * v2_val);
-            }
-        }
-
-        let out = self.tensor_tape.leaf(result, vec![m, n], false)?;
+        // Compose through autograd-aware primitives. Tracked under
+        // frankentorch-pzih. Math:
+        //   out = beta * input + alpha * (vec1 ⊗ vec2)
+        let outer = self.tensor_outer(vec1, vec2)?;
+        let alpha_t = self.full(vec![m, n], alpha, false)?;
+        let beta_t = self.full(vec![m, n], beta, false)?;
+        let alpha_outer = self.tensor_mul(outer, alpha_t)?;
+        let beta_input = self.tensor_mul(input, beta_t)?;
+        let out = self.tensor_add(beta_input, alpha_outer)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!(
@@ -36137,6 +36139,49 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         // [[2+3, 2+0], [2+0, 2+0]] = [[5, 2], [2, 2]]
         assert_eq!(vals, &[5.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn addr_propagates_gradient_through_input_and_vecs() {
+        // Regression test for frankentorch-pzih. tensor_addr used to
+        // extract values, compute the rank-1 update in plain f64, and
+        // rebuild a non-grad leaf — silently severing autograd
+        // through input / vec1 / vec2. After composing through
+        // tensor_outer + tensor_mul + tensor_add (all autograd-aware),
+        // gradients flow.
+        //
+        // For input = ones([2, 2]), v1 = [1, 2], v2 = [3, 4],
+        // beta=1, alpha=1:
+        //   out = input + v1 ⊗ v2
+        //       = [[1, 1], [1, 1]] + [[3, 4], [6, 8]]
+        //       = [[4, 5], [7, 9]]
+        // Under sum loss:
+        //   d sum / d input = beta * 1 = 1 everywhere → grad_input = ones(2,2)
+        //   d sum / d v1[i] = alpha * sum_j v2[j] = 7 for all i
+        //     → grad_v1 = [7, 7]
+        //   d sum / d v2[j] = alpha * sum_i v1[i] = 3 for all j
+        //     → grad_v2 = [3, 3]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![2, 2], true)
+            .unwrap();
+        let v1 = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let v2 = s.tensor_variable(vec![3.0, 4.0], vec![2], true).unwrap();
+        let out = s.tensor_addr(input, v1, v2, 1.0, 1.0).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_input = s
+            .tensor_gradient(&report, input)
+            .expect("addr must propagate gradient through input");
+        let grad_v1 = s
+            .tensor_gradient(&report, v1)
+            .expect("addr must propagate gradient through v1");
+        let grad_v2 = s
+            .tensor_gradient(&report, v2)
+            .expect("addr must propagate gradient through v2");
+        assert_eq!(grad_input, vec![1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(grad_v1, vec![7.0, 7.0]);
+        assert_eq!(grad_v2, vec![3.0, 3.0]);
     }
 
     // ── inner tests ─────────────────────────────────────────────────────
