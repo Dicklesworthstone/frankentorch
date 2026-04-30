@@ -3366,14 +3366,47 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let av = self.tensor_values(a)?;
-        let bv = self.tensor_values(b)?;
-        let result = vec![
-            av[1] * bv[2] - av[2] * bv[1],
-            av[2] * bv[0] - av[0] * bv[2],
-            av[0] * bv[1] - av[1] * bv[0],
-        ];
-        self.tensor_variable(result, vec![3], false)
+
+        // Cross product is bilinear, so the Jacobian-vector products
+        // are themselves cross products:
+        //     grad_a = b × grad_c
+        //     grad_b = grad_c × a
+        // Wrap in tensor_apply_function with this analytical backward.
+        // Save a and b for backward. Tracked under frankentorch-j2rj.
+        self.tensor_apply_function(
+            &[a, b],
+            |ctx, inputs| {
+                let (av, _a_shape) = inputs[0];
+                let (bv, _b_shape) = inputs[1];
+                let result = vec![
+                    av[1] * bv[2] - av[2] * bv[1],
+                    av[2] * bv[0] - av[0] * bv[2],
+                    av[0] * bv[1] - av[1] * bv[0],
+                ];
+                ctx.save_for_backward(av.to_vec(), vec![3]);
+                ctx.save_for_backward(bv.to_vec(), vec![3]);
+                Ok((result, vec![3]))
+            },
+            |ctx, grad_outputs| {
+                let g = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let av = &saved[0];
+                let bv = &saved[1];
+                // grad_a = b × grad_c
+                let grad_a = vec![
+                    bv[1] * g[2] - bv[2] * g[1],
+                    bv[2] * g[0] - bv[0] * g[2],
+                    bv[0] * g[1] - bv[1] * g[0],
+                ];
+                // grad_b = grad_c × a
+                let grad_b = vec![
+                    g[1] * av[2] - g[2] * av[1],
+                    g[2] * av[0] - g[0] * av[2],
+                    g[0] * av[1] - g[1] * av[0],
+                ];
+                Ok(vec![Some(grad_a), Some(grad_b)])
+            },
+        )
     }
 
     /// Dot product along the last dimension (batched dot product).
@@ -27983,6 +28016,51 @@ mod tests {
         let a = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
         let b = s.tensor_variable(vec![3.0, 4.0], vec![2], false).unwrap();
         assert!(s.tensor_cross(a, b).is_err());
+    }
+
+    #[test]
+    fn cross_propagates_gradient_through_a_and_b() {
+        // Regression test for frankentorch-j2rj. tensor_cross used to
+        // extract values, compute the cross product elementwise, and
+        // rebuild a requires_grad=false leaf — same severed-autograd
+        // pattern fixed under frankentorch-1tax. After wrapping in
+        // tensor_apply_function with the bilinear backward
+        //     grad_a = b × grad_c
+        //     grad_b = grad_c × a
+        // gradients flow.
+        //
+        // For a = [1, 0, 0], b = [0, 1, 0]:
+        //   c = a × b = [0*0 - 0*1, 0*0 - 1*0, 1*1 - 0*0] = [0, 0, 1]
+        //   Under sum loss: grad_c = [1, 1, 1]
+        //   grad_a = b × grad_c = [1*1 - 0*1, 0*1 - 0*1, 0*1 - 1*1] = [1, 0, -1]
+        //   grad_b = grad_c × a = [1*0 - 1*0, 1*1 - 1*0, 1*0 - 1*1] = [0, 1, -1]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 0.0, 0.0], vec![3], true).unwrap();
+        let b = s.tensor_variable(vec![0.0, 1.0, 0.0], vec![3], true).unwrap();
+        let c = s.tensor_cross(a, b).unwrap();
+        let loss = s.tensor_sum(c).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s
+            .tensor_gradient(&report, a)
+            .expect("tensor_cross must propagate gradient through a");
+        let grad_b = s
+            .tensor_gradient(&report, b)
+            .expect("tensor_cross must propagate gradient through b");
+
+        let exp_a = [1.0_f64, 0.0, -1.0];
+        let exp_b = [0.0_f64, 1.0, -1.0];
+        for (i, (&g, &e)) in grad_a.iter().zip(exp_a.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "tensor_cross grad_a[{i}] = {g}, expected {e}"
+            );
+        }
+        for (i, (&g, &e)) in grad_b.iter().zip(exp_b.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "tensor_cross grad_b[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
