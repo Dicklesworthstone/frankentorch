@@ -15980,28 +15980,29 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         offset: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let vals = self.tensor_values(input)?;
-        let n = vals.len();
-        let abs_offset = offset.unsigned_abs() as usize;
-        let size = Self::checked_add(n, abs_offset, "diagflat: output size overflow")?;
-
-        let numel = Self::checked_mul(size, size, "diagflat: output size overflow")?;
-        let _ = Self::checked_mul(
-            numel,
-            std::mem::size_of::<f64>(),
-            "diagflat: output size overflow",
-        )?;
-        let mut result = vec![0.0; numel];
-        for (i, value) in vals.iter().enumerate().take(n) {
-            let (row, col) = if offset >= 0 {
-                (i, i + abs_offset)
-            } else {
-                (i + abs_offset, i)
-            };
-            result[row * size + col] = *value;
-        }
-
-        let out = self.tensor_tape.leaf(result, vec![size, size], false)?;
+        // Compose through reshape + tensor_diag_embed (the latter is
+        // autograd-aware after frankentorch-d180). Tracked under
+        // frankentorch-lgps. Previously this body extracted values,
+        // built the matrix in plain f64, and rebuilt a non-grad leaf.
+        //
+        // diagflat(x, offset) == diag_embed(flatten(x), offset)
+        // with input flattened to 1-D first.
+        let shape = self.tensor_shape(input)?;
+        let n = Self::checked_shape_numel(&shape, "diagflat: shape volume overflow")?;
+        // diag_embed expects i32 offset; range-check the i64 input.
+        let offset_i32 = i32::try_from(offset).map_err(|_| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "diagflat: offset out of range for i32",
+                },
+            ))
+        })?;
+        let flat = if shape.len() == 1 {
+            input
+        } else {
+            self.tensor_reshape(input, vec![n])?
+        };
+        let out = self.tensor_diag_embed(flat, offset_i32)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("diagflat input={} offset={offset} out={}", input.0, out.0),
