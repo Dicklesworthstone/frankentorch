@@ -8276,17 +8276,45 @@ impl FrankenTorchSession {
             let diag_len = n.min(m - row_start);
             (row_start, 0, diag_len)
         };
-        // Extract diagonal elements using index_select on flattened tensor
+        // Extract diagonal elements using index_select on flattened tensor.
         match dtype {
             DType::F64 => {
-                let vals = self.tensor_tape.values(input)?;
-                let mut diag_vals = Vec::with_capacity(diag_len);
-                for i in 0..diag_len {
-                    diag_vals.push(vals[(row_start + i) * n + col_start + i]);
-                }
-                self.tensor_variable(diag_vals, vec![diag_len], false)
+                // Wrap in tensor_apply_function with diagonal-extraction
+                // forward + scatter backward (the inverse of
+                // diag_embed). Tracked under frankentorch-sirh.
+                let n_c = n;
+                let m_c = m;
+                let row_start_c = row_start;
+                let col_start_c = col_start;
+                let diag_len_c = diag_len;
+                self.tensor_apply_function(
+                    &[input],
+                    move |_ctx, inputs| {
+                        let (vals, _shape) = inputs[0];
+                        let mut diag_vals = Vec::with_capacity(diag_len_c);
+                        for i in 0..diag_len_c {
+                            diag_vals.push(vals[(row_start_c + i) * n_c + col_start_c + i]);
+                        }
+                        Ok((diag_vals, vec![diag_len_c]))
+                    },
+                    move |_ctx, grad_outputs| {
+                        let g = grad_outputs[0];
+                        let mut grad_in = vec![0.0_f64; m_c * n_c];
+                        for i in 0..diag_len_c {
+                            grad_in[(row_start_c + i) * n_c + col_start_c + i] = g[i];
+                        }
+                        Ok(vec![Some(grad_in)])
+                    },
+                )
             }
             DType::F32 => {
+                if self.tensor_tape.tensor_requires_grad(input)? {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "tensor_diagonal: autograd is only supported for F64",
+                        },
+                    )));
+                }
                 let vals = self.tensor_tape.values_f32(input)?;
                 let mut diag_vals = Vec::with_capacity(diag_len);
                 for i in 0..diag_len {
@@ -24400,6 +24428,48 @@ mod tests {
         let dm1 = session.tensor_diagonal(x, -1).expect("dm1");
         let vm1 = session.tensor_values(dm1).expect("vm1");
         assert_eq!(vm1, vec![4.0, 8.0]);
+    }
+
+    #[test]
+    fn diagonal_propagates_gradient_via_scatter_to_diag_positions() {
+        // Regression test for frankentorch-sirh. tensor_diagonal used
+        // to extract values, build the diagonal vector in plain f64,
+        // and rebuild a requires_grad=false leaf — same severed-
+        // autograd pattern fixed for cross / diag_embed / block_diag /
+        // logsumexp / matrix_norm / vander.
+        //
+        // Forward is purely linear (each output element is one input
+        // element), so backward scatters grad_output back to the
+        // matching diagonal positions:
+        //   grad_input[row_start + i, col_start + i] = grad_output[i]
+        //
+        // For a 3x3 main-diagonal extract under sum loss the gradient
+        // is all-ones on the main diagonal, zero elsewhere.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                vec![3, 3],
+                true,
+            )
+            .unwrap();
+        let d = s.tensor_diagonal(x, 0).unwrap();
+        let loss = s.tensor_sum(d).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("diagonal must propagate gradient via scatter");
+        let expected = [
+            1.0_f64, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0,
+        ];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "diagonal grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
