@@ -4471,9 +4471,7 @@ impl Module for RMSNorm {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let vals = session.tensor_values(input)?;
         let input_shape = session.tensor_shape(input)?;
-
         let norm_dims = checked_shape_numel(
             &self.normalized_shape,
             "RMSNorm normalized_shape volume overflow",
@@ -4508,7 +4506,6 @@ impl Module for RMSNorm {
             )));
         }
 
-        let w_vals = session.tensor_values(self.weight)?;
         let batch_dims = if ndim == norm_ndim {
             1
         } else {
@@ -4517,33 +4514,41 @@ impl Module for RMSNorm {
                 "RMSNorm batch shape overflow",
             )?
         };
-        let expected = checked_mul(batch_dims, norm_dims, "RMSNorm input shape overflow")?;
-        if expected != vals.len() {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "RMSNorm input values length mismatch",
-                },
-            )));
-        }
 
-        let mut result = vec![0.0f64; vals.len()];
-
-        for b in 0..batch_dims {
-            let offset = b * norm_dims;
-            // Compute RMS
-            let mut sum_sq = 0.0f64;
-            for i in 0..norm_dims {
-                sum_sq += vals[offset + i] * vals[offset + i];
-            }
-            let rms = (sum_sq / norm_dims as f64 + self.eps).sqrt();
-
-            // Normalize and scale
-            for i in 0..norm_dims {
-                result[offset + i] = vals[offset + i] / rms * w_vals[i];
-            }
-        }
-
-        session.tensor_variable(result, input_shape, false)
+        // Compose through autograd-aware primitives so gradients
+        // flow to both input and the weight parameter. Tracked under
+        // frankentorch-krf2. Previously this body extracted values
+        // and rebuilt a requires_grad=false leaf — silently severing
+        // autograd through every RMSNorm layer (used in LLaMA /
+        // Mistral / most modern transformer architectures).
+        //
+        // Math: y = (x / sqrt(mean(x^2) + eps)) * weight
+        // Compute via:
+        //   x_flat   = reshape(x, [batch_dims, norm_dims])
+        //   sq       = x_flat * x_flat
+        //   mean_sq  = mean(sq, dim=1)               [batch_dims]
+        //   var_eps  = mean_sq + eps
+        //   rms      = sqrt(var_eps)                 [batch_dims]
+        //   rms_b    = expand(unsqueeze(rms, 1), [batch_dims, norm_dims])
+        //   normed   = x_flat / rms_b
+        //   weight_flat = reshape(weight, [norm_dims])
+        //   weight_b = expand(unsqueeze(weight_flat, 0), [batch_dims, norm_dims])
+        //   y_flat   = normed * weight_b
+        //   y        = reshape(y_flat, input_shape)
+        let x_flat = session.tensor_reshape(input, vec![batch_dims, norm_dims])?;
+        let sq = session.tensor_mul(x_flat, x_flat)?;
+        let mean_sq = session.tensor_mean_dim(sq, 1)?; // [batch_dims]
+        let eps_t = session.full(vec![batch_dims], self.eps, false)?;
+        let var_eps = session.tensor_add(mean_sq, eps_t)?;
+        let rms = session.tensor_sqrt(var_eps)?;
+        let rms_kd = session.tensor_unsqueeze(rms, 1)?;
+        let rms_b = session.tensor_expand(rms_kd, vec![batch_dims, norm_dims])?;
+        let normed = session.tensor_div(x_flat, rms_b)?;
+        let weight_flat = session.tensor_reshape(self.weight, vec![norm_dims])?;
+        let weight_kd = session.tensor_unsqueeze(weight_flat, 0)?;
+        let weight_b = session.tensor_expand(weight_kd, vec![batch_dims, norm_dims])?;
+        let y_flat = session.tensor_mul(normed, weight_b)?;
+        session.tensor_reshape(y_flat, input_shape)
     }
 
     fn parameters(&self) -> Vec<TensorNodeId> {
@@ -19906,6 +19911,56 @@ mod tests {
         let named = rn.named_parameters_own();
         assert_eq!(named.len(), 1);
         assert_eq!(named[0].0, "weight");
+    }
+
+    #[test]
+    fn rmsnorm_propagates_gradient_through_input_and_weight() {
+        // Regression test for frankentorch-krf2. RMSNorm forward used
+        // to extract values from input + weight, compute the
+        // normalization in plain f64, and rebuild a
+        // requires_grad=false leaf — silently severing autograd
+        // through every RMSNorm layer (LLaMA / Mistral / modern
+        // transformers all use RMSNorm). After composing through
+        // reshape + mul + mean_dim + sqrt + div primitives, gradient
+        // flows to both input and weight.
+        //
+        // For input=[1,1,1,1] (shape [1,4]), default weight = ones(4):
+        //   RMS = sqrt(mean(1) + eps) ≈ 1
+        //   y = [1, 1, 1, 1]
+        // Sanity check: gradient should be finite and non-zero on
+        // both input and weight (the analytical form is messy with
+        // the chain through sqrt + div + mul; sanity is enough).
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rn = RMSNorm::new(&mut session, vec![4], 1e-5).unwrap();
+        let input = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4], true)
+            .unwrap();
+        let out = rn.forward(&mut session, input).unwrap();
+        let loss = session.tensor_sum(out).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let grad_input = session
+            .tensor_gradient(&report, input)
+            .expect("RMSNorm must propagate gradient through input");
+        let grad_weight = session
+            .tensor_gradient(&report, rn.weight())
+            .expect("RMSNorm must propagate gradient through weight");
+        assert_eq!(grad_input.len(), 4);
+        assert_eq!(grad_weight.len(), 4);
+        assert!(
+            grad_input.iter().all(|g| g.is_finite()),
+            "RMSNorm grad_input must be finite, got {grad_input:?}"
+        );
+        assert!(
+            grad_weight.iter().all(|g| g.is_finite()),
+            "RMSNorm grad_weight must be finite, got {grad_weight:?}"
+        );
+        // Weight gradient should be non-zero on all entries (each
+        // weight component sees the corresponding normalized x_i,
+        // which is non-zero for our input).
+        assert!(
+            grad_weight.iter().all(|&g| g.abs() > 1e-9),
+            "RMSNorm grad_weight should be non-zero on each entry, got {grad_weight:?}"
+        );
     }
 
     #[test]
