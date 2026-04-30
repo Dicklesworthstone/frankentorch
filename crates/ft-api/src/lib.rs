@@ -11482,15 +11482,88 @@ impl FrankenTorchSession {
     /// Compute the matrix inverse.
     ///
     /// Returns A^-1 where A @ A^-1 = I. Errors if A is singular.
+    ///
+    /// Wraps the kernel inverse in a tensor_apply_function with the
+    /// analytical backward
+    ///     grad_A = -Y^T @ grad_Y @ Y^T   where Y = A^{-1}
+    /// (standard matrix-calculus identity: dY = -A^{-1} dA A^{-1}).
+    /// Saves Y for backward to avoid recomputing the inverse.
+    /// Tracked under frankentorch-frq7 (child of frankentorch-tw0y).
     pub fn tensor_linalg_inv(
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (values, meta) = self.tensor_values_meta(input)?;
-        let shape = meta.shape().to_vec();
-        let result = ft_kernel_cpu::inv_tensor_contiguous_f64(&values, &meta)
-            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
-        self.tensor_variable(result, shape, false)
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 2 || shape[0] != shape[1] {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: shape.clone(),
+                    rhs: vec![2],
+                },
+            )));
+        }
+        let n = shape[0];
+
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, in_shape) = inputs[0];
+                let meta = ft_core::TensorMeta::from_shape(
+                    in_shape.to_vec(),
+                    DType::F64,
+                    ft_core::Device::Cpu,
+                );
+                let result = ft_kernel_cpu::inv_tensor_contiguous_f64(vals, &meta)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+                // Save Y (the inverse) for backward.
+                ctx.save_for_backward(result.clone(), in_shape.to_vec());
+                Ok((result, in_shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_y = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let y = &saved[0];
+                if grad_y.len() != n * n || y.len() != n * n {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "linalg_inv backward: gradient or saved-Y shape mismatch",
+                        },
+                    )));
+                }
+                // grad_A = -Y^T @ grad_Y @ Y^T
+                // First: tmp = Y^T @ grad_Y   (n×n)
+                //   tmp[i,j] = sum_k Y[k,i] * grad_y[k,j]
+                let mut tmp = vec![0.0_f64; n * n];
+                for i in 0..n {
+                    for j in 0..n {
+                        let mut acc = 0.0_f64;
+                        for k in 0..n {
+                            acc += y[k * n + i] * grad_y[k * n + j];
+                        }
+                        tmp[i * n + j] = acc;
+                    }
+                }
+                // Then: grad_a = -tmp @ Y^T
+                //   grad_a[i,j] = -sum_k tmp[i,k] * Y[j,k]
+                let mut grad_a = vec![0.0_f64; n * n];
+                for i in 0..n {
+                    for j in 0..n {
+                        let mut acc = 0.0_f64;
+                        for k in 0..n {
+                            acc += tmp[i * n + k] * y[j * n + k];
+                        }
+                        grad_a[i * n + j] = -acc;
+                    }
+                }
+                Ok(vec![Some(grad_a)])
+            },
+        )?;
+
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("linalg_inv input={} out={} (autograd)", input.0, out.0),
+        );
+        Ok(out)
     }
 
     /// Solve a triangular linear system: A @ X = B.
@@ -26292,6 +26365,44 @@ mod tests {
         assert!(vals[1].abs() < 1e-10);
         assert!(vals[2].abs() < 1e-10);
         assert!((vals[3] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn linalg_inv_propagates_gradient_via_inv_transpose_outer() {
+        // Regression test for frankentorch-frq7. tensor_linalg_inv
+        // used to extract values, run the kernel inverse, and rebuild
+        // a requires_grad=false leaf — same severed-autograd pattern
+        // fixed under frankentorch-1tax. After wrapping in
+        // tensor_apply_function with the analytical
+        //     grad_A = -Y^T @ grad_Y @ Y^T   (Y = A^{-1})
+        // gradients flow.
+        //
+        // Use a diagonal A so the analytical gradient is easy to
+        // verify. A = diag(2, 4) → Y = diag(1/2, 1/4) → under sum loss
+        //   grad_y[i,j] = 1
+        //   grad_A = -Y^T @ J_22 @ Y^T   where J_22 is the all-ones 2×2
+        //   For diag Y = diag(y1, y2):
+        //     (Y^T J Y^T)[i,j] = y_i * 1 * y_j = y_i * y_j
+        //   So grad_A = -[[y1*y1, y1*y2], [y2*y1, y2*y2]]
+        //            = -[[1/4, 1/8], [1/8, 1/16]]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![2.0, 0.0, 0.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let inv = s.tensor_linalg_inv(a).unwrap();
+        let loss = s.tensor_sum(inv).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, a)
+            .expect("linalg_inv must propagate gradient via -Y^T grad Y^T");
+
+        let expected = [-0.25_f64, -0.125, -0.125, -0.0625];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "linalg_inv grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     // ── pinv / kthvalue / vector_norm tests ───────────────────────────
