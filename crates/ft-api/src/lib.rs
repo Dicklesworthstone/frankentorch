@@ -12514,7 +12514,6 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         k: usize,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
-        let vals = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         if shape.len() != 1 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -12523,6 +12522,7 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        let vals = self.tensor_values(input)?;
         if k == 0 || k > vals.len() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -12531,12 +12531,28 @@ impl FrankenTorchSession {
             )));
         }
 
-        // Sort indices by value
+        // Sort indices by value to find rank-k position; the routing
+        // index is non-differentiable but the value branch routes
+        // grad_value back to that single input position. Tracked
+        // under frankentorch-0juq.
         let mut indices: Vec<usize> = (0..vals.len()).collect();
         indices.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
-
         let idx = indices[k - 1];
-        let value = self.tensor_variable(vec![vals[idx]], vec![1], false)?;
+        let n = vals.len();
+
+        let value = self.tensor_apply_function(
+            &[input],
+            move |_ctx, inputs| {
+                let (vals, _shape) = inputs[0];
+                Ok((vec![vals[idx]], vec![1]))
+            },
+            move |_ctx, grad_outputs| {
+                let g = grad_outputs[0];
+                let mut grad_in = vec![0.0_f64; n];
+                grad_in[idx] = g[0];
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
         let index = self.tensor_variable(vec![idx as f64], vec![1], false)?;
         Ok((value, index))
     }
@@ -27140,6 +27156,43 @@ mod tests {
         let (max_val, _) = s.tensor_kthvalue(t, 3).unwrap();
         assert!((s.tensor_values(min_val).unwrap()[0] - 10.0).abs() < 1e-10);
         assert!((s.tensor_values(max_val).unwrap()[0] - 30.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn kthvalue_propagates_gradient_to_routed_index() {
+        // Regression test for frankentorch-0juq. tensor_kthvalue used
+        // to extract sort indices, build the value as a non-grad
+        // leaf, and rebuild a non-grad leaf for the index — silently
+        // severing autograd through the value branch. After wrapping
+        // in tensor_apply_function with single-index routing
+        // backward, gradient flows to the input position selected
+        // by sort.
+        //
+        // For x = [3, 1, 4, 1, 5], k=3:
+        //   sorted asc = [1, 1, 3, 4, 5] → 3rd smallest is 3 at idx 0
+        //   grad_input[0] = 1 (under sum loss with grad_value = 1)
+        //   grad_input[1..4] = 0
+        //
+        // (Note: ties go by first-occurrence in the sort comparator
+        // total_cmp, which gives idx 1 for the first '1' but
+        // routing for k=3 is unambiguous.)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![3.0, 1.0, 4.0, 1.0, 5.0], vec![5], true)
+            .unwrap();
+        let (val_id, _idx_id) = s.tensor_kthvalue(x, 3).unwrap();
+        let report = s.tensor_backward(val_id).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("kthvalue must propagate gradient via index routing");
+        // Index 0 holds the 3rd-smallest value (= 3.0).
+        let expected = [1.0_f64, 0.0, 0.0, 0.0, 0.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "kthvalue grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
