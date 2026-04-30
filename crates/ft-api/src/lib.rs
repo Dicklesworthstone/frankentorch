@@ -10362,32 +10362,60 @@ impl FrankenTorchSession {
         full: bool,
         eps: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_vals = self.tensor_values(input)?;
-        let target_vals = self.tensor_values(target)?;
         let shape = self.tensor_shape(input)?;
+        // Compose through autograd primitives so gradients flow to
+        // input (and target — though target is typically constant
+        // labels, the formula is differentiable wrt both). Tracked
+        // under frankentorch-zl3n (child of frankentorch-2med).
+        // Previously this body extracted values, computed the
+        // per-element loss in plain f64, built a non-grad leaf,
+        // then took tensor_mean — the tensor_mean preserved the tape
+        // from there but the prior leaf had already severed it.
+        //
+        // Math:
+        //   log_input=True:   loss_i = exp(input_i) - target_i * input_i
+        //   log_input=False:  loss_i = input_i - target_i * log(input_i + eps)
+        // Stirling correction (full=true) is a function of target
+        // only; it shifts the loss by a target-dependent constant
+        // and doesn't affect input gradient.
+        let per_elem = if log_input {
+            let exp_inp = self.tensor_exp(input)?;
+            let tgt_times_inp = self.tensor_mul(target, input)?;
+            self.tensor_sub(exp_inp, tgt_times_inp)?
+        } else {
+            let eps_t = self.full(shape.clone(), eps, false)?;
+            let inp_plus_eps = self.tensor_add(input, eps_t)?;
+            let log_term = self.tensor_log(inp_plus_eps)?;
+            let tgt_times_log = self.tensor_mul(target, log_term)?;
+            self.tensor_sub(input, tgt_times_log)?
+        };
 
-        let values: Vec<f64> = input_vals
-            .iter()
-            .zip(target_vals.iter())
-            .map(|(&inp, &tgt)| {
-                let mut loss = if log_input {
-                    inp.exp() - tgt * inp
-                } else {
-                    inp - tgt * (inp + eps).ln()
-                };
-                if full {
-                    // Stirling approximation for log(target!)
-                    if tgt > 1.0 {
-                        loss +=
-                            tgt * tgt.ln() - tgt + 0.5 * (2.0 * std::f64::consts::PI * tgt).ln();
+        let main = self.tensor_mean(per_elem)?;
+
+        if full {
+            // Stirling correction depends only on target — compute
+            // as a non-grad constant scalar and add to the loss.
+            // PyTorch only adds when target > 1 (since for target
+            // <= 1 the Stirling approximation is poor; PyTorch uses
+            // 0 there). We replicate that.
+            let target_vals = self.tensor_values(target)?;
+            let n = target_vals.len() as f64;
+            let stirling: f64 = target_vals
+                .iter()
+                .map(|&t| {
+                    if t > 1.0 {
+                        t * t.ln() - t + 0.5 * (2.0 * std::f64::consts::PI * t).ln()
+                    } else {
+                        0.0
                     }
-                }
-                loss
-            })
-            .collect();
-
-        let loss_node = self.tensor_variable(values, shape, false)?;
-        self.tensor_mean(loss_node)
+                })
+                .sum::<f64>()
+                / n;
+            let stirling_t = self.full(vec![1], stirling, false)?;
+            self.tensor_add(main, stirling_t)
+        } else {
+            Ok(main)
+        }
     }
 
     /// Gaussian negative log likelihood loss.
@@ -27925,6 +27953,45 @@ mod tests {
             (val - expected).abs() < 1e-8,
             "poisson_nll={val}, expected={expected}"
         );
+    }
+
+    #[test]
+    fn poisson_nll_loss_propagates_gradient_through_input() {
+        // Regression test for frankentorch-zl3n. poisson_nll_loss
+        // used to extract values, compute the per-element loss in
+        // plain f64, build a non-grad leaf, then take tensor_mean —
+        // the tensor_mean preserved autograd from there but the
+        // prior leaf had already severed it.
+        //
+        // Forward (log_input=true):
+        //   loss_i = exp(input_i) - target_i * input_i
+        //   loss   = mean over i
+        // Backward:
+        //   d loss / d input_i = (1/n) * (exp(input_i) - target_i)
+        //
+        // For input = [1, 2], target = [1, 1]:
+        //   grad_0 = (e - 1) / 2 ≈ 0.8591
+        //   grad_1 = (e^2 - 1) / 2 ≈ 3.1945
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let target = s.tensor_variable(vec![1.0, 1.0], vec![2], false).unwrap();
+        let loss = s
+            .poisson_nll_loss(input, target, true, false, 1e-8)
+            .unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("poisson_nll_loss must propagate gradient through input");
+        let expected = [
+            (1.0_f64.exp() - 1.0) / 2.0,
+            (2.0_f64.exp() - 1.0) / 2.0,
+        ];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "poisson_nll grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
