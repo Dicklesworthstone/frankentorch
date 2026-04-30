@@ -15033,10 +15033,15 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         dim: usize,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
-        let (vals, shape) = {
-            let (v, m) = self.tensor_values_meta(input)?;
-            (v, m.shape().to_vec())
-        };
+        // Compose through tensor_min_dim + tensor_max_dim so gradients
+        // flow through both branches via argmin/argmax routing.
+        // Tracked under frankentorch-b0y1 — previously this body
+        // extracted values, computed mins/maxs in plain f64, and
+        // rebuilt non-grad leaves, silently severing autograd.
+        // tensor_min_dim / tensor_max_dim already implement the
+        // proper backward via the tape; discard the indices since
+        // aminmax doesn't return them.
+        let shape = self.tensor_shape(input)?;
         if dim >= shape.len() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -15044,36 +15049,8 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let outer_size = Self::checked_shape_numel(&shape[..dim], "aminmax: outer shape overflow")?;
-        let dim_size = shape[dim];
-        let inner_size =
-            Self::checked_shape_numel(&shape[dim + 1..], "aminmax: inner shape overflow")?;
-        let out_len = Self::checked_mul(outer_size, inner_size, "aminmax: output size overflow")?;
-        let mut mins = Vec::with_capacity(out_len);
-        let mut maxs = Vec::with_capacity(out_len);
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let (mut mn, mut mx) = (f64::INFINITY, f64::NEG_INFINITY);
-                for d in 0..dim_size {
-                    let v = vals[outer * dim_size * inner_size + d * inner_size + inner];
-                    if v < mn {
-                        mn = v;
-                    }
-                    if v > mx {
-                        mx = v;
-                    }
-                }
-                mins.push(mn);
-                maxs.push(mx);
-            }
-        }
-        let mut out_shape = shape;
-        out_shape.remove(dim);
-        if out_shape.is_empty() {
-            out_shape.push(1);
-        }
-        let min_out = self.tensor_tape.leaf(mins, out_shape.clone(), false)?;
-        let max_out = self.tensor_tape.leaf(maxs, out_shape, false)?;
+        let (min_out, _argmin) = self.tensor_min_dim(input, dim)?;
+        let (max_out, _argmax) = self.tensor_max_dim(input, dim)?;
         Ok((min_out, max_out))
     }
 
@@ -36057,6 +36034,45 @@ mod tests {
         let (mins, maxs) = s.tensor_aminmax(x, 1).unwrap();
         assert_eq!(s.tensor_values(mins).unwrap(), &[1.0, 2.0]);
         assert_eq!(s.tensor_values(maxs).unwrap(), &[5.0, 3.0]);
+    }
+
+    #[test]
+    fn aminmax_propagates_gradient_via_argmin_argmax_routing() {
+        // Regression test for frankentorch-b0y1. tensor_aminmax used
+        // to extract values, build mins/maxs in plain f64, and
+        // rebuild non-grad leaves — silently severing autograd
+        // through both branches. After composing through
+        // tensor_min_dim + tensor_max_dim (which delegate to the
+        // tape's autograd-aware reductions), gradients flow.
+        //
+        // For x = [[1, 5, 3], [2, 4, 6]] with dim=1:
+        //   mins = [1, 2]  (argmin = [0, 0])
+        //   maxs = [5, 6]  (argmax = [1, 2])
+        // Sum loss over (mins + maxs) → grad_y_min = [1,1], grad_y_max = [1,1].
+        //   grad_x[0, 0] = 1 (mins routes here)
+        //   grad_x[0, 1] = 1 (maxs routes here)
+        //   grad_x[0, 2] = 0
+        //   grad_x[1, 0] = 1 (mins routes here)
+        //   grad_x[1, 1] = 0
+        //   grad_x[1, 2] = 1 (maxs routes here)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 5.0, 3.0, 2.0, 4.0, 6.0], vec![2, 3], true)
+            .unwrap();
+        let (mins, maxs) = s.tensor_aminmax(x, 1).unwrap();
+        let total = s.tensor_add(mins, maxs).unwrap();
+        let loss = s.tensor_sum(total).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("tensor_aminmax must propagate gradient via argmin/argmax routing");
+        let expected = [1.0_f64, 1.0, 0.0, 1.0, 0.0, 1.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "aminmax grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
