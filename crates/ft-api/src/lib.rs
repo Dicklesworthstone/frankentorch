@@ -4074,7 +4074,8 @@ impl FrankenTorchSession {
             )));
         }
 
-        let mut all_vals: Vec<Vec<f64>> = Vec::new();
+        // Validate shapes + collect lengths.
+        let mut lengths: Vec<usize> = Vec::with_capacity(tensors.len());
         for &t in tensors {
             let s = self.tensor_shape(t)?;
             if s.len() != 1 {
@@ -4084,46 +4085,80 @@ impl FrankenTorchSession {
                     },
                 )));
             }
-            all_vals.push(self.tensor_values(t)?);
+            lengths.push(s[0]);
         }
-
-        let n_tensors = all_vals.len();
+        let n_tensors = lengths.len();
         let mut total_rows = 1usize;
-        for vals in &all_vals {
-            total_rows = total_rows
-                .checked_mul(vals.len())
-                .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+        for &len in &lengths {
+            total_rows = total_rows.checked_mul(len).ok_or(AutogradError::Dispatch(
+                ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
                         reason: "cartesian_prod: total row count overflow",
                     },
-                )))?;
+                ),
+            ))?;
         }
-
-        let capacity = total_rows
+        let _ = total_rows
             .checked_mul(n_tensors)
             .ok_or(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "cartesian_prod: output size overflow",
                 },
             )))?;
-        let mut result = Vec::with_capacity(capacity);
-        let mut indices = vec![0usize; n_tensors];
 
+        // Pre-compute the (row, k) → input_index_in_tensor_k mapping.
+        // The forward gathers; the backward scatters. Tracked under
+        // frankentorch-7ude.
+        let mut mapping: Vec<Vec<usize>> = vec![Vec::with_capacity(total_rows); n_tensors];
+        let mut indices = vec![0usize; n_tensors];
         for _ in 0..total_rows {
-            for (k, vals) in all_vals.iter().enumerate() {
-                result.push(vals[indices[k]]);
+            for k in 0..n_tensors {
+                mapping[k].push(indices[k]);
             }
-            // Increment indices (odometer style, rightmost first)
             for k in (0..n_tensors).rev() {
                 indices[k] += 1;
-                if indices[k] < all_vals[k].len() {
+                if indices[k] < lengths[k] {
                     break;
                 }
                 indices[k] = 0;
             }
         }
 
-        self.tensor_variable(result, vec![total_rows, n_tensors], false)
+        let mapping_for_fwd = mapping.clone();
+        let mapping_for_bwd = mapping;
+        let lengths_clone = lengths;
+        let total_rows_c = total_rows;
+        let n_tensors_c = n_tensors;
+
+        self.tensor_apply_function(
+            tensors,
+            move |_ctx, inputs| {
+                let mut result = Vec::with_capacity(total_rows_c * n_tensors_c);
+                for row in 0..total_rows_c {
+                    for (k, mapping_k) in mapping_for_fwd.iter().enumerate() {
+                        let idx = mapping_k[row];
+                        let (vals, _shape) = inputs[k];
+                        result.push(vals[idx]);
+                    }
+                }
+                Ok((result, vec![total_rows_c, n_tensors_c]))
+            },
+            move |_ctx, grad_outputs| {
+                let g = grad_outputs[0];
+                // For each input tensor k, scatter g[row, k] back to
+                // grad_input_k[mapping[k][row]].
+                let mut grads: Vec<Option<Vec<f64>>> = Vec::with_capacity(n_tensors_c);
+                for k in 0..n_tensors_c {
+                    let mut grad_k = vec![0.0_f64; lengths_clone[k]];
+                    for row in 0..total_rows_c {
+                        let i = mapping_for_bwd[k][row];
+                        grad_k[i] += g[row * n_tensors_c + k];
+                    }
+                    grads.push(Some(grad_k));
+                }
+                Ok(grads)
+            },
+        )
     }
 
     /// All r-length combinations of elements from a 1-D tensor.
@@ -28876,6 +28911,40 @@ mod tests {
         let result = s.tensor_cartesian_prod(&[a]).unwrap();
         let shape = s.tensor_shape(result).unwrap();
         assert_eq!(shape, vec![3, 1]);
+    }
+
+    #[test]
+    fn cartesian_prod_propagates_gradient_to_each_input() {
+        // Regression test for frankentorch-7ude. tensor_cartesian_prod
+        // used to extract values, build the all-combinations grid in
+        // plain f64, and rebuild a non-grad leaf — silently severing
+        // autograd. After wrapping in tensor_apply_function with
+        // per-tensor scatter backward, gradients flow to each input.
+        //
+        // For a = [1, 2], b = [3, 4]:
+        //   total_rows = 2 * 2 = 4
+        //   out = [[1, 3], [1, 4], [2, 3], [2, 4]]
+        //   mapping[0] = [0, 0, 1, 1] (a indexes per row)
+        //   mapping[1] = [0, 1, 0, 1] (b indexes per row)
+        // Under sum loss (grad_y is all-ones, shape [4, 2]):
+        //   grad_a[0] = 2 (rows 0 and 1 route to a[0])
+        //   grad_a[1] = 2 (rows 2 and 3 route to a[1])
+        //   grad_b[0] = 2 (rows 0 and 2 route to b[0])
+        //   grad_b[1] = 2 (rows 1 and 3 route to b[1])
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let b = s.tensor_variable(vec![3.0, 4.0], vec![2], true).unwrap();
+        let result = s.tensor_cartesian_prod(&[a, b]).unwrap();
+        let loss = s.tensor_sum(result).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s
+            .tensor_gradient(&report, a)
+            .expect("cartesian_prod must propagate gradient to a");
+        let grad_b = s
+            .tensor_gradient(&report, b)
+            .expect("cartesian_prod must propagate gradient to b");
+        assert_eq!(grad_a, vec![2.0, 2.0]);
+        assert_eq!(grad_b, vec![2.0, 2.0]);
     }
 
     #[test]
