@@ -2114,36 +2114,40 @@ impl Module for AlphaDropout {
         if !self.training.get() || self.p == 0.0 {
             return Ok(input);
         }
-        let shape = {
-            let (_, meta) = session.tensor_values_meta(input)?;
-            meta.shape().to_vec()
-        };
+        let shape = session.tensor_shape(input)?;
         let numel = checked_shape_numel(&shape, "AlphaDropout input shape overflow")?;
-        let input_vals = session.tensor_values(input)?;
-
-        // For alpha dropout, we need to affine transform to preserve mean/variance
-        // After masking: x' = mask * x + (1-mask) * sat
-        // Then affine: x'' = a * x' + b
-        // where a = (1/(1-p) * (1 + p * alpha^2 * lambda^2))^-0.5
-        //       b = -a * (1-mask_mean) * sat
 
         let alpha_p = -Self::SAT;
         let a = ((1.0 - self.p) * (1.0 + self.p * alpha_p * alpha_p)).sqrt();
         let a = 1.0 / a;
+        let b = a * self.p * Self::SAT;
 
-        let rand_vals = session.rand(vec![numel], false)?;
-        let rand = session.tensor_values(rand_vals)?;
+        // Sample the keep-mask (random, non-grad). Each entry is
+        // 1.0 if rand_i > p else 0.0.
+        let rand_vals_id = session.rand(vec![numel], false)?;
+        let rand = session.tensor_values(rand_vals_id)?;
+        let mask_vals: Vec<f64> = rand
+            .iter()
+            .map(|&r| if r > self.p { 1.0 } else { 0.0 })
+            .collect();
+        let mask = session.tensor_variable(mask_vals, shape.clone(), false)?;
 
-        let mut result = vec![0.0f64; numel];
-        for i in 0..numel {
-            if rand[i] > self.p {
-                result[i] = a * input_vals[i] + a * self.p * Self::SAT;
-            } else {
-                result[i] = a * Self::SAT + a * self.p * Self::SAT;
-            }
-        }
-
-        session.tensor_variable(result, shape, false)
+        // Compose through autograd primitives so gradients flow.
+        // y = a * (mask * x + (1 - mask) * sat) + a * p * sat
+        //   = a * mask * x + a * (1 - mask) * sat + b
+        // Tracked under frankentorch-734h. Previously this body
+        // extracted values, applied the transform in plain f64, and
+        // rebuilt a requires_grad=false leaf.
+        let ones_t = session.full(shape.clone(), 1.0, false)?;
+        let one_minus_mask = session.tensor_sub(ones_t, mask)?;
+        let sat_t = session.full(shape.clone(), Self::SAT, false)?;
+        let drop_branch = session.tensor_mul(one_minus_mask, sat_t)?;
+        let keep_branch = session.tensor_mul(mask, input)?;
+        let pre_affine = session.tensor_add(keep_branch, drop_branch)?;
+        let a_t = session.full(shape.clone(), a, false)?;
+        let scaled = session.tensor_mul(pre_affine, a_t)?;
+        let b_t = session.full(shape, b, false)?;
+        session.tensor_add(scaled, b_t)
     }
 
     fn parameters(&self) -> Vec<TensorNodeId> {
