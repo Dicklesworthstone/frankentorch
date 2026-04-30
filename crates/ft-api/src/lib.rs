@@ -10322,31 +10322,55 @@ impl FrankenTorchSession {
         alpha: f64,
         gamma: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let logit_vals = self.tensor_values(input)?;
-        let target_vals = self.tensor_values(target)?;
-        let shape = self.tensor_shape(input)?;
-
-        if logit_vals.len() != target_vals.len() {
+        let in_shape = self.tensor_shape(input)?;
+        let tgt_shape = self.tensor_shape(target)?;
+        if in_shape != tgt_shape {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "focal_loss: input and target must have the same number of elements",
+                    reason: "focal_loss: input and target must have the same shape",
                 },
             )));
         }
+        // Compose through autograd-aware primitives. Tracked under
+        // frankentorch-m6uk (child of frankentorch-2med).
+        // Math:
+        //   p          = sigmoid(input)
+        //   p_t        = target * p + (1 - target) * (1 - p)
+        //   alpha_t    = target * alpha + (1 - target) * (1 - alpha)
+        //   inner      = (1 - p_t)^gamma * log(clamp_min(p_t, 1e-15))
+        //   per_elem   = -alpha_t * inner
+        //   loss       = mean(per_elem)
+        // target is treated as a {0, 1} mask (binary labels).
+        let p = self.tensor_sigmoid(input)?;
+        let ones1 = self.full(in_shape.clone(), 1.0, false)?;
+        let one_minus_p = self.tensor_sub(ones1, p)?;
+        let ones2 = self.full(in_shape.clone(), 1.0, false)?;
+        let one_minus_target = self.tensor_sub(ones2, target)?;
 
-        let values: Vec<f64> = logit_vals
-            .iter()
-            .zip(target_vals.iter())
-            .map(|(&logit, &t)| {
-                let p = 1.0 / (1.0 + (-logit).exp()); // sigmoid
-                let p_t = if t == 1.0 { p } else { 1.0 - p };
-                let alpha_t = if t == 1.0 { alpha } else { 1.0 - alpha };
-                -alpha_t * (1.0 - p_t).powf(gamma) * p_t.max(1e-15).ln()
-            })
-            .collect();
+        // p_t = target * p + (1 - target) * (1 - p)
+        let term_pos = self.tensor_mul(target, p)?;
+        let term_neg = self.tensor_mul(one_minus_target, one_minus_p)?;
+        let p_t = self.tensor_add(term_pos, term_neg)?;
 
-        let loss_node = self.tensor_variable(values, shape, false)?;
-        self.tensor_mean(loss_node)
+        // alpha_t = target * alpha + (1 - target) * (1 - alpha)
+        let alpha_t_pos = self.full(in_shape.clone(), alpha, false)?;
+        let alpha_t_neg = self.full(in_shape.clone(), 1.0 - alpha, false)?;
+        let alpha_pos_term = self.tensor_mul(target, alpha_t_pos)?;
+        let alpha_neg_term = self.tensor_mul(one_minus_target, alpha_t_neg)?;
+        let alpha_t = self.tensor_add(alpha_pos_term, alpha_neg_term)?;
+
+        // inner = (1 - p_t)^gamma * log(clamp_min(p_t, 1e-15))
+        let ones3 = self.full(in_shape, 1.0, false)?;
+        let one_minus_p_t = self.tensor_sub(ones3, p_t)?;
+        let focal_factor = self.tensor_pow(one_minus_p_t, gamma)?;
+        let p_t_clamped = self.tensor_clamp_min(p_t, 1e-15)?;
+        let log_p_t = self.tensor_log(p_t_clamped)?;
+        let inner = self.tensor_mul(focal_factor, log_p_t)?;
+
+        // per_elem = -alpha_t * inner
+        let alpha_inner = self.tensor_mul(alpha_t, inner)?;
+        let per_elem = self.tensor_neg(alpha_inner)?;
+        self.tensor_mean(per_elem)
     }
 
     /// Poisson negative log likelihood loss.
@@ -10431,28 +10455,31 @@ impl FrankenTorchSession {
         full: bool,
         eps: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_vals = self.tensor_values(input)?;
-        let target_vals = self.tensor_values(target)?;
-        let var_vals = self.tensor_values(var)?;
         let shape = self.tensor_shape(input)?;
+        // Compose through autograd primitives so gradients flow to
+        // input / target / var. Tracked under frankentorch-vjow
+        // (child of frankentorch-2med). Math:
+        //   v'      = max(var, eps)
+        //   diff    = input - target
+        //   loss_i  = 0.5 * (log(v') + diff^2 / v')
+        //   loss    = mean(loss_i) [+ 0.5 * log(2π) if full]
+        let v_clamped = self.tensor_clamp_min(var, eps)?;
+        let log_v = self.tensor_log(v_clamped)?;
+        let diff = self.tensor_sub(input, target)?;
+        let diff_sq = self.tensor_mul(diff, diff)?;
+        let ratio = self.tensor_div(diff_sq, v_clamped)?;
+        let sum_term = self.tensor_add(log_v, ratio)?;
+        let half = self.full(shape, 0.5, false)?;
+        let per_elem = self.tensor_mul(sum_term, half)?;
+        let main = self.tensor_mean(per_elem)?;
 
-        let values: Vec<f64> = input_vals
-            .iter()
-            .zip(target_vals.iter())
-            .zip(var_vals.iter())
-            .map(|((&inp, &tgt), &v)| {
-                let v_clamped = v.max(eps);
-                let diff = inp - tgt;
-                let mut loss = 0.5 * (v_clamped.ln() + diff * diff / v_clamped);
-                if full {
-                    loss += 0.5 * (2.0 * std::f64::consts::PI).ln();
-                }
-                loss
-            })
-            .collect();
-
-        let loss_node = self.tensor_variable(values, shape, false)?;
-        self.tensor_mean(loss_node)
+        if full {
+            let const_offset = 0.5 * (2.0 * std::f64::consts::PI).ln();
+            let offset_t = self.full(vec![1], const_offset, false)?;
+            self.tensor_add(main, offset_t)
+        } else {
+            Ok(main)
+        }
     }
 
     /// Soft margin loss.
@@ -27918,6 +27945,43 @@ mod tests {
     }
 
     #[test]
+    fn focal_loss_propagates_gradient_through_input() {
+        // Regression test for frankentorch-m6uk. focal_loss used to
+        // extract values, compute the per-element formula in plain
+        // f64, build a non-grad leaf, then take tensor_mean — the
+        // tensor_mean preserved autograd from there but the prior
+        // leaf had already severed it. After composing through
+        // sigmoid + linear-blend-by-target + pow + log + mean, the
+        // input's tape edge is preserved.
+        //
+        // Sanity test: well-behaved logits with binary target should
+        // produce a non-zero finite gradient on input. We don't
+        // assert exact values here because the focal-loss closed form
+        // in the non-trivial gamma > 0 regime is messy; the
+        // important thing is that the gradient propagates at all.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, -1.0], vec![2], true).unwrap();
+        let target = s.tensor_variable(vec![1.0, 0.0], vec![2], false).unwrap();
+        let loss = s.focal_loss(input, target, 0.5, 2.0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("focal_loss must propagate gradient through input");
+        assert_eq!(grad.len(), 2);
+        assert!(
+            grad.iter().all(|g| g.is_finite()),
+            "focal_loss gradient must be finite, got {grad:?}"
+        );
+        // Both entries should be meaningfully non-zero — the gamma=2
+        // factor reduces magnitude but doesn't zero it for finite
+        // logits.
+        assert!(
+            grad.iter().all(|&g| g.abs() > 1e-9),
+            "focal_loss gradient should be non-zero on both entries, got {grad:?}"
+        );
+    }
+
+    #[test]
     fn focal_loss_gamma_reduces_easy_examples() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // High confidence correct prediction: sigmoid(5) ≈ 0.993
@@ -28008,6 +28072,49 @@ mod tests {
         assert!(
             val.abs() < 1e-8,
             "perfect prediction should have ~0 loss, got {val}"
+        );
+    }
+
+    #[test]
+    fn gaussian_nll_loss_propagates_gradient_through_input_and_var() {
+        // Regression test for frankentorch-vjow.
+        // gaussian_nll_loss used to extract values, compute the
+        // per-element loss in plain f64, and rebuild a non-grad leaf —
+        // silently severing autograd through input / target / var.
+        // After composing through clamp_min/log/sub/mul/div/mean
+        // primitives, gradients flow.
+        //
+        // Forward (no full, no clamp triggering since var > eps):
+        //   loss_i = 0.5 * (log(v_i) + (input_i - target_i)^2 / v_i)
+        //   loss   = mean(loss_i)
+        // Backward at non-clamped points:
+        //   d loss / d input_i = (1/n) * (input_i - target_i) / v_i
+        //   d loss / d var_i   = (1/n) * 0.5 * (1/v_i - (input_i - target_i)^2 / v_i^2)
+        //
+        // For input = [2.0], target = [1.0], var = [4.0]:
+        //   diff = 1, diff^2 = 1, v = 4
+        //   loss = 0.5 * (log(4) + 0.25) = 0.5 * (1.3863 + 0.25) = 0.8181
+        //   grad_input = (1/1) * 1/4 = 0.25
+        //   grad_var   = 0.5 * (1/4 - 1/16) = 0.5 * (0.25 - 0.0625) = 0.09375
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let target = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let var = s.tensor_variable(vec![4.0], vec![1], true).unwrap();
+        let loss = s
+            .gaussian_nll_loss(input, target, var, false, 1e-6)
+            .unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_input = s
+            .tensor_gradient(&report, input)
+            .expect("gaussian_nll_loss must propagate gradient through input");
+        let grad_var = s
+            .tensor_gradient(&report, var)
+            .expect("gaussian_nll_loss must propagate gradient through var");
+        assert!((grad_input[0] - 0.25).abs() < 1e-12, "grad_input[0] = {}", grad_input[0]);
+        assert!(
+            (grad_var[0] - 0.09375).abs() < 1e-12,
+            "grad_var[0] = {}",
+            grad_var[0]
         );
     }
 
