@@ -10425,22 +10425,27 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         target: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let input_vals = self.tensor_values(input)?;
-        let target_vals = self.tensor_values(target)?;
-        let shape = self.tensor_shape(input)?;
-
-        let values: Vec<f64> = input_vals
-            .iter()
-            .zip(target_vals.iter())
-            .map(|(&inp, &tgt)| {
-                let z = -tgt * inp;
-                // Numerically stable: log(1 + exp(z)) = max(0, z) + log(1 + exp(-|z|))
-                z.max(0.0) + (1.0 + (-z.abs()).exp()).ln()
-            })
-            .collect();
-
-        let loss_node = self.tensor_variable(values, shape, false)?;
-        self.tensor_mean(loss_node)
+        // Compose through autograd-aware primitives so gradients flow
+        // to input (target is typically constant ±1 but the formula
+        // treats it as a tensor for full generality).
+        // Math: with z = -t * x,
+        //     soft_margin = log1p(exp(z))
+        //                 = max(0, z) + log1p(exp(-|z|))
+        //                 = relu(z) + log1p(exp(-abs(z)))
+        // Same numerical-stability form as the prior body. Tracked
+        // under frankentorch-tr2a — previously this body extracted
+        // values, computed the per-element loss in plain f64, and
+        // built a requires_grad=false leaf, silently severing the
+        // tape.
+        let neg_target = self.tensor_neg(target)?;
+        let z = self.tensor_mul(neg_target, input)?;
+        let relu_z = self.tensor_relu(z)?;
+        let abs_z = self.tensor_abs(z)?;
+        let neg_abs_z = self.tensor_neg(abs_z)?;
+        let exp_neg_abs = self.tensor_exp(neg_abs_z)?;
+        let log_term = self.tensor_log1p(exp_neg_abs)?;
+        let loss_per_elem = self.tensor_add(relu_z, log_term)?;
+        self.tensor_mean(loss_per_elem)
     }
 
     /// Multi-class margin (hinge) loss.
@@ -27930,6 +27935,43 @@ mod tests {
         let val = s.tensor_values(loss).unwrap()[0];
         // log(1 + exp(-5)) ≈ 0.0067 for both, mean ≈ 0.0067
         assert!(val < 0.01, "well-classified should have low loss: {val}");
+    }
+
+    #[test]
+    fn soft_margin_loss_propagates_gradient_through_input() {
+        // Regression test for frankentorch-tr2a. soft_margin_loss
+        // used to extract values, compute the per-element loss in
+        // plain f64, and build a requires_grad=false leaf — the
+        // subsequent tensor_mean was autograd-aware but the prior
+        // leaf had already severed the tape. After composing
+        // through tensor_neg + tensor_mul + tensor_relu + tensor_abs +
+        // tensor_log1p + tensor_exp + tensor_add, gradients flow.
+        //
+        // Forward: soft_margin(x, t) = log1p(exp(-t*x))
+        // Backward (smooth interior, away from x*t = 0):
+        //   d/dx = -t * sigmoid(-t*x) = -t / (1 + exp(t*x))
+        // For input = [1.0, -1.0], target = [1.0, -1.0]:
+        //   At (x=1, t=1):  d/dx = -1 / (1 + exp(1)) = -1 / 3.7183 ≈ -0.26894
+        //   At (x=-1, t=-1): d/dx = -(-1) / (1 + exp(-1*1)) = 1 / 3.7183 ≈ -0.26894
+        //     Wait: t = -1, so d/dx = -(-1) / (1 + exp((-1)*(-1))) = 1 / (1 + e) ≈ 0.26894
+        // After mean (1/2 factor):
+        //   grad = [-0.13447, 0.13447]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, -1.0], vec![2], true).unwrap();
+        let target = s.tensor_variable(vec![1.0, -1.0], vec![2], false).unwrap();
+        let loss = s.soft_margin_loss(input, target).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("soft_margin_loss must propagate gradient through input");
+        let inv_one_plus_e = 1.0 / (1.0 + 1.0_f64.exp());
+        let expected = [-inv_one_plus_e / 2.0, inv_one_plus_e / 2.0];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "soft_margin_loss grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
