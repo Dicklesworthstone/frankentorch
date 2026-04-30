@@ -15610,11 +15610,7 @@ impl FrankenTorchSession {
         x: Option<TensorNodeId>,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (y_vals, y_shape) = {
-            let (v, m) = self.tensor_values_meta(y)?;
-            (v, m.shape().to_vec())
-        };
-
+        let y_shape = self.tensor_shape(y)?;
         let ndim = y_shape.len();
         if dim >= ndim {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -15636,49 +15632,45 @@ impl FrankenTorchSession {
             return self.tensor_tape.leaf(vec![0.0; numel], out_shape, false);
         }
 
-        let x_vals = if let Some(x_id) = x {
-            Some(self.tensor_values(x_id)?)
+        // Compose through autograd primitives. Tracked under
+        // frankentorch-b4ys. Math:
+        //   y0 = narrow(y, dim, 0, n-1)
+        //   y1 = narrow(y, dim, 1, n-1)
+        //   dx = (x1 - x0) if x else 1   (broadcast)
+        //   integral = sum((y0 + y1) * 0.5 * dx, dim)
+        let new_dim_size = dim_size - 1;
+        let y0 = self.tensor_narrow(y, dim, 0, new_dim_size)?;
+        let y1 = self.tensor_narrow(y, dim, 1, new_dim_size)?;
+        let y_sum = self.tensor_add(y0, y1)?;
+        let mut narrow_shape = y_shape.clone();
+        narrow_shape[dim] = new_dim_size;
+        let half_t = self.full(narrow_shape.clone(), 0.5, false)?;
+        let avg = self.tensor_mul(y_sum, half_t)?;
+
+        let weighted = if let Some(x_id) = x {
+            let x_shape = self.tensor_shape(x_id)?;
+            if x_shape != y_shape {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "trapezoid: x and y must have the same shape",
+                    },
+                )));
+            }
+            let x0 = self.tensor_narrow(x_id, dim, 0, new_dim_size)?;
+            let x1 = self.tensor_narrow(x_id, dim, 1, new_dim_size)?;
+            let dx = self.tensor_sub(x1, x0)?;
+            self.tensor_mul(avg, dx)?
         } else {
-            None
+            // dx = 1 for all cells; just take avg.
+            avg
         };
 
-        let outer_size =
-            Self::checked_shape_numel(&y_shape[..dim], "trapezoid: outer shape overflow")?;
-        let inner_size =
-            Self::checked_shape_numel(&y_shape[dim + 1..], "trapezoid: inner shape overflow")?;
-
-        let out_len = Self::checked_mul(outer_size, inner_size, "trapezoid: output size overflow")?;
-        let mut result = Vec::with_capacity(out_len);
-
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut integral = 0.0;
-                for d in 0..dim_size - 1 {
-                    let idx0 = outer * dim_size * inner_size + d * inner_size + inner;
-                    let idx1 = outer * dim_size * inner_size + (d + 1) * inner_size + inner;
-                    let dx = if let Some(ref xv) = x_vals {
-                        xv[idx1] - xv[idx0]
-                    } else {
-                        1.0
-                    };
-                    integral += 0.5 * (y_vals[idx0] + y_vals[idx1]) * dx;
-                }
-                result.push(integral);
-            }
-        }
-
-        let mut out_shape = y_shape;
-        out_shape.remove(dim);
-        if out_shape.is_empty() {
-            out_shape.push(1);
-        }
-
-        let out = self.tensor_tape.leaf(result, out_shape, false)?;
+        let integral = self.tensor_sum_dim(weighted, dim)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
-            format!("trapezoid y={} dim={dim} out={}", y.0, out.0),
+            format!("trapezoid y={} dim={dim} out={}", y.0, integral.0),
         );
-        Ok(out)
+        Ok(integral)
     }
 
     // ── cumulative_trapezoid ────────────────────────────────────────────
@@ -36082,6 +36074,41 @@ mod tests {
         let out = s.tensor_trapezoid(y, Some(x), 0).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert!((vals[0] - 10.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn trapezoid_propagates_gradient_through_y() {
+        // Regression test for frankentorch-b4ys. tensor_trapezoid
+        // used to extract values, compute the integral in plain f64,
+        // and rebuild a non-grad leaf — silently severing autograd.
+        // After composing through narrow + add + mul + sum_dim,
+        // gradients flow.
+        //
+        // For y = [1, 2, 3, 4] with uniform spacing (dx=1):
+        //   integral = 0.5*((1+2) + (2+3) + (3+4))
+        //            = 0.5*(3 + 5 + 7) = 0.5*15 = 7.5
+        // Gradient w.r.t. y[i]:
+        //   y[0] is in pair (0,1): contributes 0.5
+        //   y[1] is in pairs (0,1) and (1,2): contributes 0.5 + 0.5 = 1.0
+        //   y[2] is in pairs (1,2) and (2,3): contributes 0.5 + 0.5 = 1.0
+        //   y[3] is in pair (2,3): contributes 0.5
+        //   grad_y = [0.5, 1.0, 1.0, 0.5]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let y = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let integral = s.tensor_trapezoid(y, None, 0).unwrap();
+        let report = s.tensor_backward(integral).unwrap();
+        let grad = s
+            .tensor_gradient(&report, y)
+            .expect("trapezoid must propagate gradient through y");
+        let expected = [0.5_f64, 1.0, 1.0, 0.5];
+        for (i, (&g, &e)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - e).abs() < 1e-12,
+                "trapezoid grad[{i}] = {g}, expected {e}"
+            );
+        }
     }
 
     #[test]
