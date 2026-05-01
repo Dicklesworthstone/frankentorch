@@ -22926,6 +22926,74 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn layer_norm_linear_block_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-mwsd. Validates the
+        // LayerNorm → Linear pattern (typical transformer pre-norm
+        // FFN block) end-to-end through Adam. LayerNorm composition
+        // (mean/var/normalize/affine) chained with Linear should
+        // produce gradients that converge.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{LayerNorm, Linear, Module};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ln = LayerNorm::new(&mut session, vec![8], 1e-5).expect("layernorm");
+        let linear = Linear::new(&mut session, 8, 4, true).expect("linear");
+
+        // 4x8 input (4 tokens, embed=8). Linear expects 2-D
+        // [batch, in_features].
+        let input_vals: Vec<f64> =
+            (0..32).map(|i| ((i as f64 - 15.5) / 16.0) * 0.5).collect();
+        let input = session
+            .tensor_variable(input_vals, vec![4, 8], false)
+            .expect("input");
+        let target = session
+            .tensor_variable(vec![0.0; 16], vec![4, 4], false)
+            .expect("target");
+
+        let mut params = ln.parameters();
+        params.extend(linear.parameters());
+        let mut optimizer = Adam::new(params, 0.05);
+
+        let initial_n = ln.forward(&mut session, input).expect("initial ln");
+        let initial_h = linear
+            .forward(&mut session, initial_n)
+            .expect("initial linear");
+        let initial_loss = session
+            .mse_loss(initial_h, target)
+            .expect("initial loss");
+        let initial_loss_val = session.tensor_values(initial_loss).expect("initial val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let n = ln.forward(&mut session, input).expect("ln");
+            let h = linear.forward(&mut session, n).expect("linear");
+            let loss = session.mse_loss(h, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "LayerNorm → Linear never improved the loss"
+        );
+        // 2x reduction is the practical floor: LayerNorm normalizes
+        // each token's features, so Linear's expressivity for fitting
+        // arbitrary per-token targets is limited.
+        assert!(
+            best_loss < initial_loss_val * 0.5,
+            "LayerNorm → Linear should drop loss by 2x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
