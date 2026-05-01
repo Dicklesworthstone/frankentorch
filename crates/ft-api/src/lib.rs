@@ -11941,6 +11941,17 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         upper: bool,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            // Cholesky backward is implementable but non-trivial
+            // (involves the phi = lower(L^T L) tridiag formula).
+            // Fail loud for now (parking-lot pattern matching pvfk
+            // / 3v6e). Tracked under frankentorch-rl4g.
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_cholesky: autograd not supported (cholesky backward not yet implemented)",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let result = ft_kernel_cpu::cholesky_contiguous_f64(&values, &meta, upper)
             .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
@@ -12569,6 +12580,13 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_eigh: autograd not supported (eigendecomposition backward not yet implemented). Tracked under frankentorch-rl4g.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let result = ft_kernel_cpu::eigh_contiguous_f64(&values, &meta)
             .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
@@ -12583,6 +12601,13 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_eigvalsh: autograd not supported (eigenvalue backward not yet implemented). Tracked under frankentorch-rl4g.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let n = meta.shape()[0];
         let evals = ft_kernel_cpu::eigvalsh_contiguous_f64(&values, &meta)
@@ -12600,6 +12625,13 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         full_matrices: bool,
     ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_svd: autograd not supported (SVD backward not yet implemented). Tracked under frankentorch-rl4g.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let result = ft_kernel_cpu::svd_contiguous_f64(&values, &meta, full_matrices)
             .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
@@ -12621,6 +12653,13 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_svdvals: autograd not supported (SVD backward not yet implemented). Tracked under frankentorch-rl4g.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let input_shape = meta.shape();
         let k = input_shape[0].min(input_shape[1]);
@@ -13040,6 +13079,13 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         reduced: bool,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_qr: autograd not supported (QR backward not yet implemented). Tracked under frankentorch-rl4g.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let input_m = meta.shape()[0];
         let result = ft_kernel_cpu::qr_contiguous_f64(&values, &meta, reduced)
@@ -27655,6 +27701,50 @@ mod tests {
         assert!((grad[1] - 1.0).abs() < 1e-10);
         assert!(grad[0].abs() < 1e-10);
         assert!(grad[2].abs() < 1e-10);
+    }
+
+    #[test]
+    fn linalg_svd_class_ops_fail_loud_on_requires_grad() {
+        // Regression for frankentorch-rl4g: SVD-class linalg ops
+        // (svd, svdvals, eigh, eigvalsh, qr, cholesky) used to
+        // silently sever autograd by extracting tensor_values and
+        // rebuilding non-grad leaves. Each now fails loud when
+        // input requires_grad — matches the parking-lot pattern of
+        // pvfk (det/slogdet) and 3v6e (stft/istft).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![2.0, 0.5, 0.5, 1.0], vec![2, 2], true)
+            .unwrap();
+
+        let svd_err = s
+            .tensor_linalg_svd(a, false)
+            .expect_err("svd must fail loud on requires_grad");
+        assert!(format!("{svd_err:?}").contains("autograd not supported"));
+
+        let svdvals_err = s
+            .tensor_linalg_svdvals(a)
+            .expect_err("svdvals must fail loud on requires_grad");
+        assert!(format!("{svdvals_err:?}").contains("autograd not supported"));
+
+        let eigh_err = s
+            .tensor_linalg_eigh(a)
+            .expect_err("eigh must fail loud on requires_grad");
+        assert!(format!("{eigh_err:?}").contains("autograd not supported"));
+
+        let eigvalsh_err = s
+            .tensor_linalg_eigvalsh(a)
+            .expect_err("eigvalsh must fail loud on requires_grad");
+        assert!(format!("{eigvalsh_err:?}").contains("autograd not supported"));
+
+        let qr_err = s
+            .tensor_linalg_qr(a, true)
+            .expect_err("qr must fail loud on requires_grad");
+        assert!(format!("{qr_err:?}").contains("autograd not supported"));
+
+        let chol_err = s
+            .tensor_linalg_cholesky(a, false)
+            .expect_err("cholesky must fail loud on requires_grad");
+        assert!(format!("{chol_err:?}").contains("autograd not supported"));
     }
 
     #[test]
