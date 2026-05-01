@@ -11003,6 +11003,92 @@ mod tests {
             }
         }
 
+        // clamp(x, lo, hi) bit-exactly equals x when x is already in
+        // [lo, hi]. Use input * 0.4 to keep all values inside [-1, 1]
+        // so the [-1, 1] clamp is a no-op. Frankentorch-yg6k.
+        #[test]
+        fn fuzz_metamorphic_clamp_idempotent_in_range(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let scale = 0.4 / 2048.0;
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) * scale).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let clamped = s.tensor_clamp(x, -1.0, 1.0).expect("clamp");
+            let v = s.tensor_values(clamped).expect("vals");
+            for (a, b) in v.iter().zip(input.iter()) {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "clamp(x, -1, 1) should equal x bit-exactly when x is in range"
+                );
+            }
+        }
+
+        // mean(x) ≈ sum(x) / n within a small ULP envelope.
+        // Both paths sum the same values; the only difference is
+        // dividing by n at the end. Frankentorch-yg6k.
+        #[test]
+        fn fuzz_metamorphic_mean_equals_sum_div_n(
+            samples in prop::collection::vec(-2000i16..2000i16, 1..40)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 19.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let mean = s.tensor_mean(x).expect("mean");
+            let sum = s.tensor_sum(x).expect("sum");
+            let v_mean = s.tensor_values(mean).expect("v_mean")[0];
+            let v_sum = s.tensor_values(sum).expect("v_sum")[0];
+            #[allow(clippy::cast_precision_loss)]
+            let manual_mean = v_sum / n as f64;
+            let scale = v_mean.abs().max(manual_mean.abs()).max(1.0);
+            let diff = (v_mean - manual_mean).abs();
+            prop_assert!(
+                diff <= 8.0 * scale * f64::EPSILON,
+                "mean(x) = {v_mean} but sum(x)/n = {manual_mean}; diff = {diff:e}"
+            );
+        }
+
+        // std_dim(x, 0) ≈ sqrt(var_dim(x, 0)): both compute the same
+        // variance via the same sum-of-squares formula; std just
+        // takes the square root. Frankentorch-yg6k.
+        #[test]
+        fn fuzz_metamorphic_std_dim_equals_sqrt_var_dim(
+            samples in prop::collection::vec(-1500i16..1500i16, 2..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 13.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let std_t = s.tensor_std_dim(x, 0).expect("std_dim");
+            let var_t = s.tensor_var_dim(x, 0).expect("var_dim");
+            let sqrt_var = s.tensor_sqrt(var_t).expect("sqrt(var)");
+            let v_std = s.tensor_values(std_t).expect("v_std");
+            let v_sqrt = s.tensor_values(sqrt_var).expect("v_sqrt");
+            for (a, b) in v_std.iter().zip(v_sqrt.iter()) {
+                let scale = a.abs().max(b.abs()).max(1.0);
+                let diff = (a - b).abs();
+                prop_assert!(
+                    diff <= 16.0 * scale * f64::EPSILON,
+                    "std_dim(x, 0) = {a} but sqrt(var_dim(x, 0)) = {b}; diff = {diff:e}"
+                );
+            }
+        }
+
         // abs(x * y) bit-exactly equals abs(x) * abs(y): both are
         // sign-bit operations on the same magnitude product.
         // Frankentorch-b27s.
