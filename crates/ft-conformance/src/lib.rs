@@ -22994,6 +22994,81 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn embedding_mean_linear_classifier_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-ex6v. Validates the typical
+        // bag-of-words text classification head: Embedding lookup →
+        // mean over tokens → Linear → cross_entropy. The Embedding
+        // forward chain (reshape + index_select + reshape) should
+        // produce gradients that flow back to the embedding weight.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Embedding, Linear, Module};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let emb = Embedding::new(&mut session, 8, 4).expect("embedding");
+        let head = Linear::new(&mut session, 4, 2, true).expect("linear");
+
+        // 4 sequences of 3 tokens each. Sequences 0+2 are "class 0",
+        // 1+3 are "class 1" — we use distinct token IDs to make the
+        // classification trivial.
+        let tokens = session
+            .tensor_variable(
+                vec![0.0, 1.0, 2.0, 4.0, 5.0, 6.0, 0.0, 2.0, 1.0, 5.0, 4.0, 6.0],
+                vec![4, 3],
+                false,
+            )
+            .expect("tokens");
+        let labels = session
+            .tensor_variable(vec![0.0, 1.0, 0.0, 1.0], vec![4], false)
+            .expect("labels");
+
+        let mut params = emb.parameters();
+        params.extend(head.parameters());
+        let mut optimizer = Adam::new(params, 0.05);
+
+        let initial_e = emb.forward(&mut session, tokens).expect("initial emb");
+        // Pool over tokens (dim=1): [4, 3, 4] → [4, 4]
+        let initial_pooled = session
+            .tensor_mean_dim(initial_e, 1)
+            .expect("initial mean");
+        let initial_logits = head
+            .forward(&mut session, initial_pooled)
+            .expect("initial head");
+        let initial_loss = session
+            .cross_entropy_loss(initial_logits, labels)
+            .expect("initial loss");
+        let initial_loss_val = session.tensor_values(initial_loss).expect("initial val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let e = emb.forward(&mut session, tokens).expect("emb");
+            let pooled = session.tensor_mean_dim(e, 1).expect("mean");
+            let logits = head.forward(&mut session, pooled).expect("head");
+            let loss = session
+                .cross_entropy_loss(logits, labels)
+                .expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "Embedding text classifier never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "Embedding text classifier should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
