@@ -21718,6 +21718,70 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn multihead_attention_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-7h2t: validates the
+        // MultiheadAttention forward chain (q/k/v projections →
+        // softmax → matmul → out projection) end-to-end through
+        // Adam training. The attention pipeline composes through
+        // many autograd-aware ops; a regression in any of them
+        // (Linear, softmax, matmul, transpose, reshape) would
+        // surface here as a failure to converge.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Module, MultiheadAttention};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mha = MultiheadAttention::new(&mut session, 8, 2).expect("mha");
+
+        // Fixed input sequence: batch=1, seq=4, embed=8.
+        let input_vals: Vec<f64> =
+            (0..32).map(|i| ((i as f64 - 15.5) / 16.0) * 0.5).collect();
+        let input = session
+            .tensor_variable(input_vals, vec![1, 4, 8], false)
+            .expect("input");
+        // Target: same shape, all zeros — attention should learn to
+        // collapse the sequence representation toward zero.
+        let target = session
+            .tensor_variable(vec![0.0; 32], vec![1, 4, 8], false)
+            .expect("target");
+
+        let mut optimizer = Adam::new(mha.parameters(), 0.05);
+
+        let initial_out = mha
+            .forward(&mut session, input)
+            .expect("initial forward");
+        let initial_loss = session
+            .mse_loss(initial_out, target)
+            .expect("initial loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("initial loss val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let out = mha.forward(&mut session, input).expect("forward");
+            let loss = session.mse_loss(out, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "MultiheadAttention never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "MultiheadAttention should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
