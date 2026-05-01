@@ -10726,6 +10726,129 @@ mod tests {
                 prop_assert_eq!(*a, *b);
             }
         }
+
+        // index_select with sequential indices [0..n] must be a
+        // bit-exact identity: it just gathers each row into its own
+        // position. Frankentorch-zt03.
+        #[test]
+        fn fuzz_metamorphic_index_select_sequential_is_identity(
+            samples in prop::collection::vec(-512i16..512i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            #[allow(clippy::cast_precision_loss)]
+            let idx_vals: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let idx = s
+                .tensor_variable(idx_vals, vec![n], false)
+                .expect("idx variable");
+            let out = s.tensor_index_select(x, 0, idx).expect("index_select");
+            let out_vals = s.tensor_values(out).expect("out values");
+            prop_assert_eq!(out_vals.len(), input.len());
+            for (a, b) in out_vals.iter().zip(input.iter()) {
+                prop_assert_eq!(*a, *b);
+            }
+        }
+
+        // relu(x) - relu(-x) == x bit-exactly: both branches gather
+        // the right half of the input under negation, and their
+        // difference is exactly x even at the kink (relu(0) = 0).
+        // Frankentorch-zt03.
+        #[test]
+        fn fuzz_metamorphic_relu_decomposition_recovers_input(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 29.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let nx = s.tensor_neg(x).expect("neg");
+            let r_pos = s.tensor_relu(x).expect("relu(x)");
+            let r_neg = s.tensor_relu(nx).expect("relu(-x)");
+            let recovered = s.tensor_sub(r_pos, r_neg).expect("relu(x) - relu(-x)");
+            let v = s.tensor_values(recovered).expect("recovered values");
+            for (a, b) in v.iter().zip(input.iter()) {
+                prop_assert_eq!(*a, *b, "relu(x) - relu(-x) should equal x bit-exactly");
+            }
+        }
+
+        // diff(cumsum(x)) == x[1..] for any x: cumsum produces partial
+        // sums S_i = sum_{j<=i} x_j; diff yields S_i - S_{i-1} = x_i.
+        // The arithmetic is the same set of additions/subtractions of
+        // identical operands so the result is bit-exact except for
+        // potential reordering — which our cumsum keeps in-order.
+        // Frankentorch-zt03.
+        #[test]
+        fn fuzz_metamorphic_diff_cumsum_recovers_tail(
+            samples in prop::collection::vec(-1000i16..1000i16, 2..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let csum = s.tensor_cumsum(x, 0).expect("cumsum");
+            let diffed = s.tensor_diff(csum, 1).expect("diff");
+            let v = s.tensor_values(diffed).expect("diff values");
+            prop_assert_eq!(v.len(), n - 1);
+            // Compare against input[1..] within a ULP envelope scaled
+            // by the running cumulative magnitude — S_i - S_{i-1} can
+            // drift a few ULPs at the scale of S, even when |x_i| is
+            // small relative to |S|.
+            let cum_abs_max: f64 = input.iter().map(|x| x.abs()).sum::<f64>().max(1.0);
+            for (i, a) in v.iter().enumerate() {
+                let b = input[i + 1];
+                let diff = (a - b).abs();
+                prop_assert!(
+                    diff <= 32.0 * cum_abs_max * f64::EPSILON,
+                    "diff(cumsum(x))[{i}] = {a} but x[{i}+1] = {b}; diff = {diff:e}, bound = {:e}",
+                    32.0 * cum_abs_max * f64::EPSILON
+                );
+            }
+        }
+
+        // pow(x, 2.0) and x * x must agree within a small ULP envelope.
+        // tensor_pow generally implements x^p via exp(p * log(|x|)) for
+        // non-integer p, but for the special case p=2 the kernel
+        // shortcuts to x*x; this property test ensures the shortcut
+        // (or general path) lands within ~16 ULPs. Frankentorch-zt03.
+        #[test]
+        fn fuzz_metamorphic_pow_two_equals_self_mul(
+            samples in prop::collection::vec(-512i16..512i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 31.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let pow2 = s.tensor_pow(x, 2.0).expect("pow 2");
+            let x_sq = s.tensor_mul(x, x).expect("x * x");
+            let v_pow = s.tensor_values(pow2).expect("pow values");
+            let v_mul = s.tensor_values(x_sq).expect("mul values");
+            for (a, b) in v_pow.iter().zip(v_mul.iter()) {
+                let scale = a.abs().max(b.abs()).max(1.0);
+                let diff = (a - b).abs();
+                prop_assert!(
+                    diff <= 1e-12 || diff <= 16.0 * scale * f64::EPSILON,
+                    "pow(x, 2) = {a} but x*x = {b}; diff = {diff:e}"
+                );
+            }
+        }
     }
 
     #[cfg(feature = "fuzz")]
