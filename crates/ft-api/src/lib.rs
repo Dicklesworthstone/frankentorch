@@ -5758,73 +5758,92 @@ impl FrankenTorchSession {
             ));
         }
 
-        let input_vals = self.tensor_values(input)?;
-        let weight_vals = self.tensor_values(weight)?;
+        if kernel_d == 0 || kernel_h == 0 || kernel_w == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "conv3d: kernel dimensions must be greater than zero",
+            ));
+        }
+        if let Some(bias_id) = bias {
+            let bias_shape = self.tensor_shape(bias_id)?;
+            if bias_shape != vec![out_channels] {
+                return Err(Self::incompatible_tensor_args(
+                    "conv3d: bias must have shape [C_out]",
+                ));
+            }
+        }
 
-        let padded_d = input_d + 2 * padding_d;
-        let pad_h = Self::checked_mul(padding_h, 2, "avg_pool2d padding overflow")?;
-        let pad_w = Self::checked_mul(padding_w, 2, "avg_pool2d padding overflow")?;
-        let padded_h = Self::checked_add(input_h, pad_h, "avg_pool2d padding overflow")?;
-        let padded_w = Self::checked_add(input_w, pad_w, "avg_pool2d padding overflow")?;
+        // Compose via tensor_pad + tensor_narrow + tensor_reshape +
+        // tensor_cat + tensor_bmm so gradients flow back to both input
+        // and weight. Tracked under frankentorch-lgj2. Previous body
+        // ran the convolution in plain f64 and rebuilt a non-grad
+        // leaf, severing autograd through every functional_conv3d
+        // call (3D CNNs, video models, medical imaging).
+        //
+        // Mirrors the conv2d composition with an extra D axis: extract
+        // 3D sub-patches via narrow on dims 2, 3, 4; flatten each
+        // patch to [N, 1, C_in*K_d*K_h*K_w]; cat across patches;
+        // reshape weight to [C_out, C_in*K_d*K_h*K_w] and bmm with
+        // batched expand; transpose and reshape to
+        // [N, C_out, D_out, H_out, W_out].
+        let padded = if padding_d > 0 || padding_h > 0 || padding_w > 0 {
+            self.tensor_pad(
+                input,
+                &[
+                    padding_w, padding_w, padding_h, padding_h, padding_d, padding_d,
+                ],
+                0.0,
+            )?
+        } else {
+            input
+        };
+        let pad_d_total = Self::checked_mul(padding_d, 2, "conv3d padding depth overflow")?;
+        let pad_h_total = Self::checked_mul(padding_h, 2, "conv3d padding height overflow")?;
+        let pad_w_total = Self::checked_mul(padding_w, 2, "conv3d padding width overflow")?;
+        let padded_d = Self::checked_add(input_d, pad_d_total, "conv3d padded depth overflow")?;
+        let padded_h = Self::checked_add(input_h, pad_h_total, "conv3d padded height overflow")?;
+        let padded_w = Self::checked_add(input_w, pad_w_total, "conv3d padded width overflow")?;
+        if padded_d < kernel_d || padded_h < kernel_h || padded_w < kernel_w {
+            return Err(Self::incompatible_tensor_args(
+                "conv3d: input too small for kernel size and padding",
+            ));
+        }
+
         let output_d = (padded_d - kernel_d) / stride_d + 1;
         let output_h = (padded_h - kernel_h) / stride_h + 1;
         let output_w = (padded_w - kernel_w) / stride_w + 1;
+        let patch_width = Self::checked_mul(in_channels, kernel_d, "conv3d patch width overflow")?;
+        let patch_width = Self::checked_mul(patch_width, kernel_h, "conv3d patch width overflow")?;
+        let patch_width = Self::checked_mul(patch_width, kernel_w, "conv3d patch width overflow")?;
+        let hw_out = Self::checked_mul(output_h, output_w, "conv3d patch count overflow")?;
+        let patch_count = Self::checked_mul(output_d, hw_out, "conv3d patch count overflow")?;
 
-        let mut output = vec![0.0; batch_size * out_channels * output_d * output_h * output_w];
-
-        for n in 0..batch_size {
-            for oc in 0..out_channels {
-                for od in 0..output_d {
-                    for oh in 0..output_h {
-                        for ow in 0..output_w {
-                            let mut sum = 0.0;
-                            for ic in 0..in_channels {
-                                for kd in 0..kernel_d {
-                                    for kh in 0..kernel_h {
-                                        for kw in 0..kernel_w {
-                                            let id = od * stride_d + kd;
-                                            let ih = oh * stride_h + kh;
-                                            let iw = ow * stride_w + kw;
-                                            let id_orig = id as isize - padding_d as isize;
-                                            let ih_orig = ih as isize - padding_h as isize;
-                                            let iw_orig = iw as isize - padding_w as isize;
-                                            if (0..input_d as isize).contains(&id_orig)
-                                                && (0..input_h as isize).contains(&ih_orig)
-                                                && (0..input_w as isize).contains(&iw_orig)
-                                            {
-                                                let in_idx = ((n * in_channels + ic) * input_d
-                                                    + id_orig as usize)
-                                                    * input_h
-                                                    * input_w
-                                                    + ih_orig as usize * input_w
-                                                    + iw_orig as usize;
-                                                let w_idx = ((oc * in_channels + ic) * kernel_d
-                                                    + kd)
-                                                    * kernel_h
-                                                    * kernel_w
-                                                    + kh * kernel_w
-                                                    + kw;
-                                                sum += input_vals[in_idx] * weight_vals[w_idx];
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            let out_idx =
-                                ((n * out_channels + oc) * output_d + od) * output_h * output_w
-                                    + oh * output_w
-                                    + ow;
-                            output[out_idx] = sum;
-                        }
-                    }
+        let mut patches = Vec::with_capacity(patch_count);
+        for out_d in 0..output_d {
+            let depth_start = Self::checked_mul(out_d, stride_d, "conv3d depth start overflow")?;
+            let depth_slice = self.tensor_narrow(padded, 2, depth_start, kernel_d)?;
+            for out_h in 0..output_h {
+                let row_start = Self::checked_mul(out_h, stride_h, "conv3d row start overflow")?;
+                let row_slice = self.tensor_narrow(depth_slice, 3, row_start, kernel_h)?;
+                for out_w in 0..output_w {
+                    let col_start = Self::checked_mul(out_w, stride_w, "conv3d col start overflow")?;
+                    let patch = self.tensor_narrow(row_slice, 4, col_start, kernel_w)?;
+                    let flat = self.tensor_reshape(patch, vec![batch_size, 1, patch_width])?;
+                    patches.push(flat);
                 }
             }
         }
 
-        let out_node = self.tensor_variable(
+        let unfolded = self.tensor_cat(&patches, 1)?;
+        let weight_flat = self.tensor_reshape(weight, vec![out_channels, patch_width])?;
+        let weight_t = self.tensor_transpose(weight_flat, 0, 1)?;
+        let weight_us = self.tensor_unsqueeze(weight_t, 0)?;
+        let weight_expanded =
+            self.tensor_expand(weight_us, vec![batch_size, patch_width, out_channels])?;
+        let output = self.tensor_bmm(unfolded, weight_expanded)?;
+        let output = self.tensor_transpose(output, 1, 2)?;
+        let out_node = self.tensor_reshape(
             output,
             vec![batch_size, out_channels, output_d, output_h, output_w],
-            false,
         )?;
 
         match bias {
@@ -29338,6 +29357,40 @@ mod tests {
             .unwrap();
         let shape = s.tensor_shape(out).unwrap();
         assert_eq!(shape, vec![1, 1, 2, 2, 2]);
+    }
+
+    #[test]
+    fn conv3d_propagates_gradient_through_input_and_weight() {
+        // Regression for frankentorch-lgj2: previous body extracted
+        // tensor_values + rebuilt non-grad output, severing autograd
+        // through every functional_conv3d call. Now composes via
+        // im2col + bmm (mirrors functional_conv2d).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 1x1x2x2x2 input, 1x1x2x2x2 kernel, no stride/pad.
+        let input = s
+            .tensor_variable((0..8).map(|i| (i as f64) - 3.5).collect(), vec![1, 1, 2, 2, 2], true)
+            .unwrap();
+        let weight = s
+            .tensor_variable(vec![0.5; 8], vec![1, 1, 2, 2, 2], true)
+            .unwrap();
+        let out = s
+            .functional_conv3d(input, weight, None, (1, 1, 1), (0, 0, 0))
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 1, 1, 1]);
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let in_grad = s.tensor_gradient(&report, input).expect("input grad");
+        let w_grad = s.tensor_gradient(&report, weight).expect("weight grad");
+        // Single-output convolution: dL/dinput[k] = weight[k] = 0.5,
+        //                             dL/dweight[k] = input[k]
+        for &g in in_grad {
+            assert!((g - 0.5).abs() < 1e-12);
+        }
+        let input_vals: Vec<f64> = (0..8).map(|i| (i as f64) - 3.5).collect();
+        for (k, &g) in w_grad.iter().enumerate() {
+            assert!((g - input_vals[k]).abs() < 1e-12);
+        }
     }
 
     #[test]
