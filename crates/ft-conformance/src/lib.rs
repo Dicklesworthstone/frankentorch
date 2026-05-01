@@ -10642,6 +10642,100 @@ mod tests {
             }
         }
 
+        // Sigmoid output stays in (0, 1) for any finite input.
+        // Frankentorch-c7bl.
+        #[test]
+        fn fuzz_corpus_prop_unary_sigmoid_in_unit_interval(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            let input: Vec<f64> = samples
+                .iter()
+                .map(|value| f64::from(*value) / 17.0)
+                .collect();
+            let meta = fuzz_meta_1d(input.len());
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Sigmoid,
+                ExecutionMode::Strict,
+                &input,
+                &meta,
+                false,
+            )
+            .expect("fuzz unary sigmoid dispatch should not fail");
+            for v in &outcome.values {
+                prop_assert!(
+                    *v >= 0.0 && *v <= 1.0,
+                    "sigmoid output {v} not in [0, 1]"
+                );
+            }
+        }
+
+        // Tanh output stays in (-1, 1) for any finite input.
+        // Frankentorch-c7bl.
+        #[test]
+        fn fuzz_corpus_prop_unary_tanh_in_minus_one_one(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            let input: Vec<f64> = samples
+                .iter()
+                .map(|value| f64::from(*value) / 17.0)
+                .collect();
+            let meta = fuzz_meta_1d(input.len());
+            let outcome = dispatch_tensor_unary_contiguous_f64(
+                UnaryOp::Tanh,
+                ExecutionMode::Strict,
+                &input,
+                &meta,
+                false,
+            )
+            .expect("fuzz unary tanh dispatch should not fail");
+            for v in &outcome.values {
+                prop_assert!(
+                    *v >= -1.0 && *v <= 1.0,
+                    "tanh output {v} not in [-1, 1]"
+                );
+            }
+        }
+
+        // a - b bit-exactly equals -(b - a). Frankentorch-c7bl.
+        #[test]
+        fn fuzz_corpus_prop_binary_sub_anti_commutative(
+            pairs in prop::collection::vec((-1024i16..1024i16, -1024i16..1024i16), 1..24)
+        ) {
+            let lhs: Vec<f64> = pairs.iter().map(|(l, _)| f64::from(*l) / 19.0).collect();
+            let rhs: Vec<f64> = pairs.iter().map(|(_, r)| f64::from(*r) / 19.0).collect();
+            let meta = fuzz_meta_1d(lhs.len());
+            let lr = dispatch_tensor_binary_contiguous_f64(
+                BinaryOp::Sub,
+                ExecutionMode::Strict,
+                &lhs,
+                &rhs,
+                &meta,
+                &meta,
+                false,
+            )
+            .expect("fuzz sub lhs-rhs should not fail");
+            let rl = dispatch_tensor_binary_contiguous_f64(
+                BinaryOp::Sub,
+                ExecutionMode::Strict,
+                &rhs,
+                &lhs,
+                &meta,
+                &meta,
+                false,
+            )
+            .expect("fuzz sub rhs-lhs should not fail");
+            for (a, b) in lr.values.iter().zip(rl.values.iter()) {
+                // a - b should equal -(b - a). Compare by value
+                // (not bit pattern) to handle signed-zero: when
+                // a == b, lhs is +0.0 but -(rhs) is -0.0.
+                prop_assert!(
+                    *a == -*b,
+                    "a - b ({a}) should equal -(b - a) ({})",
+                    -*b
+                );
+            }
+        }
+
         // Mean reduction matches the simple fold reference (sum/n).
         // Frankentorch-9kc9.
         #[test]
