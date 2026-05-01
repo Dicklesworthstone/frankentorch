@@ -21313,6 +21313,94 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn weight_norm_linear_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-kom3 (depends on the
+        // 8kd7 weight_norm_reconstruct autograd fix): training on
+        // (g, v) instead of W via weight_norm_reconstruct each step
+        // should converge to fit a linear regression target.
+        // Validates that gradient flow through the magnitude and
+        // direction parametrization actually works under Adam.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{weight_norm_decompose, weight_norm_reconstruct};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Truth target: y = W_true @ x.
+        // 4 samples of x in R^3, mapped to R^2 via fixed truth weight.
+        let xs_vals = vec![
+            1.0, 2.0, 3.0, // sample 0
+            -1.0, 0.5, 1.5, // sample 1
+            0.0, -1.0, 2.0, // sample 2
+            2.0, 1.0, -0.5, // sample 3
+        ];
+        let truth_w = [
+            0.5, -0.25, 1.0, //
+            -1.0, 0.5, 0.5,
+        ];
+        let mut targets_vals = Vec::with_capacity(8);
+        for sample in 0..4 {
+            for row in 0..2 {
+                let mut sum = 0.0;
+                for col in 0..3 {
+                    sum += truth_w[row * 3 + col] * xs_vals[sample * 3 + col];
+                }
+                targets_vals.push(sum);
+            }
+        }
+        let xs = session
+            .tensor_variable(xs_vals, vec![4, 3], false)
+            .expect("xs");
+        let targets = session
+            .tensor_variable(targets_vals, vec![4, 2], false)
+            .expect("targets");
+
+        // Initial weight: small random values; decompose into (g, v).
+        let init_w = session
+            .tensor_variable(
+                vec![0.1; 6],
+                vec![2, 3],
+                true,
+            )
+            .expect("init w");
+        let (g, v) = weight_norm_decompose(&mut session, init_w, 0).expect("decompose");
+        let mut optimizer = Adam::new(vec![g, v], 0.05);
+
+        // Initial forward + loss for the regression sanity check.
+        let initial_w = weight_norm_reconstruct(&mut session, g, v, 0).expect("reconstruct");
+        let w_t = session.tensor_transpose(initial_w, 0, 1).expect("w^T");
+        let initial_pred = session.tensor_matmul(xs, w_t).expect("matmul");
+        let initial_loss = session.mse_loss(initial_pred, targets).expect("loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("loss val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..300 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let w = weight_norm_reconstruct(&mut session, g, v, 0).expect("reconstruct");
+            let w_t = session.tensor_transpose(w, 0, 1).expect("w^T");
+            let pred = session.tensor_matmul(xs, w_t).expect("matmul");
+            let loss = session.mse_loss(pred, targets).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "weight_norm linear regression never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "weight_norm linear regression should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
