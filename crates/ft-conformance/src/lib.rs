@@ -11335,6 +11335,60 @@ mod tests {
             );
         }
 
+        // tensor_min_dim ≤ tensor_max_dim element-wise: a basic
+        // sanity check that both reductions agree on the partial
+        // ordering. Frankentorch-vkbf.
+        #[test]
+        fn fuzz_metamorphic_min_le_max(
+            (rows, cols, raw) in (2usize..6, 2usize..6)
+                .prop_flat_map(|(rows, cols)| (
+                    Just(rows),
+                    Just(cols),
+                    prop::collection::vec(-2000i16..2000i16, rows * cols),
+                ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable(input, vec![rows, cols], false)
+                .expect("variable");
+            let (max_t, _) = s.tensor_max_dim(x, 1).expect("max_dim");
+            let (min_t, _) = s.tensor_min_dim(x, 1).expect("min_dim");
+            let v_max = s.tensor_values(max_t).expect("max vals");
+            let v_min = s.tensor_values(min_t).expect("min vals");
+            for (mn, mx) in v_min.iter().zip(v_max.iter()) {
+                prop_assert!(
+                    *mn <= *mx,
+                    "min should be ≤ max: min={mn}, max={mx}"
+                );
+            }
+        }
+
+        // argmax(x) bit-exactly equals argmin(-x): the index that
+        // achieves the largest value in x is the same that achieves
+        // the smallest in its negation. Frankentorch-vkbf.
+        #[test]
+        fn fuzz_metamorphic_argmax_equals_argmin_of_neg(
+            samples in prop::collection::vec(-1500i16..1500i16, 2..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input, vec![n], false)
+                .expect("variable");
+            let nx = s.tensor_neg(x).expect("neg");
+            let argmax = s.tensor_argmax(x, 0).expect("argmax");
+            let argmin_of_neg = s.tensor_argmin(nx, 0).expect("argmin(neg)");
+            let v_argmax = s.tensor_values(argmax).expect("argmax val")[0];
+            let v_argmin = s.tensor_values(argmin_of_neg).expect("argmin val")[0];
+            prop_assert_eq!(v_argmax.to_bits(), v_argmin.to_bits());
+        }
+
         // pack_padded_sequence → pad_packed_sequence round-trip
         // preserves each sequence's real-length values bit-exactly.
         // Validates the gather/scatter pattern in tp3r's
