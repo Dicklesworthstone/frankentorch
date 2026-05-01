@@ -11335,6 +11335,65 @@ mod tests {
             );
         }
 
+        // pack_padded_sequence → pad_packed_sequence round-trip
+        // preserves each sequence's real-length values bit-exactly.
+        // Validates the gather/scatter pattern in tp3r's
+        // pack/pad_packed implementations. Frankentorch-875m.
+        #[test]
+        fn fuzz_metamorphic_pack_pad_packed_round_trip(
+            (lengths_raw, raw) in (
+                prop::collection::vec(1usize..6, 2..5),
+                prop::collection::vec(-512i16..512i16, 25),
+            )
+        ) {
+            use ft_api::FrankenTorchSession;
+            use ft_nn::{pack_padded_sequence, pad_packed_sequence};
+
+            // Sort lengths descending (pack_padded_sequence requires
+            // either pre-sorted or enforce_sorted=false).
+            let mut lengths = lengths_raw.clone();
+            lengths.sort_by(|a, b| b.cmp(a));
+            let batch = lengths.len();
+            let max_len = lengths[0];
+
+            // Build padded input [max_len, batch] (time-first).
+            // Use raw values cycled to fill the buffer.
+            let mut padded: Vec<f64> = vec![0.0; max_len * batch];
+            for (b, &len) in lengths.iter().enumerate() {
+                for t in 0..len {
+                    let raw_idx = (t * batch + b) % raw.len();
+                    padded[t * batch + b] = f64::from(raw[raw_idx]) / 17.0;
+                }
+            }
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s
+                .tensor_variable(padded.clone(), vec![max_len, batch], false)
+                .expect("input");
+
+            let packed = pack_padded_sequence(&mut s, input, &lengths, false, true)
+                .expect("pack_padded_sequence");
+            let (unpacked, recovered_lengths) =
+                pad_packed_sequence(&mut s, &packed, false, 0.0, None)
+                    .expect("pad_packed_sequence");
+            let unpacked_vals = s.tensor_values(unpacked).expect("unpacked vals");
+
+            // Validate that recovered lengths match the input.
+            prop_assert_eq!(recovered_lengths, lengths.clone());
+
+            // Validate that for each (t, b) within the batch's real
+            // length, the unpacked value matches the padded input.
+            for (b, &len) in lengths.iter().enumerate() {
+                for t in 0..len {
+                    let pos = t * batch + b;
+                    prop_assert_eq!(
+                        unpacked_vals[pos].to_bits(),
+                        padded[pos].to_bits()
+                    );
+                }
+            }
+        }
+
         // cat([x, y], 0) followed by narrow(0, 0..n_x) bit-exactly
         // recovers x: cat is a memory operation, narrow is a slice;
         // both preserve values exactly. Frankentorch-nujc.
