@@ -16635,9 +16635,23 @@ impl FrankenTorchSession {
             if reduce == "sum" {
                 return self.tensor_scatter_add(input, dim, index, src);
             }
+            if reduce == "mean" {
+                // Compose mean as scatter_add(input, src) / (1 + count_per_position).
+                // include_self=True semantics: positions never hit
+                // get count=0, divisor=1, output = input.
+                // Tracked under frankentorch-uzca.
+                let src_shape = self.tensor_shape(src)?;
+                let ones_src = self.full(src_shape.clone(), 1.0, false)?;
+                let zeros_for_count = self.full(input_shape.clone(), 0.0, false)?;
+                let count = self.tensor_scatter_add(zeros_for_count, dim, index, ones_src)?;
+                let summed = self.tensor_scatter_add(input, dim, index, src)?;
+                let one_t = self.full(input_shape, 1.0, false)?;
+                let divisor = self.tensor_add(count, one_t)?;
+                return self.tensor_div(summed, divisor);
+            }
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "scatter_reduce: autograd not supported for reduce other than 'sum' (use 'sum' for autograd-aware accumulation; tracked under frankentorch-dhm4)",
+                    reason: "scatter_reduce: autograd not supported for reduce other than 'sum'/'mean' (prod/amax/amin backward not yet implemented; tracked under frankentorch-dhm4)",
                 },
             )));
         }
@@ -36927,7 +36941,9 @@ mod tests {
     }
 
     #[test]
-    fn scatter_reduce_non_sum_fails_loud_on_requires_grad() {
+    fn scatter_reduce_prod_amax_amin_fail_loud_on_requires_grad() {
+        // mean mode is now autograd-aware (frankentorch-uzca);
+        // prod/amax/amin still fail loud.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s.tensor_variable(vec![2.0, 6.0], vec![2], true).unwrap();
         let index = s
@@ -36936,12 +36952,48 @@ mod tests {
         let src = s
             .tensor_variable(vec![4.0, 8.0, 10.0], vec![3], false)
             .unwrap();
-        for reduce in ["mean", "prod", "amax", "amin"] {
+        for reduce in ["prod", "amax", "amin"] {
             let err = s
                 .tensor_scatter_reduce(input, 0, index, src, reduce)
-                .expect_err("non-sum reduce must fail loud on requires_grad");
+                .expect_err("non-sum/mean reduce must fail loud on requires_grad");
             assert!(format!("{err:?}").contains("autograd not supported"));
         }
+    }
+
+    #[test]
+    fn scatter_reduce_mean_propagates_gradient() {
+        // Regression for frankentorch-uzca: mean composes via
+        // scatter_add(sum) + scatter_add(count) + add 1 + div.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![2.0, 6.0], vec![2], true).unwrap();
+        let index = s
+            .tensor_variable(vec![0.0, 0.0, 1.0], vec![3], false)
+            .unwrap();
+        let src = s
+            .tensor_variable(vec![4.0, 8.0, 10.0], vec![3], true)
+            .unwrap();
+        let out = s
+            .tensor_scatter_reduce(input, 0, index, src, "mean")
+            .unwrap();
+        // sum: input + scatter src = [2+4+8, 6+10] = [14, 16]
+        // count: [2, 1]; divisor = count + 1 = [3, 2]
+        // mean: [14/3, 16/2] = [14/3, 8]
+        let vals = s.tensor_values(out).unwrap();
+        assert!((vals[0] - 14.0/3.0).abs() < 1e-12);
+        assert!((vals[1] - 8.0).abs() < 1e-12);
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let in_grad = s.tensor_gradient(&report, input).expect("input grad");
+        let src_grad = s.tensor_gradient(&report, src).expect("src grad");
+        // dL/dinput[i] = d/dinput[i] sum(out) = 1/divisor[i]
+        //   in_grad = [1/3, 1/2]
+        assert!((in_grad[0] - 1.0/3.0).abs() < 1e-12);
+        assert!((in_grad[1] - 0.5).abs() < 1e-12);
+        // dL/dsrc[j] = 1/divisor[index[j]]
+        //   src_grad = [1/3, 1/3, 1/2]
+        assert!((src_grad[0] - 1.0/3.0).abs() < 1e-12);
+        assert!((src_grad[1] - 1.0/3.0).abs() < 1e-12);
+        assert!((src_grad[2] - 0.5).abs() < 1e-12);
     }
 
     #[test]
