@@ -21563,6 +21563,75 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn functional_conv3d_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-rs4r (depends on the
+        // functional_conv3d autograd fix, frankentorch-lgj2):
+        // a learnable 3D conv kernel should converge to fit a
+        // target volume when trained with Adam through F.conv3d.
+        // Validates the im2col + bmm composition unblocks 3D CNN
+        // training (video models, medical imaging).
+        use ft_api::FrankenTorchSession;
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // 1x1x4x4x4 fixed input; values vary so the learning signal
+        // isn't degenerate.
+        let input_vals: Vec<f64> = (0..64).map(|i| (i as f64 - 31.5) / 32.0).collect();
+        let input = session
+            .tensor_variable(input_vals, vec![1, 1, 4, 4, 4], false)
+            .expect("input");
+
+        // Learnable Conv3d weight: 1x1x2x2x2 (in=1, out=1, kernel 2x2x2),
+        // initialized to small random values.
+        let weight_init: Vec<f64> = (0..8).map(|i| (i as f64 - 3.5) * 0.02).collect();
+        let weight = session
+            .tensor_variable(weight_init, vec![1, 1, 2, 2, 2], true)
+            .expect("weight");
+
+        // Target volume: 3x3x3 ones.
+        let target = session
+            .tensor_variable(vec![1.0; 27], vec![1, 1, 3, 3, 3], false)
+            .expect("target");
+
+        let mut optimizer = Adam::new(vec![weight], 0.05);
+
+        let initial_out = session
+            .functional_conv3d(input, weight, None, (1, 1, 1), (0, 0, 0))
+            .expect("initial conv3d");
+        let initial_loss = session
+            .mse_loss(initial_out, target)
+            .expect("initial loss");
+        let initial_loss_val = session.tensor_values(initial_loss).expect("initial loss val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let out = session
+                .functional_conv3d(input, weight, None, (1, 1, 1), (0, 0, 0))
+                .expect("conv3d");
+            let loss = session.mse_loss(out, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "functional_conv3d never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "functional_conv3d should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
