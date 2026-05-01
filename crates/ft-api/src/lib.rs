@@ -11829,6 +11829,13 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<(TensorNodeId, Vec<usize>), AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "lu_factor: autograd not supported (LU backward not yet implemented). Tracked under frankentorch-sn58.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let result = ft_kernel_cpu::lu_factor_contiguous_f64(&values, &meta)
             .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
@@ -11847,6 +11854,13 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "linalg_lu: autograd not supported (LU backward not yet implemented). Tracked under frankentorch-sn58.",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let factor = ft_kernel_cpu::lu_factor_contiguous_f64(&values, &meta)
             .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
@@ -11871,6 +11885,13 @@ impl FrankenTorchSession {
         pivots: &[usize],
         b: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(lu_packed)? || self.tensor_requires_grad(b)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "lu_solve: autograd not supported (LU backward not yet implemented). Use tensor_linalg_solve for autograd-aware solve. Tracked under frankentorch-sn58.",
+                },
+            )));
+        }
         let (lu_values, lu_meta) = self.tensor_values_meta(lu_packed)?;
         let lu_shape = lu_meta.shape();
         if lu_shape.len() != 2 || lu_shape[0] != lu_shape[1] {
@@ -25349,6 +25370,25 @@ mod tests {
             session.tensor_lu_factor(a).is_err(),
             "non-square should error"
         );
+    }
+
+    #[test]
+    fn lu_primitives_fail_loud_on_requires_grad() {
+        // Regression for frankentorch-sn58: LU decomposition primitives
+        // used to silently sever autograd via tensor_values + non-grad
+        // rebuild. Each now fails loud on requires_grad input.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![2.0, 0.0, 0.0, 3.0], vec![2, 2], true)
+            .unwrap();
+        let lu_err = s
+            .tensor_lu_factor(a)
+            .expect_err("lu_factor must fail loud on requires_grad");
+        assert!(format!("{lu_err:?}").contains("autograd not supported"));
+        let lu2_err = s
+            .tensor_linalg_lu(a)
+            .expect_err("linalg_lu must fail loud on requires_grad");
+        assert!(format!("{lu2_err:?}").contains("autograd not supported"));
     }
 
     // ---- QR Decomposition tests (bd-2drq.4) ----
