@@ -10849,6 +10849,100 @@ mod tests {
                 );
             }
         }
+
+        // neg(neg(x)) bit-exactly equals x: negation is a sign-bit flip
+        // and applying it twice restores both the value and the bit
+        // representation. Frankentorch-kznr.
+        #[test]
+        fn fuzz_metamorphic_neg_neg_is_identity(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let nx = s.tensor_neg(x).expect("neg");
+            let nnx = s.tensor_neg(nx).expect("neg(neg)");
+            let v = s.tensor_values(nnx).expect("vals");
+            for (a, b) in v.iter().zip(input.iter()) {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "neg(neg(x)) should equal x bit-exactly"
+                );
+            }
+        }
+
+        // Sorting an already-sorted tensor yields the same values.
+        // The first sort produces a fully ordered slice; the second
+        // pass cannot reorder anything further. Even if the kernel
+        // does not detect the trivial input it should still emit the
+        // same ordering. Frankentorch-kznr.
+        #[test]
+        fn fuzz_metamorphic_sort_is_idempotent(
+            samples in prop::collection::vec(-1500i16..1500i16, 2..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 19.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = s
+                .tensor_variable(input.clone(), vec![n], false)
+                .expect("variable");
+            let (sorted_once, _) = s.tensor_sort(x, 0, false).expect("sort once");
+            let (sorted_twice, _) = s
+                .tensor_sort(sorted_once, 0, false)
+                .expect("sort twice");
+            let v_once = s.tensor_values(sorted_once).expect("vals once");
+            let v_twice = s.tensor_values(sorted_twice).expect("vals twice");
+            for (a, b) in v_once.iter().zip(v_twice.iter()) {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "sort(sort(x)) should equal sort(x) bit-exactly"
+                );
+            }
+        }
+
+        // sum(sum_dim(x, 0)) within a small ULP envelope of sum(x).
+        // The two paths sum the same set of values and should agree
+        // up to floating-point reordering. Frankentorch-kznr.
+        #[test]
+        fn fuzz_metamorphic_sum_of_sum_dim_equals_sum(
+            (rows, cols, raw) in (1usize..6, 1usize..6)
+                .prop_flat_map(|(rows, cols)| (
+                    Just(rows),
+                    Just(cols),
+                    prop::collection::vec(-2000i16..2000i16, rows * cols),
+                ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable(input.clone(), vec![rows, cols], false)
+                .expect("variable");
+            let sum_dim0 = s.tensor_sum_dim(x, 0).expect("sum_dim 0");
+            let sum_full = s.tensor_sum(sum_dim0).expect("sum after sum_dim");
+            let direct = s.tensor_sum(x).expect("direct sum");
+            let v_two_step = s.tensor_values(sum_full).expect("two-step")[0];
+            let v_direct = s.tensor_values(direct).expect("direct")[0];
+            // Both paths add the same n=rows*cols values; the only
+            // difference is summation order. Bound by n * |max| * eps.
+            let abs_total: f64 = input.iter().map(|x| x.abs()).sum::<f64>().max(1.0);
+            let bound = 16.0 * abs_total * f64::EPSILON;
+            let diff = (v_two_step - v_direct).abs();
+            prop_assert!(
+                diff <= bound,
+                "sum(sum_dim(x, 0)) = {v_two_step} but sum(x) = {v_direct}; diff = {diff:e}, bound = {bound:e}"
+            );
+        }
     }
 
     #[cfg(feature = "fuzz")]
