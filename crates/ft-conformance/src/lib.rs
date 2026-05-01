@@ -21247,6 +21247,72 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn reflection_pad2d_conv2d_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-pxmu (depends on the kae4
+        // padding-modules autograd fix): ReflectionPad2d feeding into
+        // Conv2d should produce gradients that flow through both
+        // layers' parameters and the input. Chains the padding ops's
+        // tensor_index_select-based composition with Conv2d's im2col
+        // matmul path and validates end-to-end convergence.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Conv2d, Module, ReflectionPad2d};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pad = ReflectionPad2d::new((1, 1, 1, 1));
+        let conv = Conv2d::new(&mut session, 1, 1, (3, 3), (1, 1), (0, 0), true)
+            .expect("conv2d");
+
+        // 4x4 input image (single channel, single sample).
+        let input_vals: Vec<f64> = (0..16).map(|i| (i as f64 - 7.5) / 4.0).collect();
+        let input = session
+            .tensor_variable(input_vals, vec![1, 1, 4, 4], false)
+            .expect("input");
+        // Target image: 4x4 of ones — what conv should learn to map to.
+        let target_vals = vec![1.0; 16];
+        let target = session
+            .tensor_variable(target_vals, vec![1, 1, 4, 4], false)
+            .expect("target");
+
+        let mut optimizer = Adam::new(conv.parameters(), 0.05);
+
+        let initial_padded = pad.forward(&mut session, input).expect("initial pad");
+        let initial_out = conv
+            .forward(&mut session, initial_padded)
+            .expect("initial conv");
+        let initial_loss = session
+            .mse_loss(initial_out, target)
+            .expect("initial loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("initial loss val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let padded = pad.forward(&mut session, input).expect("pad");
+            let out = conv.forward(&mut session, padded).expect("conv");
+            let loss = session.mse_loss(out, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "ReflectionPad2d → Conv2d never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "ReflectionPad2d → Conv2d should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
