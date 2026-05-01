@@ -2372,30 +2372,26 @@ impl EmbeddingBag {
     ) -> Result<TensorNodeId, AutogradError> {
         let indices_vals = session.tensor_values(indices)?;
         let offsets_vals = session.tensor_values(offsets)?;
-        let weight_vals = session.tensor_values(self.weight)?;
-        let psw = if let Some(w) = per_sample_weights {
-            Some(session.tensor_values(w)?)
-        } else {
-            None
-        };
 
         let num_bags = offsets_vals.len();
         let dim = self.embedding_dim;
         let n_indices = indices_vals.len();
         let num_emb = self.num_embeddings;
-        let mut output = vec![0.0f64; num_bags * dim];
 
-        // Validate per-sample weights length if provided
-        if let Some(ref psw) = psw
-            && psw.len() != n_indices
-        {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "EmbeddingBag: per_sample_weights length must match indices length",
-                },
-            )));
+        if let Some(w) = per_sample_weights {
+            let psw_shape = session.tensor_shape(w)?;
+            let psw_numel = checked_shape_numel(&psw_shape, "EmbeddingBag: psw shape overflow")?;
+            if psw_numel != n_indices {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "EmbeddingBag: per_sample_weights length must match indices length",
+                    },
+                )));
+            }
         }
 
+        // Pre-compute (start, end) per bag and validate offsets.
+        let mut bag_ranges = Vec::with_capacity(num_bags);
         for bag in 0..num_bags {
             let start_f = offsets_vals[bag];
             if start_f < 0.0 || start_f != start_f.trunc() {
@@ -2405,7 +2401,7 @@ impl EmbeddingBag {
                     },
                 )));
             }
-            let start = start_f as usize;
+            let mut start = start_f as usize;
             let end = if bag + 1 < num_bags {
                 let end_f = offsets_vals[bag + 1];
                 if end_f < 0.0 || end_f != end_f.trunc() {
@@ -2419,78 +2415,191 @@ impl EmbeddingBag {
             } else {
                 n_indices
             };
+            if start > n_indices {
+                start = n_indices;
+            }
+            bag_ranges.push((start, end));
+        }
 
-            let start = start.min(n_indices);
-            if start >= end {
-                // Empty bag: leave as zeros
+        // Validate every index points into the embedding table (no
+        // out-of-range — even silently — because index_select would
+        // catch it later but we want the same error message).
+        for &iv in &indices_vals {
+            let idx = iv as usize;
+            if Some(idx) == self.padding_idx {
                 continue;
             }
+            if idx >= num_emb {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "EmbeddingBag: index out of range for embedding table",
+                    },
+                )));
+            }
+        }
 
-            let bag_size = end - start;
-            let mut bag_result = vec![0.0f64; dim];
+        // Compose via autograd-aware primitives so gradients flow back
+        // to weight + per_sample_weights. Tracked under
+        // frankentorch-y8le. Previous body extracted tensor_values
+        // and rebuilt a non-grad leaf, severing autograd through every
+        // EmbeddingBag layer.
+        //
+        // For Sum/Mean: emb = index_select(weight, 0, indices); apply
+        // padding mask + per-sample weights; scatter_add into a zeros
+        // [num_bags, dim] tensor along dim 0 with index = bag_id_per_token.
+        // Mean divides by bag size after.
+        //
+        // For Max: capture argmax positions in plain f64 (non-diff op),
+        // then gather rows from emb. PyTorch routes the gradient only
+        // through the argmax position, which gather replicates.
 
-            match self.mode {
-                EmbeddingBagMode::Sum | EmbeddingBagMode::Mean => {
+        // Empty inputs short-circuit to zeros (still autograd-aware:
+        // the result is a non-grad leaf, but with no upstream grad
+        // source there's nothing to break).
+        if n_indices == 0 || num_bags == 0 {
+            return session.tensor_variable(vec![0.0; num_bags * dim], vec![num_bags, dim], false);
+        }
+
+        // 1. emb_rows: index_select(weight, 0, indices) → [N, D].
+        // We replace any padding_idx with 0 in the lookup so the row
+        // is well-defined, and zero out the contribution via mask.
+        let safe_indices_vals: Vec<f64> = indices_vals
+            .iter()
+            .map(|&iv| {
+                let idx = iv as usize;
+                if Some(idx) == self.padding_idx {
+                    0.0
+                } else {
+                    iv
+                }
+            })
+            .collect();
+        let safe_idx_t = session.tensor_variable(safe_indices_vals, vec![n_indices], false)?;
+        let emb_rows = session.tensor_index_select(self.weight, 0, safe_idx_t)?; // [N, D]
+
+        // 2. Padding mask (1 where token is real, 0 where padding).
+        let pad_mask_vals: Vec<f64> = indices_vals
+            .iter()
+            .map(|&iv| {
+                let idx = iv as usize;
+                if Some(idx) == self.padding_idx {
+                    0.0
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let pad_mask = session.tensor_variable(pad_mask_vals, vec![n_indices], false)?;
+        let pad_mask_kd = session.tensor_unsqueeze(pad_mask, 1)?;
+        let pad_mask_b = session.tensor_expand(pad_mask_kd, vec![n_indices, dim])?;
+        let masked_rows = session.tensor_mul(emb_rows, pad_mask_b)?;
+
+        // 3. Apply per-sample weights (autograd-aware).
+        let weighted_rows = if let Some(psw) = per_sample_weights {
+            let psw_kd = session.tensor_unsqueeze(psw, 1)?;
+            let psw_b = session.tensor_expand(psw_kd, vec![n_indices, dim])?;
+            session.tensor_mul(masked_rows, psw_b)?
+        } else {
+            masked_rows
+        };
+
+        // 4. Build per-token bag-id and per-bag size tables.
+        let mut bag_id_per_token: Vec<f64> = vec![0.0; n_indices];
+        let mut bag_size: Vec<f64> = vec![0.0; num_bags];
+        for (bag, &(start, end)) in bag_ranges.iter().enumerate() {
+            for i in start..end {
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    bag_id_per_token[i] = bag as f64;
+                }
+                let idx = indices_vals[i] as usize;
+                if Some(idx) != self.padding_idx {
+                    bag_size[bag] += 1.0;
+                }
+            }
+        }
+
+        match self.mode {
+            EmbeddingBagMode::Sum | EmbeddingBagMode::Mean => {
+                // scatter_add along dim 0 needs an index tensor of the
+                // same shape as src ([n_indices, dim]) where each entry
+                // tells the destination row.
+                let mut bag_id_2d: Vec<f64> = Vec::with_capacity(n_indices * dim);
+                for &bag_id in &bag_id_per_token {
+                    bag_id_2d.extend(std::iter::repeat_n(bag_id, dim));
+                }
+                let bag_id_2d_t =
+                    session.tensor_variable(bag_id_2d, vec![n_indices, dim], false)?;
+                let zeros = session.full(vec![num_bags, dim], 0.0, false)?;
+                let summed =
+                    session.tensor_scatter_add(zeros, 0, bag_id_2d_t, weighted_rows)?;
+                if matches!(self.mode, EmbeddingBagMode::Mean) {
+                    // Divide by bag_size, with bag_size clamped to 1 to
+                    // avoid division by zero on empty bags (PyTorch
+                    // returns 0 for those — div by 1 of a zero summed
+                    // row also gives 0).
+                    let safe_bag_size: Vec<f64> = bag_size
+                        .iter()
+                        .map(|&n| if n > 0.0 { n } else { 1.0 })
+                        .collect();
+                    let bs_t = session.tensor_variable(safe_bag_size, vec![num_bags], false)?;
+                    let bs_kd = session.tensor_unsqueeze(bs_t, 1)?;
+                    let bs_b = session.tensor_expand(bs_kd, vec![num_bags, dim])?;
+                    return session.tensor_div(summed, bs_b);
+                }
+                Ok(summed)
+            }
+            EmbeddingBagMode::Max => {
+                // Capture argmax positions per (bag, d) by extracting
+                // values once. Argmax itself is non-differentiable;
+                // routing the gradient through tensor_gather to the
+                // argmax position matches PyTorch's autograd semantics.
+                let weighted_vals = session.tensor_values(weighted_rows)?;
+                let mut argmax_per_bag: Vec<usize> = vec![0; num_bags * dim];
+                let mut bag_has_real: Vec<bool> = vec![false; num_bags];
+                for (bag, &(start, end)) in bag_ranges.iter().enumerate() {
+                    let mut best = vec![f64::NEG_INFINITY; dim];
                     for i in start..end {
                         let idx = indices_vals[i] as usize;
                         if Some(idx) == self.padding_idx {
                             continue;
                         }
-                        if idx >= num_emb {
-                            return Err(AutogradError::Dispatch(DispatchError::Key(
-                                DispatchKeyError::IncompatibleSet {
-                                    reason: "EmbeddingBag: index out of range for embedding table",
-                                },
-                            )));
-                        }
-                        let w = if let Some(ref psw) = psw { psw[i] } else { 1.0 };
+                        bag_has_real[bag] = true;
                         for d in 0..dim {
-                            bag_result[d] += w * weight_vals[idx * dim + d];
-                        }
-                    }
-                    if self.mode == EmbeddingBagMode::Mean && bag_size > 0 {
-                        for item in bag_result.iter_mut().take(dim) {
-                            *item /= bag_size as f64;
-                        }
-                    }
-                }
-                EmbeddingBagMode::Max => {
-                    // Initialize with -inf
-                    for item in bag_result.iter_mut().take(dim) {
-                        *item = f64::NEG_INFINITY;
-                    }
-                    for &iv in indices_vals.iter().take(end).skip(start) {
-                        let idx = iv as usize;
-                        if Some(idx) == self.padding_idx {
-                            continue;
-                        }
-                        if idx >= num_emb {
-                            return Err(AutogradError::Dispatch(DispatchError::Key(
-                                DispatchKeyError::IncompatibleSet {
-                                    reason: "EmbeddingBag: index out of range for embedding table",
-                                },
-                            )));
-                        }
-                        for d in 0..dim {
-                            let v = weight_vals[idx * dim + d];
-                            if v > bag_result[d] {
-                                bag_result[d] = v;
+                            let v = weighted_vals[i * dim + d];
+                            if v > best[d] {
+                                best[d] = v;
+                                argmax_per_bag[bag * dim + d] = i;
                             }
                         }
                     }
-                    // If all were padding, replace -inf with 0
-                    for item in bag_result.iter_mut().take(dim) {
-                        if *item == f64::NEG_INFINITY {
-                            *item = 0.0;
-                        }
-                    }
                 }
+                // For empty bags (all padding), point argmax to row 0
+                // and zero out via real_mask after gather.
+                let argmax_f64: Vec<f64> = argmax_per_bag
+                    .iter()
+                    .map(|&v| {
+                        #[allow(clippy::cast_precision_loss)]
+                        let r = v as f64;
+                        r
+                    })
+                    .collect();
+                let argmax_t =
+                    session.tensor_variable(argmax_f64, vec![num_bags, dim], false)?;
+                // gather over dim 0: output[bag, d] = weighted_rows[argmax[bag, d], d].
+                let gathered =
+                    session.tensor_gather(weighted_rows, 0, argmax_t)?;
+                let real_mask_vals: Vec<f64> = bag_has_real
+                    .iter()
+                    .map(|&b| if b { 1.0 } else { 0.0 })
+                    .collect();
+                let real_mask =
+                    session.tensor_variable(real_mask_vals, vec![num_bags], false)?;
+                let real_kd = session.tensor_unsqueeze(real_mask, 1)?;
+                let real_b = session.tensor_expand(real_kd, vec![num_bags, dim])?;
+                session.tensor_mul(gathered, real_b)
             }
-
-            output[bag * dim..(bag + 1) * dim].copy_from_slice(&bag_result);
         }
-
-        session.tensor_variable(output, vec![num_bags, dim], false)
     }
 }
 
@@ -23209,6 +23318,129 @@ mod tests {
             err.to_string().contains("non-negative"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn embedding_bag_sum_mode_propagates_weight_gradient() {
+        // Regression for frankentorch-y8le: previous body extracted
+        // tensor_values + rebuilt non-grad output, severing autograd
+        // through the embedding weight.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 4, 2, EmbeddingBagMode::Sum, None).unwrap();
+        let weight_vals: Vec<f64> = (0..8).map(|x| x as f64).collect();
+        let weight = session
+            .tensor_variable(weight_vals, vec![4, 2], true)
+            .unwrap();
+        let eb = EmbeddingBag {
+            weight,
+            ..eb
+        };
+        // Two bags: bag 0 has indices [0, 1, 2], bag 1 has [3].
+        let indices = session
+            .tensor_variable(vec![0.0, 1.0, 2.0, 3.0], vec![4], false)
+            .unwrap();
+        let offsets = session.tensor_variable(vec![0.0, 3.0], vec![2], false).unwrap();
+        let out = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .unwrap();
+        let loss = session.tensor_sum(out).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let w_grad = session
+            .tensor_gradient(&report, weight)
+            .expect("weight gradient should exist (autograd not severed)");
+        // For Sum: each contributing row gets +1 per dim from sum(out).
+        // Row 0 used in bag 0, row 1 in bag 0, row 2 in bag 0, row 3 in bag 1.
+        // So each row's grad is [1, 1].
+        assert_eq!(w_grad, &vec![1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn embedding_bag_mean_mode_propagates_weight_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 3, 2, EmbeddingBagMode::Mean, None).unwrap();
+        let weight_vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight = session
+            .tensor_variable(weight_vals, vec![3, 2], true)
+            .unwrap();
+        let eb = EmbeddingBag { weight, ..eb };
+        // One bag with [0, 1, 2] (size 3). Mean: each row contributes 1/3.
+        let indices = session
+            .tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false)
+            .unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let out = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .unwrap();
+        let loss = session.tensor_sum(out).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let w_grad = session.tensor_gradient(&report, weight).expect("weight grad");
+        // Each row participates in the mean over 3 with weight 1/3,
+        // and sum(out) propagates +1 per dim.
+        for &g in w_grad {
+            assert!(
+                (g - (1.0 / 3.0)).abs() < 1e-12,
+                "expected 1/3, got {g}"
+            );
+        }
+    }
+
+    #[test]
+    fn embedding_bag_per_sample_weights_propagates_psw_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 3, 2, EmbeddingBagMode::Sum, None).unwrap();
+        let weight_vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight = session
+            .tensor_variable(weight_vals, vec![3, 2], true)
+            .unwrap();
+        let eb = EmbeddingBag { weight, ..eb };
+        let indices = session
+            .tensor_variable(vec![0.0, 1.0], vec![2], false)
+            .unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let psw = session.tensor_variable(vec![0.5, 1.5], vec![2], true).unwrap();
+        let out = eb
+            .forward_with_offsets(&mut session, indices, offsets, Some(psw))
+            .unwrap();
+        let loss = session.tensor_sum(out).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let psw_grad = session
+            .tensor_gradient(&report, psw)
+            .expect("psw gradient should exist");
+        // For Sum: out[bag, d] = sum_i psw[i] * weight[indices[i], d].
+        // dL/dpsw[i] = sum_d weight[indices[i], d] = (row sum of weight[indices[i]])
+        // psw[0] uses row 0 = [1, 2] → sum 3
+        // psw[1] uses row 1 = [3, 4] → sum 7
+        assert!((psw_grad[0] - 3.0).abs() < 1e-12);
+        assert!((psw_grad[1] - 7.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn embedding_bag_max_mode_propagates_weight_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let eb = EmbeddingBag::new(&mut session, 3, 2, EmbeddingBagMode::Max, None).unwrap();
+        // Per-column argmax: col 0 -> row 1 (val 3), col 1 -> row 2 (val 6).
+        let weight_vals: Vec<f64> = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let weight = session
+            .tensor_variable(weight_vals, vec![3, 2], true)
+            .unwrap();
+        let eb = EmbeddingBag { weight, ..eb };
+        let indices = session
+            .tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false)
+            .unwrap();
+        let offsets = session.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let out = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .unwrap();
+        let loss = session.tensor_sum(out).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let w_grad = session.tensor_gradient(&report, weight).expect("weight grad");
+        // Max routes gradient only to argmax positions.
+        // Col 0: argmax is row 1 (val 3) → grad 1; rows 0, 2 col 0 → 0.
+        // Wait: weight = [[1,2],[3,4],[5,6]]. Per-col max:
+        //   col 0: max(1,3,5) = 5 at row 2
+        //   col 1: max(2,4,6) = 6 at row 2
+        // So row 2 gets [1, 1]; rows 0, 1 get [0, 0].
+        assert_eq!(w_grad, &vec![0.0, 0.0, 0.0, 0.0, 1.0, 1.0]);
     }
 
     // ── CTCLoss Tests ──────────────────────────────────────────────────
