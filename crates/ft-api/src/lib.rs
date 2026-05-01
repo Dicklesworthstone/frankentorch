@@ -14679,6 +14679,23 @@ impl FrankenTorchSession {
         mode: &str,
         align_corners: Option<bool>,
     ) -> Result<TensorNodeId, AutogradError> {
+        // Autograd-aware path for `mode="nearest"` (frankentorch-ov0v):
+        // nearest interpolation is just a structured index_select per
+        // spatial axis, so we can flatten the input to [N*C, Hin*Win*...],
+        // compute the source-position index for each output position,
+        // and tensor_index_select. Other modes (linear/bilinear/etc.)
+        // need bespoke backwards via index_select + weighted sums; for
+        // now, fail loud on requires_grad input to surface the silent
+        // severance that the legacy plain-f64 path produced.
+        let requires_grad = self.tensor_requires_grad(input)?;
+        if requires_grad && mode != "nearest" {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "interpolate: autograd not supported for mode != nearest (linear/bilinear/bicubic/trilinear backward not yet implemented). Tracked under frankentorch-ov0v.",
+                },
+            )));
+        }
+
         let (storage, meta) = {
             let tensor = self.tensor_tape.tensor(input)?;
             (tensor.storage()?.to_vec(), tensor.meta().clone())
@@ -14741,7 +14758,11 @@ impl FrankenTorchSession {
 
         match mode {
             "nearest" => {
-                self.interpolate_nearest(&storage, batch, channels, &in_spatial, &out_spatial)
+                if requires_grad {
+                    self.interpolate_nearest_autograd(input, batch, channels, &in_spatial, &out_spatial)
+                } else {
+                    self.interpolate_nearest(&storage, batch, channels, &in_spatial, &out_spatial)
+                }
             }
             "linear" if spatial_dims == 1 => self.interpolate_linear_1d(
                 &storage,
@@ -14781,6 +14802,89 @@ impl FrankenTorchSession {
                 },
             ))),
         }
+    }
+
+    fn interpolate_nearest_autograd(
+        &mut self,
+        input: TensorNodeId,
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Autograd-aware nearest interpolation via tensor_index_select
+        // along the flattened spatial axis. Tracked under
+        // frankentorch-ov0v.
+        //
+        // Build a flat source-index array of length out_numel: each
+        // output position is mapped to a source spatial position
+        // computed as floor(out_pos * in_dim / out_dim) per axis.
+        // Then reshape input to [N*C, in_numel], gather the source
+        // positions along dim 1, and reshape back to
+        // [N, C, *out_spatial].
+        let bc = Self::checked_mul(batch, channels, "interpolate: bc overflow")?;
+        let in_numel =
+            Self::checked_shape_numel(in_spatial, "interpolate: input spatial shape overflow")?;
+        let out_numel =
+            Self::checked_shape_numel(out_spatial, "interpolate: output spatial shape overflow")?;
+        let mut idx_vals: Vec<f64> = Vec::with_capacity(out_numel);
+        match in_spatial.len() {
+            1 => {
+                let (i_l, o_l) = (in_spatial[0], out_spatial[0]);
+                for oi in 0..o_l {
+                    let ii = ((oi as f64 * i_l as f64 / o_l as f64).floor() as usize)
+                        .min(i_l - 1);
+                    #[allow(clippy::cast_precision_loss)]
+                    idx_vals.push(ii as f64);
+                }
+            }
+            2 => {
+                let (i_h, i_w) = (in_spatial[0], in_spatial[1]);
+                let (o_h, o_w) = (out_spatial[0], out_spatial[1]);
+                for oy in 0..o_h {
+                    let iy =
+                        ((oy as f64 * i_h as f64 / o_h as f64).floor() as usize).min(i_h - 1);
+                    for ox in 0..o_w {
+                        let ix = ((ox as f64 * i_w as f64 / o_w as f64).floor() as usize)
+                            .min(i_w - 1);
+                        #[allow(clippy::cast_precision_loss)]
+                        idx_vals.push((iy * i_w + ix) as f64);
+                    }
+                }
+            }
+            3 => {
+                let (i_d, i_h, i_w) = (in_spatial[0], in_spatial[1], in_spatial[2]);
+                let (o_d, o_h, o_w) = (out_spatial[0], out_spatial[1], out_spatial[2]);
+                for oz in 0..o_d {
+                    let iz =
+                        ((oz as f64 * i_d as f64 / o_d as f64).floor() as usize).min(i_d - 1);
+                    for oy in 0..o_h {
+                        let iy = ((oy as f64 * i_h as f64 / o_h as f64).floor() as usize)
+                            .min(i_h - 1);
+                        for ox in 0..o_w {
+                            let ix = ((ox as f64 * i_w as f64 / o_w as f64).floor() as usize)
+                                .min(i_w - 1);
+                            #[allow(clippy::cast_precision_loss)]
+                            idx_vals.push((iz * i_h * i_w + iy * i_w + ix) as f64);
+                        }
+                    }
+                }
+            }
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "interpolate: nearest supports only 1-D, 2-D, or 3-D inputs",
+                    },
+                )));
+            }
+        }
+
+        let idx_node = self.tensor_variable(idx_vals, vec![out_numel], false)?;
+        let flat_input = self.tensor_reshape(input, vec![bc, in_numel])?;
+        let gathered = self.tensor_index_select(flat_input, 1, idx_node)?;
+        let mut out_shape = vec![batch, channels];
+        out_shape.extend_from_slice(out_spatial);
+        self.tensor_reshape(gathered, out_shape)
     }
 
     fn interpolate_nearest(
@@ -28702,6 +28806,41 @@ mod tests {
             3.0, 3.0, 4.0, 4.0,
         ];
         assert_eq!(vals, expected);
+    }
+
+    #[test]
+    fn interpolate_nearest_propagates_input_gradient() {
+        // Regression for frankentorch-ov0v: requires_grad routes
+        // through the index_select-based composition.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, None, Some(vec![2.0, 2.0]), "nearest", None)
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("input gradient should exist");
+        // Each input pixel is replicated 4 times in the [1,1,4,4] output
+        // → grad = [4, 4, 4, 4].
+        assert_eq!(grad, &vec![4.0, 4.0, 4.0, 4.0]);
+    }
+
+    #[test]
+    fn interpolate_non_nearest_fails_loud_on_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
+            .unwrap();
+        for mode in ["bilinear", "bicubic"] {
+            let err = s
+                .tensor_interpolate(input, Some(vec![4, 4]), None, mode, Some(false))
+                .expect_err("non-nearest mode must fail loud on requires_grad");
+            assert!(format!("{err:?}").contains("autograd not supported"));
+        }
     }
 
     #[test]
