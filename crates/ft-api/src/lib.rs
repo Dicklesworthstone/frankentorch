@@ -5413,11 +5413,15 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         weight: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let indices = self.tensor_values(input)?;
+        // Compose via tensor_reshape + tensor_index_select so gradients
+        // flow back to the weight tensor. Tracked under
+        // frankentorch-b9od. Previous body extracted both indices and
+        // weight values, looked up rows in plain f64, and rebuilt a
+        // non-grad leaf — silently severing autograd through every
+        // F.embedding call (used directly outside the nn.Embedding
+        // wrapper in custom transformer blocks, etc.).
         let input_shape = self.tensor_shape(input)?;
-        let w_vals = self.tensor_values(weight)?;
         let w_shape = self.tensor_shape(weight)?;
-
         if w_shape.len() != 2 {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -5425,50 +5429,38 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let num_emb = w_shape[0];
         let emb_dim = w_shape[1];
-        let expected = Self::checked_mul(num_emb, emb_dim, "embedding weight shape overflow")?;
-        if w_vals.len() != expected {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "embedding: weight values length does not match shape",
-                },
-            )));
-        }
 
-        let out_len = Self::checked_mul(indices.len(), emb_dim, "embedding output size overflow")?;
-        let mut result = Vec::with_capacity(out_len);
+        let total = input_shape.iter().product::<usize>();
+        // Validate indices once via a values read (non-grad path on
+        // input — input is an integer index tensor and therefore
+        // never has requires_grad in any sane training loop). This
+        // matches the validation that tensor_index_select itself
+        // performs internally; do it here too to keep the prior
+        // error messages in place.
+        let indices = self.tensor_values(input)?;
         for &idx_f in &indices {
-            if idx_f < 0.0 {
+            if !idx_f.is_finite() || idx_f < 0.0 || idx_f.fract() != 0.0 {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "embedding: indices must be non-negative",
+                        reason: "embedding: indices must be non-negative integer-valued",
                     },
                 )));
             }
-            if idx_f.fract() != 0.0 {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "embedding: indices must be integer-valued",
-                    },
-                )));
-            }
-            let idx = idx_f as usize;
-            if idx >= num_emb {
+            if (idx_f as usize) >= w_shape[0] {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
                         reason: "embedding: index out of range",
                     },
                 )));
             }
-            let start = Self::checked_mul(idx, emb_dim, "embedding index overflow")?;
-            let end = Self::checked_add(start, emb_dim, "embedding index overflow")?;
-            result.extend_from_slice(&w_vals[start..end]);
         }
 
+        let flat_indices = self.tensor_reshape(input, vec![total])?;
+        let selected = self.tensor_index_select(weight, 0, flat_indices)?;
         let mut out_shape = input_shape;
         out_shape.push(emb_dim);
-        self.tensor_variable(result, out_shape, false)
+        self.tensor_reshape(selected, out_shape)
     }
 
     /// Apply a linear transformation: `y = x @ weight^T + bias`.
@@ -30713,6 +30705,32 @@ mod tests {
         let out = s.functional_embedding(indices, weight).unwrap();
         let shape = s.tensor_shape(out).unwrap();
         assert_eq!(shape, vec![2, 2, 2]);
+    }
+
+    #[test]
+    fn functional_embedding_propagates_weight_gradient() {
+        // Regression for frankentorch-b9od: previous body extracted
+        // weight values + rebuilt non-grad output, severing autograd
+        // through the embedding weight. Now composes through
+        // tensor_index_select so gradients flow.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 4x2 weight, 4 vocab tokens of dim 2.
+        let weight = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![4, 2], true)
+            .unwrap();
+        // Indices [0, 2, 0, 3] — token 0 used twice, 2 once, 3 once.
+        let indices = s
+            .tensor_variable(vec![0.0, 2.0, 0.0, 3.0], vec![4], false)
+            .unwrap();
+        let out = s.functional_embedding(indices, weight).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, weight)
+            .expect("weight gradient should exist (autograd not severed)");
+        // For sum(out): gradient at row k = (count of k in indices) * [1, 1].
+        // Row 0 used 2x → grad [2, 2]; row 1 unused → [0, 0]; row 2 → [1, 1]; row 3 → [1, 1].
+        assert_eq!(grad, &vec![2.0, 2.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
