@@ -2135,6 +2135,13 @@ impl FrankenTorchSession {
     /// `input` contains probabilities in [0, 1]. Returns a tensor of the same shape
     /// with values 0.0 or 1.0 sampled from Bernoulli(p) for each element p.
     pub fn bernoulli(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "bernoulli: autograd not supported (sampling is non-differentiable; use rsample-style reparameterization for diff'able sampling). Tracked under frankentorch-vugw.",
+                },
+            )));
+        }
         let probs = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
         let values: Vec<f64> = probs
@@ -2167,6 +2174,13 @@ impl FrankenTorchSession {
     /// Each element of `input` is the rate parameter λ; returns integer samples
     /// (as f64) from Poisson(λ) for each element.
     pub fn poisson(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "poisson: autograd not supported (sampling is non-differentiable; use rsample-style reparameterization for diff'able sampling). Tracked under frankentorch-vugw.",
+                },
+            )));
+        }
         let rates = self.tensor_values(input)?;
         let shape = self.tensor_shape(input)?;
 
@@ -32744,6 +32758,29 @@ mod tests {
         let result = s.poisson(rates).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!(vals[0].is_nan());
+    }
+
+    #[test]
+    fn sampling_ops_fail_loud_on_requires_grad() {
+        // Regression for frankentorch-vugw: bernoulli/poisson are
+        // non-differentiable sampling ops; both used to silently
+        // sever autograd via tensor_values. Each now fails loud on
+        // requires_grad input.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let p = s
+            .tensor_variable(vec![0.5, 0.5, 0.5], vec![3], true)
+            .unwrap();
+        let bern_err = s
+            .bernoulli(p)
+            .expect_err("bernoulli must fail loud on requires_grad");
+        assert!(format!("{bern_err:?}").contains("autograd not supported"));
+        let r = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        let pois_err = s
+            .poisson(r)
+            .expect_err("poisson must fail loud on requires_grad");
+        assert!(format!("{pois_err:?}").contains("autograd not supported"));
     }
 
     #[test]
