@@ -22457,6 +22457,74 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn cnn_classifier_head_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-iex3: validates a typical
+        // CNN classifier head Conv2d → MaxPool2d → Flatten → Linear
+        // end-to-end through Adam. A regression in any of the chained
+        // ops (im2col + bmm in Conv2d, narrow + max_dim + cat in
+        // MaxPool2d, reshape in Flatten, matmul in Linear) would
+        // surface here as a failure to converge.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Conv2d, Flatten, Linear, MaxPool2d, Module};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv2d::new(&mut session, 1, 2, (3, 3), (1, 1), (1, 1), true)
+            .expect("conv2d");
+        let pool = MaxPool2d::new((2, 2), (2, 2));
+        let flat = Flatten::new(1, 3);
+        let head = Linear::new(&mut session, 8, 1, true).expect("linear");
+
+        let input_vals: Vec<f64> = (0..16).map(|i| (i as f64 - 7.5) / 8.0).collect();
+        let input = session
+            .tensor_variable(input_vals, vec![1, 1, 4, 4], false)
+            .expect("input");
+        let target = session
+            .tensor_variable(vec![1.0], vec![1, 1], false)
+            .expect("target");
+
+        let mut params = conv.parameters();
+        params.extend(head.parameters());
+        let mut optimizer = Adam::new(params, 0.05);
+
+        let initial_h = conv.forward(&mut session, input).expect("initial conv");
+        let initial_p = pool.forward(&mut session, initial_h).expect("initial pool");
+        let initial_f = flat.forward(&mut session, initial_p).expect("initial flat");
+        let initial_o = head.forward(&mut session, initial_f).expect("initial head");
+        let initial_loss = session
+            .mse_loss(initial_o, target)
+            .expect("initial loss");
+        let initial_loss_val = session.tensor_values(initial_loss).expect("initial val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let h = conv.forward(&mut session, input).expect("conv");
+            let p = pool.forward(&mut session, h).expect("pool");
+            let f = flat.forward(&mut session, p).expect("flat");
+            let o = head.forward(&mut session, f).expect("head");
+            let loss = session.mse_loss(o, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "CNN classifier head never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "CNN classifier should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
