@@ -12919,6 +12919,25 @@ impl FrankenTorchSession {
             )));
         }
 
+        // Autograd-aware path for full-rank A (frankentorch-ea99):
+        // X = A^+ @ B where A^+ = pinv(A). pinv was made autograd-
+        // aware via the normal-equation formulation (frankentorch-d3gs);
+        // composing matmul on top delivers gradients to both A and B.
+        // The SVD path below stays for non-grad inputs to continue
+        // handling rank-deficient cases.
+        if self.tensor_requires_grad(a)? || self.tensor_requires_grad(b)? {
+            let pinv = self.tensor_linalg_pinv(a)?;
+            return if b_shape.len() == 1 {
+                let n_dim = a_shape[1];
+                let n_rhs = a_shape[0];
+                let b_2d = self.tensor_reshape(b, vec![n_rhs, 1])?;
+                let x_2d = self.tensor_matmul(pinv, b_2d)?;
+                self.tensor_reshape(x_2d, vec![n_dim])
+            } else {
+                self.tensor_matmul(pinv, b)
+            };
+        }
+
         let m = a_shape[0];
         let n = a_shape[1];
 
@@ -28346,6 +28365,33 @@ mod tests {
         assert!((vals[1] - 2.0).abs() < 1e-8);
         assert!((vals[2] - 3.0).abs() < 1e-8);
         assert!((vals[3] - 4.0).abs() < 1e-8);
+    }
+
+    #[test]
+    fn lstsq_propagates_gradient_through_full_rank_input() {
+        // Regression for frankentorch-ea99: requires_grad inputs now
+        // route through pinv + matmul (autograd-aware) instead of the
+        // SVD-based path which fails loud after rl4g.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Tall A (m=3, n=2) full column rank.
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![
+            1.0, 0.0,
+            0.0, 1.0,
+            1.0, 1.0,
+        ], vec![3, 2], true).unwrap();
+        let b = s.tensor_variable(vec![1.0, 1.0, 2.0], vec![3], true).unwrap();
+        let x = s.tensor_linalg_lstsq(a, b).unwrap();
+        let x_shape = s.tensor_shape(x).unwrap();
+        assert_eq!(x_shape, vec![2]);
+        let loss = s.tensor_sum(x).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let a_grad = s.tensor_gradient(&report, a).expect("a grad");
+        let b_grad = s.tensor_gradient(&report, b).expect("b grad");
+        assert!(a_grad.iter().all(|g| g.is_finite()));
+        assert!(b_grad.iter().all(|g| g.is_finite()));
+        assert!(a_grad.iter().any(|g| g.abs() > 1e-12));
+        assert!(b_grad.iter().any(|g| g.abs() > 1e-12));
     }
 
     #[test]
