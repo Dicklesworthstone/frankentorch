@@ -14688,10 +14688,10 @@ impl FrankenTorchSession {
         // now, fail loud on requires_grad input to surface the silent
         // severance that the legacy plain-f64 path produced.
         let requires_grad = self.tensor_requires_grad(input)?;
-        if requires_grad && mode != "nearest" {
+        if requires_grad && mode == "bicubic" {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "interpolate: autograd not supported for mode != nearest (linear/bilinear/bicubic/trilinear backward not yet implemented). Tracked under frankentorch-ov0v.",
+                    reason: "interpolate: bicubic autograd not yet implemented (cubic-Hermite backward needs 16-corner weighted gather). Tracked under frankentorch-ov0v.",
                 },
             )));
         }
@@ -14764,22 +14764,38 @@ impl FrankenTorchSession {
                     self.interpolate_nearest(&storage, batch, channels, &in_spatial, &out_spatial)
                 }
             }
-            "linear" if spatial_dims == 1 => self.interpolate_linear_1d(
-                &storage,
-                batch,
-                channels,
-                in_spatial[0],
-                out_spatial[0],
-                align,
-            ),
-            "bilinear" if spatial_dims == 2 => self.interpolate_bilinear(
-                &storage,
-                batch,
-                channels,
-                &in_spatial,
-                &out_spatial,
-                align,
-            ),
+            "linear" if spatial_dims == 1 => {
+                if requires_grad {
+                    self.interpolate_linear_1d_autograd(
+                        input, batch, channels, in_spatial[0], out_spatial[0], align,
+                    )
+                } else {
+                    self.interpolate_linear_1d(
+                        &storage,
+                        batch,
+                        channels,
+                        in_spatial[0],
+                        out_spatial[0],
+                        align,
+                    )
+                }
+            }
+            "bilinear" if spatial_dims == 2 => {
+                if requires_grad {
+                    self.interpolate_bilinear_autograd(
+                        input, batch, channels, &in_spatial, &out_spatial, align,
+                    )
+                } else {
+                    self.interpolate_bilinear(
+                        &storage,
+                        batch,
+                        channels,
+                        &in_spatial,
+                        &out_spatial,
+                        align,
+                    )
+                }
+            }
             "bicubic" if spatial_dims == 2 => self.interpolate_bicubic(
                 &storage,
                 batch,
@@ -14788,14 +14804,22 @@ impl FrankenTorchSession {
                 &out_spatial,
                 align,
             ),
-            "trilinear" if spatial_dims == 3 => self.interpolate_trilinear(
-                &storage,
-                batch,
-                channels,
-                &in_spatial,
-                &out_spatial,
-                align,
-            ),
+            "trilinear" if spatial_dims == 3 => {
+                if requires_grad {
+                    self.interpolate_trilinear_autograd(
+                        input, batch, channels, &in_spatial, &out_spatial, align,
+                    )
+                } else {
+                    self.interpolate_trilinear(
+                        &storage,
+                        batch,
+                        channels,
+                        &in_spatial,
+                        &out_spatial,
+                        align,
+                    )
+                }
+            }
             _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "interpolate: unsupported mode for given input dimensionality",
@@ -14885,6 +14909,205 @@ impl FrankenTorchSession {
         let mut out_shape = vec![batch, channels];
         out_shape.extend_from_slice(out_spatial);
         self.tensor_reshape(gathered, out_shape)
+    }
+
+    /// Compute the per-output-position source coordinate for linear /
+    /// bilinear / trilinear interpolation. Returns a (low, high, frac)
+    /// tuple where `low` is floor(src) clamped to [0, in-1], `high` is
+    /// (low+1) clamped, and `frac = src - low`. Matches the alignment
+    /// formulas in interpolate_linear_1d / interpolate_bilinear /
+    /// interpolate_trilinear so the autograd path is bit-exact with
+    /// the legacy plain-f64 path.
+    fn interp_axis_coord(
+        in_dim: usize,
+        out_dim: usize,
+        out_idx: usize,
+        align_corners: bool,
+    ) -> (usize, usize, f64) {
+        let src = if align_corners && out_dim > 1 {
+            out_idx as f64 * (in_dim - 1) as f64 / (out_dim - 1) as f64
+        } else {
+            (out_idx as f64 + 0.5) * in_dim as f64 / out_dim as f64 - 0.5
+        };
+        let src = src.max(0.0);
+        let lo = (src.floor() as usize).min(in_dim - 1);
+        let hi = (lo + 1).min(in_dim - 1);
+        let t = src - lo as f64;
+        (lo, hi, t)
+    }
+
+    fn interpolate_linear_1d_autograd(
+        &mut self,
+        input: TensorNodeId,
+        batch: usize,
+        channels: usize,
+        in_len: usize,
+        out_len: usize,
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Autograd-aware 1-D linear interpolation via two
+        // index_selects + a weighted blend. Tracked under
+        // frankentorch-3t1t. Each output position is a convex
+        // combination of two input positions:
+        //   y[oi] = (1-t)*x[lo] + t*x[hi]
+        let bc = Self::checked_mul(batch, channels, "interpolate_linear_1d_autograd: bc overflow")?;
+        let mut idx_lo: Vec<f64> = Vec::with_capacity(out_len);
+        let mut idx_hi: Vec<f64> = Vec::with_capacity(out_len);
+        let mut w_lo: Vec<f64> = Vec::with_capacity(out_len);
+        let mut w_hi: Vec<f64> = Vec::with_capacity(out_len);
+        for oi in 0..out_len {
+            let (lo, hi, t) = Self::interp_axis_coord(in_len, out_len, oi, align_corners);
+            #[allow(clippy::cast_precision_loss)]
+            {
+                idx_lo.push(lo as f64);
+                idx_hi.push(hi as f64);
+            }
+            w_lo.push(1.0 - t);
+            w_hi.push(t);
+        }
+        let flat = self.tensor_reshape(input, vec![bc, in_len])?;
+        let lo_idx = self.tensor_variable(idx_lo, vec![out_len], false)?;
+        let hi_idx = self.tensor_variable(idx_hi, vec![out_len], false)?;
+        let lo_g = self.tensor_index_select(flat, 1, lo_idx)?;
+        let hi_g = self.tensor_index_select(flat, 1, hi_idx)?;
+        let lo_w = self.tensor_variable(w_lo, vec![1, out_len], false)?;
+        let hi_w = self.tensor_variable(w_hi, vec![1, out_len], false)?;
+        let lo_w_b = self.tensor_expand(lo_w, vec![bc, out_len])?;
+        let hi_w_b = self.tensor_expand(hi_w, vec![bc, out_len])?;
+        let lo_term = self.tensor_mul(lo_g, lo_w_b)?;
+        let hi_term = self.tensor_mul(hi_g, hi_w_b)?;
+        let summed = self.tensor_add(lo_term, hi_term)?;
+        self.tensor_reshape(summed, vec![batch, channels, out_len])
+    }
+
+    fn interpolate_bilinear_autograd(
+        &mut self,
+        input: TensorNodeId,
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Autograd-aware 2-D bilinear interpolation via four
+        // index_selects of the four corner pixels per output position,
+        // then a weighted blend. Tracked under frankentorch-3t1t.
+        //   y[oh, ow] = (1-ty)*(1-tx)*x[y0, x0] + (1-ty)*tx*x[y0, x1]
+        //             + ty*(1-tx)*x[y1, x0] + ty*tx*x[y1, x1]
+        let (ih, iw) = (in_spatial[0], in_spatial[1]);
+        let (oh, ow) = (out_spatial[0], out_spatial[1]);
+        let bc = Self::checked_mul(batch, channels, "interpolate_bilinear_autograd: bc overflow")?;
+        let in_numel = Self::checked_mul(ih, iw, "interpolate_bilinear_autograd: in_numel overflow")?;
+        let out_numel = Self::checked_mul(oh, ow, "interpolate_bilinear_autograd: out_numel overflow")?;
+        let mut idx_00: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut idx_01: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut idx_10: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut idx_11: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut w_00: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut w_01: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut w_10: Vec<f64> = Vec::with_capacity(out_numel);
+        let mut w_11: Vec<f64> = Vec::with_capacity(out_numel);
+        for oy in 0..oh {
+            let (y0, y1, ty) = Self::interp_axis_coord(ih, oh, oy, align_corners);
+            for ox in 0..ow {
+                let (x0, x1, tx) = Self::interp_axis_coord(iw, ow, ox, align_corners);
+                #[allow(clippy::cast_precision_loss)]
+                {
+                    idx_00.push((y0 * iw + x0) as f64);
+                    idx_01.push((y0 * iw + x1) as f64);
+                    idx_10.push((y1 * iw + x0) as f64);
+                    idx_11.push((y1 * iw + x1) as f64);
+                }
+                w_00.push((1.0 - ty) * (1.0 - tx));
+                w_01.push((1.0 - ty) * tx);
+                w_10.push(ty * (1.0 - tx));
+                w_11.push(ty * tx);
+            }
+        }
+        let flat = self.tensor_reshape(input, vec![bc, in_numel])?;
+        let mut acc: Option<TensorNodeId> = None;
+        for (idx_vec, w_vec) in [
+            (idx_00, w_00),
+            (idx_01, w_01),
+            (idx_10, w_10),
+            (idx_11, w_11),
+        ] {
+            let idx_n = self.tensor_variable(idx_vec, vec![out_numel], false)?;
+            let g = self.tensor_index_select(flat, 1, idx_n)?;
+            let w_n = self.tensor_variable(w_vec, vec![1, out_numel], false)?;
+            let w_b = self.tensor_expand(w_n, vec![bc, out_numel])?;
+            let term = self.tensor_mul(g, w_b)?;
+            acc = Some(match acc {
+                Some(a) => self.tensor_add(a, term)?,
+                None => term,
+            });
+        }
+        let summed = acc.expect("bilinear has at least one corner");
+        self.tensor_reshape(summed, vec![batch, channels, oh, ow])
+    }
+
+    fn interpolate_trilinear_autograd(
+        &mut self,
+        input: TensorNodeId,
+        batch: usize,
+        channels: usize,
+        in_spatial: &[usize],
+        out_spatial: &[usize],
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // Autograd-aware 3-D trilinear interpolation: 8 corner
+        // index_selects and a 3-axis weighted blend. Tracked under
+        // frankentorch-3t1t.
+        let (id, ih, iw) = (in_spatial[0], in_spatial[1], in_spatial[2]);
+        let (od, oh, ow) = (out_spatial[0], out_spatial[1], out_spatial[2]);
+        let bc = Self::checked_mul(batch, channels, "interpolate_trilinear_autograd: bc overflow")?;
+        let plane = Self::checked_mul(ih, iw, "interpolate_trilinear_autograd: plane overflow")?;
+        let in_numel = Self::checked_mul(id, plane, "interpolate_trilinear_autograd: in_numel overflow")?;
+        let out_plane = Self::checked_mul(oh, ow, "interpolate_trilinear_autograd: out_plane overflow")?;
+        let out_numel = Self::checked_mul(od, out_plane, "interpolate_trilinear_autograd: out_numel overflow")?;
+        // Eight corners, each gets an index array and a weight array.
+        let mut corners: Vec<(Vec<f64>, Vec<f64>)> = (0..8)
+            .map(|_| (Vec::with_capacity(out_numel), Vec::with_capacity(out_numel)))
+            .collect();
+        for oz in 0..od {
+            let (z0, z1, tz) = Self::interp_axis_coord(id, od, oz, align_corners);
+            for oy in 0..oh {
+                let (y0, y1, ty) = Self::interp_axis_coord(ih, oh, oy, align_corners);
+                for ox in 0..ow {
+                    let (x0, x1, tx) = Self::interp_axis_coord(iw, ow, ox, align_corners);
+                    let zs = [z0, z1];
+                    let ys = [y0, y1];
+                    let xs = [x0, x1];
+                    let tzs = [1.0 - tz, tz];
+                    let tys = [1.0 - ty, ty];
+                    let txs = [1.0 - tx, tx];
+                    for (ci, corner) in corners.iter_mut().enumerate() {
+                        let zi = (ci >> 2) & 1;
+                        let yi = (ci >> 1) & 1;
+                        let xi = ci & 1;
+                        let pos = zs[zi] * plane + ys[yi] * iw + xs[xi];
+                        #[allow(clippy::cast_precision_loss)]
+                        corner.0.push(pos as f64);
+                        corner.1.push(tzs[zi] * tys[yi] * txs[xi]);
+                    }
+                }
+            }
+        }
+        let flat = self.tensor_reshape(input, vec![bc, in_numel])?;
+        let mut acc: Option<TensorNodeId> = None;
+        for (idx_vec, w_vec) in corners {
+            let idx_n = self.tensor_variable(idx_vec, vec![out_numel], false)?;
+            let g = self.tensor_index_select(flat, 1, idx_n)?;
+            let w_n = self.tensor_variable(w_vec, vec![1, out_numel], false)?;
+            let w_b = self.tensor_expand(w_n, vec![bc, out_numel])?;
+            let term = self.tensor_mul(g, w_b)?;
+            acc = Some(match acc {
+                Some(a) => self.tensor_add(a, term)?,
+                None => term,
+            });
+        }
+        let summed = acc.expect("trilinear has 8 corners");
+        self.tensor_reshape(summed, vec![batch, channels, od, oh, ow])
     }
 
     fn interpolate_nearest(
@@ -28830,17 +29053,82 @@ mod tests {
     }
 
     #[test]
-    fn interpolate_non_nearest_fails_loud_on_requires_grad() {
+    fn interpolate_bicubic_fails_loud_on_requires_grad() {
+        // bilinear/trilinear/linear are now autograd-aware
+        // (frankentorch-3t1t); only bicubic still fails loud.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
             .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
             .unwrap();
-        for mode in ["bilinear", "bicubic"] {
-            let err = s
-                .tensor_interpolate(input, Some(vec![4, 4]), None, mode, Some(false))
-                .expect_err("non-nearest mode must fail loud on requires_grad");
-            assert!(format!("{err:?}").contains("autograd not supported"));
-        }
+        let err = s
+            .tensor_interpolate(input, Some(vec![4, 4]), None, "bicubic", Some(false))
+            .expect_err("bicubic must fail loud on requires_grad");
+        assert!(format!("{err:?}").contains("autograd not yet implemented"));
+    }
+
+    #[test]
+    fn interpolate_bilinear_propagates_input_gradient() {
+        // Regression for frankentorch-3t1t: bilinear interp now
+        // composes via four index_selects + weighted blend.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 2x2 input → 4x4 bilinear output. Verify the result agrees
+        // with the legacy plain-f64 path (first run with requires_grad
+        // = true uses the autograd path) and that gradients flow.
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![4, 4]), None, "bilinear", Some(true))
+            .unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4]);
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, input)
+            .expect("input gradient should exist");
+        // Total grad mass equals the output element count (4x4 = 16
+        // ones from sum) — bilinear is a partition of unity over the
+        // 4 corners per output position.
+        let total: f64 = grad.iter().sum();
+        assert!((total - 16.0).abs() < 1e-9, "total grad mass = {total}");
+        assert!(grad.iter().all(|g| g.is_finite()));
+    }
+
+    #[test]
+    fn interpolate_trilinear_propagates_input_gradient() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 1x1x2x2x2 input → 1x1x4x4x4 trilinear output. 64 ones from
+        // sum, bound by partition-of-unity over 8 corners.
+        let input = s
+            .tensor_variable((0..8).map(|i| i as f64).collect(), vec![1, 1, 2, 2, 2], true)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![4, 4, 4]), None, "trilinear", Some(true))
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, input).expect("trilinear grad");
+        let total: f64 = grad.iter().sum();
+        assert!((total - 64.0).abs() < 1e-9, "total grad mass = {total}");
+    }
+
+    #[test]
+    fn interpolate_linear_1d_propagates_input_gradient() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 1, 3], true)
+            .unwrap();
+        let out = s
+            .tensor_interpolate(input, Some(vec![6]), None, "linear", Some(true))
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, input).expect("linear 1d grad");
+        let total: f64 = grad.iter().sum();
+        // Output has 6 elements, each is a convex combo of two source
+        // pixels — total grad mass = 6.
+        assert!((total - 6.0).abs() < 1e-9, "total grad mass = {total}");
     }
 
     #[test]
