@@ -11901,14 +11901,35 @@ impl FrankenTorchSession {
         a: TensorNodeId,
         b: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (a_values, a_meta) = self.tensor_values_meta(a)?;
-        let factor = ft_kernel_cpu::lu_factor_contiguous_f64(&a_values, &a_meta)
-            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
-        let (b_values, b_meta) = self.tensor_values_meta(b)?;
-        let b_shape = b_meta.shape().to_vec();
-        let solution = ft_kernel_cpu::lu_solve_contiguous_f64(&factor, &b_values, &b_meta)
-            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
-        self.tensor_variable(solution, b_shape, false)
+        // Compose via tensor_linalg_inv + tensor_matmul so gradients
+        // flow back to both A and B. Tracked under frankentorch-dlht.
+        // Previous body called LU factor/solve kernels directly and
+        // rebuilt a non-grad leaf, severing autograd through every
+        // linear solve.
+        //
+        // Math: X = inv(A) @ B. The chain rule via inv backward
+        // (-Y^T grad Y^T, frankentorch-frq7) and matmul backward
+        // recovers the standard solve adjoint:
+        //   dL/dB = A^{-T} dL/dX
+        //   dL/dA = -A^{-T} dL/dX X^T
+        // Trade-off: forward pass uses the explicit inverse instead
+        // of LU solve — slightly less stable for ill-conditioned A,
+        // but PyTorch's solve autograd uses the same inv-based path
+        // for backward, so gradient correctness is identical.
+        //
+        // For batched B [n, m] this still works: matmul broadcasts
+        // [n, n] @ [n, m] = [n, m]. For 1-D B [n], we reshape to
+        // [n, 1] then squeeze to recover the [n] output shape.
+        let b_shape = self.tensor_shape(b)?;
+        let inv_a = self.tensor_linalg_inv(a)?;
+        if b_shape.len() == 1 {
+            let n = b_shape[0];
+            let b_2d = self.tensor_reshape(b, vec![n, 1])?;
+            let x_2d = self.tensor_matmul(inv_a, b_2d)?;
+            self.tensor_reshape(x_2d, vec![n])
+        } else {
+            self.tensor_matmul(inv_a, b)
+        }
     }
 
     /// Compute the Cholesky decomposition of a symmetric positive-definite matrix.
@@ -31470,17 +31491,58 @@ mod tests {
     }
 
     #[test]
-    fn solve_singular_returns_result() {
-        // Singular A — lu_solve zeroes out dependent rows rather than erroring.
+    fn solve_singular_errors_loud() {
+        // Singular A — frankentorch-dlht switched the solve body to
+        // tensor_linalg_inv + tensor_matmul, which fails loud on
+        // singular A instead of silently returning a degenerate
+        // result. Matches torch.linalg.solve which raises a
+        // LinAlgError on singular matrices.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = s
             .tensor_variable(vec![1.0, 2.0, 2.0, 4.0], vec![2, 2], false)
             .unwrap();
         let b = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
-        // Does not error; returns a (possibly inaccurate) solution
+        let err = s
+            .tensor_linalg_solve(a, b)
+            .expect_err("singular A must error");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.to_lowercase().contains("singular"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn solve_propagates_gradient_through_a_and_b() {
+        // Regression for frankentorch-dlht: the previous LU-based body
+        // built a non-grad leaf, severing autograd on every linear
+        // solve. Validates that both A and B receive correct gradients.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // A = [[2, 0], [0, 4]] (diagonal, easy reference math).
+        let a = s
+            .tensor_variable(vec![2.0, 0.0, 0.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let b = s.tensor_variable(vec![6.0, 8.0], vec![2], true).unwrap();
         let x = s.tensor_linalg_solve(a, b).unwrap();
         let vals = s.tensor_values(x).unwrap();
-        assert_eq!(vals.len(), 2);
+        assert!((vals[0] - 3.0).abs() < 1e-12);
+        assert!((vals[1] - 2.0).abs() < 1e-12);
+        // L = sum(x) = b[0]/a[0,0] + b[1]/a[1,1] = 3 + 2 = 5
+        let loss = s.tensor_sum(x).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let a_grad = s.tensor_gradient(&report, a).expect("a grad");
+        let b_grad = s.tensor_gradient(&report, b).expect("b grad");
+        // dL/db = A^{-T} 1 = diag(0.5, 0.25) @ [1, 1] = [0.5, 0.25]
+        assert!((b_grad[0] - 0.5).abs() < 1e-12);
+        assert!((b_grad[1] - 0.25).abs() < 1e-12);
+        // dL/dA = -A^{-T} dL/dX X^T = -[[1/a0, 0], [0, 1/a1]] [1, 1]^T [x0, x1]
+        //       = -[[b0/a0^2, b1/(a0*a1)], [b0/(a0*a1), b1/a1^2]]
+        // With a = diag(2, 4), b = [6, 8]:
+        //   a_grad = -[[6/4, 8/8], [6/8, 8/16]] = -[[1.5, 1.0], [0.75, 0.5]]
+        assert!((a_grad[0] - (-1.5)).abs() < 1e-12);
+        assert!((a_grad[1] - (-1.0)).abs() < 1e-12);
+        assert!((a_grad[2] - (-0.75)).abs() < 1e-12);
+        assert!((a_grad[3] - (-0.5)).abs() < 1e-12);
     }
 
     #[test]
