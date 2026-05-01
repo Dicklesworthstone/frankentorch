@@ -3664,8 +3664,7 @@ impl FrankenTorchSession {
             )));
         }
 
-        let weight_vals = if let Some(w) = weights {
-            let wv = self.tensor_values(w)?;
+        if let Some(w) = weights {
             let w_shape = self.tensor_shape(w)?;
             if w_shape.len() != 1 || w_shape[0] != input_shape[0] {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -3674,10 +3673,7 @@ impl FrankenTorchSession {
                     },
                 )));
             }
-            Some(wv)
-        } else {
-            None
-        };
+        }
 
         // Find max value to determine output size
         let mut max_val: Option<i64> = None;
@@ -3733,18 +3729,28 @@ impl FrankenTorchSession {
             std::mem::size_of::<f64>(),
             "bincount output size overflow",
         )?;
-        let mut counts = vec![0.0f64; out_len];
 
-        for (i, &v) in vals.iter().enumerate() {
-            let idx = v as usize;
-            if let Some(ref wv) = weight_vals {
-                counts[idx] += wv[i];
-            } else {
-                counts[idx] += 1.0;
-            }
+        // Compose via tensor_scatter_add so gradients flow back to the
+        // weights tensor when present. Tracked under frankentorch-9r3c.
+        // Previous body extracted both input and weight values + rebuilt
+        // a non-grad leaf, severing autograd through every weighted
+        // bincount call (focal-loss-style class re-weighting, etc.).
+        // The input (bin indices) is integer-valued and intrinsically
+        // non-differentiable; only weights flow gradients.
+        if vals.is_empty() {
+            return self.tensor_variable(vec![0.0; out_len], vec![out_len], false);
         }
-
-        self.tensor_variable(counts, vec![out_len], false)
+        let zeros = self.full(vec![out_len], 0.0, false)?;
+        // input itself is the index tensor; reshape pass-through to
+        // make the autograd contract clear (and so we can pass the
+        // original requires_grad=false integer tensor as the index).
+        if let Some(weights) = weights {
+            self.tensor_scatter_add(zeros, 0, input, weights)
+        } else {
+            // Unweighted case: src = ones of same shape as input.
+            let ones = self.full(vec![vals.len()], 1.0, false)?;
+            self.tensor_scatter_add(zeros, 0, input, ones)
+        }
     }
 
     /// Compute the histogram of a tensor.
@@ -26538,6 +26544,29 @@ mod tests {
         assert!((vals[0] - 0.5).abs() < 1e-12);
         assert!((vals[1] - 1.25).abs() < 1e-12);
         assert!((vals[2] - 2.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn bincount_propagates_weight_gradient() {
+        // Regression for frankentorch-9r3c: previous body extracted
+        // weight values + rebuilt non-grad output, severing autograd
+        // through the weights tensor. Now composes via scatter_add.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0, 1.0, 1.0, 2.0], vec![4], false)
+            .unwrap();
+        let w = s
+            .tensor_variable(vec![0.5, 1.0, 0.25, 2.0], vec![4], true)
+            .unwrap();
+        let out = s.tensor_bincount(t, Some(w), 0).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, w)
+            .expect("weight gradient should exist (autograd not severed)");
+        // sum(out) gives 1.0 contribution to every weight that lands
+        // in any bin — every weight does — so grad = [1, 1, 1, 1].
+        assert_eq!(grad, &vec![1.0, 1.0, 1.0, 1.0]);
     }
 
     #[test]
