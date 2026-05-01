@@ -22291,6 +22291,80 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn batch_norm1d_linear_regressor_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-tyta. Validates BatchNorm1d's
+        // training-mode running-statistics path + affine parameters
+        // chained with a Linear head, end-to-end through Adam. A
+        // regression in the autograd composition (tensor_mean_dim,
+        // tensor_sub, tensor_mul, tensor_div, tensor_sqrt) would
+        // surface here as a failure to converge.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{BatchNorm1d, Linear, Module};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let bn = BatchNorm1d::new(&mut session, 3, 1e-5, 0.1).expect("bn");
+        let head = Linear::new(&mut session, 3, 1, true).expect("linear");
+
+        // 4 samples, 3 features.
+        let input_vals: Vec<f64> = (0..12).map(|i| ((i as f64 - 5.5) / 6.0) * 0.5).collect();
+        let input = session
+            .tensor_variable(input_vals, vec![4, 3], false)
+            .expect("input");
+        // Two pairs of identical targets: pre-normalized features in
+        // even+odd batch positions are roughly mirror images, so a
+        // bipolar target lets BN+Linear find a clean decision
+        // boundary in a few hundred Adam steps.
+        let target = session
+            .tensor_variable(vec![1.0, -1.0, 1.0, -1.0], vec![4, 1], false)
+            .expect("target");
+
+        let mut params = bn.parameters();
+        params.extend(head.parameters());
+        let mut optimizer = Adam::new(params, 0.05);
+
+        let initial_normalized = bn.forward(&mut session, input).expect("initial bn");
+        let initial_pred = head
+            .forward(&mut session, initial_normalized)
+            .expect("initial head");
+        let initial_loss = session
+            .mse_loss(initial_pred, target)
+            .expect("initial loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("initial loss val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let n = bn.forward(&mut session, input).expect("bn");
+            let p = head.forward(&mut session, n).expect("head");
+            let loss = session.mse_loss(p, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "BatchNorm1d → Linear never improved the loss"
+        );
+        // 2x reduction is the practical convergence floor here: the
+        // normalized output limits Linear's expressivity, so we set
+        // a looser threshold than the 10x used by other E2E tests
+        // (this test's primary purpose is to validate gradients flow,
+        // not to perfectly fit arbitrary targets).
+        assert!(
+            best_loss < initial_loss_val * 0.5,
+            "BatchNorm1d → Linear should drop loss by 2x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
