@@ -12869,61 +12869,63 @@ impl FrankenTorchSession {
             )));
         }
 
+        // Compose via autograd-aware primitives so gradients flow back
+        // to the input matrix. Tracked under frankentorch-dsif. The
+        // previous body extracted intermediate scalar values from the
+        // svdvals/norm tensors and rebuilt non-grad leaves, severing
+        // autograd through every condition-number computation in a
+        // training loop.
         if p == 2.0 || p == -2.0 {
-            // SVD-based: cond = sigma_max / sigma_min (or reciprocal for p=-2)
+            // SVD-based: cond = sigma_max / sigma_min (or reciprocal for p=-2).
+            // tensor_linalg_svdvals itself does not currently backward
+            // through the SVD (the kernel returns a non-grad leaf),
+            // so even though tensor_narrow + tensor_div compose
+            // through autograd downstream, the input gradient is still
+            // severed at the svdvals boundary. Fail loud when the
+            // caller asked for gradients via requires_grad — this
+            // matches the parking-lot pattern used for det/slogdet
+            // (frankentorch-pvfk) and stft/istft autograd guards.
+            if self.tensor_requires_grad(input)? {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "linalg_cond(p=±2): autograd not supported (tensor_linalg_svdvals severs the tape); use p=1, p=-inf, p=inf, or p='fro' for gradient-aware paths",
+                    },
+                )));
+            }
+            // svdvals returns a 1-D tensor of length min(m,n) sorted
+            // descending; extract first/last elements via tensor_narrow.
             let s = self.tensor_linalg_svdvals(input)?;
-            let s_vals = self.tensor_values(s)?;
-            if s_vals.is_empty() {
+            let s_shape = self.tensor_shape(s)?;
+            if s_shape.is_empty() || s_shape[0] == 0 {
+                // Empty matrix — autograd is not meaningful here.
                 return self.tensor_variable(vec![f64::NAN], vec![1], false);
             }
-            let sigma_max = s_vals[0]; // svdvals returns descending order
-            let sigma_min = s_vals[s_vals.len() - 1];
-            let cond = if p == 2.0 {
-                if sigma_min == 0.0 {
-                    f64::INFINITY
-                } else {
-                    sigma_max / sigma_min
-                }
+            let n = s_shape[0];
+            let sigma_max = self.tensor_narrow(s, 0, 0, 1)?; // [1]
+            let sigma_min = self.tensor_narrow(s, 0, n - 1, 1)?; // [1]
+            if p == 2.0 {
+                self.tensor_div(sigma_max, sigma_min)
             } else {
-                // p == -2: reciprocal
-                if sigma_max == 0.0 {
-                    f64::INFINITY
-                } else {
-                    sigma_min / sigma_max
-                }
-            };
-            self.tensor_variable(vec![cond], vec![1], false)
+                self.tensor_div(sigma_min, sigma_max)
+            }
         } else {
-            // For other norms: cond(A) = norm(A, p) * norm(inv(A), p)
-            let norm_a = self.tensor_matrix_norm(
-                input,
-                if p == f64::INFINITY {
-                    "inf"
-                } else if p == f64::NEG_INFINITY {
-                    "-inf"
-                } else if p == 1.0 {
-                    "1"
-                } else {
-                    "fro"
-                },
-            )?;
+            // For other norms: cond(A) = norm(A, p) * norm(inv(A), p).
+            // tensor_matrix_norm and tensor_linalg_inv are both
+            // autograd-aware; just multiply the two norm tensors
+            // directly instead of extracting f64 scalars.
+            let ord = if p == f64::INFINITY {
+                "inf"
+            } else if p == f64::NEG_INFINITY {
+                "-inf"
+            } else if p == 1.0 {
+                "1"
+            } else {
+                "fro"
+            };
+            let norm_a = self.tensor_matrix_norm(input, ord)?;
             let inv = self.tensor_linalg_inv(input)?;
-            let norm_inv = self.tensor_matrix_norm(
-                inv,
-                if p == f64::INFINITY {
-                    "inf"
-                } else if p == f64::NEG_INFINITY {
-                    "-inf"
-                } else if p == 1.0 {
-                    "1"
-                } else {
-                    "fro"
-                },
-            )?;
-
-            let norm_a_val = self.tensor_values(norm_a)?[0];
-            let norm_inv_val = self.tensor_values(norm_inv)?[0];
-            self.tensor_variable(vec![norm_a_val * norm_inv_val], vec![1], false)
+            let norm_inv = self.tensor_matrix_norm(inv, ord)?;
+            self.tensor_mul(norm_a, norm_inv)
         }
     }
 
@@ -28063,6 +28065,60 @@ mod tests {
             vals[0] > 1e9,
             "ill-conditioned matrix should have large cond, got {}",
             vals[0]
+        );
+    }
+
+    #[test]
+    fn cond_p2_fails_loud_with_requires_grad() {
+        // Regression for frankentorch-dsif: previous body extracted
+        // svdvals to f64, picked sigma_max/sigma_min by index, and
+        // rebuilt a non-grad leaf — severing autograd silently.
+        // The p=±2 path now fails loud when the input requires grad
+        // because tensor_linalg_svdvals is the underlying bottleneck;
+        // p≠±2 paths route through autograd-aware norms.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![3.0, 0.0, 0.0, 1.0], vec![2, 2], true).unwrap();
+        let err = s
+            .tensor_linalg_cond(a, 2.0)
+            .expect_err("p=2 + requires_grad must fail loud");
+        let msg = format!("{err:?}");
+        assert!(
+            msg.contains("autograd not supported"),
+            "unexpected error: {msg}"
+        );
+    }
+
+    #[test]
+    fn cond_p2_no_grad_input_still_works() {
+        // Existing functionality for non-grad input is preserved.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![3.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        let c = s.tensor_linalg_cond(a, 2.0).unwrap();
+        let val = s.tensor_values(c).unwrap()[0];
+        assert!((val - 3.0).abs() < 1e-9, "cond should be 3.0, got {val}");
+    }
+
+    #[test]
+    fn cond_p_inf_propagates_input_gradient() {
+        // The p≠±2 path goes through tensor_matrix_norm + tensor_inv +
+        // tensor_mul — all autograd-aware after recent fixes — so this
+        // path now actually delivers a gradient.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let a = s.tensor_variable(vec![2.0, 0.0, 0.0, 4.0], vec![2, 2], true).unwrap();
+        let c = s.tensor_linalg_cond(a, f64::INFINITY).unwrap();
+        let report = s.tensor_backward(c).unwrap();
+        let grad = s
+            .tensor_gradient(&report, a)
+            .expect("p=inf input gradient should exist");
+        assert!(grad.iter().all(|g| g.is_finite()));
+        // The gradient must not be all zeros — that would indicate
+        // tensor_mul is silently severing the chain rule.
+        assert!(
+            grad.iter().any(|g| g.abs() > 1e-12),
+            "at least one input gradient component must be non-zero"
         );
     }
 
