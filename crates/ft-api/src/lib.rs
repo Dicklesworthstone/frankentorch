@@ -4969,6 +4969,43 @@ impl FrankenTorchSession {
         self.tensor_add(pos_mask, zero_contrib)
     }
 
+    /// Normalized sinc function: `sin(pi*x) / (pi*x)`, with `sinc(0) = 1`.
+    ///
+    /// Equivalent to `torch.sinc(input)`. Handles the x = 0 case via
+    /// a tensor_where + safe denominator: at x=0 we route to the
+    /// constant tensor 1 instead of evaluating 0/0. Gradient at x=0
+    /// is correctly 0 (the where routes there to a no-grad constant).
+    /// Composes through autograd-aware tensor_mul + tensor_sin +
+    /// tensor_div + tensor_eq + tensor_where. Tracked under
+    /// frankentorch-zl65.
+    pub fn tensor_sinc(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let pi_t = self.full(shape.clone(), std::f64::consts::PI, false)?;
+        let pi_x = self.tensor_mul(input, pi_t)?;
+        let sin_pi_x = self.tensor_sin(pi_x)?;
+
+        // Build the zero mask and the safe denominator. The safe
+        // denominator is pi*x where x != 0, and 1 where x == 0 — the
+        // exact value at masked positions doesn't matter because
+        // tensor_where will discard it.
+        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let zero_mask = self.tensor_eq(input, zeros)?;
+        let pi_t2 = self.full(shape.clone(), std::f64::consts::PI, false)?;
+        let pi_x_safe_a = self.tensor_mul(input, pi_t2)?;
+        let ones = self.full(shape.clone(), 1.0, false)?;
+        let safe_denom = self.tensor_where(zero_mask, ones, pi_x_safe_a)?;
+        let ratio = self.tensor_div(sin_pi_x, safe_denom)?;
+
+        // Final select: at x = 0 → 1.0; otherwise the ratio.
+        let zeros2 = self.full(shape.clone(), 0.0, false)?;
+        let zero_mask2 = self.tensor_eq(input, zeros2)?;
+        let ones2 = self.full(shape, 1.0, false)?;
+        self.tensor_where(zero_mask2, ones2, ratio)
+    }
+
     /// L2 hypotenuse: `sqrt(x² + y²)`.
     ///
     /// Equivalent to `torch.hypot(x, y)`. Element-wise. Composes
@@ -28461,6 +28498,65 @@ mod tests {
         let m = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
         let g = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
         assert!(s.tensor_copysign(m, g).is_err());
+    }
+
+    // ── tensor_sinc tests (frankentorch-zl65) ──────────────────────────
+
+    #[test]
+    fn sinc_known_values() {
+        // sinc(0) = 1; sinc(0.5) = sin(pi/2) / (pi/2) = 2/pi ≈ 0.63662
+        // sinc(1) = sin(pi) / pi = 0; sinc(2) = 0
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 0.5, 1.0, 2.0], vec![4], false)
+            .unwrap();
+        let out = s.tensor_sinc(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!((v[0] - 1.0).abs() < 1e-12);
+        assert!((v[1] - 2.0 / std::f64::consts::PI).abs() < 1e-12);
+        assert!(v[2].abs() < 1e-12);
+        assert!(v[3].abs() < 1e-12);
+    }
+
+    #[test]
+    fn sinc_handles_zero_without_nan() {
+        // The pure formula sin(pi*0)/(pi*0) = 0/0 → NaN. Our
+        // safe-denominator + where chain must produce exactly 1.0.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_sinc(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        for val in &v {
+            assert!(!val.is_nan(), "sinc(0) must not be NaN");
+            assert!((val - 1.0).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn sinc_propagates_gradient_zero_at_x_equals_zero() {
+        // The continuous derivative d/dx sinc(x) is 0 at x = 0
+        // (sinc has a maximum there). Our implementation should
+        // produce gradient 0 at x = 0 because the final tensor_where
+        // routes that position to the no-grad ones constant.
+        // For x != 0: d/dx sinc(x) = (cos(pi*x) - sinc(x)) / x.
+        // At x = 0.5: d/dx sinc = (cos(pi/2) - 2/pi) / 0.5 = (0 - 2/pi) / 0.5 = -4/pi.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 0.5], vec![2], true)
+            .unwrap();
+        let out = s.tensor_sinc(x).unwrap();
+        let scalar = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert!((g[0]).abs() < 1e-12, "grad at x=0 should be 0, got {}", g[0]);
+        let expected = -4.0 / std::f64::consts::PI;
+        assert!(
+            (g[1] - expected).abs() < 1e-10,
+            "grad at x=0.5: got {}, expected {expected}",
+            g[1]
+        );
     }
 
     // ── tensor_heaviside tests (frankentorch-b4m6) ────────────────────
