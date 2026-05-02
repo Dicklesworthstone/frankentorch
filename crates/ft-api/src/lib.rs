@@ -4867,6 +4867,50 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Heaviside step function: `0 if x<0, 1 if x>0, values[i] if x==0`.
+    ///
+    /// Equivalent to `torch.heaviside(input, values)`. `values` must
+    /// have the same shape as `input` (the value taken at the
+    /// discontinuity is supplied per-element).
+    ///
+    /// Non-differentiable: the step has a Dirac delta at 0. Fail-loud
+    /// on tracked input to avoid silently severing the autograd tape.
+    /// Tracked under frankentorch-b4m6.
+    pub fn tensor_heaviside(
+        &mut self,
+        input: TensorNodeId,
+        values: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(values)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "heaviside: autograd not supported (step function is non-differentiable). Tracked under frankentorch-b4m6.",
+                },
+            )));
+        }
+        let in_shape = self.tensor_shape(input)?;
+        let v_shape = self.tensor_shape(values)?;
+        if in_shape != v_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: in_shape,
+                    rhs: v_shape,
+                },
+            )));
+        }
+        // Build the step output: for x > 0 → 1, for x < 0 → 0, for
+        // x == 0 → values[i]. Compose:
+        //   pos_mask  = (x > 0)              // 1 where x > 0, else 0
+        //   zero_mask = (x == 0)             // 1 where x == 0, else 0
+        //   out = pos_mask + zero_mask * values
+        let zeros = self.full(in_shape.clone(), 0.0, false)?;
+        let pos_mask = self.tensor_gt(input, zeros)?;
+        let zeros2 = self.full(in_shape, 0.0, false)?;
+        let zero_mask = self.tensor_eq(input, zeros2)?;
+        let zero_contrib = self.tensor_mul(zero_mask, values)?;
+        self.tensor_add(pos_mask, zero_contrib)
+    }
+
     /// L2 hypotenuse: `sqrt(x² + y²)`.
     ///
     /// Equivalent to `torch.hypot(x, y)`. Element-wise. Composes
@@ -28122,6 +28166,52 @@ mod tests {
         assert!((v[6] - third).abs() < 1e-12);
         assert!((v[7] - third).abs() < 1e-12);
         assert!((v[8] - third).abs() < 1e-12);
+    }
+
+    // ── tensor_heaviside tests (frankentorch-b4m6) ────────────────────
+
+    #[test]
+    fn heaviside_known_values() {
+        // x = [-1, 0, 1, 2], values = [0.5, 0.5, 0.5, 0.5]
+        // → [0, 0.5, 1, 1]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![-1.0, 0.0, 1.0, 2.0], vec![4], false)
+            .unwrap();
+        let vals = s
+            .tensor_variable(vec![0.5; 4], vec![4], false)
+            .unwrap();
+        let out = s.tensor_heaviside(x, vals).unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), vec![0.0, 0.5, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn heaviside_uses_per_element_values_at_zero() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false)
+            .unwrap();
+        let vals = s
+            .tensor_variable(vec![0.0, 0.5, 1.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_heaviside(x, vals).unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), vec![0.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn heaviside_fails_loud_on_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let v = s.tensor_variable(vec![0.5], vec![1], false).unwrap();
+        assert!(s.tensor_heaviside(x, v).is_err());
+    }
+
+    #[test]
+    fn heaviside_rejects_shape_mismatch() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let v = s.tensor_variable(vec![0.5], vec![1], false).unwrap();
+        assert!(s.tensor_heaviside(x, v).is_err());
     }
 
     // ── tensor_hypot tests (frankentorch-k3p4) ────────────────────────
