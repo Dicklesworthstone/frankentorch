@@ -4586,6 +4586,70 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Ensure `input` has at least 1 dimension.
+    ///
+    /// Equivalent to `torch.atleast_1d(input)`. 0-D scalars are
+    /// reshaped to `[1]`; tensors with rank ≥ 1 are returned
+    /// unchanged. Composes through autograd-aware tensor_reshape.
+    /// Tracked under frankentorch-oi03.
+    pub fn tensor_atleast_1d(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.is_empty() {
+            self.tensor_reshape(input, vec![1])
+        } else {
+            Ok(input)
+        }
+    }
+
+    /// Ensure `input` has at least 2 dimensions.
+    ///
+    /// Equivalent to `torch.atleast_2d(input)`. 0-D scalars become
+    /// `[1, 1]`; 1-D `[N]` becomes `[1, N]`; tensors with rank ≥ 2
+    /// are returned unchanged. Tracked under frankentorch-oi03.
+    pub fn tensor_atleast_2d(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        match shape.len() {
+            0 => self.tensor_reshape(input, vec![1, 1]),
+            1 => {
+                let n = shape[0];
+                self.tensor_reshape(input, vec![1, n])
+            }
+            _ => Ok(input),
+        }
+    }
+
+    /// Ensure `input` has at least 3 dimensions.
+    ///
+    /// Equivalent to `torch.atleast_3d(input)`. 0-D becomes `[1, 1, 1]`;
+    /// 1-D `[N]` becomes `[1, N, 1]`; 2-D `[N, M]` becomes `[N, M, 1]`;
+    /// tensors with rank ≥ 3 are returned unchanged. The asymmetric
+    /// padding (left for the 1-D case, right for the 2-D case) matches
+    /// PyTorch and numpy semantics. Tracked under frankentorch-oi03.
+    pub fn tensor_atleast_3d(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        match shape.len() {
+            0 => self.tensor_reshape(input, vec![1, 1, 1]),
+            1 => {
+                let n = shape[0];
+                self.tensor_reshape(input, vec![1, n, 1])
+            }
+            2 => {
+                let (n, m) = (shape[0], shape[1]);
+                self.tensor_reshape(input, vec![n, m, 1])
+            }
+            _ => Ok(input),
+        }
+    }
+
     /// Matrix-vector product: `out = M @ v`.
     ///
     /// Equivalent to `torch.mv(input, vec_input)`. `input` must be a 2-D
@@ -27269,6 +27333,90 @@ mod tests {
         let (sign_id, _logabsdet_id) = s.tensor_linalg_slogdet(a).unwrap();
         assert!(!s.tensor_requires_grad(sign_id).unwrap(),
             "slogdet sign must be non-grad");
+    }
+
+    // ── tensor_atleast_{1,2,3}d tests (frankentorch-oi03) ──────────────
+
+    #[test]
+    fn atleast_1d_promotes_scalar_keeps_higher_rank() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let scalar = s.tensor_variable(vec![3.0], vec![], false).unwrap();
+        let r1 = s.tensor_atleast_1d(scalar).unwrap();
+        assert_eq!(s.tensor_shape(r1).unwrap(), vec![1]);
+        assert_eq!(s.tensor_values(r1).unwrap(), vec![3.0]);
+
+        let v1d = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let r2 = s.tensor_atleast_1d(v1d).unwrap();
+        // Already rank ≥ 1: returned unchanged (same id).
+        assert_eq!(r2, v1d);
+
+        let m2d = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let r3 = s.tensor_atleast_1d(m2d).unwrap();
+        assert_eq!(r3, m2d);
+    }
+
+    #[test]
+    fn atleast_2d_promotes_scalar_and_1d_keeps_higher_rank() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let scalar = s.tensor_variable(vec![5.0], vec![], false).unwrap();
+        let r0 = s.tensor_atleast_2d(scalar).unwrap();
+        assert_eq!(s.tensor_shape(r0).unwrap(), vec![1, 1]);
+
+        let v1d = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let r1 = s.tensor_atleast_2d(v1d).unwrap();
+        // 1-D [N] → [1, N], left-padded.
+        assert_eq!(s.tensor_shape(r1).unwrap(), vec![1, 3]);
+        assert_eq!(s.tensor_values(r1).unwrap(), vec![1.0, 2.0, 3.0]);
+
+        let m2d = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let r2 = s.tensor_atleast_2d(m2d).unwrap();
+        assert_eq!(r2, m2d);
+    }
+
+    #[test]
+    fn atleast_3d_promotes_with_pytorch_padding() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let scalar = s.tensor_variable(vec![7.0], vec![], false).unwrap();
+        let r0 = s.tensor_atleast_3d(scalar).unwrap();
+        assert_eq!(s.tensor_shape(r0).unwrap(), vec![1, 1, 1]);
+
+        // 1-D [N] → [1, N, 1]
+        let v1d = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let r1 = s.tensor_atleast_3d(v1d).unwrap();
+        assert_eq!(s.tensor_shape(r1).unwrap(), vec![1, 3, 1]);
+
+        // 2-D [N, M] → [N, M, 1]
+        let m2d = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let r2 = s.tensor_atleast_3d(m2d).unwrap();
+        assert_eq!(s.tensor_shape(r2).unwrap(), vec![2, 3, 1]);
+
+        // 3-D unchanged
+        let t3d = s
+            .tensor_variable(vec![1.0; 12], vec![2, 3, 2], false)
+            .unwrap();
+        let r3 = s.tensor_atleast_3d(t3d).unwrap();
+        assert_eq!(r3, t3d);
+    }
+
+    #[test]
+    fn atleast_2d_propagates_gradient_unchanged() {
+        // Reshape is autograd-aware: gradient of sum of atleast_2d
+        // through a 1-D input should be all ones.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let v = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let promoted = s.tensor_atleast_2d(v).unwrap();
+        let scalar = s.tensor_sum(promoted).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, v).unwrap();
+        assert_eq!(g, &[1.0, 1.0, 1.0, 1.0]);
     }
 
     // ── tensor_mv tests (frankentorch-256l) ───────────────────────────
