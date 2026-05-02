@@ -11837,6 +11837,41 @@ mod tests {
             }
         }
 
+        // sin²(x) + cos²(x) = 1 within a few ULPs. Locks the
+        // standard Pythagorean identity across random inputs and
+        // exercises both tensor_sin and tensor_cos with mul and add.
+        // Frankentorch-iora.
+        #[test]
+        fn fuzz_metamorphic_sin_squared_plus_cos_squared_equals_one(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let xs: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let n = xs.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(xs.clone(), vec![n], false).expect("x");
+            let sin_x = s.tensor_sin(x).expect("sin");
+            let cos_x = s.tensor_cos(x).expect("cos");
+            let sin_sq = s.tensor_mul(sin_x, sin_x).expect("sin²");
+            let cos_sq = s.tensor_mul(cos_x, cos_x).expect("cos²");
+            let total = s.tensor_add(sin_sq, cos_sq).expect("sum");
+            let v = s.tensor_values(total).expect("values");
+
+            // sin² + cos² = 1 exactly in real arithmetic. In f64 each
+            // sin/cos has ~1 ULP error; the squaring and summing
+            // compounds this to ~4 ULPs. Bound conservatively: scale
+            // by max(|sin|,|cos|) which is ≤ 1, so use 16 * EPSILON.
+            let bound = 16.0 * f64::EPSILON;
+            for value in &v {
+                let diff = (value - 1.0).abs();
+                prop_assert!(
+                    diff <= bound,
+                    "sin²+cos² = {value} but expected 1; diff = {diff:e}, bound = {bound:e}"
+                );
+            }
+        }
+
         // pixel_unshuffle(pixel_shuffle(x, r), r) == x, bit-exactly.
         // Both ops are pure reshape + permute with no arithmetic, so
         // any deviation indicates a permutation-axis bug in either
