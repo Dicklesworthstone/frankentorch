@@ -7669,6 +7669,45 @@ impl FrankenTorchSession {
         self.tensor_tape.index_select(input, dim, &indices_data)
     }
 
+    /// Gather elements via flat (row-major) indices, reshaped like indices.
+    ///
+    /// Equivalent to `torch.take(input, indices)` — i.e.
+    /// `input.flatten()[indices].reshape(indices.shape)`. Composes
+    /// through tensor_reshape (flatten input + flatten indices) +
+    /// tensor_index_select + tensor_reshape (back to indices shape),
+    /// so gradients flow back to input via the index_select backward.
+    /// Tracked under frankentorch-1qxf.
+    pub fn tensor_take(
+        &mut self,
+        input: TensorNodeId,
+        indices: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let indices_shape = self.tensor_shape(indices)?;
+        let numel = Self::checked_shape_numel(&input_shape, "take: input shape volume overflow")?;
+        let n_idx = Self::checked_shape_numel(&indices_shape, "take: indices shape volume overflow")?;
+
+        // Flatten input to [numel] and indices to [n_idx].
+        let flat_input = if input_shape == [numel] {
+            input
+        } else {
+            self.tensor_reshape(input, vec![numel])?
+        };
+        let flat_idx = if indices_shape == [n_idx] {
+            indices
+        } else {
+            self.tensor_reshape(indices, vec![n_idx])?
+        };
+        let gathered = self.tensor_index_select(flat_input, 0, flat_idx)?;
+
+        // Reshape result back to indices' original shape.
+        if indices_shape == [n_idx] {
+            Ok(gathered)
+        } else {
+            self.tensor_reshape(gathered, indices_shape)
+        }
+    }
+
     /// Like `tensor_index_select`, but the input's gradient is also
     /// surfaced as a sparse COO tensor on the backward report
     /// (`TensorBackwardReport::sparse_gradient`). Only meaningful for
@@ -8329,6 +8368,34 @@ impl FrankenTorchSession {
         dim1: usize,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_tape.transpose(input, dim0, dim1)
+    }
+
+    /// Swap two dimensions; alias for `tensor_transpose`.
+    ///
+    /// Equivalent to `torch.swapaxes(input, dim0, dim1)`. PyTorch
+    /// keeps both names for numpy compatibility (numpy uses
+    /// `swapaxes`). Tracked under frankentorch-1qxf.
+    pub fn tensor_swapaxes(
+        &mut self,
+        input: TensorNodeId,
+        dim0: usize,
+        dim1: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_transpose(input, dim0, dim1)
+    }
+
+    /// Swap two dimensions; alias for `tensor_transpose`.
+    ///
+    /// Equivalent to `torch.swapdims(input, dim0, dim1)`. PyTorch
+    /// keeps swapaxes / swapdims as separate aliases for transpose.
+    /// Tracked under frankentorch-1qxf.
+    pub fn tensor_swapdims(
+        &mut self,
+        input: TensorNodeId,
+        dim0: usize,
+        dim1: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_transpose(input, dim0, dim1)
     }
 
     pub fn tensor_permute(
@@ -27662,6 +27729,69 @@ mod tests {
         let (sign_id, _logabsdet_id) = s.tensor_linalg_slogdet(a).unwrap();
         assert!(!s.tensor_requires_grad(sign_id).unwrap(),
             "slogdet sign must be non-grad");
+    }
+
+    // ── tensor_take + swapaxes/swapdims tests (frankentorch-1qxf) ─────
+
+    #[test]
+    fn take_returns_flat_indexed_values_reshaped() {
+        // input = [[1, 2, 3], [4, 5, 6]] flat=[1,2,3,4,5,6]
+        // indices = [[0, 5], [2, 3]] → take = [[1, 6], [3, 4]]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let idx = s
+            .tensor_variable(vec![0.0, 5.0, 2.0, 3.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.tensor_take(x, idx).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![2, 2]);
+        assert_eq!(s.tensor_values(out).unwrap(), vec![1.0, 6.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn take_propagates_gradient_to_indexed_positions() {
+        // sum(take(x, [0, 2])) backward gives grad = [1, 0, 1] in flat.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let idx = s
+            .tensor_variable(vec![0.0, 3.0], vec![2], false)
+            .unwrap();
+        let out = s.tensor_take(x, idx).unwrap();
+        let scalar = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert_eq!(g, &[1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn take_repeated_indices_accumulate_gradient() {
+        // sum(take(x, [0, 0, 0])) should give grad x[0] = 3.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0], vec![2], true).unwrap();
+        let idx = s
+            .tensor_variable(vec![0.0, 0.0, 0.0], vec![3], false)
+            .unwrap();
+        let out = s.tensor_take(x, idx).unwrap();
+        let scalar = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert_eq!(g, &[3.0, 0.0]);
+    }
+
+    #[test]
+    fn swapaxes_and_swapdims_match_transpose() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let t1 = s.tensor_transpose(x, 0, 1).unwrap();
+        let t2 = s.tensor_swapaxes(x, 0, 1).unwrap();
+        let t3 = s.tensor_swapdims(x, 0, 1).unwrap();
+        assert_eq!(s.tensor_values(t1).unwrap(), s.tensor_values(t2).unwrap());
+        assert_eq!(s.tensor_values(t1).unwrap(), s.tensor_values(t3).unwrap());
     }
 
     // ── tensor_maximum / minimum tests (frankentorch-h2m0) ─────────────
