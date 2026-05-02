@@ -5330,6 +5330,57 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// NaN-aware sum: equivalent to `torch.nansum(input)`.
+    ///
+    /// Treats NaN values as 0 contribution. ±inf values pass through
+    /// unchanged (matching PyTorch behavior — only NaN is masked).
+    /// Composes through tensor_isnan + tensor_where + tensor_sum,
+    /// so gradients flow only to non-NaN positions (the where
+    /// routes the upstream gradient to the all-zero constant tensor
+    /// at NaN positions, which has no requires_grad). Tracked under
+    /// frankentorch-8q4o.
+    pub fn tensor_nansum(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let zeros = self.full(shape, 0.0, false)?;
+        let mask = self.tensor_isnan(input)?;
+        let cleaned = self.tensor_where(mask, zeros, input)?;
+        self.tensor_sum(cleaned)
+    }
+
+    /// NaN-aware mean: equivalent to `torch.nanmean(input)`.
+    ///
+    /// Divides `nansum(input)` by the count of non-NaN elements.
+    /// ±inf are counted as non-NaN (matching PyTorch). If every
+    /// element is NaN the divisor is zero and the output is NaN.
+    /// Tracked under frankentorch-8q4o.
+    pub fn tensor_nanmean(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let numel: usize = shape.iter().product();
+        let zeros = self.full(shape, 0.0, false)?;
+        let mask = self.tensor_isnan(input)?;
+        let cleaned = self.tensor_where(mask, zeros, input)?;
+        let summed = self.tensor_sum(cleaned)?;
+        // count_non_nan = numel - sum(isnan(x)). Read sum(mask) as a
+        // plain f64 (the count itself is non-differentiable — its
+        // value depends on the input's NaN pattern which is not part
+        // of any smooth gradient flow). The divisor enters as a
+        // tensor_div by a non-grad scalar, so the gradient on summed
+        // scales by 1 / count which is what nanmean's backward
+        // needs.
+        let nan_count_t = self.tensor_sum(mask)?;
+        let nan_count = self.tensor_values(nan_count_t)?[0];
+        let count_non_nan = numel as f64 - nan_count;
+        let summed_shape = self.tensor_shape(summed)?;
+        let divisor = self.full(summed_shape, count_non_nan, false)?;
+        self.tensor_div(summed, divisor)
+    }
+
     pub fn tensor_sum_dim(
         &mut self,
         input: TensorNodeId,
@@ -36633,6 +36684,107 @@ mod tests {
         assert_eq!(g[3], 1.0, "Finite position should have unit gradient");
         assert_eq!(g[4], 0.0, "-inf position should have zero gradient");
         assert_eq!(g[5], 1.0, "Finite position should have unit gradient");
+    }
+
+    #[test]
+    fn nansum_treats_nan_as_zero() {
+        // sum([1, NaN, 3, NaN, 5]) ignoring NaN = 9
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0],
+                vec![5],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_nansum(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert_eq!(v.len(), 1);
+        assert!((v[0] - 9.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nansum_passes_through_inf() {
+        // PyTorch: nansum only masks NaN, not ±inf. sum([1, +inf]) = +inf.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, f64::INFINITY], vec![2], false)
+            .unwrap();
+        let out = s.tensor_nansum(x).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!(v.is_infinite() && v > 0.0);
+    }
+
+    #[test]
+    fn nansum_propagates_gradient_to_non_nan_positions() {
+        // backward(nansum(x)) routes the upstream grad to non-NaN
+        // positions only.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0],
+                vec![5],
+                true,
+            )
+            .unwrap();
+        let out = s.tensor_nansum(x).unwrap();
+        let report = s.tensor_backward(out).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert_eq!(g.len(), 5);
+        assert_eq!(g[0], 1.0, "non-NaN position should receive gradient");
+        assert_eq!(g[1], 0.0, "NaN position should be masked to zero");
+        assert_eq!(g[2], 1.0);
+        assert_eq!(g[3], 0.0);
+        assert_eq!(g[4], 1.0);
+    }
+
+    #[test]
+    fn nanmean_divides_by_non_nan_count() {
+        // mean of [1, NaN, 3, NaN, 5] over non-NaN = 9 / 3 = 3
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0],
+                vec![5],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_nanmean(x).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!((v - 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nanmean_all_nan_returns_nan() {
+        // Edge case: every element NaN → divisor 0 → NaN result.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![f64::NAN, f64::NAN], vec![2], false)
+            .unwrap();
+        let out = s.tensor_nanmean(x).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!(v.is_nan(), "all-NaN nanmean should be NaN, got {v}");
+    }
+
+    #[test]
+    fn nanmean_propagates_gradient_scaled_by_one_over_count() {
+        // grad to non-NaN positions = 1 / count_non_nan; zero at NaN.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, 5.0],
+                vec![4],
+                true,
+            )
+            .unwrap();
+        let out = s.tensor_nanmean(x).unwrap();
+        let report = s.tensor_backward(out).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        let expected = 1.0_f64 / 3.0;
+        assert!((g[0] - expected).abs() < 1e-12);
+        assert_eq!(g[1], 0.0);
+        assert!((g[2] - expected).abs() < 1e-12);
+        assert!((g[3] - expected).abs() < 1e-12);
     }
 
     #[test]
