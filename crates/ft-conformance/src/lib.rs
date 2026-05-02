@@ -23344,6 +23344,86 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn conv2d_pixel_shuffle_super_resolution_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-rr7i. Tiny super-resolution
+        // stack: Conv2d(in_ch → out_ch * r^2) → PixelShuffle(r). The
+        // shuffle has no parameters but rearranges channels into
+        // spatial dims; gradients flow back through reshape + permute
+        // + reshape into the conv weight. Mirrors models like ESPCN.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Conv2d, Module, PixelShuffle};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let r = 2;
+        let in_ch = 2;
+        let out_ch = 1;
+        // Conv outputs out_ch * r^2 channels so PixelShuffle(r) folds them
+        // back to out_ch with 2x spatial upscale.
+        let conv = Conv2d::new(
+            &mut session,
+            in_ch,
+            out_ch * r * r,
+            (3, 3),
+            (1, 1),
+            (1, 1),
+            true,
+        )
+        .expect("conv2d");
+        let shuffle = PixelShuffle::new(r);
+
+        // 1×2×2×2 input image — small enough for a fast smoke test but
+        // large enough to exercise the spatial-channel rearrangement.
+        let input = session
+            .tensor_variable(
+                vec![0.5, -0.3, 0.2, 0.8, -0.6, 0.1, -0.4, 0.7],
+                vec![1, in_ch, 2, 2],
+                false,
+            )
+            .expect("input");
+        // Target after 2x upscale: 1×1×4×4 zeros — reachable by driving
+        // conv weights toward zero, an easy convergence target.
+        let target = session
+            .tensor_variable(vec![0.0; 16], vec![1, out_ch, 4, 4], false)
+            .expect("target");
+
+        let mut optimizer = Adam::new(conv.parameters(), 0.05);
+
+        let initial_conv_out = conv.forward(&mut session, input).expect("init conv");
+        let initial_up = shuffle
+            .forward(&mut session, initial_conv_out)
+            .expect("init shuffle");
+        let initial_loss = session.mse_loss(initial_up, target).expect("init loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("init loss val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let conv_out = conv.forward(&mut session, input).expect("conv");
+            let up = shuffle.forward(&mut session, conv_out).expect("shuffle");
+            let loss = session.mse_loss(up, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "Conv2d + PixelShuffle never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "Conv2d + PixelShuffle should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
