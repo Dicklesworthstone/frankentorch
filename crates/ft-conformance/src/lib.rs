@@ -23878,6 +23878,59 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn conv1d_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-nhrd. Tiny Conv1d stack:
+        // Conv1d(2 → 1, k=3, p=1) on 1×2×4 input, MSE against zeros.
+        // Easy convergence target — drives the conv weights toward 0.
+        // Locks the im2col + bmm gradient chain inside Conv1d.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Conv1d, Module};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv1d::new(&mut session, 2, 1, 3, 1, 1, true).expect("conv1d");
+
+        let input = session
+            .tensor_variable(
+                vec![0.5, -0.3, 0.8, -0.6, 0.1, -0.4, 0.7, 0.2],
+                vec![1, 2, 4],
+                false,
+            )
+            .expect("input");
+        let target = session
+            .tensor_variable(vec![0.0; 4], vec![1, 1, 4], false)
+            .expect("target");
+
+        let mut optimizer = Adam::new(conv.parameters(), 0.05);
+
+        let initial_out = conv.forward(&mut session, input).expect("init conv");
+        let initial_loss = session.mse_loss(initial_out, target).expect("init loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("init val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let out = conv.forward(&mut session, input).expect("conv");
+            let loss = session.mse_loss(out, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(saw_loss_improvement, "Conv1d never improved the loss");
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "Conv1d should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn conv2d_global_avg_pool_classifier_trains_end_to_end_with_adam() {
         // E2E regression for frankentorch-oviu. Canonical CNN
         // classification head: Conv2d → AdaptiveAvgPool2d((1,1))
