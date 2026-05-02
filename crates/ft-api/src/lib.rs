@@ -5884,6 +5884,41 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Gated Linear Unit: split `input` in half along `dim` and gate.
+    ///
+    /// Equivalent to `torch.nn.functional.glu(input, dim)`. Returns
+    /// `a * sigmoid(b)` where `a` is the first half and `b` the second
+    /// half along `dim`. The size of `dim` must be even. Composes
+    /// through autograd-aware tensor_narrow + tensor_sigmoid +
+    /// tensor_mul. Tracked under frankentorch-47fn.
+    pub fn tensor_glu(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if dim >= shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "glu: dim out of range",
+                },
+            )));
+        }
+        let dim_size = shape[dim];
+        if dim_size % 2 != 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "glu: input size along dim must be even",
+                },
+            )));
+        }
+        let half = dim_size / 2;
+        let a = self.tensor_narrow(input, dim, 0, half)?;
+        let b = self.tensor_narrow(input, dim, half, half)?;
+        let b_sig = self.tensor_sigmoid(b)?;
+        self.tensor_mul(a, b_sig)
+    }
+
     /// Compute the softmin along a dimension: `softmax(-input, dim)`.
     ///
     /// Equivalent to `torch.nn.functional.softmin(input, dim)`. Just a
@@ -28238,6 +28273,89 @@ mod tests {
         assert!((v[6] - third).abs() < 1e-12);
         assert!((v[7] - third).abs() < 1e-12);
         assert!((v[8] - third).abs() < 1e-12);
+    }
+
+    // ── tensor_glu tests (frankentorch-47fn) ──────────────────────────
+
+    #[test]
+    fn glu_known_values() {
+        // input = [1, 2, 3, 4] split along dim=0 → a=[1,2], b=[3,4]
+        // out = a * sigmoid(b) = [1 * sigmoid(3), 2 * sigmoid(4)]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
+            .unwrap();
+        let out = s.tensor_glu(x, 0).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![2]);
+        let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+        assert!((v[0] - 1.0 * sig(3.0)).abs() < 1e-12);
+        assert!((v[1] - 2.0 * sig(4.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn glu_2d_input_default_dim_minus_one_equivalent_to_last() {
+        // [[1, 2, 3, 4], [5, 6, 7, 8]] split along dim=1
+        // → a = [[1, 2], [5, 6]], b = [[3, 4], [7, 8]]
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                vec![2, 4],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_glu(x, 1).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![2, 2]);
+        let v = s.tensor_values(out).unwrap();
+        let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+        assert!((v[0] - 1.0 * sig(3.0)).abs() < 1e-12);
+        assert!((v[1] - 2.0 * sig(4.0)).abs() < 1e-12);
+        assert!((v[2] - 5.0 * sig(7.0)).abs() < 1e-12);
+        assert!((v[3] - 6.0 * sig(8.0)).abs() < 1e-12);
+    }
+
+    #[test]
+    fn glu_rejects_odd_dim_size() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        assert!(s.tensor_glu(x, 0).is_err());
+    }
+
+    #[test]
+    fn glu_rejects_dim_out_of_range() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        assert!(s.tensor_glu(x, 1).is_err());
+    }
+
+    #[test]
+    fn glu_propagates_gradient_to_both_halves() {
+        // For input = [1, 2, 3, 4], out = [1*sigmoid(3), 2*sigmoid(4)].
+        // sum(out) backward:
+        //   ∂/∂a_i = sigmoid(b_i)
+        //   ∂/∂b_i = a_i * sigmoid(b_i) * (1 - sigmoid(b_i))
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .unwrap();
+        let out = s.tensor_glu(x, 0).unwrap();
+        let scalar = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        let sig = |z: f64| 1.0 / (1.0 + (-z).exp());
+        // a-half (indices 0, 1)
+        assert!((g[0] - sig(3.0)).abs() < 1e-12);
+        assert!((g[1] - sig(4.0)).abs() < 1e-12);
+        // b-half (indices 2, 3)
+        let s3 = sig(3.0);
+        let s4 = sig(4.0);
+        assert!((g[2] - 1.0 * s3 * (1.0 - s3)).abs() < 1e-12);
+        assert!((g[3] - 2.0 * s4 * (1.0 - s4)).abs() < 1e-12);
     }
 
     // ── tensor_softmin tests (frankentorch-n947) ──────────────────────
