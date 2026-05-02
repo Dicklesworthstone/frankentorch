@@ -23955,6 +23955,85 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn transformer_decoder_layer_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-y0d6. Validates the
+        // TransformerDecoderLayer forward chain — self-attention +
+        // cross-attention against a memory tensor + feedforward,
+        // each wrapped in residual + LayerNorm. Cross-attention
+        // gradient flow is unique to the decoder (the encoder tests
+        // dv5a and 48ja don't exercise the QK^T against an external
+        // memory tensor).
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Module, TransformerActivation, TransformerDecoderLayer};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let layer = TransformerDecoderLayer::new(
+            &mut session,
+            8,    // d_model
+            2,    // nhead
+            16,   // dim_feedforward
+            0.0,  // dropout
+            TransformerActivation::Gelu,
+            false, // norm_first (post-norm)
+        )
+        .expect("decoder layer");
+
+        // 1x4x8 target sequence.
+        let tgt_vals: Vec<f64> =
+            (0..32).map(|i| ((i as f64 - 15.5) / 16.0) * 0.5).collect();
+        let tgt = session
+            .tensor_variable(tgt_vals, vec![1, 4, 8], false)
+            .expect("tgt");
+        // 1x3x8 memory (different src_len from tgt to exercise the
+        // cross-attention K, V dimensions properly).
+        let mem_vals: Vec<f64> =
+            (0..24).map(|i| ((i as f64 - 11.5) / 12.0) * 0.3).collect();
+        let memory = session
+            .tensor_variable(mem_vals, vec![1, 3, 8], false)
+            .expect("memory");
+
+        let target = session
+            .tensor_variable(vec![0.0; 32], vec![1, 4, 8], false)
+            .expect("target");
+
+        let mut optimizer = Adam::new(layer.parameters(), 0.05);
+
+        let initial_out = layer
+            .forward_layer(&mut session, tgt, memory)
+            .expect("init forward");
+        let initial_loss = session.mse_loss(initial_out, target).expect("init loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("init val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let out = layer
+                .forward_layer(&mut session, tgt, memory)
+                .expect("forward");
+            let loss = session.mse_loss(out, target).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "TransformerDecoderLayer never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "TransformerDecoderLayer should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn transformer_encoder_two_layers_trains_end_to_end_with_adam() {
         // E2E regression for frankentorch-48ja. Validates the
         // multi-layer TransformerEncoder wrapper (stacking +
