@@ -5371,6 +5371,57 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for `tensor_clamp`. Equivalent to `torch.clip(input, min, max)`.
+    /// Tracked under frankentorch-5man.
+    pub fn tensor_clip(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, min_val, max_val)
+    }
+
+    /// Alias for `tensor_sub`. Equivalent to `torch.subtract(lhs, rhs)`.
+    /// Tracked under frankentorch-5man.
+    pub fn tensor_subtract(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_sub(lhs, rhs)
+    }
+
+    /// Alias for `tensor_mul`. Equivalent to `torch.multiply(lhs, rhs)`.
+    /// Tracked under frankentorch-5man.
+    pub fn tensor_multiply(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_mul(lhs, rhs)
+    }
+
+    /// Alias for `tensor_div`. Equivalent to `torch.divide(lhs, rhs)`.
+    /// Tracked under frankentorch-5man.
+    pub fn tensor_divide(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_div(lhs, rhs)
+    }
+
+    /// Alias for `tensor_linalg_inv`. Equivalent to `torch.inverse(input)`,
+    /// the deprecated-but-still-used alias for torch.linalg.inv.
+    /// Tracked under frankentorch-5man.
+    pub fn tensor_inverse(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_inv(input)
+    }
+
     /// Clamp all elements to be >= min_val.
     ///
     /// Equivalent to `torch.clamp_min(input, min)` or `torch.clamp(input, min=min)`.
@@ -29228,6 +29279,54 @@ mod tests {
         let b = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
         assert!(s.tensor_isclose(a, b, -1e-5, 1e-8, false).is_err());
         assert!(s.tensor_isclose(a, b, 1e-5, -1e-8, false).is_err());
+    }
+
+    // ── alias ops tests (frankentorch-5man) ───────────────────────────
+
+    #[test]
+    fn aliases_match_underlying_ops() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
+            .unwrap();
+        let b = s
+            .tensor_variable(vec![10.0, 20.0, 30.0, 40.0], vec![4], false)
+            .unwrap();
+
+        // clip == clamp
+        let clamped = s.tensor_clamp(a, 1.5, 3.5).unwrap();
+        let clipped = s.tensor_clip(a, 1.5, 3.5).unwrap();
+        assert_eq!(s.tensor_values(clamped).unwrap(), s.tensor_values(clipped).unwrap());
+
+        // subtract == sub
+        let sub_v = s.tensor_sub(a, b).unwrap();
+        let subtract_v = s.tensor_subtract(a, b).unwrap();
+        assert_eq!(s.tensor_values(sub_v).unwrap(), s.tensor_values(subtract_v).unwrap());
+
+        // multiply == mul
+        let mul_v = s.tensor_mul(a, b).unwrap();
+        let multiply_v = s.tensor_multiply(a, b).unwrap();
+        assert_eq!(s.tensor_values(mul_v).unwrap(), s.tensor_values(multiply_v).unwrap());
+
+        // divide == div
+        let div_v = s.tensor_div(a, b).unwrap();
+        let divide_v = s.tensor_divide(a, b).unwrap();
+        assert_eq!(s.tensor_values(div_v).unwrap(), s.tensor_values(divide_v).unwrap());
+    }
+
+    #[test]
+    fn inverse_matches_linalg_inv() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 5.0], vec![2, 2], false)
+            .unwrap();
+        let inv1 = s.tensor_linalg_inv(m).unwrap();
+        let inv2 = s.tensor_inverse(m).unwrap();
+        let v1 = s.tensor_values(inv1).unwrap();
+        let v2 = s.tensor_values(inv2).unwrap();
+        for (a, b) in v1.iter().zip(v2.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
     }
 
     // ── tensor_view_as tests (frankentorch-0uc1) ──────────────────────
