@@ -4843,6 +4843,34 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Convert from degrees to radians.
+    ///
+    /// Equivalent to `torch.deg2rad(input)`. Element-wise multiply by
+    /// pi / 180. Composes through autograd-aware tensor_mul.
+    /// Tracked under frankentorch-obts.
+    pub fn tensor_deg2rad(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let factor = self.full(shape, std::f64::consts::PI / 180.0, false)?;
+        self.tensor_mul(input, factor)
+    }
+
+    /// Convert from radians to degrees.
+    ///
+    /// Equivalent to `torch.rad2deg(input)`. Element-wise multiply by
+    /// 180 / pi. Composes through autograd-aware tensor_mul.
+    /// Tracked under frankentorch-obts.
+    pub fn tensor_rad2deg(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let factor = self.full(shape, 180.0 / std::f64::consts::PI, false)?;
+        self.tensor_mul(input, factor)
+    }
+
     /// Inverse hyperbolic sine.
     ///
     /// Equivalent to `torch.asinh(input)`. Composes via the closed
@@ -27786,6 +27814,75 @@ mod tests {
         let (sign_id, _logabsdet_id) = s.tensor_linalg_slogdet(a).unwrap();
         assert!(!s.tensor_requires_grad(sign_id).unwrap(),
             "slogdet sign must be non-grad");
+    }
+
+    // ── tensor_deg2rad / rad2deg tests (frankentorch-obts) ────────────
+
+    #[test]
+    fn deg2rad_known_values() {
+        // 0° = 0 rad; 90° = π/2; 180° = π; 360° = 2π.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 90.0, 180.0, 360.0], vec![4], false)
+            .unwrap();
+        let out = s.tensor_deg2rad(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].abs() < 1e-12);
+        assert!((v[1] - std::f64::consts::FRAC_PI_2).abs() < 1e-12);
+        assert!((v[2] - std::f64::consts::PI).abs() < 1e-12);
+        assert!((v[3] - 2.0 * std::f64::consts::PI).abs() < 1e-12);
+    }
+
+    #[test]
+    fn rad2deg_known_values() {
+        // π = 180°; 2π = 360°.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![
+                    0.0,
+                    std::f64::consts::FRAC_PI_2,
+                    std::f64::consts::PI,
+                    2.0 * std::f64::consts::PI,
+                ],
+                vec![4],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_rad2deg(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].abs() < 1e-12);
+        assert!((v[1] - 90.0).abs() < 1e-12);
+        assert!((v[2] - 180.0).abs() < 1e-12);
+        assert!((v[3] - 360.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn deg2rad_rad2deg_round_trip_is_identity() {
+        // rad2deg(deg2rad(x)) should equal x to high precision.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![45.0, 123.456, -10.0], vec![3], false)
+            .unwrap();
+        let intermediate = s.tensor_deg2rad(x).unwrap();
+        let recovered = s.tensor_rad2deg(intermediate).unwrap();
+        let original = s.tensor_values(x).unwrap();
+        let v = s.tensor_values(recovered).unwrap();
+        for (a, b) in v.iter().zip(original.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn deg2rad_propagates_gradient_pi_over_180() {
+        // d/dx deg2rad(x) = π/180.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![45.0], vec![1], true).unwrap();
+        let out = s.tensor_deg2rad(x).unwrap();
+        let scalar = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert!((g[0] - std::f64::consts::PI / 180.0).abs() < 1e-12);
     }
 
     // ── tensor_asinh / acosh / atanh tests (frankentorch-2vc0) ────────
