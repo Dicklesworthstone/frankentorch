@@ -5884,6 +5884,20 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Compute the softmin along a dimension: `softmax(-input, dim)`.
+    ///
+    /// Equivalent to `torch.nn.functional.softmin(input, dim)`. Just a
+    /// one-line composition through autograd-aware tensor_neg +
+    /// tensor_softmax. Tracked under frankentorch-n947.
+    pub fn tensor_softmin(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let neg = self.tensor_neg(input)?;
+        self.tensor_softmax(neg, dim)
+    }
+
     pub fn tensor_log_softmax(
         &mut self,
         input: TensorNodeId,
@@ -28224,6 +28238,60 @@ mod tests {
         assert!((v[6] - third).abs() < 1e-12);
         assert!((v[7] - third).abs() < 1e-12);
         assert!((v[8] - third).abs() < 1e-12);
+    }
+
+    // ── tensor_softmin tests (frankentorch-n947) ──────────────────────
+
+    #[test]
+    fn softmin_equals_softmax_of_negation() {
+        // softmin(x) == softmax(-x). Verify on a simple input.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let smin = s.tensor_softmin(x, 0).unwrap();
+        let neg_x = s.tensor_neg(x).unwrap();
+        let smax_neg = s.tensor_softmax(neg_x, 0).unwrap();
+        let v_min = s.tensor_values(smin).unwrap();
+        let v_smax = s.tensor_values(smax_neg).unwrap();
+        for (a, b) in v_min.iter().zip(v_smax.iter()) {
+            assert!((a - b).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn softmin_sums_to_one_smaller_input_gets_higher_weight() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let smin = s.tensor_softmin(x, 0).unwrap();
+        let v = s.tensor_values(smin).unwrap();
+        // Sums to 1.
+        let sum: f64 = v.iter().sum();
+        assert!((sum - 1.0).abs() < 1e-12);
+        // Smaller input → larger probability.
+        assert!(v[0] > v[1] && v[1] > v[2]);
+    }
+
+    #[test]
+    fn softmin_propagates_gradient() {
+        // Just verify backward succeeds and gradient sums to 0
+        // (softmax-family invariant — perturbing all input by same
+        // amount shifts no probability mass).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], true)
+            .unwrap();
+        let smin = s.tensor_softmin(x, 0).unwrap();
+        let scalar = s.tensor_sum(smin).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        // d/dx of sum(softmax(-x)) = sum of jacobian rows. Each row of
+        // jacobian sums to 0 (softmax-Jacobian property), so total
+        // grad should be 0 for sum-of-softmin.
+        let grad_sum: f64 = g.iter().sum();
+        assert!(grad_sum.abs() < 1e-12, "grad sum should be 0, got {grad_sum}");
     }
 
     // ── tensor_logical_not + copysign tests (frankentorch-nezf) ───────
