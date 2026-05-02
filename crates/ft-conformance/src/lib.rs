@@ -11789,6 +11789,54 @@ mod tests {
                 );
             }
         }
+
+        // det(A @ B) = det(A) * det(B): the determinant is a multiplicative
+        // homomorphism. Exercises the autograd-aware tensor_linalg_det
+        // (frankentorch-pvfk) through composition with matmul + mul.
+        // Frankentorch-1kfd.
+        #[test]
+        fn fuzz_metamorphic_det_of_product_equals_product_of_dets(
+            (n, a_raw, b_raw) in (2usize..=3).prop_flat_map(|n| (
+                Just(n),
+                prop::collection::vec(-128i16..128i16, n * n),
+                prop::collection::vec(-128i16..128i16, n * n),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let b: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a_n = s.tensor_variable(a.clone(), vec![n, n], false).expect("a");
+            let b_n = s.tensor_variable(b.clone(), vec![n, n], false).expect("b");
+
+            // det(A @ B)
+            let ab = s.tensor_matmul(a_n, b_n).expect("a@b");
+            let det_ab_id = s.tensor_linalg_det(ab).expect("det(a@b)");
+            let det_ab = s.tensor_values(det_ab_id).expect("det_ab vals")[0];
+
+            // det(A) * det(B)
+            let det_a_id = s.tensor_linalg_det(a_n).expect("det(a)");
+            let det_b_id = s.tensor_linalg_det(b_n).expect("det(b)");
+            let det_a = s.tensor_values(det_a_id).expect("det_a vals")[0];
+            let det_b = s.tensor_values(det_b_id).expect("det_b vals")[0];
+            let det_a_times_det_b = det_a * det_b;
+
+            // Numerical stability: det grows like (n * |entry|max)^n; product
+            // of two dets compounds the rounding from each LU factorization
+            // independently. Use a bound proportional to |det| times a
+            // generous factor of n^2 * EPSILON.
+            let abs_a_max: f64 = a.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let abs_b_max: f64 = b.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let scale = ((n as f64) * abs_a_max).powi(n as i32)
+                * ((n as f64) * abs_b_max).powi(n as i32);
+            let bound = scale * (n as f64).powi(2) * f64::EPSILON * 64.0 + 1e-12;
+            let diff = (det_ab - det_a_times_det_b).abs();
+            prop_assert!(
+                diff <= bound,
+                "det(AB) = {det_ab} but det(A)*det(B) = {det_a_times_det_b}; diff = {diff:e}, bound = {bound:e}"
+            );
+        }
     }
 
     #[cfg(feature = "fuzz")]
