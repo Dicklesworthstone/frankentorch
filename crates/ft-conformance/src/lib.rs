@@ -23424,6 +23424,79 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn triplet_margin_metric_learning_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-wn4t. Tiny metric-learning
+        // setup: a shared Linear embedding net maps three fixed
+        // 4-dim inputs (anchor, positive, negative) into a 4-dim
+        // embedding space. TripletMarginLoss = relu(d(a,p) - d(a,n) + margin).
+        // After training, the loss should approach zero: the network
+        // learns to keep positive close to anchor while pushing the
+        // negative beyond `margin`. Locks the autograd chain
+        // sub → mul → sum → sqrt → relu used inside TripletMarginLoss.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{Linear, Module, TripletMarginLoss};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let embed = Linear::new(&mut session, 4, 4, true).expect("linear");
+        let triplet = TripletMarginLoss::new(1.0, 2.0);
+
+        // Anchor and positive are similar inputs; negative is opposite.
+        let x_anchor = session
+            .tensor_variable(vec![1.0, 0.5, -0.3, 0.2], vec![1, 4], false)
+            .expect("anchor input");
+        let x_positive = session
+            .tensor_variable(vec![0.9, 0.6, -0.2, 0.3], vec![1, 4], false)
+            .expect("positive input");
+        let x_negative = session
+            .tensor_variable(vec![-1.0, -0.5, 0.3, -0.2], vec![1, 4], false)
+            .expect("negative input");
+
+        let mut optimizer = Adam::new(embed.parameters(), 0.05);
+
+        let initial_a = embed.forward(&mut session, x_anchor).expect("init a");
+        let initial_p = embed.forward(&mut session, x_positive).expect("init p");
+        let initial_n = embed.forward(&mut session, x_negative).expect("init n");
+        let initial_loss = triplet
+            .forward_triplet(&mut session, initial_a, initial_p, initial_n)
+            .expect("init loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("init val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let a = embed.forward(&mut session, x_anchor).expect("a");
+            let p = embed.forward(&mut session, x_positive).expect("p");
+            let n = embed.forward(&mut session, x_negative).expect("n");
+            let loss = triplet
+                .forward_triplet(&mut session, a, p, n)
+                .expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "TripletMarginLoss never improved the loss"
+        );
+        // The relu floor at zero means a successful triplet-margin
+        // separation drives loss to exactly 0.0 (margin satisfied).
+        // We allow a small slack in case the optimizer hovers just
+        // above the boundary.
+        assert!(
+            best_loss <= initial_loss_val * 0.1,
+            "TripletMarginLoss should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
