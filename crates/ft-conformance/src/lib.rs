@@ -23878,6 +23878,85 @@ print(json.dumps({"softplus": sp_out}))
     }
 
     #[test]
+    fn conv2d_global_avg_pool_classifier_trains_end_to_end_with_adam() {
+        // E2E regression for frankentorch-oviu. Canonical CNN
+        // classification head: Conv2d → AdaptiveAvgPool2d((1,1))
+        // (global avg pool) → Flatten → Linear → cross_entropy.
+        // This is the standard ResNet / EfficientNet pattern;
+        // AdaptiveAvgPool2d gradient flow is otherwise untested
+        // in the perfect-e2e battery.
+        use ft_api::FrankenTorchSession;
+        use ft_nn::{AdaptiveAvgPool2d, Conv2d, Flatten, Linear, Module};
+        use ft_optim::{Adam, Optimizer};
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv2d::new(&mut session, 3, 4, (3, 3), (1, 1), (1, 1), true)
+            .expect("conv2d");
+        let pool = AdaptiveAvgPool2d::new((1, 1));
+        let flatten = Flatten::new(1, 3);
+        let head = Linear::new(&mut session, 4, 2, true).expect("linear");
+
+        // 2 samples, 3 channels, 4x4 spatial. Distinct constant-pattern
+        // inputs to make the classification trivial.
+        let mut input_vals = vec![0.0_f64; 2 * 3 * 4 * 4];
+        // Sample 0: all 1.0
+        for v in &mut input_vals[0..3 * 4 * 4] {
+            *v = 1.0;
+        }
+        // Sample 1: all -1.0
+        for v in &mut input_vals[3 * 4 * 4..] {
+            *v = -1.0;
+        }
+        let input = session
+            .tensor_variable(input_vals, vec![2, 3, 4, 4], false)
+            .expect("input");
+        let labels = session
+            .tensor_variable(vec![0.0, 1.0], vec![2], false)
+            .expect("labels");
+
+        let mut params = conv.parameters();
+        params.extend(head.parameters());
+        let mut optimizer = Adam::new(params, 0.05);
+
+        let initial_c = conv.forward(&mut session, input).expect("init conv");
+        let initial_p = pool.forward(&mut session, initial_c).expect("init pool");
+        let initial_f = flatten.forward(&mut session, initial_p).expect("init flat");
+        let initial_l = head.forward(&mut session, initial_f).expect("init head");
+        let initial_loss = session
+            .cross_entropy_loss(initial_l, labels)
+            .expect("init loss");
+        let initial_loss_val =
+            session.tensor_values(initial_loss).expect("init val")[0];
+        let mut best_loss = initial_loss_val;
+        let mut saw_loss_improvement = false;
+
+        for _ in 0..200 {
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+            let c = conv.forward(&mut session, input).expect("conv");
+            let p = pool.forward(&mut session, c).expect("pool");
+            let f = flatten.forward(&mut session, p).expect("flatten");
+            let logits = head.forward(&mut session, f).expect("head");
+            let loss = session.cross_entropy_loss(logits, labels).expect("loss");
+            let loss_val = session.tensor_values(loss).expect("loss val")[0];
+            if loss_val < best_loss {
+                best_loss = loss_val;
+                saw_loss_improvement = true;
+            }
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("optim step");
+        }
+
+        assert!(
+            saw_loss_improvement,
+            "Conv2d + AdaptiveAvgPool2d + Linear never improved the loss"
+        );
+        assert!(
+            best_loss < initial_loss_val * 0.1,
+            "Conv2d + GAP + Linear should drop loss by 10x: initial={initial_loss_val}, best={best_loss}"
+        );
+    }
+
+    #[test]
     fn terminate_and_reap_child_reaps_running_process() {
         let mut child = Command::new("sh")
             .arg("-c")
