@@ -4867,6 +4867,64 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Element-wise logical NOT: `1 if x == 0 else 0`.
+    ///
+    /// Equivalent to `torch.logical_not(input)`. Composes through
+    /// tensor_eq against a zeros constant. Returns 0/1 floats
+    /// (matches the convention for tensor_eq, tensor_lt, etc.).
+    /// Non-differentiable: fail-loud on requires_grad.
+    /// Tracked under frankentorch-nezf.
+    pub fn tensor_logical_not(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "logical_not: autograd not supported (boolean negation is non-differentiable). Tracked under frankentorch-nezf.",
+                },
+            )));
+        }
+        let shape = self.tensor_shape(input)?;
+        let zeros = self.full(shape, 0.0, false)?;
+        self.tensor_eq(input, zeros)
+    }
+
+    /// Element-wise copysign: `|magnitude| * sign(sign_tensor)`.
+    ///
+    /// Equivalent to `torch.copysign(magnitude, sign)`. Both inputs
+    /// must have the same shape. Composes through tensor_abs +
+    /// tensor_sign + tensor_mul. Non-differentiable through the sign
+    /// branch (Dirac at 0); fail-loud on requires_grad on either input
+    /// to avoid silently severing the autograd tape.
+    /// Tracked under frankentorch-nezf.
+    pub fn tensor_copysign(
+        &mut self,
+        magnitude: TensorNodeId,
+        sign: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(magnitude)? || self.tensor_requires_grad(sign)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "copysign: autograd not supported (sign is non-differentiable at 0). Tracked under frankentorch-nezf.",
+                },
+            )));
+        }
+        let m_shape = self.tensor_shape(magnitude)?;
+        let s_shape = self.tensor_shape(sign)?;
+        if m_shape != s_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: m_shape,
+                    rhs: s_shape,
+                },
+            )));
+        }
+        let abs_m = self.tensor_abs(magnitude)?;
+        let sign_s = self.tensor_sign(sign)?;
+        self.tensor_mul(abs_m, sign_s)
+    }
+
     /// Heaviside step function: `0 if x<0, 1 if x>0, values[i] if x==0`.
     ///
     /// Equivalent to `torch.heaviside(input, values)`. `values` must
@@ -28166,6 +28224,57 @@ mod tests {
         assert!((v[6] - third).abs() < 1e-12);
         assert!((v[7] - third).abs() < 1e-12);
         assert!((v[8] - third).abs() < 1e-12);
+    }
+
+    // ── tensor_logical_not + copysign tests (frankentorch-nezf) ───────
+
+    #[test]
+    fn logical_not_zero_becomes_one_nonzero_becomes_zero() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, 1.0, -2.0, 0.0, 5.5], vec![5], false)
+            .unwrap();
+        let out = s.tensor_logical_not(x).unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), vec![1.0, 0.0, 0.0, 1.0, 0.0]);
+    }
+
+    #[test]
+    fn logical_not_fails_loud_on_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.0, 1.0], vec![2], true).unwrap();
+        assert!(s.tensor_logical_not(x).is_err());
+    }
+
+    #[test]
+    fn copysign_known_values() {
+        // |magnitude| with sign of sign_tensor.
+        // mag = [-3, 4, -5, 6], sign = [1, -1, 0, -2]
+        // → [3, -4, 0, -6]   (sign(0) = 0 in our tensor_sign convention)
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mag = s
+            .tensor_variable(vec![-3.0, 4.0, -5.0, 6.0], vec![4], false)
+            .unwrap();
+        let sign = s
+            .tensor_variable(vec![1.0, -1.0, 0.0, -2.0], vec![4], false)
+            .unwrap();
+        let out = s.tensor_copysign(mag, sign).unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), vec![3.0, -4.0, 0.0, -6.0]);
+    }
+
+    #[test]
+    fn copysign_fails_loud_on_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let g = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        assert!(s.tensor_copysign(m, g).is_err());
+    }
+
+    #[test]
+    fn copysign_rejects_shape_mismatch() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let g = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        assert!(s.tensor_copysign(m, g).is_err());
     }
 
     // ── tensor_heaviside tests (frankentorch-b4m6) ────────────────────
