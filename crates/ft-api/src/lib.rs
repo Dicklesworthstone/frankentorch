@@ -6053,7 +6053,10 @@ impl FrankenTorchSession {
         // scales by 1 / count which is what nanmean's backward
         // needs.
         let nan_count_t = self.tensor_sum(mask)?;
-        let nan_count = self.tensor_values(nan_count_t)?[0];
+        let nan_count = self
+            .tensor_tape
+            .tensor(nan_count_t)?
+            .contiguous_values_as_f64()?[0];
         let count_non_nan = numel as f64 - nan_count;
         let divisor = self.full_like(summed, count_non_nan, false)?;
         self.tensor_div(summed, divisor)
@@ -6088,7 +6091,10 @@ impl FrankenTorchSession {
         let cleaned = self.tensor_where(mask, zeros, input)?;
         let summed = self.tensor_sum(cleaned)?;
         let mask_sum = self.tensor_sum(mask)?;
-        let nan_count = self.tensor_values(mask_sum)?[0];
+        let nan_count = self
+            .tensor_tape
+            .tensor(mask_sum)?
+            .contiguous_values_as_f64()?[0];
         let count_non_nan = numel as f64 - nan_count;
 
         let mean_divisor = self.full_like(summed, count_non_nan, false)?;

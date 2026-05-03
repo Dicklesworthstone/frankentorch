@@ -7938,7 +7938,7 @@ impl TensorTape {
         x: TensorNodeId,
         y: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (values, output_shape, output_dtype, output_device, requires_grad) = {
+        let (storage, output_shape, output_dtype, output_device, requires_grad) = {
             let cond_node = self.node(condition)?;
             let x_node = self.node(x)?;
             let y_node = self.node(y)?;
@@ -7973,28 +7973,38 @@ impl TensorTape {
             let cond_values = cond_node.tensor.contiguous_values_as_f64()?;
             let x_values = x_node.tensor.contiguous_values_as_f64()?;
             let y_values = y_node.tensor.contiguous_values_as_f64()?;
+            let output_shape = x_meta.shape().to_vec();
+            let output_dtype = x_meta.dtype();
+            let output_device = x_meta.device();
             let meta = ft_core::TensorMeta::from_shape(
-                x_meta.shape().to_vec(),
-                DType::F64,
-                x_meta.device(),
+                output_shape.clone(),
+                output_dtype,
+                output_device,
             );
             let values = where_tensor_contiguous_f64(&cond_values, &x_values, &y_values, &meta)
                 .map_err(|e| AutogradError::Dispatch(e.into()))?;
-            let output_shape = meta.shape().to_vec();
+            let storage = match output_dtype {
+                DType::F32 => {
+                    TensorStorage::F32(Arc::new(values.into_iter().map(|v| v as f32).collect()))
+                }
+                DType::F64 => TensorStorage::F64(Arc::new(values)),
+                _ => TensorStorage::F64(Arc::new(values)),
+            };
+            let output_dtype = storage.dtype();
             (
-                values,
+                storage,
                 output_shape,
-                DType::F64,
-                meta.device(),
+                output_dtype,
+                output_device,
                 requires_grad,
             )
         };
 
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
+            tensor: DenseTensor::from_typed_storage(
                 ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
-                values,
+                storage,
             )?,
             requires_grad,
             op: TensorNodeOp::Where { condition, x, y },
@@ -8639,21 +8649,30 @@ impl TensorTape {
         input: TensorNodeId,
         target_shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result_data, original_shape, dtype, device) = {
+        let (requires_grad, storage, original_shape, dtype, device) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let original_shape = meta.shape().to_vec();
-            let storage = input_node.tensor.contiguous_values_as_f64()?;
+            let input_dtype = meta.dtype();
+            let values = input_node.tensor.contiguous_values_as_f64()?;
 
             let result_data =
-                ft_kernel_cpu::expand_tensor_contiguous_f64(&storage, meta, &target_shape)
+                ft_kernel_cpu::expand_tensor_contiguous_f64(&values, meta, &target_shape)
                     .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+            let storage = match input_dtype {
+                DType::F32 => TensorStorage::F32(Arc::new(
+                    result_data.into_iter().map(|value| value as f32).collect(),
+                )),
+                DType::F64 => TensorStorage::F64(Arc::new(result_data)),
+                _ => TensorStorage::F64(Arc::new(result_data)),
+            };
+            let dtype = storage.dtype();
 
             (
                 input_node.requires_grad,
-                result_data,
+                storage,
                 original_shape,
-                DType::F64,
+                dtype,
                 meta.device(),
             )
         };
@@ -8661,7 +8680,7 @@ impl TensorTape {
         let new_meta = ft_core::TensorMeta::from_shape(target_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(new_meta, result_data)?,
+            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
             requires_grad,
             op: TensorNodeOp::Expand {
                 input,
@@ -12011,8 +12030,7 @@ impl TensorTape {
                     Self::ensure_tensor_len(node_id, index_numel, index.len())?;
 
                     let mut active_src_slots = vec![true; index_numel];
-                    let mut last_writer_for_output: Vec<Option<usize>> =
-                        vec![None; input_numel];
+                    let mut last_writer_for_output: Vec<Option<usize>> = vec![None; input_numel];
 
                     for outer in 0..outer_size {
                         for r in 0..idx_dim_size {
@@ -14999,6 +15017,29 @@ mod tests {
         assert_eq!(
             out.dispatch_values().expect("where output values"),
             &[10.0, -2.0, 30.0]
+        );
+    }
+
+    #[test]
+    fn tensor_where_preserves_f32_dtype() {
+        let mut tape = TensorTape::new();
+        let cond = tape
+            .leaf_f32(vec![1.0, 0.0, 1.0], vec![3], false)
+            .expect("cond should build");
+        let x = tape
+            .leaf_f32(vec![10.0, 20.0, 30.0], vec![3], false)
+            .expect("x should build");
+        let y = tape
+            .leaf_f32(vec![-1.0, -2.0, -3.0], vec![3], false)
+            .expect("y should build");
+
+        let out = tape
+            .tensor_where(cond, x, y)
+            .expect("where should accept matching f32 tensors");
+        assert_eq!(tape.dtype(out).expect("dtype should resolve"), DType::F32);
+        assert_eq!(
+            tape.values_f32(out).expect("values should resolve"),
+            vec![10.0, -2.0, 30.0]
         );
     }
 
@@ -19225,6 +19266,15 @@ mod tests {
         assert_eq!(tape.dtype(c).unwrap(), DType::F32);
         let vals = tape.values_f32(c).unwrap();
         assert_eq!(vals, vec![1.0f32, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn f32_expand_preserves_dtype() {
+        let mut tape = TensorTape::new();
+        let a = tape.leaf_f32(vec![2.0f32], vec![1], false).unwrap();
+        let out = tape.expand(a, vec![3]).unwrap();
+        assert_eq!(tape.dtype(out).unwrap(), DType::F32);
+        assert_eq!(tape.values_f32(out).unwrap(), vec![2.0f32, 2.0, 2.0]);
     }
 
     // ── F32 autograd: forward f32 → backward gradients correct ────────
