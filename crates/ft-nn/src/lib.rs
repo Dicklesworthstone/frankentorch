@@ -25,6 +25,35 @@ fn checked_add(a: usize, b: usize, reason: &'static str) -> Result<usize, Autogr
     a.checked_add(b).ok_or(overflow_error(reason))
 }
 
+#[derive(Clone, Copy)]
+struct ConvTransposeOutputDimReasons {
+    overflow_reason: &'static str,
+    padding_overflow_reason: &'static str,
+    underflow_reason: &'static str,
+    empty_reason: &'static str,
+}
+
+fn checked_conv_transpose_output_dim(
+    input: usize,
+    stride: usize,
+    kernel: usize,
+    padding: usize,
+    output_padding: usize,
+    reasons: ConvTransposeOutputDimReasons,
+) -> Result<usize, AutogradError> {
+    if input == 0 {
+        return Err(incompatible_error(reasons.empty_reason));
+    }
+    let span = checked_mul(input - 1, stride, reasons.overflow_reason)?;
+    let base = checked_add(span, kernel, reasons.overflow_reason)?;
+    let base = checked_add(base, output_padding, reasons.overflow_reason)?;
+    let padding = checked_mul(padding, 2, reasons.padding_overflow_reason)?;
+    if base <= padding {
+        return Err(incompatible_error(reasons.underflow_reason));
+    }
+    Ok(base - padding)
+}
+
 fn checked_shape_numel(shape: &[usize], reason: &'static str) -> Result<usize, AutogradError> {
     if shape.is_empty() {
         return Ok(1);
@@ -7953,46 +7982,31 @@ impl Module for ConvTranspose2d {
             )));
         }
 
-        let h_span = checked_mul(
-            h_in - 1,
+        let h_out = checked_conv_transpose_output_dim(
+            h_in,
             self.stride_h,
-            "ConvTranspose2d output height overflow",
-        )?;
-        let w_span = checked_mul(
-            w_in - 1,
-            self.stride_w,
-            "ConvTranspose2d output width overflow",
-        )?;
-        let pad_h = checked_mul(self.padding_h, 2, "ConvTranspose2d padding overflow")?;
-        let pad_w = checked_mul(self.padding_w, 2, "ConvTranspose2d padding overflow")?;
-        if h_span < pad_h || w_span < pad_w {
-            return Err(AutogradError::Dispatch(DispatchError::Key(
-                DispatchKeyError::IncompatibleSet {
-                    reason: "ConvTranspose2d output size underflow from padding",
-                },
-            )));
-        }
-        let h_base = h_span - pad_h;
-        let w_base = w_span - pad_w;
-        let h_out = checked_add(
-            h_base,
             self.kernel_h,
-            "ConvTranspose2d output height overflow",
-        )?;
-        let h_out = checked_add(
-            h_out,
+            self.padding_h,
             self.output_padding_h,
-            "ConvTranspose2d output height overflow",
+            ConvTransposeOutputDimReasons {
+                overflow_reason: "ConvTranspose2d output height overflow",
+                padding_overflow_reason: "ConvTranspose2d padding overflow",
+                underflow_reason: "ConvTranspose2d output size underflow from padding",
+                empty_reason: "ConvTranspose2d requires non-empty spatial dimensions",
+            },
         )?;
-        let w_out = checked_add(
-            w_base,
+        let w_out = checked_conv_transpose_output_dim(
+            w_in,
+            self.stride_w,
             self.kernel_w,
-            "ConvTranspose2d output width overflow",
-        )?;
-        let w_out = checked_add(
-            w_out,
+            self.padding_w,
             self.output_padding_w,
-            "ConvTranspose2d output width overflow",
+            ConvTransposeOutputDimReasons {
+                overflow_reason: "ConvTranspose2d output width overflow",
+                padding_overflow_reason: "ConvTranspose2d padding overflow",
+                underflow_reason: "ConvTranspose2d output size underflow from padding",
+                empty_reason: "ConvTranspose2d requires non-empty spatial dimensions",
+            },
         )?;
 
         // Transposed convolution via col2im approach (autograd-friendly).
@@ -8438,12 +8452,45 @@ impl Module for ConvTranspose3d {
         let h_in = input_shape[3];
         let w_in = input_shape[4];
 
-        let d_out =
-            (d_in - 1) * self.stride_d - 2 * self.padding_d + self.kernel_d + self.output_padding_d;
-        let h_out =
-            (h_in - 1) * self.stride_h - 2 * self.padding_h + self.kernel_h + self.output_padding_h;
-        let w_out =
-            (w_in - 1) * self.stride_w - 2 * self.padding_w + self.kernel_w + self.output_padding_w;
+        let d_out = checked_conv_transpose_output_dim(
+            d_in,
+            self.stride_d,
+            self.kernel_d,
+            self.padding_d,
+            self.output_padding_d,
+            ConvTransposeOutputDimReasons {
+                overflow_reason: "ConvTranspose3d output depth overflow",
+                padding_overflow_reason: "ConvTranspose3d padding overflow",
+                underflow_reason: "ConvTranspose3d output size underflow from padding",
+                empty_reason: "ConvTranspose3d requires non-empty spatial dimensions",
+            },
+        )?;
+        let h_out = checked_conv_transpose_output_dim(
+            h_in,
+            self.stride_h,
+            self.kernel_h,
+            self.padding_h,
+            self.output_padding_h,
+            ConvTransposeOutputDimReasons {
+                overflow_reason: "ConvTranspose3d output height overflow",
+                padding_overflow_reason: "ConvTranspose3d padding overflow",
+                underflow_reason: "ConvTranspose3d output size underflow from padding",
+                empty_reason: "ConvTranspose3d requires non-empty spatial dimensions",
+            },
+        )?;
+        let w_out = checked_conv_transpose_output_dim(
+            w_in,
+            self.stride_w,
+            self.kernel_w,
+            self.padding_w,
+            self.output_padding_w,
+            ConvTransposeOutputDimReasons {
+                overflow_reason: "ConvTranspose3d output width overflow",
+                padding_overflow_reason: "ConvTranspose3d padding overflow",
+                underflow_reason: "ConvTranspose3d output size underflow from padding",
+                empty_reason: "ConvTranspose3d requires non-empty spatial dimensions",
+            },
+        )?;
 
         let mut result = session.zeros(
             vec![batch_size, self.out_channels, d_out, h_out, w_out],
@@ -18663,6 +18710,34 @@ mod tests {
     }
 
     #[test]
+    fn conv_transpose2d_allows_padding_preserved_singleton_spatial() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv =
+            ConvTranspose2d::new(&mut session, 1, 1, (3, 3), (1, 1), (1, 1), (0, 0), false)
+                .expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0], vec![1, 1, 1, 1], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn conv_transpose2d_rejects_padding_erased_output() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv =
+            ConvTranspose2d::new(&mut session, 1, 1, (1, 1), (1, 1), (1, 1), (0, 0), false)
+                .expect("new");
+        let x = session
+            .tensor_variable(vec![1.0], vec![1, 1, 1, 1], false)
+            .expect("variable");
+
+        assert!(deconv.forward(&mut session, x).is_err());
+    }
+
+    #[test]
     fn conv_transpose2d_with_output_padding() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         // stride=2, output_padding=1: H_out = (2-1)*2 - 0 + 3 + 1 = 6
@@ -18788,6 +18863,50 @@ mod tests {
         let out = deconv.forward(&mut session, x).expect("forward");
         let (_, meta) = session.tensor_values_meta(out).expect("vals");
         assert_eq!(meta.shape(), &[1, 1, 4, 4, 4]);
+    }
+
+    #[test]
+    fn conv_transpose3d_allows_padding_preserved_singleton_spatial() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose3d::new(
+            &mut session,
+            1,
+            1,
+            (3, 3, 3),
+            (1, 1, 1),
+            (1, 1, 1),
+            (0, 0, 0),
+            false,
+        )
+        .expect("new");
+
+        let x = session
+            .tensor_variable(vec![1.0], vec![1, 1, 1, 1, 1], false)
+            .expect("variable");
+        let out = deconv.forward(&mut session, x).expect("forward");
+        let (_, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 1, 1, 1]);
+    }
+
+    #[test]
+    fn conv_transpose3d_rejects_padding_erased_output() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let deconv = ConvTranspose3d::new(
+            &mut session,
+            1,
+            1,
+            (1, 1, 1),
+            (1, 1, 1),
+            (1, 1, 1),
+            (0, 0, 0),
+            false,
+        )
+        .expect("new");
+        let x = session
+            .tensor_variable(vec![1.0], vec![1, 1, 1, 1, 1], false)
+            .expect("variable");
+
+        assert!(deconv.forward(&mut session, x).is_err());
     }
 
     #[test]
