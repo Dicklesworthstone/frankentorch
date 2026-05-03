@@ -212,3 +212,52 @@ residual failure to current-JSONL import behavior. Remaining follow-up should tr
   free-space corruption while the archived xsp JSONL passes
 - removing the temporary `--no-auto-import` recovery restriction only after both archived and
   current-JSONL recovery imports preserve orthogonal `PRAGMA integrity_check = ok`
+
+## 2026-05-03 dbp revalidation
+
+`frankentorch-dbp` repeated the minimal reproducer against `br 0.1.38` (same release as the
+2026-04-27 z2w probe) and the current `.beads/issues.jsonl` (now 329 lines / ~370 KB; previously
+smaller during the z2w run). Probe artifacts:
+
+- `artifacts/beads_recovery/dbp_revalidation_20260503T014034Z/results.json`
+- `artifacts/beads_recovery/dbp_revalidation_20260503T014034Z/issues.jsonl`
+- `artifacts/beads_recovery/dbp_revalidation_20260503T014034Z/baseline_fresh.db`
+  (post-import, corrupted — preserved for future inspection)
+
+### Confirmed: corruption persists in `tree 12` (the metadata table)
+
+Pre-import baseline (`.beads/beads.db.vacuum_c84_20260407T013244Z`):
+
+- `integrity_check`: `ok`
+- `page_count`: `89`
+- `freelist_count`: `0`
+- `metadata` table rootpage: `12` ← matches the corruption tree
+- `idx_metadata_key` rootpage: `52`
+- `blocked_issues_cache` rootpage: `19`, autoindex `20`, `idx_blocked_cache_blocked_at` `56`
+
+After `br --db baseline_fresh.db sync --import-only --json --allow-external-jsonl`:
+
+- `integrity_check`:
+  - `*** in database main *** Tree 12 page 12: free space corruption`
+  - **NEW (not in z2w report):** `wrong # of entries in index idx_metadata_key`
+- `page_count`: `89 → 260` (vs. `89 → 109` at z2w time — corruption signature is now larger)
+- `freelist_count`: `0 → 4` (unchanged from z2w)
+- `blocked_issues_cache` rootpages all unchanged at `19/20/56` — confirms the original #224 fix
+  for blocked_issues_cache rootpage churn is still holding.
+
+### Interpretation
+
+The corruption tree number (`12`) matches the `metadata` table's rootpage exactly. The new
+`wrong # of entries in index idx_metadata_key` symptom strongly suggests the import path is
+mutating `metadata` rows in a way that desynchronizes `idx_metadata_key` from the table. That
+desynchronization is upstream of the visible free-space corruption — `metadata` is one of the
+tables `br` writes during every import (last_import_time, jsonl_hash, etc.).
+
+### Status
+
+- The `--no-auto-import` recovery rule remains necessary on freshly vacuumed recovery DBs.
+- The `frankentorch-dbp` bead remains deferred (still upstream-blocked).
+- New evidence to escalate to `Dicklesworthstone/beads_rust` (#224 follow-up): the index-entry
+  desynchronization on `idx_metadata_key` is a sharper fingerprint than the page-leak symptom
+  alone — points the upstream investigation at the metadata write path rather than the
+  blocked_issues_cache rebuild path.
