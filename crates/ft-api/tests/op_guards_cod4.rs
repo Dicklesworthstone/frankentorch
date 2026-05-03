@@ -63,6 +63,32 @@ fn istft_requires_grad_input_fails_loud() {
 }
 
 #[test]
+fn stft_requires_grad_window_fails_loud() {
+    let mut session = strict_session();
+    let input = session
+        .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false)
+        .unwrap();
+    let window = session
+        .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![4], true)
+        .unwrap();
+
+    assert_fails_loud(
+        session.tensor_stft(
+            input,
+            4,
+            StftOptions {
+                hop_length: Some(4),
+                win_length: Some(4),
+                window: Some(window),
+                center: false,
+                ..StftOptions::default()
+            },
+        ),
+        "stft requires_grad window",
+    );
+}
+
+#[test]
 fn istft_requires_grad_window_fails_loud() {
     let mut session = strict_session();
     let input = session
