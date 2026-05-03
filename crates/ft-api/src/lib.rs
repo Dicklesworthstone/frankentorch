@@ -31812,6 +31812,92 @@ mod tests {
     }
 
     #[test]
+    fn stft_istft_complex_ops_fail_loud_on_requires_grad() {
+        // Lock the fail-loud autograd guards on the remaining
+        // 3v6e parking-lot ops: stft, istft, tensor_complex,
+        // view_as_real, view_as_complex. Companion to
+        // fft_ops_fail_loud_on_requires_grad and
+        // linalg_svd_class_ops_fail_loud_on_requires_grad.
+        // Tracked under frankentorch-m6s7.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // stft: 1-D real input with requires_grad must fail loud.
+        let real_grad = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![8], true)
+            .unwrap();
+        let stft_err = s
+            .tensor_stft(real_grad, 4, StftOptions::default())
+            .expect_err("stft must fail loud on requires_grad");
+        assert!(
+            format!("{stft_err:?}").contains("autograd is not supported"),
+            "got {stft_err:?}"
+        );
+
+        // istft: build a 2-D real spectrogram (matches istft's
+        // current "2-D real input" surface) with requires_grad.
+        let spec_grad = s
+            .tensor_variable(vec![1.0; 12], vec![3, 4], true)
+            .unwrap();
+        let istft_err = s
+            .tensor_istft(spec_grad, 4, IstftOptions::default())
+            .expect_err("istft must fail loud on requires_grad");
+        assert!(
+            format!("{istft_err:?}").contains("autograd is not supported"),
+            "got {istft_err:?}"
+        );
+
+        // tensor_complex: requires_grad on either real or imag part
+        // must fail loud (autograd of complex outputs is unsupported).
+        let real_no_grad = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let imag_no_grad = s
+            .tensor_variable(vec![3.0, 4.0], vec![2], false)
+            .unwrap();
+        let real_with_grad = s
+            .tensor_variable(vec![1.0, 2.0], vec![2], true)
+            .unwrap();
+        let imag_with_grad = s
+            .tensor_variable(vec![3.0, 4.0], vec![2], true)
+            .unwrap();
+        let complex_err_real = s
+            .tensor_complex(real_with_grad, imag_no_grad)
+            .expect_err("tensor_complex must fail loud on requires_grad real");
+        assert!(format!("{complex_err_real:?}").contains("autograd"));
+        let complex_err_imag = s
+            .tensor_complex(real_no_grad, imag_with_grad)
+            .expect_err("tensor_complex must fail loud on requires_grad imag");
+        assert!(format!("{complex_err_imag:?}").contains("autograd"));
+
+        // view_as_complex: real input with trailing dim 2 +
+        // requires_grad must fail loud (output is complex-valued).
+        let real_pair_grad = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let vac_err = s
+            .tensor_view_as_complex(real_pair_grad)
+            .expect_err("view_as_complex must fail loud on requires_grad");
+        assert!(format!("{vac_err:?}").contains("autograd"));
+
+        // view_as_real requires a complex input. Build one with
+        // requires_grad through tensor_variable_from_storage and
+        // verify the guard fires.
+        let cplx_storage = ft_core::DenseTensor::from_typed_storage(
+            ft_core::TensorMeta::from_shape(vec![2], DType::Complex128, Device::Cpu),
+            ft_core::TensorStorage::Complex128(std::sync::Arc::new(vec![
+                ft_core::Complex128::new(1.0, 0.5),
+                ft_core::Complex128::new(2.0, -1.5),
+            ])),
+        )
+        .unwrap();
+        let cplx_grad = s.tensor_variable_from_storage(cplx_storage, true);
+        let var_err = s
+            .tensor_view_as_real(cplx_grad)
+            .expect_err("view_as_real must fail loud on requires_grad complex");
+        assert!(format!("{var_err:?}").contains("autograd"));
+    }
+
+    #[test]
     fn linalg_svd_class_ops_fail_loud_on_requires_grad() {
         // Regression for frankentorch-rl4g: SVD-class linalg ops
         // (svd, svdvals, eigh, eigvalsh, qr, cholesky) used to
