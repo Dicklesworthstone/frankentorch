@@ -6008,6 +6008,83 @@ impl FrankenTorchSession {
         self.tensor_div(summed, divisor)
     }
 
+    /// NaN-aware variance: equivalent to `torch.nanvar(input, correction)`.
+    ///
+    /// `correction` selects the divisor:
+    ///   - 0 → biased variance (divide by count_non_nan)
+    ///   - 1 → Bessel-corrected (divide by count_non_nan - 1, default in torch)
+    ///
+    /// NaN positions contribute 0 to both the mean and the
+    /// sum-of-squared-deviations; they are excluded from the count.
+    /// All-NaN inputs return NaN (0/0 divisor); single-element non-NaN
+    /// inputs with `correction=1` also return NaN (0 divisor) — both
+    /// match torch's behavior.
+    ///
+    /// Composes through tensor_isnan + tensor_where + tensor_sub +
+    /// tensor_mul + tensor_sum + tensor_div, all autograd-aware.
+    /// Tracked under frankentorch-6awn.
+    pub fn tensor_nanvar(
+        &mut self,
+        input: TensorNodeId,
+        correction: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let numel: usize = shape.iter().product();
+
+        // Compute the NaN-masked mean (same pattern as nanmean).
+        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let mask = self.tensor_isnan(input)?;
+        let cleaned = self.tensor_where(mask, zeros, input)?;
+        let summed = self.tensor_sum(cleaned)?;
+        let mask_sum = self.tensor_sum(mask)?;
+        let nan_count = self.tensor_values(mask_sum)?[0];
+        let count_non_nan = numel as f64 - nan_count;
+
+        let summed_shape = self.tensor_shape(summed)?;
+        let mean_divisor = self.full(summed_shape.clone(), count_non_nan, false)?;
+        let mean_scalar = self.tensor_div(summed, mean_divisor)?;
+
+        // Broadcast the scalar mean back to the input shape so we can
+        // form (x - mean). tensor_broadcast_to lifts the [1] mean to
+        // the full input shape.
+        let mean_broadcast = self.tensor_broadcast_to(mean_scalar, shape.clone())?;
+        let raw_diff = self.tensor_sub(input, mean_broadcast)?;
+
+        // Re-mask: NaN positions in `input` produce NaN in raw_diff;
+        // we need them to be 0 so their squares don't pollute the
+        // sum. The mask was already computed; reuse via a fresh
+        // tensor_where (zeros same shape, autograd-aware).
+        let zeros_diff = self.full(shape, 0.0, false)?;
+        let mask2 = self.tensor_isnan(input)?;
+        let diff = self.tensor_where(mask2, zeros_diff, raw_diff)?;
+        let sq = self.tensor_mul(diff, diff)?;
+        let sq_sum = self.tensor_sum(sq)?;
+
+        let sq_sum_shape = self.tensor_shape(sq_sum)?;
+        let var_divisor_value = if correction <= count_non_nan as usize {
+            count_non_nan - correction as f64
+        } else {
+            // count_non_nan < correction → divisor would be ≤ 0; torch
+            // returns NaN here. Use 0 so the division produces NaN.
+            0.0
+        };
+        let var_divisor = self.full(sq_sum_shape, var_divisor_value, false)?;
+        self.tensor_div(sq_sum, var_divisor)
+    }
+
+    /// NaN-aware standard deviation: `sqrt(nanvar(input, correction))`.
+    ///
+    /// Equivalent to `torch.nanstd(input, correction)`. Composes via
+    /// `tensor_nanvar` + `tensor_sqrt`. Tracked under frankentorch-6awn.
+    pub fn tensor_nanstd(
+        &mut self,
+        input: TensorNodeId,
+        correction: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let var = self.tensor_nanvar(input, correction)?;
+        self.tensor_sqrt(var)
+    }
+
     pub fn tensor_sum_dim(
         &mut self,
         input: TensorNodeId,
@@ -39426,6 +39503,97 @@ mod tests {
         assert_eq!(g[1], 0.0);
         assert!((g[2] - expected).abs() < 1e-12);
         assert!((g[3] - expected).abs() < 1e-12);
+    }
+
+    #[test]
+    fn nanvar_biased_matches_population_variance_over_non_nan() {
+        // x = [1, NaN, 3, NaN, 5] → non-NaN = [1, 3, 5], mean = 3,
+        // squared deviations = [4, 0, 4], sum = 8, biased var = 8/3.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0],
+                vec![5],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_nanvar(x, 0).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!((v - 8.0 / 3.0).abs() < 1e-12, "got {v}");
+    }
+
+    #[test]
+    fn nanvar_unbiased_matches_bessel_corrected() {
+        // Same data; unbiased var = 8/(3-1) = 4.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0],
+                vec![5],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_nanvar(x, 1).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!((v - 4.0).abs() < 1e-12, "got {v}");
+    }
+
+    #[test]
+    fn nanstd_is_sqrt_of_nanvar() {
+        // x = [1, NaN, 3, NaN, 5] → unbiased var = 4 → std = 2.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(
+                vec![1.0, f64::NAN, 3.0, f64::NAN, 5.0],
+                vec![5],
+                false,
+            )
+            .unwrap();
+        let out = s.tensor_nanstd(x, 1).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!((v - 2.0).abs() < 1e-12, "got {v}");
+    }
+
+    #[test]
+    fn nanvar_all_nan_returns_nan() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![f64::NAN, f64::NAN], vec![2], false)
+            .unwrap();
+        let out = s.tensor_nanvar(x, 0).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!(v.is_nan(), "all-NaN nanvar should be NaN, got {v}");
+    }
+
+    #[test]
+    fn nanvar_single_non_nan_with_bessel_correction_returns_nan() {
+        // count_non_nan = 1, correction = 1 → divisor 0 → NaN.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![5.0, f64::NAN], vec![2], false)
+            .unwrap();
+        let out = s.tensor_nanvar(x, 1).unwrap();
+        let v = s.tensor_values(out).unwrap()[0];
+        assert!(v.is_nan(), "expected NaN for n=1 with Bessel correction, got {v}");
+    }
+
+    #[test]
+    fn nanvar_propagates_gradient_to_non_nan_positions() {
+        // For biased var of [a, NaN, c] with two non-NaN elements:
+        //   var = ((a - m)² + (c - m)²) / 2, m = (a + c) / 2
+        //   ∂var/∂a = 0.5 * (a - c)
+        //   ∂var/∂c = 0.5 * (c - a)
+        // For a=1, c=5: grad_a = -2, grad_c = 2. NaN slot: 0.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, f64::NAN, 5.0], vec![3], true)
+            .unwrap();
+        let out = s.tensor_nanvar(x, 0).unwrap();
+        let report = s.tensor_backward(out).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert!((g[0] - (-2.0)).abs() < 1e-12, "got {}", g[0]);
+        assert_eq!(g[1], 0.0);
+        assert!((g[2] - 2.0).abs() < 1e-12, "got {}", g[2]);
     }
 
     #[test]
