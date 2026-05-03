@@ -9263,6 +9263,45 @@ impl FrankenTorchSession {
         self.tensor_tape.unflatten(input, dim, sizes)
     }
 
+    /// Flatten a tensor to 1-D.
+    ///
+    /// Equivalent to `torch.ravel(input)` — returns a 1-D tensor
+    /// containing all elements in row-major (C-contiguous) order.
+    /// Empty input returns an empty 1-D tensor. Composes through
+    /// autograd-aware tensor_flatten over the full rank.
+    /// Tracked under frankentorch-icld.
+    pub fn tensor_ravel(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.is_empty() {
+            // 0-D scalar → 1-element 1-D tensor.
+            return self.tensor_reshape(input, vec![1]);
+        }
+        let last_dim = shape.len() - 1;
+        self.tensor_flatten(input, 0, last_dim)
+    }
+
+    /// Remove all size-1 dimensions from `input`.
+    ///
+    /// Equivalent to `torch.squeeze(input)` (no-dim variant). Removes
+    /// every dimension whose size is 1, in any position. Composes
+    /// through autograd-aware tensor_reshape with the size-1-stripped
+    /// shape. Tracked under frankentorch-icld.
+    pub fn tensor_squeeze_all(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let new_shape: Vec<usize> = shape.iter().copied().filter(|&d| d != 1).collect();
+        if new_shape == shape {
+            // No 1-dims to strip — return unchanged.
+            return Ok(input);
+        }
+        self.tensor_reshape(input, new_shape)
+    }
+
     pub fn tensor_narrow(
         &mut self,
         input: TensorNodeId,
@@ -39759,6 +39798,103 @@ mod tests {
         assert!((g[0] - (-2.0)).abs() < 1e-12, "got {}", g[0]);
         assert_eq!(g[1], 0.0);
         assert!((g[2] - 2.0).abs() < 1e-12, "got {}", g[2]);
+    }
+
+    // ── tensor_ravel + squeeze_all tests (frankentorch-icld) ──────────
+
+    #[test]
+    fn ravel_flattens_to_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 2x3 → [6]
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false)
+            .unwrap();
+        let out = s.tensor_ravel(x).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![6]);
+        assert_eq!(s.tensor_values(out).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+
+        // 3-D 2x2x2 → [8] in row-major order
+        let y = s
+            .tensor_variable(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                vec![2, 2, 2],
+                false,
+            )
+            .unwrap();
+        let out_y = s.tensor_ravel(y).unwrap();
+        assert_eq!(s.tensor_shape(out_y).unwrap(), vec![8]);
+        assert_eq!(
+            s.tensor_values(out_y).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn ravel_scalar_returns_one_element_1d() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![42.0], vec![], false).unwrap();
+        let out = s.tensor_ravel(x).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![1]);
+        assert_eq!(s.tensor_values(out).unwrap(), vec![42.0]);
+    }
+
+    #[test]
+    fn ravel_propagates_gradient() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .unwrap();
+        let r = s.tensor_ravel(x).unwrap();
+        let scalar = s.tensor_sum(r).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert_eq!(g, &[1.0, 1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn squeeze_all_removes_all_size_one_dims() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [1, 3, 1, 2, 1] → [3, 2]
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![1, 3, 1, 2, 1], false)
+            .unwrap();
+        let out = s.tensor_squeeze_all(x).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![3, 2]);
+        assert_eq!(s.tensor_values(out).unwrap(), vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0]);
+    }
+
+    #[test]
+    fn squeeze_all_no_op_when_no_size_one_dims() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let out = s.tensor_squeeze_all(x).unwrap();
+        // Same id since no reshape was needed.
+        assert_eq!(out, x);
+    }
+
+    #[test]
+    fn squeeze_all_handles_all_size_one_dims_to_scalar_promoted_to_empty() {
+        // [1, 1, 1] → [] (rank-0 scalar). Our reshape supports rank-0.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![5.0], vec![1, 1, 1], false).unwrap();
+        let out = s.tensor_squeeze_all(x).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), Vec::<usize>::new());
+        assert_eq!(s.tensor_values(out).unwrap(), vec![5.0]);
+    }
+
+    #[test]
+    fn squeeze_all_propagates_gradient() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 4, 1], true)
+            .unwrap();
+        let out = s.tensor_squeeze_all(x).unwrap();
+        let scalar = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(scalar).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        assert_eq!(g, &[1.0, 1.0, 1.0, 1.0]);
     }
 
     // ── tensor_pow_tensor tests (frankentorch-8gy3) ────────────────────
