@@ -127,4 +127,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_kernel_cpu_where"
+path = "fuzz_targets/ft_kernel_cpu_where.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
