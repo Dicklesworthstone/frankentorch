@@ -12742,12 +12742,14 @@ impl FrankenTorchSession {
         // Reuses delta_tensor — DAG allows multiple refs
         let in_quadratic = self.tensor_ge(delta_tensor, abs_diff)?;
 
-        // Blend: mask * quadratic + (1 - mask) * linear
-        let masked_quad = self.tensor_mul(in_quadratic, quadratic)?;
-        let ones = self.full(shape, 1.0, false)?;
-        let one_minus_mask = self.tensor_sub(ones, in_quadratic)?;
-        let masked_lin = self.tensor_mul(one_minus_mask, linear)?;
-        let result = self.tensor_add(masked_quad, masked_lin)?;
+        // Blend via autograd-aware tensor_where instead of the
+        // textbook mask*quadratic + (1-mask)*linear chain. Same
+        // simplification as smooth_l1_loss (uqtq) — tensor_where
+        // routes gradients to whichever branch the mask selects,
+        // preserving the original backward semantics. -1 full()
+        // allocation, -1 sub + -2 mul + -1 add collapsed into 1
+        // where node. Tracked under frankentorch-yt94.
+        let result = self.tensor_where(in_quadratic, quadratic, linear)?;
 
         self.tensor_mean(result)
     }
