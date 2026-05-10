@@ -5929,6 +5929,123 @@ mod tests {
         parse_schema_name, parse_schema_or_name, schema_dispatch_keyset_from_tags,
     };
 
+    #[test]
+    fn dispatch_schema_diagnostic_snapshots() {
+        let cases = [
+            ("dispatch_key_empty", DispatchKeyError::EmptySet.to_string()),
+            (
+                "dispatch_key_unknown_bits",
+                DispatchKeyError::UnknownBits {
+                    unknown_mask: 0x0102,
+                }
+                .to_string(),
+            ),
+            (
+                "dispatch_key_incompatible",
+                DispatchKeyError::IncompatibleSet {
+                    reason: "AutogradCPU requires CPU backend availability",
+                }
+                .to_string(),
+            ),
+            (
+                "dispatch_error_kernel",
+                DispatchError::Kernel(KernelError::InvalidDimension { dim: 4, ndim: 3 })
+                    .to_string(),
+            ),
+            (
+                "dispatch_error_key",
+                DispatchError::Key(DispatchKeyError::NoBackendKey).to_string(),
+            ),
+            ("op_schema_empty", OpSchemaError::EmptyInput.to_string()),
+            (
+                "op_schema_invalid_name",
+                OpSchemaError::InvalidOperatorName {
+                    reason: "operator name contains whitespace",
+                }
+                .to_string(),
+            ),
+            (
+                "op_schema_invalid_overload",
+                OpSchemaError::InvalidOverloadName {
+                    overload: "bad-overload".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "op_schema_malformed",
+                OpSchemaError::MalformedSchema {
+                    reason: "missing return arrow",
+                }
+                .to_string(),
+            ),
+            (
+                "op_schema_unknown_key",
+                OpSchemaError::UnknownDispatchKey {
+                    key: "PrivateUse9".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "op_schema_incompatible_keyset",
+                OpSchemaError::IncompatibleDispatchKeyset(DispatchKeyError::NoBackendKey)
+                    .to_string(),
+            ),
+            (
+                "schema_registry_duplicate",
+                SchemaRegistryError::DuplicateSchema {
+                    name: "aten.add.Tensor".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "schema_registry_missing",
+                SchemaRegistryError::MissingSchema {
+                    name: "aten.mul.Tensor".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "schema_registry_unsupported",
+                SchemaRegistryError::UnsupportedOperator {
+                    base: "aten.linalg_svd".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "schema_registry_incompatible_keyset",
+                SchemaRegistryError::IncompatibleDispatchKeyset(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "Undefined cannot be selected for scalar binary dispatch",
+                    },
+                )
+                .to_string(),
+            ),
+            (
+                "schema_dispatch_registry",
+                SchemaDispatchError::Registry(SchemaRegistryError::MissingSchema {
+                    name: "aten.sub.Tensor".to_string(),
+                })
+                .to_string(),
+            ),
+            (
+                "schema_dispatch_dispatch",
+                SchemaDispatchError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "AutogradCPU fallback requires CPU kernel",
+                    },
+                ))
+                .to_string(),
+            ),
+        ];
+        let rendered = cases
+            .iter()
+            .map(|(name, diagnostic)| format!("{name}: {diagnostic}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        insta::assert_snapshot!("dispatch_schema_diagnostic_snapshots", rendered);
+    }
+
     fn det_seed(parts: &[u64]) -> u64 {
         let mut hash = 0xcbf2_9ce4_8422_2325u64;
         for value in parts {

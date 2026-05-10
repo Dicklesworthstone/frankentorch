@@ -450,6 +450,7 @@ version = "0.1.0"
 dependencies = [
  "ft-core",
  "ft-kernel-cpu",
+ "insta",
  "proptest",
 ]
 

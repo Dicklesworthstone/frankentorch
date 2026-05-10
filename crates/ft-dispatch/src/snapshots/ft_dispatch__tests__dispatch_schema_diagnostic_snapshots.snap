@@ -1,0 +1,21 @@
+---
+source: crates/ft-dispatch/src/lib.rs
+expression: rendered
+---
+dispatch_key_empty: dispatch keyset is empty
+dispatch_key_unknown_bits: dispatch keyset has unknown bitmask 0x0000000000000102
+dispatch_key_incompatible: incompatible dispatch keyset: AutogradCPU requires CPU backend availability
+dispatch_error_kernel: kernel dispatch failure: invalid reduction dimension 4 for tensor with 3 dimensions
+dispatch_error_key: dispatch key failure: dispatch keyset has no backend key
+op_schema_empty: schema input is empty
+op_schema_invalid_name: invalid operator name: operator name contains whitespace
+op_schema_invalid_overload: invalid overload name: bad-overload
+op_schema_malformed: malformed schema: missing return arrow
+op_schema_unknown_key: unknown schema dispatch key 'PrivateUse9'
+op_schema_incompatible_keyset: incompatible schema dispatch keyset: dispatch keyset has no backend key
+schema_registry_duplicate: schema registry already has an entry for 'aten.add.Tensor'
+schema_registry_missing: schema registry has no entry for 'aten.mul.Tensor'
+schema_registry_unsupported: schema base operator 'aten.linalg_svd' is not yet dispatchable
+schema_registry_incompatible_keyset: schema dispatch keyset is incompatible: incompatible dispatch keyset: Undefined cannot be selected for scalar binary dispatch
+schema_dispatch_registry: schema registry failure: schema registry has no entry for 'aten.sub.Tensor'
+schema_dispatch_dispatch: schema dispatch failure: dispatch key failure: incompatible dispatch keyset: AutogradCPU fallback requires CPU kernel
