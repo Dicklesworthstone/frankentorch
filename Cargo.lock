@@ -458,6 +458,7 @@ name = "ft-kernel-cpu"
 version = "0.1.0"
 dependencies = [
  "ft-core",
+ "insta",
  "libm",
  "proptest",
 ]

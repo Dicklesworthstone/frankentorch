@@ -7575,6 +7575,72 @@ mod tests {
     use super::{pairwise_sum_f64, pairwise_sum_map_f64};
 
     #[test]
+    fn kernel_error_display_diagnostic_snapshot() {
+        let cases = [
+            (
+                "incompatible_dtype",
+                KernelError::Incompatible(TensorCompatError::DTypeMismatch {
+                    lhs: DType::F64,
+                    rhs: DType::F32,
+                }),
+            ),
+            (
+                "incompatible_device",
+                KernelError::Incompatible(TensorCompatError::DeviceMismatch {
+                    lhs: Device::Cpu,
+                    rhs: Device::Cuda,
+                }),
+            ),
+            (
+                "shape_mismatch",
+                KernelError::ShapeMismatch {
+                    lhs: vec![2, 3],
+                    rhs: vec![3, 2],
+                },
+            ),
+            (
+                "unsupported_layout",
+                KernelError::UnsupportedLayout { side: "lhs" },
+            ),
+            (
+                "storage_span_overflow",
+                KernelError::StorageSpanOverflow {
+                    side: "input",
+                    storage_offset: 7,
+                    numel: 11,
+                },
+            ),
+            (
+                "insufficient_storage",
+                KernelError::InsufficientStorage {
+                    side: "rhs",
+                    needed: 12,
+                    available: 8,
+                },
+            ),
+            (
+                "invalid_dimension",
+                KernelError::InvalidDimension { dim: 4, ndim: 3 },
+            ),
+            (
+                "shape_overflow",
+                KernelError::ShapeOverflow {
+                    context: "broadcast output numel",
+                },
+            ),
+            ("singular_matrix", KernelError::SingularMatrix { size: 3 }),
+            ("not_positive_definite", KernelError::NotPositiveDefinite),
+        ];
+        let rendered = cases
+            .iter()
+            .map(|(name, error)| format!("{name}: {error}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        insta::assert_snapshot!("kernel_error_display_diagnostics", rendered);
+    }
+
+    #[test]
     fn neg_scalar_returns_expected_value() {
         let input = ScalarTensor::new(3.5, DType::F64, Device::Cpu);
         let out = neg_scalar(&input);

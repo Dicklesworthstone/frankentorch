@@ -9,6 +9,7 @@ ft-core = { workspace = true }
 libm = { workspace = true }
 
 [dev-dependencies]
+insta = "1.47.2"
 proptest = "1.6.0"
 
 [lints]

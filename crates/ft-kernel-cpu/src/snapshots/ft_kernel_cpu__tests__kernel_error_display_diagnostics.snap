@@ -1,0 +1,14 @@
+---
+source: crates/ft-kernel-cpu/src/lib.rs
+expression: rendered
+---
+incompatible_dtype: incompatible tensors: dtype mismatch: lhs=F64, rhs=F32
+incompatible_device: incompatible tensors: device mismatch: lhs=Cpu, rhs=Cuda
+shape_mismatch: shape mismatch: lhs=[2, 3], rhs=[3, 2]
+unsupported_layout: unsupported non-contiguous layout on lhs
+storage_span_overflow: storage span overflow on input: storage_offset=7, numel=11
+insufficient_storage: insufficient storage on rhs: needed=12, available=8
+invalid_dimension: invalid reduction dimension 4 for tensor with 3 dimensions
+shape_overflow: shape arithmetic overflow: broadcast output numel
+singular_matrix: singular matrix: size=3x3
+not_positive_definite: matrix is not positive definite
