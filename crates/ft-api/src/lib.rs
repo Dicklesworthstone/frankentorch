@@ -46500,6 +46500,58 @@ mod tests {
     }
 
     #[test]
+    fn renorm_is_idempotent_and_bounds_slice_norms() {
+        // Metamorphic relation: renorm(renorm(x)) == renorm(x).
+        // Post-condition: every slice along dim has p-norm <= maxnorm.
+        // Generated cases include both already-valid and clipped rows.
+        let ps = [1.0, 2.0, 3.0];
+        let maxnorms = [1.5, 3.0, 7.0];
+
+        for rows in 1..5 {
+            for cols in 2..6 {
+                let values: Vec<f64> = (0..rows * cols)
+                    .map(|i| ((i * 17 + rows * 13 + cols * 7) % 31) as f64 / 3.0 - 4.0)
+                    .collect();
+
+                for (&p, &maxnorm) in ps.iter().zip(maxnorms.iter()) {
+                    let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                    let x = s
+                        .tensor_variable(values.clone(), vec![rows, cols], false)
+                        .unwrap();
+                    let once = s.tensor_renorm(x, p, 0, maxnorm).unwrap();
+                    let twice = s.tensor_renorm(once, p, 0, maxnorm).unwrap();
+                    let once_vals = s.tensor_values(once).unwrap();
+                    let twice_vals = s.tensor_values(twice).unwrap();
+
+                    for row in 0..rows {
+                        let norm = (0..cols)
+                            .map(|col| once_vals[row * cols + col].abs().powf(p))
+                            .sum::<f64>()
+                            .powf(1.0 / p);
+                        let tol = 64.0 * maxnorm.max(norm).max(1.0) * f64::EPSILON;
+                        assert!(
+                            norm <= maxnorm + 1e-10 + tol,
+                            "renorm row {row} p={p} norm={norm} exceeds maxnorm={maxnorm}"
+                        );
+                    }
+
+                    for (idx, (&once, &twice)) in
+                        once_vals.iter().zip(twice_vals.iter()).enumerate()
+                    {
+                        let diff = (once - twice).abs();
+                        let tol = 64.0 * once.abs().max(twice.abs()).max(1.0) * f64::EPSILON;
+                        assert!(
+                            diff <= 1e-10 || diff <= tol,
+                            "renorm idempotence failed at {idx}: once={once}, twice={twice}, \
+                             p={p}, maxnorm={maxnorm}, diff={diff:e}, tol={tol:e}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn renorm_dim_out_of_range_errors() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s
