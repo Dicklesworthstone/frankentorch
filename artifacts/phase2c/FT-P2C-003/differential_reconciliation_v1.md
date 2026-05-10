@@ -36,8 +36,8 @@ Validated threat controls mapped in `artifacts/phase2c/FT-P2C-003/risk_note.md`:
 - `THR-304`: dispatch metadata incompatibility fail-closed behavior
 - `THR-305`: replay evidence contract continuity through differential checks
 
-Remaining deferred gap:
-- `GAP-SCHEMA-001` (symbolic-shape semantics closure)
+Modeled deferred gap:
+- `GAP-SCHEMA-001` symbolic-shape semantics remain deferred, but `frankentorch-795j` adds the active `symbolic_shape_gap_marker` fixture so strict+hardened e2e/differential logs fail closed with an explicit gap marker instead of silently accepting symbolic-shape behavior.
 
 ## Method-Stack Status for This Bead
 

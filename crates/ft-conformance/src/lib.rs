@@ -1354,11 +1354,16 @@ struct OpSchemaCase {
     name_input: Option<String>,
     dispatch_tags: Option<Vec<String>>,
     expected_kernel: Option<String>,
+    gap_id: Option<String>,
     expect_parse_ok: bool,
     expect_schema_variant: Option<bool>,
     expect_out_variant: Option<bool>,
     expect_dispatch_ok: Option<bool>,
     expect_name_normalization: Option<bool>,
+    #[serde(default)]
+    contract_ids: Vec<String>,
+    #[serde(default)]
+    e2e_scenarios: Vec<String>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -7807,7 +7812,9 @@ fn run_op_schema_case(
         && kernel_ok
         && normalization_ok;
     let reason_code = if passed {
-        if case.expect_parse_ok {
+        if case.gap_id.as_deref() == Some("GAP-SCHEMA-001") {
+            "op_schema_symbolic_shape_gap_fail_closed"
+        } else if case.expect_parse_ok {
             "op_schema_parity_ok"
         } else {
             "op_schema_adversarial_fail_closed_ok"
@@ -7869,6 +7876,13 @@ fn run_op_schema_case(
                         .clone()
                         .unwrap_or_else(|| "none".to_string())
                 ),
+            ),
+            ("gap_id".to_string(), json!(case.gap_id)),
+            ("contract_ids".to_string(), json!(case.contract_ids)),
+            ("e2e_scenarios".to_string(), json!(case.e2e_scenarios)),
+            (
+                "observed_parse_error".to_string(),
+                json!(parsed_schema.as_ref().err().map(ToString::to_string)),
             ),
         ])),
     })
@@ -13783,6 +13797,37 @@ mod tests {
     }
 
     #[test]
+    fn op_schema_symbolic_shape_gap_marker_is_fail_closed() {
+        let cfg = HarnessConfig::default_paths();
+        let (_report, cases) =
+            run_op_schema_conformance(&cfg, ExecutionMode::Strict).expect("op schema should run");
+        let case = cases
+            .iter()
+            .find(|case| case.name == "symbolic_shape_gap_marker")
+            .expect("symbolic-shape gap marker fixture must be present");
+
+        assert!(case.passed());
+        assert_eq!(
+            case.forensic_log.reason_code,
+            "op_schema_symbolic_shape_gap_fail_closed"
+        );
+        assert_eq!(
+            case.forensic_log
+                .extra_fields
+                .get("gap_id")
+                .and_then(Value::as_str),
+            Some("GAP-SCHEMA-001")
+        );
+        assert_eq!(
+            case.forensic_log
+                .extra_fields
+                .get("schema_dispatch_observed")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+    }
+
+    #[test]
     fn strict_scheduler_conformance_is_green() {
         let cfg = HarnessConfig::default_paths();
         let (report, cases) = run_autograd_scheduler_conformance(&cfg, ExecutionMode::Strict)
@@ -15106,6 +15151,12 @@ mod tests {
             check.suite == "op_schema"
                 && check.case_name == "dispatch_metadata_incompatible"
                 && check.comparator == "adversarial_dispatch_metadata_rejected"
+        }));
+        assert!(report.checks.iter().any(|check| {
+            check.suite == "op_schema"
+                && check.case_name == "symbolic_shape_gap_marker"
+                && check.comparator == "adversarial_dispatch_metadata_rejected"
+                && check.status == "pass"
         }));
     }
 
@@ -16717,6 +16768,148 @@ print(json.dumps({"results": results}, sort_keys=True))
             };
             check("i0", got_i0, exp_i0);
             check("i0e", got_i0e, exp_i0e);
+        }
+    }
+
+    #[test]
+    fn torch_nan_to_num_f32_subprocess_conformance() {
+        // Torch differential coverage for F32 tensor_nan_to_num
+        // forward + backward (frankentorch-dfd9). The F32 path
+        // was extended via lczj to share the autograd-aware
+        // compose chain with F64 — this oracle pins both forward
+        // and backward against torch.nan_to_num + torch.autograd
+        // at f32 precision, catching any silent dtype-promotion
+        // drift the F64-only oracles can't see.
+        use ft_api::FrankenTorchSession;
+
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let torch_available = Command::new(&python)
+            .arg("-c")
+            .arg("import torch")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !torch_available {
+            eprintln!("torch_nan_to_num_f32_subprocess_conformance: torch unavailable, skipping");
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let case_payload = json!({
+            "x": ["nan", 1.5, "inf", "-inf", 3.5, 0.0, "-0.0", -7.25],
+            "nan_replacement": 0.0,
+        });
+
+        let script = r#"
+import json
+import math
+import sys
+import torch
+
+def decode_scalar(v):
+    if isinstance(v, str):
+        return {"nan": float("nan"), "inf": float("inf"),
+                "-inf": float("-inf"), "-0.0": -0.0}[v]
+    return float(v)
+
+def encode_scalar(v):
+    if math.isnan(v):
+        return "nan"
+    if math.isinf(v):
+        return "inf" if v > 0 else "-inf"
+    if v == 0.0 and math.copysign(1.0, v) < 0:
+        return "-0.0"
+    return v
+
+payload = json.loads(sys.stdin.read())
+xs = [decode_scalar(c) for c in payload["x"]]
+nan_repl = float(payload["nan_replacement"])
+x = torch.tensor(xs, dtype=torch.float32, requires_grad=True)
+out = torch.nan_to_num(x, nan=nan_repl)
+out.sum().backward()
+forward = [encode_scalar(float(v)) for v in out.detach().tolist()]
+grad = [encode_scalar(float(v)) for v in x.grad.tolist()]
+print(json.dumps({"forward": forward, "grad": grad}, sort_keys=True))
+"#;
+
+        let oracle = super::run_legacy_oracle_script(&config, script, &case_payload)
+            .expect("torch.nan_to_num F32 oracle should run");
+        let exp_forward = oracle
+            .get("forward")
+            .and_then(Value::as_array)
+            .expect("forward array");
+        let exp_grad = oracle
+            .get("grad")
+            .and_then(Value::as_array)
+            .expect("grad array");
+
+        fn decode(v: &Value) -> f64 {
+            if let Some(s) = v.as_str() {
+                match s {
+                    "nan" => f64::NAN,
+                    "inf" => f64::INFINITY,
+                    "-inf" => f64::NEG_INFINITY,
+                    "-0.0" => -0.0,
+                    other => panic!("unexpected tagged scalar: {other}"),
+                }
+            } else {
+                v.as_f64().expect("scalar")
+            }
+        }
+
+        let xs_in: Vec<f32> = case_payload
+            .get("x")
+            .and_then(Value::as_array)
+            .expect("x array")
+            .iter()
+            .map(|v| decode(v) as f32)
+            .collect();
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = session
+            .tensor_variable_f32(xs_in.clone(), vec![xs_in.len()], true)
+            .expect("variable");
+        let out = session
+            .tensor_nan_to_num(xt, 0.0, None, None)
+            .expect("nan_to_num");
+        let got_forward = session.tensor_values_f32(out).expect("forward");
+
+        for (i, (got, expected)) in got_forward.iter().zip(exp_forward.iter()).enumerate() {
+            let exp_v = decode(expected) as f32;
+            if exp_v.is_nan() {
+                assert!(got.is_nan(), "case {i}: expected NaN, got {got}");
+                continue;
+            }
+            // Allow ±0 sign drift (torch may not preserve through
+            // nan_to_num) but require value equality otherwise.
+            if exp_v == 0.0 && *got == 0.0 {
+                continue;
+            }
+            assert_eq!(
+                got.to_bits(),
+                exp_v.to_bits(),
+                "case {i} forward: F32 nan_to_num = {got}, torch = {exp_v}"
+            );
+        }
+
+        let loss = session.tensor_sum(out).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let got_grad = session.tensor_gradient(&report, xt).expect("grad").to_vec();
+
+        for (i, (got, expected)) in got_grad.iter().zip(exp_grad.iter()).enumerate() {
+            let exp_v = decode(expected) as f32;
+            assert_eq!(
+                (*got as f32).to_bits(),
+                exp_v.to_bits(),
+                "case {i} grad: F32 nan_to_num grad = {got}, torch = {exp_v}"
+            );
         }
     }
 

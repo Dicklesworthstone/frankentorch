@@ -36,7 +36,7 @@ Primary attack surfaces:
 | `THR-303` | out/structured alias metadata corruption | out schema rows and structured delegate metadata | unsafe mutability/alias handling and parity drift | explicit out-alias invariants + structured delegate preservation checks | strict=fail on mismatch, hardened=fail on mismatch | `ft_dispatch::schema_out_variant_requires_mutable_out_alias`, `ft_dispatch::structured_delegate_ref_is_preserved` | `op_schema/strict:add_out_schema_alignment`=`73962521145086383`, `op_schema/hardened:add_out_schema_alignment`=`4600075214105047437` |
 | `THR-304` | dispatch metadata incompatibility | schema `dispatch:` mapping into scoped keyset routing | unsafe or wrong kernel route selection | reject unknown/incompatible metadata before route resolution | strict=fail, hardened=fail | `ft_dispatch::schema_dispatch_keyset_rejects_unknown_backend_key`, `ft_dispatch::schema_dispatch_keyset_requires_cpu_backend_for_scoped_ops` | `op_schema/strict:dispatch_metadata_incompatible`=`5876961574866201650`, `op_schema/hardened:dispatch_metadata_incompatible`=`3598587240931457689` |
 | `THR-305` | replay evidence omission/tampering | structured forensics payload | unreplayable schema incidents and audit loss | required deterministic log contract + reliability gate | same in both modes | conformance logging contract checks (`StructuredCaseLog`) | full-suite e2e/reliability gate runs |
-| `THR-306` | symbolic-shape parity ambiguity | schema rows requiring unresolved symbolic-shape semantics | silent acceptance of undefined schema behavior | explicit gap marker + deferred closure dependency | strict=fail-closed on unknown symbolic-shape semantics, hardened=same semantics with bounded diagnostics | placeholder tests gated by `GAP-SCHEMA-001` | `op_schema/strict:symbolic_shape_gap_marker`=`11150072441506177902`, `op_schema/hardened:symbolic_shape_gap_marker`=`5960984333540654265` |
+| `THR-306` | symbolic-shape parity ambiguity | schema rows requiring unresolved symbolic-shape semantics | silent acceptance of undefined schema behavior | explicit gap marker + deferred closure dependency | strict=fail-closed on unknown symbolic-shape semantics, hardened=same semantics with bounded diagnostics | `symbolic_shape_gap_marker` fixture gated by `GAP-SCHEMA-001` | `op_schema/strict:symbolic_shape_gap_marker`, `op_schema/hardened:symbolic_shape_gap_marker` |
 
 ## 4) Mandatory Forensic Logging + Replay Artifacts for Incidents
 
@@ -66,7 +66,7 @@ Required artifact linkage chain:
 
 Residual risks:
 - this packet only scopes a constrained operator family; full native operator universe ingestion is deferred.
-- symbolic-shape schema parity remains explicit debt tracked by `GAP-SCHEMA-001`.
+- symbolic-shape schema parity remains explicit implementation debt tracked by `GAP-SCHEMA-001`, with active fail-closed marker coverage under `frankentorch-795j`.
 
 Deferred controls and ownership:
 - `bd-3v0.14.6` status: completed.

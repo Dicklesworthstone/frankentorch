@@ -48,6 +48,18 @@
       "expect_parse_ok": true,
       "expect_schema_variant": true,
       "expect_dispatch_ok": false
+    },
+    {
+      "name": "symbolic_shape_gap_marker",
+      "schema_input": "reshape.symint(Tensor self, SymInt[] shape) -> Tensor",
+      "dispatch_tags": ["CPU", "AutogradCPU"],
+      "gap_id": "GAP-SCHEMA-001",
+      "expect_parse_ok": true,
+      "expect_schema_variant": true,
+      "expect_out_variant": false,
+      "expect_dispatch_ok": false,
+      "contract_ids": ["OPSCHEMA-SYMSHAPE-007", "GAP-SCHEMA-001"],
+      "e2e_scenarios": ["op_schema:symbolic_shape_gap_marker"]
     }
   ]
 }
