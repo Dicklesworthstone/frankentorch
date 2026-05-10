@@ -5724,31 +5724,37 @@ impl FrankenTorchSession {
     /// Modified Bessel function of the first kind, order 0.
     ///
     /// Equivalent to `torch.special.i0(input)`. Uses the
-    /// Abramowitz & Stegun 9.8.1 / 9.8.2 piecewise polynomial:
-    /// Chebyshev expansion in `(x/3.75)²` for `|x| < 3.75` and
-    /// an asymptotic expansion for `|x| >= 3.75`. Even in `x`
-    /// (so `i0(-x) = i0(x)`). Used in the von Mises distribution
-    /// PDF. Tracked under frankentorch-2vxa.
-    ///
-    /// Autograd: not yet supported (needs `tensor_special_i1` for
-    /// the analytical backward `d/dx i0(x) = i1(x)`). Fail-loud
-    /// on `requires_grad=true` rather than silently severing the
-    /// tape (matches `tensor_sgn` / `tensor_copysign` pattern).
+    /// Abramowitz & Stegun 9.8.1 / 9.8.2 piecewise polynomial.
+    /// Even in `x`. Autograd-aware via the analytical backward
+    /// `d/dx i0(x) = i1(x)` — wired through tensor_apply_function
+    /// using the i1 scalar helper from frankentorch-ner6. Tracked
+    /// under frankentorch-2vxa (forward) + frankentorch-urmm
+    /// (autograd unblock).
     pub fn tensor_special_i0(
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "i0: autograd not yet supported (needs tensor_special_i1 for analytical backward). Tracked under frankentorch-2vxa.",
-                },
-            )));
-        }
-        let vals = self.tensor_values(input)?;
-        let shape = self.tensor_shape(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_i0_scalar(x)).collect();
-        self.tensor_variable(result, shape, false)
+        self.tensor_apply_function(
+            &[input],
+            |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                let result: Vec<f64> = vals.iter().map(|&x| bessel_i0_scalar(x)).collect();
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                Ok((result, shape.to_vec()))
+            },
+            |ctx, grad_outputs| {
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                let grad_y = grad_outputs[0];
+                // d/dx i0(x) = i1(x).
+                let grad_x: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_y.iter())
+                    .map(|(&x, &gy)| gy * bessel_i1_scalar(x))
+                    .collect();
+                Ok(vec![Some(grad_x)])
+            },
+        )
     }
 
     /// Exponentially scaled modified Bessel of the first kind,
@@ -39263,14 +39269,21 @@ mod tests {
     }
 
     #[test]
-    fn i0_fails_loud_on_requires_grad() {
-        // Until tensor_special_i1 lands for the analytical
-        // backward, requires_grad must fail closed rather than
-        // silently sever the tape.
+    fn i0_propagates_gradient_via_i1() {
+        // d/dx i0(x) = i1(x). At x=1: i1(1) ≈ 0.5651591.
+        // (frankentorch-urmm — autograd unblock now that i1
+        // is shipped.)
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
-        let result = s.tensor_special_i0(x);
-        assert!(result.is_err(), "i0 with requires_grad must fail closed");
+        let out = s.tensor_special_i0(x).unwrap();
+        let report = s.tensor_backward(out).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        // i1(1) ≈ 0.56515910 (A&S polynomial accuracy ~5e-7).
+        assert!(
+            (g[0] - 0.56515910).abs() < 5e-7,
+            "i0 grad at x=1 = {} (expected i1(1) ≈ 0.5651591)",
+            g[0]
+        );
     }
 
     #[test]
