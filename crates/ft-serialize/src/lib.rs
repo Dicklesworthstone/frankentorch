@@ -2424,9 +2424,36 @@ mod tests {
         DenseTensor::from_contiguous_values(values, shape, Device::Cpu).unwrap()
     }
 
+    fn test_temp_path(basename: &str) -> std::path::PathBuf {
+        let thread_id = format!("{:?}", std::thread::current().id());
+        let thread_id_sanitized: String = thread_id
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+            .collect();
+        std::env::temp_dir().join(format!(
+            "{}_{}_{}",
+            basename,
+            std::process::id(),
+            thread_id_sanitized,
+        ))
+    }
+
+    #[test]
+    fn temp_file_helper_scopes_paths_by_thread() {
+        let main_path = test_temp_path("ft_test_save_single");
+        let worker_path = std::thread::spawn(|| test_temp_path("ft_test_save_single"))
+            .join()
+            .expect("worker should return path");
+
+        assert_ne!(
+            main_path, worker_path,
+            "same-basename temp paths must not collide across test threads"
+        );
+    }
+
     #[test]
     fn save_load_single_tensor() {
-        let dir = std::env::temp_dir().join("ft_test_save_single");
+        let dir = test_temp_path("ft_test_save_single");
         let _ = std::fs::remove_file(&dir);
         let mut sd = BTreeMap::new();
         sd.insert(
@@ -2448,7 +2475,7 @@ mod tests {
 
     #[test]
     fn save_load_multiple_tensors() {
-        let dir = std::env::temp_dir().join("ft_test_save_multi");
+        let dir = test_temp_path("ft_test_save_multi");
         let _ = std::fs::remove_file(&dir);
         let mut sd = BTreeMap::new();
         sd.insert(
@@ -2483,7 +2510,7 @@ mod tests {
 
     #[test]
     fn save_load_empty_state_dict() {
-        let dir = std::env::temp_dir().join("ft_test_save_empty");
+        let dir = test_temp_path("ft_test_save_empty");
         let _ = std::fs::remove_file(&dir);
         let sd = BTreeMap::new();
 
@@ -2496,7 +2523,7 @@ mod tests {
 
     #[test]
     fn save_load_scalar_tensor() {
-        let dir = std::env::temp_dir().join("ft_test_save_scalar");
+        let dir = test_temp_path("ft_test_save_scalar");
         let _ = std::fs::remove_file(&dir);
         let mut sd = BTreeMap::new();
         sd.insert("lr".to_string(), make_f64_tensor(vec![0.001], vec![1]));
@@ -2510,7 +2537,7 @@ mod tests {
 
     #[test]
     fn save_load_f32_tensor() {
-        let dir = std::env::temp_dir().join("ft_test_save_f32");
+        let dir = test_temp_path("ft_test_save_f32");
         let _ = std::fs::remove_file(&dir);
         let mut sd = BTreeMap::new();
         let meta = TensorMeta::from_shape(vec![3], DType::F32, Device::Cpu);
@@ -2724,7 +2751,7 @@ mod tests {
 
     #[test]
     fn save_state_dict_unsupported_dtype_leaves_existing_file_untouched() {
-        let path = std::env::temp_dir().join("ft_test_save_unsupported_dtype");
+        let path = test_temp_path("ft_test_save_unsupported_dtype");
         let original = b"sentinel-state";
         std::fs::write(&path, original).unwrap();
 
@@ -2745,7 +2772,7 @@ mod tests {
 
     #[test]
     fn magic_bytes_present() {
-        let dir = std::env::temp_dir().join("ft_test_magic");
+        let dir = test_temp_path("ft_test_magic");
         let _ = std::fs::remove_file(&dir);
         let sd = BTreeMap::new();
         save_state_dict(&sd, &dir).unwrap();
@@ -2756,7 +2783,7 @@ mod tests {
 
     #[test]
     fn save_load_large_tensor() {
-        let dir = std::env::temp_dir().join("ft_test_save_large");
+        let dir = test_temp_path("ft_test_save_large");
         let _ = std::fs::remove_file(&dir);
         let n = 10_000;
         let values: Vec<f64> = (0..n).map(|i| i as f64 * 0.001).collect();
@@ -2801,7 +2828,7 @@ mod tests {
 
     #[test]
     fn overwrite_existing_file() {
-        let dir = std::env::temp_dir().join("ft_test_overwrite");
+        let dir = test_temp_path("ft_test_overwrite");
         let _ = std::fs::remove_file(&dir);
 
         // Write first version
@@ -2831,7 +2858,7 @@ mod tests {
 
     #[test]
     fn safetensors_round_trip_f64() {
-        let path = std::env::temp_dir().join("ft_test_st_f64.safetensors");
+        let path = test_temp_path("ft_test_st_f64.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         sd.insert(
@@ -2852,7 +2879,7 @@ mod tests {
 
     #[test]
     fn safetensors_round_trip_f32() {
-        let path = std::env::temp_dir().join("ft_test_st_f32.safetensors");
+        let path = test_temp_path("ft_test_st_f32.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         let meta = TensorMeta::from_shape(vec![3], DType::F32, Device::Cpu);
@@ -2872,7 +2899,7 @@ mod tests {
 
     #[test]
     fn safetensors_respects_storage_offset() {
-        let path = std::env::temp_dir().join("ft_test_st_offset.safetensors");
+        let path = test_temp_path("ft_test_st_offset.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         let meta = TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu).with_storage_offset(1);
@@ -2891,7 +2918,7 @@ mod tests {
 
     #[test]
     fn safetensors_rejects_noncontiguous_tensor() {
-        let path = std::env::temp_dir().join("ft_test_st_noncontig.safetensors");
+        let path = test_temp_path("ft_test_st_noncontig.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         let meta =
@@ -2912,7 +2939,7 @@ mod tests {
 
     #[test]
     fn safetensors_round_trip_f16() {
-        let path = std::env::temp_dir().join("ft_test_st_f16.safetensors");
+        let path = test_temp_path("ft_test_st_f16.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         let vals: Vec<ft_core::Float16> = vec![1.0f32, 2.0, 3.0]
@@ -2934,7 +2961,7 @@ mod tests {
 
     #[test]
     fn safetensors_round_trip_bf16() {
-        let path = std::env::temp_dir().join("ft_test_st_bf16.safetensors");
+        let path = test_temp_path("ft_test_st_bf16.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         let vals: Vec<ft_core::BFloat16> = vec![1.0f32, 2.0, 3.0]
@@ -2956,7 +2983,7 @@ mod tests {
 
     #[test]
     fn safetensors_empty_state_dict() {
-        let path = std::env::temp_dir().join("ft_test_st_empty.safetensors");
+        let path = test_temp_path("ft_test_st_empty.safetensors");
         let _ = std::fs::remove_file(&path);
         let sd: BTreeMap<String, DenseTensor> = BTreeMap::new();
 
@@ -3036,7 +3063,7 @@ mod tests {
 
     #[test]
     fn safetensors_multiple_tensors() {
-        let path = std::env::temp_dir().join("ft_test_st_multi.safetensors");
+        let path = test_temp_path("ft_test_st_multi.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         sd.insert(
@@ -3071,7 +3098,7 @@ mod tests {
 
     #[test]
     fn safetensors_with_metadata() {
-        let path = std::env::temp_dir().join("ft_test_st_meta.safetensors");
+        let path = test_temp_path("ft_test_st_meta.safetensors");
         let _ = std::fs::remove_file(&path);
         let mut sd = BTreeMap::new();
         sd.insert("x".to_string(), make_f64_tensor(vec![1.0], vec![1]));
@@ -3091,7 +3118,7 @@ mod tests {
 
     #[test]
     fn safetensors_no_metadata() {
-        let path = std::env::temp_dir().join("ft_test_st_nometa.safetensors");
+        let path = test_temp_path("ft_test_st_nometa.safetensors");
         let _ = std::fs::remove_file(&path);
         let sd: BTreeMap<String, DenseTensor> = BTreeMap::new();
 
@@ -3107,7 +3134,7 @@ mod tests {
         let mut sd = BTreeMap::new();
         sd.insert("a".to_string(), make_f64_tensor(vec![1.0, 2.0], vec![2]));
 
-        let path = std::env::temp_dir().join("ft_test_st_bytes.safetensors");
+        let path = test_temp_path("ft_test_st_bytes.safetensors");
         let _ = std::fs::remove_file(&path);
         save_safetensors(&sd, &path, None).unwrap();
         let bytes = std::fs::read(&path).unwrap();
@@ -3260,7 +3287,7 @@ mod tests {
 
     #[test]
     fn native_format_round_trip_zero_element_tensor() {
-        let dir = std::env::temp_dir().join("ft_test_zero_elem");
+        let dir = test_temp_path("ft_test_zero_elem");
         let _ = std::fs::remove_file(&dir);
         let mut sd = BTreeMap::new();
         sd.insert("empty".to_string(), make_f64_tensor(vec![], vec![0]));
@@ -3276,7 +3303,7 @@ mod tests {
 
     #[test]
     fn native_format_round_trip_high_dimensional_tensor() {
-        let dir = std::env::temp_dir().join("ft_test_high_dim");
+        let dir = test_temp_path("ft_test_high_dim");
         let _ = std::fs::remove_file(&dir);
         let mut sd = BTreeMap::new();
         // 5D tensor: [1, 1, 1, 1, 2]
