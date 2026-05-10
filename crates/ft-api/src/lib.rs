@@ -6039,6 +6039,22 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// `torch.float_power(input, exponent)` parity alias.
+    ///
+    /// torch.float_power is identical to torch.pow but always
+    /// promotes to a floating-point dtype before exponentiation.
+    /// ft-api is f32/f64-only so the dtype-promotion is a no-op
+    /// here; the method delegates to `tensor_pow`. Provided so
+    /// torch code using `float_power` ports verbatim. Tracked
+    /// under frankentorch-xkdg.
+    pub fn tensor_float_power(
+        &mut self,
+        input: TensorNodeId,
+        exponent: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pow(input, exponent)
+    }
+
     /// Element-wise power with a tensor exponent: `input^exponent`.
     ///
     /// Equivalent to `torch.pow(input, exponent)` when `exponent` is
@@ -39585,6 +39601,55 @@ mod tests {
         for (i, (a, b)) in v_lg.iter().zip(v_gn.iter()).enumerate() {
             assert_eq!(a.to_bits(), b.to_bits(), "i={i}: lgamma={a}, gammaln={b}");
         }
+    }
+
+    #[test]
+    fn float_power_matches_pow_for_finite_exponents() {
+        // tensor_float_power is a thin alias of tensor_pow
+        // (frankentorch-xkdg) — verify parity across positive,
+        // negative, and fractional exponents.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xs = vec![2.0_f64, 0.5, 4.0, 9.0];
+        let n = xs.len();
+        let a = s
+            .tensor_variable(xs.clone(), vec![n], false)
+            .unwrap();
+        let b = s.tensor_variable(xs, vec![n], false).unwrap();
+        for exp in [3.0, -1.0, 0.5, 2.0] {
+            let p = s.tensor_pow(a, exp).unwrap();
+            let fp = s.tensor_float_power(b, exp).unwrap();
+            let v_p = s.tensor_values(p).unwrap();
+            let v_fp = s.tensor_values(fp).unwrap();
+            for (i, (x, y)) in v_p.iter().zip(v_fp.iter()).enumerate() {
+                assert_eq!(
+                    x.to_bits(),
+                    y.to_bits(),
+                    "exp={exp} i={i}: pow={x}, float_power={y}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn float_power_known_values() {
+        // float_power(2, 3) = 8; float_power(0.5, -1) = 2.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![2.0_f64, 0.5], vec![2], false)
+            .unwrap();
+        let cubed = s.tensor_float_power(x, 3.0).unwrap();
+        let v = s.tensor_values(cubed).unwrap();
+        assert!((v[0] - 8.0).abs() < 1e-12, "float_power(2, 3) = {}", v[0]);
+        assert!(
+            (v[1] - 0.125).abs() < 1e-12,
+            "float_power(0.5, 3) = {}",
+            v[1]
+        );
+
+        let inv = s.tensor_float_power(x, -1.0).unwrap();
+        let v_inv = s.tensor_values(inv).unwrap();
+        assert!((v_inv[0] - 0.5).abs() < 1e-12);
+        assert!((v_inv[1] - 2.0).abs() < 1e-12);
     }
 
     #[test]
