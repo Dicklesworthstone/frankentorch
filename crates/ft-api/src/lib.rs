@@ -5768,17 +5768,43 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        if self.tensor_requires_grad(input)? {
-            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "i0e: autograd not yet supported (needs tensor_special_i1). Tracked under frankentorch-2vxa.",
-                },
-            )));
-        }
-        let vals = self.tensor_values(input)?;
-        let shape = self.tensor_shape(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_i0e_scalar(x)).collect();
-        self.tensor_variable(result, shape, false)
+        // Autograd-aware via product rule (frankentorch-0wcm,
+        // unblocked by ner6's i1e):
+        //   d/dx i0e(x) = i1e(x) - sign(x) * i0e(x)
+        //
+        // i0e has a corner at x = 0 (derivative jumps from -1 to
+        // +1). Convention: sign(0) = 0 gives gradient = i1e(0) =
+        // 0, matching torch's autograd choice for the
+        // non-differentiable point.
+        self.tensor_apply_function(
+            &[input],
+            |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                let result: Vec<f64> = vals.iter().map(|&x| bessel_i0e_scalar(x)).collect();
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                Ok((result, shape.to_vec()))
+            },
+            |ctx, grad_outputs| {
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                let grad_y = grad_outputs[0];
+                let grad_x: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_y.iter())
+                    .map(|(&x, &gy)| {
+                        let signum = if x > 0.0 {
+                            1.0
+                        } else if x < 0.0 {
+                            -1.0
+                        } else {
+                            0.0
+                        };
+                        gy * (bessel_i1e_scalar(x) - signum * bessel_i0e_scalar(x))
+                    })
+                    .collect();
+                Ok(vec![Some(grad_x)])
+            },
+        )
     }
 
     /// Modified Bessel function of the first kind, order 1.
@@ -39332,6 +39358,28 @@ mod tests {
             (v[0] - 0.03989).abs() < 1e-3,
             "i0e(100) ≈ 0.03989, got {}",
             v[0]
+        );
+    }
+
+    #[test]
+    fn i0e_propagates_gradient_via_product_rule() {
+        // d/dx i0e(x) = i1e(x) - sign(x) * i0e(x).
+        // At x = 1: i1e(1) - i0e(1) = exp(-1) * (i1(1) - i0(1))
+        //         ≈ 0.3679 * (0.5651591 - 1.2660658)
+        //         ≈ 0.3679 * (-0.7009067)
+        //         ≈ -0.2579.
+        // (frankentorch-0wcm — autograd unblock).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let out = s.tensor_special_i0e(x).unwrap();
+        let report = s.tensor_backward(out).unwrap();
+        let g = s.tensor_gradient(&report, x).unwrap();
+        let expected = (-1.0_f64).exp() * (0.56515910 - 1.26606587);
+        assert!(
+            (g[0] - expected).abs() < 5e-7,
+            "i0e grad at x=1 = {}, expected ≈ {}",
+            g[0],
+            expected
         );
     }
 
