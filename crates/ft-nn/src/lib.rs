@@ -2143,6 +2143,18 @@ impl Module for AlphaDropout {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        // Validate p before sampling — non-finite or out-of-range
+        // probabilities yield nonsensical masks and non-finite
+        // affine coefficients (a = 1/sqrt((1-p)(1+p*alpha_p²))
+        // can be NaN or inf for invalid p). Mirrors the guard
+        // already in Dropout. Tracked under frankentorch-pi1t.
+        if !self.p.is_finite() || !(0.0..=1.0).contains(&self.p) {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "alpha_dropout probability p must be finite and in [0, 1]",
+                },
+            )));
+        }
         if !self.training.get() || self.p == 0.0 {
             return Ok(input);
         }
@@ -4338,20 +4350,34 @@ impl Module for RReLU {
     ) -> Result<TensorNodeId, AutogradError> {
         // RReLU(x) = x         if x >= 0
         //          = slope * x otherwise
-        // where slope is the midpoint of [lower, upper] for
-        // deterministic eval-mode replay (training-mode random
-        // sampling is intentionally not implemented — det contract).
+        // where slope is sampled element-wise from U(lower, upper)
+        // during training and is the midpoint of [lower, upper] for
+        // deterministic eval-mode replay.
         //
         // Composed as where(x >= 0, x, slope * x) using tensor_ge,
         // tensor_mul (with broadcast `slope` constant), and
         // tensor_where. Backward routes the gradient correctly:
         //   x >= 0: 1
-        //   x <  0: slope
-        let slope = (self.lower + self.upper) / 2.0;
-        let shape = session.tensor_shape(input)?;
-        let slope_t = session.full(shape.clone(), slope, false)?;
+        //   x <  0: realized slope
+        if !self.lower.is_finite() || !self.upper.is_finite() || self.lower > self.upper {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "RReLU: lower and upper must be finite with lower <= upper",
+                },
+            )));
+        }
+
+        let slope_t = if self.training.get() {
+            let random = session.rand_like(input, false)?;
+            let span = session.full_like(input, self.upper - self.lower, false)?;
+            let scaled = session.tensor_mul(span, random)?;
+            let lower = session.full_like(input, self.lower, false)?;
+            session.tensor_add(lower, scaled)?
+        } else {
+            session.full_like(input, (self.lower + self.upper) / 2.0, false)?
+        };
         let neg_branch = session.tensor_mul(slope_t, input)?;
-        let zeros = session.full(shape, 0.0, false)?;
+        let zeros = session.zeros_like(input, false)?;
         let mask = session.tensor_ge(input, zeros)?;
         session.tensor_where(mask, input, neg_branch)
     }
@@ -14913,6 +14939,84 @@ mod tests {
         assert!(d.parameters().is_empty());
     }
 
+    #[test]
+    fn alpha_dropout_invalid_probability_fails_closed() {
+        // AlphaDropout must reject NaN, negative, and >1 p — same
+        // contract as Dropout. Without this guard, the affine
+        // coefficient a = 1/sqrt((1-p)(1+p*alpha_p²)) goes
+        // non-finite for p outside [0, 1] and the keep-mask
+        // sample becomes nonsensical. Tracked under
+        // frankentorch-pi1t.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("variable");
+
+        for p in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let d = AlphaDropout::new(p);
+            let err = d
+                .forward(&mut session, x)
+                .expect_err("invalid alpha_dropout probability must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "alpha_dropout probability p must be finite and in [0, 1]"
+                        }
+                    ))
+                ),
+                "p={p}: unexpected error {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn alpha_dropout_p_at_boundaries_succeeds() {
+        // Boundary values 0 and 1 are valid: p=0 short-circuits
+        // to identity, p=1 produces a degenerate but well-defined
+        // output (every element drops to the SELU saturation).
+        // Neither should be rejected by the new finite/range
+        // guard.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .expect("variable");
+        let d_zero = AlphaDropout::new(0.0);
+        d_zero
+            .forward(&mut session, x)
+            .expect("p=0 must succeed (identity)");
+        let d_one = AlphaDropout::new(1.0);
+        d_one
+            .forward(&mut session, x)
+            .expect("p=1 must succeed (full drop)");
+    }
+
+    #[test]
+    fn alpha_dropout_eval_with_invalid_p_still_fails_closed_in_train() {
+        // Eval mode short-circuits to identity, BUT the
+        // probability validation must fire BEFORE the eval
+        // short-circuit so an invalid p is rejected even when
+        // training=false. (Symmetric with the Dropout pattern.)
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], false)
+            .expect("variable");
+        let d = AlphaDropout::new(f64::NAN);
+        d.eval();
+        let err = d
+            .forward(&mut session, x)
+            .expect_err("eval with NaN p must still fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "alpha_dropout probability p must be finite and in [0, 1]"
+                }
+            ))
+        ));
+    }
+
     // ── Loss function tests (bd-2f7k.10) ──────────────────────────────
 
     #[test]
@@ -24984,6 +25088,7 @@ mod tests {
     fn rrelu_module_negative_scaled() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let m = RReLU::new(0.1, 0.3);
+        m.eval();
         let input = session
             .tensor_variable(vec![-10.0], vec![1], false)
             .unwrap();
@@ -25015,6 +25120,7 @@ mod tests {
         const SLOPE: f64 = (LOWER + UPPER) / 2.0;
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let m = RReLU::new(LOWER, UPPER);
+        m.eval();
         let input = session
             .tensor_variable(vec![-2.0, -0.5, 0.0, 0.5, 2.0], vec![5], true)
             .unwrap();
@@ -25031,6 +25137,98 @@ mod tests {
                 "RReLU grad[{i}] = {g}, expected {want}"
             );
         }
+    }
+
+    #[test]
+    fn rrelu_training_samples_negative_slopes_in_range_and_advances_rng() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = RReLU::new(0.1, 0.3);
+        let input_values = vec![-10.0, -8.0, -6.0, -4.0, -2.0, 0.0, 2.0];
+        let input_a = session
+            .tensor_variable(input_values.clone(), vec![input_values.len()], false)
+            .unwrap();
+        let out_a = m.forward(&mut session, input_a).unwrap();
+        let vals_a = session.tensor_values(out_a).unwrap();
+
+        let input_b = session
+            .tensor_variable(input_values.clone(), vec![input_values.len()], false)
+            .unwrap();
+        let out_b = m.forward(&mut session, input_b).unwrap();
+        let vals_b = session.tensor_values(out_b).unwrap();
+
+        let mut saw_changed_slope = false;
+        for i in 0..5 {
+            let slope_a = vals_a[i] / input_values[i];
+            let slope_b = vals_b[i] / input_values[i];
+            assert!(
+                (0.1..0.3).contains(&slope_a),
+                "training RReLU slope_a[{i}]={slope_a} not in [0.1, 0.3)"
+            );
+            assert!(
+                (0.1..0.3).contains(&slope_b),
+                "training RReLU slope_b[{i}]={slope_b} not in [0.1, 0.3)"
+            );
+            saw_changed_slope |= (slope_a - slope_b).abs() > 1e-12;
+        }
+        assert!(
+            saw_changed_slope,
+            "successive training forwards must consume RNG and vary negative slopes"
+        );
+        assert_eq!(vals_a[5], 0.0, "zero is in the passthrough branch");
+        assert_eq!(vals_a[6], 2.0, "positive values pass through");
+    }
+
+    #[test]
+    fn rrelu_training_backward_uses_realized_negative_slopes() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = RReLU::new(0.1, 0.3);
+        let input_values = vec![-2.0, -0.5, 0.0, 0.5, 2.0];
+        let input = session
+            .tensor_variable(input_values.clone(), vec![5], true)
+            .unwrap();
+        let out = m.forward(&mut session, input).unwrap();
+        let vals = session.tensor_values(out).unwrap();
+        let realized_slopes = [vals[0] / input_values[0], vals[1] / input_values[1]];
+        for (i, slope) in realized_slopes.iter().copied().enumerate() {
+            assert!(
+                (0.1..0.3).contains(&slope),
+                "training RReLU realized slope[{i}]={slope} not in [0.1, 0.3)"
+            );
+        }
+
+        let loss = session.tensor_sum(out).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+        let grad = session
+            .tensor_gradient(&report, input)
+            .expect("training RReLU must propagate gradient to input");
+        let expected = [realized_slopes[0], realized_slopes[1], 1.0, 1.0, 1.0];
+        for (i, (&g, &want)) in grad.iter().zip(expected.iter()).enumerate() {
+            assert!(
+                (g - want).abs() < 1e-12,
+                "training RReLU grad[{i}] = {g}, expected realized slope {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn rrelu_rejects_invalid_slope_bounds() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        assert!(RReLU::new(0.3, 0.1).forward(&mut session, input).is_err());
+
+        let input = session.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        assert!(
+            RReLU::new(f64::NAN, 0.3)
+                .forward(&mut session, input)
+                .is_err()
+        );
+
+        let input = session.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        assert!(
+            RReLU::new(0.1, f64::INFINITY)
+                .forward(&mut session, input)
+                .is_err()
+        );
     }
 
     // ── RNN utils tests ──────────────────────────────────────────────────
