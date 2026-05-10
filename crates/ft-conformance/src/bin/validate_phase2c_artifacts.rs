@@ -41,6 +41,8 @@ const RAPTORQ_REPAIR_MANIFEST_FILE: &str =
     "artifacts/phase2c/RAPTORQ_REPAIR_SYMBOL_MANIFEST_V1.json";
 const RAPTORQ_SCRUB_REPORT_FILE: &str = "artifacts/phase2c/RAPTORQ_INTEGRITY_SCRUB_REPORT_V1.json";
 const RAPTORQ_DECODE_EVENTS_FILE: &str = "artifacts/phase2c/RAPTORQ_DECODE_PROOF_EVENTS_V1.json";
+const DISABLE_PACKET_PARALLELISM_ENV: &str = "FT_DISABLE_PACKET_PARALLELISM";
+const PACKET_VALIDATOR_WORKERS_ENV: &str = "FT_PACKET_VALIDATOR_WORKERS";
 const REQUIRED_ALLOWLIST_TOP_LEVEL_KEYS: [&str; 5] = [
     "schema_version",
     "policy",
@@ -286,13 +288,13 @@ fn validate_packets(packet_dirs: Vec<(String, PathBuf)>) -> Vec<PacketValidation
         return Vec::new();
     }
 
-    let workers = if std::env::var_os("FT_DISABLE_PACKET_PARALLELISM").is_some() {
-        1
-    } else {
-        std::thread::available_parallelism()
-            .map_or(1, |parallelism| parallelism.get())
-            .min(packet_dirs.len())
-    };
+    let worker_cap = std::env::var(PACKET_VALIDATOR_WORKERS_ENV).ok();
+    let workers = select_packet_worker_count(
+        packet_dirs.len(),
+        std::env::var_os(DISABLE_PACKET_PARALLELISM_ENV).is_some(),
+        worker_cap.as_deref(),
+        std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get()),
+    );
 
     if workers <= 1 {
         let mut packets = Vec::with_capacity(packet_dirs.len());
@@ -324,6 +326,31 @@ fn validate_packets(packet_dirs: Vec<(String, PathBuf)>) -> Vec<PacketValidation
         }
     });
     packets
+}
+
+fn select_packet_worker_count(
+    packet_count: usize,
+    disable_parallelism: bool,
+    configured_cap: Option<&str>,
+    available_parallelism: usize,
+) -> usize {
+    if packet_count == 0 {
+        return 0;
+    }
+
+    if disable_parallelism {
+        return 1;
+    }
+
+    let mut workers = available_parallelism.max(1);
+    if let Some(cap) = configured_cap
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|cap| *cap > 0)
+    {
+        workers = workers.min(cap);
+    }
+
+    workers.clamp(1, packet_count)
 }
 
 fn validate_packet(packet_id: &str, packet_path: &Path) -> PacketValidation {
@@ -827,7 +854,7 @@ fn default_root() -> PathBuf {
 
 #[cfg(test)]
 mod tests {
-    use super::{check_required_keys, validate_markdown};
+    use super::{check_required_keys, select_packet_worker_count, validate_markdown};
     use serde_json::json;
     use std::collections::BTreeMap;
 
@@ -879,5 +906,36 @@ mod tests {
 
         assert!(errors.is_empty());
         assert_eq!(checks.get("md_non_empty:legacy_anchor_map.md"), Some(&true));
+    }
+
+    #[test]
+    fn packet_worker_count_defaults_to_available_parallelism() {
+        let workers = select_packet_worker_count(8, false, None, 4);
+        assert_eq!(workers, 4);
+    }
+
+    #[test]
+    fn packet_worker_count_clamps_to_packet_count() {
+        let workers = select_packet_worker_count(3, false, Some("16"), 8);
+        assert_eq!(workers, 3);
+    }
+
+    #[test]
+    fn packet_worker_count_honors_explicit_positive_cap() {
+        let workers = select_packet_worker_count(8, false, Some("2"), 16);
+        assert_eq!(workers, 2);
+    }
+
+    #[test]
+    fn packet_worker_count_disable_env_wins_over_cap() {
+        let workers = select_packet_worker_count(8, true, Some("6"), 16);
+        assert_eq!(workers, 1);
+    }
+
+    #[test]
+    fn packet_worker_count_ignores_invalid_cap_values() {
+        assert_eq!(select_packet_worker_count(8, false, Some("not-a-number"), 4), 4);
+        assert_eq!(select_packet_worker_count(8, false, Some("0"), 4), 4);
+        assert_eq!(select_packet_worker_count(8, false, Some(" 3 "), 4), 3);
     }
 }
