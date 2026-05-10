@@ -5775,6 +5775,58 @@ impl FrankenTorchSession {
         self.tensor_variable(result, shape, false)
     }
 
+    /// Modified Bessel function of the first kind, order 1.
+    ///
+    /// Equivalent to `torch.special.i1(input)`. Uses A&S 9.8.3
+    /// / 9.8.4 piecewise polynomials. Odd in x:
+    /// `i1(-x) = -i1(x)`. Used in von Mises gradients and
+    /// heat-equation kernels. Tracked under frankentorch-ner6.
+    ///
+    /// Autograd: not yet supported. The analytical backward
+    /// `d/dx i1(x) = (i0(x) + i2(x)) / 2` would need both `i0`
+    /// (have it) and `i2` (not ported). Fail-loud on
+    /// `requires_grad=true` until the chain is wired.
+    pub fn tensor_special_i1(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "i1: autograd not yet supported (d/dx i1 = (i0 + i2) / 2 needs i2). Tracked under frankentorch-ner6.",
+                },
+            )));
+        }
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let result: Vec<f64> = vals.iter().map(|&x| bessel_i1_scalar(x)).collect();
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Exponentially scaled modified Bessel of the first kind,
+    /// order 1: `i1e(x) = exp(-|x|) * i1(x)`.
+    ///
+    /// Equivalent to `torch.special.i1e(input)`. Stays bounded for
+    /// large `|x|` where `i1(x)` would overflow. Same fail-loud
+    /// autograd policy as `tensor_special_i1`. Tracked under
+    /// frankentorch-ner6.
+    pub fn tensor_special_i1e(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "i1e: autograd not yet supported. Tracked under frankentorch-ner6.",
+                },
+            )));
+        }
+        let vals = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        let result: Vec<f64> = vals.iter().map(|&x| bessel_i1e_scalar(x)).collect();
+        self.tensor_variable(result, shape, false)
+    }
+
     /// Numerically stable log of the standard normal CDF.
     ///
     /// Equivalent to `torch.special.log_ndtr(input)`. Uses
@@ -8320,11 +8372,7 @@ impl FrankenTorchSession {
                 let patch = self.tensor_narrow(row_slice, 3, w_start, w_len)?;
                 let summed_w = self.tensor_sum_dim(patch, 3)?;
                 let summed = self.tensor_sum_dim(summed_w, 2)?;
-                let count = Self::checked_mul(
-                    h_len,
-                    w_len,
-                    "adaptive_avg_pool2d count overflow",
-                )?;
+                let count = Self::checked_mul(h_len, w_len, "adaptive_avg_pool2d count overflow")?;
                 let divisor = self.full_like(summed, count as f64, false)?;
                 let avg = self.tensor_div(summed, divisor)?;
                 patches.push(self.tensor_reshape(avg, vec![n, c, 1])?);
@@ -8391,16 +8439,10 @@ impl FrankenTorchSession {
                     let summed_w = self.tensor_sum_dim(patch, 4)?;
                     let summed_h = self.tensor_sum_dim(summed_w, 3)?;
                     let summed = self.tensor_sum_dim(summed_h, 2)?;
-                    let hw_len = Self::checked_mul(
-                        h_len,
-                        w_len,
-                        "adaptive_avg_pool3d count overflow",
-                    )?;
-                    let count = Self::checked_mul(
-                        d_len,
-                        hw_len,
-                        "adaptive_avg_pool3d count overflow",
-                    )?;
+                    let hw_len =
+                        Self::checked_mul(h_len, w_len, "adaptive_avg_pool3d count overflow")?;
+                    let count =
+                        Self::checked_mul(d_len, hw_len, "adaptive_avg_pool3d count overflow")?;
                     let divisor = self.full_like(summed, count as f64, false)?;
                     let avg = self.tensor_div(summed, divisor)?;
                     patches.push(self.tensor_reshape(avg, vec![n, c, 1])?);
@@ -20517,6 +20559,89 @@ fn bessel_i0e_scalar(x: f64) -> f64 {
         );
         poly / ax.sqrt()
     }
+}
+
+/// Scalar modified Bessel I1 via Abramowitz & Stegun 9.8.3 / 9.8.4
+/// (frankentorch-ner6). Odd in x. The polynomial pieces are rated
+/// to ~1.6e-7 relative.
+fn bessel_i1_scalar(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    let ax = x.abs();
+    if ax == 0.0 {
+        return 0.0;
+    }
+    let result = if ax < 3.75 {
+        // A&S 9.8.3: i1(x)/x ≈ Σ b_k * t^k where t = (x/3.75)².
+        let t = (x / 3.75).powi(2);
+        ax * eval_poly_f64(
+            t,
+            &[
+                0.5,
+                0.87890594,
+                0.51498869,
+                0.15084934,
+                0.02658733,
+                0.00301532,
+                0.00032411,
+            ],
+        )
+    } else {
+        // A&S 9.8.4: i1(x) ≈ exp(|x|)/sqrt(|x|) * P(3.75/|x|).
+        let u = 3.75 / ax;
+        let poly = eval_poly_f64(
+            u,
+            &[
+                0.39894228,
+                -0.03988024,
+                -0.00362018,
+                0.00163801,
+                -0.01031555,
+                0.02282967,
+                -0.02895312,
+                0.01787654,
+                -0.00420059,
+            ],
+        );
+        ax.exp() / ax.sqrt() * poly
+    };
+    if x < 0.0 { -result } else { result }
+}
+
+/// Exponentially scaled I1: `exp(-|x|) * i1(x)`. Same A&S
+/// polynomials, with the exp(|x|) cancelled inside the large-x
+/// branch so the result stays bounded for arbitrary x. Tracked
+/// under frankentorch-ner6.
+fn bessel_i1e_scalar(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    let ax = x.abs();
+    if ax == 0.0 {
+        return 0.0;
+    }
+    let result = if ax < 3.75 {
+        bessel_i1_scalar(x).abs() * (-ax).exp()
+    } else {
+        let u = 3.75 / ax;
+        let poly = eval_poly_f64(
+            u,
+            &[
+                0.39894228,
+                -0.03988024,
+                -0.00362018,
+                0.00163801,
+                -0.01031555,
+                0.02282967,
+                -0.02895312,
+                0.01787654,
+                -0.00420059,
+            ],
+        );
+        poly / ax.sqrt()
+    };
+    if x < 0.0 { -result } else { result }
 }
 
 /// Numerically stable scalar log_ndtr (frankentorch-2mb1).
@@ -35473,10 +35598,7 @@ mod tests {
         let grad = s.tensor_gradient(&report, input).expect("input grad");
         let expected = [1.0 / 3.0, 1.0 / 3.0, 2.0 / 3.0, 1.0 / 3.0, 1.0 / 3.0];
         for (i, (&got, &want)) in grad.iter().zip(expected.iter()).enumerate() {
-            assert!(
-                (got - want).abs() < 1e-10,
-                "grad[{i}]={got}, want {want}"
-            );
+            assert!((got - want).abs() < 1e-10, "grad[{i}]={got}, want {want}");
         }
     }
 
@@ -38960,6 +39082,87 @@ mod tests {
                 g = grad[i]
             );
         }
+    }
+
+    // ── tensor_special_i1 / i1e tests (frankentorch-ner6) ─────────────
+
+    #[test]
+    fn i1_at_zero_is_zero() {
+        // i1(0) = 0 by parity (i1 is odd).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let out = s.tensor_special_i1(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].abs() < 1e-12, "i1(0) = {}", v[0]);
+    }
+
+    #[test]
+    fn i1_at_one_matches_known_value() {
+        // i1(1) ≈ 0.5651591040 (standard reference).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let out = s.tensor_special_i1(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(
+            (v[0] - 0.56515910).abs() < 5e-7,
+            "i1(1) = {}, expected ≈ 0.5651591",
+            v[0]
+        );
+    }
+
+    #[test]
+    fn i1_is_odd() {
+        // i1 is odd: i1(-x) bit-equals -i1(x).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![2.0, -2.0, 5.0, -5.0], vec![4], false)
+            .unwrap();
+        let out = s.tensor_special_i1(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!((v[0] + v[1]).abs() < 1e-7, "i1(2) + i1(-2) = {}", v[0] + v[1]);
+        assert!((v[2] + v[3]).abs() < 1e-7, "i1(5) + i1(-5) = {}", v[2] + v[3]);
+    }
+
+    #[test]
+    fn i1_propagates_nan() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![f64::NAN], vec![1], false).unwrap();
+        let out = s.tensor_special_i1(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].is_nan());
+    }
+
+    #[test]
+    fn i1_fails_loud_on_requires_grad() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let result = s.tensor_special_i1(x);
+        assert!(result.is_err(), "i1 with requires_grad must fail closed");
+    }
+
+    #[test]
+    fn i1e_at_zero_is_zero() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let out = s.tensor_special_i1e(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].abs() < 1e-12, "i1e(0) = {}", v[0]);
+    }
+
+    #[test]
+    fn i1e_stays_bounded_for_large_input() {
+        // i1e(100) is finite (~ 1/sqrt(2π·100) ≈ 0.0398942 with a
+        // small correction). i1(100) would overflow.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![100.0], vec![1], false).unwrap();
+        let out = s.tensor_special_i1e(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].is_finite(), "i1e(100) must stay finite, got {}", v[0]);
+        assert!(
+            v[0] > 0.0 && v[0] < 0.05,
+            "i1e(100) ≈ 0.0398, got {}",
+            v[0]
+        );
     }
 
     // ── tensor_special_i0 / i0e tests (frankentorch-2vxa) ─────────────
