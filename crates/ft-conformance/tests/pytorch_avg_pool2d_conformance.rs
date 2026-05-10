@@ -1,7 +1,5 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
-
 use ft_api::FrankenTorchSession;
+use ft_conformance::{HarnessConfig, run_legacy_oracle_script};
 use ft_core::ExecutionMode;
 use serde_json::{Value, json};
 
@@ -143,15 +141,17 @@ fn avg_pool2d_padding_divisor_matches_pytorch_known_fixtures() {
 }
 
 fn torch_available() -> bool {
-    Command::new("python3")
-        .arg("-c")
-        .arg("import torch")
-        .stdin(Stdio::null())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .map(|status| status.success())
-        .unwrap_or(false)
+    let script = r#"
+import json
+import torch
+print(json.dumps({"ok": True}, sort_keys=True))
+"#;
+    run_legacy_oracle_script(
+        &HarnessConfig::default(),
+        script,
+        &json!({"probe": "torch"}),
+    )
+    .is_ok()
 }
 
 fn query_torch_avg_pool2d(cases: &[AvgPool2dCase]) -> Option<Value> {
@@ -203,27 +203,10 @@ for case in req["cases"]:
 print(json.dumps({"cases": out}))
 "#;
 
-    let mut child = Command::new("python3")
-        .arg("-c")
-        .arg(script)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("python3 torch subprocess must spawn after availability check");
-    let mut stdin = child.stdin.take().expect("torch stdin");
-    stdin
-        .write_all(payload.to_string().as_bytes())
-        .expect("write torch payload");
-    drop(stdin);
-
-    let output = child.wait_with_output().expect("wait for torch subprocess");
-    assert!(
-        output.status.success(),
-        "torch avg_pool2d subprocess failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Some(serde_json::from_slice(&output.stdout).expect("torch response must be valid JSON"))
+    Some(
+        run_legacy_oracle_script(&HarnessConfig::default(), script, &payload)
+            .expect("torch avg_pool2d oracle must run after availability check"),
+    )
 }
 
 #[test]

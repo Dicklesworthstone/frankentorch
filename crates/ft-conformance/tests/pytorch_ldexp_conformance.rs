@@ -1,7 +1,5 @@
-use std::io::Write;
-use std::process::{Command, Stdio};
-
 use ft_api::FrankenTorchSession;
+use ft_conformance::{HarnessConfig, run_legacy_oracle_script};
 use ft_core::ExecutionMode;
 use serde_json::{Value, json};
 
@@ -68,24 +66,17 @@ fn decode_scalar(value: &Value) -> f64 {
 }
 
 fn torch_available() -> bool {
-    let mut child = match Command::new("python3")
-        .arg("-")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    {
-        Ok(child) => child,
-        Err(_) => return false,
-    };
-    let Some(mut stdin) = child.stdin.take() else {
-        return false;
-    };
-    if stdin.write_all(b"import torch\n").is_err() {
-        return false;
-    }
-    drop(stdin);
-    child.wait().map(|status| status.success()).unwrap_or(false)
+    let script = r#"
+import json
+import torch
+print(json.dumps({"ok": True}, sort_keys=True))
+"#;
+    run_legacy_oracle_script(
+        &HarnessConfig::default(),
+        script,
+        &json!({"probe": "torch"}),
+    )
+    .is_ok()
 }
 
 fn query_torch_ldexp(cases: &[LdexpCase]) -> Option<Value> {
@@ -139,7 +130,7 @@ def encode_scalar(value):
         return "-0.0"
     return value
 
-req = json.loads(sys.argv[1])
+req = json.loads(sys.stdin.read())
 out = []
 for case in req["cases"]:
     input_tensor = torch.tensor(
@@ -166,27 +157,10 @@ except RuntimeError:
 print(json.dumps({"cases": out, "mismatch_error": mismatch_error}, sort_keys=True))
 "#;
 
-    let mut child = Command::new("python3")
-        .arg("-")
-        .arg(payload.to_string())
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
-    let mut stdin = child.stdin.take()?;
-    if stdin.write_all(script.as_bytes()).is_err() {
-        return None;
-    }
-    drop(stdin);
-
-    let output = child.wait_with_output().ok()?;
-    assert!(
-        output.status.success(),
-        "torch ldexp subprocess failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    serde_json::from_slice(&output.stdout).ok()
+    Some(
+        run_legacy_oracle_script(&HarnessConfig::default(), script, &payload)
+            .expect("torch ldexp oracle must run after availability check"),
+    )
 }
 
 fn run_frankentorch(case: &LdexpCase) -> (Vec<usize>, Vec<f64>) {

@@ -9220,7 +9220,8 @@ fn query_legacy_optimizer_oracle(
     Ok(LegacyOptimizerObservation { params })
 }
 
-fn run_legacy_oracle_script(
+/// Runs a legacy Python oracle script with bounded stdin/stdout/stderr and a timeout.
+pub fn run_legacy_oracle_script(
     config: &HarnessConfig,
     script: &str,
     payload: &Value,
