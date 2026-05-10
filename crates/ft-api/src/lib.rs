@@ -6087,6 +6087,33 @@ impl FrankenTorchSession {
         )
     }
 
+    /// Inverse standard normal cumulative distribution function.
+    ///
+    /// Equivalent to `torch.special.ndtri(input)`. Composes
+    /// through the autograd-aware `tensor_erfinv` via the
+    /// closed-form identity:
+    ///
+    ///   ndtri(p) = sqrt(2) * erfinv(2*p - 1)
+    ///
+    /// Used in Gaussian sampling (inverse-CDF method), quantile
+    /// transforms, and probit regression. Real-world sanity
+    /// checks: `ndtri(0.5) = 0`, `ndtri(0.025) ≈ -1.96`,
+    /// `ndtri(0.975) ≈ +1.96`. Tracked under frankentorch-gf4d.
+    pub fn tensor_special_ndtri(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        // 2*p - 1 maps [0, 1] to [-1, 1] which is erfinv's domain.
+        let two = self.full(shape.clone(), 2.0, false)?;
+        let one = self.full(shape.clone(), 1.0, false)?;
+        let sqrt2 = self.full(shape, std::f64::consts::SQRT_2, false)?;
+        let two_p = self.tensor_mul(input, two)?;
+        let two_p_minus_one = self.tensor_sub(two_p, one)?;
+        let erfinv_val = self.tensor_erfinv(two_p_minus_one)?;
+        self.tensor_mul(erfinv_val, sqrt2)
+    }
+
     /// Standard normal cumulative distribution function.
     ///
     /// Equivalent to `torch.special.ndtr(input)`. Composes through
@@ -39693,6 +39720,62 @@ mod tests {
             "log_ndtr grad at x=-10 should be ~10 (Mills ratio), got {}",
             g[0]
         );
+    }
+
+    // ── tensor_special_ndtri tests (frankentorch-gf4d) ────────────────
+
+    #[test]
+    fn ndtri_at_half_returns_zero() {
+        // ndtri(0.5) = 0 (median of standard normal).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.5], vec![1], false).unwrap();
+        let out = s.tensor_special_ndtri(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(v[0].abs() < 1e-10, "ndtri(0.5) = {}", v[0]);
+    }
+
+    #[test]
+    fn ndtri_quantile_values() {
+        // ndtri(0.025) ≈ -1.96 (lower 2.5% quantile)
+        // ndtri(0.975) ≈ +1.96 (upper 2.5% quantile)
+        // erfinv has loose A&S accuracy (~1e-6 relative); allow
+        // 1e-4 absolute tolerance.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.025, 0.975], vec![2], false)
+            .unwrap();
+        let out = s.tensor_special_ndtri(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!(
+            (v[0] + 1.95996398).abs() < 1e-4,
+            "ndtri(0.025) = {}",
+            v[0]
+        );
+        assert!(
+            (v[1] - 1.95996398).abs() < 1e-4,
+            "ndtri(0.975) = {}",
+            v[1]
+        );
+    }
+
+    #[test]
+    fn ndtri_inverse_relationship_with_ndtr() {
+        // For p in (0, 1): ndtr(ndtri(p)) ≈ p.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ps = vec![0.1, 0.3, 0.5, 0.7, 0.9];
+        let n = ps.len();
+        let p_in = s.tensor_variable(ps.clone(), vec![n], false).unwrap();
+        let inv = s.tensor_special_ndtri(p_in).unwrap();
+        let back = s.tensor_special_ndtr(inv).unwrap();
+        let v = s.tensor_values(back).unwrap();
+        for (i, (got, expected)) in v.iter().zip(ps.iter()).enumerate() {
+            // ndtri uses erfinv (looser accuracy), so allow 1e-5
+            // absolute tolerance for the round-trip.
+            assert!(
+                (got - expected).abs() < 1e-5,
+                "i={i}: ndtr(ndtri({expected})) = {got}"
+            );
+        }
     }
 
     // ── tensor_special_ndtr tests (frankentorch-7qh9) ─────────────────
