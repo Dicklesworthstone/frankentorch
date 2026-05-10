@@ -14697,6 +14697,91 @@ mod tests {
     }
 
     #[test]
+    fn state_dict_and_registration_diagnostic_snapshots() {
+        let cases = [
+            (
+                "module_invalid_name",
+                ModuleRegistrationError::InvalidName { kind: "parameter" }.to_string(),
+            ),
+            (
+                "module_name_conflict",
+                ModuleRegistrationError::NameConflict {
+                    name: "encoder.weight".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "module_unsupported",
+                ModuleRegistrationError::Unsupported {
+                    module_type: "ft_nn::Linear",
+                    operation: "register_buffer",
+                }
+                .to_string(),
+            ),
+            (
+                "state_autograd",
+                StateDictError::Autograd(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::NoBackendKey,
+                )))
+                .to_string(),
+            ),
+            (
+                "state_dense_tensor",
+                StateDictError::DenseTensor(DenseTensorError::UnsupportedDType(DType::Bool))
+                    .to_string(),
+            ),
+            (
+                "state_duplicate_key",
+                StateDictError::DuplicateStateKey {
+                    key: "layer.weight".to_string(),
+                }
+                .to_string(),
+            ),
+            (
+                "state_unsupported_dtype",
+                StateDictError::UnsupportedDType {
+                    key: "running.count".to_string(),
+                    dtype: DType::I64,
+                }
+                .to_string(),
+            ),
+            (
+                "state_strict_key_mismatch",
+                StateDictError::StrictKeyMismatch {
+                    missing_keys: vec!["weight".to_string(), "bias".to_string()],
+                    unexpected_keys: vec!["extra".to_string()],
+                }
+                .to_string(),
+            ),
+            (
+                "state_shape_mismatch",
+                StateDictError::ShapeMismatch {
+                    key: "layer.weight".to_string(),
+                    expected: vec![2, 3],
+                    found: vec![3, 2],
+                }
+                .to_string(),
+            ),
+            (
+                "state_dtype_mismatch",
+                StateDictError::DTypeMismatch {
+                    key: "layer.bias".to_string(),
+                    expected: DType::F64,
+                    found: DType::F32,
+                }
+                .to_string(),
+            ),
+        ];
+        let rendered = cases
+            .iter()
+            .map(|(name, diagnostic)| format!("{name}: {diagnostic}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        insta::assert_snapshot!("state_dict_and_registration_diagnostics", rendered);
+    }
+
+    #[test]
     fn default_registration_errors_include_module_type_context() {
         let mut module = DummyLeafModule;
 

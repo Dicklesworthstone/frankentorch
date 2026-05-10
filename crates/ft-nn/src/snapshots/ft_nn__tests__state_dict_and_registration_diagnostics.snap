@@ -1,0 +1,14 @@
+---
+source: crates/ft-nn/src/lib.rs
+expression: rendered
+---
+module_invalid_name: invalid parameter registration name
+module_name_conflict: registration name 'encoder.weight' conflicts with existing state
+module_unsupported: ft_nn::Linear does not support 'register_buffer'
+state_autograd: autograd error: dispatch failure: dispatch key failure: dispatch keyset has no backend key
+state_dense_tensor: dense tensor error: unsupported tensor dtype for this storage type: Bool
+state_duplicate_key: duplicate state key 'layer.weight'
+state_unsupported_dtype: state key 'running.count' uses unsupported dtype I64
+state_strict_key_mismatch: strict load_state_dict key mismatch: missing=["weight", "bias"], unexpected=["extra"]
+state_shape_mismatch: shape mismatch for state key 'layer.weight': expected=[2, 3], found=[3, 2]
+state_dtype_mismatch: dtype mismatch for state key 'layer.bias': expected=F64, found=F32

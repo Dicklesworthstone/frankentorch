@@ -11,5 +11,8 @@ ft-autograd = { workspace = true }
 ft-dispatch = { workspace = true }
 ft-kernel-cpu = { workspace = true }
 
+[dev-dependencies]
+insta = "1.47.2"
+
 [lints]
 workspace = true

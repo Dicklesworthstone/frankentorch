@@ -473,6 +473,7 @@ dependencies = [
  "ft-core",
  "ft-dispatch",
  "ft-kernel-cpu",
+ "insta",
 ]
 
 [[package]]
