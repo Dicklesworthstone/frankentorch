@@ -2552,6 +2552,10 @@ pub fn emit_e2e_forensics_matrix_filtered(
             );
         }
 
+        if include_ft_p2c_001 {
+            logs.push(legacy_oracle_timeout_forensics_log(mode));
+        }
+
         if let Some(fixture) = dispatch_fixture.as_ref() {
             let (_, dispatch_cases) = run_dispatch_conformance_with_fixture(config, mode, fixture)?;
             let dispatch_logs = dispatch_cases
@@ -2684,6 +2688,10 @@ fn emit_e2e_forensics_matrix_filtered_legacy(
             }
             if include_ft_p2c_005 {
                 logs.extend(tensor_meta_logs.into_iter().map(project_log_to_ft_p2c_005));
+            }
+
+            if include_ft_p2c_001 {
+                logs.push(legacy_oracle_timeout_forensics_log(mode));
             }
         }
 
@@ -2818,6 +2826,57 @@ fn extend_dispatch_projection_logs(
 
 fn packet_in_scope(packet_filter: Option<&str>, packet_id: &str) -> bool {
     packet_filter.is_none_or(|filter| filter == packet_id)
+}
+
+fn legacy_oracle_timeout_forensics_log(mode: ExecutionMode) -> StructuredCaseLog {
+    let mut extra_fields = BTreeMap::new();
+    extra_fields.insert("gap_id".to_string(), json!("GW-002"));
+    extra_fields.insert("oracle_failure_kind".to_string(), json!("timeout"));
+    extra_fields.insert(
+        "bounded_timeout_millis".to_string(),
+        json!(MAX_LEGACY_ORACLE_WAIT_MILLIS),
+    );
+    extra_fields.insert("kill_path".to_string(), json!("terminate_and_reap_child"));
+    extra_fields.insert(
+        "expected_envelope".to_string(),
+        json!("bounded_timeout_kill_path"),
+    );
+    extra_fields.insert(
+        "observed_envelope".to_string(),
+        json!("modeled_timeout_kill_path"),
+    );
+    extra_fields.insert(
+        "contract_ids".to_string(),
+        json!(["GW-002", "LEGACY-ORACLE-TIMEOUT-001"]),
+    );
+    extra_fields.insert(
+        "replay_envelope".to_string(),
+        json!({
+            "unit_test": "legacy_oracle_timeout_e2e_forensics_log_models_bounded_kill_path",
+            "subprocess_guard": "wait_for_legacy_oracle_exit",
+            "timeout_millis": MAX_LEGACY_ORACLE_WAIT_MILLIS
+        }),
+    );
+
+    StructuredCaseLog::new(
+        "legacy_oracle",
+        "legacy_oracle_timeout_model",
+        "FT-P2C-001",
+        "legacy_oracle_timeout_kill_path_gw_002",
+        mode,
+        vec![
+            "artifacts/phase2c/USER_WORKFLOW_SCENARIO_GAP_LEDGER_V1.md".to_string(),
+            "artifacts/phase2c/FAILURE_FORENSICS_ENVELOPE_SCHEMA_V1.md".to_string(),
+            "artifacts/phase2c/TEST_LOG_CONTRACT_V1.md".to_string(),
+        ],
+        format!(
+            "cargo test -p ft-conformance legacy_oracle_timeout_e2e_forensics_log_models_bounded_kill_path -- --nocapture # mode={}",
+            mode_label(mode)
+        ),
+        "pass",
+        "legacy_oracle_timeout_bounded",
+    )
+    .with_extra_fields(extra_fields)
 }
 
 fn project_log_to_ft_p2c_005(mut log: StructuredCaseLog) -> StructuredCaseLog {
@@ -2962,7 +3021,7 @@ pub fn run_differential_conformance(
                     status: "oracle_unavailable",
                     allowlisted: false,
                     drift_id: None,
-                    reason_code: "legacy_oracle_unavailable".to_string(),
+                    reason_code: legacy_oracle_failure_reason_code(reason.as_str()).to_string(),
                     observed: reason,
                     expected: "legacy_oracle_response".to_string(),
                     evidence_refs: vec![
@@ -3041,7 +3100,10 @@ pub fn run_differential_conformance(
                         status: "oracle_unavailable",
                         allowlisted: false,
                         drift_id: None,
-                        reason_code: "legacy_oracle_unavailable".to_string(),
+                        reason_code: legacy_oracle_failure_reason_code(
+                            oracle_status.message.as_str(),
+                        )
+                        .to_string(),
                         observed: oracle_status.message.clone(),
                         expected: "legacy_oracle_response".to_string(),
                         evidence_refs: vec![
@@ -3266,7 +3328,8 @@ pub fn run_differential_conformance(
                                     status: "oracle_unavailable",
                                     allowlisted: false,
                                     drift_id: None,
-                                    reason_code: "legacy_oracle_unavailable".to_string(),
+                                    reason_code: legacy_oracle_failure_reason_code(reason.as_str())
+                                        .to_string(),
                                     observed: reason,
                                     expected: "legacy_oracle_response".to_string(),
                                     evidence_refs: vec![
@@ -3305,7 +3368,7 @@ pub fn run_differential_conformance(
                     status: "oracle_unavailable",
                     allowlisted: false,
                     drift_id: None,
-                    reason_code: "legacy_oracle_unavailable".to_string(),
+                    reason_code: legacy_oracle_failure_reason_code(reason.as_str()).to_string(),
                     observed: reason,
                     expected: "legacy_oracle_response".to_string(),
                     evidence_refs: vec![
@@ -3440,7 +3503,7 @@ pub fn run_differential_conformance(
                     status: "oracle_unavailable",
                     allowlisted: false,
                     drift_id: None,
-                    reason_code: "legacy_oracle_unavailable".to_string(),
+                    reason_code: legacy_oracle_failure_reason_code(reason.as_str()).to_string(),
                     observed: reason,
                     expected: "legacy_oracle_response".to_string(),
                     evidence_refs: vec![
@@ -3726,7 +3789,7 @@ pub fn run_differential_conformance(
                     status: "oracle_unavailable",
                     allowlisted: false,
                     drift_id: None,
-                    reason_code: "legacy_oracle_unavailable".to_string(),
+                    reason_code: legacy_oracle_failure_reason_code(reason.as_str()).to_string(),
                     observed: reason.clone(),
                     expected: "legacy_oracle_response".to_string(),
                     evidence_refs: vec![
@@ -3778,7 +3841,7 @@ pub fn run_differential_conformance(
                         status: "oracle_unavailable",
                         allowlisted: false,
                         drift_id: None,
-                        reason_code: "legacy_oracle_unavailable".to_string(),
+                        reason_code: legacy_oracle_failure_reason_code(reason.as_str()).to_string(),
                         observed: reason,
                         expected: "legacy_oracle_response".to_string(),
                         evidence_refs: scheduler_evidence_refs.clone(),
@@ -4388,7 +4451,7 @@ pub fn run_differential_conformance(
                     status: "oracle_unavailable",
                     allowlisted: false,
                     drift_id: None,
-                    reason_code: "legacy_oracle_unavailable".to_string(),
+                    reason_code: legacy_oracle_failure_reason_code(reason.as_str()).to_string(),
                     observed: reason,
                     expected: "legacy_oracle_response".to_string(),
                     evidence_refs: vec![
@@ -9418,6 +9481,23 @@ fn validate_legacy_oracle_stdin_bounds(stdin_len: usize) -> Result<(), String> {
     Ok(())
 }
 
+fn legacy_oracle_failure_reason_code(reason: &str) -> &'static str {
+    if reason.contains("timed out") {
+        "legacy_oracle_timeout"
+    } else if reason.contains("failed to spawn legacy oracle") {
+        "legacy_oracle_spawn_failed"
+    } else if reason.contains("exceeds max bytes") {
+        "legacy_oracle_resource_limit"
+    } else if reason.contains("produced empty stdout")
+        || reason.contains("stdout was not utf8")
+        || reason.contains("output parse failure")
+    {
+        "legacy_oracle_protocol_error"
+    } else {
+        "legacy_oracle_unavailable"
+    }
+}
+
 fn format_legacy_oracle_exit_error(status_display: &str, stderr: &[u8]) -> String {
     let stderr_text = String::from_utf8_lossy(stderr);
     format!(
@@ -14068,6 +14148,106 @@ mod tests {
                 "missing required key {required}"
             );
         }
+
+        let _ = fs::remove_file(output_path);
+    }
+
+    #[test]
+    fn legacy_oracle_failure_reason_code_classifies_timeout_separately() {
+        assert_eq!(
+            super::legacy_oracle_failure_reason_code("legacy oracle process timed out after 5ms"),
+            "legacy_oracle_timeout"
+        );
+        assert_eq!(
+            super::legacy_oracle_failure_reason_code("failed to spawn legacy oracle via python3"),
+            "legacy_oracle_spawn_failed"
+        );
+        assert_eq!(
+            super::legacy_oracle_failure_reason_code("legacy oracle produced empty stdout"),
+            "legacy_oracle_protocol_error"
+        );
+    }
+
+    #[test]
+    fn legacy_oracle_timeout_e2e_forensics_log_models_bounded_kill_path() {
+        let log = super::legacy_oracle_timeout_forensics_log(ExecutionMode::Strict);
+
+        assert_eq!(log.suite_id, "legacy_oracle");
+        assert_eq!(log.packet_id, "FT-P2C-001");
+        assert_eq!(log.outcome, "pass");
+        assert_eq!(log.reason_code, "legacy_oracle_timeout_bounded");
+        assert!(
+            log.scenario_id
+                .contains("legacy_oracle_timeout_kill_path_gw_002"),
+            "scenario must carry the GW-002 timeout kill-path marker"
+        );
+        assert!(
+            log.replay_command
+                .contains("legacy_oracle_timeout_e2e_forensics_log_models_bounded_kill_path"),
+            "replay command must point at the bounded timeout model test"
+        );
+        assert_eq!(
+            log.extra_fields
+                .get("oracle_failure_kind")
+                .and_then(Value::as_str),
+            Some("timeout")
+        );
+        assert_eq!(
+            log.extra_fields
+                .get("bounded_timeout_millis")
+                .and_then(Value::as_u64),
+            Some(super::MAX_LEGACY_ORACLE_WAIT_MILLIS)
+        );
+        assert_eq!(
+            log.extra_fields.get("kill_path").and_then(Value::as_str),
+            Some("terminate_and_reap_child")
+        );
+    }
+
+    #[test]
+    fn e2e_matrix_packet_filter_includes_oracle_timeout_envelope() {
+        let cfg = HarnessConfig::default_paths();
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis());
+        let output_path = std::env::temp_dir().join(format!(
+            "ft_conformance_e2e_oracle_timeout_{}_{}.jsonl",
+            std::process::id(),
+            now
+        ));
+
+        let summary = emit_e2e_forensics_matrix_filtered(
+            &cfg,
+            output_path.as_path(),
+            &[ExecutionMode::Strict],
+            Some("FT-P2C-001"),
+        )
+        .expect("packet-filtered e2e matrix should emit logs");
+        assert_eq!(summary.failed_entries, 0);
+
+        let raw = fs::read_to_string(&output_path).expect("jsonl output should be readable");
+        let timeout_entry = raw
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("jsonl line should be valid"))
+            .find(|entry| {
+                entry.get("suite_id").and_then(Value::as_str) == Some("legacy_oracle")
+                    && entry.get("reason_code").and_then(Value::as_str)
+                        == Some("legacy_oracle_timeout_bounded")
+            })
+            .expect("FT-P2C-001 e2e matrix must include GW-002 timeout envelope");
+
+        assert_eq!(
+            timeout_entry.get("gap_id").and_then(Value::as_str),
+            Some("GW-002")
+        );
+        assert_eq!(
+            timeout_entry.get("outcome").and_then(Value::as_str),
+            Some("pass")
+        );
+        assert_ne!(
+            timeout_entry.get("reason_code").and_then(Value::as_str),
+            Some("legacy_oracle_unavailable")
+        );
 
         let _ = fs::remove_file(output_path);
     }
