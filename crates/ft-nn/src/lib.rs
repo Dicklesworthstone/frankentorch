@@ -6586,7 +6586,11 @@ impl MaxUnpool2d {
         let h_pooled = input_shape[2];
         let w_pooled = input_shape[3];
         let (h_out, w_out) = output_size;
-        let spatial_pooled = h_pooled * w_pooled;
+        let spatial_pooled = checked_mul(
+            h_pooled,
+            w_pooled,
+            "MaxUnpool2d pooled spatial size overflow",
+        )?;
 
         if indices.len() != spatial_pooled {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -6598,9 +6602,13 @@ impl MaxUnpool2d {
 
         // Same scatter-then-gather autograd pattern as MaxUnpool1d.
         // Tracked under frankentorch-cbyx.
-        let in_numel = n * c * spatial_pooled;
-        let out_spatial = h_out * w_out;
-        let out_numel = n * c * out_spatial;
+        let in_numel = checked_shape_numel(
+            &[n, c, h_pooled, w_pooled],
+            "MaxUnpool2d input shape overflow",
+        )?;
+        let out_spatial = checked_mul(h_out, w_out, "MaxUnpool2d output spatial size overflow")?;
+        let out_numel =
+            checked_shape_numel(&[n, c, h_out, w_out], "MaxUnpool2d output shape overflow")?;
         let indices_for_fwd: Vec<usize> = indices.to_vec();
         let indices_for_bwd: Vec<usize> = indices.to_vec();
         let out_shape = vec![n, c, h_out, w_out];
@@ -6720,7 +6728,16 @@ impl MaxUnpool3d {
         let h_pooled = input_shape[3];
         let w_pooled = input_shape[4];
         let (d_out, h_out, w_out) = output_size;
-        let spatial_pooled = d_pooled * h_pooled * w_pooled;
+        let pooled_plane = checked_mul(
+            d_pooled,
+            h_pooled,
+            "MaxUnpool3d pooled spatial size overflow",
+        )?;
+        let spatial_pooled = checked_mul(
+            pooled_plane,
+            w_pooled,
+            "MaxUnpool3d pooled spatial size overflow",
+        )?;
 
         if indices.len() != spatial_pooled {
             return Err(AutogradError::Dispatch(DispatchError::Key(
@@ -6732,9 +6749,17 @@ impl MaxUnpool3d {
 
         // Same scatter-then-gather autograd pattern as MaxUnpool1d/2d.
         // Tracked under frankentorch-cbyx.
-        let in_numel = n * c * spatial_pooled;
-        let out_spatial = d_out * h_out * w_out;
-        let out_numel = n * c * out_spatial;
+        let in_numel = checked_shape_numel(
+            &[n, c, d_pooled, h_pooled, w_pooled],
+            "MaxUnpool3d input shape overflow",
+        )?;
+        let out_plane = checked_mul(d_out, h_out, "MaxUnpool3d output spatial size overflow")?;
+        let out_spatial =
+            checked_mul(out_plane, w_out, "MaxUnpool3d output spatial size overflow")?;
+        let out_numel = checked_shape_numel(
+            &[n, c, d_out, h_out, w_out],
+            "MaxUnpool3d output shape overflow",
+        )?;
         let indices_for_fwd: Vec<usize> = indices.to_vec();
         let indices_for_bwd: Vec<usize> = indices.to_vec();
         let out_shape = vec![n, c, d_out, h_out, w_out];
@@ -23635,6 +23660,21 @@ mod tests {
     }
 
     #[test]
+    fn maxunpool2d_rejects_overflowing_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pooled = session
+            .tensor_variable(vec![5.0], vec![1, 1, 1, 1], false)
+            .unwrap();
+        let unpool = MaxUnpool2d::new((1, 1), (1, 1));
+
+        assert!(
+            unpool
+                .forward_with_indices(&mut session, pooled, &[0], (usize::MAX, 2))
+                .is_err()
+        );
+    }
+
+    #[test]
     fn maxunpool3d_basic() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         // [1, 1, 1, 1, 2] with indices pointing into 1x1x4 output space
@@ -23649,6 +23689,21 @@ mod tests {
         assert_eq!(shape, vec![1, 1, 1, 1, 4]);
         let vals = session.tensor_values(output).unwrap();
         assert_eq!(vals, vec![0.0, 5.0, 0.0, 9.0]);
+    }
+
+    #[test]
+    fn maxunpool3d_rejects_overflowing_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pooled = session
+            .tensor_variable(vec![5.0], vec![1, 1, 1, 1, 1], false)
+            .unwrap();
+        let unpool = MaxUnpool3d::new((1, 1, 1), (1, 1, 1));
+
+        assert!(
+            unpool
+                .forward_with_indices(&mut session, pooled, &[0], (usize::MAX, 2, 1))
+                .is_err()
+        );
     }
 
     #[test]
