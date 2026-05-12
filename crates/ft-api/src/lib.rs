@@ -9835,6 +9835,82 @@ impl FrankenTorchSession {
         Ok((grad_input, grad_grid))
     }
 
+    fn grid_sample_nearest_backward_f64(
+        input: &[f64],
+        grid: &[f64],
+        grad_output: &[f64],
+        plan: GridSamplePlan,
+    ) -> Result<(Vec<f64>, Vec<f64>), AutogradError> {
+        let expected_out = plan.batch * plan.channels * plan.out_h * plan.out_w;
+        if grad_output.len() != expected_out {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "grid_sample nearest backward: incoming gradient shape mismatch",
+                },
+            )));
+        }
+
+        let mut grad_input = vec![0.0; input.len()];
+        let grad_grid = vec![0.0; grid.len()];
+
+        for n in 0..plan.batch {
+            for h in 0..plan.out_h {
+                for w in 0..plan.out_w {
+                    let grid_base = ((n * plan.out_h + h) * plan.out_w + w) * 2;
+                    let mut x = grid[grid_base];
+                    let mut y = grid[grid_base + 1];
+                    if x.is_nan() {
+                        x = -1.0;
+                    }
+                    if y.is_nan() {
+                        y = -1.0;
+                    }
+
+                    let mut ix = Self::grid_sampler_unnormalize(x, plan.in_w, plan.align_corners);
+                    let mut iy = Self::grid_sampler_unnormalize(y, plan.in_h, plan.align_corners);
+                    match plan.padding_mode {
+                        GridSamplePaddingMode::Zeros => {}
+                        GridSamplePaddingMode::Border => {
+                            ix = ix.clamp(0.0, (plan.in_w.saturating_sub(1)) as f64);
+                            iy = iy.clamp(0.0, (plan.in_h.saturating_sub(1)) as f64);
+                        }
+                        GridSamplePaddingMode::Reflection => {
+                            ix = Self::grid_sampler_reflect(ix, plan.in_w, plan.align_corners);
+                            iy = Self::grid_sampler_reflect(iy, plan.in_h, plan.align_corners);
+                        }
+                    }
+
+                    let mut nearest_x = ix.round() as isize;
+                    let mut nearest_y = iy.round() as isize;
+                    if matches!(
+                        plan.padding_mode,
+                        GridSamplePaddingMode::Border | GridSamplePaddingMode::Reflection
+                    ) {
+                        nearest_x = nearest_x.clamp(0, plan.in_w as isize - 1);
+                        nearest_y = nearest_y.clamp(0, plan.in_h as isize - 1);
+                    }
+
+                    for c in 0..plan.channels {
+                        let out_idx = ((n * plan.channels + c) * plan.out_h + h) * plan.out_w + w;
+                        Self::grid_sample_add_input_grad(
+                            &mut grad_input,
+                            plan,
+                            GridSamplePoint {
+                                n,
+                                c,
+                                y: nearest_y,
+                                x: nearest_x,
+                            },
+                            grad_output[out_idx],
+                        );
+                    }
+                }
+            }
+        }
+
+        Ok((grad_input, grad_grid))
+    }
+
     fn istft_reconstruct_f64(
         &self,
         spectrogram: Vec<ft_core::Complex128>,
@@ -11236,14 +11312,8 @@ impl FrankenTorchSession {
         let input_requires_grad = self.tensor_tape.tensor_requires_grad(input)?;
         let grid_requires_grad = self.tensor_tape.tensor_requires_grad(grid)?;
         if input_requires_grad || grid_requires_grad {
-            if mode != GridSampleMode::Bilinear {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "grid_sample: autograd is only supported for bilinear mode",
-                    },
-                )));
-            }
-            if padding_mode == GridSamplePaddingMode::Reflection {
+            if mode == GridSampleMode::Bilinear && padding_mode == GridSamplePaddingMode::Reflection
+            {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
                         reason: "grid_sample: autograd is not supported for reflection padding",
@@ -11279,12 +11349,20 @@ impl FrankenTorchSession {
                     let saved = ctx.saved_tensors();
                     let input_values = &saved[0];
                     let grid_values = &saved[1];
-                    let (grad_input, grad_grid) = Self::grid_sample_bilinear_backward_f64(
-                        input_values,
-                        grid_values,
-                        grad_outputs[0],
-                        plan_c,
-                    )?;
+                    let (grad_input, grad_grid) = match plan_c.mode {
+                        GridSampleMode::Bilinear => Self::grid_sample_bilinear_backward_f64(
+                            input_values,
+                            grid_values,
+                            grad_outputs[0],
+                            plan_c,
+                        )?,
+                        GridSampleMode::Nearest => Self::grid_sample_nearest_backward_f64(
+                            input_values,
+                            grid_values,
+                            grad_outputs[0],
+                            plan_c,
+                        )?,
+                    };
                     Ok(vec![Some(grad_input), Some(grad_grid)])
                 },
             )?;
@@ -43310,27 +43388,42 @@ mod tests {
     }
 
     #[test]
-    fn tensor_grid_sample_fails_closed_for_grad_inputs() {
-        // Nearest-mode grid_sample remains fail-loud for gradients:
-        // only the bilinear floating-point slice has an analytical
-        // backward.
+    fn tensor_grid_sample_nearest_propagates_input_grad_and_zero_grid_grad() {
+        // Regression for frankentorch-i852: nearest-mode grid_sample
+        // used to fail-loud for tracked tensors. PyTorch treats nearest
+        // interpolation as piecewise constant in the grid, so input
+        // gradients scatter to the selected pixel while grid gradients
+        // are zero almost everywhere.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
             .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
             .unwrap();
         let grid = s
-            .tensor_variable(vec![0.0, 0.0], vec![1, 1, 1, 2], false)
+            .tensor_variable(vec![-1.0, -1.0, 1.0, 1.0], vec![1, 1, 2, 2], true)
             .unwrap();
-        assert!(
-            s.tensor_grid_sample(
+
+        let output = s
+            .tensor_grid_sample(
                 input,
                 grid,
                 GridSampleMode::Nearest,
                 GridSamplePaddingMode::Zeros,
                 true,
             )
-            .is_err()
-        );
+            .expect("nearest grid_sample should support autograd");
+        assert_eq!(s.tensor_values(output).unwrap(), vec![1.0, 4.0]);
+
+        let loss = s.tensor_sum(output).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_input = s
+            .tensor_gradient(&report, input)
+            .expect("nearest grid_sample should propagate input gradient");
+        let grad_grid = s
+            .tensor_gradient(&report, grid)
+            .expect("nearest grid_sample should return zero grid gradient");
+
+        assert_eq!(grad_input, &[1.0, 0.0, 0.0, 1.0]);
+        assert_eq!(grad_grid, &[0.0, 0.0, 0.0, 0.0]);
     }
 
     #[test]
