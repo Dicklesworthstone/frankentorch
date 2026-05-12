@@ -3409,7 +3409,7 @@ impl FrankenTorchSession {
         }
 
         match self.tensor_dtype(tensor)? {
-            DType::F64 => {
+            DType::F64 | DType::F32 => {
                 let forward_map = input_to_output.clone();
                 let backward_map = input_to_output;
                 let output_shape_for_forward = output_shape.clone();
@@ -3432,19 +3432,6 @@ impl FrankenTorchSession {
                         Ok(vec![Some(grad_input)])
                     },
                 )
-            }
-            DType::F32 => {
-                if self.tensor_tape.tensor_requires_grad(tensor)? {
-                    return Err(make_err(
-                        "einsum: repeated-index autograd is only supported for F64",
-                    ));
-                }
-                let values = self.tensor_tape.values_f32(tensor)?;
-                let mut output = vec![0.0_f32; output_len];
-                for (input_linear, output_linear) in input_to_output {
-                    output[output_linear] += values[input_linear];
-                }
-                self.tensor_variable_f32(output, output_shape, false)
             }
             _ => Err(make_err(
                 "einsum: repeated-index unary requires f32 or f64 tensor",
@@ -41584,6 +41571,28 @@ mod tests {
             .tensor_variable((1..=12).map(f64::from).collect(), vec![2, 3, 2], true)
             .unwrap();
         let result = s.tensor_einsum("iji->j", &[a]).unwrap();
+        let loss = s.tensor_sum_dim(result, 0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, a).expect("input gradient");
+        assert_eq!(
+            grad,
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn einsum_repeated_index_f32_scatters_gradient_to_higher_rank_diagonal() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable_f32((1_u16..=12).map(f32::from).collect(), vec![2, 3, 2], true)
+            .unwrap();
+        let result = s.tensor_einsum("iji->j", &[a]).unwrap();
+        assert_eq!(s.tensor_dtype(result).unwrap(), DType::F32);
+        assert_eq!(
+            s.tensor_values_f32(result).unwrap(),
+            vec![9.0_f32, 13.0, 17.0]
+        );
+
         let loss = s.tensor_sum_dim(result, 0).unwrap();
         let report = s.tensor_backward(loss).unwrap();
         let grad = s.tensor_gradient(&report, a).expect("input gradient");
