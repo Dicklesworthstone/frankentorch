@@ -180,7 +180,7 @@ Subset (Arc-based), random_split (deterministic seeded)
 | Mixed precision (`torch.amp`) | parity_partial | Autocast context + `GradScaler` shipped. F16/BF16 forward already supported; backward currently runs in F64. | `frankentorch-iha` (closed) |
 | ONNX export | not_started | No ONNX tracing/export/interchange path exists | `frankentorch-iey` |
 | Gradient checkpointing | parity_partial | `session.checkpoint(...)` exposes recompute-on-backward; broader API surface (use_reentrant, distributed-aware) deferred. | `frankentorch-plj` (closed) |
-| PyTorch-compatible custom autograd Function surface | parity_gap | Closure-based custom autograd exists via `FrankenTorchSession::tensor_apply_function(...)` and `TensorTape::apply_function(...)`, including `save_for_backward`, but the PyTorch-compatible `torch.autograd.Function` API surface is not exposed yet | `frankentorch-2er` |
+| Custom autograd Function surface | parity_supported | Rust-idiomatic custom autograd is exposed through `FrankenTorchSession::tensor_apply_function(...)` and `TensorTape::apply_function(...)`, with `FunctionCtx::save_for_backward`, `needs_input_grad`, deterministic backward closures, and coverage under `frankentorch-2er`; a PyTorch-style trait/class wrapper would be API sugar, not a blocking parity gap. | `frankentorch-2er` (closed) |
 
 ## Current Green Scope (CPU Eager-Mode Slice)
 
