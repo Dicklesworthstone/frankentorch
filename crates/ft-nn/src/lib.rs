@@ -3188,9 +3188,9 @@ impl Conv1d {
         }
 
         // Kaiming uniform: U(-bound, bound) where bound = sqrt(1 / (in_channels * kernel_size))
-        let fan_in = in_channels * kernel_size;
+        let fan_in = checked_mul(in_channels, kernel_size, "Conv1d fan_in overflow")?;
         let bound = 1.0 / (fan_in as f64).sqrt();
-        let numel = out_channels * in_channels * kernel_size;
+        let numel = checked_mul(out_channels, fan_in, "Conv1d weight size overflow")?;
 
         let w_rand = session.rand(vec![numel], false)?;
         let w_scale = session.full(vec![numel], 2.0 * bound, false)?;
@@ -5055,9 +5055,10 @@ impl Conv2d {
         }
 
         // Kaiming uniform: U(-bound, bound) where bound = sqrt(1 / fan_in)
-        let fan_in = in_channels * kh * kw;
+        let kernel_area = checked_mul(kh, kw, "Conv2d kernel size overflow")?;
+        let fan_in = checked_mul(in_channels, kernel_area, "Conv2d fan_in overflow")?;
         let bound = 1.0 / (fan_in as f64).sqrt();
-        let numel = out_channels * in_channels * kh * kw;
+        let numel = checked_mul(out_channels, fan_in, "Conv2d weight size overflow")?;
 
         let w_rand = session.rand(vec![numel], false)?;
         let w_scale = session.full(vec![numel], 2.0 * bound, false)?;
@@ -16926,6 +16927,14 @@ mod tests {
         assert!(conv.forward(&mut session, x).is_err());
     }
 
+    #[test]
+    fn conv1d_rejects_overflowing_weight_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        assert!(Conv1d::new(&mut session, usize::MAX, 2, 2, 1, 0, false).is_err());
+        assert!(Conv1d::new(&mut session, 2, usize::MAX, 2, 1, 0, false).is_err());
+    }
+
     // ---- AvgPool1d tests ----
 
     #[test]
@@ -17490,6 +17499,14 @@ mod tests {
             .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
             .expect("variable");
         assert!(conv.forward(&mut session, x).is_err());
+    }
+
+    #[test]
+    fn conv2d_rejects_overflowing_weight_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        assert!(Conv2d::new(&mut session, usize::MAX, 2, (2, 2), (1, 1), (0, 0), false).is_err());
+        assert!(Conv2d::new(&mut session, 2, usize::MAX, (2, 2), (1, 1), (0, 0), false).is_err());
     }
 
     #[test]
