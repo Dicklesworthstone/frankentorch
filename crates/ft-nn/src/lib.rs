@@ -92,6 +92,43 @@ fn checked_shape_numel(shape: &[usize], reason: &'static str) -> Result<usize, A
     Ok(product)
 }
 
+fn checked_ceil_div(
+    numerator: usize,
+    denominator: usize,
+    reason: &'static str,
+) -> Result<usize, AutogradError> {
+    if denominator == 0 {
+        return Err(incompatible_error("adaptive pool output size must be > 0"));
+    }
+
+    let quotient = numerator / denominator;
+    if numerator.is_multiple_of(denominator) {
+        Ok(quotient)
+    } else {
+        checked_add(quotient, 1, reason)
+    }
+}
+
+fn adaptive_pool_start_index(
+    output_index: usize,
+    input_size: usize,
+    output_size: usize,
+    reason: &'static str,
+) -> Result<usize, AutogradError> {
+    Ok(checked_mul(output_index, input_size, reason)? / output_size)
+}
+
+fn adaptive_pool_end_index(
+    output_index_next: usize,
+    input_size: usize,
+    output_size: usize,
+    multiply_reason: &'static str,
+    ceil_reason: &'static str,
+) -> Result<usize, AutogradError> {
+    let numerator = checked_mul(output_index_next, input_size, multiply_reason)?;
+    checked_ceil_div(numerator, output_size, ceil_reason)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ModuleRegistrationError {
     InvalidName {
@@ -5512,14 +5549,32 @@ impl Module for AdaptiveAvgPool2d {
             for ow in 0..self.output_w {
                 let oh_next = checked_add(oh, 1, "AdaptiveAvgPool2d output row overflow")?;
                 let ow_next = checked_add(ow, 1, "AdaptiveAvgPool2d output col overflow")?;
-                let h_start =
-                    checked_mul(oh, h_in, "AdaptiveAvgPool2d row start overflow")? / self.output_h;
-                let h_end = checked_mul(oh_next, h_in, "AdaptiveAvgPool2d row end overflow")?
-                    / self.output_h;
-                let w_start =
-                    checked_mul(ow, w_in, "AdaptiveAvgPool2d col start overflow")? / self.output_w;
-                let w_end = checked_mul(ow_next, w_in, "AdaptiveAvgPool2d col end overflow")?
-                    / self.output_w;
+                let h_start = adaptive_pool_start_index(
+                    oh,
+                    h_in,
+                    self.output_h,
+                    "AdaptiveAvgPool2d row start overflow",
+                )?;
+                let h_end = adaptive_pool_end_index(
+                    oh_next,
+                    h_in,
+                    self.output_h,
+                    "AdaptiveAvgPool2d row end overflow",
+                    "AdaptiveAvgPool2d row end ceil overflow",
+                )?;
+                let w_start = adaptive_pool_start_index(
+                    ow,
+                    w_in,
+                    self.output_w,
+                    "AdaptiveAvgPool2d col start overflow",
+                )?;
+                let w_end = adaptive_pool_end_index(
+                    ow_next,
+                    w_in,
+                    self.output_w,
+                    "AdaptiveAvgPool2d col end overflow",
+                    "AdaptiveAvgPool2d col end ceil overflow",
+                )?;
 
                 let kh = h_end - h_start;
                 let kw = w_end - w_start;
@@ -6058,10 +6113,19 @@ impl Module for AdaptiveAvgPool1d {
         let mut slices = Vec::with_capacity(self.output_size);
         for i in 0..self.output_size {
             let i_next = checked_add(i, 1, "AdaptiveAvgPool1d output index overflow")?;
-            let start =
-                checked_mul(i, l_in, "AdaptiveAvgPool1d start overflow")? / self.output_size;
-            let end =
-                checked_mul(i_next, l_in, "AdaptiveAvgPool1d end overflow")? / self.output_size;
+            let start = adaptive_pool_start_index(
+                i,
+                l_in,
+                self.output_size,
+                "AdaptiveAvgPool1d start overflow",
+            )?;
+            let end = adaptive_pool_end_index(
+                i_next,
+                l_in,
+                self.output_size,
+                "AdaptiveAvgPool1d end overflow",
+                "AdaptiveAvgPool1d end ceil overflow",
+            )?;
             let k = end - start;
             let patch = session.tensor_narrow(input, 2, start, k)?;
             let avg = session.tensor_mean_dim(patch, 2)?;
@@ -6150,28 +6214,55 @@ impl Module for AdaptiveAvgPool3d {
 
         for od in 0..self.output_d {
             let od_next = checked_add(od, 1, "AdaptiveAvgPool3d output depth overflow")?;
-            let d_start =
-                checked_mul(od, d_in, "AdaptiveAvgPool3d depth start overflow")? / self.output_d;
-            let d_end =
-                checked_mul(od_next, d_in, "AdaptiveAvgPool3d depth end overflow")? / self.output_d;
+            let d_start = adaptive_pool_start_index(
+                od,
+                d_in,
+                self.output_d,
+                "AdaptiveAvgPool3d depth start overflow",
+            )?;
+            let d_end = adaptive_pool_end_index(
+                od_next,
+                d_in,
+                self.output_d,
+                "AdaptiveAvgPool3d depth end overflow",
+                "AdaptiveAvgPool3d depth end ceil overflow",
+            )?;
             let kd = d_end - d_start;
             let d_slice = session.tensor_narrow(input, 2, d_start, kd)?;
 
             for oh in 0..self.output_h {
                 let oh_next = checked_add(oh, 1, "AdaptiveAvgPool3d output row overflow")?;
-                let h_start =
-                    checked_mul(oh, h_in, "AdaptiveAvgPool3d row start overflow")? / self.output_h;
-                let h_end = checked_mul(oh_next, h_in, "AdaptiveAvgPool3d row end overflow")?
-                    / self.output_h;
+                let h_start = adaptive_pool_start_index(
+                    oh,
+                    h_in,
+                    self.output_h,
+                    "AdaptiveAvgPool3d row start overflow",
+                )?;
+                let h_end = adaptive_pool_end_index(
+                    oh_next,
+                    h_in,
+                    self.output_h,
+                    "AdaptiveAvgPool3d row end overflow",
+                    "AdaptiveAvgPool3d row end ceil overflow",
+                )?;
                 let kh = h_end - h_start;
                 let h_slice = session.tensor_narrow(d_slice, 3, h_start, kh)?;
 
                 for ow in 0..self.output_w {
                     let ow_next = checked_add(ow, 1, "AdaptiveAvgPool3d output col overflow")?;
-                    let w_start = checked_mul(ow, w_in, "AdaptiveAvgPool3d col start overflow")?
-                        / self.output_w;
-                    let w_end = checked_mul(ow_next, w_in, "AdaptiveAvgPool3d col end overflow")?
-                        / self.output_w;
+                    let w_start = adaptive_pool_start_index(
+                        ow,
+                        w_in,
+                        self.output_w,
+                        "AdaptiveAvgPool3d col start overflow",
+                    )?;
+                    let w_end = adaptive_pool_end_index(
+                        ow_next,
+                        w_in,
+                        self.output_w,
+                        "AdaptiveAvgPool3d col end overflow",
+                        "AdaptiveAvgPool3d col end ceil overflow",
+                    )?;
                     let kw = w_end - w_start;
                     let patch = session.tensor_narrow(h_slice, 4, w_start, kw)?;
 
@@ -6248,10 +6339,19 @@ impl Module for AdaptiveMaxPool1d {
         let mut slices = Vec::with_capacity(self.output_size);
         for i in 0..self.output_size {
             let i_next = checked_add(i, 1, "AdaptiveMaxPool1d output index overflow")?;
-            let start =
-                checked_mul(i, l_in, "AdaptiveMaxPool1d start overflow")? / self.output_size;
-            let end =
-                checked_mul(i_next, l_in, "AdaptiveMaxPool1d end overflow")? / self.output_size;
+            let start = adaptive_pool_start_index(
+                i,
+                l_in,
+                self.output_size,
+                "AdaptiveMaxPool1d start overflow",
+            )?;
+            let end = adaptive_pool_end_index(
+                i_next,
+                l_in,
+                self.output_size,
+                "AdaptiveMaxPool1d end overflow",
+                "AdaptiveMaxPool1d end ceil overflow",
+            )?;
             let k = end - start;
             let patch = session.tensor_narrow(input, 2, start, k)?;
             let (max_vals, _) = session.tensor_max_dim(patch, 2)?;
@@ -6328,19 +6428,37 @@ impl Module for AdaptiveMaxPool2d {
 
         for oh in 0..self.output_h {
             let oh_next = checked_add(oh, 1, "AdaptiveMaxPool2d output row overflow")?;
-            let h_start =
-                checked_mul(oh, h_in, "AdaptiveMaxPool2d row start overflow")? / self.output_h;
-            let h_end =
-                checked_mul(oh_next, h_in, "AdaptiveMaxPool2d row end overflow")? / self.output_h;
+            let h_start = adaptive_pool_start_index(
+                oh,
+                h_in,
+                self.output_h,
+                "AdaptiveMaxPool2d row start overflow",
+            )?;
+            let h_end = adaptive_pool_end_index(
+                oh_next,
+                h_in,
+                self.output_h,
+                "AdaptiveMaxPool2d row end overflow",
+                "AdaptiveMaxPool2d row end ceil overflow",
+            )?;
             let kh = h_end - h_start;
             let h_slice = session.tensor_narrow(input, 2, h_start, kh)?;
 
             for ow in 0..self.output_w {
                 let ow_next = checked_add(ow, 1, "AdaptiveMaxPool2d output col overflow")?;
-                let w_start =
-                    checked_mul(ow, w_in, "AdaptiveMaxPool2d col start overflow")? / self.output_w;
-                let w_end = checked_mul(ow_next, w_in, "AdaptiveMaxPool2d col end overflow")?
-                    / self.output_w;
+                let w_start = adaptive_pool_start_index(
+                    ow,
+                    w_in,
+                    self.output_w,
+                    "AdaptiveMaxPool2d col start overflow",
+                )?;
+                let w_end = adaptive_pool_end_index(
+                    ow_next,
+                    w_in,
+                    self.output_w,
+                    "AdaptiveMaxPool2d col end overflow",
+                    "AdaptiveMaxPool2d col end ceil overflow",
+                )?;
                 let kw = w_end - w_start;
                 let patch = session.tensor_narrow(h_slice, 3, w_start, kw)?;
 
@@ -6429,28 +6547,55 @@ impl Module for AdaptiveMaxPool3d {
 
         for od in 0..self.output_d {
             let od_next = checked_add(od, 1, "AdaptiveMaxPool3d output depth overflow")?;
-            let d_start =
-                checked_mul(od, d_in, "AdaptiveMaxPool3d depth start overflow")? / self.output_d;
-            let d_end =
-                checked_mul(od_next, d_in, "AdaptiveMaxPool3d depth end overflow")? / self.output_d;
+            let d_start = adaptive_pool_start_index(
+                od,
+                d_in,
+                self.output_d,
+                "AdaptiveMaxPool3d depth start overflow",
+            )?;
+            let d_end = adaptive_pool_end_index(
+                od_next,
+                d_in,
+                self.output_d,
+                "AdaptiveMaxPool3d depth end overflow",
+                "AdaptiveMaxPool3d depth end ceil overflow",
+            )?;
             let kd = d_end - d_start;
             let d_slice = session.tensor_narrow(input, 2, d_start, kd)?;
 
             for oh in 0..self.output_h {
                 let oh_next = checked_add(oh, 1, "AdaptiveMaxPool3d output row overflow")?;
-                let h_start =
-                    checked_mul(oh, h_in, "AdaptiveMaxPool3d row start overflow")? / self.output_h;
-                let h_end = checked_mul(oh_next, h_in, "AdaptiveMaxPool3d row end overflow")?
-                    / self.output_h;
+                let h_start = adaptive_pool_start_index(
+                    oh,
+                    h_in,
+                    self.output_h,
+                    "AdaptiveMaxPool3d row start overflow",
+                )?;
+                let h_end = adaptive_pool_end_index(
+                    oh_next,
+                    h_in,
+                    self.output_h,
+                    "AdaptiveMaxPool3d row end overflow",
+                    "AdaptiveMaxPool3d row end ceil overflow",
+                )?;
                 let kh = h_end - h_start;
                 let h_slice = session.tensor_narrow(d_slice, 3, h_start, kh)?;
 
                 for ow in 0..self.output_w {
                     let ow_next = checked_add(ow, 1, "AdaptiveMaxPool3d output col overflow")?;
-                    let w_start = checked_mul(ow, w_in, "AdaptiveMaxPool3d col start overflow")?
-                        / self.output_w;
-                    let w_end = checked_mul(ow_next, w_in, "AdaptiveMaxPool3d col end overflow")?
-                        / self.output_w;
+                    let w_start = adaptive_pool_start_index(
+                        ow,
+                        w_in,
+                        self.output_w,
+                        "AdaptiveMaxPool3d col start overflow",
+                    )?;
+                    let w_end = adaptive_pool_end_index(
+                        ow_next,
+                        w_in,
+                        self.output_w,
+                        "AdaptiveMaxPool3d col end overflow",
+                        "AdaptiveMaxPool3d col end ceil overflow",
+                    )?;
                     let kw = w_end - w_start;
                     let patch = session.tensor_narrow(h_slice, 4, w_start, kw)?;
 
@@ -23610,6 +23755,34 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_avg_pool1d_upsample_keeps_bins_non_empty() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![7.0], vec![1, 1, 1], false)
+            .unwrap();
+        let pool = AdaptiveAvgPool1d::new(2);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![7.0, 7.0]);
+    }
+
+    #[test]
+    fn adaptive_avg_pool2d_upsample_keeps_bins_non_empty() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![7.0], vec![1, 1, 1, 1], false)
+            .unwrap();
+        let pool = AdaptiveAvgPool2d::new((2, 2));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![7.0, 7.0, 7.0, 7.0]);
+    }
+
+    #[test]
     fn adaptive_avg_pool3d_forward() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         // [1, 1, 4, 4, 4] -> (1, 1, 1) => global average
@@ -23627,6 +23800,20 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_avg_pool3d_upsample_keeps_bins_non_empty() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![7.0], vec![1, 1, 1, 1, 1], false)
+            .unwrap();
+        let pool = AdaptiveAvgPool3d::new((2, 2, 2));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![7.0; 8]);
+    }
+
+    #[test]
     fn adaptive_max_pool1d_forward() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let data = vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0];
@@ -23640,6 +23827,20 @@ mod tests {
         assert!((vals[0] - 5.0).abs() < 1e-10);
         // Second bin [4,2,6]: max=6
         assert!((vals[1] - 6.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_max_pool1d_upsample_keeps_bins_non_empty() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![7.0], vec![1, 1, 1], false)
+            .unwrap();
+        let pool = AdaptiveMaxPool1d::new(2);
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![7.0, 7.0]);
     }
 
     #[test]
@@ -23672,6 +23873,20 @@ mod tests {
     }
 
     #[test]
+    fn adaptive_max_pool2d_upsample_keeps_bins_non_empty() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![7.0], vec![1, 1, 1, 1], false)
+            .unwrap();
+        let pool = AdaptiveMaxPool2d::new((2, 2));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![7.0, 7.0, 7.0, 7.0]);
+    }
+
+    #[test]
     fn adaptive_max_pool3d_forward() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         // [1, 1, 4, 4, 4] -> (1, 1, 1) => global max
@@ -23685,6 +23900,20 @@ mod tests {
         assert_eq!(shape, vec![1, 1, 1, 1, 1]);
         let vals = session.tensor_values(output).unwrap();
         assert!((vals[0] - 64.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn adaptive_max_pool3d_upsample_keeps_bins_non_empty() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![7.0], vec![1, 1, 1, 1, 1], false)
+            .unwrap();
+        let pool = AdaptiveMaxPool3d::new((2, 2, 2));
+        let output = pool.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 2, 2, 2]);
+        let vals = session.tensor_values(output).unwrap();
+        assert_eq!(vals, vec![7.0; 8]);
     }
 
     #[test]
