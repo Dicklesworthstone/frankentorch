@@ -6480,8 +6480,9 @@ impl MaxUnpool1d {
         // frankentorch-cbyx. Forward scatters input values into the
         // output grid via the indices mapping; backward gathers
         // grad_output back via the same mapping.
-        let in_numel = n * c * l_pooled;
-        let out_numel = n * c * output_size;
+        let in_numel = checked_shape_numel(&[n, c, l_pooled], "MaxUnpool1d input shape overflow")?;
+        let out_numel =
+            checked_shape_numel(&[n, c, output_size], "MaxUnpool1d output shape overflow")?;
         let indices_for_fwd: Vec<usize> = indices.to_vec();
         let indices_for_bwd: Vec<usize> = indices.to_vec();
         let out_shape = vec![n, c, output_size];
@@ -23619,6 +23620,21 @@ mod tests {
         assert_eq!(shape, vec![1, 1, 4]);
         let vals = session.tensor_values(output).unwrap();
         assert_eq!(vals, vec![0.0, 5.0, 0.0, 8.0]);
+    }
+
+    #[test]
+    fn maxunpool1d_rejects_overflowing_output_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let pooled = session
+            .tensor_variable(vec![5.0, 6.0], vec![1, 2, 1], false)
+            .unwrap();
+        let unpool = MaxUnpool1d::new(1, 1);
+
+        assert!(
+            unpool
+                .forward_with_indices(&mut session, pooled, &[0], usize::MAX)
+                .is_err()
+        );
     }
 
     #[test]
