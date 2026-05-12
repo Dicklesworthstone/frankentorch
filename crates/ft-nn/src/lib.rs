@@ -14038,10 +14038,42 @@ pub fn pack_padded_sequence(
         (shape[0], shape[1])
     };
 
+    if batch_size == 0 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: batch size must be greater than zero",
+            },
+        )));
+    }
+
+    if max_len == 0 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: time dimension must be greater than zero",
+            },
+        )));
+    }
+
     if lengths.len() != batch_size {
         return Err(AutogradError::Dispatch(DispatchError::Key(
             DispatchKeyError::IncompatibleSet {
                 reason: "pack_padded_sequence: lengths must match batch size",
+            },
+        )));
+    }
+
+    if lengths.contains(&0) {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: lengths must be greater than zero",
+            },
+        )));
+    }
+
+    if lengths.iter().any(|&length| length > max_len) {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pack_padded_sequence: lengths must not exceed input time dimension",
             },
         )));
     }
@@ -14153,6 +14185,68 @@ pub fn pad_packed_sequence(
     padding_value: f64,
     total_length: Option<usize>,
 ) -> Result<(TensorNodeId, Vec<usize>), AutogradError> {
+    if packed.batch_sizes.is_empty() {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: batch_sizes must not be empty",
+            },
+        )));
+    }
+
+    let batch_size = packed.batch_sizes[0]; // first timestep has all sequences
+    if batch_size == 0 {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: batch size must be greater than zero",
+            },
+        )));
+    }
+
+    if packed.sorted_indices.len() != batch_size || packed.unsorted_indices.len() != batch_size {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: index metadata must match batch size",
+            },
+        )));
+    }
+
+    if packed
+        .batch_sizes
+        .iter()
+        .any(|&size| size == 0 || size > batch_size)
+    {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: batch_sizes must be positive and bounded by batch size",
+            },
+        )));
+    }
+
+    if packed
+        .batch_sizes
+        .windows(2)
+        .any(|window| window[1] > window[0])
+    {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: batch_sizes must be non-increasing",
+            },
+        )));
+    }
+
+    if packed
+        .sorted_indices
+        .iter()
+        .chain(packed.unsorted_indices.iter())
+        .any(|&index| index >= batch_size)
+    {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: index metadata out of range",
+            },
+        )));
+    }
+
     let packed_shape = session.tensor_shape(packed.data)?;
 
     let feature_size = if packed_shape.len() > 1 {
@@ -14161,8 +14255,16 @@ pub fn pad_packed_sequence(
         1
     };
 
-    let batch_size = packed.batch_sizes[0]; // first timestep has all sequences
     let max_len = packed.batch_sizes.len();
+    if let Some(total_length) = total_length
+        && total_length < max_len
+    {
+        return Err(AutogradError::Dispatch(DispatchError::Key(
+            DispatchKeyError::IncompatibleSet {
+                reason: "pad_packed_sequence: total_length must be at least packed sequence length",
+            },
+        )));
+    }
     let out_len = total_length.unwrap_or(max_len);
 
     // Recover sorted lengths from batch_sizes
@@ -26505,6 +26607,66 @@ mod tests {
         let input = s.tensor_variable(vec![0.0; 6], vec![3, 2], false).unwrap();
         // lengths [1, 3] are NOT sorted descending
         assert!(pack_padded_sequence(&mut s, input, &[1, 3], false, true).is_err());
+    }
+
+    #[test]
+    fn pack_padded_rejects_zero_lengths() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0; 6], vec![3, 2], false).unwrap();
+        let result = pack_padded_sequence(&mut s, input, &[3, 0], false, false);
+        assert!(result.is_err(), "zero sequence lengths must fail closed");
+        let err = result.err().expect("error already asserted");
+        assert!(
+            format!("{err:?}").contains("lengths must be greater than zero"),
+            "unexpected zero-length error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pack_padded_rejects_lengths_over_time_dimension() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0; 6], vec![3, 2], false).unwrap();
+        let result = pack_padded_sequence(&mut s, input, &[4, 2], false, false);
+        assert!(
+            result.is_err(),
+            "overlong sequence lengths must fail closed"
+        );
+        let err = result.err().expect("error already asserted");
+        assert!(
+            format!("{err:?}").contains("lengths must not exceed input time dimension"),
+            "unexpected overlong-length error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pad_packed_rejects_empty_batch_sizes() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data = s.tensor_variable(vec![0.0], vec![1], false).unwrap();
+        let packed = PackedSequence {
+            data,
+            batch_sizes: Vec::new(),
+            sorted_indices: Vec::new(),
+            unsorted_indices: Vec::new(),
+        };
+        let err = pad_packed_sequence(&mut s, &packed, false, 0.0, None)
+            .expect_err("empty batch_sizes must fail closed");
+        assert!(
+            format!("{err:?}").contains("batch_sizes must not be empty"),
+            "unexpected empty batch_sizes error: {err:?}"
+        );
+    }
+
+    #[test]
+    fn pad_packed_rejects_short_total_length() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0; 6], vec![3, 2], false).unwrap();
+        let packed = pack_padded_sequence(&mut s, input, &[3, 1], false, false).unwrap();
+        let err = pad_packed_sequence(&mut s, &packed, false, 0.0, Some(2))
+            .expect_err("short total_length must fail closed");
+        assert!(
+            format!("{err:?}").contains("total_length must be at least packed sequence length"),
+            "unexpected short-total_length error: {err:?}"
+        );
     }
 
     #[test]
