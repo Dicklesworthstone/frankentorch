@@ -4833,6 +4833,7 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         let x1_shape = self.tensor_shape(x1)?;
         let x2_shape = self.tensor_shape(x2)?;
+        Self::validate_nonnegative_norm_order(p, "cdist: p must be in [0, inf]")?;
 
         let (batch, p_dim, m1, r_dim, m2, batched) = match (x1_shape.len(), x2_shape.len()) {
             (2, 2) => (1, x1_shape[0], x1_shape[1], x2_shape[0], x2_shape[1], false),
@@ -5004,6 +5005,7 @@ impl FrankenTorchSession {
                 },
             )));
         }
+        Self::validate_nonnegative_norm_order(p, "pdist: p must be in [0, inf]")?;
         let n = shape[0];
         let m = shape[1];
         let out_len = n * (n - 1) / 2;
@@ -12974,6 +12976,16 @@ impl FrankenTorchSession {
             return Err(Self::incompatible_tensor_args(
                 "poisson: rates must be finite and non-negative",
             ));
+        }
+        Ok(())
+    }
+
+    fn validate_nonnegative_norm_order(
+        norm_order: f64,
+        reason: &'static str,
+    ) -> Result<(), AutogradError> {
+        if norm_order.is_nan() || norm_order < 0.0 || norm_order == f64::NEG_INFINITY {
+            return Err(Self::incompatible_tensor_args(reason));
         }
         Ok(())
     }
@@ -33999,6 +34011,20 @@ mod tests {
     }
 
     #[test]
+    fn cdist_rejects_invalid_p() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x1 = s
+            .tensor_variable(vec![0.0, 0.0], vec![1, 2], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![1.0, 1.0], vec![1, 2], false)
+            .unwrap();
+        for p in [-1.0, f64::NEG_INFINITY, f64::NAN] {
+            assert!(s.tensor_cdist(x1, x2, p).is_err(), "accepted p={p}");
+        }
+    }
+
+    #[test]
     fn cdist_l2_propagates_gradient_through_both_inputs() {
         // Regression test for frankentorch-tdqo. tensor_cdist used to
         // extract values, compute distances in plain f64, and rebuild
@@ -34093,6 +34119,17 @@ mod tests {
         let out = s.tensor_pdist(t, 1.0).unwrap();
         let vals = s.tensor_values(out).unwrap();
         assert!((vals[0] - 7.0).abs() < 1e-10); // |3|+|4| = 7
+    }
+
+    #[test]
+    fn pdist_rejects_invalid_p() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable(vec![0.0, 0.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        for p in [-1.0, f64::NEG_INFINITY, f64::NAN] {
+            assert!(s.tensor_pdist(t, p).is_err(), "accepted p={p}");
+        }
     }
 
     #[test]
