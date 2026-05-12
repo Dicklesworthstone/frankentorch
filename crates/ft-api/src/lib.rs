@@ -3250,23 +3250,20 @@ impl FrankenTorchSession {
 
         if !repeated.is_empty() {
             // Trace-like: extract diagonal(s) then sum/permute
-            // For simplicity, handle the common case: "ii->" (trace) and "ii->i" (diagonal)
-            if input_idx.len() == 2 && repeated.len() == 1 {
-                let shape = self.tensor_shape(tensor)?;
-                if shape[0] != shape[1] {
-                    return Err(make_err("einsum: trace requires square matrix"));
-                }
-                if output_idx.is_empty() {
-                    // Trace: sum of diagonal
-                    return self.tensor_trace(tensor);
-                } else if output_idx.len() == 1 && output_idx[0] == repeated[0] {
-                    // Diagonal extraction. Delegate to tensor_diagonal
-                    // so the autograd path goes through the
-                    // diag-scatter backward (frankentorch-sirh).
-                    // Previously this body extracted values + rebuilt
-                    // a non-grad leaf — silently severing autograd
-                    // for the einsum 'ii->i' pattern.
-                    return self.tensor_diagonal(tensor, 0);
+            if repeated.len() == 1 {
+                let repeated_ch = repeated[0];
+                let repeated_positions: Vec<usize> = input_idx
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(position, &ch)| (ch == repeated_ch).then_some(position))
+                    .collect();
+                if repeated_positions.len() == 2 {
+                    return self.einsum_unary_single_repeated_index(
+                        input_idx,
+                        output_idx,
+                        tensor,
+                        &repeated_positions,
+                    );
                 }
             }
             return Err(make_err(
@@ -3330,6 +3327,129 @@ impl FrankenTorchSession {
         }
 
         Ok(current)
+    }
+
+    fn einsum_unary_single_repeated_index(
+        &mut self,
+        input_idx: &[char],
+        output_idx: &[char],
+        tensor: TensorNodeId,
+        repeated_positions: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let make_err = |reason: &'static str| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+            ))
+        };
+
+        let mut seen_output = std::collections::HashSet::new();
+        for &ch in output_idx {
+            if !seen_output.insert(ch) {
+                return Err(make_err("einsum: duplicate output index"));
+            }
+            if !input_idx.contains(&ch) {
+                return Err(make_err("einsum: output index not found in input"));
+            }
+        }
+
+        let shape = self.tensor_shape(tensor)?;
+        let first_repeated = repeated_positions[0];
+        let second_repeated = repeated_positions[1];
+        if shape[first_repeated] != shape[second_repeated] {
+            return Err(make_err(
+                "einsum: dimension size mismatch for repeated index",
+            ));
+        }
+
+        let output_positions: Vec<usize> = output_idx
+            .iter()
+            .map(|&ch| {
+                input_idx
+                    .iter()
+                    .position(|&input_ch| input_ch == ch)
+                    .expect("output index membership validated above")
+            })
+            .collect();
+        let output_shape = if output_positions.is_empty() {
+            vec![1]
+        } else {
+            output_positions
+                .iter()
+                .map(|&position| shape[position])
+                .collect()
+        };
+        let output_len =
+            Self::checked_shape_numel(&output_shape, "einsum: output shape volume overflow")?;
+        let input_len = Self::checked_shape_numel(&shape, "einsum: input shape volume overflow")?;
+        let input_strides = contiguous_strides(&shape);
+        let output_strides = contiguous_strides(&output_shape);
+        let mut input_to_output = Vec::new();
+
+        for input_linear in 0..input_len {
+            let first_coord =
+                (input_linear / input_strides[first_repeated]) % shape[first_repeated];
+            let second_coord =
+                (input_linear / input_strides[second_repeated]) % shape[second_repeated];
+            if first_coord != second_coord {
+                continue;
+            }
+
+            let mut output_linear = 0usize;
+            for (output_dim, &input_dim) in output_positions.iter().enumerate() {
+                let coord = (input_linear / input_strides[input_dim]) % shape[input_dim];
+                let offset = Self::checked_mul(
+                    coord,
+                    output_strides[output_dim],
+                    "einsum: output index overflow",
+                )?;
+                output_linear =
+                    Self::checked_add(output_linear, offset, "einsum: output index overflow")?;
+            }
+            input_to_output.push((input_linear, output_linear));
+        }
+
+        match self.tensor_dtype(tensor)? {
+            DType::F64 => {
+                let forward_map = input_to_output.clone();
+                let backward_map = input_to_output;
+                let output_shape_for_forward = output_shape.clone();
+                self.tensor_apply_function(
+                    &[tensor],
+                    move |_ctx, inputs| {
+                        let (values, _shape) = inputs[0];
+                        let mut output = vec![0.0_f64; output_len];
+                        for &(input_linear, output_linear) in &forward_map {
+                            output[output_linear] += values[input_linear];
+                        }
+                        Ok((output, output_shape_for_forward.clone()))
+                    },
+                    move |_ctx, grad_outputs| {
+                        let grad_output = grad_outputs[0];
+                        let mut grad_input = vec![0.0_f64; input_len];
+                        for &(input_linear, output_linear) in &backward_map {
+                            grad_input[input_linear] += grad_output[output_linear];
+                        }
+                        Ok(vec![Some(grad_input)])
+                    },
+                )
+            }
+            DType::F32 => {
+                if self.tensor_tape.tensor_requires_grad(tensor)? {
+                    return Err(make_err(
+                        "einsum: repeated-index autograd is only supported for F64",
+                    ));
+                }
+                let values = self.tensor_tape.values_f32(tensor)?;
+                let mut output = vec![0.0_f32; output_len];
+                for (input_linear, output_linear) in input_to_output {
+                    output[output_linear] += values[input_linear];
+                }
+                self.tensor_variable_f32(output, output_shape, false)
+            }
+            _ => Err(make_err(
+                "einsum: repeated-index unary requires f32 or f64 tensor",
+            )),
+        }
     }
 
     fn einsum_binary(
@@ -41474,6 +41594,47 @@ mod tests {
         assert_eq!(shape, vec![3]);
         let vals = s.tensor_values(result).unwrap();
         assert_eq!(vals, vec![1.0, 5.0, 9.0]);
+    }
+
+    #[test]
+    fn einsum_repeated_index_sums_higher_rank_diagonal() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable((1..=12).map(f64::from).collect(), vec![2, 3, 2], false)
+            .unwrap();
+        let result = s.tensor_einsum("iji->j", &[a]).unwrap();
+        assert_eq!(s.tensor_shape(result).unwrap(), vec![3]);
+        assert_eq!(s.tensor_values(result).unwrap(), vec![9.0, 13.0, 17.0]);
+    }
+
+    #[test]
+    fn einsum_repeated_index_keeps_higher_rank_diagonal_dimension() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable((1..=12).map(f64::from).collect(), vec![2, 3, 2], false)
+            .unwrap();
+        let result = s.tensor_einsum("iji->ij", &[a]).unwrap();
+        assert_eq!(s.tensor_shape(result).unwrap(), vec![2, 3]);
+        assert_eq!(
+            s.tensor_values(result).unwrap(),
+            vec![1.0, 3.0, 5.0, 8.0, 10.0, 12.0]
+        );
+    }
+
+    #[test]
+    fn einsum_repeated_index_scatters_gradient_to_higher_rank_diagonal() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable((1..=12).map(f64::from).collect(), vec![2, 3, 2], true)
+            .unwrap();
+        let result = s.tensor_einsum("iji->j", &[a]).unwrap();
+        let loss = s.tensor_sum_dim(result, 0).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, a).expect("input gradient");
+        assert_eq!(
+            grad,
+            &[1.0, 0.0, 1.0, 0.0, 1.0, 0.0, 0.0, 1.0, 0.0, 1.0, 0.0, 1.0]
+        );
     }
 
     #[test]
