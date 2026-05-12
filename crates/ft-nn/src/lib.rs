@@ -1112,6 +1112,9 @@ impl Bilinear {
     ) -> Result<TensorNodeId, AutogradError> {
         let x1_shape = session.tensor_shape(x1)?;
         let x2_shape = session.tensor_shape(x2)?;
+        if x1_shape.is_empty() || x2_shape.is_empty() {
+            return Err(incompatible_error("bilinear: inputs must be at least 1-D"));
+        }
         let in1 = self.in1_features;
         let in2 = self.in2_features;
         let out = self.out_features;
@@ -19059,6 +19062,36 @@ mod tests {
         // batch 1: 0*1*4 + 0*0*5 + 1*0*4 + 1*1*5 = 5
         assert!((vals[0] - 2.0).abs() < 1e-10);
         assert!((vals[1] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn bilinear_rejects_scalar_inputs() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let bilinear = Bilinear::new(&mut session, 2, 3, 1, false).unwrap();
+
+        let scalar_x1 = session.tensor_variable(vec![1.0], vec![], false).unwrap();
+        let x2 = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        let err = bilinear
+            .forward_bilinear(&mut session, scalar_x1, x2)
+            .expect_err("scalar x1 must fail closed");
+        assert!(
+            format!("{err:?}").contains("bilinear: inputs must be at least 1-D"),
+            "unexpected scalar-x1 error: {err:?}"
+        );
+
+        let x1 = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .unwrap();
+        let scalar_x2 = session.tensor_variable(vec![1.0], vec![], false).unwrap();
+        let err = bilinear
+            .forward_bilinear(&mut session, x1, scalar_x2)
+            .expect_err("scalar x2 must fail closed");
+        assert!(
+            format!("{err:?}").contains("bilinear: inputs must be at least 1-D"),
+            "unexpected scalar-x2 error: {err:?}"
+        );
     }
 
     #[test]
