@@ -14109,125 +14109,57 @@ impl FrankenTorchSession {
             return Ok(input);
         }
         let dtype = self.tensor_dtype(input)?;
-        match dtype {
-            DType::F64 => {
-                // Compose F64 diff through autograd primitives so the
-                // backward pass actually flows through the input. The
-                // previous implementation extracted tensor_values and
-                // rebuilt a requires_grad=false leaf per iteration —
-                // silently severing the tape (the same severed-autograd
-                // pattern Scatter / ScatterAdd / IndexPut had until
-                // recent fixes).
-                //
-                // diff(x, n=1) along last dim is linear:
-                //     out[..., i] = x[..., i + 1] - x[..., i]
-                // which is exactly
-                //     narrow(x, last, 1, len-1) - narrow(x, last, 0, len-1).
-                // Both narrow and sub have backward kernels in
-                // ft-autograd, so the resulting graph is fully
-                // differentiable and PyTorch-equivalent: each x[..., i]
-                // for 0 < i < len-1 contributes +1 to out[..., i-1]
-                // and -1 to out[..., i], so dL/dx for a sum-loss is
-                // [-1, 0, 0, ..., 0, +1] (or telescoped for higher n).
-                //
-                // For n > 1 the diff is reapplied n times, just like
-                // PyTorch's iterative implementation.
-                let mut current = input;
-                for _ in 0..n {
-                    let shape = self.tensor_shape(current)?;
-                    // PyTorch errors on rank-0 input ("diff expects input
-                    // to be at least one-dimensional"). Match that.
-                    if shape.is_empty() {
-                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "diff: input must have at least one dimension",
-                            },
-                        )));
-                    }
-                    let last_dim_idx = shape.len() - 1;
-                    let last_dim = shape[last_dim_idx];
-                    if last_dim < 2 {
-                        // PyTorch parity: [3, 1] -> [3, 0], not [0].
-                        // Preserve every leading dim and reduce only
-                        // the last one (frankentorch-rjn4).
-                        let mut out_shape = shape.clone();
-                        out_shape[last_dim_idx] = 0;
-                        return self.tensor_variable(vec![], out_shape, false);
-                    }
-                    let new_last = last_dim - 1;
-                    let head = self.tensor_narrow(current, last_dim_idx, 1, new_last)?;
-                    let tail = self.tensor_narrow(current, last_dim_idx, 0, new_last)?;
-                    current = self.tensor_sub(head, tail)?;
-                }
-                Ok(current)
-            }
-            DType::F32 => {
-                // F32 diff: the autograd path through tensor_narrow +
-                // tensor_sub doesn't currently preserve F32 dtype
-                // through the binary op (tensor_sub upcasts), which
-                // would silently change the output dtype. Until a
-                // dtype-preserving F32 sub is wired up, fail-loud on
-                // requires_grad=true and keep the existing severed
-                // forward path for non-grad inputs (matches the
-                // affine_grid / linalg_inv pattern of "F64 autograd
-                // only" for tensor_apply_function-incompatible ops).
-                if self.tensor_tape.tensor_requires_grad(input)? {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "diff: autograd is only supported for F64",
-                        },
-                    )));
-                }
-                let mut current = input;
-                for _ in 0..n {
-                    let vals = self.tensor_values_f32(current)?;
-                    let shape = self.tensor_shape(current)?;
-                    if shape.is_empty() {
-                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "diff: input must have at least one dimension",
-                            },
-                        )));
-                    }
-                    let last_dim = *shape.last().expect("shape non-empty checked above");
-                    if last_dim < 2 {
-                        let mut out_shape = shape.clone();
-                        if let Some(last) = out_shape.last_mut() {
-                            *last = 0;
-                        }
-                        return self.tensor_variable_f32(vec![], out_shape, false);
-                    }
-                    let batch: usize = vals.len() / last_dim;
-                    let new_last = last_dim - 1;
-                    let result_len =
-                        Self::checked_mul(batch, new_last, "diff output size overflow")?;
-                    let mut result = Vec::with_capacity(result_len);
-                    for b in 0..batch {
-                        let base = b * last_dim;
-                        for i in 0..new_last {
-                            result.push(vals[base + i + 1] - vals[base + i]);
-                        }
-                    }
-                    let mut new_shape = shape.clone();
-                    if let Some(last) = new_shape.last_mut() {
-                        *last = new_last;
-                    } else {
-                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                            ft_dispatch::DispatchKeyError::IncompatibleSet {
-                                reason: "diff: input must have at least one dimension",
-                            },
-                        )));
-                    }
-                    current = self.tensor_variable_f32(result, new_shape, false)?;
-                }
-                Ok(current)
-            }
-            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+        if !matches!(dtype, DType::F64 | DType::F32) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "diff requires f32 or f64 tensors",
                 },
-            ))),
+            )));
         }
+
+        // Compose diff through autograd primitives so the backward pass
+        // flows through the input for both F64 and F32. diff(x, n=1)
+        // along the last dim is linear:
+        //     out[..., i] = x[..., i + 1] - x[..., i]
+        // which is exactly narrow(x, last, 1, len-1) -
+        // narrow(x, last, 0, len-1). For n > 1 the diff is reapplied
+        // iteratively, matching PyTorch.
+        let mut current = input;
+        for _ in 0..n {
+            let shape = self.tensor_shape(current)?;
+            // PyTorch errors on rank-0 input ("diff expects input to
+            // be at least one-dimensional"). Match that.
+            if shape.is_empty() {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "diff: input must have at least one dimension",
+                    },
+                )));
+            }
+            let last_dim_idx = shape.len() - 1;
+            let last_dim = shape[last_dim_idx];
+            if last_dim < 2 {
+                // PyTorch parity: [3, 1] -> [3, 0], not [0].
+                // Preserve every leading dim and reduce only the last
+                // one (frankentorch-rjn4), while preserving dtype.
+                let mut out_shape = shape.clone();
+                out_shape[last_dim_idx] = 0;
+                return match self.tensor_dtype(current)? {
+                    DType::F64 => self.tensor_variable(vec![], out_shape, false),
+                    DType::F32 => self.tensor_variable_f32(vec![], out_shape, false),
+                    _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "diff requires f32 or f64 tensors",
+                        },
+                    ))),
+                };
+            }
+            let new_last = last_dim - 1;
+            let head = self.tensor_narrow(current, last_dim_idx, 1, new_last)?;
+            let tail = self.tensor_narrow(current, last_dim_idx, 0, new_last)?;
+            current = self.tensor_sub(head, tail)?;
+        }
+        Ok(current)
     }
 
     /// Cumulative maximum along flattened tensor.
@@ -33191,6 +33123,7 @@ mod tests {
             .tensor_variable_f32(vec![1.0f32, 2.5, 2.0], vec![3], false)
             .unwrap();
         let out = s.tensor_diff(t, 1).unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F32);
         let vals = s.tensor_values_f32(out).unwrap();
         assert_eq!(vals, vec![1.5f32, -0.5]);
     }
@@ -33236,6 +33169,7 @@ mod tests {
             .tensor_variable_f32(vec![1.0f32, 2.0, 3.0, 4.0], vec![2, 2, 1], false)
             .unwrap();
         let out = s.tensor_diff(t, 1).unwrap();
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F32);
         assert_eq!(s.tensor_shape(out).unwrap(), vec![2, 2, 0]);
         assert!(s.tensor_values_f32(out).unwrap().is_empty());
     }
@@ -33335,6 +33269,28 @@ mod tests {
             .tensor_gradient(&report, x)
             .expect("tensor_diff must propagate gradient through 2-D input");
         assert_eq!(grad, &[-1.0, 0.0, 0.0, 1.0, -1.0, 0.0, 0.0, 1.0]);
+    }
+
+    #[test]
+    fn diff_n1_propagates_gradients_f32_and_preserves_dtype() {
+        // Regression for frankentorch-w43h: the F32 path used to
+        // fail-loud on requires_grad because tensor_sub previously
+        // upcast F32. It now uses the same narrow+sub composition as
+        // F64 and must keep the output dtype F32.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(vec![1.0f32, 4.0, 9.0, 16.0], vec![4], true)
+            .unwrap();
+        let d = s.tensor_diff(x, 1).unwrap();
+        assert_eq!(s.tensor_dtype(d).unwrap(), DType::F32);
+        assert_eq!(s.tensor_values_f32(d).unwrap(), vec![3.0f32, 5.0, 7.0]);
+
+        let loss = s.tensor_sum(d).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, x)
+            .expect("F32 tensor_diff must propagate gradient to input");
+        assert_eq!(grad, &[-1.0, 0.0, 0.0, 1.0]);
     }
 
     // ── cummax / cummin tests ──────────────────────────────────────────
