@@ -6,8 +6,8 @@ use std::fmt;
 use std::sync::Arc;
 
 use ft_core::{
-    DType, DenseI64Tensor, DenseTensor, DenseTensorError, Device, ExecutionMode, ScalarTensor,
-    SparseCOOTensor, SparseTensorError, TensorMeta, TensorStorage,
+    BFloat16, DType, DenseI64Tensor, DenseTensor, DenseTensorError, Device, ExecutionMode, Float16,
+    ScalarTensor, SparseCOOTensor, SparseTensorError, TensorMeta, TensorStorage,
 };
 use ft_dispatch::{
     AddmmDispatchDecision, BinaryOp, ClampDispatchDecision, DispatchDecision, DispatchError,
@@ -4165,6 +4165,34 @@ impl TensorTape {
         Self::default()
     }
 
+    fn tensor_from_f64_values(
+        meta: TensorMeta,
+        values: Vec<f64>,
+    ) -> Result<DenseTensor, DenseTensorError> {
+        match meta.dtype() {
+            DType::F64 => DenseTensor::from_storage(meta, values),
+            DType::F32 => {
+                let values = values.into_iter().map(|value| value as f32).collect();
+                DenseTensor::from_storage_f32(meta, values)
+            }
+            DType::F16 => {
+                let values = values
+                    .into_iter()
+                    .map(|value| Float16::from_f32(value as f32))
+                    .collect();
+                DenseTensor::from_storage_f16(meta, values)
+            }
+            DType::BF16 => {
+                let values = values
+                    .into_iter()
+                    .map(|value| BFloat16::from_f32(value as f32))
+                    .collect();
+                DenseTensor::from_storage_bf16(meta, values)
+            }
+            other => Err(DenseTensorError::UnsupportedDType(other)),
+        }
+    }
+
     #[must_use]
     pub fn node_count(&self) -> usize {
         self.nodes.len()
@@ -7866,7 +7894,7 @@ impl TensorTape {
 
         if !any_requires_grad || !self.grad_enabled {
             self.nodes.push(TensorNode {
-                tensor: DenseTensor::from_storage(
+                tensor: Self::tensor_from_f64_values(
                     ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
                     output_values,
                 )?,
@@ -7889,7 +7917,7 @@ impl TensorTape {
         );
 
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
+            tensor: Self::tensor_from_f64_values(
                 ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
                 output_values,
             )?,
@@ -19384,6 +19412,72 @@ mod tests {
         let report = tape.backward(y).expect("backward");
         let grad = report.gradient(x).expect("gradient exists");
         assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_f32_preserves_dtype_without_grad() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf_f32(vec![1.0, -2.0, 3.5], vec![3], false)
+            .expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let out = vals.iter().map(|value| value * 2.0).collect();
+                    Ok((out, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| {
+                    let grad = grad_outputs[0].iter().map(|value| value * 2.0).collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("f32 custom function");
+
+        assert_eq!(tape.dtype(y).expect("dtype"), DType::F32);
+        assert_eq!(
+            tape.values_f32(y).expect("values"),
+            vec![2.0_f32, -4.0, 7.0]
+        );
+        assert!(
+            !tape.tensor_requires_grad(y).expect("requires_grad"),
+            "non-grad f32 custom function should stay a non-grad leaf"
+        );
+    }
+
+    #[test]
+    fn custom_function_f32_preserves_dtype_and_backward() {
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf_f32(vec![2.0, 3.0, -4.0], vec![3], true)
+            .expect("x");
+
+        let y = tape
+            .apply_function(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = &inputs[0];
+                    let out = vals.iter().map(|value| value * 3.0).collect();
+                    Ok((out, shape.to_vec()))
+                },
+                |_ctx, grad_outputs| {
+                    let grad = grad_outputs[0].iter().map(|value| value * 3.0).collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("f32 custom function");
+
+        assert_eq!(tape.dtype(y).expect("dtype"), DType::F32);
+        assert_eq!(
+            tape.values_f32(y).expect("values"),
+            vec![6.0_f32, 9.0, -12.0]
+        );
+
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[3.0, 3.0, 3.0]);
     }
 
     #[test]
