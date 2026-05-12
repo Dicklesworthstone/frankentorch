@@ -12990,6 +12990,30 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    fn checked_interpolate_scale_dim(
+        input_dim: usize,
+        scale_factor: f64,
+    ) -> Result<usize, AutogradError> {
+        if !scale_factor.is_finite() || scale_factor <= 0.0 {
+            return Err(Self::incompatible_tensor_args(
+                "interpolate: scale_factor must be finite and > 0",
+            ));
+        }
+        let scaled = input_dim as f64 * scale_factor;
+        if !scaled.is_finite() || scaled > usize::MAX as f64 {
+            return Err(Self::incompatible_tensor_args(
+                "interpolate: output size overflow",
+            ));
+        }
+        let output_dim = scaled.floor();
+        if output_dim < 1.0 {
+            return Err(Self::incompatible_tensor_args(
+                "interpolate: output spatial dimensions must be > 0",
+            ));
+        }
+        Ok(output_dim as usize)
+    }
+
     fn validate_pool1d_output_len(
         input_len: usize,
         kernel_size: usize,
@@ -18062,6 +18086,11 @@ impl FrankenTorchSession {
 
         let spatial_dims = ndim - 2;
         let in_spatial: Vec<usize> = shape[2..].to_vec();
+        if in_spatial.contains(&0) {
+            return Err(Self::incompatible_tensor_args(
+                "interpolate: input spatial dimensions must be > 0",
+            ));
+        }
 
         let out_spatial: Vec<usize> = if let Some(ref s) = size {
             if s.len() != spatial_dims {
@@ -18070,6 +18099,11 @@ impl FrankenTorchSession {
                         reason: "interpolate: size length must match spatial dimensions",
                     },
                 )));
+            }
+            if s.contains(&0) {
+                return Err(Self::incompatible_tensor_args(
+                    "interpolate: output spatial dimensions must be > 0",
+                ));
             }
             s.clone()
         } else if let Some(ref sf) = scale_factor {
@@ -18083,8 +18117,8 @@ impl FrankenTorchSession {
             in_spatial
                 .iter()
                 .zip(sf.iter())
-                .map(|(&d, &s)| (d as f64 * s).floor() as usize)
-                .collect()
+                .map(|(&d, &s)| Self::checked_interpolate_scale_dim(d, s))
+                .collect::<Result<Vec<_>, _>>()?
         } else {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -18095,6 +18129,15 @@ impl FrankenTorchSession {
 
         let batch = shape[0];
         let channels = shape[1];
+        let mut checked_out_shape = vec![batch, channels];
+        checked_out_shape.extend_from_slice(&out_spatial);
+        let out_numel =
+            Self::checked_shape_numel(&checked_out_shape, "interpolate: output size overflow")?;
+        let _ = Self::checked_mul(
+            out_numel,
+            std::mem::size_of::<f64>(),
+            "interpolate: output size overflow",
+        )?;
         let align = align_corners.unwrap_or(false);
 
         match mode {
@@ -35724,6 +35767,45 @@ mod tests {
                 None
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn interpolate_rejects_zero_output_size() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], false)
+            .unwrap();
+        assert!(
+            s.tensor_interpolate(input, Some(vec![0, 2]), None, "nearest", None)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn interpolate_rejects_invalid_scale_factor() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0; 4], vec![1, 1, 2, 2], false)
+            .unwrap();
+        for scale in [0.0, -1.0, f64::NAN, f64::INFINITY, 0.1] {
+            assert!(
+                s.tensor_interpolate(input, None, Some(vec![scale, 1.0]), "nearest", None)
+                    .is_err(),
+                "accepted scale_factor={scale}",
+            );
+        }
+    }
+
+    #[test]
+    fn interpolate_rejects_zero_input_spatial_dim() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(Vec::new(), vec![1, 1, 0, 2], false)
+            .unwrap();
+        assert!(
+            s.tensor_interpolate(input, Some(vec![2, 2]), None, "nearest", None)
+                .is_err()
         );
     }
 
