@@ -1014,8 +1014,20 @@ impl Bilinear {
         out_features: usize,
         use_bias: bool,
     ) -> Result<Self, AutogradError> {
+        if in1_features == 0 || in2_features == 0 || out_features == 0 {
+            return Err(incompatible_error(
+                "Bilinear requires positive in1_features, in2_features, and out_features",
+            ));
+        }
+
         let bound = 1.0 / (in1_features as f64).sqrt();
-        let total = out_features * in1_features * in2_features;
+        let feature_product =
+            checked_mul(in1_features, in2_features, "Bilinear feature size overflow")?;
+        let total = checked_mul(
+            out_features,
+            feature_product,
+            "Bilinear weight size overflow",
+        )?;
 
         let weight_rand = session.rand(vec![total], false)?;
         let scale = session.full(vec![total], 2.0 * bound, false)?;
@@ -18565,6 +18577,23 @@ mod tests {
         assert_eq!(named.len(), 2);
         assert_eq!(named[0].0, "weight");
         assert_eq!(named[1].0, "bias");
+    }
+
+    #[test]
+    fn bilinear_rejects_zero_dimensions() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        assert!(Bilinear::new(&mut session, 0, 3, 2, false).is_err());
+        assert!(Bilinear::new(&mut session, 3, 0, 2, false).is_err());
+        assert!(Bilinear::new(&mut session, 3, 2, 0, false).is_err());
+    }
+
+    #[test]
+    fn bilinear_rejects_overflowing_weight_shape() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        assert!(Bilinear::new(&mut session, usize::MAX, 2, 2, false).is_err());
+        assert!(Bilinear::new(&mut session, 2, 2, usize::MAX, false).is_err());
     }
 
     // ── Unfold / Fold Tests ──────────────────────────────────────────
