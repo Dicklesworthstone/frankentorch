@@ -20196,6 +20196,166 @@ impl FrankenTorchSession {
                 let masked_src = self.tensor_mul(mask_src, src)?;
                 return self.tensor_scatter_add(masked_input, dim, index, masked_src);
             }
+            if reduce == "prod" {
+                let input_dtype = self.tensor_tape.dtype(input)?;
+                let src_dtype = self.tensor_tape.dtype(src)?;
+                if src_dtype != input_dtype {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "scatter_reduce requires input and src to have matching dtypes",
+                        },
+                    )));
+                }
+                if !matches!(input_dtype, DType::F64 | DType::F32) {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "scatter_reduce requires f32 or f64 tensors",
+                        },
+                    )));
+                }
+
+                let idx_vals = self.tensor_values(index)?;
+                Self::validate_index_tensor_values(&input_shape, dim, &idx_vals)?;
+                let in_numel =
+                    Self::checked_shape_numel(&input_shape, "scatter_reduce prod input overflow")?;
+                let src_numel =
+                    Self::checked_shape_numel(&src_shape, "scatter_reduce prod src overflow")?;
+                let outer = Self::checked_shape_numel(
+                    &input_shape[..dim],
+                    "scatter_reduce prod outer overflow",
+                )?;
+                let inner = Self::checked_shape_numel(
+                    &input_shape[dim + 1..],
+                    "scatter_reduce prod inner overflow",
+                )?;
+                let dim_size = input_shape[dim];
+                let src_dim_size = src_shape[dim];
+                let src_outer = Self::checked_shape_numel(
+                    &src_shape[..dim],
+                    "scatter_reduce prod src outer overflow",
+                )?;
+                let src_inner = Self::checked_shape_numel(
+                    &src_shape[dim + 1..],
+                    "scatter_reduce prod src inner overflow",
+                )?;
+                if src_outer != outer || src_inner != inner {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "scatter_reduce: src shape must match input shape except at dim",
+                        },
+                    )));
+                }
+                let dim_size_i = isize::try_from(dim_size).map_err(|_| {
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "scatter_reduce: dim size out of platform isize",
+                        },
+                    ))
+                })?;
+                let mut dst_for_src = vec![0usize; src_numel];
+                for o in 0..outer {
+                    for s in 0..src_dim_size {
+                        for i in 0..inner {
+                            let src_flat = (o * src_dim_size + s) * inner + i;
+                            let idx_i = Self::exact_integer_index_to_isize(
+                                idx_vals[src_flat],
+                                "scatter_reduce: index values must be finite integers",
+                            )?;
+                            if idx_i < -dim_size_i || idx_i >= dim_size_i {
+                                return Err(AutogradError::Dispatch(
+                                    ft_dispatch::DispatchError::Key(
+                                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                            reason: "scatter_reduce: index value out of range",
+                                        },
+                                    ),
+                                ));
+                            }
+                            let target_dim = if idx_i < 0 {
+                                (idx_i + dim_size_i) as usize
+                            } else {
+                                idx_i as usize
+                            };
+                            dst_for_src[src_flat] = (o * dim_size + target_dim) * inner + i;
+                        }
+                    }
+                }
+
+                let output_shape_f = input_shape.clone();
+                let dst_for_src_f = dst_for_src.clone();
+                let dst_for_src_b = dst_for_src;
+                let out = self.tensor_apply_function(
+                    &[input, src],
+                    move |ctx, inputs| {
+                        let (input_values, input_shape) = inputs[0];
+                        let (src_values, src_shape) = inputs[1];
+                        let mut output = input_values.to_vec();
+                        for (src_flat, &dst_flat) in dst_for_src_f.iter().enumerate() {
+                            output[dst_flat] *= src_values[src_flat];
+                        }
+                        ctx.save_for_backward(input_values.to_vec(), input_shape.to_vec());
+                        ctx.save_for_backward(src_values.to_vec(), src_shape.to_vec());
+                        Ok((output, output_shape_f.clone()))
+                    },
+                    move |ctx, grad_outputs| {
+                        let grad_output = grad_outputs[0];
+                        if grad_output.len() != in_numel {
+                            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                    reason: "scatter_reduce prod backward: incoming gradient shape mismatch",
+                                },
+                            )));
+                        }
+                        let saved = ctx.saved_tensors();
+                        let input_values = &saved[0];
+                        let src_values = &saved[1];
+                        let mut product_nonzero = vec![1.0_f64; in_numel];
+                        let mut zero_count = vec![0usize; in_numel];
+                        for (dst, &value) in input_values.iter().enumerate() {
+                            if value == 0.0 {
+                                zero_count[dst] += 1;
+                            } else {
+                                product_nonzero[dst] *= value;
+                            }
+                        }
+                        for (src_flat, &dst_flat) in dst_for_src_b.iter().enumerate() {
+                            let value = src_values[src_flat];
+                            if value == 0.0 {
+                                zero_count[dst_flat] += 1;
+                            } else {
+                                product_nonzero[dst_flat] *= value;
+                            }
+                        }
+
+                        let factor_grad = |value: f64, dst: usize| -> f64 {
+                            let upstream = grad_output[dst];
+                            match zero_count[dst] {
+                                0 => upstream * product_nonzero[dst] / value,
+                                1 if value == 0.0 => upstream * product_nonzero[dst],
+                                _ => 0.0,
+                            }
+                        };
+                        let grad_input = input_values
+                            .iter()
+                            .enumerate()
+                            .map(|(dst, &value)| factor_grad(value, dst))
+                            .collect::<Vec<_>>();
+                        let grad_src = src_values
+                            .iter()
+                            .enumerate()
+                            .map(|(src_flat, &value)| factor_grad(value, dst_for_src_b[src_flat]))
+                            .collect::<Vec<_>>();
+                        Ok(vec![Some(grad_input), Some(grad_src)])
+                    },
+                )?;
+                self.runtime.ledger_mut().record(
+                    EvidenceKind::Dispatch,
+                    format!(
+                        "scatter_reduce input={} dim={dim} reduce=prod out={} (autograd)",
+                        input.0, out.0
+                    ),
+                );
+                return Ok(out);
+            }
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
                     reason: "scatter_reduce: autograd not supported for reduce='prod' (divide-back at zero is unstable; tracked under frankentorch-dhm4)",
@@ -45690,21 +45850,52 @@ mod tests {
     }
 
     #[test]
-    fn scatter_reduce_prod_fails_loud_on_requires_grad() {
-        // amax/amin are now autograd-aware (frankentorch-7k6a);
-        // only prod still fails loud.
+    fn scatter_reduce_prod_propagates_gradient() {
+        // Regression for frankentorch-q5dc: prod now uses the
+        // product rule instead of fail-loud rejecting tracked input/src.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s.tensor_variable(vec![2.0, 6.0], vec![2], true).unwrap();
         let index = s
             .tensor_variable(vec![0.0, 0.0, 1.0], vec![3], false)
             .unwrap();
         let src = s
-            .tensor_variable(vec![4.0, 8.0, 10.0], vec![3], false)
+            .tensor_variable(vec![4.0, 8.0, 10.0], vec![3], true)
             .unwrap();
-        let err = s
+        let out = s
             .tensor_scatter_reduce(input, 0, index, src, "prod")
-            .expect_err("prod must fail loud on requires_grad");
-        assert!(format!("{err:?}").contains("autograd not supported"));
+            .unwrap();
+        // prod: [2*4*8, 6*10] = [64, 60]
+        assert_eq!(s.tensor_values(out).unwrap(), &[64.0, 60.0]);
+
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let in_grad = s.tensor_gradient(&report, input).expect("input grad");
+        let src_grad = s.tensor_gradient(&report, src).expect("src grad");
+        assert_eq!(in_grad, &[32.0, 10.0]);
+        assert_eq!(src_grad, &[16.0, 8.0, 6.0]);
+    }
+
+    #[test]
+    fn scatter_reduce_prod_zero_factor_propagates_only_to_single_zero() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![2.0, 5.0], vec![2], true).unwrap();
+        let index = s
+            .tensor_variable(vec![0.0, 0.0, 1.0], vec![3], false)
+            .unwrap();
+        let src = s
+            .tensor_variable(vec![4.0, 0.0, 3.0], vec![3], true)
+            .unwrap();
+        let out = s
+            .tensor_scatter_reduce(input, 0, index, src, "prod")
+            .unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), &[0.0, 15.0]);
+
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let in_grad = s.tensor_gradient(&report, input).expect("input grad");
+        let src_grad = s.tensor_gradient(&report, src).expect("src grad");
+        assert_eq!(in_grad, &[0.0, 3.0]);
+        assert_eq!(src_grad, &[0.0, 8.0, 5.0]);
     }
 
     #[test]
