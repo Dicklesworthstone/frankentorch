@@ -1986,6 +1986,13 @@ impl Module for Dropout2d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if !self.p.is_finite() || !(0.0..=1.0).contains(&self.p) {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "dropout probability p must be finite and in [0, 1]",
+                },
+            )));
+        }
         if !self.training.get() || self.p == 0.0 {
             return Ok(input);
         }
@@ -2069,6 +2076,13 @@ impl Module for Dropout3d {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if !self.p.is_finite() || !(0.0..=1.0).contains(&self.p) {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "dropout probability p must be finite and in [0, 1]",
+                },
+            )));
+        }
         if !self.training.get() || self.p == 0.0 {
             return Ok(input);
         }
@@ -14966,6 +14980,29 @@ mod tests {
     }
 
     #[test]
+    fn dropout2d_invalid_probability_fails_closed() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3 * 4 * 4], vec![2, 3, 4, 4], false)
+            .unwrap();
+
+        for p in [-0.1, 1.1, f64::NAN] {
+            let d = Dropout2d::new(p);
+            let err = d
+                .forward(&mut session, x)
+                .expect_err("invalid Dropout2d probability must fail closed");
+            assert!(matches!(
+                err,
+                AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "dropout probability p must be finite and in [0, 1]"
+                    }
+                ))
+            ));
+        }
+    }
+
+    #[test]
     fn dropout2d_channel_consistency() {
         // All spatial elements in a dropped channel should be zero
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -14993,6 +15030,29 @@ mod tests {
     fn dropout2d_has_no_parameters() {
         let d = Dropout2d::new(0.5);
         assert!(d.parameters().is_empty());
+    }
+
+    #[test]
+    fn dropout3d_invalid_probability_fails_closed() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 2 * 2 * 2], vec![1, 2, 2, 2, 2], false)
+            .unwrap();
+
+        for p in [-0.1, 1.1, f64::NAN] {
+            let d = Dropout3d::new(p);
+            let err = d
+                .forward(&mut session, x)
+                .expect_err("invalid Dropout3d probability must fail closed");
+            assert!(matches!(
+                err,
+                AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "dropout probability p must be finite and in [0, 1]"
+                    }
+                ))
+            ));
+        }
     }
 
     #[test]
