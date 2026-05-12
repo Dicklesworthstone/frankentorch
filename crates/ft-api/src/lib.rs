@@ -13199,7 +13199,8 @@ impl FrankenTorchSession {
 
     /// Cosine similarity between two tensors along a dimension.
     ///
-    /// `cos_sim(x1, x2, dim) = sum(x1 * x2, dim) / max(norm(x1, dim) * norm(x2, dim), eps)`
+    /// `cos_sim(x1, x2, dim) =
+    /// sum(x1 * x2, dim) / (max(norm(x1, dim), eps) * max(norm(x2, dim), eps))`
     ///
     /// Returns a tensor with the specified dimension reduced.
     /// `eps` prevents division by zero when one or both inputs have zero norm.
@@ -13216,15 +13217,12 @@ impl FrankenTorchSession {
         let prod = self.tensor_mul(x1, x2)?;
         let dot = self.tensor_sum_dim(prod, dim)?;
 
-        // norms = norm(x1, dim) * norm(x2, dim)
+        // Denominator = max(norm(x1, dim), eps) * max(norm(x2, dim), eps)
         let norm1 = self.tensor_norm_dim(x1, 2.0, dim)?;
         let norm2 = self.tensor_norm_dim(x2, 2.0, dim)?;
-        let norms = self.tensor_mul(norm1, norm2)?;
-
-        // Clamp norms below to eps to avoid division by zero
-        let norms_shape = self.tensor_shape(norms)?;
-        let eps_tensor = self.full(norms_shape, eps, false)?;
-        let denom = self.tensor_max(norms, eps_tensor)?;
+        let norm1 = self.tensor_clamp_min(norm1, eps)?;
+        let norm2 = self.tensor_clamp_min(norm2, eps)?;
+        let denom = self.tensor_mul(norm1, norm2)?;
 
         // cos_sim = dot / denom
         self.tensor_div(dot, denom)
@@ -25888,6 +25886,24 @@ mod tests {
     }
 
     #[test]
+    fn cosine_similarity_clamps_norms_independently() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x1 = s
+            .tensor_variable(vec![1e-9, 0.0], vec![1, 2], false)
+            .unwrap();
+        let x2 = s
+            .tensor_variable(vec![1e9, 0.0], vec![1, 2], false)
+            .unwrap();
+        let sim = s.cosine_similarity(x1, x2, 1, 1e-8).unwrap();
+        let vals = s.tensor_values(sim).unwrap();
+        assert!(
+            (vals[0] - 0.1).abs() < 1e-12,
+            "cosine_similarity must clamp each norm before multiplying, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
     fn cosine_similarity_scale_and_sign_metamorphic() {
         // Metamorphic relations outside the eps-clamp region:
         //   cos(k*x, y) == cos(x, y) for k > 0
@@ -25997,7 +26013,7 @@ mod tests {
             .unwrap();
         let sim = s.cosine_similarity(x1, x2, 0, 1e-8).unwrap();
         let vals = s.tensor_values(sim).unwrap();
-        // dot = 0, norms product is clamped to eps, result should be ~0
+        // dot = 0, each norm is clamped to eps, result should be ~0
         assert!(
             vals[0].is_finite(),
             "zero vector with eps should not produce NaN/Inf, got {}",

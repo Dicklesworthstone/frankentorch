@@ -13620,8 +13620,9 @@ impl CosineSimilarity {
         // norms
         let norm1 = session.tensor_norm_dim(x1, 2.0, self.dim)?;
         let norm2 = session.tensor_norm_dim(x2, 2.0, self.dim)?;
-        let norm_prod = session.tensor_mul(norm1, norm2)?;
-        let denom = session.tensor_clamp_min(norm_prod, self.eps)?;
+        let norm1 = session.tensor_clamp_min(norm1, self.eps)?;
+        let norm2 = session.tensor_clamp_min(norm2, self.eps)?;
+        let denom = session.tensor_mul(norm1, norm2)?;
 
         session.tensor_div(dot, denom)
     }
@@ -25379,6 +25380,25 @@ mod tests {
         assert!(
             (vals[0] + 1.0).abs() < 1e-6,
             "opposite vectors should have cosine similarity -1.0, got {}",
+            vals[0]
+        );
+    }
+
+    #[test]
+    fn cosine_similarity_clamps_norms_independently() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let cs = CosineSimilarity::new(1);
+        let x1 = session
+            .tensor_variable(vec![1e-9, 0.0], vec![1, 2], false)
+            .unwrap();
+        let x2 = session
+            .tensor_variable(vec![1e9, 0.0], vec![1, 2], false)
+            .unwrap();
+        let out = cs.forward_pair(&mut session, x1, x2).unwrap();
+        let vals = session.tensor_values(out).unwrap();
+        assert!(
+            (vals[0] - 0.1).abs() < 1e-12,
+            "CosineSimilarity must clamp each norm before multiplying, got {}",
             vals[0]
         );
     }
