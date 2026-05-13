@@ -386,4 +386,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_serialize_checkpoint_roundtrip"
+path = "fuzz_targets/ft_serialize_checkpoint_roundtrip.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
