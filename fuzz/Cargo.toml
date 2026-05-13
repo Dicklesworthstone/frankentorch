@@ -190,4 +190,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_kernel_cpu_scatter_add"
+path = "fuzz_targets/ft_kernel_cpu_scatter_add.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
