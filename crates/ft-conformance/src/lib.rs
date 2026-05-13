@@ -13952,6 +13952,52 @@ mod tests {
             }
         }
 
+        // MR (hyperbolic Pythagorean identity): cosh^2(x) - sinh^2(x)
+        // ≈ 1 for any finite real x. Catches libm sinh/cosh precision
+        // regressions, sign drift, autograd severance.
+        //
+        // Note: cosh and sinh grow exponentially in |x|, so the
+        // squared values themselves grow as e^(2|x|). With x in
+        // [-3, 3], the squares are at most ~1e5 and the difference
+        // is 1, so relative tolerance must scale by the magnitude
+        // of cosh^2 (worst-case ~5e3). Use a generous absolute
+        // bound on the diff scaled by cosh^2.
+        // frankentorch-fc2a.
+        #[test]
+        fn fuzz_metamorphic_sinh_cosh_hyperbolic_identity(
+            samples in prop::collection::vec(-768i16..768i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // x in roughly [-3, 3] keeps cosh^2 below ~100 so the
+            // tolerance bound stays meaningful.
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 256.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x_a = s.tensor_variable(input.clone(), vec![n], false).expect("x_a");
+            let cosh_x = s.tensor_cosh(x_a).expect("cosh");
+            let cosh2 = s.tensor_square(cosh_x).expect("cosh2");
+            let x_b = s.tensor_variable(input.clone(), vec![n], false).expect("x_b");
+            let sinh_x = s.tensor_sinh(x_b).expect("sinh");
+            let sinh2 = s.tensor_square(sinh_x).expect("sinh2");
+            let diff = s.tensor_sub(cosh2, sinh2).expect("sub");
+            let v = s.tensor_values(diff).expect("values");
+
+            for (i, &g) in v.iter().enumerate() {
+                let x_mag = input[i].abs();
+                let cosh_max_sq = (x_mag.cosh()).powi(2);
+                // ULP bound scales by cosh^2 since the difference
+                // cosh^2 - sinh^2 cancels two large numbers down to 1.
+                let bound = 32.0 * f64::EPSILON * cosh_max_sq + 1e-12;
+                let err = (g - 1.0).abs();
+                prop_assert!(
+                    err <= bound,
+                    "cosh^2(x) - sinh^2(x) [{}] = {} (expected 1.0, x = {}, err = {:e}, bound = {:e})",
+                    i, g, input[i], err, bound
+                );
+            }
+        }
+
         // MR (Pythagorean identity): sin^2(x) + cos^2(x) ≈ 1
         // within 8 ULP for any finite real x. The squares are
         // exact under f64 (no rounding for x*x with finite x);
