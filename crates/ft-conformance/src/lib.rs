@@ -13952,6 +13952,44 @@ mod tests {
             }
         }
 
+        // MR (Pythagorean identity): sin^2(x) + cos^2(x) ≈ 1
+        // within 8 ULP for any finite real x. The squares are
+        // exact under f64 (no rounding for x*x with finite x);
+        // the sin and cos drifts contribute O(ULP) at each
+        // evaluation, so the sum drift is ~16 ULP-of-1. Catches
+        // libm sin/cos precision regressions and sign drift in
+        // either trig op. frankentorch-zi3o.
+        #[test]
+        fn fuzz_metamorphic_sin_cos_pythagorean(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // Bounded x in roughly [-12, 12] so we exercise a few
+            // periods of sin/cos but stay well clear of catastrophic
+            // argument-reduction regions (huge |x|).
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 170.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x_node = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let sin_x = s.tensor_sin(x_node).expect("sin");
+            let sin2 = s.tensor_square(sin_x).expect("sin2");
+            let x_node2 = s.tensor_variable(input, vec![n], false).expect("x2");
+            let cos_x = s.tensor_cos(x_node2).expect("cos");
+            let cos2 = s.tensor_square(cos_x).expect("cos2");
+            let summed = s.tensor_add(sin2, cos2).expect("add");
+            let v = s.tensor_values(summed).expect("values");
+
+            for (i, &g) in v.iter().enumerate() {
+                let diff = (g - 1.0).abs();
+                prop_assert!(
+                    diff <= 16.0 * f64::EPSILON,
+                    "sin^2 + cos^2 [{}] = {} (expected 1.0, diff = {:e})",
+                    i, g, diff
+                );
+            }
+        }
+
         // MR (inverse function): square(sqrt(x)) ≈ x for x >= 0
         // within 8 ULP. The two operations are an inverse pair on
         // the non-negative reals; for x = 0 the round-trip is
