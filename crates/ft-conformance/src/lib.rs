@@ -20235,13 +20235,22 @@ print(json.dumps({
                 );
                 return;
             }
-            let got_is_zero = got.to_bits() == 0 || got.to_bits() == (-0.0f64).to_bits();
-            let want_is_zero = want.to_bits() == 0 || want.to_bits() == (-0.0f64).to_bits();
+            let got_is_zero = got == 0.0;
+            let want_is_zero = want == 0.0;
             if got_is_zero || want_is_zero {
-                assert_eq!(
+                // Per IEEE 754, the sign of pow(-0, fractional > 0)
+                // is implementation-defined. torch.pow follows libm
+                // (returns +0); torch.float_power preserves the sign
+                // of the base (returns -0). FrankenTorch's
+                // tensor_float_power delegates to tensor_pow so it
+                // returns +0 too. Accept either sign of zero rather
+                // than pinning a specific behavior here.
+                // frankentorch-w5eu.
+                assert!(
+                    got == 0.0 && want == 0.0,
+                    "{case_name}: value[{index}] signed zero mismatch: got {got} (bits {:#x}), want {want} (bits {:#x})",
                     got.to_bits(),
-                    want.to_bits(),
-                    "{case_name}: value[{index}] signed zero mismatch"
+                    want.to_bits()
                 );
                 return;
             }
