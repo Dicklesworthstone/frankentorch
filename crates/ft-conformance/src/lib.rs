@@ -13952,6 +13952,71 @@ mod tests {
             }
         }
 
+        // MR (gradient distribution): sum(matmul(A, B)) backward
+        // gives well-defined closed-form gradients via chain rule.
+        // For loss = sum(A @ B) with d_loss/d_y = ones_{m,n}:
+        //   d_loss/d_A[i,k] = sum_j(B[k,j])  (each row identical)
+        //   d_loss/d_B[k,j] = sum_i(A[i,k])  (each col identical)
+        // Catches autograd severance through matmul + transpose-
+        // confusion in the backward formula. frankentorch-g2ut.
+        #[test]
+        fn fuzz_metamorphic_matmul_sum_backward_chain_rule(
+            (m, k, n, a_raw, b_raw) in (1usize..=4, 1usize..=4, 1usize..=4)
+                .prop_flat_map(|(m, k, n)| (
+                    Just(m),
+                    Just(k),
+                    Just(n),
+                    prop::collection::vec(-128i16..128i16, m * k),
+                    prop::collection::vec(-128i16..128i16, k * n),
+                ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a_vals: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let b_vals: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_variable(a_vals.clone(), vec![m, k], true).expect("a");
+            let b = s.tensor_variable(b_vals.clone(), vec![k, n], true).expect("b");
+            let prod = s.tensor_matmul(a, b).expect("matmul");
+            let loss = s.tensor_sum(prod).expect("sum");
+            s.tensor_backward(loss).expect("backward");
+
+            let a_grad = s.tensor_accumulated_gradient(a)
+                .expect("a_grad accessor")
+                .expect("a_grad some");
+            let b_grad = s.tensor_accumulated_gradient(b)
+                .expect("b_grad accessor")
+                .expect("b_grad some");
+
+            // Expected A grad: sum of B columns repeated for each A row.
+            // a_grad[i, k] = sum_j B[k, j]
+            for i in 0..m {
+                for kk in 0..k {
+                    let expected: f64 = (0..n).map(|j| b_vals[kk * n + j]).sum();
+                    let got = a_grad[i * k + kk];
+                    let bound = 16.0 * f64::EPSILON * (n as f64) * b_vals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
+                    prop_assert!(
+                        (got - expected).abs() < bound + 1e-12,
+                        "a_grad[{i},{kk}] = {got}, expected sum_j(B[{kk},j]) = {expected}"
+                    );
+                }
+            }
+            // Expected B grad: sum of A rows for each B column.
+            // b_grad[k, j] = sum_i A[i, k]
+            for kk in 0..k {
+                for j in 0..n {
+                    let expected: f64 = (0..m).map(|i| a_vals[i * k + kk]).sum();
+                    let got = b_grad[kk * n + j];
+                    let bound = 16.0 * f64::EPSILON * (m as f64) * a_vals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
+                    prop_assert!(
+                        (got - expected).abs() < bound + 1e-12,
+                        "b_grad[{kk},{j}] = {got}, expected sum_i(A[i,{kk}]) = {expected}"
+                    );
+                }
+            }
+        }
+
         // MR (gradient distribution): sum(gather(input, dim, index))
         // backward yields input_grad as a count histogram of how
         // many times each input position appears in index. Catches:
