@@ -12246,6 +12246,107 @@ mod tests {
             }
         }
 
+        // ── tensor_special_ndtri metamorphic suite (frankentorch-n3qp) ──
+        //
+        // Three independent MRs:
+        //   - sign symmetry: ndtri(1-p) = -ndtri(p)
+        //   - monotonicity: ndtri is non-decreasing
+        //   - roundtrip: ndtri(ndtr(x)) ≈ x
+        //
+        // Tolerances are loose because the underlying erfinv
+        // polynomial is only ~1e-4 accurate.
+
+        // MR (sign symmetry): ndtri(1-p) = -ndtri(p) for any
+        // p in (0, 1). Standard normal is symmetric about 0.
+        #[test]
+        fn fuzz_metamorphic_ndtri_sign_symmetry(
+            samples in prop::collection::vec(50u16..950u16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // p in (0.05, 0.95) to avoid the boundary regime
+            // where erfinv's polynomial accuracy degrades.
+            let ps: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 1000.0).collect();
+            let one_minus_ps: Vec<f64> = ps.iter().map(|p| 1.0 - p).collect();
+            let n = ps.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let p_t = s.tensor_variable(ps, vec![n], false).expect("p");
+            let comp_t = s
+                .tensor_variable(one_minus_ps, vec![n], false)
+                .expect("1-p");
+            let a = s.tensor_special_ndtri(p_t).expect("ndtri(p)");
+            let b = s.tensor_special_ndtri(comp_t).expect("ndtri(1-p)");
+            let v_a = s.tensor_values(a).expect("v_a");
+            let v_b = s.tensor_values(b).expect("v_b");
+
+            for (i, (av, bv)) in v_a.iter().zip(v_b.iter()).enumerate() {
+                let sum = av + bv;
+                prop_assert!(
+                    sum.abs() < 1e-3,
+                    "ndtri(p[{}]) + ndtri(1-p[{}]) = {} but expected 0",
+                    i, i, sum
+                );
+            }
+        }
+
+        // MR (monotonicity): ndtri non-decreasing on sorted input.
+        #[test]
+        fn fuzz_metamorphic_ndtri_monotonicity(
+            samples in prop::collection::vec(50u16..950u16, 2..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let mut ps: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 1000.0).collect();
+            ps.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+            let n = ps.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let pt = s.tensor_variable(ps, vec![n], false).expect("pt");
+            let out = s.tensor_special_ndtri(pt).expect("ndtri");
+            let v = s.tensor_values(out).expect("values");
+
+            for i in 1..n {
+                prop_assert!(
+                    v[i] + 1e-4 >= v[i - 1],
+                    "ndtri non-monotone: v[{}]={}, v[{}]={}",
+                    i - 1, v[i - 1], i, v[i]
+                );
+            }
+        }
+
+        // MR (roundtrip): ndtri(ndtr(x)) ≈ x.
+        #[test]
+        fn fuzz_metamorphic_ndtri_inverse_roundtrip(
+            samples in prop::collection::vec(-300i16..300i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // x in (-3, 3) — outside this the underlying
+            // erfinv polynomial saturates and the roundtrip
+            // loses accuracy quickly. Skip 0 to avoid 50/50 ties.
+            let xs: Vec<f64> = samples
+                .iter()
+                .filter(|v| **v != 0)
+                .map(|v| f64::from(*v) / 100.0)
+                .collect();
+            if xs.is_empty() {
+                return Ok(());
+            }
+            let n = xs.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xt = s.tensor_variable(xs.clone(), vec![n], false).expect("xt");
+            let cdf = s.tensor_special_ndtr(xt).expect("ndtr");
+            let inv = s.tensor_special_ndtri(cdf).expect("ndtri");
+            let v = s.tensor_values(inv).expect("values");
+
+            for (i, (got, &original)) in v.iter().zip(xs.iter()).enumerate() {
+                let diff = (got - original).abs();
+                prop_assert!(
+                    diff < 1e-3,
+                    "i={i}: ndtri(ndtr({original})) = {got}, diff = {diff}"
+                );
+            }
+        }
+
         // logaddexp is symmetric in its arguments: logaddexp(a, b) ==
         // logaddexp(b, a) bit-exactly. log(exp(a)+exp(b)) is unchanged
         // by argument order, and the max-subtraction stabilization
