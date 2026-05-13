@@ -232,4 +232,18 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_kernel_cpu_addmm"
+path = "fuzz_targets/ft_kernel_cpu_addmm.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ft_kernel_cpu_addmv"
+path = "fuzz_targets/ft_kernel_cpu_addmv.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
