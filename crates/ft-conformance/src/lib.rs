@@ -21683,6 +21683,124 @@ print(json.dumps({"results": out}))
     }
 
     #[test]
+    fn torch_diag_embed_numpy_subprocess_conformance() {
+        // Numpy oracle for tensor_diag_embed. torch.diag_embed wraps
+        // numpy's diag construction with an explicit offset parameter.
+        // Existing torch_diag_subprocess_conformance (1prj) covers
+        // tensor_diag for both 1-D→matrix and matrix→1-D paths but
+        // not diag_embed, which has a distinct offset arithmetic
+        // path (shifts the diagonal up or down by offset).
+        // frankentorch-una3.
+        use ft_api::FrankenTorchSession;
+        use std::process::{Command, Stdio};
+
+        let python_available = Command::new("python3")
+            .arg("-c")
+            .arg("import numpy, json, struct, sys")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|s| s.success())
+            .unwrap_or(false);
+        if !python_available {
+            eprintln!("torch_diag_embed_numpy_subprocess_conformance: python3/numpy not available, skipping");
+            return;
+        }
+
+        let config = HarnessConfig::default_paths();
+
+        // Cases: (input values, offset)
+        let cases: Vec<(Vec<f64>, i32)> = vec![
+            (vec![1.0, 2.0, 3.0], 0),
+            (vec![1.0, 2.0, 3.0], 1),
+            (vec![1.0, 2.0, 3.0], -1),
+            (vec![1.0, 2.0, 3.0, 4.0], 2),
+            (vec![1.0, 2.0, 3.0, 4.0], -2),
+            (vec![5.0], 0),
+            (vec![0.5, -1.5, 2.5, -3.5, 4.5], 0),
+        ];
+
+        let serialized: Vec<(Vec<String>, i32)> = cases
+            .iter()
+            .map(|(v, off)| (v.iter().map(|x| x.to_bits().to_string()).collect(), *off))
+            .collect();
+        let payload = json!({ "cases": serialized });
+
+        let script = r#"
+import json, struct, sys
+import numpy as np
+
+req = json.loads(sys.stdin.read())
+out = []
+for arr_bits, offset in req["cases"]:
+    arr = np.array([struct.unpack("<d", struct.pack("<Q", int(b)))[0] for b in arr_bits], dtype=np.float64)
+    m = np.diagflat([0]) if False else None  # placeholder
+    # numpy.diag accepts a 1-D array and an offset k.
+    result = np.diag(arr, k=int(offset))
+    flat = result.flatten().tolist()
+    out.append([struct.unpack("<Q", struct.pack("<d", v))[0] for v in flat])
+print(json.dumps({"results": out}))
+"#;
+
+        let response = match super::run_legacy_oracle_script(&config, script, &payload) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!(
+                    "torch_diag_embed_numpy_subprocess_conformance: oracle invocation failed ({e}); skipping"
+                );
+                return;
+            }
+        };
+        let results = response.get("results").and_then(|v| v.as_array()).expect("results");
+
+        let mut mismatches = Vec::<String>::new();
+        for (case_idx, (input, offset)) in cases.iter().enumerate() {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let n = input.len();
+            let x = session.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let embedded = match session.tensor_diag_embed(x, *offset) {
+                Ok(t) => t,
+                Err(_) => {
+                    mismatches.push(format!(
+                        "case {case_idx}: tensor_diag_embed errored on input len {n}, offset {offset}"
+                    ));
+                    continue;
+                }
+            };
+            let v_got = session.tensor_values(embedded).expect("values");
+            let case_result = results[case_idx].as_array().expect("result array");
+            if v_got.len() != case_result.len() {
+                mismatches.push(format!(
+                    "case {case_idx}: got len {}, numpy len {}",
+                    v_got.len(),
+                    case_result.len()
+                ));
+                continue;
+            }
+            for (i, (got, want_v)) in v_got.iter().zip(case_result.iter()).enumerate() {
+                let want_bits: u64 = want_v.as_str().unwrap().parse().unwrap();
+                let want = f64::from_bits(want_bits);
+                if got.to_bits() != want.to_bits() {
+                    mismatches.push(format!(
+                        "case {case_idx} [{i}]: got {} (bits 0x{:016x}), numpy {} (bits 0x{:016x})",
+                        got,
+                        got.to_bits(),
+                        want,
+                        want_bits
+                    ));
+                }
+            }
+        }
+
+        assert!(
+            mismatches.is_empty(),
+            "diag_embed numpy conformance mismatches:\n{}",
+            mismatches.join("\n")
+        );
+    }
+
+    #[test]
     fn torch_lgamma_libm_subprocess_conformance() {
         // Lock the precision contract for lgamma (log-Gamma).
         //
