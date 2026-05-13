@@ -13847,6 +13847,80 @@ mod tests {
             }
         }
 
+        // MR (invertibility): irfft(rfft(x)) == x for real input x
+        // within bounded ULP. The DFT inverse-DFT roundtrip catches:
+        // - sign flips in the exp(-2πi k n / N) phase
+        // - normalization mismatch (rfft uses 1/N convention, irfft
+        //   must undo with N to recover x)
+        // - rfft/irfft length contracts (rfft N -> N/2+1, irfft N/2+1 -> N)
+        //
+        // Tolerance is N * 64 * EPSILON because each butterfly stage
+        // doubles the relative rounding error. Unblocked by w6x1.
+        // frankentorch-obqq.
+        #[test]
+        fn fuzz_metamorphic_irfft_of_rfft_recovers_input(
+            (n, raw) in (2usize..=16).prop_flat_map(|n| (
+                Just(n),
+                prop::collection::vec(-256i16..256i16, n),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let freq = s.tensor_rfft(x, None).expect("rfft");
+            let recovered = s.tensor_irfft(freq, Some(n)).expect("irfft");
+            let v_rec = s.tensor_values(recovered).expect("v_rec");
+            prop_assert_eq!(v_rec.len(), n, "irfft must restore original length");
+
+            let abs_max = input.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let bound = (n as f64) * 64.0 * f64::EPSILON * abs_max.max(1.0) + 1e-12;
+            for (i, (got, expected)) in v_rec.iter().zip(input.iter()).enumerate() {
+                let diff = (got - expected).abs();
+                prop_assert!(
+                    diff <= bound,
+                    "irfft(rfft(x))[{}] = {} but x[{}] = {} (diff = {:e}, bound = {:e})",
+                    i, got, i, expected, diff, bound
+                );
+            }
+        }
+
+        // MR (invertibility): ifft(fft(x)).real == x for real input x.
+        // Complementary to the rfft round-trip — exercises the
+        // tensor_complex wiring and the ifft normalization branch
+        // (1/N at the end of the inverse DFT). Unblocked by w6x1.
+        // frankentorch-obqq.
+        #[test]
+        fn fuzz_metamorphic_ifft_of_fft_recovers_real_part(
+            (n, raw) in (2usize..=16).prop_flat_map(|n| (
+                Just(n),
+                prop::collection::vec(-256i16..256i16, n),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let freq = s.tensor_fft(x, None).expect("fft");
+            let recovered = s.tensor_ifft(freq, None).expect("ifft");
+            let real_part = s.tensor_real(recovered).expect("real");
+            let v_rec = s.tensor_values(real_part).expect("v_rec");
+            prop_assert_eq!(v_rec.len(), n, "ifft real-part must match input length");
+
+            let abs_max = input.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+            let bound = (n as f64) * 64.0 * f64::EPSILON * abs_max.max(1.0) + 1e-12;
+            for (i, (got, expected)) in v_rec.iter().zip(input.iter()).enumerate() {
+                let diff = (got - expected).abs();
+                prop_assert!(
+                    diff <= bound,
+                    "ifft(fft(x)).real[{}] = {} but x[{}] = {} (diff = {:e}, bound = {:e})",
+                    i, got, i, expected, diff, bound
+                );
+            }
+        }
+
         // MR (consistency): exp(log_softmax(x)) == softmax(x) within
         // bounded ULP tolerance. The two ops are mathematically the
         // exp/log pair on the same normalized distribution; any
