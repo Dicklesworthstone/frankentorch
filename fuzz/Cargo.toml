@@ -351,4 +351,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_api_diag"
+path = "fuzz_targets/ft_api_diag.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
