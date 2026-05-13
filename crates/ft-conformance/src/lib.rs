@@ -13847,6 +13847,39 @@ mod tests {
             }
         }
 
+        // MR (descending duality): for non-NaN inputs,
+        // sort_descending(x) bit-exactly equals reverse(sort_ascending(x)).
+        // Catches any sign-comparator bug in the descending path.
+        // frankentorch-kc70.
+        #[test]
+        fn fuzz_metamorphic_sort_descending_is_reverse_of_ascending(
+            samples in prop::collection::vec(-1024i16..1024i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xa = s.tensor_variable(input.clone(), vec![n], false).expect("xa");
+            let (asc, _) = s.tensor_sort(xa, 0, false).expect("sort asc");
+            let v_asc = s.tensor_values(asc).expect("v_asc");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xd = s.tensor_variable(input, vec![n], false).expect("xd");
+            let (desc, _) = s.tensor_sort(xd, 0, true).expect("sort desc");
+            let v_desc = s.tensor_values(desc).expect("v_desc");
+
+            // Reverse v_asc and compare bit-exactly to v_desc.
+            let reversed_asc: Vec<f64> = v_asc.iter().rev().copied().collect();
+            for (i, (a, b)) in reversed_asc.iter().zip(v_desc.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "reverse(sort_asc(x))[{}] = {} but sort_desc(x)[{}] = {}", i, a, i, b
+                );
+            }
+        }
+
         // MR (invertibility): istft(stft(x)) ≈ x for a real signal
         // x within bounded ULP, using default options (rectangular
         // window, hop = n_fft/4, center=true, onesided=true). The
