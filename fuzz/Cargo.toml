@@ -267,4 +267,11 @@ test = false
 doc = false
 bench = false
 
+[[bin]]
+name = "ft_kernel_cpu_activations"
+path = "fuzz_targets/ft_kernel_cpu_activations.rs"
+test = false
+doc = false
+bench = false
+
 [workspace]
