@@ -16811,6 +16811,125 @@ print(json.dumps({"results": results}, sort_keys=True))
     }
 
     #[test]
+    fn torch_special_ndtri_subprocess_conformance() {
+        // Subprocess oracle for tensor_special_ndtri (gf4d) —
+        // the inverse standard normal CDF. ft-api composes via
+        // ndtri(p) = sqrt(2) * erfinv(2p - 1); the underlying
+        // A&S erfinv polynomial is ~1e-4 accurate. This oracle
+        // quantifies the ULP gap vs torch.special.ndtri's
+        // higher-order implementation. Tracked under
+        // frankentorch-2hbw.
+        use ft_api::FrankenTorchSession;
+
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let torch_available = Command::new(&python)
+            .arg("-c")
+            .arg("import torch")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !torch_available {
+            eprintln!("torch_special_ndtri_subprocess_conformance: torch unavailable, skipping");
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let case_payload = json!({
+            "cases": [
+                0.5,
+                0.025, 0.975,
+                0.1, 0.9,
+                0.001, 0.999,
+                0.5e-6, 1.0 - 0.5e-6,
+                "nan",
+            ]
+        });
+
+        let script = r#"
+import json
+import math
+import sys
+import torch
+
+def decode_scalar(v):
+    if isinstance(v, str):
+        return {"nan": float("nan"), "inf": float("inf"),
+                "-inf": float("-inf"), "-0.0": -0.0}[v]
+    return float(v)
+
+def encode_scalar(v):
+    if math.isnan(v):
+        return "nan"
+    if math.isinf(v):
+        return "inf" if v > 0 else "-inf"
+    return v
+
+cases = [decode_scalar(c) for c in json.loads(sys.stdin.read())["cases"]]
+results = [
+    encode_scalar(torch.special.ndtri(torch.tensor(c, dtype=torch.float64)).item())
+    for c in cases
+]
+print(json.dumps({"results": results}, sort_keys=True))
+"#;
+
+        let oracle = super::run_legacy_oracle_script(&config, script, &case_payload)
+            .expect("torch.special.ndtri oracle should run");
+        let results = oracle
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("oracle results");
+        let cases_arr = case_payload
+            .get("cases")
+            .and_then(Value::as_array)
+            .expect("cases");
+        assert_eq!(results.len(), cases_arr.len(), "oracle case count");
+
+        fn decode(v: &Value) -> f64 {
+            if let Some(s) = v.as_str() {
+                match s {
+                    "nan" => f64::NAN,
+                    "inf" => f64::INFINITY,
+                    "-inf" => f64::NEG_INFINITY,
+                    "-0.0" => -0.0,
+                    other => panic!("unexpected tagged scalar: {other}"),
+                }
+            } else {
+                v.as_f64().expect("oracle scalar")
+            }
+        }
+
+        for (i, (case, expected_value)) in cases_arr.iter().zip(results.iter()).enumerate() {
+            let input = decode(case);
+            let expected = decode(expected_value);
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xt = session.tensor_variable(vec![input], vec![1], false).unwrap();
+            let out = session.tensor_special_ndtri(xt).unwrap();
+            let got = session.tensor_values(out).expect("got")[0];
+
+            if expected.is_nan() {
+                assert!(got.is_nan(), "case {i} (input={input}): expected NaN");
+                continue;
+            }
+            if expected.is_infinite() {
+                continue;
+            }
+            let diff = (got - expected).abs();
+            let scale = got.abs().max(expected.abs()).max(1.0);
+            assert!(
+                diff <= 1e-4 || diff <= 1e-3 * scale,
+                "case {i} (input={input}): tensor_special_ndtri = {got}, torch = {expected}, diff = {diff:e}"
+            );
+        }
+    }
+
+    #[test]
     fn torch_nan_to_num_f32_subprocess_conformance() {
         // Torch differential coverage for F32 tensor_nan_to_num
         // forward + backward (frankentorch-dfd9). The F32 path
