@@ -19068,6 +19068,98 @@ impl FrankenTorchSession {
 
     // ── FFT operations ───────────────────────────────────────────────────
 
+    /// In-place 1-D DFT. When `n` is a power of two, runs an
+    /// iterative Cooley-Tukey decimation-in-time FFT in
+    /// O(N log N) with O(log N · ε) accumulated rounding. For
+    /// non-power-of-two `n`, falls back to the naive O(N^2) DFT.
+    /// The caller passes interleaved real/imag buffers of length
+    /// `n`; this function overwrites them with the transform.
+    /// If `inverse` is true, computes the inverse DFT (positive
+    /// twiddle exponent + 1/N normalization).
+    /// frankentorch-hpo6.
+    fn dft_inplace_1d(re: &mut [f64], im: &mut [f64], inverse: bool) {
+        let n = re.len();
+        assert_eq!(re.len(), im.len(), "dft_inplace_1d re/im length mismatch");
+        if n <= 1 {
+            if inverse && n == 1 {
+                // 1-element inverse: divide by 1, no-op.
+            }
+            return;
+        }
+
+        if n.is_power_of_two() {
+            // Bit-reversal permutation.
+            let mut j = 0usize;
+            for i in 1..n {
+                let mut bit = n >> 1;
+                while j & bit != 0 {
+                    j ^= bit;
+                    bit >>= 1;
+                }
+                j ^= bit;
+                if i < j {
+                    re.swap(i, j);
+                    im.swap(i, j);
+                }
+            }
+            // Butterfly stages.
+            let sign = if inverse { 1.0 } else { -1.0 };
+            let two_pi = 2.0 * std::f64::consts::PI;
+            let mut stage = 2usize;
+            while stage <= n {
+                let half = stage / 2;
+                let angle_step = sign * two_pi / stage as f64;
+                for start in (0..n).step_by(stage) {
+                    for k in 0..half {
+                        let angle = angle_step * k as f64;
+                        let w_re = angle.cos();
+                        let w_im = angle.sin();
+                        let idx = start + k;
+                        let jdx = start + k + half;
+                        let tw_re = w_re * re[jdx] - w_im * im[jdx];
+                        let tw_im = w_re * im[jdx] + w_im * re[jdx];
+                        re[jdx] = re[idx] - tw_re;
+                        im[jdx] = im[idx] - tw_im;
+                        re[idx] += tw_re;
+                        im[idx] += tw_im;
+                    }
+                }
+                stage *= 2;
+            }
+        } else {
+            // Non-power-of-two fallback: naive O(N^2) DFT.
+            let mut out_re = vec![0.0_f64; n];
+            let mut out_im = vec![0.0_f64; n];
+            let sign = if inverse { 1.0 } else { -1.0 };
+            let two_pi = 2.0 * std::f64::consts::PI;
+            for k in 0..n {
+                let mut acc_re = 0.0_f64;
+                let mut acc_im = 0.0_f64;
+                for nn in 0..n {
+                    let angle = sign * two_pi * k as f64 * nn as f64 / n as f64;
+                    let c = angle.cos();
+                    let s = angle.sin();
+                    acc_re += re[nn] * c - im[nn] * s;
+                    acc_im += re[nn] * s + im[nn] * c;
+                }
+                out_re[k] = acc_re;
+                out_im[k] = acc_im;
+            }
+            re.copy_from_slice(&out_re);
+            im.copy_from_slice(&out_im);
+        }
+
+        if inverse {
+            let inv_n = 1.0 / n as f64;
+            for v in re.iter_mut() {
+                *v *= inv_n;
+            }
+            for v in im.iter_mut() {
+                *v *= inv_n;
+            }
+        }
+    }
+
     /// Compute the 1-D Discrete Fourier Transform.
     ///
     /// Equivalent to `torch.fft.fft(input, n)`.
@@ -19089,31 +19181,20 @@ impl FrankenTorchSession {
         let input_len = vals.len();
         let fft_len = n.unwrap_or(input_len);
 
-        // Zero-pad or truncate input to length n
-        let mut x = vec![0.0; fft_len];
+        // Zero-pad or truncate input to length n. Build real
+        // interleaved storage with zero imaginary part.
+        let mut re_buf = vec![0.0_f64; fft_len];
+        let mut im_buf = vec![0.0_f64; fft_len];
         let copy_len = input_len.min(fft_len);
-        x[..copy_len].copy_from_slice(&vals[..copy_len]);
+        re_buf[..copy_len].copy_from_slice(&vals[..copy_len]);
 
-        // Direct DFT: X[k] = sum_n x[n] * exp(-2*pi*i*k*n/N)
-        let mut real_out = Vec::with_capacity(fft_len);
-        let mut imag_out = Vec::with_capacity(fft_len);
-        let two_pi = 2.0 * std::f64::consts::PI;
-
-        for k in 0..fft_len {
-            let mut re = 0.0;
-            let mut im = 0.0;
-            for (nn, &xn) in x.iter().enumerate() {
-                let angle = -two_pi * k as f64 * nn as f64 / fft_len as f64;
-                re += xn * angle.cos();
-                im += xn * angle.sin();
-            }
-            real_out.push(re);
-            imag_out.push(im);
-        }
+        // Cooley-Tukey for power-of-two N, O(N^2) fallback otherwise.
+        // frankentorch-hpo6.
+        Self::dft_inplace_1d(&mut re_buf, &mut im_buf, false);
 
         // Create real and imag tensors, then combine as complex
-        let re_node = self.tensor_variable(real_out, vec![fft_len], false)?;
-        let im_node = self.tensor_variable(imag_out, vec![fft_len], false)?;
+        let re_node = self.tensor_variable(re_buf, vec![fft_len], false)?;
+        let im_node = self.tensor_variable(im_buf, vec![fft_len], false)?;
         self.tensor_complex(re_node, im_node)
     }
 
@@ -19153,35 +19234,20 @@ impl FrankenTorchSession {
         let fft_len = n.unwrap_or(input_len);
 
         // Extract real/imag parts (zero-pad if needed)
-        let mut re_in = vec![0.0; fft_len];
-        let mut im_in = vec![0.0; fft_len];
+        let mut re_in = vec![0.0_f64; fft_len];
+        let mut im_in = vec![0.0_f64; fft_len];
         let copy_len = input_len.min(fft_len);
         for i in 0..copy_len {
             re_in[i] = vals[i * 2];
             im_in[i] = vals[i * 2 + 1];
         }
 
-        // Inverse DFT: x[n] = (1/N) * sum_k X[k] * exp(2*pi*i*k*n/N)
-        let two_pi = 2.0 * std::f64::consts::PI;
-        let mut re_out = Vec::with_capacity(fft_len);
-        let mut im_out = Vec::with_capacity(fft_len);
+        // Cooley-Tukey inverse DFT (positive sign + 1/N) when N is
+        // a power of two, naive O(N^2) otherwise. frankentorch-hpo6.
+        Self::dft_inplace_1d(&mut re_in, &mut im_in, true);
 
-        for nn in 0..fft_len {
-            let mut re = 0.0;
-            let mut im = 0.0;
-            for k in 0..fft_len {
-                let angle = two_pi * k as f64 * nn as f64 / fft_len as f64;
-                let cos_a = angle.cos();
-                let sin_a = angle.sin();
-                re += re_in[k] * cos_a - im_in[k] * sin_a;
-                im += re_in[k] * sin_a + im_in[k] * cos_a;
-            }
-            re_out.push(re / fft_len as f64);
-            im_out.push(im / fft_len as f64);
-        }
-
-        let re_node = self.tensor_variable(re_out, vec![fft_len], false)?;
-        let im_node = self.tensor_variable(im_out, vec![fft_len], false)?;
+        let re_node = self.tensor_variable(re_in, vec![fft_len], false)?;
+        let im_node = self.tensor_variable(im_in, vec![fft_len], false)?;
         self.tensor_complex(re_node, im_node)
     }
 
@@ -19206,25 +19272,20 @@ impl FrankenTorchSession {
         let fft_len = n.unwrap_or(input_len);
         let out_len = fft_len / 2 + 1;
 
-        let mut x = vec![0.0; fft_len];
+        // Real input → full complex output via Cooley-Tukey, then
+        // take only the first N/2+1 bins (the rest are conjugate-
+        // symmetric for real input). For non-power-of-two N this
+        // still costs O(N^2) via the dft_inplace_1d fallback, but
+        // for the power-of-two case it drops to O(N log N).
+        // frankentorch-hpo6.
+        let mut re_buf = vec![0.0_f64; fft_len];
+        let mut im_buf = vec![0.0_f64; fft_len];
         let copy_len = input_len.min(fft_len);
-        x[..copy_len].copy_from_slice(&vals[..copy_len]);
+        re_buf[..copy_len].copy_from_slice(&vals[..copy_len]);
+        Self::dft_inplace_1d(&mut re_buf, &mut im_buf, false);
 
-        let two_pi = 2.0 * std::f64::consts::PI;
-        let mut re_out = Vec::with_capacity(out_len);
-        let mut im_out = Vec::with_capacity(out_len);
-
-        for k in 0..out_len {
-            let mut re = 0.0;
-            let mut im = 0.0;
-            for (nn, &xn) in x.iter().enumerate() {
-                let angle = -two_pi * k as f64 * nn as f64 / fft_len as f64;
-                re += xn * angle.cos();
-                im += xn * angle.sin();
-            }
-            re_out.push(re);
-            im_out.push(im);
-        }
+        let re_out: Vec<f64> = re_buf[..out_len].to_vec();
+        let im_out: Vec<f64> = im_buf[..out_len].to_vec();
 
         let re_node = self.tensor_variable(re_out, vec![out_len], false)?;
         let im_node = self.tensor_variable(im_out, vec![out_len], false)?;
@@ -19281,18 +19342,11 @@ impl FrankenTorchSession {
             }
         }
 
-        // Inverse DFT to get real output
-        let two_pi = 2.0 * std::f64::consts::PI;
-        let mut result = Vec::with_capacity(out_len);
-
-        for nn in 0..out_len {
-            let mut re = 0.0;
-            for k in 0..out_len {
-                let angle = two_pi * k as f64 * nn as f64 / out_len as f64;
-                re += re_full[k] * angle.cos() - im_full[k] * angle.sin();
-            }
-            result.push(re / out_len as f64);
-        }
+        // Inverse DFT via the shared helper. frankentorch-hpo6.
+        Self::dft_inplace_1d(&mut re_full, &mut im_full, true);
+        // Real output: keep only the real part. Imaginary part
+        // should be ~0 by conjugate symmetry (modulo FP rounding).
+        let result = re_full;
 
         self.tensor_variable(result, vec![out_len], false)
     }
@@ -34999,6 +35053,37 @@ mod tests {
             assert!(
                 diff <= bound,
                 "ifft(fft(x)).real[{i}] = {got}, expected x[{i}] = {expected}, diff = {diff:e}"
+            );
+        }
+    }
+
+    /// Regression for frankentorch-hpo6: at N=2048 the previous
+    /// O(N^2) naive DFT cost ~4M complex multiplies per call (each
+    /// invoking sin+cos), which is pathologically slow for the
+    /// usual audio/vision FFT sizes. This test exercises a 1024-point
+    /// FFT roundtrip — large enough that the test would have run
+    /// in seconds with the naive impl but completes in milliseconds
+    /// with Cooley-Tukey. The bound is N * log2(N) * 64 * EPSILON,
+    /// reflecting the O(log N) butterfly error growth (vs O(N) for
+    /// the naive impl).
+    #[test]
+    fn fft_irfft_roundtrip_at_n_1024_completes_quickly() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let n = 1024usize;
+        let input: Vec<f64> = (0..n).map(|i| (i as f64).sin()).collect();
+        let x = s.tensor_variable(input.clone(), vec![n], false).unwrap();
+        let freq = s.tensor_rfft(x, None).expect("rfft");
+        let recovered = s.tensor_irfft(freq, Some(n)).expect("irfft");
+        let v = s.tensor_values(recovered).expect("values");
+        assert_eq!(v.len(), n);
+        let abs_max = input.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs()));
+        // Cooley-Tukey accumulates ~log2(N) ULPs per output cell.
+        let bound = (n as f64).log2() * 64.0 * f64::EPSILON * abs_max.max(1.0) + 1e-12;
+        for (got, expected) in v.iter().zip(input.iter()) {
+            let diff = (got - expected).abs();
+            assert!(
+                diff <= bound,
+                "irfft(rfft(x))[i] = {got}, expected x[i] = {expected}, diff = {diff:e}, bound = {bound:e}"
             );
         }
     }
