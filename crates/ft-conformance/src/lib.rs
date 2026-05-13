@@ -13847,6 +13847,92 @@ mod tests {
             }
         }
 
+        // MR (consistency): exp(log_softmax(x)) == softmax(x) within
+        // bounded ULP tolerance. The two ops are mathematically the
+        // exp/log pair on the same normalized distribution; any
+        // silent divergence — e.g. a max-subtract stabilization fix
+        // applied to only one of them — surfaces here.
+        // frankentorch-epsb.
+        #[test]
+        fn fuzz_metamorphic_softmax_exp_of_log_softmax(
+            (rows, cols, raw) in (1usize..=4, 1usize..=8).prop_flat_map(|(r, c)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..256i16, r * c),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let sm = s.tensor_softmax(x, 1).expect("softmax");
+            let v_sm = s.tensor_values(sm).expect("v_sm");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s.tensor_variable(input, vec![rows, cols], false).expect("x2");
+            let lsm = s.tensor_log_softmax(x2, 1).expect("log_softmax");
+            let exp_lsm = s.tensor_exp(lsm).expect("exp(log_softmax)");
+            let v_exp_lsm = s.tensor_values(exp_lsm).expect("v_exp_lsm");
+
+            for (i, (a, b)) in v_sm.iter().zip(v_exp_lsm.iter()).enumerate() {
+                if !a.is_finite() || !b.is_finite() {
+                    continue;
+                }
+                let scale = a.abs().max(b.abs()).max(1.0);
+                let diff = (a - b).abs();
+                prop_assert!(
+                    diff <= 32.0 * f64::EPSILON * scale,
+                    "softmax[{}]={} but exp(log_softmax)[{}]={} (diff={:e})", i, a, i, b, diff
+                );
+            }
+        }
+
+        // MR (argmax preservation): argmax(x) == argmax(softmax(x))
+        // for any row that has a unique max. Softmax is strictly
+        // monotone, so the largest input cell becomes the largest
+        // output cell. Skip rows with NaN or with a non-unique
+        // maximum (those are ambiguous for argmax tie-breaking).
+        // frankentorch-epsb.
+        #[test]
+        fn fuzz_metamorphic_softmax_preserves_argmax(
+            (rows, cols, raw) in (1usize..=4, 2usize..=8).prop_flat_map(|(r, c)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..256i16, r * c),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let sm = s.tensor_softmax(x, 1).expect("softmax");
+            let v_sm = s.tensor_values(sm).expect("v_sm");
+
+            for r in 0..rows {
+                let row = &input[r * cols..(r + 1) * cols];
+                if row.iter().any(|v| v.is_nan()) {
+                    continue;
+                }
+                let row_max = row.iter().fold(f64::NEG_INFINITY, |acc, &v| acc.max(v));
+                let max_count = row.iter().filter(|&&v| v == row_max).count();
+                if max_count != 1 {
+                    continue; // tie — argmax tie-breaking is implementation-defined
+                }
+                let max_pos = row.iter().position(|&v| v == row_max).unwrap();
+
+                let sm_row = &v_sm[r * cols..(r + 1) * cols];
+                let sm_max = sm_row.iter().fold(f64::NEG_INFINITY, |acc, &v| acc.max(v));
+                let sm_max_pos = sm_row.iter().position(|&v| v == sm_max).unwrap();
+                prop_assert_eq!(
+                    max_pos, sm_max_pos,
+                    "softmax must preserve argmax: input argmax = {} (val {}), softmax argmax = {} (val {})",
+                    max_pos, row_max, sm_max_pos, sm_max
+                );
+            }
+        }
+
         // MR (idempotence): hardtanh(hardtanh(x)) bit-exactly equals
         // hardtanh(x). Once values are clamped to [-1, 1], a second
         // hardtanh is a no-op. Catches clamp-bound regressions where
