@@ -1912,7 +1912,10 @@ pub fn prod_dim_tensor_contiguous_f64(
         return Ok(vec![1.0; out_numel]);
     }
     let offset = meta.storage_offset();
-    let mut output = vec![1.0; out_numel];
+    // Push-based output skips the 1.0-init pass; row-major
+    // (outer, inner) order matches output index
+    // outer * inner_size + inner (frankentorch-suw1).
+    let mut output = Vec::with_capacity(out_numel);
     let data = &input[offset..];
 
     for outer in 0..outer_size {
@@ -1921,7 +1924,7 @@ pub fn prod_dim_tensor_contiguous_f64(
             for r in 0..reduce_size {
                 prod *= data[outer * reduce_size * inner_size + r * inner_size + inner];
             }
-            output[outer * inner_size + inner] = prod;
+            output.push(prod);
         }
     }
 
@@ -1956,7 +1959,10 @@ pub fn var_dim_tensor_contiguous_f64(
     let offset = meta.storage_offset();
     let data = &input[offset..];
 
-    let mut output = vec![0.0; out_numel];
+    // Push-based output skips the zero-init pass; (outer, inner)
+    // loop matches output index outer * inner_size + inner
+    // (frankentorch-suw1).
+    let mut output = Vec::with_capacity(out_numel);
     #[allow(clippy::cast_precision_loss)]
     let correction = (reduce_size - 1) as f64; // Bessel's correction
     #[allow(clippy::cast_precision_loss)]
@@ -1985,7 +1991,7 @@ pub fn var_dim_tensor_contiguous_f64(
                 let d = x - mean;
                 d * d
             });
-            output[outer * inner_size + inner] = var_sum / correction;
+            output.push(var_sum / correction);
         }
     }
 
