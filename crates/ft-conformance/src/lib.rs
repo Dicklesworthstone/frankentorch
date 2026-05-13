@@ -16974,6 +16974,140 @@ print(json.dumps({"results": results}, sort_keys=True))
     }
 
     #[test]
+    fn torch_logaddexp2_subprocess_conformance() {
+        // Subprocess oracle for tensor_logaddexp2 — base-2 analog
+        // of logaddexp. ft-api has tensor_logaddexp_numpy_subprocess
+        // but no torch oracle for logaddexp2. This test pins the
+        // numerically-stable log2(2^a + 2^b) computation across the
+        // canonical hard cases (±inf, NaN, large magnitude with
+        // dominant term, symmetric large magnitudes). Tracked under
+        // frankentorch-wfza.
+        use ft_api::FrankenTorchSession;
+
+        let mut config = HarnessConfig::default_paths();
+        let python = config
+            .legacy_oracle_python
+            .clone()
+            .unwrap_or_else(|| PathBuf::from("python3"));
+        let torch_available = Command::new(&python)
+            .arg("-c")
+            .arg("import torch")
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false);
+        if !torch_available {
+            eprintln!("torch_logaddexp2_subprocess_conformance: torch unavailable, skipping");
+            return;
+        }
+        config.legacy_oracle_python = Some(python);
+
+        let case_payload = json!({
+            "pairs": [
+                [0.0, 0.0],         // log2(1+1) = 1
+                [1.0, 1.0],         // log2(2+2) = 2
+                [3.0, 3.0],         // log2(8+8) = 4
+                [-1.0, -2.0],       // dominant term ≈ -1
+                [10.0, -10.0],      // far apart: ≈ 10
+                [50.0, 50.0],       // symmetric large: 51
+                [1e9, 1e9],         // very large: 1e9 + 1
+                ["inf", 0.0],       // inf dominates
+                [0.0, "-inf"],      // -inf is identity in log2(2^a + 2^b) → ≈ 0
+                ["nan", 1.0],       // NaN propagates
+            ]
+        });
+
+        let script = r#"
+import json
+import math
+import sys
+import torch
+
+def decode_scalar(v):
+    if isinstance(v, str):
+        return {"nan": float("nan"), "inf": float("inf"),
+                "-inf": float("-inf"), "-0.0": -0.0}[v]
+    return float(v)
+
+def encode_scalar(v):
+    if math.isnan(v):
+        return "nan"
+    if math.isinf(v):
+        return "inf" if v > 0 else "-inf"
+    return v
+
+pairs = json.loads(sys.stdin.read())["pairs"]
+results = []
+for a, b in pairs:
+    av = decode_scalar(a)
+    bv = decode_scalar(b)
+    out = torch.logaddexp2(
+        torch.tensor(av, dtype=torch.float64),
+        torch.tensor(bv, dtype=torch.float64),
+    ).item()
+    results.append(encode_scalar(out))
+print(json.dumps({"results": results}, sort_keys=True))
+"#;
+
+        let oracle = super::run_legacy_oracle_script(&config, script, &case_payload)
+            .expect("torch.logaddexp2 oracle should run");
+        let results = oracle
+            .get("results")
+            .and_then(Value::as_array)
+            .expect("oracle results");
+        let pairs = case_payload
+            .get("pairs")
+            .and_then(Value::as_array)
+            .expect("pairs");
+        assert_eq!(results.len(), pairs.len(), "oracle case count");
+
+        fn decode(v: &Value) -> f64 {
+            if let Some(s) = v.as_str() {
+                match s {
+                    "nan" => f64::NAN,
+                    "inf" => f64::INFINITY,
+                    "-inf" => f64::NEG_INFINITY,
+                    "-0.0" => -0.0,
+                    other => panic!("unexpected tagged scalar: {other}"),
+                }
+            } else {
+                v.as_f64().expect("oracle scalar")
+            }
+        }
+
+        for (i, (pair, expected_value)) in pairs.iter().zip(results.iter()).enumerate() {
+            let arr = pair.as_array().expect("pair");
+            let av = decode(&arr[0]);
+            let bv = decode(&arr[1]);
+            let expected = decode(expected_value);
+
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = session.tensor_variable(vec![av], vec![1], false).unwrap();
+            let b = session.tensor_variable(vec![bv], vec![1], false).unwrap();
+            let out = session.tensor_logaddexp2(a, b).unwrap();
+            let got = session.tensor_values(out).expect("got")[0];
+
+            if expected.is_nan() {
+                assert!(got.is_nan(), "case {i} (a={av}, b={bv}): expected NaN");
+                continue;
+            }
+            if expected.is_infinite() {
+                assert!(got.is_infinite() && got.signum() == expected.signum(),
+                    "case {i} (a={av}, b={bv}): expected {expected}, got {got}");
+                continue;
+            }
+            let diff = (got - expected).abs();
+            let scale = got.abs().max(expected.abs()).max(1.0);
+            assert!(
+                diff <= 1e-12 || diff <= 16.0 * scale * f64::EPSILON,
+                "case {i} (a={av}, b={bv}): tensor_logaddexp2 = {got}, torch = {expected}, diff = {diff:e}"
+            );
+        }
+    }
+
+    #[test]
     fn torch_windows_subprocess_conformance() {
         // Subprocess oracle for the 4 signal-processing windows
         // (lg75/fhrd/q4hs/8moo) against torch.{hamming, blackman,
