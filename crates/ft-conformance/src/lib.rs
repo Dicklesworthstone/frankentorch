@@ -13952,6 +13952,39 @@ mod tests {
             }
         }
 
+        // MR (roundtrip): unflatten(flatten(x, dim, end_dim), dim,
+        // original_sizes) == x bit-exact. flatten collapses a range
+        // of dims; unflatten un-collapses with the explicit sizes.
+        // Both are pure metadata ops so the roundtrip preserves
+        // bits. frankentorch-dks0.
+        #[test]
+        fn fuzz_metamorphic_unflatten_of_flatten_roundtrip(
+            (rows, cols, raw) in (1usize..=8, 1usize..=8).prop_flat_map(|(r, c)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..256i16, r * c),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            // Flatten dims 0..=1 into a single dim.
+            let flat = s.tensor_flatten(x, 0, 1).expect("flatten");
+            let restored = s.tensor_unflatten(flat, 0, vec![rows, cols]).expect("unflatten");
+            let v = s.tensor_values(restored).expect("vals");
+            let shape = s.tensor_shape(restored).expect("shape");
+            prop_assert_eq!(shape, vec![rows, cols]);
+            for (i, (a, b)) in v.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "unflatten(flatten(x))[{}] = {} != x[{}] = {}", i, a, i, b
+                );
+            }
+        }
+
         // MR (roundtrip): unsqueeze(squeeze(x, dim), dim) == x
         // bit-exact when the squeezed dim has size 1. Both are pure
         // metadata ops. frankentorch-7ca0.
