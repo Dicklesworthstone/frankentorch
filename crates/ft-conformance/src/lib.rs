@@ -13952,6 +13952,42 @@ mod tests {
             }
         }
 
+        // MR (closed form): sigmoid(x) ≈ 1 / (1 + exp(-x)) within
+        // 16 ULP. The two paths use libm exp and then a div vs the
+        // dedicated sigmoid kernel which may use a more numerically
+        // stable formulation; agreement within ULP catches drift.
+        // frankentorch-tcho.
+        #[test]
+        fn fuzz_metamorphic_sigmoid_closed_form(
+            samples in prop::collection::vec(-1000i16..=1000i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // x in roughly [-12, 12] — saturation of sigmoid is
+            // well-defined here. Avoids extreme values where exp(-x)
+            // could overflow to inf, making the closed form 0.
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 80.0).collect();
+            let n = input.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_a = s.tensor_variable(input.clone(), vec![n], false).expect("x_a");
+            let sig = s.tensor_sigmoid(x_a).expect("sigmoid");
+            let v_sig = s.tensor_values(sig).expect("sig vals");
+
+            // Compute 1 / (1 + exp(-x)) directly in Rust as the
+            // expected value.
+            for (i, (&x_i, &got)) in input.iter().zip(v_sig.iter()).enumerate() {
+                let expected = 1.0 / (1.0 + (-x_i).exp());
+                let diff = (got - expected).abs();
+                let scale = got.abs().max(expected.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 16.0 * f64::EPSILON * scale,
+                    "sigmoid({})[{}] = {} vs 1/(1+exp(-x)) = {} (diff = {:e})",
+                    x_i, i, got, expected, diff
+                );
+            }
+        }
+
         // MR (closed form): relu(x) == x * (x > 0) bit-exact.
         // The relu output is x when x > 0 and 0 otherwise.
         // For x = 0 we have relu(0) = 0 and 0 * 1 = 0 (bit-exact).
