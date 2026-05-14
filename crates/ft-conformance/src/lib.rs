@@ -13952,6 +13952,45 @@ mod tests {
             }
         }
 
+        // MR (double-angle): cos(2x) ≈ cos^2(x) - sin^2(x) within
+        // 16 ULP. Companion to sin double-angle (kwct).
+        // frankentorch-30qq.
+        #[test]
+        fn fuzz_metamorphic_cos_double_angle(
+            samples in prop::collection::vec(-1500i16..=1500i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 125.0).collect();
+            let two_x: Vec<f64> = input.iter().map(|&v| 2.0 * v).collect();
+            let n = input.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_a = s.tensor_variable(two_x, vec![n], false).expect("x_a");
+            let cos_2x = s.tensor_cos(x_a).expect("cos(2x)");
+            let v_cos_2x = s.tensor_values(cos_2x).expect("cos(2x) vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_b = s.tensor_variable(input.clone(), vec![n], false).expect("x_b");
+            let sin_x = s.tensor_sin(x_b).expect("sin(x)");
+            let v_sin_x = s.tensor_values(sin_x).expect("sin(x) vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_c = s.tensor_variable(input.clone(), vec![n], false).expect("x_c");
+            let cos_x = s.tensor_cos(x_c).expect("cos(x)");
+            let v_cos_x = s.tensor_values(cos_x).expect("cos(x) vals");
+
+            for (i, ((got, &sx), &cx)) in v_cos_2x.iter().zip(v_sin_x.iter()).zip(v_cos_x.iter()).enumerate() {
+                let expected = cx * cx - sx * sx;
+                let diff = (got - expected).abs();
+                prop_assert!(
+                    diff <= 16.0 * f64::EPSILON,
+                    "cos(2x)[{}] = {} vs cos^2(x) - sin^2(x) = {} (x = {}, diff = {:e})",
+                    i, got, expected, input[i], diff
+                );
+            }
+        }
+
         // MR (double-angle): sin(2x) ≈ 2 * sin(x) * cos(x) within
         // 16 ULP. Classic trig identity couples sin and cos.
         // Catches drift between sin/cos at the doubled vs single
