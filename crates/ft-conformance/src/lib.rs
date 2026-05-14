@@ -15418,6 +15418,81 @@ mod tests {
             }
         }
 
+        // MR (glu contracts): tensor_glu(x, dim) splits the input
+        // along dim (size must be even) into first half a and
+        // second half b, then returns a * sigmoid(b). Three
+        // contracts on a 2-D input with even cols:
+        //   1. Output shape is input shape with size halved at
+        //      dim.
+        //   2. Output bit-equals the composed reference
+        //      a * sigmoid(b) where a, b are obtained via
+        //      tensor_narrow. The op is literally this composition
+        //      in ft-api, so the MR is bit-exact.
+        //   3. |output| <= |a| because sigmoid(b) is in (0, 1):
+        //      the gate can only attenuate, never amplify, the
+        //      left half magnitude. Test verifies the upper
+        //      bound holds element-wise.
+        // Catches half-split-direction reversal (swapping a and
+        // b), drift between the gate path and the value path,
+        // and any boundary handling at the input/2 split.
+        // frankentorch-fe62m.
+        #[test]
+        fn fuzz_metamorphic_glu_half_shape_and_bound(
+            (rows, half_cols, raw) in (1usize..=4, 1usize..=4).prop_flat_map(|(r, h)| (
+                Just(r),
+                Just(h),
+                prop::collection::vec(-128i16..=128i16, r * 2 * h),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let cols = 2 * half_cols;
+
+            // Contract 1 + 2: kernel match against the composed
+            // reference along dim=1.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let kernel_out = s.tensor_glu(x, 1).expect("glu");
+            let v_kernel = s.tensor_values(kernel_out).expect("kernel vals");
+            let shape_kernel = s.tensor_shape(kernel_out).expect("kernel shape");
+            prop_assert_eq!(shape_kernel, vec![rows, half_cols],
+                "glu output shape must halve dim=1");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let a = s.tensor_narrow(x, 1, 0, half_cols).expect("a");
+            let b = s.tensor_narrow(x, 1, half_cols, half_cols).expect("b");
+            let sig_b = s.tensor_sigmoid(b).expect("sigmoid b");
+            let composed = s.tensor_mul(a, sig_b).expect("a * sigmoid(b)");
+            let v_composed = s.tensor_values(composed).expect("composed vals");
+
+            prop_assert_eq!(v_kernel.len(), v_composed.len());
+            for (i, (k, c)) in v_kernel.iter().zip(v_composed.iter()).enumerate() {
+                prop_assert_eq!(
+                    k.to_bits(), c.to_bits(),
+                    "glu[{}] = {} != composed reference {} bit-exact", i, k, c
+                );
+            }
+
+            // Contract 3: |glu(x)| <= |a| element-wise. Compute
+            // |a| in plain Rust from the input layout.
+            for (r_idx, row_chunk) in input.chunks(cols).enumerate() {
+                for (col_idx, k_val) in v_kernel.iter()
+                    .skip(r_idx * half_cols)
+                    .take(half_cols)
+                    .enumerate()
+                {
+                    let a_val = row_chunk[col_idx];
+                    prop_assert!(
+                        k_val.abs() <= a_val.abs() + 64.0 * f64::EPSILON,
+                        "|glu[{},{}]| = {} exceeds |a| = {}",
+                        r_idx, col_idx, k_val.abs(), a_val.abs()
+                    );
+                }
+            }
+        }
+
         // MR (softmin contracts): softmin(x, dim) = softmax(-x,
         // dim) by construction in the API. Three contracts on a
         // 1-D input (dim 0):
