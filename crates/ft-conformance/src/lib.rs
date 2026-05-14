@@ -15418,6 +15418,76 @@ mod tests {
             }
         }
 
+        // MR (elu closed-form contract): the kernel uses fixed
+        // alpha=1 with `if x > 0 { x } else { x.exp() - 1.0 }`
+        // (ft-kernel-cpu lib.rs:254). So:
+        //   * x  > 0 → output == x bit-exact.
+        //   * x <= 0 → output == x.exp() - 1.0 bit-exact (same
+        //     IEEE expression evaluated in Rust on the reference
+        //     side, so no slop expected).
+        //   * elu(0)    == 0.   (exp(0) - 1 = 0)
+        //   * elu(-inf) == -1.  (exp(-inf) - 1 = -1 exactly)
+        //   * elu monotone non-decreasing in x.
+        //   * elu(x) >= x always: identity on positive branch,
+        //     exp(x) - 1 > x for x < 0 (well-known).
+        // Catches drift between the kernel and the closed-form
+        // reference, sign-bit handling at x = 0, and any failure
+        // to handle the -inf saturation. frankentorch-f9o0.
+        #[test]
+        fn fuzz_metamorphic_elu_closed_form(
+            raw in prop::collection::vec(-2048i16..=2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let out = s.tensor_elu(x).expect("elu");
+            let got = s.tensor_values(out).expect("got vals");
+
+            // Closed-form bit-exact match.
+            for (i, (&g, &xi)) in got.iter().zip(input.iter()).enumerate() {
+                let expected = if xi > 0.0 { xi } else { xi.exp() - 1.0 };
+                prop_assert_eq!(
+                    g.to_bits(), expected.to_bits(),
+                    "elu[{}] = {} (bits 0x{:x}) != closed-form {} (bits 0x{:x}) for x = {}",
+                    i, g, g.to_bits(), expected, expected.to_bits(), xi
+                );
+            }
+
+            // Monotone non-decreasing in x.
+            let mut pairs: Vec<(f64, f64)> = input.iter().zip(got.iter())
+                .map(|(&a, &b)| (a, b)).collect();
+            pairs.sort_by(|a, b| a.0.total_cmp(&b.0));
+            for k in 1..pairs.len() {
+                prop_assert!(
+                    pairs[k - 1].1 <= pairs[k].1 + 1e-300,
+                    "elu not monotone: x={} -> {}, x={} -> {}",
+                    pairs[k - 1].0, pairs[k - 1].1, pairs[k].0, pairs[k].1
+                );
+            }
+
+            // elu(x) >= x for all x.
+            for (&xi, &gi) in input.iter().zip(got.iter()) {
+                prop_assert!(
+                    gi >= xi - 1e-300,
+                    "elu(x) = {} < x = {} violates lower bound", gi, xi
+                );
+            }
+
+            // Asymptotic + origin boundary cases.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let edge_x = s.tensor_variable(vec![0.0, f64::NEG_INFINITY], vec![2], false).expect("edge");
+            let edge_out = s.tensor_elu(edge_x).expect("edge elu");
+            let edge_vals = s.tensor_values(edge_out).expect("edge vals");
+            prop_assert_eq!(edge_vals[0].to_bits(), 0.0_f64.to_bits(),
+                "elu(0) must be 0, got {}", edge_vals[0]);
+            prop_assert_eq!(edge_vals[1].to_bits(), (-1.0_f64).to_bits(),
+                "elu(-inf) must be -1, got {}", edge_vals[1]);
+        }
+
         // MR (leaky_relu closed-form contract): the kernel uses
         // a fixed 0.01 slope (ft-kernel-cpu line 247 / 4964), so:
         //   * x >= 0  →  output == x bit-exact (positive branch is
