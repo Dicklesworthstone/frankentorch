@@ -15418,6 +15418,90 @@ mod tests {
             }
         }
 
+        // MR (cosine_similarity contracts): cosine_similarity(x, y)
+        // = (x · y) / (|x| * |y|) must satisfy four contracts:
+        //   1. Self-similarity: cosine_similarity(x, x) ≈ 1 for
+        //      non-zero x. Catches dot-product / norm consistency.
+        //   2. Antipodal: cosine_similarity(x, -x) ≈ -1 for non-
+        //      zero x. The L2 norms of x and -x are identical and
+        //      the dot product x · -x = -|x|^2 cancels.
+        //   3. Bounded in [-1, 1] (Cauchy-Schwarz).
+        //   4. Sign-flip under negation: cosine_similarity(-x, y)
+        //      ≈ -cosine_similarity(x, y). Negating one argument
+        //      negates the dot product but leaves the norms
+        //      unchanged.
+        // Excludes zero or near-zero vectors (eps regime) so the
+        // similarity is well-defined. frankentorch-t23xg.
+        #[test]
+        fn fuzz_metamorphic_cosine_similarity_contracts(
+            (x_raw, y_raw) in (2usize..=8).prop_flat_map(|n| (
+                prop::collection::vec(-128i16..=128i16, n),
+                prop::collection::vec(-128i16..=128i16, n),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let x_vals: Vec<f64> = x_raw.iter().map(|v| f64::from(*v) / 13.0).collect();
+            let y_vals: Vec<f64> = y_raw.iter().map(|v| f64::from(*v) / 13.0).collect();
+            let n = x_vals.len();
+            let eps = 1e-8;
+
+            // Skip near-zero inputs that would trigger the eps
+            // clamp (those degenerate to whatever eps yields).
+            let x_norm: f64 = x_vals.iter().map(|v| v * v).sum::<f64>().sqrt();
+            let y_norm: f64 = y_vals.iter().map(|v| v * v).sum::<f64>().sqrt();
+            if x_norm < 1.0 || y_norm < 1.0 {
+                return Ok(());
+            }
+
+            // Contract 1: self-similarity.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x1 = s.tensor_variable(x_vals.clone(), vec![1, n], false).expect("x1");
+            let x2 = s.tensor_variable(x_vals.clone(), vec![1, n], false).expect("x2");
+            let cs = s.cosine_similarity(x1, x2, 1, eps).expect("cosine self");
+            let v = s.tensor_values(cs).expect("self val")[0];
+            prop_assert!(
+                (v - 1.0).abs() <= 64.0 * f64::EPSILON,
+                "cosine_similarity(x, x) = {} not ≈ 1.0", v
+            );
+
+            // Contract 2: antipodal.
+            let neg_x: Vec<f64> = x_vals.iter().map(|v| -v).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x1 = s.tensor_variable(x_vals.clone(), vec![1, n], false).expect("x1");
+            let xn = s.tensor_variable(neg_x.clone(), vec![1, n], false).expect("xn");
+            let cs = s.cosine_similarity(x1, xn, 1, eps).expect("cosine antipodal");
+            let v = s.tensor_values(cs).expect("antipodal val")[0];
+            prop_assert!(
+                (v + 1.0).abs() <= 64.0 * f64::EPSILON,
+                "cosine_similarity(x, -x) = {} not ≈ -1.0", v
+            );
+
+            // Contract 3: bounded in [-1, 1].
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xa = s.tensor_variable(x_vals.clone(), vec![1, n], false).expect("xa");
+            let yb = s.tensor_variable(y_vals.clone(), vec![1, n], false).expect("yb");
+            let cs = s.cosine_similarity(xa, yb, 1, eps).expect("cosine xy");
+            let v_xy = s.tensor_values(cs).expect("xy val")[0];
+            prop_assert!(
+                v_xy >= -1.0 - 64.0 * f64::EPSILON && v_xy <= 1.0 + 64.0 * f64::EPSILON,
+                "cosine_similarity(x, y) = {} outside [-1, 1]", v_xy
+            );
+
+            // Contract 4: sign-flip under negation of one arg.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xa = s.tensor_variable(neg_x, vec![1, n], false).expect("xa");
+            let yb = s.tensor_variable(y_vals, vec![1, n], false).expect("yb");
+            let cs = s.cosine_similarity(xa, yb, 1, eps).expect("cosine neg x y");
+            let v_neg_xy = s.tensor_values(cs).expect("neg xy val")[0];
+            let diff = (v_neg_xy + v_xy).abs();
+            prop_assert!(
+                diff <= 128.0 * f64::EPSILON,
+                "cosine_similarity(-x, y) = {} not ≈ -cosine_similarity(x, y) = {}",
+                v_neg_xy, -v_xy
+            );
+        }
+
         // MR (dist metric axioms): tensor_dist(a, b, p) =
         // norm(a - b, p) must satisfy the metric axioms for p >= 1
         // (the Minkowski p-distance is a metric in that regime):
