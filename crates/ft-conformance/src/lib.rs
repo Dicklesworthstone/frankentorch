@@ -13952,6 +13952,47 @@ mod tests {
             }
         }
 
+        // MR (consistency): tensor_pow(x, 2.0) == tensor_square(x)
+        // bit-exact. Both are x*x; the dedicated square op exists
+        // as an autograd-friendlier path but should produce the
+        // same bit pattern as the general pow with exponent 2.
+        // Catches drift between the two implementations.
+        // frankentorch-x5ra.
+        #[test]
+        fn fuzz_metamorphic_pow_2_equals_square(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x1 = s.tensor_variable(input.clone(), vec![n], false).expect("x1");
+            let p = s.tensor_pow(x1, 2.0).expect("pow");
+            let v_p = s.tensor_values(p).expect("pow vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s.tensor_variable(input, vec![n], false).expect("x2");
+            let sq = s.tensor_square(x2).expect("square");
+            let v_sq = s.tensor_values(sq).expect("square vals");
+
+            for (i, (p_val, sq_val)) in v_p.iter().zip(v_sq.iter()).enumerate() {
+                if p_val.is_nan() && sq_val.is_nan() {
+                    continue;
+                }
+                // Use approx_eq: pow(x, 2) goes through libm pow
+                // which may not be bit-exact x*x, while square is
+                // x*x. Difference is at most a few ULP.
+                let diff = (p_val - sq_val).abs();
+                let scale = p_val.abs().max(sq_val.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 16.0 * f64::EPSILON * scale,
+                    "pow(x, 2)[{}] = {} != square(x)[{}] = {} (diff = {:e})",
+                    i, p_val, i, sq_val, diff
+                );
+            }
+        }
+
         // MR (distributivity): a * (b + c) ≈ a*b + a*c within
         // generous ULP tolerance. FP distributivity is non-exact —
         // the two sides cancel differently and a few ULP drift per
