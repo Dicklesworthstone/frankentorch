@@ -13952,6 +13952,36 @@ mod tests {
             }
         }
 
+        // MR (involution): transpose(transpose(M, i, j), i, j) == M
+        // bit-exact. Two transposes of the same dim pair return to
+        // the original. Catches transpose index off-by-one and
+        // backward shape contract drift. frankentorch-1vur.
+        #[test]
+        fn fuzz_metamorphic_transpose_involution(
+            (rows, cols, raw) in (1usize..=8, 1usize..=8).prop_flat_map(|(r, c)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..256i16, r * c),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let t1 = s.tensor_transpose(x, 0, 1).expect("transpose once");
+            let t2 = s.tensor_transpose(t1, 0, 1).expect("transpose twice");
+            let v = s.tensor_values(t2).expect("values");
+            prop_assert_eq!(v.len(), input.len(), "shape preserved");
+            for (i, (a, b)) in v.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "transpose(transpose(x))[{}] = {} != x[{}] = {}", i, a, i, b
+                );
+            }
+        }
+
         // MR (consistency): tensor_div(a, b) ≈ tensor_mul(a, reciprocal(b))
         // for non-zero b within 8 ULP. Two different paths to the
         // same answer; divergence catches reciprocal-mul drift or
