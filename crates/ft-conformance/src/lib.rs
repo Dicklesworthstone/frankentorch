@@ -13952,6 +13952,44 @@ mod tests {
             }
         }
 
+        // MR (complement): ge(a, b) + lt(a, b) == 1.0 for non-NaN.
+        // ge == NOT lt is the standard order-comparator complement.
+        // NaN drops both sides to 0. frankentorch-ubh2.
+        #[test]
+        fn fuzz_metamorphic_ge_is_complement_of_lt(
+            (a_raw, b_raw) in (
+                prop::collection::vec(-512i16..=512i16, 1..24),
+                prop::collection::vec(-512i16..=512i16, 1..24),
+            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a_vals: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let b_vals: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = a_vals.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a1 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a1");
+            let b1 = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b1");
+            let ge_ab = s.tensor_ge(a1, b1).expect("ge");
+            let v_ge = s.tensor_values(ge_ab).expect("ge vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a2 = s.tensor_variable(a_vals, vec![n], false).expect("a2");
+            let b2 = s.tensor_variable(b_vals, vec![n], false).expect("b2");
+            let lt_ab = s.tensor_lt(a2, b2).expect("lt");
+            let v_lt = s.tensor_values(lt_ab).expect("lt vals");
+
+            for (i, (&ge_v, &lt_v)) in v_ge.iter().zip(v_lt.iter()).enumerate() {
+                let sum = ge_v + lt_v;
+                prop_assert!(
+                    sum == 1.0,
+                    "ge + lt [{}] = {} (expected 1.0); ge = {}, lt = {}",
+                    i, sum, ge_v, lt_v
+                );
+            }
+        }
+
         // MR (consistency): le(a, b) == lt(a, b) + eq(a, b) for
         // non-NaN inputs. The "less or equal" predicate is the OR
         // of strict-less and equal — and since they're disjoint,
