@@ -13952,6 +13952,49 @@ mod tests {
             }
         }
 
+        // MR (roundtrip): unbind(stack(tensors, dim), dim) returns
+        // the original tensor list bit-exact. Stacking inserts a new
+        // dim of size k; unbinding along that dim splits back into
+        // k tensors. frankentorch-b16w.
+        #[test]
+        fn fuzz_metamorphic_stack_unbind_roundtrip(
+            (n, k, raw) in (1usize..=6, 2usize..=4).prop_flat_map(|(n, k)| (
+                Just(n),
+                Just(k),
+                prop::collection::vec(-256i16..=256i16, n * k),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mut originals: Vec<Vec<f64>> = Vec::with_capacity(k);
+            let mut nodes: Vec<_> = Vec::with_capacity(k);
+            for chunk_idx in 0..k {
+                let slice: Vec<f64> = raw[chunk_idx * n..(chunk_idx + 1) * n]
+                    .iter()
+                    .map(|v| f64::from(*v) / 23.0)
+                    .collect();
+                let t = s.tensor_variable(slice.clone(), vec![n], false).expect("t");
+                originals.push(slice);
+                nodes.push(t);
+            }
+            let stacked = s.tensor_stack(&nodes, 0).expect("stack");
+            let unbound = s.tensor_unbind(stacked, 0).expect("unbind");
+            prop_assert_eq!(unbound.len(), k);
+            for (chunk_idx, &got_node) in unbound.iter().enumerate() {
+                let v = s.tensor_values(got_node).expect("got vals");
+                let expected = &originals[chunk_idx];
+                prop_assert_eq!(v.len(), expected.len());
+                for (i, (a, b)) in v.iter().zip(expected.iter()).enumerate() {
+                    prop_assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "unbind[{}][{}] = {} != original[{}] = {}", chunk_idx, i, a, i, b
+                    );
+                }
+            }
+        }
+
         // MR (consistency): tensor_repeat along dim 0 followed by
         // tensor_chunk into k pieces returns k copies of x, each
         // bit-exactly equal to the original. Catches drift between
