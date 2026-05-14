@@ -15418,6 +15418,64 @@ mod tests {
             }
         }
 
+        // MR (cov contracts): tensor_cov(x) takes a 2-D (N, M)
+        // input and returns the (N, N) covariance matrix. Three
+        // contracts:
+        //   1. Shape: (N, N).
+        //   2. Symmetry: cov[i, j] == cov[j, i] bit-exact (the
+        //      kernel routes through matmul(C, C^T) which is
+        //      symmetric in IEEE arithmetic when summation
+        //      order matches across (i,j) and (j,i)).
+        //   3. Non-negative diagonal: cov[i, i] >= 0 (variances
+        //      are sum-of-squares divided by (M - 1)).
+        // Catches transpose direction reversal, drift between
+        // (i, j) and (j, i) summation, and any signed result on
+        // the variance diagonal. frankentorch-57rtv.
+        #[test]
+        fn fuzz_metamorphic_cov_shape_symmetry_diagonal(
+            (n, m, raw) in (1usize..=4, 2usize..=6).prop_flat_map(|(nn, mm)| (
+                Just(nn),
+                Just(mm),
+                prop::collection::vec(-128i16..=128i16, nn * mm),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input, vec![n, m], false).expect("x");
+            let c = s.tensor_cov(x).expect("cov");
+            let shape = s.tensor_shape(c).expect("cov shape");
+            let v = s.tensor_values(c).expect("cov vals");
+
+            // Contract 1: shape.
+            prop_assert_eq!(shape, vec![n, n],
+                "cov shape must be (N, N) = ({}, {})", n, n);
+            prop_assert_eq!(v.len(), n * n);
+
+            // Contract 2: symmetry bit-exact.
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let upper = v[i * n + j];
+                    let lower = v[j * n + i];
+                    prop_assert_eq!(
+                        upper.to_bits(), lower.to_bits(),
+                        "cov[{}, {}] = {} != cov[{}, {}] = {}", i, j, upper, j, i, lower
+                    );
+                }
+            }
+
+            // Contract 3: non-negative diagonal.
+            for i in 0..n {
+                let var_i = v[i * n + i];
+                prop_assert!(
+                    var_i >= 0.0,
+                    "cov[{}, {}] = {} is negative (variance must be >= 0)", i, i, var_i
+                );
+            }
+        }
+
         // MR (block_diag contracts): tensor_block_diag([A, B])
         // creates a block-diagonal matrix with A in the upper-left
         // and B in the lower-right, with zeros elsewhere. Three
