@@ -15418,6 +15418,97 @@ mod tests {
             }
         }
 
+        // MR (creation op contracts): eye / arange / linspace have
+        // strong structural contracts that no MR currently
+        // exercises. This MR bundles three families:
+        //   * eye(n): shape [n, n], diagonals bit-exactly 1.0,
+        //     off-diagonals bit-exactly 0.0, sum exactly n, and
+        //     trace exactly n.
+        //   * arange(0, n, 1): length n; entries form the integer
+        //     progression 0, 1, 2, ..., n-1 (each one a Rust
+        //     `i as f64` exact for small i).
+        //   * linspace(a, b, n) for n >= 2: shape [n], linspace[0]
+        //     == a bit-exact, linspace[n-1] == b bit-exact (or
+        //     within 1 ULP via the kernel's i/(n-1) interpolation),
+        //     and all values bracketed by [min(a,b), max(a,b)].
+        // Catches off-by-one in length, swapped endpoints, and
+        // misplaced 1.0 diagonals. frankentorch-7ce3w.
+        #[test]
+        fn fuzz_metamorphic_eye_arange_linspace_contracts(
+            n in 1usize..=10
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // eye contract.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let e = s.eye(n, false).expect("eye");
+            let shape = s.tensor_shape(e).expect("eye shape");
+            let v = s.tensor_values(e).expect("eye vals");
+            prop_assert_eq!(shape, vec![n, n], "eye shape must be [n, n]");
+            let mut diag_sum = 0.0_f64;
+            for i in 0..n {
+                for j in 0..n {
+                    let g = v[i * n + j];
+                    if i == j {
+                        prop_assert_eq!(g.to_bits(), 1.0_f64.to_bits(),
+                            "eye[{}, {}] (diag) = {} != 1.0", i, j, g);
+                        diag_sum += g;
+                    } else {
+                        prop_assert_eq!(g.to_bits(), 0.0_f64.to_bits(),
+                            "eye[{}, {}] (off-diag) = {} != 0.0", i, j, g);
+                    }
+                }
+            }
+            prop_assert_eq!(diag_sum.to_bits(), (n as f64).to_bits(),
+                "trace(eye(n)) = {} != n = {}", diag_sum, n);
+
+            // arange(0, n, 1) contract: integer progression.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let ar = s.arange(0.0, n as f64, 1.0, false).expect("arange");
+            let shape = s.tensor_shape(ar).expect("arange shape");
+            let v = s.tensor_values(ar).expect("arange vals");
+            prop_assert_eq!(shape, vec![n], "arange(0, n, 1) length must be n");
+            for (i, &g) in v.iter().enumerate() {
+                let want = i as f64;
+                prop_assert_eq!(g.to_bits(), want.to_bits(),
+                    "arange[{}] = {} != {} bit-exact", i, g, want);
+            }
+
+            // linspace(a, b, n) contracts for n >= 2.
+            if n >= 2 {
+                let a = -3.0_f64;
+                let b =  7.5_f64;
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let ls = s.linspace(a, b, n, false).expect("linspace");
+                let shape = s.tensor_shape(ls).expect("linspace shape");
+                let v = s.tensor_values(ls).expect("linspace vals");
+                prop_assert_eq!(shape, vec![n], "linspace length must be n");
+                // Endpoint a: bit-exact (kernel's first iter
+                // adds 0 * (b - a) / (n-1) = 0 to a).
+                prop_assert_eq!(v[0].to_bits(), a.to_bits(),
+                    "linspace[0] = {} != start = {}", v[0], a);
+                // Endpoint b: within 1 ULP since the kernel
+                // computes start + (end - start) * (n-1)/(n-1)
+                // which can drift by 1 ULP from `end`.
+                let diff_end = (v[n - 1] - b).abs();
+                let scale_end = v[n - 1].abs().max(b.abs()).max(1.0);
+                prop_assert!(
+                    diff_end <= 1.0 * f64::EPSILON * scale_end,
+                    "linspace[{}] = {} not within 1 ULP of end = {}",
+                    n - 1, v[n - 1], b
+                );
+                // Bracketed values.
+                let lo = a.min(b);
+                let hi = a.max(b);
+                for (i, &g) in v.iter().enumerate() {
+                    prop_assert!(
+                        g >= lo - 1e-12 && g <= hi + 1e-12,
+                        "linspace[{}] = {} outside [{}, {}]", i, g, lo, hi
+                    );
+                }
+            }
+        }
+
         // MR (addmv decomposition): tensor_addmv(input, mat, vec,
         // beta, alpha) = beta * input + alpha * (mat @ vec).
         // Three contracts on a [m, n] mat with [n] vector and [m]
