@@ -15418,6 +15418,66 @@ mod tests {
             }
         }
 
+        // MR (softmin contracts): softmin(x, dim) = softmax(-x,
+        // dim) by construction in the API. Three contracts on a
+        // 1-D input (dim 0):
+        //   1. Sums to 1 along dim (probability distribution).
+        //   2. argmax(softmin(x)) == argmin(x). The position of
+        //      the maximum probability in softmin equals the
+        //      position of the minimum in the input.
+        //   3. Element-wise positive (in (0, 1) for finite input).
+        // Catches sign-flip drift between softmin and softmax,
+        // accidental skipping of the negation, and any drift
+        // between the argmin path used as ground truth and the
+        // softmax-of-negation path. frankentorch-oxfsn.
+        #[test]
+        fn fuzz_metamorphic_softmin_contracts(
+            raw in prop::collection::vec(-512i16..=512i16, 2..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let sm = s.tensor_softmin(x, 0).expect("softmin");
+            let v_sm = s.tensor_values(sm).expect("sm vals");
+
+            // Contract 1: sums to 1.
+            let total: f64 = v_sm.iter().sum();
+            let diff = (total - 1.0).abs();
+            prop_assert!(
+                diff <= 8.0 * f64::EPSILON * n as f64,
+                "softmin does not sum to 1: total = {} (diff = {:e})", total, diff
+            );
+
+            // Contract 3: element-wise positive in (0, 1).
+            for (i, &p) in v_sm.iter().enumerate() {
+                prop_assert!(
+                    p > 0.0 && p < 1.0 + 64.0 * f64::EPSILON,
+                    "softmin[{}] = {} outside (0, 1)", i, p
+                );
+            }
+
+            // Contract 2: argmax(softmin(x)) == argmin(x).
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let sm = s.tensor_softmin(x, 0).expect("softmin");
+            let amx = s.tensor_argmax(sm, 0).expect("argmax sm");
+            let amx_val = s.tensor_values(amx).expect("argmax val")[0] as usize;
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input, vec![n], false).expect("x");
+            let amn = s.tensor_argmin(x, 0).expect("argmin x");
+            let amn_val = s.tensor_values(amn).expect("argmin val")[0] as usize;
+
+            prop_assert_eq!(
+                amx_val, amn_val,
+                "argmax(softmin(x)) = {} != argmin(x) = {}", amx_val, amn_val
+            );
+        }
+
         // MR (smooth_l1_loss + huber_loss contracts): both losses
         // are 2-piece (quadratic near 0, linear far from 0):
         //   smooth_l1(d, β) = 0.5 * d^2 / β   if |d| <  β
