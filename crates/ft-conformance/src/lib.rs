@@ -13952,6 +13952,43 @@ mod tests {
             }
         }
 
+        // MR (consistency): rsqrt(x) ≈ 1 / sqrt(x) for x > 0
+        // within 8 ULP. Catches drift between dedicated rsqrt
+        // (which may use a more numerically stable formulation)
+        // and the composed reciprocal-of-sqrt path.
+        // frankentorch-zb1c.
+        #[test]
+        fn fuzz_metamorphic_rsqrt_equals_one_over_sqrt(
+            samples in prop::collection::vec(1i16..=2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // Positive x — rsqrt is undefined at 0.
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_a = s.tensor_variable(input.clone(), vec![n], false).expect("x_a");
+            let r = s.tensor_rsqrt(x_a).expect("rsqrt");
+            let v_r = s.tensor_values(r).expect("rsqrt vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_b = s.tensor_variable(input.clone(), vec![n], false).expect("x_b");
+            let sq = s.tensor_sqrt(x_b).expect("sqrt");
+            let v_sq = s.tensor_values(sq).expect("sqrt vals");
+
+            for (i, (got, &sqval)) in v_r.iter().zip(v_sq.iter()).enumerate() {
+                let expected = 1.0 / sqval;
+                let diff = (got - expected).abs();
+                let scale = got.abs().max(expected.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 8.0 * f64::EPSILON * scale,
+                    "rsqrt({})[{}] = {} vs 1/sqrt(x) = {} (diff = {:e})",
+                    input[i], i, got, expected, diff
+                );
+            }
+        }
+
         // MR (consistency): pow(a, 0.5) ≈ sqrt(a) for non-negative a
         // within 8 ULP. Two paths to the same answer; agreement
         // catches drift between libm pow with exponent=0.5 and the
