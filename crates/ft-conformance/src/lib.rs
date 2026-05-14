@@ -15418,6 +15418,82 @@ mod tests {
             }
         }
 
+        // MR (index_add contract): tensor_index_add(input, dim,
+        // index, src) accumulates src[k] into input at position
+        // index[k] along dim. The MR exercises two contracts on a
+        // 1-D input + src + identity index:
+        //   1. sum(result) ≈ sum(input) + sum(src). The IEEE
+        //      summation order of (input[0] + ... + src[k_n]) and
+        //      the explicit (sum(input) + sum(src)) may differ in
+        //      the last bit, so allow 8 ULP slack relative to the
+        //      max scale.
+        //   2. With input == zeros_like(src) and an identity
+        //      index, result equals src bit-exact (a single
+        //      accumulation into a zero target).
+        // Catches off-by-one in the gather/scatter index path and
+        // any accidental skip of an index slot.
+        // frankentorch-qg4g.
+        #[test]
+        fn fuzz_metamorphic_index_add_sum_and_identity(
+            raw in prop::collection::vec(-256i16..=256i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let src_vals: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let n = src_vals.len();
+            // Use a distinct input so contract 1 doesn't degenerate.
+            let input_vals: Vec<f64> = (0..n).map(|i| (i as f64) * 0.5 - 1.25).collect();
+
+            let expected_sum = input_vals.iter().sum::<f64>() + src_vals.iter().sum::<f64>();
+
+            // Contract 1: sum-preservation with identity index.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(input_vals.clone(), vec![n], false).expect("input");
+            let src = s.tensor_variable(src_vals.clone(), vec![n], false).expect("src");
+            let index_f: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let index = s.tensor_variable(index_f, vec![n], false).expect("index");
+            let out = s.tensor_index_add(input, 0, index, src).expect("index_add");
+            let out_vals = s.tensor_values(out).expect("out vals");
+            prop_assert_eq!(out_vals.len(), n);
+
+            let actual_sum: f64 = out_vals.iter().sum();
+            let diff = (actual_sum - expected_sum).abs();
+            let scale = actual_sum.abs().max(expected_sum.abs()).max(1.0);
+            prop_assert!(
+                diff <= 8.0 * f64::EPSILON * scale,
+                "sum(index_add) = {} but sum(input) + sum(src) = {} (diff = {:e}, scale = {:e})",
+                actual_sum, expected_sum, diff, scale
+            );
+
+            // Per-position bit-exact recovery (identity index): for
+            // each k, result[k] should equal input[k] + src[k].
+            for (k, (got, (i, s))) in out_vals.iter()
+                .zip(input_vals.iter().zip(src_vals.iter())).enumerate()
+            {
+                let want = i + s;
+                prop_assert_eq!(
+                    got.to_bits(), want.to_bits(),
+                    "index_add[{}] = {} != input[{}] + src[{}] = {} + {} = {}",
+                    k, got, k, k, i, s, want
+                );
+            }
+
+            // Contract 2: zero input + identity index returns src.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let zeros = s.tensor_variable(vec![0.0; n], vec![n], false).expect("zeros");
+            let src = s.tensor_variable(src_vals.clone(), vec![n], false).expect("src");
+            let index_f: Vec<f64> = (0..n).map(|i| i as f64).collect();
+            let index = s.tensor_variable(index_f, vec![n], false).expect("index");
+            let out = s.tensor_index_add(zeros, 0, index, src).expect("index_add zero");
+            let out_vals = s.tensor_values(out).expect("out vals");
+            for (k, (a, b)) in out_vals.iter().zip(src_vals.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "index_add(zeros, identity, src)[{}] = {} != src[{}] = {}", k, a, k, b
+                );
+            }
+        }
+
         // MR (nonzero / count_nonzero contract): the index matrix
         // returned by tensor_nonzero must agree with the scalar
         // returned by tensor_count_nonzero, and every returned index
