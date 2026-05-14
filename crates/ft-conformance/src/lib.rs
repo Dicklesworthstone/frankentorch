@@ -15418,6 +15418,94 @@ mod tests {
             }
         }
 
+        // MR (complex/real/imag round-trip): the pair
+        // tensor_complex / (tensor_real, tensor_imag) is a strict
+        // inverse for both Complex64 and Complex128 dtypes:
+        //   tensor_real(tensor_complex(re, im)) == re bit-exact
+        //   tensor_imag(tensor_complex(re, im)) == im bit-exact
+        // The MR builds a complex tensor from F32 reals (giving
+        // Complex64) and from F64 reals (giving Complex128) and
+        // verifies bit-exact recovery on both paths. Catches
+        // any re/im axis swap in the complex pack/unpack code and
+        // any precision-truncation bug between F32/F64 and the
+        // corresponding complex dtype. frankentorch-566cu.
+        #[test]
+        fn fuzz_metamorphic_complex_real_imag_roundtrip(
+            (re_raw, im_raw) in (1usize..=8).prop_flat_map(|n| (
+                prop::collection::vec(-256i16..=256i16, n),
+                prop::collection::vec(-256i16..=256i16, n),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let re_vals: Vec<f64> = re_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let im_vals: Vec<f64> = im_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = re_vals.len();
+
+            // Complex128 path: F64 + F64 → Complex128.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let re64 = s.tensor_variable(re_vals.clone(), vec![n], false).expect("re64");
+            let im64 = s.tensor_variable(im_vals.clone(), vec![n], false).expect("im64");
+            let z128 = s.tensor_complex(re64, im64).expect("complex128");
+            let dtype128 = s.tensor_dtype(z128).expect("z128 dtype");
+            prop_assert_eq!(dtype128, DType::Complex128,
+                "complex(f64, f64) must produce Complex128, got {:?}", dtype128);
+
+            let re_back = s.tensor_real(z128).expect("real128");
+            let im_back = s.tensor_imag(z128).expect("imag128");
+            let v_re = s.tensor_values(re_back).expect("re back vals");
+            let v_im = s.tensor_values(im_back).expect("im back vals");
+
+            for (i, (g, want)) in v_re.iter().zip(re_vals.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "Complex128 real[{}] = {} != original re = {}", i, g, want
+                );
+            }
+            for (i, (g, want)) in v_im.iter().zip(im_vals.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "Complex128 imag[{}] = {} != original im = {}", i, g, want
+                );
+            }
+
+            // Complex64 path: F32 + F32 → Complex64. Recovery is
+            // bit-exact when compared back to the F32 cast values
+            // (round-trip preserves F32 bit pattern).
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let re64 = s.tensor_variable(re_vals.clone(), vec![n], false).expect("re64");
+            let im64 = s.tensor_variable(im_vals.clone(), vec![n], false).expect("im64");
+            let re32 = s.tensor_to_f32(re64).expect("re32");
+            let im32 = s.tensor_to_f32(im64).expect("im32");
+            let z64 = s.tensor_complex(re32, im32).expect("complex64");
+            let dtype64 = s.tensor_dtype(z64).expect("z64 dtype");
+            prop_assert_eq!(dtype64, DType::Complex64,
+                "complex(f32, f32) must produce Complex64, got {:?}", dtype64);
+
+            // tensor_real / tensor_imag on Complex64 produce F32;
+            // tensor_values_f32 reads them back as f32. Compare
+            // bit-exact against the same cast-to-f32 reference
+            // computed in plain Rust.
+            let re_back = s.tensor_real(z64).expect("real64");
+            let im_back = s.tensor_imag(z64).expect("imag64");
+            let v_re_f32 = s.tensor_values_f32(re_back).expect("re back f32");
+            let v_im_f32 = s.tensor_values_f32(im_back).expect("im back f32");
+            for (i, (&g, &want_f64)) in v_re_f32.iter().zip(re_vals.iter()).enumerate() {
+                let want_f32 = want_f64 as f32;
+                prop_assert_eq!(
+                    g.to_bits(), want_f32.to_bits(),
+                    "Complex64 real[{}] = {} != cast re = {}", i, g, want_f32
+                );
+            }
+            for (i, (&g, &want_f64)) in v_im_f32.iter().zip(im_vals.iter()).enumerate() {
+                let want_f32 = want_f64 as f32;
+                prop_assert_eq!(
+                    g.to_bits(), want_f32.to_bits(),
+                    "Complex64 imag[{}] = {} != cast im = {}", i, g, want_f32
+                );
+            }
+        }
+
         // MR (atleast_Nd contracts): the three atleast surfaces
         // ensure the input has rank >= 1, 2, or 3 by padding with
         // size-1 dims using PyTorch's asymmetric convention:
