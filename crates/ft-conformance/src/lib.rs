@@ -15418,6 +15418,106 @@ mod tests {
             }
         }
 
+        // MR (lerp contracts): tensor_lerp(a, b, weight) =
+        // a + weight * (b - a). Four contracts on a 1-D pair:
+        //   1. weight == 0 → a bit-exact (weight·(b-a) = 0·δ = 0).
+        //   2. weight == 1 → b within 1 ULP relative (a + (b-a))
+        //      can shift by 1 ULP from b under round-to-nearest.
+        //   3. Zero-segment: lerp(a, a, t) == a for any t since
+        //      (a - a) = 0 so weight·0 = 0 element-wise.
+        //   4. Closed-form decomposition: matches the explicit
+        //      a + weight*(b - a) reference within 8 ULP relative
+        //      across multiple weights.
+        // Catches direction reversal (lerp toward a vs b), drift
+        // in the (b - a) path, and any rounding inconsistency in
+        // the fused vs composed forms. frankentorch-x590f.
+        #[test]
+        fn fuzz_metamorphic_lerp_contracts(
+            (a_raw, b_raw) in (1usize..=12).prop_flat_map(|n| (
+                prop::collection::vec(-256i16..=256i16, n),
+                prop::collection::vec(-256i16..=256i16, n),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a_vals: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let b_vals: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = a_vals.len();
+
+            // Contract 1: weight == 0 → a bit-exact.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let av = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a");
+            let bv = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b");
+            let out = s.tensor_lerp(av, bv, 0.0).expect("lerp 0");
+            let v = s.tensor_values(out).expect("lerp 0 vals");
+            for (i, (g, want)) in v.iter().zip(a_vals.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "lerp(a, b, 0)[{}] = {} != a[{}] = {}", i, g, i, want
+                );
+            }
+
+            // Contract 2: weight == 1 → b within 4 ULP. The
+            // expression a + 1.0 * (b - a) routes through three
+            // ops (sub, mul-by-1, add) so the rounding envelope
+            // is wider than the pure b path even though
+            // mathematically the result is exactly b.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let av = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a");
+            let bv = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b");
+            let out = s.tensor_lerp(av, bv, 1.0).expect("lerp 1");
+            let v = s.tensor_values(out).expect("lerp 1 vals");
+            for (i, (g, want)) in v.iter().zip(b_vals.iter()).enumerate() {
+                let diff = (g - want).abs();
+                let scale = g.abs().max(want.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 4.0 * f64::EPSILON * scale,
+                    "lerp(a, b, 1)[{}] = {} not within 4 ULP of b[{}] = {}",
+                    i, g, i, want
+                );
+            }
+
+            // Contract 3: lerp(a, a, t) == a for any t.
+            for &t in &[0.0_f64, 0.25, 0.5, 0.75, 1.0, -0.5, 1.5] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let av1 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a1");
+                let av2 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a2");
+                let out = s.tensor_lerp(av1, av2, t).expect("lerp aa");
+                let v = s.tensor_values(out).expect("lerp aa vals");
+                for (i, (g, want)) in v.iter().zip(a_vals.iter()).enumerate() {
+                    prop_assert_eq!(
+                        g.to_bits(), want.to_bits(),
+                        "lerp(a, a, t={})[{}] = {} != a[{}] = {} (zero-segment)",
+                        t, i, g, i, want
+                    );
+                }
+            }
+
+            // Contract 4: closed-form decomposition for an
+            // interior weight.
+            let weight = 0.375_f64;
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let av = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a");
+            let bv = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b");
+            let kernel_out = s.tensor_lerp(av, bv, weight).expect("lerp w");
+            let v_kernel = s.tensor_values(kernel_out).expect("kernel vals");
+
+            for (i, ((&g, &ai), &bi)) in v_kernel.iter()
+                .zip(a_vals.iter())
+                .zip(b_vals.iter())
+                .enumerate()
+            {
+                let want = ai + weight * (bi - ai);
+                let diff = (g - want).abs();
+                let scale = g.abs().max(want.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 8.0 * f64::EPSILON * scale,
+                    "lerp(a, b, {})[{}] = {} != closed-form {} (a = {}, b = {})",
+                    weight, i, g, want, ai, bi
+                );
+            }
+        }
+
         // MR (IEEE predicate partition): every f64 falls into
         // exactly one of three classes (finite, ±inf, NaN). The
         // predicates must agree:
