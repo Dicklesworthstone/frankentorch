@@ -13952,6 +13952,61 @@ mod tests {
             }
         }
 
+        // MR (max/min identity): max(a, b) + min(a, b) == a + b
+        // bit-exact for finite a, b (FP addition is exact when no
+        // rounding occurs, which is the case when a and b have
+        // similar magnitudes — but in general the sum is within
+        // 1 ULP). Similarly max * min == a * b. Symmetric identity
+        // catches drift between max/min branches.
+        // frankentorch-m6tz.
+        #[test]
+        fn fuzz_metamorphic_max_min_pair_identities(
+            (a_raw, b_raw) in (
+                prop::collection::vec(-1024i16..=1024i16, 1..24),
+                prop::collection::vec(-1024i16..=1024i16, 1..24),
+            ).prop_filter("same length", |(a, b)| a.len() == b.len())
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a_vals: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let b_vals: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = a_vals.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a1 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a1");
+            let b1 = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b1");
+            let max_ab = s.tensor_maximum(a1, b1).expect("max");
+            let v_max = s.tensor_values(max_ab).expect("max vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a2 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a2");
+            let b2 = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b2");
+            let min_ab = s.tensor_minimum(a2, b2).expect("min");
+            let v_min = s.tensor_values(min_ab).expect("min vals");
+
+            for (i, (((&mx, &mn), &av), &bv)) in v_max.iter()
+                .zip(v_min.iter())
+                .zip(a_vals.iter())
+                .zip(b_vals.iter())
+                .enumerate()
+            {
+                let sum = mx + mn;
+                let expected_sum = av + bv;
+                prop_assert!(
+                    (sum - expected_sum).abs() < f64::EPSILON * (sum.abs() + 1.0),
+                    "max + min identity broken at [{}]: a = {}, b = {}, max = {}, min = {}, max+min = {} (expected a+b = {})",
+                    i, av, bv, mx, mn, sum, expected_sum
+                );
+                let prod = mx * mn;
+                let expected_prod = av * bv;
+                prop_assert!(
+                    (prod - expected_prod).abs() < f64::EPSILON * (prod.abs() + 1.0),
+                    "max * min identity broken at [{}]: a = {}, b = {}, max = {}, min = {}, max*min = {} (expected a*b = {})",
+                    i, av, bv, mx, mn, prod, expected_prod
+                );
+            }
+        }
+
         // MR (quotient/remainder identity): for non-zero b,
         //   a ≈ floor_divide(a, b) * b + remainder(a, b)
         // within ULP tolerance. The Euclidean division algorithm
