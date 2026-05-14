@@ -13952,6 +13952,65 @@ mod tests {
             }
         }
 
+        // MR (distributivity): a * (b + c) ≈ a*b + a*c within
+        // generous ULP tolerance. FP distributivity is non-exact —
+        // the two sides cancel differently and a few ULP drift per
+        // operand is expected. Tolerance scales by k=1 (binary op
+        // depth) × max(|a|, |b+c|) × EPSILON. frankentorch-rqph.
+        #[test]
+        fn fuzz_metamorphic_mul_distributes_over_add(
+            (a_raw, b_raw, c_raw) in (
+                prop::collection::vec(-128i16..128i16, 1..16),
+                prop::collection::vec(-128i16..128i16, 1..16),
+                prop::collection::vec(-128i16..128i16, 1..16),
+            ).prop_filter(
+                "all same length",
+                |(a, b, c)| a.len() == b.len() && b.len() == c.len(),
+            )
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a_vals: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let b_vals: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let c_vals: Vec<f64> = c_raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let n = a_vals.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a1 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a");
+            let b1 = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b");
+            let c1 = s.tensor_variable(c_vals.clone(), vec![n], false).expect("c");
+            let bc = s.tensor_add(b1, c1).expect("b+c");
+            let a_bc = s.tensor_mul(a1, bc).expect("a*(b+c)");
+            let v_lhs = s.tensor_values(a_bc).expect("lhs vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a2 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a2");
+            let b2 = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b2");
+            let ab = s.tensor_mul(a2, b2).expect("a*b");
+            let v_ab = s.tensor_values(ab).expect("ab vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a3 = s.tensor_variable(a_vals.clone(), vec![n], false).expect("a3");
+            let c3 = s.tensor_variable(c_vals.clone(), vec![n], false).expect("c3");
+            let ac = s.tensor_mul(a3, c3).expect("a*c");
+            let v_ac = s.tensor_values(ac).expect("ac vals");
+
+            let abs_a = a_vals.iter().fold(0.0_f64, |acc, &v| acc.max(v.abs())).max(1.0);
+            let abs_bc = b_vals.iter().zip(c_vals.iter())
+                .fold(0.0_f64, |acc, (&b, &c)| acc.max((b + c).abs())).max(1.0);
+
+            for (i, (l, (bv, cv))) in v_lhs.iter().zip(v_ab.iter().zip(v_ac.iter())).enumerate() {
+                let expected = bv + cv;
+                let bound = 16.0 * f64::EPSILON * abs_a * abs_bc + 1e-12;
+                let diff = (l - expected).abs();
+                prop_assert!(
+                    diff <= bound,
+                    "a*(b+c)[{}] = {} vs a*b + a*c[{}] = {} (diff {:e}, bound {:e})",
+                    i, l, i, expected, diff, bound
+                );
+            }
+        }
+
         // MR (commutativity): tensor_add(a, b) == tensor_add(b, a)
         // bit-exact (modulo NaN-NaN which preserve no specific bit
         // pattern but both sides are NaN). Catches operand-swap
