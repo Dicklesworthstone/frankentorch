@@ -15418,6 +15418,94 @@ mod tests {
             }
         }
 
+        // MR (functional_normalize contracts): normalize(x, p, dim)
+        // divides x by its Lp norm along dim. Three contracts on
+        // a 1-D input with dim=0 and p ∈ {1.0, 2.0, 3.0}:
+        //   1. Unit-norm: ||normalize(x)||_p == 1 along dim for
+        //      non-zero input within 32 ULP relative.
+        //   2. Sign preservation: each output element has the
+        //      same sign as the corresponding input element
+        //      (since dividing by a positive norm preserves sign).
+        //   3. Scale-invariance: normalize(α·x) == sign(α) ·
+        //      normalize(x) for α != 0 — multiplying input by a
+        //      positive scalar leaves normalize unchanged, by a
+        //      negative scalar flips every output sign.
+        // Skip near-zero inputs (norm < 1.0) so the eps clamp
+        // path doesn't dominate. frankentorch-jydy3.
+        #[test]
+        fn fuzz_metamorphic_functional_normalize_contracts(
+            raw in prop::collection::vec(-256i16..=256i16, 2..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+
+            // Skip near-zero inputs (eps clamp dominates).
+            let total_abs: f64 = input.iter().map(|v| v.abs()).sum();
+            if total_abs < 1.0 {
+                return Ok(());
+            }
+
+            for p in [1.0_f64, 2.0, 3.0] {
+                // Contract 1: unit Lp norm.
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+                let nm = s.functional_normalize(x, p, 0).expect("normalize");
+                let v_nm = s.tensor_values(nm).expect("nm vals");
+
+                let norm_p: f64 = v_nm.iter().map(|v| v.abs().powf(p)).sum::<f64>().powf(1.0 / p);
+                let diff = (norm_p - 1.0).abs();
+                prop_assert!(
+                    diff <= 32.0 * f64::EPSILON * n as f64,
+                    "||normalize(x, p={})||_p = {} not ≈ 1 (diff = {:e})", p, norm_p, diff
+                );
+
+                // Contract 2: sign preservation.
+                for (i, (&g, &xi)) in v_nm.iter().zip(input.iter()).enumerate() {
+                    if xi != 0.0 {
+                        prop_assert!(
+                            (g >= 0.0) == (xi >= 0.0),
+                            "normalize[{}] = {} has different sign than x = {}", i, g, xi
+                        );
+                    }
+                }
+
+                // Contract 3: scale-invariance under positive α.
+                let alpha = 3.5_f64;
+                let scaled: Vec<f64> = input.iter().map(|v| alpha * v).collect();
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(scaled, vec![n], false).expect("scaled");
+                let nm_scaled = s.functional_normalize(x, p, 0).expect("normalize scaled");
+                let v_scaled = s.tensor_values(nm_scaled).expect("nm scaled vals");
+                for (i, (&g_pos, &g)) in v_scaled.iter().zip(v_nm.iter()).enumerate() {
+                    let diff = (g_pos - g).abs();
+                    let scale = g_pos.abs().max(g.abs()).max(1.0);
+                    prop_assert!(
+                        diff <= 32.0 * f64::EPSILON * scale,
+                        "normalize(α·x, p={})[{}] = {} != normalize(x, p={})[{}] = {}",
+                        p, i, g_pos, p, i, g
+                    );
+                }
+
+                // Contract 3b: under negative α, every output flips sign.
+                let neg_scaled: Vec<f64> = input.iter().map(|v| -alpha * v).collect();
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(neg_scaled, vec![n], false).expect("neg scaled");
+                let nm_neg = s.functional_normalize(x, p, 0).expect("normalize neg");
+                let v_neg = s.tensor_values(nm_neg).expect("nm neg vals");
+                for (i, (&g_neg, &g)) in v_neg.iter().zip(v_nm.iter()).enumerate() {
+                    let diff = (g_neg + g).abs();
+                    let scale = g_neg.abs().max(g.abs()).max(1.0);
+                    prop_assert!(
+                        diff <= 32.0 * f64::EPSILON * scale,
+                        "normalize(-α·x, p={})[{}] = {} != -normalize(x, p={})[{}] = {}",
+                        p, i, g_neg, p, i, -g
+                    );
+                }
+            }
+        }
+
         // MR (creation op contracts): eye / arange / linspace have
         // strong structural contracts that no MR currently
         // exercises. This MR bundles three families:
