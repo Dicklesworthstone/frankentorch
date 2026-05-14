@@ -13952,6 +13952,43 @@ mod tests {
             }
         }
 
+        // MR (consistency): tensor_expand and tensor_broadcast_to
+        // should produce bit-identical output for inputs where both
+        // ops are well-defined (the input shape has 1s where the
+        // target shape grows). Catches drift between the two
+        // broadcasting paths. frankentorch-2n82.
+        #[test]
+        fn fuzz_metamorphic_expand_equals_broadcast_to(
+            (rows, raw) in (1usize..=8).prop_flat_map(|r| (
+                Just(r),
+                prop::collection::vec(-256i16..=256i16, r),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let n = input.len();
+            // Start with [n, 1] and expand to [n, 4].
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_a = s.tensor_variable(input.clone(), vec![n, 1], false).expect("x_a");
+            let expanded = s.tensor_expand(x_a, vec![n, 4]).expect("expand");
+            let v_e = s.tensor_values(expanded).expect("expand vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_b = s.tensor_variable(input, vec![n, 1], false).expect("x_b");
+            let bcast = s.tensor_broadcast_to(x_b, vec![n, 4]).expect("bcast");
+            let v_b = s.tensor_values(bcast).expect("bcast vals");
+
+            prop_assert_eq!(v_e.len(), v_b.len(), "shape mismatch");
+            for (i, (a, b)) in v_e.iter().zip(v_b.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "expand[{}] = {} != broadcast_to[{}] = {}", i, a, i, b
+                );
+            }
+        }
+
         // MR (inverse roll): roll(roll(x, n, dim), -n, dim) == x
         // bit-exact. Rolling forward then backward by the same
         // amount returns to original. Catches off-by-one in the
