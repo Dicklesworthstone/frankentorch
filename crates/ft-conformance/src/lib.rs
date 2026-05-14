@@ -15418,6 +15418,99 @@ mod tests {
             }
         }
 
+        // MR (corrcoef contracts): tensor_corrcoef(x) returns the
+        // Pearson correlation matrix. Four contracts on a 2-D
+        // (N, M) input with M >= 2:
+        //   1. Shape: (N, N).
+        //   2. Symmetry: corrcoef[i, j] ≈ corrcoef[j, i] within
+        //      16 ULP relative (cov is symmetric bit-exact, but
+        //      the post-division through sqrt(cov[i,i] *
+        //      cov[j,j]) introduces a tiny asymmetry between the
+        //      two halves of the matrix).
+        //   3. Self-correlation: corrcoef[i, i] ≈ 1 within 16
+        //      ULP for non-constant variables (cov[i, i] > 0).
+        //   4. Bounded: |corrcoef[i, j]| <= 1 + 16·EPSILON
+        //      (Cauchy-Schwarz: correlation is at most 1 in
+        //      magnitude, with a small ULP cushion for rounding).
+        // Catches direction reversal in the normalize step,
+        // axis-swap in the outer-product denominator, and any
+        // failure of the Cauchy-Schwarz bound.
+        // frankentorch-juxft.
+        #[test]
+        fn fuzz_metamorphic_corrcoef_contracts(
+            (n, m, raw) in (2usize..=4, 3usize..=6).prop_flat_map(|(nn, mm)| (
+                Just(nn),
+                Just(mm),
+                prop::collection::vec(-64i16..=64i16, nn * mm),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 13.0).collect();
+
+            // Skip cases where some variable is constant (cov[i,i] == 0
+            // makes corrcoef undefined / NaN at that row/col).
+            let mut all_variable = true;
+            for i in 0..n {
+                let row_start = i * m;
+                let row = &input[row_start..row_start + m];
+                let first = row[0];
+                if row.iter().all(|&v| v == first) {
+                    all_variable = false;
+                    break;
+                }
+            }
+            if !all_variable {
+                return Ok(());
+            }
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input, vec![n, m], false).expect("x");
+            let cc = s.tensor_corrcoef(x).expect("corrcoef");
+            let shape = s.tensor_shape(cc).expect("cc shape");
+            let v = s.tensor_values(cc).expect("cc vals");
+
+            // Contract 1: shape.
+            prop_assert_eq!(shape, vec![n, n],
+                "corrcoef shape must be (N, N) = ({}, {})", n, n);
+            prop_assert_eq!(v.len(), n * n);
+
+            // Contract 2: symmetry within 16 ULP.
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let upper = v[i * n + j];
+                    let lower = v[j * n + i];
+                    let diff = (upper - lower).abs();
+                    let scale = upper.abs().max(lower.abs()).max(1.0);
+                    prop_assert!(
+                        diff <= 16.0 * f64::EPSILON * scale,
+                        "corrcoef[{}, {}] = {} != corrcoef[{}, {}] = {} (diff = {:e})",
+                        i, j, upper, j, i, lower, diff
+                    );
+                }
+            }
+
+            // Contract 3: diagonal ≈ 1.
+            for i in 0..n {
+                let self_corr = v[i * n + i];
+                let diff = (self_corr - 1.0).abs();
+                prop_assert!(
+                    diff <= 16.0 * f64::EPSILON,
+                    "corrcoef[{}, {}] = {} not ≈ 1 (diff = {:e})",
+                    i, i, self_corr, diff
+                );
+            }
+
+            // Contract 4: |corrcoef[i, j]| <= 1 (Cauchy-Schwarz).
+            for (k, &c) in v.iter().enumerate() {
+                prop_assert!(
+                    c.abs() <= 1.0 + 16.0 * f64::EPSILON,
+                    "|corrcoef[{}]| = {} exceeds Cauchy-Schwarz bound 1",
+                    k, c.abs()
+                );
+            }
+        }
+
         // MR (cov contracts): tensor_cov(x) takes a 2-D (N, M)
         // input and returns the (N, N) covariance matrix. Three
         // contracts:
