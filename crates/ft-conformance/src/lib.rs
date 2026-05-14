@@ -13952,6 +13952,39 @@ mod tests {
             }
         }
 
+        // MR (additive inverse): x + (-x) == 0 for finite x. This
+        // is exact under FP (no rounding when adding two equal-
+        // magnitude opposite-sign values — they cancel exactly).
+        // Skip NaN (NaN + -NaN = NaN, not 0) and inf (inf + -inf
+        // = NaN). Catches sign-bit drift in neg.
+        // frankentorch-w613.
+        #[test]
+        fn fuzz_metamorphic_x_plus_neg_x_equals_zero(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let neg = s.tensor_neg(x).expect("neg");
+            let summed = s.tensor_add(x, neg).expect("x + neg(x)");
+            let v = s.tensor_values(summed).expect("values");
+
+            for (i, &g) in v.iter().enumerate() {
+                let x_i = input[i];
+                if !x_i.is_finite() {
+                    continue; // skip inf, NaN
+                }
+                prop_assert!(
+                    g == 0.0,
+                    "x + (-x) [{}] = {} (expected 0; x = {})",
+                    i, g, x_i
+                );
+            }
+        }
+
         // MR (consistency): tensor_pow(x, 2.0) == tensor_square(x)
         // bit-exact. Both are x*x; the dedicated square op exists
         // as an autograd-friendlier path but should produce the
