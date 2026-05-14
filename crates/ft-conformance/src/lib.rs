@@ -13952,6 +13952,47 @@ mod tests {
             }
         }
 
+        // MR (consistency): atan2(y, x) ≈ atan(y / x) for x > 0
+        // within 16 ULP. For positive x, atan2 reduces to atan on
+        // the ratio. Catches atan2 vs atan drift in the principal
+        // branch. frankentorch-ombw.
+        #[test]
+        fn fuzz_metamorphic_atan2_equals_atan_of_ratio_pos_x(
+            (y_raw, x_raw) in (
+                prop::collection::vec(-2048i16..=2048i16, 1..24),
+                prop::collection::vec(1i16..=2048i16, 1..24),
+            ).prop_filter("same length", |(y, x)| y.len() == x.len())
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let y_vals: Vec<f64> = y_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            // Positive x.
+            let x_vals: Vec<f64> = x_raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = y_vals.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let y_a = s.tensor_variable(y_vals.clone(), vec![n], false).expect("y_a");
+            let x_a = s.tensor_variable(x_vals.clone(), vec![n], false).expect("x_a");
+            let a2 = s.tensor_atan2(y_a, x_a).expect("atan2");
+            let v_a2 = s.tensor_values(a2).expect("atan2 vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let ratio: Vec<f64> = y_vals.iter().zip(x_vals.iter()).map(|(y, x)| y / x).collect();
+            let r_node = s.tensor_variable(ratio, vec![n], false).expect("r");
+            let atan_r = s.tensor_atan(r_node).expect("atan");
+            let v_at = s.tensor_values(atan_r).expect("atan vals");
+
+            for (i, (got, want)) in v_a2.iter().zip(v_at.iter()).enumerate() {
+                let diff = (got - want).abs();
+                let scale = got.abs().max(want.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 16.0 * f64::EPSILON * scale,
+                    "atan2(y, x)[{}] = {} vs atan(y/x) = {} (y = {}, x = {}, diff = {:e})",
+                    i, got, want, y_vals[i], x_vals[i], diff
+                );
+            }
+        }
+
         // MR (consistency): rsqrt(x) ≈ 1 / sqrt(x) for x > 0
         // within 8 ULP. Catches drift between dedicated rsqrt
         // (which may use a more numerically stable formulation)
