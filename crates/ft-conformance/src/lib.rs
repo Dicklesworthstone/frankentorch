@@ -13952,6 +13952,36 @@ mod tests {
             }
         }
 
+        // MR (closed form): tanh(x) ≈ (1 - exp(-2x)) / (1 + exp(-2x))
+        // within 32 ULP. Two division paths for the same answer:
+        // dedicated tanh vs closed-form via exp + div. Catches drift
+        // between the two. frankentorch-b4cl.
+        #[test]
+        fn fuzz_metamorphic_tanh_closed_form(
+            samples in prop::collection::vec(-1000i16..=1000i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // x in roughly [-12, 12].
+            let input: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 80.0).collect();
+            let n = input.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x_a = s.tensor_variable(input.clone(), vec![n], false).expect("x_a");
+            let t = s.tensor_tanh(x_a).expect("tanh");
+            let v_t = s.tensor_values(t).expect("tanh vals");
+            for (i, (&x_i, &got)) in input.iter().zip(v_t.iter()).enumerate() {
+                let exp_neg2x = (-2.0 * x_i).exp();
+                let expected = (1.0 - exp_neg2x) / (1.0 + exp_neg2x);
+                let diff = (got - expected).abs();
+                let scale = got.abs().max(expected.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 32.0 * f64::EPSILON * scale,
+                    "tanh({})[{}] = {} vs (1-e^-2x)/(1+e^-2x) = {} (diff = {:e})",
+                    x_i, i, got, expected, diff
+                );
+            }
+        }
+
         // MR (closed form): sigmoid(x) ≈ 1 / (1 + exp(-x)) within
         // 16 ULP. The two paths use libm exp and then a div vs the
         // dedicated sigmoid kernel which may use a more numerically
