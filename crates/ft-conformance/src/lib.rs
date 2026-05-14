@@ -15418,6 +15418,69 @@ mod tests {
             }
         }
 
+        // MR (meshgrid ij indexing): tensor_meshgrid([a, b])
+        // returns two [m, n] tensors where m = |a|, n = |b| and
+        //   results[0][i, j] = a[i]
+        //   results[1][i, j] = b[j]
+        // (the PyTorch / numpy "ij" indexing scheme).
+        // Three contracts:
+        //   1. Output count: meshgrid returns exactly k tensors
+        //      for k inputs (here k = 2).
+        //   2. Shape: both outputs are [m, n].
+        //   3. Element formula: bit-exact ij indexing (no
+        //      arithmetic, pure reshape + expand).
+        // Catches axis swap between the two output tensors, drift
+        // between the reshape and expand paths, and any
+        // failure of the expand to broadcast without copy.
+        // frankentorch-n49xc.
+        #[test]
+        fn fuzz_metamorphic_meshgrid_ij_indexing(
+            (a_raw, b_raw) in (1usize..=4, 1usize..=4).prop_flat_map(|(mm, nn)| (
+                prop::collection::vec(-64i16..=64i16, mm),
+                prop::collection::vec(-64i16..=64i16, nn),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a_vals: Vec<f64> = a_raw.iter().map(|v| f64::from(*v) / 13.0).collect();
+            let b_vals: Vec<f64> = b_raw.iter().map(|v| f64::from(*v) / 13.0).collect();
+            let m = a_vals.len();
+            let n = b_vals.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_variable(a_vals.clone(), vec![m], false).expect("a");
+            let b = s.tensor_variable(b_vals.clone(), vec![n], false).expect("b");
+            let grid = s.tensor_meshgrid(&[a, b]).expect("meshgrid");
+
+            // Contract 1: returns two tensors.
+            prop_assert_eq!(grid.len(), 2,
+                "meshgrid must return 2 tensors for 2 inputs, got {}", grid.len());
+
+            // Contract 2: both are [m, n].
+            let shape0 = s.tensor_shape(grid[0]).expect("g0 shape");
+            let shape1 = s.tensor_shape(grid[1]).expect("g1 shape");
+            prop_assert_eq!(shape0, vec![m, n], "meshgrid[0] shape must be [m, n]");
+            prop_assert_eq!(shape1, vec![m, n], "meshgrid[1] shape must be [m, n]");
+
+            // Contract 3: ij indexing bit-exact.
+            let v0 = s.tensor_values(grid[0]).expect("g0 vals");
+            let v1 = s.tensor_values(grid[1]).expect("g1 vals");
+            for i in 0..m {
+                for j in 0..n {
+                    let got0 = v0[i * n + j];
+                    let got1 = v1[i * n + j];
+                    prop_assert_eq!(
+                        got0.to_bits(), a_vals[i].to_bits(),
+                        "meshgrid[0][{}, {}] = {} != a[{}] = {}", i, j, got0, i, a_vals[i]
+                    );
+                    prop_assert_eq!(
+                        got1.to_bits(), b_vals[j].to_bits(),
+                        "meshgrid[1][{}, {}] = {} != b[{}] = {}", i, j, got1, j, b_vals[j]
+                    );
+                }
+            }
+        }
+
         // MR (cartesian_prod contracts): tensor_cartesian_prod
         // enumerates pairs of 1-D vectors in lexicographic order.
         // Three contracts:
