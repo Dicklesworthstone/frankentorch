@@ -13952,6 +13952,41 @@ mod tests {
             }
         }
 
+        // MR (consistency): tensor_argmax(x, dim) == max_dim(x, dim).indices
+        // bit-exact. Both ops return integer indices of the max
+        // position. Catches dispatch drift between the dedicated
+        // argmax and the indices half of max_dim. frankentorch-tmhg.
+        #[test]
+        fn fuzz_metamorphic_argmax_equals_max_indices(
+            (rows, cols, raw) in (1usize..=6, 2usize..=8).prop_flat_map(|(r, c)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-512i16..=512i16, r * c),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x1 = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x1");
+            let am = s.tensor_argmax(x1, 1).expect("argmax");
+            let v_am = s.tensor_values(am).expect("am vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s.tensor_variable(input, vec![rows, cols], false).expect("x2");
+            let (_, idx) = s.tensor_max_dim(x2, 1).expect("max_dim");
+            let v_idx = s.tensor_values(idx).expect("idx vals");
+
+            prop_assert_eq!(v_am.len(), v_idx.len(), "shape mismatch");
+            for (i, (a, b)) in v_am.iter().zip(v_idx.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(),
+                    b.to_bits(),
+                    "argmax[{}] = {} != max_dim.indices[{}] = {}", i, a, i, b
+                );
+            }
+        }
+
         // MR (complement): ge(a, b) + lt(a, b) == 1.0 for non-NaN.
         // ge == NOT lt is the standard order-comparator complement.
         // NaN drops both sides to 0. frankentorch-ubh2.
