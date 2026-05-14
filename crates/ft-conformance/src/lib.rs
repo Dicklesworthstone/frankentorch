@@ -13952,6 +13952,44 @@ mod tests {
             }
         }
 
+        // MR (commutativity): tensor_add(a, b) == tensor_add(b, a)
+        // bit-exact (modulo NaN-NaN which preserve no specific bit
+        // pattern but both sides are NaN). Catches operand-swap
+        // regressions in the elementwise_contiguous dispatch.
+        // frankentorch-tol6.
+        #[test]
+        fn fuzz_metamorphic_tensor_add_commutativity(
+            samples in prop::collection::vec(-2048i16..2048i16, 1..32)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let a: Vec<f64> = samples.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let b: Vec<f64> = a.iter().rev().copied().collect();
+            let n = a.len();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a_t = s.tensor_variable(a.clone(), vec![n], false).expect("a");
+            let b_t = s.tensor_variable(b.clone(), vec![n], false).expect("b");
+            let ab = s.tensor_add(a_t, b_t).expect("a+b");
+            let v_ab = s.tensor_values(ab).expect("v_ab");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a2 = s.tensor_variable(a, vec![n], false).expect("a2");
+            let b2 = s.tensor_variable(b, vec![n], false).expect("b2");
+            let ba = s.tensor_add(b2, a2).expect("b+a");
+            let v_ba = s.tensor_values(ba).expect("v_ba");
+
+            for (i, (l, r)) in v_ab.iter().zip(v_ba.iter()).enumerate() {
+                if l.is_nan() && r.is_nan() {
+                    continue;
+                }
+                prop_assert_eq!(
+                    l.to_bits(),
+                    r.to_bits(),
+                    "a+b[{}] = {} != b+a[{}] = {}", i, l, i, r
+                );
+            }
+        }
+
         // MR (multiplicative inverse): x * reciprocal(x) ≈ 1 for
         // non-zero x within 4 ULP. Catches reciprocal precision
         // drift and any divide-by-zero handling issues that would
