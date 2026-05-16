@@ -15418,6 +15418,79 @@ mod tests {
             }
         }
 
+        // MR (index_fill contracts): tensor_index_fill(x, 0,
+        // indices, value) fills the rows at `indices` with `value`
+        // and leaves other rows untouched. Three contracts on a
+        // 2-D input:
+        //   1. Shape preserved.
+        //   2. Rows at filled indices == value bit-exact in every
+        //      column.
+        //   3. Rows not in indices == x bit-exact (no rounding
+        //      through the fill path).
+        // Plus empty-index identity: index_fill(x, dim, [], v)
+        // == x bit-exact (no-op when there are no slots to fill).
+        // Catches fill direction reversal (fill vs preserve),
+        // any drift between the value path and the preserved
+        // path, and the empty-index degenerate case.
+        // frankentorch-fg5wu.
+        #[test]
+        fn fuzz_metamorphic_index_fill_contract(
+            (rows, cols, raw, fill_idx_raw) in (2usize..=4, 1usize..=4, 1usize..=2).prop_flat_map(|(r, c, k)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..=256i16, r * c),
+                prop::collection::vec(0u8..=255u8, k),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            // Dedup filtered into the row range.
+            let mut idx_set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for b in fill_idx_raw {
+                idx_set.insert(usize::from(b) % rows);
+            }
+            let fill_indices: Vec<f64> = idx_set.iter().map(|&i| i as f64).collect();
+            let value = 7.25_f64;
+
+            // Contracts 1–3: filled + preserved rows.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let n = fill_indices.len();
+            let idx = s.tensor_variable(fill_indices.clone(), vec![n], false).expect("idx");
+            let out = s.tensor_index_fill(x, 0, idx, value).expect("index_fill");
+            let shape = s.tensor_shape(out).expect("out shape");
+            let v = s.tensor_values(out).expect("out vals");
+            prop_assert_eq!(shape, vec![rows, cols],
+                "index_fill must preserve shape");
+
+            for i in 0..rows {
+                let is_filled = idx_set.contains(&i);
+                for j in 0..cols {
+                    let got = v[i * cols + j];
+                    let want = if is_filled { value } else { input[i * cols + j] };
+                    prop_assert_eq!(
+                        got.to_bits(), want.to_bits(),
+                        "index_fill[{}, {}] = {} != expected {} (filled = {})",
+                        i, j, got, want, is_filled
+                    );
+                }
+            }
+
+            // Empty-index identity.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let empty_idx = s.tensor_variable(Vec::new(), vec![0], false).expect("empty");
+            let out = s.tensor_index_fill(x, 0, empty_idx, value).expect("index_fill empty");
+            let v = s.tensor_values(out).expect("empty vals");
+            for (i, (g, want)) in v.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "index_fill(empty)[{}] = {} != x[{}] = {}", i, g, i, want
+                );
+            }
+        }
+
         // MR (combinations contracts): tensor_combinations(x, 2,
         // wr) generates all 2-combinations of a 1-D input. Three
         // contracts:
