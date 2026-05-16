@@ -15418,6 +15418,96 @@ mod tests {
             }
         }
 
+        // MR (clamp_min / clamp_max contracts): the one-sided
+        // clamp ops have four contracts:
+        //   1. Lower bound: clamp_min(x, m)[i] >= m for every i.
+        //   2. Upper bound: clamp_max(x, M)[i] <= M for every i.
+        //   3. Infinite-bound passthrough:
+        //      clamp_min(x, NEG_INFINITY) == x bit-exact,
+        //      clamp_max(x, INFINITY) == x bit-exact.
+        //   4. Composition: clamp_max(clamp_min(x, m), M)
+        //      bit-equals tensor_clamp(x, m, M).
+        // Catches direction reversal (min vs max), missed
+        // saturation, and any drift between the one-sided path
+        // and the two-sided fused tensor_clamp. frankentorch-0lrf7.
+        #[test]
+        fn fuzz_metamorphic_clamp_min_max_contracts(
+            raw in prop::collection::vec(-256i16..=256i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+            let m_bound = -2.0_f64;
+            let max_bound = 3.5_f64;
+
+            // Contract 1: clamp_min lower bound.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let cm = s.tensor_clamp_min(x, m_bound).expect("clamp_min");
+            let v = s.tensor_values(cm).expect("cm vals");
+            for (i, &g) in v.iter().enumerate() {
+                prop_assert!(
+                    g >= m_bound,
+                    "clamp_min[{}] = {} below bound {}", i, g, m_bound
+                );
+            }
+
+            // Contract 2: clamp_max upper bound.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let cM = s.tensor_clamp_max(x, max_bound).expect("clamp_max");
+            let v = s.tensor_values(cM).expect("cM vals");
+            for (i, &g) in v.iter().enumerate() {
+                prop_assert!(
+                    g <= max_bound,
+                    "clamp_max[{}] = {} above bound {}", i, g, max_bound
+                );
+            }
+
+            // Contract 3: infinite-bound passthrough.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let cm_inf = s.tensor_clamp_min(x, f64::NEG_INFINITY).expect("clamp_min -inf");
+            let v_cm = s.tensor_values(cm_inf).expect("cm inf vals");
+            for (i, (g, want)) in v_cm.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "clamp_min(x, -inf)[{}] = {} != x[{}] = {}", i, g, i, want
+                );
+            }
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let cM_inf = s.tensor_clamp_max(x, f64::INFINITY).expect("clamp_max inf");
+            let v_cM = s.tensor_values(cM_inf).expect("cM inf vals");
+            for (i, (g, want)) in v_cM.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "clamp_max(x, inf)[{}] = {} != x[{}] = {}", i, g, i, want
+                );
+            }
+
+            // Contract 4: clamp_max(clamp_min(x, m), M) == clamp(x, m, M).
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let cm = s.tensor_clamp_min(x, m_bound).expect("clamp_min comp");
+            let cMm = s.tensor_clamp_max(cm, max_bound).expect("clamp_max comp");
+            let v_comp = s.tensor_values(cMm).expect("comp vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input, vec![n], false).expect("x");
+            let c = s.tensor_clamp(x, m_bound, max_bound).expect("clamp");
+            let v_clamp = s.tensor_values(c).expect("clamp vals");
+
+            for (i, (a, b)) in v_comp.iter().zip(v_clamp.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "composed clamp_max(clamp_min(x, m), M)[{}] = {} != clamp(x, m, M)[{}] = {}",
+                    i, a, i, b
+                );
+            }
+        }
+
         // MR (logcumsumexp contracts): tensor_logcumsumexp(x, dim)
         // is the running log-sum-exp along dim. Three contracts
         // on a 1-D input (dim = 0):
