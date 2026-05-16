@@ -15418,6 +15418,93 @@ mod tests {
             }
         }
 
+        // MR (index_copy contracts): tensor_index_copy(x, 0,
+        // indices, src) writes src rows at positions indices.
+        // Three contracts on a 2-D input:
+        //   1. Shape preserved.
+        //   2. For each k, output row indices[k] == src row k
+        //      bit-exact.
+        //   3. Rows not in indices == x bit-exact.
+        // Plus identity-index recovery: index_copy(x, 0,
+        // [0..n-1], x) == x bit-exact when both inputs match.
+        // Catches axis confusion between source and target slots
+        // and any drift between the copy path and the preserve
+        // path. frankentorch-otp70.
+        #[test]
+        fn fuzz_metamorphic_index_copy_contract(
+            (rows, cols, raw_input, raw_src, idx_raw) in (2usize..=4, 1usize..=4, 1usize..=2).prop_flat_map(|(r, c, k)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..=256i16, r * c),
+                prop::collection::vec(-256i16..=256i16, k * c),
+                prop::collection::vec(0u8..=255u8, k),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw_input.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let src_vals: Vec<f64> = raw_src.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let n_idx = src_vals.len() / cols;
+            // Build distinct indices ∈ [0, rows).
+            let mut idx_set: std::collections::BTreeSet<usize> = std::collections::BTreeSet::new();
+            for b in &idx_raw {
+                idx_set.insert(usize::from(*b) % rows);
+                if idx_set.len() == n_idx { break; }
+            }
+            if idx_set.len() != n_idx {
+                // Couldn't get enough distinct indices for this run.
+                return Ok(());
+            }
+            let indices: Vec<usize> = idx_set.into_iter().collect();
+            let idx_f: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
+
+            // Contracts 1–3.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let idx = s.tensor_variable(idx_f.clone(), vec![n_idx], false).expect("idx");
+            let src = s.tensor_variable(src_vals.clone(), vec![n_idx, cols], false).expect("src");
+            let out = s.tensor_index_copy(x, 0, idx, src).expect("index_copy");
+            let shape = s.tensor_shape(out).expect("out shape");
+            let v = s.tensor_values(out).expect("out vals");
+            prop_assert_eq!(shape, vec![rows, cols], "index_copy must preserve shape");
+
+            // Build a quick reverse map indices -> src-row.
+            let mut idx_to_src: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+            for (k, &row_idx) in indices.iter().enumerate() {
+                idx_to_src.insert(row_idx, k);
+            }
+
+            for i in 0..rows {
+                for j in 0..cols {
+                    let got = v[i * cols + j];
+                    let want = match idx_to_src.get(&i) {
+                        Some(&k) => src_vals[k * cols + j],
+                        None => input[i * cols + j],
+                    };
+                    prop_assert_eq!(
+                        got.to_bits(), want.to_bits(),
+                        "index_copy[{}, {}] = {} != expected {}", i, j, got, want
+                    );
+                }
+            }
+
+            // Identity-index recovery: index_copy(x, 0,
+            // [0..rows-1], x) == x bit-exact.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let identity_idx: Vec<f64> = (0..rows).map(|i| i as f64).collect();
+            let idx = s.tensor_variable(identity_idx, vec![rows], false).expect("idx");
+            let src_x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("src x");
+            let out = s.tensor_index_copy(x, 0, idx, src_x).expect("identity copy");
+            let v = s.tensor_values(out).expect("identity vals");
+            for (i, (g, want)) in v.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "identity index_copy[{}] = {} != x[{}] = {}", i, g, i, want
+                );
+            }
+        }
+
         // MR (index_fill contracts): tensor_index_fill(x, 0,
         // indices, value) fills the rows at `indices` with `value`
         // and leaves other rows untouched. Three contracts on a
