@@ -15418,6 +15418,64 @@ mod tests {
             }
         }
 
+        // MR (repeat_interleave contracts): tensor_repeat_interleave(
+        // x, k) on a 1-D input produces an in-place k-fold
+        // repetition: out[i*k + j] = x[i]. Distinct from tile,
+        // which repeats the whole vector. Three contracts:
+        //   1. Shape: [n*k] for a length-n input.
+        //   2. In-place pattern: out[i*k + j] == x[i] bit-exact
+        //      for all 0 <= i < n, 0 <= j < k.
+        //   3. Identity: repeat_interleave(x, 1) == x bit-exact.
+        // Catches confusion between in-place and full-vector
+        // repetition (tile vs repeat_interleave) and any off-by-
+        // one in the index stride. frankentorch-0514s.
+        #[test]
+        fn fuzz_metamorphic_repeat_interleave_pattern(
+            (k, raw) in (1usize..=4).prop_flat_map(|kk| (
+                Just(kk),
+                prop::collection::vec(-128i16..=128i16, 1..8),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+
+            // Contracts 1 + 2: shape + pattern.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let r = s.tensor_repeat_interleave(x, k).expect("repeat_interleave");
+            let shape = s.tensor_shape(r).expect("r shape");
+            let v = s.tensor_values(r).expect("r vals");
+            prop_assert_eq!(shape, vec![n * k],
+                "repeat_interleave shape must be [n*k] = [{}]", n * k);
+            prop_assert_eq!(v.len(), n * k);
+            for i in 0..n {
+                for j in 0..k {
+                    let got = v[i * k + j];
+                    let want = input[i];
+                    prop_assert_eq!(
+                        got.to_bits(), want.to_bits(),
+                        "repeat_interleave[{}*{}+{} = {}] = {} != x[{}] = {}",
+                        i, k, j, i * k + j, got, i, want
+                    );
+                }
+            }
+
+            // Contract 3: repeat_interleave(x, 1) == x bit-exact.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let r = s.tensor_repeat_interleave(x, 1).expect("repeat_interleave 1");
+            let v = s.tensor_values(r).expect("r 1 vals");
+            prop_assert_eq!(v.len(), n);
+            for (i, (g, want)) in v.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "repeat_interleave(x, 1)[{}] = {} != x[{}] = {}", i, g, i, want
+                );
+            }
+        }
+
         // MR (deg2rad + rad2deg contracts): the two angle-unit
         // ops are inverses up to floating-point rounding. Four
         // contracts:
