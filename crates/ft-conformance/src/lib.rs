@@ -15418,6 +15418,103 @@ mod tests {
             }
         }
 
+        // MR (i0 + i1 contracts): the modified Bessel functions
+        // I_0 and I_1 of the first kind. Six contracts:
+        //   1. i0(0) == 1 (the global minimum of I_0).
+        //   2. i0(x) >= 1 for all real x.
+        //   3. i0 is even: i0(-x) ≈ i0(x).
+        //   4. i1(0) == 0.
+        //   5. i1 is odd: i1(-x) ≈ -i1(x).
+        //   6. i0e(x) = exp(-|x|) * i0(x) is bounded by 1 for
+        //      large |x| (i.e. i0e <= 1 + a small slack).
+        // Catches direction reversal in the polynomial
+        // approximation and any failure of the parity contracts.
+        // frankentorch-u0vbt.
+        #[test]
+        fn fuzz_metamorphic_i0_i1_contracts(
+            raw in prop::collection::vec(-128i16..=128i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 31.0).collect();
+            let n = input.len();
+            let neg_input: Vec<f64> = input.iter().map(|v| -v).collect();
+
+            // Contract 1: i0(0) == 1.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let z = s.tensor_variable(vec![0.0], vec![1], false).expect("0");
+            let i0z = s.tensor_special_i0(z).expect("i0 0");
+            let v = s.tensor_values(i0z).expect("i0 0 val")[0];
+            prop_assert!(
+                (v - 1.0).abs() <= 16.0 * f64::EPSILON,
+                "i0(0) = {} not ≈ 1", v
+            );
+
+            // Contract 4: i1(0) == 0.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let z = s.tensor_variable(vec![0.0], vec![1], false).expect("0");
+            let i1z = s.tensor_special_i1(z).expect("i1 0");
+            let v = s.tensor_values(i1z).expect("i1 0 val")[0];
+            prop_assert!(
+                v.abs() <= 16.0 * f64::EPSILON,
+                "i1(0) = {} not ≈ 0", v
+            );
+
+            // Contract 2 + 3: i0 even + lower bound.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let i0x = s.tensor_special_i0(x).expect("i0");
+            let v_i0 = s.tensor_values(i0x).expect("i0 vals");
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xn = s.tensor_variable(neg_input.clone(), vec![n], false).expect("neg x");
+            let i0nx = s.tensor_special_i0(xn).expect("i0 neg");
+            let v_i0n = s.tensor_values(i0nx).expect("i0 neg vals");
+            for (i, ((&p, &neg), _)) in v_i0.iter().zip(v_i0n.iter()).zip(input.iter()).enumerate() {
+                // Even: i0(-x) == i0(x).
+                let diff = (p - neg).abs();
+                let scale = p.abs().max(neg.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 1e-10 * scale,
+                    "i0(-x)[{}] = {} != i0(x) = {}", i, neg, p
+                );
+                // Lower bound: i0(x) >= 1.
+                prop_assert!(
+                    p >= 1.0 - 16.0 * f64::EPSILON,
+                    "i0[{}] = {} below 1", i, p
+                );
+            }
+
+            // Contract 5: i1 odd.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let i1x = s.tensor_special_i1(x).expect("i1");
+            let v_i1 = s.tensor_values(i1x).expect("i1 vals");
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xn = s.tensor_variable(neg_input, vec![n], false).expect("neg x");
+            let i1nx = s.tensor_special_i1(xn).expect("i1 neg");
+            let v_i1n = s.tensor_values(i1nx).expect("i1 neg vals");
+            for (i, (&p, &neg)) in v_i1.iter().zip(v_i1n.iter()).enumerate() {
+                let diff = (neg + p).abs();
+                let scale = p.abs().max(neg.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 1e-10 * scale,
+                    "i1(-x)[{}] = {} != -i1(x) = {}", i, neg, -p
+                );
+            }
+
+            // Contract 6: i0e(x) <= 1 + small slack for all x.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let i0e = s.tensor_special_i0e(x).expect("i0e");
+            let v = s.tensor_values(i0e).expect("i0e vals");
+            for (i, &g) in v.iter().enumerate() {
+                prop_assert!(
+                    g <= 1.0 + 16.0 * f64::EPSILON,
+                    "i0e[{}] = {} above 1", i, g
+                );
+            }
+        }
+
         // MR (digamma contracts): tensor_digamma(x) = ψ(x) =
         // d/dx log(|Γ(x)|). Three contracts:
         //   1. Euler-Mascheroni anchor: digamma(1) ≈ -γ where
