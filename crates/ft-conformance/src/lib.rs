@@ -15418,6 +15418,94 @@ mod tests {
             }
         }
 
+        // MR (combinations contracts): tensor_combinations(x, 2,
+        // wr) generates all 2-combinations of a 1-D input. Three
+        // contracts:
+        //   1. Shape: [n*(n-1)/2, 2] for wr=false; [n*(n+1)/2, 2]
+        //      for wr=true.
+        //   2. Lex order: row k = [x[i], x[j]] for the k-th pair
+        //      in the i < j (no-replacement) or i <= j (with-
+        //      replacement) lex scan — bit-exact.
+        //   3. Membership: every output value is an element of x
+        //      (no synthetic values introduced).
+        // Catches off-by-one in the recursive index generator,
+        // direction flip between i <= j and i < j, and any drift
+        // between the with_replacement and without_replacement
+        // paths. frankentorch-l4ua1.
+        #[test]
+        fn fuzz_metamorphic_combinations_two_lex(
+            raw in prop::collection::vec(-32i16..=32i16, 2..6)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let x_vals: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 7.0).collect();
+            let n = x_vals.len();
+
+            // Compute expected pairs for both modes.
+            let mut expected_no_rep: Vec<(f64, f64)> = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    expected_no_rep.push((x_vals[i], x_vals[j]));
+                }
+            }
+            let mut expected_with_rep: Vec<(f64, f64)> = Vec::new();
+            for i in 0..n {
+                for j in i..n {
+                    expected_with_rep.push((x_vals[i], x_vals[j]));
+                }
+            }
+
+            // No-replacement path.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(x_vals.clone(), vec![n], false).expect("x");
+            let c = s.tensor_combinations(x, 2, false).expect("combinations");
+            let shape = s.tensor_shape(c).expect("c shape");
+            let v = s.tensor_values(c).expect("c vals");
+            prop_assert_eq!(shape, vec![expected_no_rep.len(), 2],
+                "combinations(x, 2, false) shape must be [{}, 2]", expected_no_rep.len());
+            for (k, &(want_a, want_b)) in expected_no_rep.iter().enumerate() {
+                let got_a = v[k * 2];
+                let got_b = v[k * 2 + 1];
+                prop_assert_eq!(
+                    got_a.to_bits(), want_a.to_bits(),
+                    "combinations[{}, 0] = {} != expected {}", k, got_a, want_a
+                );
+                prop_assert_eq!(
+                    got_b.to_bits(), want_b.to_bits(),
+                    "combinations[{}, 1] = {} != expected {}", k, got_b, want_b
+                );
+            }
+
+            // With-replacement path.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(x_vals.clone(), vec![n], false).expect("x");
+            let c = s.tensor_combinations(x, 2, true).expect("combinations wr");
+            let shape = s.tensor_shape(c).expect("c wr shape");
+            let v = s.tensor_values(c).expect("c wr vals");
+            prop_assert_eq!(shape, vec![expected_with_rep.len(), 2],
+                "combinations(x, 2, true) shape must be [{}, 2]", expected_with_rep.len());
+            for (k, &(want_a, want_b)) in expected_with_rep.iter().enumerate() {
+                let got_a = v[k * 2];
+                let got_b = v[k * 2 + 1];
+                prop_assert_eq!(
+                    got_a.to_bits(), want_a.to_bits(),
+                    "combinations(wr)[{}, 0] = {} != expected {}", k, got_a, want_a
+                );
+                prop_assert_eq!(
+                    got_b.to_bits(), want_b.to_bits(),
+                    "combinations(wr)[{}, 1] = {} != expected {}", k, got_b, want_b
+                );
+            }
+
+            // Contract 3: membership.
+            for &val in &v {
+                prop_assert!(
+                    x_vals.iter().any(|&xv| xv == val),
+                    "combinations value {} not in input", val
+                );
+            }
+        }
+
         // MR (meshgrid ij indexing): tensor_meshgrid([a, b])
         // returns two [m, n] tensors where m = |a|, n = |b| and
         //   results[0][i, j] = a[i]
