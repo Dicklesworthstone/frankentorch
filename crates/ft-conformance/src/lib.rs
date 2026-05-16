@@ -15418,6 +15418,67 @@ mod tests {
             }
         }
 
+        // MR (polygamma contracts): tensor_polygamma(n, x) is
+        // the (n+1)-th derivative of log(Γ(x)). Three contracts:
+        //   1. n == 0 routing: polygamma(0, x) == digamma(x)
+        //      bit-exact (the API delegates).
+        //   2. Basel anchor: polygamma(1, 1) ≈ π²/6 (ζ(2) =
+        //      π²/6, and polygamma(1, 1) = ζ(2)).
+        //   3. Sign: polygamma(1, x) > 0 for x > 0 (trigamma is
+        //      positive on the positive reals).
+        // Catches drift between the n=0 and n>=1 paths, and
+        // any failure of the well-known Basel identity.
+        // frankentorch-nja81.
+        #[test]
+        fn fuzz_metamorphic_polygamma_contracts(
+            raw in prop::collection::vec(1i16..=64i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 10.0).collect();
+            let n = input.len();
+
+            // Contract 1: polygamma(0, x) == digamma(x) bit-exact.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let pg = s.tensor_polygamma(0, x).expect("polygamma 0");
+            let v_pg = s.tensor_values(pg).expect("pg vals");
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let dg = s.tensor_digamma(x).expect("digamma");
+            let v_dg = s.tensor_values(dg).expect("dg vals");
+            for (i, (&a, &b)) in v_pg.iter().zip(v_dg.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "polygamma(0, x)[{}] = {} != digamma(x)[{}] = {} bit-exact", i, a, i, b
+                );
+            }
+
+            // Contract 2: Basel anchor polygamma(1, 1) ≈ π²/6.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let one = s.tensor_variable(vec![1.0], vec![1], false).expect("1");
+            let pg = s.tensor_polygamma(1, one).expect("polygamma 1, 1");
+            let v = s.tensor_values(pg).expect("basel val")[0];
+            let pi = std::f64::consts::PI;
+            let basel = pi * pi / 6.0;
+            prop_assert!(
+                (v - basel).abs() <= 1e-4,
+                "polygamma(1, 1) = {} not ≈ π²/6 = {}", v, basel
+            );
+
+            // Contract 3: polygamma(1, x) > 0 for x > 0.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input, vec![n], false).expect("x");
+            let pg = s.tensor_polygamma(1, x).expect("polygamma 1");
+            let v = s.tensor_values(pg).expect("pg 1 vals");
+            for (i, &g) in v.iter().enumerate() {
+                prop_assert!(
+                    g > 0.0,
+                    "polygamma(1, x)[{}] = {} not positive (x > 0)", i, g
+                );
+            }
+        }
+
         // MR (i0 + i1 contracts): the modified Bessel functions
         // I_0 and I_1 of the first kind. Six contracts:
         //   1. i0(0) == 1 (the global minimum of I_0).
