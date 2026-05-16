@@ -15418,6 +15418,88 @@ mod tests {
             }
         }
 
+        // MR (ldexp contracts): tensor_ldexp(x, n) == x * 2^n,
+        // composed through exp2 + mul in the API. Four contracts:
+        //   1. n == 0: ldexp(x, 0) == x within 1 ULP relative
+        //      (exp2(0) = 1 is libm-exact and 1.0 * x == x).
+        //   2. n == 1: ldexp(x, 1) == 2.0 * x within 4 ULP
+        //      (two-step composition: exp2 + mul).
+        //   3. n == -1: ldexp(x, -1) == 0.5 * x within 4 ULP.
+        //   4. ldexp(0, n) == 0 bit-exact for all integer n.
+        // Catches exp2 / mul drift, sign-of-zero bugs at the
+        // origin, and any failure of the (n=0)-passthrough.
+        // frankentorch-4gdvy.
+        #[test]
+        fn fuzz_metamorphic_ldexp_contracts(
+            raw in prop::collection::vec(-256i16..=256i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 17.0).collect();
+            let n = input.len();
+
+            // Contract 1: ldexp(x, 0) == x.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let zeros = s.tensor_variable(vec![0.0; n], vec![n], false).expect("zeros");
+            let out = s.tensor_ldexp(x, zeros).expect("ldexp 0");
+            let v = s.tensor_values(out).expect("ldexp 0 vals");
+            for (i, (g, want)) in v.iter().zip(input.iter()).enumerate() {
+                let diff = (g - want).abs();
+                let scale = g.abs().max(want.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 1.0 * f64::EPSILON * scale,
+                    "ldexp(x, 0)[{}] = {} != x[{}] = {}", i, g, i, want
+                );
+            }
+
+            // Contract 2: ldexp(x, 1) == 2*x.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let ones = s.tensor_variable(vec![1.0; n], vec![n], false).expect("ones");
+            let out = s.tensor_ldexp(x, ones).expect("ldexp 1");
+            let v = s.tensor_values(out).expect("ldexp 1 vals");
+            for (i, (g, &xi)) in v.iter().zip(input.iter()).enumerate() {
+                let want = 2.0 * xi;
+                let diff = (g - want).abs();
+                let scale = g.abs().max(want.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 4.0 * f64::EPSILON * scale,
+                    "ldexp(x, 1)[{}] = {} != 2*x[{}] = {}", i, g, i, want
+                );
+            }
+
+            // Contract 3: ldexp(x, -1) == 0.5*x.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let neg_ones = s.tensor_variable(vec![-1.0; n], vec![n], false).expect("neg_ones");
+            let out = s.tensor_ldexp(x, neg_ones).expect("ldexp -1");
+            let v = s.tensor_values(out).expect("ldexp -1 vals");
+            for (i, (g, &xi)) in v.iter().zip(input.iter()).enumerate() {
+                let want = 0.5 * xi;
+                let diff = (g - want).abs();
+                let scale = g.abs().max(want.abs()).max(1.0);
+                prop_assert!(
+                    diff <= 4.0 * f64::EPSILON * scale,
+                    "ldexp(x, -1)[{}] = {} != 0.5*x[{}] = {}", i, g, i, want
+                );
+            }
+
+            // Contract 4: ldexp(0, n) == 0.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let z = s.tensor_variable(vec![0.0; n], vec![n], false).expect("zeros");
+            let ns = s.tensor_variable((0..n).map(|i| i as f64 - 4.0).collect(), vec![n], false)
+                .expect("ns");
+            let out = s.tensor_ldexp(z, ns).expect("ldexp 0 base");
+            let v = s.tensor_values(out).expect("ldexp 0 base vals");
+            for (i, &g) in v.iter().enumerate() {
+                prop_assert!(
+                    g == 0.0,
+                    "ldexp(0, n)[{}] = {} != 0", i, g
+                );
+            }
+        }
+
         // MR (copysign contracts): tensor_copysign(m, s) returns
         // |m| with the sign of s. Three contracts on 1-D inputs:
         //   1. Magnitude: |copysign(m, s)| == |m| bit-exact.
