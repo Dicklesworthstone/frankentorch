@@ -15418,6 +15418,80 @@ mod tests {
             }
         }
 
+        // MR (entr contracts): tensor_entr(x) = -x*log(x) for
+        // x > 0, 0 for x == 0, -inf for x < 0 (the scipy.special
+        // .entr convention). Four contracts:
+        //   1. Anchor: entr(0) == 0 bit-exact.
+        //   2. Anchor: entr(1) == 0 bit-exact (log(1) = 0).
+        //   3. Non-negative region: entr(x) >= 0 for 0 < x <= 1
+        //      (since -x*log(x) >= 0 when log(x) <= 0).
+        //   4. Closed-form: entr(x) ≈ -x*log(x) within 8 ULP
+        //      relative for x > 0.
+        // Catches drift between the masked composition and the
+        // closed-form math. frankentorch-xbn8b.
+        #[test]
+        fn fuzz_metamorphic_entr_contracts(
+            raw in prop::collection::vec(1i16..=256i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // Positive x ∈ (0, 5].
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 53.0).collect();
+            let n = input.len();
+
+            // Contract 1: entr(0) == 0.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let z = s.tensor_variable(vec![0.0], vec![1], false).expect("0");
+            let e = s.tensor_entr(z).expect("entr 0");
+            let v = s.tensor_values(e).expect("entr 0 val")[0];
+            prop_assert_eq!(v.to_bits(), 0.0_f64.to_bits(),
+                "entr(0) = {} != 0 bit-exact", v);
+
+            // Contract 2: entr(1) == 0.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let one = s.tensor_variable(vec![1.0], vec![1], false).expect("1");
+            let e = s.tensor_entr(one).expect("entr 1");
+            let v = s.tensor_values(e).expect("entr 1 val")[0];
+            prop_assert!(
+                v == 0.0,
+                "entr(1) = {} must be ±0 (log(1) = 0)", v
+            );
+
+            // Contract 3: non-negative on 0 < x <= 1.
+            let small_input: Vec<f64> = input.iter().map(|v| v.min(1.0)).collect();
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(small_input.clone(), vec![n], false).expect("x");
+            let e = s.tensor_entr(x).expect("entr");
+            let v = s.tensor_values(e).expect("entr vals");
+            for (i, (&g, &xi)) in v.iter().zip(small_input.iter()).enumerate() {
+                if xi > 0.0 && xi <= 1.0 {
+                    prop_assert!(
+                        g >= -16.0 * f64::EPSILON,
+                        "entr({})[{}] = {} negative (should be non-negative on (0, 1])",
+                        xi, i, g
+                    );
+                }
+            }
+
+            // Contract 4: closed-form -x*log(x).
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let e = s.tensor_entr(x).expect("entr");
+            let v = s.tensor_values(e).expect("entr vals");
+            for (i, (&g, &xi)) in v.iter().zip(input.iter()).enumerate() {
+                if xi > 0.0 {
+                    let want = -xi * xi.ln();
+                    let diff = (g - want).abs();
+                    let scale = g.abs().max(want.abs()).max(1.0);
+                    prop_assert!(
+                        diff <= 8.0 * f64::EPSILON * scale,
+                        "entr({})[{}] = {} != -x*log(x) = {} (diff = {:e})",
+                        xi, i, g, want, diff
+                    );
+                }
+            }
+        }
+
         // MR (xlogy contracts): tensor_xlogy(x, y) = x * log(y)
         // with the convention 0 * log(0) = 0 (matches scipy.
         // special.xlogy). Three contracts:
