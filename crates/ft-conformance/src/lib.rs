@@ -15418,6 +15418,63 @@ mod tests {
             }
         }
 
+        // MR (one_hot contracts): one_hot(indices, num_classes)
+        // converts class indices to a binary matrix where each
+        // row is exactly the indicator vector of one class.
+        // Three contracts on a 1-D index input:
+        //   1. Shape: input shape with [num_classes] appended.
+        //   2. Exactly one 1 and num_classes-1 zeros per row, all
+        //      bit-exact (no rounding through the indicator).
+        //   3. The 1 sits at column indices[i] for every row i.
+        // Catches axis swap (row vs col), miscounted columns,
+        // and any rounding through the indicator path.
+        // frankentorch-10plw.
+        #[test]
+        fn fuzz_metamorphic_one_hot_contracts(
+            (num_classes, idx_raw) in (2usize..=8).prop_flat_map(|nc| (
+                Just(nc),
+                prop::collection::vec(0u8..=255u8, 1..16),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let indices_f: Vec<f64> = idx_raw.iter()
+                .map(|&b| (usize::from(b) % num_classes) as f64)
+                .collect();
+            let n = indices_f.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let idx = s.tensor_variable(indices_f.clone(), vec![n], false).expect("idx");
+            let oh = s.one_hot(idx, num_classes).expect("one_hot");
+            let shape = s.tensor_shape(oh).expect("oh shape");
+            let v = s.tensor_values(oh).expect("oh vals");
+
+            // Contract 1: shape.
+            prop_assert_eq!(shape, vec![n, num_classes],
+                "one_hot shape must be [{}, {}]", n, num_classes);
+            prop_assert_eq!(v.len(), n * num_classes);
+
+            // Contracts 2 + 3: exactly one 1 at the class column.
+            for (i, &class_f) in indices_f.iter().enumerate() {
+                let class = class_f as usize;
+                let mut ones = 0;
+                for c in 0..num_classes {
+                    let val = v[i * num_classes + c];
+                    let want: f64 = if c == class { 1.0 } else { 0.0 };
+                    prop_assert_eq!(
+                        val.to_bits(), want.to_bits(),
+                        "one_hot[{}, {}] = {} != {} (class = {})",
+                        i, c, val, want, class
+                    );
+                    if val == 1.0 {
+                        ones += 1;
+                    }
+                }
+                prop_assert_eq!(ones, 1,
+                    "row {} has {} ones (expected exactly 1)", i, ones);
+            }
+        }
+
         // MR (acosh contracts): tensor_acosh(x) is the inverse
         // hyperbolic cosine, defined for x >= 1. Three contracts:
         //   1. acosh(1) == 0 bit-exact (the anchor where
