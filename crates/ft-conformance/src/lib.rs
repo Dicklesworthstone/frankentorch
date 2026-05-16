@@ -15418,6 +15418,87 @@ mod tests {
             }
         }
 
+        // MR (frac decomposition): tensor_frac(x) returns the
+        // fractional part of x. Four contracts:
+        //   1. Decomposition: frac(x) + trunc(x) == x bit-exact
+        //      (torch.frac is defined as x - trunc(x)).
+        //   2. Bounded: |frac(x)| < 1 for finite x.
+        //   3. Integer identity: frac(int) == 0 bit-exact.
+        //   4. Sign of frac matches sign of x for non-zero finite
+        //      x (the IEEE-correct convention).
+        // Catches drift between trunc and frac, sign-flip bugs,
+        // and any failure of the integer-input degenerate case.
+        // frankentorch-60sxu.
+        #[test]
+        fn fuzz_metamorphic_frac_decomposition(
+            raw in prop::collection::vec(-2048i16..=2048i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            // x ∈ ~[-20, 20] with fractional components.
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 100.0).collect();
+            let n = input.len();
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let f = s.tensor_frac(x).expect("frac");
+            let v_f = s.tensor_values(f).expect("frac vals");
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let t = s.tensor_trunc(x).expect("trunc");
+            let v_t = s.tensor_values(t).expect("trunc vals");
+
+            for (i, ((&fi, &ti), &xi)) in v_f.iter()
+                .zip(v_t.iter())
+                .zip(input.iter())
+                .enumerate()
+            {
+                if !xi.is_finite() {
+                    continue;
+                }
+
+                // Contract 1: frac + trunc == x bit-exact.
+                let sum = fi + ti;
+                prop_assert_eq!(
+                    sum.to_bits(), xi.to_bits(),
+                    "frac({}) + trunc({}) = {} + {} = {} != {} (bit-exact)",
+                    xi, xi, fi, ti, sum, xi
+                );
+
+                // Contract 2: |frac(x)| < 1.
+                prop_assert!(
+                    fi.abs() < 1.0,
+                    "|frac({})| = {} not strictly less than 1", xi, fi.abs()
+                );
+
+                // Contract 4: sign of frac matches sign of x when
+                // both are non-zero.
+                if fi != 0.0 && xi != 0.0 {
+                    prop_assert!(
+                        (fi > 0.0) == (xi > 0.0),
+                        "sign(frac({})) = {} differs from sign(x)", xi, fi
+                    );
+                }
+            }
+
+            // Contract 3: frac(int) == 0 bit-exact.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let ints = s.tensor_variable(
+                vec![-3.0, -1.0, 0.0, 1.0, 3.0, 7.0],
+                vec![6],
+                false,
+            ).expect("ints");
+            let fr = s.tensor_frac(ints).expect("frac ints");
+            let v = s.tensor_values(fr).expect("frac int vals");
+            for (i, &g) in v.iter().enumerate() {
+                prop_assert!(
+                    g == 0.0,
+                    "frac(int)[{}] = {} != ±0", i, g
+                );
+            }
+        }
+
         // MR (trunc contracts): tensor_trunc(x) rounds toward
         // zero. Four contracts:
         //   1. Integer-valued: result has zero fractional part
