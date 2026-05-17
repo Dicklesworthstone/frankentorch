@@ -15418,6 +15418,51 @@ mod tests {
             }
         }
 
+        // MR (ravel contracts): tensor_ravel(x) flattens to 1-D.
+        // Three contracts on a 2-D input:
+        //   1. Output rank == 1.
+        //   2. Values bit-exactly match flatten of input in
+        //      C-contiguous order.
+        //   3. Numel preserved.
+        // Catches drift in the rank-1 promotion and any failure
+        // of the row-major flat ordering. frankentorch-4r845.
+        #[test]
+        fn fuzz_metamorphic_ravel_contracts(
+            (rows, cols, raw) in (1usize..=4, 1usize..=4).prop_flat_map(|(r, c)| (
+                Just(r),
+                Just(c),
+                prop::collection::vec(-256i16..=256i16, r * c),
+            ))
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 23.0).collect();
+            let numel = rows * cols;
+
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![rows, cols], false).expect("x");
+            let r = s.tensor_ravel(x).expect("ravel");
+            let shape = s.tensor_shape(r).expect("r shape");
+            let v = s.tensor_values(r).expect("r vals");
+
+            // Contract 1: 1-D output.
+            prop_assert_eq!(shape.len(), 1,
+                "ravel output rank must be 1, got {:?}", shape);
+
+            // Contract 3: numel preserved.
+            prop_assert_eq!(v.len(), numel,
+                "ravel numel = {} != input numel = {}", v.len(), numel);
+
+            // Contract 2: values bit-exactly match flattened
+            // input in C order.
+            for (i, (g, want)) in v.iter().zip(input.iter()).enumerate() {
+                prop_assert_eq!(
+                    g.to_bits(), want.to_bits(),
+                    "ravel[{}] = {} != flatten(x)[{}] = {}", i, g, i, want
+                );
+            }
+        }
+
         // MR (view_as contracts): tensor_view_as(input, other)
         // reshapes input to match other's shape (requires same
         // numel). Three contracts:
