@@ -38,6 +38,9 @@ a.out
 
 # Remote compilation helper artifacts
 .rch-target/
+# Per-job target shards created by `rch` when multiple cargo invocations
+# run concurrently (suffix is target-set + job-id + nanos + retry counter).
+.rch-target-*/
 .rch-deploy-root/
 rch-bin/
 rch-install/
