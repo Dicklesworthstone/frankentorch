@@ -15418,6 +15418,54 @@ mod tests {
             }
         }
 
+        // MR (fix + absolute torch aliases): tensor_fix is an
+        // alias for tensor_trunc; tensor_absolute is an alias
+        // for tensor_abs. Two contracts on a 1-D input:
+        //   1. tensor_fix(x) bit-equals tensor_trunc(x).
+        //   2. tensor_absolute(x) bit-equals tensor_abs(x).
+        // frankentorch-1ht8w.
+        #[test]
+        fn fuzz_metamorphic_fix_absolute_aliases(
+            raw in prop::collection::vec(-2048i16..=2048i16, 1..16)
+        ) {
+            use ft_api::FrankenTorchSession;
+
+            let input: Vec<f64> = raw.iter().map(|v| f64::from(*v) / 100.0).collect();
+            let n = input.len();
+
+            // Contract 1: fix == trunc.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let fx = s.tensor_fix(x).expect("fix");
+            let v_fix = s.tensor_values(fx).expect("fix vals");
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let tr = s.tensor_trunc(x).expect("trunc");
+            let v_tr = s.tensor_values(tr).expect("trunc vals");
+            for (i, (&a, &b)) in v_fix.iter().zip(v_tr.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "fix[{}] = {} != trunc[{}] = {}", i, a, i, b
+                );
+            }
+
+            // Contract 2: absolute == abs.
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input.clone(), vec![n], false).expect("x");
+            let ab1 = s.tensor_absolute(x).expect("absolute");
+            let v_ab1 = s.tensor_values(ab1).expect("abs vals");
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(input, vec![n], false).expect("x");
+            let ab2 = s.tensor_abs(x).expect("abs");
+            let v_ab2 = s.tensor_values(ab2).expect("abs vals");
+            for (i, (&a, &b)) in v_ab1.iter().zip(v_ab2.iter()).enumerate() {
+                prop_assert_eq!(
+                    a.to_bits(), b.to_bits(),
+                    "absolute[{}] = {} != abs[{}] = {}", i, a, i, b
+                );
+            }
+        }
+
         // MR (unsafe_chunk alias): tensor_unsafe_chunk is a
         // torch parity alias for tensor_chunk. Two contracts on
         // a 1-D input chunked into 2 pieces:
