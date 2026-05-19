@@ -191,6 +191,7 @@ pub struct SGD {
     params: Vec<TensorNodeId>,
     lr: f64,
     momentum: f64,
+    dampening: f64,
     weight_decay: f64,
     nesterov: bool,
     velocity: Vec<Option<Vec<f64>>>,
@@ -208,6 +209,7 @@ impl SGD {
             params,
             lr,
             momentum: 0.0,
+            dampening: 0.0,
             weight_decay: 0.0,
             nesterov: false,
             velocity: vec![None; n],
@@ -218,6 +220,20 @@ impl SGD {
     #[must_use]
     pub fn momentum(mut self, momentum: f64) -> Self {
         self.momentum = momentum;
+        self
+    }
+
+    /// Set the momentum dampening factor (default: 0.0).
+    ///
+    /// Mirrors `torch.optim.SGD`'s `dampening`: from the second step
+    /// onward the momentum buffer update becomes
+    /// `buf = momentum * buf + (1 - dampening) * grad`. The first step
+    /// always seeds `buf` with the raw (weight-decayed) gradient
+    /// regardless of `dampening`, matching upstream. Nesterov momentum
+    /// requires `dampening == 0`.
+    #[must_use]
+    pub fn dampening(mut self, dampening: f64) -> Self {
+        self.dampening = dampening;
         self
     }
 
@@ -246,13 +262,18 @@ impl SGD {
                 "sgd requires finite non-negative momentum",
             ));
         }
+        if !self.dampening.is_finite() {
+            return Err(optimizer_hparam_error("sgd requires finite dampening"));
+        }
         if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
             return Err(optimizer_hparam_error(
                 "sgd requires finite non-negative weight_decay",
             ));
         }
-        if self.nesterov && self.momentum == 0.0 {
-            return Err(optimizer_hparam_error("sgd nesterov requires momentum > 0"));
+        if self.nesterov && (self.momentum == 0.0 || self.dampening != 0.0) {
+            return Err(optimizer_hparam_error(
+                "sgd nesterov requires momentum > 0 and zero dampening",
+            ));
         }
         Ok(())
     }
@@ -301,15 +322,25 @@ impl Optimizer for SGD {
             }
 
             if self.momentum != 0.0 {
-                // Update velocity: v = momentum * v + grad
+                // Update velocity. PyTorch seeds the momentum buffer with
+                // the raw (weight-decayed) gradient on the first step, and
+                // from the second step onward applies
+                // `buf = momentum * buf + (1 - dampening) * grad`.
+                let is_first_step = self.velocity[i].is_none();
                 let vel = self.velocity[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
                 ensure_state_len(
                     effective_grad.len(),
                     vel.len(),
                     "sgd optimizer state length mismatch with gradient length",
                 )?;
-                for (v, g) in vel.iter_mut().zip(effective_grad.iter()) {
-                    *v = self.momentum * *v + g;
+                if is_first_step {
+                    for (v, g) in vel.iter_mut().zip(effective_grad.iter()) {
+                        *v = *g;
+                    }
+                } else {
+                    for (v, g) in vel.iter_mut().zip(effective_grad.iter()) {
+                        *v = self.momentum * *v + (1.0 - self.dampening) * g;
+                    }
                 }
 
                 if self.nesterov {
@@ -5536,10 +5567,119 @@ mod tests {
             err,
             AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "sgd nesterov requires momentum > 0"
+                    reason: "sgd nesterov requires momentum > 0 and zero dampening"
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn sgd_nesterov_rejects_nonzero_dampening() {
+        // torch.optim.SGD rejects `nesterov=True` together with a nonzero
+        // `dampening` ("Nesterov momentum requires a momentum and zero
+        // dampening"); FrankenTorch must fail closed the same way.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = SGD::new(vec![x], 0.1)
+            .momentum(0.9)
+            .dampening(0.1)
+            .nesterov(true);
+        let loss = session.tensor_mul(x, x).expect("mul");
+        let loss_sum = session.tensor_sum(loss).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+
+        let err = optimizer
+            .step(&mut session, &report)
+            .expect_err("nesterov with dampening must fail closed");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "sgd nesterov requires momentum > 0 and zero dampening"
+                }
+            ))
+        ));
+    }
+
+    #[test]
+    fn sgd_dampening_does_not_affect_first_step() {
+        // The first momentum-buffer write is `buf = grad`; dampening only
+        // applies from the second step onward. So step 1 with dampening
+        // must be bit-identical to a run with dampening = 0.
+        let mut s_damp = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xd = s_damp
+            .tensor_variable(vec![3.0], vec![1], true)
+            .expect("var");
+        let mut opt_damp = SGD::new(vec![xd], 0.1).momentum(0.9).dampening(0.5);
+        let ld = s_damp.tensor_mul(xd, xd).expect("mul");
+        let ld = s_damp.tensor_sum(ld).expect("sum");
+        let rd = s_damp.tensor_backward(ld).expect("backward");
+        opt_damp.step(&mut s_damp, &rd).expect("step");
+        let after_damp = s_damp.tensor_values(xd).expect("values")[0];
+
+        let mut s_plain = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xp = s_plain
+            .tensor_variable(vec![3.0], vec![1], true)
+            .expect("var");
+        let mut opt_plain = SGD::new(vec![xp], 0.1).momentum(0.9);
+        let lp = s_plain.tensor_mul(xp, xp).expect("mul");
+        let lp = s_plain.tensor_sum(lp).expect("sum");
+        let rp = s_plain.tensor_backward(lp).expect("backward");
+        opt_plain.step(&mut s_plain, &rp).expect("step");
+        let after_plain = s_plain.tensor_values(xp).expect("values")[0];
+
+        assert_eq!(
+            after_damp, after_plain,
+            "dampening must not affect the first step"
+        );
+    }
+
+    #[test]
+    fn sgd_dampening_matches_torch_buffer_recurrence() {
+        // torch.optim.SGD with dampening `d` seeds `buf_1 = grad_1` and
+        // thereafter applies `buf_t = momentum * buf_{t-1}
+        // + (1 - d) * grad_t`, stepping `param -= lr * buf_t`. Check a
+        // multi-step trajectory against an independent reference.
+        let lr = 0.1_f64;
+        let momentum = 0.5_f64;
+        let dampening = 0.25_f64;
+        let steps = 8usize;
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![3.0], vec![1], true)
+            .expect("var");
+        let mut optimizer = SGD::new(vec![x], lr)
+            .momentum(momentum)
+            .dampening(dampening);
+        let mut ft_traj = Vec::with_capacity(steps);
+        for _ in 0..steps {
+            let sq = session.tensor_mul(x, x).expect("mul");
+            let loss = session.tensor_sum(sq).expect("sum");
+            let report = session.tensor_backward(loss).expect("backward");
+            optimizer.step(&mut session, &report).expect("step");
+            ft_traj.push(session.tensor_values(x).expect("values")[0]);
+            optimizer.zero_grad(&mut session).expect("zero_grad");
+        }
+
+        let mut p = 3.0_f64;
+        let mut buf = 0.0_f64;
+        for (i, &ft) in ft_traj.iter().enumerate() {
+            let g = 2.0 * p; // d/dp (p * p)
+            buf = if i == 0 {
+                g
+            } else {
+                momentum * buf + (1.0 - dampening) * g
+            };
+            p -= lr * buf;
+            assert!(
+                (ft - p).abs() <= 1e-12 * p.abs().max(1.0),
+                "SGD dampening step {} diverged from torch reference: ft={ft}, ref={p}",
+                i + 1
+            );
+        }
     }
 
     #[test]
