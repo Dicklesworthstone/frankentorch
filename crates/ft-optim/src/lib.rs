@@ -4860,6 +4860,38 @@ impl SparseAdam {
         }
         Ok(())
     }
+
+    fn sparse_flat_index(
+        indices_storage: &[i64],
+        dense_shape: &[usize],
+        sparse_dim: usize,
+        nnz: usize,
+        nz_idx: usize,
+        dense_inner: usize,
+    ) -> Result<usize, AutogradError> {
+        let mut sparse_flat_idx = 0usize;
+        let mut stride = 1usize;
+        for d in (0..sparse_dim).rev() {
+            let coord = indices_storage[d * nnz + nz_idx];
+            if coord < 0 || (coord as usize) >= dense_shape[d] {
+                return Err(optimizer_hparam_error(
+                    "sparse_adam sparse gradient coordinate out of bounds",
+                ));
+            }
+            let dim_offset = (coord as usize)
+                .checked_mul(stride)
+                .ok_or_else(|| optimizer_state_error("sparse_adam sparse flat index overflow"))?;
+            sparse_flat_idx = sparse_flat_idx
+                .checked_add(dim_offset)
+                .ok_or_else(|| optimizer_state_error("sparse_adam sparse flat index overflow"))?;
+            stride = stride
+                .checked_mul(dense_shape[d])
+                .ok_or_else(|| optimizer_state_error("sparse_adam sparse stride overflow"))?;
+        }
+        sparse_flat_idx
+            .checked_mul(dense_inner)
+            .ok_or_else(|| optimizer_state_error("sparse_adam sparse dense offset overflow"))
+    }
 }
 
 impl Optimizer for SparseAdam {
@@ -4884,21 +4916,7 @@ impl Optimizer for SparseAdam {
 
             // Check for sparse gradient in the report first (more efficient)
             if let Some(sparse_grad) = report.sparse_gradient(param) {
-                let t = advance_param_step_count(
-                    &mut self.step_counts,
-                    i,
-                    "sparse_adam step counter overflow",
-                )?;
-                let bias_correction1 = adam_bias_correction(self.beta1, t);
-                let bias_correction2 = adam_bias_correction(self.beta2, t);
-                self.step_sparse_gradient(
-                    session,
-                    param,
-                    i,
-                    sparse_grad,
-                    bias_correction1,
-                    bias_correction2,
-                )?;
+                self.step_sparse_gradient(session, param, i, sparse_grad)?;
                 continue;
             }
 
@@ -4966,15 +4984,9 @@ impl SparseAdam {
         param: TensorNodeId,
         param_idx: usize,
         sparse_grad: &ft_core::SparseCOOTensor,
-        bias_correction1: f64,
-        bias_correction2: f64,
     ) -> Result<(), AutogradError> {
-        let param_values = session.tensor_values(param)?;
+        let (param_values, param_meta) = session.tensor_values_meta(param)?;
         let param_numel = param_values.len();
-
-        // Initialize moment buffers if needed
-        let m = self.m[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
-        let v = self.v[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
 
         // Get the sparse indices and values
         let indices = sparse_grad.indices();
@@ -4985,52 +4997,103 @@ impl SparseAdam {
         let nnz = sparse_grad.nnz();
         let sparse_dim = sparse_grad.sparse_dim();
         let dense_shape = sparse_grad.dense_shape();
+        if dense_shape != param_meta.shape() {
+            return Err(optimizer_hparam_error(
+                "sparse_adam sparse gradient shape must match parameter shape",
+            ));
+        }
+        if sparse_dim > dense_shape.len() {
+            return Err(optimizer_hparam_error(
+                "sparse_adam sparse dimension exceeds gradient rank",
+            ));
+        }
+        let expected_indices_len = sparse_dim
+            .checked_mul(nnz)
+            .ok_or_else(|| optimizer_state_error("sparse_adam sparse indices length overflow"))?;
+        if indices_storage.len() != expected_indices_len {
+            return Err(optimizer_hparam_error(
+                "sparse_adam sparse indices storage length mismatch",
+            ));
+        }
+        let dense_inner = checked_shape_numel(
+            &dense_shape[sparse_dim..],
+            "sparse_adam sparse dense-value shape overflow",
+        )?;
+        let expected_values_len = nnz
+            .checked_mul(dense_inner)
+            .ok_or_else(|| optimizer_state_error("sparse_adam sparse values length overflow"))?;
+        if grad_values.len() != expected_values_len {
+            return Err(optimizer_hparam_error(
+                "sparse_adam sparse values storage length mismatch",
+            ));
+        }
+
+        let t = advance_param_step_count(
+            &mut self.step_counts,
+            param_idx,
+            "sparse_adam step counter overflow",
+        )?;
+        let bias_correction1 = adam_bias_correction(self.beta1, t);
+        let bias_correction2 = adam_bias_correction(self.beta2, t);
+
+        // Initialize moment buffers only after the sparse gradient has passed validation.
+        let m = self.m[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
+        let v = self.v[param_idx].get_or_insert_with(|| vec![0.0; param_numel]);
 
         // Build update vector (sparse: only touched indices)
         let mut update = vec![0.0; param_numel];
 
         // For each non-zero entry in the sparse gradient
         for nz_idx in 0..nnz {
-            // Compute the flat index from sparse coordinates
-            let mut flat_idx = 0usize;
-            let mut stride = 1usize;
-            for d in (0..sparse_dim).rev() {
-                let coord = indices_storage[d * nnz + nz_idx];
-                if coord < 0 || (coord as usize) >= dense_shape[d] {
-                    continue; // Skip invalid indices
-                }
-                flat_idx += (coord as usize) * stride;
-                stride *= dense_shape[d];
-            }
+            let flat_idx = Self::sparse_flat_index(
+                indices_storage,
+                dense_shape,
+                sparse_dim,
+                nnz,
+                nz_idx,
+                dense_inner,
+            )?;
 
             // Get the gradient value (handle dense dimensions if any)
             let grad_val = if sparse_dim < dense_shape.len() {
                 // Has dense dimensions - grad_values is [nnz, *dense_dims]
-                // For embedding: sparse_dim=1, dense_dims=[embedding_dim]
-                // Each entry in grad_values corresponds to one row
-                let embedding_dim = dense_shape.get(1).copied().unwrap_or(1);
-                for emb_idx in 0..embedding_dim {
-                    let g_idx = nz_idx * embedding_dim + emb_idx;
-                    let p_idx = flat_idx * embedding_dim + emb_idx;
-                    if g_idx < grad_values.len() && p_idx < param_numel {
-                        let g = grad_values[g_idx];
-                        if g != 0.0 {
-                            m[p_idx] = self.beta1 * m[p_idx] + (1.0 - self.beta1) * g;
-                            v[p_idx] = self.beta2 * v[p_idx] + (1.0 - self.beta2) * g * g;
-                            let m_hat = m[p_idx] / bias_correction1;
-                            let v_hat = v[p_idx] / bias_correction2;
-                            update[p_idx] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                        }
+                for dense_offset in 0..dense_inner {
+                    let g_idx = nz_idx
+                        .checked_mul(dense_inner)
+                        .and_then(|base| base.checked_add(dense_offset))
+                        .ok_or_else(|| {
+                            optimizer_state_error(
+                                "sparse_adam sparse gradient value index overflow",
+                            )
+                        })?;
+                    let p_idx = flat_idx.checked_add(dense_offset).ok_or_else(|| {
+                        optimizer_state_error("sparse_adam sparse parameter index overflow")
+                    })?;
+                    if p_idx >= param_numel {
+                        return Err(optimizer_hparam_error(
+                            "sparse_adam sparse gradient coordinate maps outside parameter",
+                        ));
+                    }
+                    let g = grad_values[g_idx];
+                    if g != 0.0 {
+                        m[p_idx] = self.beta1 * m[p_idx] + (1.0 - self.beta1) * g;
+                        v[p_idx] = self.beta2 * v[p_idx] + (1.0 - self.beta2) * g * g;
+                        let m_hat = m[p_idx] / bias_correction1;
+                        let v_hat = v[p_idx] / bias_correction2;
+                        update[p_idx] = self.lr * m_hat / (v_hat.sqrt() + self.eps);
                     }
                 }
                 continue; // Already processed all dense dims
-            } else if nz_idx < grad_values.len() {
-                grad_values[nz_idx]
             } else {
-                continue;
+                grad_values[nz_idx]
             };
 
-            if flat_idx < param_numel && grad_val != 0.0 {
+            if flat_idx >= param_numel {
+                return Err(optimizer_hparam_error(
+                    "sparse_adam sparse gradient coordinate maps outside parameter",
+                ));
+            }
+            if grad_val != 0.0 {
                 m[flat_idx] = self.beta1 * m[flat_idx] + (1.0 - self.beta1) * grad_val;
                 v[flat_idx] = self.beta2 * v[flat_idx] + (1.0 - self.beta2) * grad_val * grad_val;
                 let m_hat = m[flat_idx] / bias_correction1;
@@ -5226,7 +5289,7 @@ impl GradScaler {
 #[cfg(test)]
 mod tests {
     use ft_api::FrankenTorchSession;
-    use ft_core::ExecutionMode;
+    use ft_core::{DenseI64Tensor, DenseTensor, Device, ExecutionMode, SparseCOOTensor};
 
     use super::*;
 
@@ -9651,6 +9714,43 @@ mod tests {
         let loss_sum = session.tensor_sum(loss).expect("sum");
         let report = session.tensor_backward(loss_sum).expect("backward");
         assert!(opt.step(&mut session, &report).is_err());
+    }
+
+    #[test]
+    fn sparse_adam_rejects_malformed_sparse_coordinates() {
+        let negative = SparseAdam::sparse_flat_index(&[-1], &[2], 1, 1, 0, 1)
+            .expect_err("negative sparse coordinate should fail closed");
+        assert!(format!("{negative:?}").contains("coordinate out of bounds"));
+
+        let out_of_bounds = SparseAdam::sparse_flat_index(&[2], &[2], 1, 1, 0, 1)
+            .expect_err("out-of-bounds sparse coordinate should fail closed");
+        assert!(format!("{out_of_bounds:?}").contains("coordinate out of bounds"));
+    }
+
+    #[test]
+    fn sparse_adam_rejects_sparse_gradient_shape_without_mutating_parameter() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![10.0, 20.0], vec![2], true)
+            .expect("variable");
+        let mut opt = SparseAdam::new(vec![x], 0.1);
+        let indices = DenseI64Tensor::from_contiguous_values(vec![2], vec![1, 1], Device::Cpu)
+            .expect("indices");
+        let values =
+            DenseTensor::from_contiguous_values(vec![1.0], vec![1], Device::Cpu).expect("values");
+        let sparse_grad =
+            SparseCOOTensor::new(indices, values, vec![3], true).expect("sparse grad");
+        let before = session.tensor_values(x).expect("values");
+
+        let err = opt
+            .step_sparse_gradient(&mut session, x, 0, &sparse_grad)
+            .expect_err("shape-mismatched sparse gradient should fail closed");
+
+        assert!(format!("{err:?}").contains("shape must match parameter shape"));
+        assert_eq!(session.tensor_values(x).expect("values"), before);
+        assert_eq!(opt.step_counts[0], 0);
+        assert!(opt.m[0].is_none());
+        assert!(opt.v[0].is_none());
     }
 
     #[test]
