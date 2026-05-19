@@ -15057,6 +15057,26 @@ impl FrankenTorchSession {
             )));
         }
 
+        // PyTorch's `reflect` padding requires each pad amount to be
+        // strictly less than the corresponding input dimension — a
+        // reflection that reaches the opposite boundary would have to
+        // repeat past it. `torch.nn.functional.pad(x, pad, "reflect")`
+        // raises a RuntimeError ("Padding size should be less than the
+        // corresponding input dimension") in that case. `replicate`
+        // (clamp) and `circular` (wrap) accept arbitrary pad widths.
+        if mode == "reflect" {
+            for i in 0..num_pad_dims {
+                let dim = ndim - 1 - i;
+                if padding[i * 2] >= shape[dim] || padding[i * 2 + 1] >= shape[dim] {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "pad: reflect padding size must be less than the corresponding input dimension",
+                        },
+                    )));
+                }
+            }
+        }
+
         let out_strides = ft_core::contiguous_strides(&out_shape);
         let in_strides = ft_core::contiguous_strides(shape);
 
@@ -36282,6 +36302,81 @@ mod tests {
             .tensor_pad_mode(input, &[usize::MAX, 0], "reflect", 0.0)
             .expect_err("overflow should fail closed");
         assert!(format!("{err}").contains("pad: output shape overflow"));
+    }
+
+    #[test]
+    fn pad_reflect_rejects_padding_ge_dim_size() {
+        // PyTorch raises when reflect padding >= the corresponding input
+        // dimension: F.pad(torch.arange(4).view(1,1,4), (4,4), "reflect")
+        // -> RuntimeError. The reflection cannot reach past the opposite
+        // boundary without repeating it. Both `pad == dim_size` and
+        // `pad > dim_size` must fail closed; either side counts.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false)
+            .unwrap();
+        for pad in [&[4usize, 0], &[0, 4], &[5, 5]] {
+            let err = s
+                .tensor_pad_mode(input, pad, "reflect", 0.0)
+                .expect_err("reflect padding >= dim size must fail closed");
+            assert!(
+                format!("{err}").contains(
+                    "pad: reflect padding size must be less than the corresponding input dimension"
+                ),
+                "pad={pad:?} returned unexpected error: {err}"
+            );
+        }
+        // pad == dim_size - 1 is the largest legal reflect pad.
+        let ok = s
+            .tensor_pad_mode(input, &[3, 3], "reflect", 0.0)
+            .expect("reflect pad of dim_size - 1 is legal");
+        assert_eq!(s.tensor_shape(ok).unwrap(), vec![1, 1, 10]);
+        assert_eq!(
+            s.tensor_values(ok).unwrap(),
+            vec![4.0, 3.0, 2.0, 1.0, 2.0, 3.0, 4.0, 3.0, 2.0, 1.0]
+        );
+    }
+
+    #[test]
+    fn pad_reflect_rejects_unit_dim_with_padding() {
+        // A reflect pad of 1 over a size-1 dimension is pad >= dim_size,
+        // so PyTorch rejects it; FrankenTorch must too.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![7.0], vec![1, 1, 1], false).unwrap();
+        let err = s
+            .tensor_pad_mode(input, &[1, 1], "reflect", 0.0)
+            .expect_err("reflect padding over a unit dim must fail closed");
+        assert!(format!("{err}").contains(
+            "pad: reflect padding size must be less than the corresponding input dimension"
+        ));
+    }
+
+    #[test]
+    fn pad_replicate_and_circular_accept_padding_ge_dim_size() {
+        // The `pad < dim_size` rule is reflect-only. Replicate clamps and
+        // circular wraps, so both stay defined for arbitrary pad widths.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 4], false)
+            .unwrap();
+        // Replicate: edges 1.0 / 4.0 repeated past dim_size.
+        let rep = s
+            .tensor_pad_mode(input, &[6, 6], "replicate", 0.0)
+            .expect("replicate accepts pad >= dim size");
+        assert_eq!(
+            s.tensor_values(rep).unwrap(),
+            vec![
+                1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 2.0, 3.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0, 4.0
+            ]
+        );
+        // Circular: wraps modulo dim_size.
+        let circ = s
+            .tensor_pad_mode(input, &[4, 4], "circular", 0.0)
+            .expect("circular accepts pad >= dim size");
+        assert_eq!(
+            s.tensor_values(circ).unwrap(),
+            vec![1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0, 1.0, 2.0, 3.0, 4.0]
+        );
     }
 
     #[test]
