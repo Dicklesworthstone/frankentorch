@@ -1959,16 +1959,10 @@ mod tests {
     }
 
     #[test]
-    fn random_split_partial_sum() {
-        // Split doesn't need to cover entire dataset
+    #[should_panic(expected = "must equal dataset size")]
+    fn random_split_rejects_partial_sum() {
+        // PyTorch requires random_split lengths to exhaust the dataset.
         let ds = make_dataset(20, 1);
-        let splits = random_split(ds, &[5, 5], 42);
-        assert_eq!(splits.len(), 2);
-        assert_eq!(splits[0].len(), 5);
-        assert_eq!(splits[1].len(), 5);
-        // No overlap between the two splits
-        let set0: std::collections::HashSet<usize> = splits[0].indices().iter().copied().collect();
-        let set1: std::collections::HashSet<usize> = splits[1].indices().iter().copied().collect();
-        assert!(set0.is_disjoint(&set1), "partial splits must not overlap");
+        random_split(ds, &[5, 5], 42);
     }
 }
