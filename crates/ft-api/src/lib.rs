@@ -5120,6 +5120,53 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// `torch.addcmul`: `input + value * tensor1 * tensor2`.
+    ///
+    /// Composed through autograd-aware primitives, so gradients flow to
+    /// `input`, `tensor1`, and `tensor2` (`grad_t1 = value*t2*g`,
+    /// `grad_t2 = value*t1*g`). Matches torch 2.12 (frankentorch-tf10).
+    pub fn tensor_addcmul(
+        &mut self,
+        input: TensorNodeId,
+        tensor1: TensorNodeId,
+        tensor2: TensorNodeId,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let prod = self.tensor_mul(tensor1, tensor2)?;
+        let scaled = self.scale_by_constant(prod, value)?;
+        self.tensor_add(input, scaled)
+    }
+
+    /// `torch.addcdiv`: `input + value * tensor1 / tensor2`.
+    ///
+    /// Composed through autograd-aware primitives (frankentorch-tf10).
+    pub fn tensor_addcdiv(
+        &mut self,
+        input: TensorNodeId,
+        tensor1: TensorNodeId,
+        tensor2: TensorNodeId,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let quot = self.tensor_div(tensor1, tensor2)?;
+        let scaled = self.scale_by_constant(quot, value)?;
+        self.tensor_add(input, scaled)
+    }
+
+    /// Multiplies `node` by a non-grad scalar constant. `value == 1.0`
+    /// is returned unchanged so the common default adds no tape node.
+    fn scale_by_constant(
+        &mut self,
+        node: TensorNodeId,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if value == 1.0 {
+            return Ok(node);
+        }
+        let shape = self.tensor_shape(node)?;
+        let constant = self.full(shape, value, false)?;
+        self.tensor_mul(node, constant)
+    }
+
     pub fn tensor_addmm(
         &mut self,
         input: TensorNodeId,
@@ -29811,6 +29858,54 @@ mod tests {
         for &g in grad_end {
             assert!((g - 0.25).abs() < 1e-10);
         }
+    }
+
+    #[test]
+    fn session_tensor_addcmul() {
+        // torch.addcmul([1,2],[3,4],[5,6],value=2) = [31,50] (torch 2.12).
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let i = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], true)
+            .expect("i");
+        let a = session
+            .tensor_variable(vec![3.0, 4.0], vec![2], true)
+            .expect("a");
+        let b = session
+            .tensor_variable(vec![5.0, 6.0], vec![2], true)
+            .expect("b");
+        let out = session.tensor_addcmul(i, a, b, 2.0).expect("addcmul");
+        let vals = session.tensor_values(out).expect("vals");
+        assert!((vals[0] - 31.0).abs() < 1e-9 && (vals[1] - 50.0).abs() < 1e-9);
+        let report = session.tensor_backward(out).expect("backward");
+        // grad_i=1, grad_a=value*b, grad_b=value*a.
+        assert_eq!(session.tensor_gradient(&report, i).expect("gi"), &[1.0, 1.0]);
+        assert_eq!(
+            session.tensor_gradient(&report, a).expect("ga"),
+            &[10.0, 12.0]
+        );
+        assert_eq!(
+            session.tensor_gradient(&report, b).expect("gb"),
+            &[6.0, 8.0]
+        );
+    }
+
+    #[test]
+    fn session_tensor_addcdiv() {
+        // torch.addcdiv([1,2],[3,4],[5,6],value=2) = [2.2, 3.3333] (torch 2.12).
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let i = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], false)
+            .expect("i");
+        let a = session
+            .tensor_variable(vec![3.0, 4.0], vec![2], false)
+            .expect("a");
+        let b = session
+            .tensor_variable(vec![5.0, 6.0], vec![2], false)
+            .expect("b");
+        let out = session.tensor_addcdiv(i, a, b, 2.0).expect("addcdiv");
+        let vals = session.tensor_values(out).expect("vals");
+        assert!((vals[0] - 2.2).abs() < 1e-9);
+        assert!((vals[1] - (2.0 + 2.0 * 4.0 / 6.0)).abs() < 1e-9);
     }
 
     // ── Addmm operations ──
