@@ -402,14 +402,22 @@ fn powf_torch_signed_zero_f32(value: f32, exponent: f32) -> f32 {
 
 pub fn clamp_scalar(input: &ScalarTensor, min_val: f64, max_val: f64) -> ScalarTensor {
     let value = input.value();
+    // clamp is min(max(x, min_val), max_val): the lower bound is applied
+    // first, then the upper. When min_val > max_val the upper bound wins,
+    // matching PyTorch / std::min(std::max(...)).
     let clamped = if value.is_nan() {
         f64::NAN
-    } else if !min_val.is_nan() && value < min_val {
-        min_val
-    } else if !max_val.is_nan() && value > max_val {
-        max_val
     } else {
-        value
+        let lo = if !min_val.is_nan() && value < min_val {
+            min_val
+        } else {
+            value
+        };
+        if !max_val.is_nan() && lo > max_val {
+            max_val
+        } else {
+            lo
+        }
     };
     input.with_value(clamped)
 }
@@ -1128,14 +1136,21 @@ pub fn clamp_tensor_contiguous_f64(
     Ok(window
         .iter()
         .map(|value| {
+            // clamp is min(max(x, min_val), max_val): lower bound first,
+            // then upper, so when min_val > max_val the upper bound wins.
             if value.is_nan() {
                 f64::NAN
-            } else if !min_val.is_nan() && *value < min_val {
-                min_val
-            } else if !max_val.is_nan() && *value > max_val {
-                max_val
             } else {
-                *value
+                let lo = if !min_val.is_nan() && *value < min_val {
+                    min_val
+                } else {
+                    *value
+                };
+                if !max_val.is_nan() && lo > max_val {
+                    max_val
+                } else {
+                    lo
+                }
             }
         })
         .collect())
@@ -2009,9 +2024,25 @@ pub fn norm_tensor_contiguous_f64(
     let data = &input[offset..offset + numel];
 
     if p == f64::INFINITY {
-        Ok(data.iter().fold(0.0_f64, |acc, &x| acc.max(x.abs())))
+        // norm(inf) = max(|x|). f64::max silently drops NaN, but PyTorch's
+        // max reduction propagates it, so fold with explicit NaN checks.
+        Ok(data.iter().fold(0.0_f64, |acc, &x| {
+            let a = x.abs();
+            if acc.is_nan() || a.is_nan() {
+                f64::NAN
+            } else {
+                acc.max(a)
+            }
+        }))
     } else if p == f64::NEG_INFINITY {
-        Ok(data.iter().fold(f64::INFINITY, |acc, &x| acc.min(x.abs())))
+        Ok(data.iter().fold(f64::INFINITY, |acc, &x| {
+            let a = x.abs();
+            if acc.is_nan() || a.is_nan() {
+                f64::NAN
+            } else {
+                acc.min(a)
+            }
+        }))
     } else if p == 0.0 {
         // L0 "norm": count of non-zero elements
         Ok(data.iter().filter(|&&x| x != 0.0).count() as f64)
@@ -2061,12 +2092,19 @@ pub fn norm_dim_tensor_contiguous_f64(
     let mut output = Vec::with_capacity(out_numel);
 
     if p == f64::INFINITY {
+        // max(|x|) / min(|x|): f64::max/min drop NaN silently, so propagate
+        // NaN explicitly to match PyTorch's max/min reductions.
         for outer in 0..outer_size {
             for inner in 0..inner_size {
                 let mut max_abs = 0.0_f64;
                 for r in 0..reduce_size {
-                    max_abs = max_abs
-                        .max(data[outer * reduce_size * inner_size + r * inner_size + inner].abs());
+                    let a =
+                        data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
+                    max_abs = if max_abs.is_nan() || a.is_nan() {
+                        f64::NAN
+                    } else {
+                        max_abs.max(a)
+                    };
                 }
                 output.push(max_abs);
             }
@@ -2076,8 +2114,13 @@ pub fn norm_dim_tensor_contiguous_f64(
             for inner in 0..inner_size {
                 let mut min_abs = f64::INFINITY;
                 for r in 0..reduce_size {
-                    min_abs = min_abs
-                        .min(data[outer * reduce_size * inner_size + r * inner_size + inner].abs());
+                    let a =
+                        data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
+                    min_abs = if min_abs.is_nan() || a.is_nan() {
+                        f64::NAN
+                    } else {
+                        min_abs.min(a)
+                    };
                 }
                 output.push(min_abs);
             }
@@ -3428,12 +3471,38 @@ pub fn cumprod_backward_tensor_contiguous_f64(
     Ok(grad_input)
 }
 
+/// Total order over f64 that ranks NaN above every non-NaN value
+/// (NaN == NaN), matching how PyTorch's sort/topk treat NaN as the
+/// largest element. Unlike `partial_cmp(..).unwrap_or(Equal)` this
+/// relation is transitive, so it is safe to hand to a comparison sort
+/// (a non-transitive comparator silently corrupts timsort output).
+fn nan_greatest_cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        // Both finite/infinite: partial_cmp is always Some here.
+        (false, false) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+    }
+}
+
+/// F32 companion to [`nan_greatest_cmp_f64`].
+fn nan_greatest_cmp_f32(a: f32, b: f32) -> std::cmp::Ordering {
+    match (a.is_nan(), b.is_nan()) {
+        (true, true) => std::cmp::Ordering::Equal,
+        (true, false) => std::cmp::Ordering::Greater,
+        (false, true) => std::cmp::Ordering::Less,
+        (false, false) => a.partial_cmp(&b).unwrap_or(std::cmp::Ordering::Equal),
+    }
+}
+
 /// Sort a contiguous f64 tensor along the given dimension.
 ///
 /// Returns `(sorted_values, indices)` where `indices[i]` is the original position
 /// of `sorted_values[i]` along the sorted dimension.
 ///
-/// `descending = true` sorts from largest to smallest.
+/// `descending = true` sorts from largest to smallest. NaN is treated as the
+/// largest value (it sorts to the end ascending, to the front descending).
 pub fn sort_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
@@ -3473,9 +3542,9 @@ pub fn sort_tensor_contiguous_f64(
                 .collect();
 
             if descending {
-                lane.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f64(b.1, a.1));
             } else {
-                lane.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f64(a.1, b.1));
             }
 
             for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
@@ -3540,9 +3609,9 @@ pub fn topk_tensor_contiguous_f64(
                 .collect();
 
             if largest {
-                lane.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f64(b.1, a.1));
             } else {
-                lane.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f64(a.1, b.1));
             }
 
             let top = &lane[..k];
@@ -5207,14 +5276,21 @@ pub fn clamp_tensor_contiguous_f32(
     Ok(window
         .iter()
         .map(|value| {
+            // clamp is min(max(x, min_val), max_val): lower bound first,
+            // then upper, so when min_val > max_val the upper bound wins.
             if value.is_nan() {
                 f32::NAN
-            } else if !min_val.is_nan() && *value < min_val {
-                min_val
-            } else if !max_val.is_nan() && *value > max_val {
-                max_val
             } else {
-                *value
+                let lo = if !min_val.is_nan() && *value < min_val {
+                    min_val
+                } else {
+                    *value
+                };
+                if !max_val.is_nan() && lo > max_val {
+                    max_val
+                } else {
+                    lo
+                }
             }
         })
         .collect())
@@ -5646,9 +5722,25 @@ pub fn norm_tensor_contiguous_f32(
     }
     let data = &input[offset..offset + numel];
     if p == f32::INFINITY {
-        Ok(data.iter().fold(0.0f32, |acc, &x| acc.max(x.abs())))
+        // norm(inf) = max(|x|). f32::max silently drops NaN, but PyTorch's
+        // max reduction propagates it, so fold with explicit NaN checks.
+        Ok(data.iter().fold(0.0f32, |acc, &x| {
+            let a = x.abs();
+            if acc.is_nan() || a.is_nan() {
+                f32::NAN
+            } else {
+                acc.max(a)
+            }
+        }))
     } else if p == f32::NEG_INFINITY {
-        Ok(data.iter().fold(f32::INFINITY, |acc, &x| acc.min(x.abs())))
+        Ok(data.iter().fold(f32::INFINITY, |acc, &x| {
+            let a = x.abs();
+            if acc.is_nan() || a.is_nan() {
+                f32::NAN
+            } else {
+                acc.min(a)
+            }
+        }))
     } else if p == 0.0f32 {
         Ok(data.iter().filter(|&&x| x != 0.0f32).count() as f32)
     } else if p == 1.0f32 {
@@ -5689,12 +5781,19 @@ pub fn norm_dim_tensor_contiguous_f32(
     let mut output = Vec::with_capacity(out_numel);
 
     if p == f32::INFINITY {
+        // max(|x|) / min(|x|): f32::max/min drop NaN silently, so propagate
+        // NaN explicitly to match PyTorch's max/min reductions.
         for outer in 0..outer_size {
             for inner in 0..inner_size {
                 let mut max_abs = 0.0f32;
                 for r in 0..reduce_size {
-                    max_abs = max_abs
-                        .max(data[outer * reduce_size * inner_size + r * inner_size + inner].abs());
+                    let a =
+                        data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
+                    max_abs = if max_abs.is_nan() || a.is_nan() {
+                        f32::NAN
+                    } else {
+                        max_abs.max(a)
+                    };
                 }
                 output.push(max_abs);
             }
@@ -5704,8 +5803,13 @@ pub fn norm_dim_tensor_contiguous_f32(
             for inner in 0..inner_size {
                 let mut min_abs = f32::INFINITY;
                 for r in 0..reduce_size {
-                    min_abs = min_abs
-                        .min(data[outer * reduce_size * inner_size + r * inner_size + inner].abs());
+                    let a =
+                        data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
+                    min_abs = if min_abs.is_nan() || a.is_nan() {
+                        f32::NAN
+                    } else {
+                        min_abs.min(a)
+                    };
                 }
                 output.push(min_abs);
             }
@@ -6865,9 +6969,9 @@ pub fn sort_tensor_contiguous_f32(
                 })
                 .collect();
             if descending {
-                lane.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f32(b.1, a.1));
             } else {
-                lane.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f32(a.1, b.1));
             }
             for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
                 let out_idx = outer * dim_size * inner_size + out_d * inner_size + inner;
@@ -6922,9 +7026,9 @@ pub fn topk_tensor_contiguous_f32(
                 })
                 .collect();
             if largest {
-                lane.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f32(b.1, a.1));
             } else {
-                lane.sort_by(|a, b| a.1.partial_cmp(&b.1).unwrap_or(std::cmp::Ordering::Equal));
+                lane.sort_by(|a, b| nan_greatest_cmp_f32(a.1, b.1));
             }
             let top = &lane[..k];
             let mut selected: Vec<(usize, f32)> = top.to_vec();
@@ -9137,6 +9241,65 @@ mod tests {
         let out = clamp_tensor_contiguous_f64(&input, &meta, 0.0, 5.0)
             .expect("contiguous clamp should succeed");
         assert_eq!(out, vec![0.0, 0.0, 3.0, 5.0, 5.0]);
+    }
+
+    #[test]
+    fn clamp_min_greater_than_max_returns_max() {
+        // clamp = min(max(x, lo), hi). When lo > hi every element collapses
+        // to hi, matching PyTorch / std::min(std::max(...)).
+        let scalar = clamp_scalar(&ScalarTensor::new(3.0, DType::F64, Device::Cpu), 5.0, 2.0);
+        assert_eq!(scalar.value(), 2.0);
+
+        let meta = TensorMeta::from_shape(vec![4], DType::F64, Device::Cpu);
+        let out = clamp_tensor_contiguous_f64(&[-10.0, 3.0, 7.0, 100.0], &meta, 5.0, 2.0)
+            .expect("clamp should succeed");
+        assert_eq!(out, vec![2.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn norm_inf_propagates_nan() {
+        // norm(inf)/norm(-inf) are max/min of |x|; a NaN element makes the
+        // whole result NaN, matching PyTorch's max/min reductions.
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let inf = norm_tensor_contiguous_f64(&[1.0, f64::NAN, 2.0], &meta, f64::INFINITY)
+            .expect("norm should succeed");
+        assert!(inf.is_nan(), "norm(inf) with a NaN element must be NaN");
+        let neg_inf = norm_tensor_contiguous_f64(&[1.0, f64::NAN, 2.0], &meta, f64::NEG_INFINITY)
+            .expect("norm should succeed");
+        assert!(neg_inf.is_nan(), "norm(-inf) with a NaN element must be NaN");
+        // Without a NaN the result is still the ordinary extremum.
+        let clean = norm_tensor_contiguous_f64(&[1.0, -3.0, 2.0], &meta, f64::INFINITY)
+            .expect("norm should succeed");
+        assert_eq!(clean, 3.0);
+    }
+
+    #[test]
+    fn sort_places_nan_as_largest() {
+        // PyTorch sorts NaN as the largest value: ascending puts it last,
+        // descending puts it first. A non-transitive comparator would leave
+        // the finite elements unsorted.
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let (asc, _) = super::sort_tensor_contiguous_f64(&[2.0, f64::NAN, 1.0], &meta, 0, false)
+            .expect("sort should succeed");
+        assert_eq!(asc[0], 1.0);
+        assert_eq!(asc[1], 2.0);
+        assert!(asc[2].is_nan(), "ascending sort must place NaN last");
+        let (desc, _) = super::sort_tensor_contiguous_f64(&[2.0, f64::NAN, 1.0], &meta, 0, true)
+            .expect("sort should succeed");
+        assert!(desc[0].is_nan(), "descending sort must place NaN first");
+        assert_eq!(desc[1], 2.0);
+        assert_eq!(desc[2], 1.0);
+    }
+
+    #[test]
+    fn topk_largest_selects_nan_first() {
+        // With largest=true PyTorch treats NaN as the maximum element.
+        let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let (values, indices) =
+            super::topk_tensor_contiguous_f64(&[1.0, f64::NAN, 3.0], &meta, 1, 0, true, true)
+                .expect("topk should succeed");
+        assert!(values[0].is_nan(), "topk largest must pick NaN, got {values:?}");
+        assert_eq!(indices[0], 1);
     }
 
     #[test]
