@@ -13453,6 +13453,70 @@ impl TensorTape {
                         rule: "d(mean(x))/dx=expand(grad)/n (cg)",
                     });
                 }
+                TensorNodeOp::Sinh { input } => {
+                    // d(sinh(x))/dx = cosh(x) * grad
+                    let cosh_x = self.cg_cosh(input)?;
+                    let grad_in = self.cg_mul(incoming_id, cosh_x)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(sinh(x))/dx=cosh(x)*grad (cg)",
+                    });
+                }
+                TensorNodeOp::Cosh { input } => {
+                    // d(cosh(x))/dx = sinh(x) * grad
+                    let sinh_x = self.cg_sinh(input)?;
+                    let grad_in = self.cg_mul(incoming_id, sinh_x)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(cosh(x))/dx=sinh(x)*grad (cg)",
+                    });
+                }
+                TensorNodeOp::Erf { input } => {
+                    // d(erf(x))/dx = (2/sqrt(pi)) * exp(-x^2) * grad
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "erf backward shape overflow")?;
+                    let coeff = 2.0 / std::f64::consts::PI.sqrt();
+                    let coeff_leaf = self.leaf(vec![coeff; numel], shape, false)?;
+                    let x_sq = self.cg_mul(input, input)?;
+                    let neg_x_sq = self.cg_neg(x_sq)?;
+                    let exp_term = self.cg_exp(neg_x_sq)?;
+                    let scaled = self.cg_mul(coeff_leaf, exp_term)?;
+                    let grad_in = self.cg_mul(incoming_id, scaled)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(erf(x))/dx=(2/sqrt(pi))*exp(-x^2)*grad (cg)",
+                    });
+                }
+                TensorNodeOp::Erfc { input } => {
+                    // d(erfc(x))/dx = -(2/sqrt(pi)) * exp(-x^2) * grad
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "erfc backward shape overflow")?;
+                    let coeff = -2.0 / std::f64::consts::PI.sqrt();
+                    let coeff_leaf = self.leaf(vec![coeff; numel], shape, false)?;
+                    let x_sq = self.cg_mul(input, input)?;
+                    let neg_x_sq = self.cg_neg(x_sq)?;
+                    let exp_term = self.cg_exp(neg_x_sq)?;
+                    let scaled = self.cg_mul(coeff_leaf, exp_term)?;
+                    let grad_in = self.cg_mul(incoming_id, scaled)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(erfc(x))/dx=-(2/sqrt(pi))*exp(-x^2)*grad (cg)",
+                    });
+                }
                 // For unsupported ops, fall back to non-differentiable gradient
                 _ => {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -13792,6 +13856,72 @@ impl TensorTape {
             tensor: DenseTensor::from_storage(meta, result)?,
             requires_grad,
             op: TensorNodeOp::Cos { input },
+        });
+        Ok(out)
+    }
+
+    /// Helper: elementwise sinh for create_graph backward.
+    fn cg_sinh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, shape, dtype, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let shape = node.tensor.meta().shape().to_vec();
+            let dtype = node.tensor.meta().dtype();
+            let device = node.tensor.meta().device();
+            let result = data.iter().map(|&v| v.sinh()).collect();
+            (node.requires_grad, result, shape, dtype, device)
+        };
+
+        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Sinh { input },
+        });
+        Ok(out)
+    }
+
+    /// Helper: elementwise cosh for create_graph backward.
+    fn cg_cosh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, shape, dtype, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let shape = node.tensor.meta().shape().to_vec();
+            let dtype = node.tensor.meta().dtype();
+            let device = node.tensor.meta().device();
+            let result = data.iter().map(|&v| v.cosh()).collect();
+            (node.requires_grad, result, shape, dtype, device)
+        };
+
+        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Cosh { input },
+        });
+        Ok(out)
+    }
+
+    /// Helper: elementwise exp for create_graph backward.
+    fn cg_exp(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, shape, dtype, device) = {
+            let node = self.node(input)?;
+            let data = node.tensor.contiguous_values_as_f64()?;
+            let shape = node.tensor.meta().shape().to_vec();
+            let dtype = node.tensor.meta().dtype();
+            let device = node.tensor.meta().device();
+            let result = data.iter().map(|&v| v.exp()).collect();
+            (node.requires_grad, result, shape, dtype, device)
+        };
+
+        let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Exp { input },
         });
         Ok(out)
     }
@@ -20786,6 +20916,81 @@ mod tests {
             &[0.0, 0.0, -1.0, 1.0],
             "abs gradient at 0/-0 must be 0 (PyTorch sgn), got {grad_x:?}"
         );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_sinh_cosh() {
+        // sinh: f'=cosh, f''=sinh.  cosh: f'=sinh, f''=cosh.
+        let xv = 0.5_f64;
+        for is_sinh in [true, false] {
+            let mut tape = TensorTape::new();
+            let x = tape.leaf(vec![xv], vec![1], true).expect("x");
+            let (hx, _) = if is_sinh {
+                tape.sinh(x, ExecutionMode::Strict).expect("sinh(x)")
+            } else {
+                tape.cosh(x, ExecutionMode::Strict).expect("cosh(x)")
+            };
+            let report1 = tape
+                .backward_with_options(
+                    hx,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("first backward");
+            let grad_x = report1.gradient(x).expect("x gradient");
+            let expected_first = if is_sinh { xv.cosh() } else { xv.sinh() };
+            assert!((grad_x[0] - expected_first).abs() < 1e-10, "hyperbolic'");
+            let dx_node = report1.gradient_node(x).expect("gradient node");
+            let report2 = tape.backward(dx_node).expect("second backward");
+            let grad2 = report2.gradient(x).expect("second gradient");
+            let expected_second = if is_sinh { xv.sinh() } else { xv.cosh() };
+            assert!(
+                (grad2[0] - expected_second).abs() < 1e-9,
+                "hyperbolic'' should be {expected_second}, got {}",
+                grad2[0]
+            );
+        }
+    }
+
+    #[test]
+    fn create_graph_second_derivative_erf_erfc() {
+        // erf'(x) = (2/sqrt(pi))*exp(-x^2); erf''(x) = -2x*erf'(x).
+        // erfc'(x) = -erf'(x); erfc''(x) = -2x*erfc'(x).
+        let xv = 0.7_f64;
+        let coeff = 2.0 / std::f64::consts::PI.sqrt();
+        for is_erf in [true, false] {
+            let mut tape = TensorTape::new();
+            let x = tape.leaf(vec![xv], vec![1], true).expect("x");
+            let (ex, _) = if is_erf {
+                tape.erf(x, ExecutionMode::Strict).expect("erf(x)")
+            } else {
+                tape.erfc(x, ExecutionMode::Strict).expect("erfc(x)")
+            };
+            let report1 = tape
+                .backward_with_options(
+                    ex,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("first backward");
+            let base = coeff * (-xv * xv).exp();
+            let expected_first = if is_erf { base } else { -base };
+            let grad_x = report1.gradient(x).expect("x gradient");
+            assert!((grad_x[0] - expected_first).abs() < 1e-10, "erf'/erfc'");
+            let dx_node = report1.gradient_node(x).expect("gradient node");
+            let report2 = tape.backward(dx_node).expect("second backward");
+            let grad2 = report2.gradient(x).expect("second gradient");
+            let expected_second = -2.0 * xv * expected_first;
+            assert!(
+                (grad2[0] - expected_second).abs() < 1e-9,
+                "erf''/erfc'' should be {expected_second}, got {}",
+                grad2[0]
+            );
+        }
     }
 
     // ── F32 typed dispatch: reductions preserve dtype ──────────────────
