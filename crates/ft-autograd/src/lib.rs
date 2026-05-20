@@ -13520,6 +13520,258 @@ impl TensorTape {
                         rule: "d(erfc(x))/dx=-(2/sqrt(pi))*exp(-x^2)*grad (cg)",
                     });
                 }
+                TensorNodeOp::Reshape { input, .. }
+                | TensorNodeOp::View { input, .. }
+                | TensorNodeOp::Squeeze { input, .. }
+                | TensorNodeOp::Unsqueeze { input, .. } => {
+                    // Shape ops preserve every element; the gradient is
+                    // the incoming grad reshaped to the input's shape.
+                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let grad_in = self.reshape(incoming_id, input_shape)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(shape_op(x))/dx=reshape_grad_to_input (cg)",
+                    });
+                }
+                TensorNodeOp::Transpose { input, dim0, dim1 } => {
+                    // transpose is its own inverse: re-swap dim0/dim1.
+                    let grad_in = self.transpose(incoming_id, dim0, dim1)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(transpose(x))/dx=transpose(grad) (cg)",
+                    });
+                }
+                TensorNodeOp::Permute { input, ref dims } => {
+                    // Apply the inverse permutation to the incoming grad.
+                    let mut inv_perm = vec![0usize; dims.len()];
+                    for (i, &d) in dims.iter().enumerate() {
+                        inv_perm[d] = i;
+                    }
+                    let grad_in = self.permute(incoming_id, inv_perm)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(permute(x))/dx=inverse_permute(grad) (cg)",
+                    });
+                }
+                TensorNodeOp::Clamp {
+                    input,
+                    min_val,
+                    max_val,
+                } => {
+                    // d(clamp)/dx = 1 where min<=x<=max else 0. The mask
+                    // is a data-dependent constant (NaN fails both
+                    // comparisons -> 0), exactly as the first-order rule.
+                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let mask: Vec<f64> = input_values
+                        .iter()
+                        .map(|&x| if x >= min_val && x <= max_val { 1.0 } else { 0.0 })
+                        .collect();
+                    let mask_node = self.leaf(mask, shape, false)?;
+                    let grad_in = self.cg_mul(incoming_id, mask_node)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(clamp(x,min,max))/dx=1 if min<=x<=max else 0 (cg)",
+                    });
+                }
+                TensorNodeOp::Asin { input } => {
+                    // d(asin(x))/dx = grad / sqrt(1 - x^2)
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "asin backward shape overflow")?;
+                    let ones = self.leaf(vec![1.0; numel], shape.clone(), false)?;
+                    let half = self.leaf(vec![0.5; numel], shape, false)?;
+                    let x_sq = self.cg_mul(input, input)?;
+                    let one_minus = self.cg_sub(ones, x_sq)?;
+                    let sqrt_term = self.cg_pow(one_minus, half)?;
+                    let grad_in = self.cg_div(incoming_id, sqrt_term)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(asin(x))/dx=grad/sqrt(1-x^2) (cg)",
+                    });
+                }
+                TensorNodeOp::Acos { input } => {
+                    // d(acos(x))/dx = -grad / sqrt(1 - x^2)
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "acos backward shape overflow")?;
+                    let ones = self.leaf(vec![1.0; numel], shape.clone(), false)?;
+                    let half = self.leaf(vec![0.5; numel], shape, false)?;
+                    let x_sq = self.cg_mul(input, input)?;
+                    let one_minus = self.cg_sub(ones, x_sq)?;
+                    let sqrt_term = self.cg_pow(one_minus, half)?;
+                    let quot = self.cg_div(incoming_id, sqrt_term)?;
+                    let grad_in = self.cg_neg(quot)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(acos(x))/dx=-grad/sqrt(1-x^2) (cg)",
+                    });
+                }
+                TensorNodeOp::Atan2 { lhs, rhs } => {
+                    // atan2(y, x): d/dy = grad*x/(x^2+y^2),
+                    //              d/dx = -grad*y/(x^2+y^2).
+                    let y_sq = self.cg_mul(lhs, lhs)?;
+                    let x_sq = self.cg_mul(rhs, rhs)?;
+                    let denom = self.cg_add(x_sq, y_sq)?;
+                    let g_x = self.cg_mul(incoming_id, rhs)?;
+                    let grad_lhs = self.cg_div(g_x, denom)?;
+                    let neg_y = self.cg_neg(lhs)?;
+                    let g_neg_y = self.cg_mul(incoming_id, neg_y)?;
+                    let grad_rhs = self.cg_div(g_neg_y, denom)?;
+                    self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
+                    self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(atan2(y,x))/dy=g*x/(x^2+y^2); dx=-g*y/(x^2+y^2) (cg)",
+                    });
+                }
+                TensorNodeOp::MatMul { lhs, rhs } => {
+                    // d(A@B)/dA = grad @ B^T ; d(A@B)/dB = A^T @ grad.
+                    let rhs_t = self.transpose(rhs, 0, 1)?;
+                    let (grad_lhs, _) =
+                        self.matmul(incoming_id, rhs_t, ExecutionMode::Strict)?;
+                    let lhs_t = self.transpose(lhs, 0, 1)?;
+                    let (grad_rhs, _) =
+                        self.matmul(lhs_t, incoming_id, ExecutionMode::Strict)?;
+                    self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
+                    self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(A@B)/dA=grad@B^T; d(A@B)/dB=A^T@grad (cg)",
+                    });
+                }
+                TensorNodeOp::SumDim {
+                    input,
+                    dim,
+                    ref input_shape,
+                } => {
+                    // Broadcast the incoming grad back along `dim`: a
+                    // reshape to a size-1 `dim` followed by an Expand
+                    // (whose own backward sums the broadcast dim).
+                    let reduce_size = input_shape[dim];
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "sum_dim cg backward shape volume overflow",
+                    )?;
+                    let incoming_vals =
+                        self.nodes[incoming_id.0].tensor.contiguous_values_as_f64()?;
+                    let mut bshape = input_shape.clone();
+                    bshape[dim] = 1;
+                    let reshaped = self.reshape(incoming_id, bshape)?;
+                    let mut expanded = vec![0.0; input_numel];
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let g = incoming_vals[outer * inner_size + inner];
+                            for r in 0..reduce_size {
+                                expanded[outer * reduce_size * inner_size + r * inner_size
+                                    + inner] = g;
+                            }
+                        }
+                    }
+                    let grad_in = self.cg_expand(reshaped, expanded, input_shape.clone())?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(sum_dim(x))/dx=broadcast_grad_along_dim (cg)",
+                    });
+                }
+                TensorNodeOp::MeanDim {
+                    input,
+                    dim,
+                    ref input_shape,
+                } => {
+                    // Same broadcast as SumDim, then divide by the
+                    // reduced count. The 1/n stays an explicit Div node
+                    // so it survives a further backward pass.
+                    let reduce_size = input_shape[dim];
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "mean_dim cg backward shape volume overflow",
+                    )?;
+                    let incoming_vals =
+                        self.nodes[incoming_id.0].tensor.contiguous_values_as_f64()?;
+                    let mut bshape = input_shape.clone();
+                    bshape[dim] = 1;
+                    let reshaped = self.reshape(incoming_id, bshape)?;
+                    let mut expanded = vec![0.0; input_numel];
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let g = incoming_vals[outer * inner_size + inner];
+                            for r in 0..reduce_size {
+                                expanded[outer * reduce_size * inner_size + r * inner_size
+                                    + inner] = g;
+                            }
+                        }
+                    }
+                    let expanded_node =
+                        self.cg_expand(reshaped, expanded, input_shape.clone())?;
+                    let n_leaf = self.leaf(
+                        vec![reduce_size as f64; input_numel],
+                        input_shape.clone(),
+                        false,
+                    )?;
+                    let grad_in = self.cg_div(expanded_node, n_leaf)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(mean_dim(x))/dx=broadcast_grad_along_dim/n (cg)",
+                    });
+                }
+                TensorNodeOp::Silu { input } => {
+                    // d(silu)/dx = s(x) * (1 + x*(1 - s(x))), s = sigmoid.
+                    // sigmoid is composed from cg primitives so the
+                    // derivative is itself differentiable.
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "silu backward shape overflow")?;
+                    let ones = self.leaf(vec![1.0; numel], shape, false)?;
+                    let neg_x = self.cg_neg(input)?;
+                    let exp_neg = self.cg_exp(neg_x)?;
+                    let one_plus = self.cg_add(ones, exp_neg)?;
+                    let sig = self.cg_div(ones, one_plus)?;
+                    let one_minus_sig = self.cg_sub(ones, sig)?;
+                    let x_term = self.cg_mul(input, one_minus_sig)?;
+                    let inner = self.cg_add(ones, x_term)?;
+                    let deriv = self.cg_mul(sig, inner)?;
+                    let grad_in = self.cg_mul(incoming_id, deriv)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(silu(x))/dx=s*(1+x*(1-s)) (cg)",
+                    });
+                }
                 // For unsupported ops, fall back to non-differentiable gradient
                 _ => {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -20468,6 +20720,241 @@ mod tests {
             analytic_second_deriv,
             fd_second_deriv
         );
+    }
+
+    // ---- create_graph coverage for more ops (frankentorch-z9pz) ----
+
+    #[test]
+    fn create_graph_asin_second_derivative() {
+        // asin'(x)=1/sqrt(1-x^2); asin''(x)=x/(1-x^2)^1.5.
+        // At x=0.5: g'=1.1547005, g''=0.7698003 (torch 2.12).
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![0.5], vec![1], true).expect("x");
+        let (y, _) = tape.asin(x, ExecutionMode::Strict).expect("asin");
+        let report1 = tape
+            .backward_with_options(
+                y,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        assert!((report1.gradient(x).expect("g")[0] - 1.154_700_5).abs() < 1e-6);
+        let dx = report1.gradient_node(x).expect("grad node");
+        let report2 = tape.backward(dx).expect("second backward");
+        assert!((report2.gradient(x).expect("g2")[0] - 0.769_800_3).abs() < 1e-6);
+    }
+
+    #[test]
+    fn create_graph_acos_second_derivative() {
+        // acos is -asin: g'=-1.1547005, g''=-0.7698003 (torch 2.12).
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![0.5], vec![1], true).expect("x");
+        let (y, _) = tape.acos(x, ExecutionMode::Strict).expect("acos");
+        let report1 = tape
+            .backward_with_options(
+                y,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        assert!((report1.gradient(x).expect("g")[0] - (-1.154_700_5)).abs() < 1e-6);
+        let dx = report1.gradient_node(x).expect("grad node");
+        let report2 = tape.backward(dx).expect("second backward");
+        assert!((report2.gradient(x).expect("g2")[0] - (-0.769_800_3)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn create_graph_silu_second_derivative() {
+        // silu at x=1.0: g'=0.92767054, g''=0.30236611 (torch 2.12).
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0], vec![1], true).expect("x");
+        let (y, _) = tape.silu(x, ExecutionMode::Strict).expect("silu");
+        let report1 = tape
+            .backward_with_options(
+                y,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        assert!((report1.gradient(x).expect("g")[0] - 0.927_670_5).abs() < 1e-6);
+        let dx = report1.gradient_node(x).expect("grad node");
+        let report2 = tape.backward(dx).expect("second backward");
+        assert!((report2.gradient(x).expect("g2")[0] - 0.302_366_1).abs() < 1e-6);
+    }
+
+    #[test]
+    fn create_graph_atan2_gradients() {
+        // atan2(y,x) at (1,2): d/dy=0.4, d/dx=-0.2 (torch 2.12).
+        let mut tape = TensorTape::new();
+        let y = tape.leaf(vec![1.0], vec![1], true).expect("y");
+        let x = tape.leaf(vec![2.0], vec![1], true).expect("x");
+        let (z, _) = tape
+            .tensor_atan2(y, x, ExecutionMode::Strict)
+            .expect("atan2");
+        let report = tape
+            .backward_with_options(
+                z,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("backward");
+        assert!((report.gradient(y).expect("dy")[0] - 0.4).abs() < 1e-9);
+        assert!((report.gradient(x).expect("dx")[0] - (-0.2)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn create_graph_shape_ops_second_derivative() {
+        // sum(reshape(x).square()) = sum(x^2); f''=2 through Reshape.
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![4], true)
+            .expect("x");
+        let r = tape.reshape(x, vec![2, 2]).expect("reshape");
+        let (sq, _) = tape.square(r, ExecutionMode::Strict).expect("square");
+        let (s, _) = tape.sum(sq, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        // f'(x) = 2x.
+        let g = report1.gradient(x).expect("g");
+        assert!((g[0] - 2.0).abs() < 1e-9 && (g[3] - 8.0).abs() < 1e-9);
+        let dx = report1.gradient_node(x).expect("grad node");
+        let report2 = tape.backward(dx).expect("second backward");
+        // f''(x) = 2 for every element.
+        for v in report2.gradient(x).expect("g2") {
+            assert!((v - 2.0).abs() < 1e-9, "reshape f'' should be 2, got {v}");
+        }
+    }
+
+    #[test]
+    fn create_graph_transpose_carries_gradient() {
+        // sum(transpose(x).square()) = sum(x^2); f''=2 through Transpose.
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let t = tape.transpose(x, 0, 1).expect("transpose");
+        let (sq, _) = tape.square(t, ExecutionMode::Strict).expect("square");
+        let (s, _) = tape.sum(sq, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        let g = report1.gradient(x).expect("g");
+        assert!((g[0] - 2.0).abs() < 1e-9 && (g[5] - 12.0).abs() < 1e-9);
+        let dx = report1.gradient_node(x).expect("grad node");
+        let report2 = tape.backward(dx).expect("second backward");
+        for v in report2.gradient(x).expect("g2") {
+            assert!((v - 2.0).abs() < 1e-9, "transpose f'' should be 2, got {v}");
+        }
+    }
+
+    #[test]
+    fn create_graph_matmul_gradient_matches_plain_backward() {
+        // create_graph backward of A@B must agree with the plain
+        // backward gradient (grad_A = grad_out @ B^T).
+        let build = |create_graph: bool| -> (Vec<f64>, Vec<f64>) {
+            let mut tape = TensorTape::new();
+            let a = tape
+                .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+                .expect("a");
+            let b = tape
+                .leaf(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], true)
+                .expect("b");
+            let (prod, _) = tape.matmul(a, b, ExecutionMode::Strict).expect("a@b");
+            let (s, _) = tape.sum(prod, ExecutionMode::Strict).expect("sum");
+            let report = tape
+                .backward_with_options(
+                    s,
+                    BackwardOptions {
+                        create_graph,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("backward");
+            (
+                report.gradient(a).expect("ga").to_vec(),
+                report.gradient(b).expect("gb").to_vec(),
+            )
+        };
+        let (plain_a, plain_b) = build(false);
+        let (cg_a, cg_b) = build(true);
+        for (p, c) in plain_a.iter().zip(cg_a.iter()) {
+            assert!((p - c).abs() < 1e-9, "matmul cg grad_A mismatch: {p} vs {c}");
+        }
+        for (p, c) in plain_b.iter().zip(cg_b.iter()) {
+            assert!((p - c).abs() < 1e-9, "matmul cg grad_B mismatch: {p} vs {c}");
+        }
+    }
+
+    #[test]
+    fn create_graph_sum_dim_and_clamp() {
+        // create_graph backward of sum_dim and clamp must agree with
+        // the plain backward gradient.
+        let cases: [bool; 2] = [false, true];
+        let mut sum_dim_grads = Vec::new();
+        let mut clamp_grads = Vec::new();
+        for &cg in &cases {
+            let mut tape = TensorTape::new();
+            let x = tape
+                .leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true)
+                .expect("x");
+            let (sd, _) = tape.sum_dim(x, 1, ExecutionMode::Strict).expect("sum_dim");
+            let (s, _) = tape.sum(sd, ExecutionMode::Strict).expect("sum");
+            let report = tape
+                .backward_with_options(
+                    s,
+                    BackwardOptions {
+                        create_graph: cg,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("backward");
+            sum_dim_grads.push(report.gradient(x).expect("g").to_vec());
+
+            let mut tape2 = TensorTape::new();
+            let x2 = tape2
+                .leaf(vec![-2.0, 0.5, 3.0], vec![3], true)
+                .expect("x2");
+            let (c, _) = tape2
+                .tensor_clamp(x2, 0.0, 1.0, ExecutionMode::Strict)
+                .expect("clamp");
+            let (s2, _) = tape2.sum(c, ExecutionMode::Strict).expect("sum");
+            let report2 = tape2
+                .backward_with_options(
+                    s2,
+                    BackwardOptions {
+                        create_graph: cg,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("backward");
+            clamp_grads.push(report2.gradient(x2).expect("g").to_vec());
+        }
+        // sum_dim grad is all ones; clamp grad is 1 only for the
+        // in-range element (0.5).
+        assert_eq!(sum_dim_grads[0], sum_dim_grads[1]);
+        assert_eq!(clamp_grads[0], clamp_grads[1]);
+        assert_eq!(clamp_grads[1], vec![0.0, 1.0, 0.0]);
     }
 
     #[test]
