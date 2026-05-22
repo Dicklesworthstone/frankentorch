@@ -14609,6 +14609,52 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place put: puts values into target at flat indices.
+    pub fn tensor_put_(
+        &mut self,
+        target: TensorNodeId,
+        indices: TensorNodeId,
+        values: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_put(target, indices, values)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("put_", target, None);
+        Ok(())
+    }
+
+    /// In-place masked scatter: scatters source values at positions where mask is non-zero.
+    pub fn tensor_masked_scatter_(
+        &mut self,
+        target: TensorNodeId,
+        mask: TensorNodeId,
+        source: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_masked_scatter(target, mask, source)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("masked_scatter_", target, None);
+        Ok(())
+    }
+
+    /// In-place index put: puts values at advanced-indexed positions.
+    pub fn tensor_index_put_(
+        &mut self,
+        target: TensorNodeId,
+        indices: &[TensorNodeId],
+        values: TensorNodeId,
+        accumulate: bool,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_index_put(target, indices, values, accumulate)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("index_put_", target, Some(format!("accumulate={accumulate}")));
+        Ok(())
+    }
+
     pub fn backward(&mut self, root: NodeId) -> Result<BackwardReport, AutogradError> {
         let options = BackwardOptions::for_mode(self.mode());
         self.backward_with_options(root, options)
@@ -54590,6 +54636,26 @@ mod tests {
         let v2 = s.tensor_variable(vec![3.0, 4.0], vec![2], false).unwrap();
         s.tensor_addr_(m, v1, v2, 1.0, 1.0).unwrap();
         assert_eq!(s.tensor_values(m).unwrap(), vec![4.0, 5.0, 7.0, 9.0]);
+    }
+
+    #[test]
+    fn test_put_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        let idx = s.tensor_variable(vec![0.0, 3.0], vec![2], false).unwrap();
+        let vals = s.tensor_variable(vec![10.0, 40.0], vec![2], false).unwrap();
+        s.tensor_put_(x, idx, vals).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![10.0, 2.0, 3.0, 40.0]);
+    }
+
+    #[test]
+    fn test_masked_scatter_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        let mask = s.tensor_variable(vec![1.0, 0.0, 1.0, 0.0], vec![4], false).unwrap();
+        let src = s.tensor_variable(vec![10.0, 30.0], vec![2], false).unwrap();
+        s.tensor_masked_scatter_(x, mask, src).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![10.0, 2.0, 30.0, 4.0]);
     }
 
     #[test]
