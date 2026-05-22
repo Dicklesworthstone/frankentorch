@@ -14383,6 +14383,18 @@ impl FrankenTorchSession {
         self.tensor_device(node)
     }
 
+    pub fn tensor_is_cpu(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        Ok(self.tensor_device(node)? == Device::Cpu)
+    }
+
+    pub fn tensor_is_cuda(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        Ok(self.tensor_device(node)? == Device::Cuda)
+    }
+
+    pub fn tensor_is_pinned(&self, _node: TensorNodeId) -> Result<bool, AutogradError> {
+        Ok(false)
+    }
+
     /// Alias for `tensor_dim`. Equivalent to `tensor.ndim` in PyTorch.
     pub fn tensor_ndim(&self, node: TensorNodeId) -> Result<usize, AutogradError> {
         self.tensor_dim(node)
@@ -52666,5 +52678,14 @@ mod tests {
         let x = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
         assert_eq!(s.tensor_device(x).unwrap(), Device::Cpu);
         assert_eq!(s.tensor_get_device(x).unwrap(), Device::Cpu);
+    }
+
+    #[test]
+    fn test_is_cpu_cuda_pinned() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        assert!(s.tensor_is_cpu(x).unwrap());
+        assert!(!s.tensor_is_cuda(x).unwrap());
+        assert!(!s.tensor_is_pinned(x).unwrap());
     }
 }
