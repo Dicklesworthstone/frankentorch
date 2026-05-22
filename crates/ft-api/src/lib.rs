@@ -13865,6 +13865,26 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Compute the broadcast shape of multiple tensor shapes.
+    ///
+    /// Equivalent to `torch.broadcast_shapes(*shapes)`. Returns the shape
+    /// that would result from broadcasting tensors of the given shapes together.
+    /// Does not create any tensors - pure shape computation.
+    pub fn tensor_broadcast_shapes(
+        &self,
+        tensors: &[TensorNodeId],
+    ) -> Result<Vec<usize>, AutogradError> {
+        if tensors.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut joint_shape = self.tensor_shape(tensors[0])?;
+        for &t in &tensors[1..] {
+            let shape = self.tensor_shape(t)?;
+            joint_shape = Self::broadcast_shape(&joint_shape, &shape)?;
+        }
+        Ok(joint_shape)
+    }
+
     /// Indices of non-zero elements; alias for `tensor_nonzero`.
     ///
     /// Equivalent to `torch.argwhere(input)` — a numpy-compatible
@@ -13917,6 +13937,46 @@ impl FrankenTorchSession {
         dim: usize,
     ) -> Result<Vec<TensorNodeId>, AutogradError> {
         self.tensor_split(input, split_sizes, dim)
+    }
+
+    /// Split tensor into sections, allowing uneven splits.
+    ///
+    /// Equivalent to `numpy.array_split(ary, indices_or_sections, axis)`.
+    /// Unlike tensor_chunk which requires even division, array_split handles
+    /// cases where dim_size % sections != 0 by making first (dim_size % sections)
+    /// chunks have one extra element.
+    pub fn tensor_array_split(
+        &mut self,
+        input: TensorNodeId,
+        sections: usize,
+        dim: usize,
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        if sections == 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "array_split: sections must be > 0",
+                },
+            )));
+        }
+        let shape = self.tensor_shape(input)?;
+        let ndim = shape.len();
+        if dim >= ndim {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::InvalidDimension { dim, ndim },
+            )));
+        }
+        let dim_size = shape[dim];
+        let base_size = dim_size / sections;
+        let remainder = dim_size % sections;
+        let mut split_sizes = Vec::with_capacity(sections);
+        for i in 0..sections {
+            if i < remainder {
+                split_sizes.push(base_size + 1);
+            } else {
+                split_sizes.push(base_size);
+            }
+        }
+        self.tensor_split(input, &split_sizes, dim)
     }
 
     /// `torch.unsafe_chunk(input, chunks, dim)` parity alias for
@@ -58711,5 +58771,26 @@ mod tests {
         assert!(vals.iter().all(|&v| v >= 0.0 && v == v.floor()));
         let mean: f64 = vals.iter().sum::<f64>() / vals.len() as f64;
         assert!(mean > 2.0 && mean < 10.0); // rough check
+    }
+
+    #[test]
+    fn test_tensor_array_split() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0], vec![5], false).unwrap();
+        // Split into 3 sections: sizes [2, 2, 1] for dim_size=5
+        let splits = s.tensor_array_split(a, 3, 0).unwrap();
+        assert_eq!(splits.len(), 3);
+        assert_eq!(s.tensor_numel(splits[0]).unwrap(), 2);
+        assert_eq!(s.tensor_numel(splits[1]).unwrap(), 2);
+        assert_eq!(s.tensor_numel(splits[2]).unwrap(), 1);
+    }
+
+    #[test]
+    fn test_tensor_broadcast_shapes() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false).unwrap();
+        let b = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3, 1], false).unwrap();
+        let shape = s.tensor_broadcast_shapes(&[a, b]).unwrap();
+        assert_eq!(shape, vec![3, 3]);
     }
 }
