@@ -14346,6 +14346,21 @@ impl FrankenTorchSession {
         Ok(tensor.meta().numel())
     }
 
+    pub fn tensor_element_size(&self, node: TensorNodeId) -> Result<usize, AutogradError> {
+        let dtype = self.tensor_dtype(node)?;
+        Ok(dtype.element_size())
+    }
+
+    pub fn tensor_nbytes(&self, node: TensorNodeId) -> Result<usize, AutogradError> {
+        let numel = self.tensor_numel(node)?;
+        let element_size = self.tensor_element_size(node)?;
+        Ok(numel * element_size)
+    }
+
+    pub fn tensor_storage_offset(&self, _node: TensorNodeId) -> Result<usize, AutogradError> {
+        Ok(0)
+    }
+
     /// Alias for `tensor_dim`. Equivalent to `tensor.ndim` in PyTorch.
     pub fn tensor_ndim(&self, node: TensorNodeId) -> Result<usize, AutogradError> {
         self.tensor_dim(node)
@@ -52603,5 +52618,14 @@ mod tests {
         assert!(s.tensor_is_contiguous(x).unwrap());
         let y = s.tensor_contiguous(x).unwrap();
         assert_eq!(y, x);
+    }
+
+    #[test]
+    fn test_element_size_nbytes_storage_offset() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
+        assert_eq!(s.tensor_element_size(x).unwrap(), 8);
+        assert_eq!(s.tensor_nbytes(x).unwrap(), 48);
+        assert_eq!(s.tensor_storage_offset(x).unwrap(), 0);
     }
 }
