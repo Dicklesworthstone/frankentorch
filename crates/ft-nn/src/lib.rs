@@ -14357,6 +14357,128 @@ impl Module for CircularPad2d {
     }
 }
 
+/// Circular padding for 3D inputs.
+///
+/// Padding order matches PyTorch: `(left, right, top, bottom, front, back)`.
+pub struct CircularPad3d {
+    pad_left: usize,
+    pad_right: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+    pad_front: usize,
+    pad_back: usize,
+}
+
+impl CircularPad3d {
+    #[must_use]
+    pub fn new(padding: (usize, usize, usize, usize, usize, usize)) -> Self {
+        Self {
+            pad_left: padding.0,
+            pad_right: padding.1,
+            pad_top: padding.2,
+            pad_bottom: padding.3,
+            pad_front: padding.4,
+            pad_back: padding.5,
+        }
+    }
+}
+
+impl Module for CircularPad3d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        if ndim < 3 {
+            return Err(incompatible_error(
+                "CircularPad3d requires at least 3D input",
+            ));
+        }
+
+        let d = input_shape[ndim - 3];
+        let h = input_shape[ndim - 2];
+        let w = input_shape[ndim - 1];
+        if (d == 0 || h == 0 || w == 0)
+            && (self.pad_front > 0
+                || self.pad_back > 0
+                || self.pad_top > 0
+                || self.pad_bottom > 0
+                || self.pad_left > 0
+                || self.pad_right > 0)
+        {
+            return Err(incompatible_error(
+                "CircularPad3d: input spatial dims are zero",
+            ));
+        }
+        if self.pad_front == 0
+            && self.pad_back == 0
+            && self.pad_top == 0
+            && self.pad_bottom == 0
+            && self.pad_left == 0
+            && self.pad_right == 0
+        {
+            return Ok(input);
+        }
+
+        let pad_d = checked_add(
+            self.pad_front,
+            self.pad_back,
+            "CircularPad3d padding overflow",
+        )?;
+        let pad_h = checked_add(
+            self.pad_top,
+            self.pad_bottom,
+            "CircularPad3d padding overflow",
+        )?;
+        let pad_w = checked_add(
+            self.pad_left,
+            self.pad_right,
+            "CircularPad3d padding overflow",
+        )?;
+        let new_d = checked_add(d, pad_d, "CircularPad3d output depth overflow")?;
+        let new_h = checked_add(h, pad_h, "CircularPad3d output height overflow")?;
+        let new_w = checked_add(w, pad_w, "CircularPad3d output width overflow")?;
+
+        let mut col_indices: Vec<f64> = Vec::with_capacity(new_w);
+        for col_out in 0..new_w {
+            let src_col = ((col_out as isize - self.pad_left as isize) % w as isize + w as isize)
+                as usize
+                % w;
+            #[allow(clippy::cast_precision_loss)]
+            col_indices.push(src_col as f64);
+        }
+        let col_t = session.tensor_variable(col_indices, vec![new_w], false)?;
+        let after_w = session.tensor_index_select(input, ndim - 1, col_t)?;
+
+        let mut row_indices: Vec<f64> = Vec::with_capacity(new_h);
+        for row_out in 0..new_h {
+            let src_row =
+                ((row_out as isize - self.pad_top as isize) % h as isize + h as isize) as usize % h;
+            #[allow(clippy::cast_precision_loss)]
+            row_indices.push(src_row as f64);
+        }
+        let row_t = session.tensor_variable(row_indices, vec![new_h], false)?;
+        let after_h = session.tensor_index_select(after_w, ndim - 2, row_t)?;
+
+        let mut depth_indices: Vec<f64> = Vec::with_capacity(new_d);
+        for depth_out in 0..new_d {
+            let src_depth = ((depth_out as isize - self.pad_front as isize) % d as isize
+                + d as isize) as usize
+                % d;
+            #[allow(clippy::cast_precision_loss)]
+            depth_indices.push(src_depth as f64);
+        }
+        let depth_t = session.tensor_variable(depth_indices, vec![new_d], false)?;
+        session.tensor_index_select(after_h, ndim - 3, depth_t)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 // ── PixelShuffle / PixelUnshuffle / ChannelShuffle Modules ─────────────
 
 /// Rearranges elements from channels into spatial dimensions.
@@ -26566,6 +26688,49 @@ mod tests {
     }
 
     #[test]
+    fn circular_pad3d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                vec![1, 1, 2, 2, 2],
+                false,
+            )
+            .unwrap();
+        let pad = CircularPad3d::new((1, 1, 1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 4, 4, 4]);
+        let vals = session.tensor_values(output).unwrap();
+
+        assert!((vals[0] - 8.0).abs() < 1e-10);
+        assert!((vals[21] - 1.0).abs() < 1e-10);
+        assert!((vals[63] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn circular_pad3d_rejects_invalid_contracts() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rank2 = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let pad = CircularPad3d::new((0, 0, 0, 0, 0, 0));
+        let err = pad
+            .forward(&mut session, rank2)
+            .expect_err("rank-2 input must fail closed");
+        assert!(format!("{err:?}").contains("CircularPad3d requires at least 3D input"));
+
+        let empty_depth = session
+            .tensor_variable(Vec::new(), vec![1, 1, 0, 2, 2], false)
+            .unwrap();
+        let pad = CircularPad3d::new((1, 0, 0, 0, 0, 0));
+        let err = pad
+            .forward(&mut session, empty_depth)
+            .expect_err("zero spatial dimension must fail closed");
+        assert!(format!("{err:?}").contains("CircularPad3d: input spatial dims are zero"));
+    }
+
+    #[test]
     fn padding_zero_is_identity() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = session
@@ -26594,6 +26759,11 @@ mod tests {
         );
         assert!(CircularPad1d::new((1, 1)).parameters().is_empty());
         assert!(CircularPad2d::new((1, 1, 1, 1)).parameters().is_empty());
+        assert!(
+            CircularPad3d::new((1, 1, 1, 1, 1, 1))
+                .parameters()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -26761,6 +26931,27 @@ mod tests {
         // Output is [1,1,4,5] = 20 ones distributed across 6 input cells.
         let total: f64 = grad.iter().sum();
         assert!((total - 20.0).abs() < 1e-9, "total grad mass = {}", total);
+    }
+
+    #[test]
+    fn circular_pad3d_propagates_input_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0],
+                vec![1, 1, 2, 2, 2],
+                true,
+            )
+            .unwrap();
+        let pad = CircularPad3d::new((1, 1, 1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let loss = session.tensor_sum(output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let grad = session
+            .tensor_gradient(&report, input)
+            .expect("input gradient should exist");
+
+        assert_eq!(grad, &vec![8.0; 8]);
     }
 
     // ── EmbeddingBag Tests ───────────────────────────────────────────────
