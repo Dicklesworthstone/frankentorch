@@ -6275,6 +6275,58 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Continuously Differentiable Exponential Linear Unit.
+    ///
+    /// celu(x, alpha) = max(0,x) + min(0, alpha*(exp(x/alpha)-1))
+    /// Default alpha = 1.0.
+    /// Tracked under frankentorch-fk1i.
+    pub fn tensor_celu(&mut self, input: TensorNodeId, alpha: f64) -> Result<TensorNodeId, AutogradError> {
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals.iter().map(|&x| {
+                    if x > 0.0 {
+                        x
+                    } else {
+                        alpha * ((x / alpha).exp() - 1.0)
+                    }
+                }).collect();
+                Ok((values, shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "celu backward: gradient length mismatch",
+                        },
+                    )));
+                }
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| {
+                        if x > 0.0 {
+                            go
+                        } else {
+                            go * (x / alpha).exp()
+                        }
+                    })
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("celu in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
     pub fn tensor_rsqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.rsqrt(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -51404,5 +51456,16 @@ mod tests {
         assert!(vals[0].abs() < 1e-10); // selu(0) = 0
         assert!((vals[1] - 1.0507010).abs() < 1e-5); // selu(1) = scale * 1
         assert!((vals[2] + 1.1113307).abs() < 1e-5); // selu(-1) = scale * alpha * (e^-1 - 1)
+    }
+
+    #[test]
+    fn test_celu_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0, 1.0, -1.0], vec![3], false).unwrap();
+        let result = s.tensor_celu(input, 1.0).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals[0].abs() < 1e-10); // celu(0) = 0
+        assert!((vals[1] - 1.0).abs() < 1e-10); // celu(1) = 1
+        assert!((vals[2] + 0.6321206).abs() < 1e-5); // celu(-1) = e^-1 - 1
     }
 }
