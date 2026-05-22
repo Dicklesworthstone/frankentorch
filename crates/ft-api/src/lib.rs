@@ -17515,6 +17515,24 @@ impl FrankenTorchSession {
         Ok(dtype.is_floating_point() || dtype.is_complex() || matches!(dtype, DType::I64 | DType::I32))
     }
 
+    /// Check if a scalar tensor contains a nonzero value.
+    ///
+    /// Equivalent to `torch.is_nonzero(input)`. Requires input to be a
+    /// single-element tensor. Returns true if the value is not zero.
+    pub fn tensor_is_nonzero(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
+        let shape = self.tensor_shape(node)?;
+        let numel: usize = shape.iter().product();
+        if numel != 1 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "is_nonzero: input must be a single-element tensor",
+                },
+            )));
+        }
+        let values = self.tensor_values(node)?;
+        Ok(values[0] != 0.0)
+    }
+
     pub fn tensor_device(&self, node: TensorNodeId) -> Result<Device, AutogradError> {
         let tensor = self.tensor_tape.tensor(node)?;
         Ok(tensor.meta().device())
