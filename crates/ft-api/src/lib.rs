@@ -13444,6 +13444,23 @@ impl FrankenTorchSession {
         self.apply_tensor_unary_in_place("mish_", target, None, |x| x * (1.0 + x.exp()).ln().tanh())
     }
 
+    /// In-place GELU activation: x * 0.5 * (1 + erf(x / sqrt(2))).
+    ///
+    /// Equivalent to `F.gelu(tensor, inplace=True)` in PyTorch.
+    pub fn tensor_gelu_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        let sqrt2_inv = std::f64::consts::FRAC_1_SQRT_2;
+        self.apply_tensor_unary_in_place("gelu_", target, None, |x| {
+            x * 0.5 * (1.0 + libm::erf(x * sqrt2_inv))
+        })
+    }
+
+    /// In-place softplus activation: ln(1 + exp(x)).
+    ///
+    /// Equivalent to `F.softplus(tensor, inplace=True)` in PyTorch.
+    pub fn tensor_softplus_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("softplus_", target, None, |x| (1.0 + x.exp()).ln())
+    }
+
     pub fn tensor_clamp_(
         &mut self,
         target: TensorNodeId,
@@ -53475,6 +53492,17 @@ mod tests {
         assert_eq!(s.tensor_shape(a).unwrap(), vec![3]);
         let b = s.tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], false).unwrap();
         s.tensor_mish_(b).unwrap();
+        assert_eq!(s.tensor_shape(b).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_tensor_gelu_softplus_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], false).unwrap();
+        s.tensor_gelu_(a).unwrap();
+        assert_eq!(s.tensor_shape(a).unwrap(), vec![3]);
+        let b = s.tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], false).unwrap();
+        s.tensor_softplus_(b).unwrap();
         assert_eq!(s.tensor_shape(b).unwrap(), vec![3]);
     }
 }
