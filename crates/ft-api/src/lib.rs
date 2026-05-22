@@ -14389,6 +14389,26 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place i1e: exponentially scaled modified Bessel function order 1.
+    pub fn tensor_i1e_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_i1e(target)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("i1e_", target, None);
+        Ok(())
+    }
+
+    /// In-place log_ndtr: log of standard Gaussian CDF.
+    pub fn tensor_log_ndtr_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_log_ndtr(target)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("log_ndtr_", target, None);
+        Ok(())
+    }
+
     /// In-place signum: -1 for negative, 0 for zero, +1 for positive.
     ///
     /// Equivalent to `tensor.sign_()` in PyTorch.
