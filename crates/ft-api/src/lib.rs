@@ -5111,6 +5111,19 @@ impl FrankenTorchSession {
         )
     }
 
+    /// Compute r-length combinations with replacement from a 1D input tensor.
+    ///
+    /// Equivalent to `torch.combinations(input, r, with_replacement=True)`.
+    /// This is a convenience wrapper around `tensor_combinations` with
+    /// `with_replacement=true`.
+    pub fn tensor_combinations_with_replacement(
+        &mut self,
+        input: TensorNodeId,
+        r: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_combinations(input, r, true)
+    }
+
     /// Compute batched pairwise distance between two sets of vectors.
     ///
     /// Equivalent to `torch.cdist(x1, x2, p=2.0)`.
@@ -12855,6 +12868,24 @@ impl FrankenTorchSession {
         self.tensor_tape.narrow(input, dim, start, length)
     }
 
+    /// Equivalent to `torch.narrow_copy`. Returns a contiguous copy of the
+    /// narrowed tensor.
+    ///
+    /// In FrankenTorch, all tensors use value semantics (no aliasing views),
+    /// so this is functionally identical to `tensor_narrow`. Provided for
+    /// PyTorch API compatibility.
+    pub fn tensor_narrow_copy(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        start: usize,
+        length: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        // In FrankenTorch tensors are already value-based; narrow doesn't
+        // create aliases. contiguous() would be a no-op; just delegate.
+        self.tensor_narrow(input, dim, start, length)
+    }
+
     pub fn tensor_expand(
         &mut self,
         input: TensorNodeId,
@@ -20021,6 +20052,43 @@ impl FrankenTorchSession {
         self.tensor_variable(s, vec![k], false)
     }
 
+    /// Compute the numerical rank of a matrix.
+    ///
+    /// Equivalent to `torch.linalg.matrix_rank(input, tol)`. Counts the number
+    /// of singular values above the tolerance threshold.
+    ///
+    /// If `tol` is None, uses the default tolerance:
+    ///     `tol = max(m, n) * eps * max_singular_value`
+    /// where eps is machine epsilon (~2.2e-16 for f64).
+    ///
+    /// Returns a scalar tensor (0-D) containing the rank. Does not support
+    /// autograd (rank is discrete).
+    pub fn tensor_matrix_rank(
+        &mut self,
+        input: TensorNodeId,
+        tol: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "matrix_rank: input must be a 2D matrix",
+                },
+            )));
+        }
+        let m = shape[0];
+        let n = shape[1];
+        let s_id = self.tensor_linalg_svdvals(input)?;
+        let s_vals = self.tensor_values(s_id)?;
+        let max_s = s_vals.iter().cloned().fold(0.0_f64, f64::max);
+        let actual_tol = tol.unwrap_or_else(|| {
+            let eps = f64::EPSILON;
+            (m.max(n) as f64) * eps * max_s
+        });
+        let rank = s_vals.iter().filter(|&&v| v > actual_tol).count() as f64;
+        self.tensor_variable(vec![rank], vec![], false)
+    }
+
     /// Compute the determinant of a square matrix.
     ///
     /// Returns a 0-D tensor that participates in the autograd graph
@@ -20305,6 +20373,40 @@ impl FrankenTorchSession {
 
     pub fn tensor_pinv(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.tensor_linalg_pinv(input)
+    }
+
+    /// Compute the least-squares solution to a linear matrix equation.
+    ///
+    /// Equivalent to `torch.linalg.lstsq(A, B)`. Computes the solution `X`
+    /// that minimizes `||AX - B||_2` for an m×n matrix A and m×k matrix B.
+    ///
+    /// Returns only the solution X (n×k matrix). For the full output
+    /// (residuals, rank, singular values), use SVD-based decomposition.
+    ///
+    /// Implementation: uses pseudo-inverse `X = pinv(A) @ B`.
+    pub fn tensor_lstsq(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let a_shape = self.tensor_shape(a)?;
+        let b_shape = self.tensor_shape(b)?;
+        if a_shape.len() != 2 || b_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "lstsq: A and B must be 2D matrices",
+                },
+            )));
+        }
+        if a_shape[0] != b_shape[0] {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "lstsq: A and B must have the same number of rows",
+                },
+            )));
+        }
+        let a_pinv = self.tensor_pinv(a)?;
+        self.tensor_matmul(a_pinv, b)
     }
 
     /// Return the k-th smallest element of a 1-D tensor.
@@ -25300,6 +25402,18 @@ impl FrankenTorchSession {
             format!("trapezoid y={} dim={dim} out={}", y.0, integral.0),
         );
         Ok(integral)
+    }
+
+    /// Alias for `tensor_trapezoid`. Equivalent to `torch.trapz`.
+    ///
+    /// Deprecated in favor of `trapezoid`, but kept for backwards compatibility.
+    pub fn tensor_trapz(
+        &mut self,
+        y: TensorNodeId,
+        x: Option<TensorNodeId>,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trapezoid(y, x, dim)
     }
 
     // ── cumulative_trapezoid ────────────────────────────────────────────
