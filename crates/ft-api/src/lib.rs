@@ -17998,6 +17998,91 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Scaled complementary error function: erfcx(x) = exp(x²) * erfc(x).
+    ///
+    /// Equivalent to `torch.special.erfcx(input)`.
+    ///
+    /// erfcx is useful because it stays finite for large positive x where
+    /// erfc(x) would underflow. Autograd backward:
+    ///   d erfcx(x)/dx = 2x * erfcx(x) - 2/sqrt(π)
+    pub fn tensor_erfcx(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let out = self.tensor_apply_function(
+            &[input],
+            |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals.iter().map(|&x| erfcx_approx(x)).collect();
+                Ok((values, shape.to_vec()))
+            },
+            |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "erfcx backward: incoming gradient length mismatch",
+                        },
+                    )));
+                }
+                // d erfcx(x)/dx = 2x * erfcx(x) - 2/sqrt(π)
+                let two_over_sqrt_pi = 2.0 * 0.564_189_583_547_756_3_f64;
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| go * (2.0 * x * erfcx_approx(x) - two_over_sqrt_pi))
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("erfcx in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Hurwitz zeta function: zeta(s, a) = sum_{n=0}^{inf} (n+a)^(-s).
+    ///
+    /// Equivalent to `torch.special.zeta(input, q)`.
+    ///
+    /// Requires a > 0. For s <= 1, the series diverges (returns NaN).
+    /// The Riemann zeta function is zeta(s, 1).
+    ///
+    /// Autograd is not implemented for this function (gradients are complex).
+    pub fn tensor_zeta(
+        &mut self,
+        s: TensorNodeId,
+        a: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (s_vals, s_shape) = {
+            let t = self.tensor_tape.tensor(s)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        let (a_vals, a_shape) = {
+            let t = self.tensor_tape.tensor(a)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        if s_shape != a_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "zeta: inputs must have the same shape",
+                },
+            )));
+        }
+        let values: Vec<f64> = s_vals
+            .iter()
+            .zip(a_vals.iter())
+            .map(|(&s_val, &a_val)| zeta_approx(s_val, a_val))
+            .collect();
+        let out = self.tensor_tape.leaf(values, s_shape, false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("zeta s={} a={} out={}", s.0, a.0, out.0),
+        );
+        Ok(out)
+    }
+
     /// Element-wise entropy: -x * log(x).
     ///
     /// Equivalent to `torch.special.entr(input)`.
@@ -22184,6 +22269,92 @@ fn polygamma_approx(n: u32, mut x: f64) -> f64 {
             - factorial * np1 * (n_f + 2.0) / (120.0 * xn3));
 
     result
+}
+
+/// Scaled complementary error function: erfcx(x) = exp(x²) * erfc(x).
+///
+/// Uses different approximations for different regions:
+/// - For large positive x: asymptotic expansion
+/// - For small |x|: series based on erfc
+/// - For large negative x: reflection formula
+fn erfcx_approx(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    if x.is_infinite() {
+        return if x > 0.0 { 0.0 } else { f64::INFINITY };
+    }
+
+    if x >= 0.0 {
+        // For x >= 0, erfcx is well-behaved
+        if x > 26.0 {
+            // Asymptotic: erfcx(x) ~ 1/(sqrt(pi)*x) * (1 - 1/(2x²) + ...)
+            let inv_x = 1.0 / x;
+            let inv_x2 = inv_x * inv_x;
+            return inv_x * 0.564_189_583_547_756_3_f64
+                * (1.0 - 0.5 * inv_x2 + 0.75 * inv_x2 * inv_x2);
+        }
+        // Direct computation: exp(x²) * erfc(x)
+        let x2 = x * x;
+        let erfc_val = libm::erfc(x);
+        if x2 < 700.0 {
+            x2.exp() * erfc_val
+        } else {
+            // Would overflow, use asymptotic
+            let inv_x = 1.0 / x;
+            inv_x * 0.564_189_583_547_756_3_f64
+        }
+    } else {
+        // For x < 0: erfcx(-|x|) = 2*exp(x²) - erfcx(|x|)
+        let abs_x = -x;
+        let x2 = abs_x * abs_x;
+        if x2 > 700.0 {
+            return f64::INFINITY;
+        }
+        2.0 * x2.exp() - erfcx_approx(abs_x)
+    }
+}
+
+/// Hurwitz zeta function: zeta(s, a) = sum_{n=0}^{inf} (n+a)^(-s).
+///
+/// Requires s > 1 or s is a negative integer for convergence.
+/// This implementation uses direct summation with Euler-Maclaurin correction.
+fn zeta_approx(s: f64, a: f64) -> f64 {
+    if s.is_nan() || a.is_nan() {
+        return f64::NAN;
+    }
+    if a <= 0.0 {
+        return f64::NAN;
+    }
+    if s <= 1.0 && s != s.floor() {
+        // Zeta pole at s=1, divergent for s < 1 (non-integer)
+        return f64::NAN;
+    }
+
+    // Special case: s = 1 is a pole
+    if (s - 1.0).abs() < 1e-10 {
+        return f64::INFINITY;
+    }
+
+    // For s > 1, use direct summation with Euler-Maclaurin
+    let n_terms = 100;
+    let mut sum = 0.0;
+
+    for n in 0..n_terms {
+        let term = (n as f64 + a).powf(-s);
+        if !term.is_finite() {
+            break;
+        }
+        sum += term;
+    }
+
+    // Euler-Maclaurin correction for remainder
+    let last = (n_terms as f64 + a).powf(-s);
+    let last_deriv = -s * (n_terms as f64 + a).powf(-s - 1.0);
+    sum += last / 2.0 + (n_terms as f64 + a).powf(1.0 - s) / (s - 1.0);
+    sum += last_deriv / 12.0;
+
+    sum
 }
 
 /// Binary search: leftmost insertion position (lower_bound).
