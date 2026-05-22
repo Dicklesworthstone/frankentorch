@@ -13481,6 +13481,22 @@ impl FrankenTorchSession {
         })
     }
 
+    /// In-place hardtanh activation: clamp(x, min_val, max_val).
+    ///
+    /// Equivalent to `F.hardtanh(tensor, min_val, max_val, inplace=True)` in PyTorch.
+    pub fn tensor_hardtanh_(&mut self, target: TensorNodeId, min_val: f64, max_val: f64) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("hardtanh_", target, Some(format!("min={min_val} max={max_val}")), |x| {
+            x.clamp(min_val, max_val)
+        })
+    }
+
+    /// In-place hardsigmoid activation: clamp(x/6 + 0.5, 0, 1).
+    ///
+    /// Equivalent to `F.hardsigmoid(tensor, inplace=True)` in PyTorch.
+    pub fn tensor_hardsigmoid_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("hardsigmoid_", target, None, |x| (x / 6.0 + 0.5).clamp(0.0, 1.0))
+    }
+
     pub fn tensor_clamp_(
         &mut self,
         target: TensorNodeId,
@@ -53534,6 +53550,17 @@ mod tests {
         assert_eq!(s.tensor_shape(a).unwrap(), vec![3]);
         let b = s.tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], false).unwrap();
         s.tensor_selu_(b).unwrap();
+        assert_eq!(s.tensor_shape(b).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_tensor_hardtanh_hardsigmoid_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![-2.0, 0.0, 2.0], vec![3], false).unwrap();
+        s.tensor_hardtanh_(a, -1.0, 1.0).unwrap();
+        assert_eq!(s.tensor_shape(a).unwrap(), vec![3]);
+        let b = s.tensor_variable(vec![-1.0, 0.0, 1.0], vec![3], false).unwrap();
+        s.tensor_hardsigmoid_(b).unwrap();
         assert_eq!(s.tensor_shape(b).unwrap(), vec![3]);
     }
 }
