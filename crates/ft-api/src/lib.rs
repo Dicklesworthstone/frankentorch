@@ -14881,6 +14881,22 @@ impl FrankenTorchSession {
         self.apply_tensor_unary_in_place("tanhshrink_", target, None, |x| x - x.tanh())
     }
 
+    /// In-place softsign: x / (1 + |x|).
+    pub fn tensor_softsign_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("softsign_", target, None, |x| x / (1.0 + x.abs()))
+    }
+
+    /// In-place logsigmoid: log(sigmoid(x)) = -softplus(-x).
+    pub fn tensor_logsigmoid_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("logsigmoid_", target, None, |x| {
+            if x > 0.0 {
+                -(-x).ln_1p()
+            } else {
+                x - (1.0 + x.exp()).ln()
+            }
+        })
+    }
+
     pub fn tensor_clamp_(
         &mut self,
         target: TensorNodeId,
