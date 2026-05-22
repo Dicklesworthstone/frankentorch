@@ -8402,6 +8402,45 @@ impl Module for Upsample2d {
     }
 }
 
+/// PyTorch-named nearest-neighbor 2D upsampling module.
+///
+/// This is equivalent to `Upsample2d` with nearest-neighbor semantics for 4D
+/// `[N, C, H, W]` tensors.
+pub struct UpsamplingNearest2d {
+    inner: Upsample2d,
+}
+
+impl UpsamplingNearest2d {
+    /// Create an UpsamplingNearest2d module with the same scale factor for
+    /// height and width.
+    #[must_use]
+    pub fn new(scale_factor: usize) -> Self {
+        Self::with_scale_factors(scale_factor, scale_factor)
+    }
+
+    /// Create an UpsamplingNearest2d module with explicit height/width scales.
+    #[must_use]
+    pub fn with_scale_factors(scale_h: usize, scale_w: usize) -> Self {
+        Self {
+            inner: Upsample2d::new(scale_h, scale_w),
+        }
+    }
+}
+
+impl Module for UpsamplingNearest2d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.inner.forward(session, input)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 /// Nearest-neighbor upsampling for 3D inputs (5D tensors `[N, C, D, H, W]`).
 ///
 /// Repeats each element along depth, height, and width by the configured scale
@@ -22460,6 +22499,88 @@ mod tests {
     fn upsample2d_has_no_parameters() {
         let up = Upsample2d::new(2, 2);
         assert!(up.parameters().is_empty());
+    }
+
+    #[test]
+    fn upsampling_nearest2d_forward_uniform_scale() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let up = UpsamplingNearest2d::new(2);
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .expect("variable");
+        let out = up.forward(&mut session, x).expect("forward");
+
+        let (vals, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 4, 4]);
+        assert_eq!(
+            vals,
+            &[
+                1.0, 1.0, 2.0, 2.0, 1.0, 1.0, 2.0, 2.0, 3.0, 3.0, 4.0, 4.0, 3.0, 3.0, 4.0, 4.0
+            ]
+        );
+    }
+
+    #[test]
+    fn upsampling_nearest2d_forward_per_axis_scale() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let up = UpsamplingNearest2d::with_scale_factors(1, 3);
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0], vec![1, 1, 1, 2], false)
+            .expect("variable");
+        let out = up.forward(&mut session, x).expect("forward");
+
+        let (vals, meta) = session.tensor_values_meta(out).expect("vals");
+        assert_eq!(meta.shape(), &[1, 1, 1, 6]);
+        assert_eq!(vals, &[1.0, 1.0, 1.0, 2.0, 2.0, 2.0]);
+    }
+
+    #[test]
+    fn upsampling_nearest2d_rejects_zero_scale_factors() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], false)
+            .expect("variable");
+
+        let zero_height = UpsamplingNearest2d::with_scale_factors(0, 2);
+        assert!(zero_height.forward(&mut session, x).is_err());
+
+        let zero_width = UpsamplingNearest2d::with_scale_factors(2, 0);
+        assert!(zero_width.forward(&mut session, x).is_err());
+    }
+
+    #[test]
+    fn upsampling_nearest2d_rejects_wrong_dim() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let up = UpsamplingNearest2d::new(2);
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 1, 3], false)
+            .expect("variable");
+        assert!(up.forward(&mut session, x).is_err());
+    }
+
+    #[test]
+    fn upsampling_nearest2d_has_no_parameters() {
+        let up = UpsamplingNearest2d::new(2);
+        assert!(up.parameters().is_empty());
+    }
+
+    #[test]
+    fn upsampling_nearest2d_backward_sums_repeated_cells() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let up = UpsamplingNearest2d::new(2);
+
+        let x = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![1, 1, 2, 2], true)
+            .expect("variable");
+        let out = up.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(out).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let grad = session.tensor_gradient(&report, x).expect("input grad");
+
+        assert_eq!(grad, &[4.0, 4.0, 4.0, 4.0]);
     }
 
     #[test]
