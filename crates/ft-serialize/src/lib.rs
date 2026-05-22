@@ -1038,6 +1038,446 @@ fn bytes_to_array<const N: usize>(data: &[u8], reason: &str) -> Result<[u8; N], 
     })
 }
 
+// ── ONNX Export Support ────────────────────────────────────────────────
+
+pub const ONNX_IR_VERSION: i64 = 8;
+pub const ONNX_DEFAULT_OPSET_VERSION: i64 = 17;
+
+const ONNX_PROTOBUF_WIRE_VARINT: u64 = 0;
+const ONNX_PROTOBUF_WIRE_FIXED64: u64 = 1;
+const ONNX_PROTOBUF_WIRE_LENGTH_DELIMITED: u64 = 2;
+const ONNX_PROTOBUF_WIRE_FIXED32: u64 = 5;
+
+const ONNX_TENSOR_PROTO_FLOAT: i32 = 1;
+const ONNX_TENSOR_PROTO_DOUBLE: i32 = 11;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnnxLinearExportConfig {
+    pub graph_name: String,
+    pub input_name: String,
+    pub output_name: String,
+    pub weight_name: String,
+    pub bias_name: Option<String>,
+    pub batch_size: Option<usize>,
+    pub opset_version: i64,
+}
+
+impl OnnxLinearExportConfig {
+    pub fn new(
+        graph_name: impl Into<String>,
+        input_name: impl Into<String>,
+        output_name: impl Into<String>,
+        weight_name: impl Into<String>,
+    ) -> Self {
+        Self {
+            graph_name: graph_name.into(),
+            input_name: input_name.into(),
+            output_name: output_name.into(),
+            weight_name: weight_name.into(),
+            bias_name: Some("bias".to_string()),
+            batch_size: None,
+            opset_version: ONNX_DEFAULT_OPSET_VERSION,
+        }
+    }
+}
+
+pub fn save_linear_onnx<P: AsRef<Path>>(
+    config: &OnnxLinearExportConfig,
+    weight: &DenseTensor,
+    bias: Option<&DenseTensor>,
+    path: P,
+) -> Result<(), TensorIOError> {
+    let path_str = path.as_ref().to_string_lossy().to_string();
+    let encoded = export_linear_onnx_to_bytes(config, weight, bias)?;
+    std::fs::write(&path, encoded).map_err(|e| io_err(&path_str, e))?;
+    Ok(())
+}
+
+pub fn export_linear_onnx_to_bytes(
+    config: &OnnxLinearExportConfig,
+    weight: &DenseTensor,
+    bias: Option<&DenseTensor>,
+) -> Result<Vec<u8>, TensorIOError> {
+    validate_onnx_name("graph_name", &config.graph_name)?;
+    validate_onnx_name("input_name", &config.input_name)?;
+    validate_onnx_name("output_name", &config.output_name)?;
+    validate_onnx_name("weight_name", &config.weight_name)?;
+    if let Some(name) = &config.bias_name {
+        validate_onnx_name("bias_name", name)?;
+    }
+    if config.opset_version <= 0 {
+        return Err(TensorIOError::Corrupt {
+            reason: "ONNX opset_version must be positive".to_string(),
+        });
+    }
+
+    let weight_shape = validate_onnx_linear_weight(weight)?;
+    let out_features = weight_shape[0];
+    let in_features = weight_shape[1];
+    let dtype = weight.meta().dtype();
+    let elem_type = onnx_tensor_elem_type(dtype)?;
+
+    let transposed_weight = transposed_linear_weight_values(weight, in_features, out_features)?;
+    let bias_values = match bias {
+        Some(tensor) => Some(validate_onnx_linear_bias(tensor, dtype, out_features)?),
+        None => None,
+    };
+    let bias_name = match (&config.bias_name, &bias_values) {
+        (Some(name), Some(_)) => Some(name.as_str()),
+        (None, Some(_)) => {
+            return Err(TensorIOError::Corrupt {
+                reason: "ONNX Linear export received bias tensor without bias_name".to_string(),
+            });
+        }
+        _ => None,
+    };
+
+    let weight_initializer = encode_onnx_tensor(
+        &config.weight_name,
+        &[in_features, out_features],
+        dtype,
+        &transposed_weight,
+    )?;
+    let bias_initializer = match (bias_name, bias_values) {
+        (Some(name), Some(values)) => {
+            Some(encode_onnx_tensor(name, &[out_features], dtype, &values)?)
+        }
+        _ => None,
+    };
+
+    let mut graph = Vec::new();
+    let matmul_output = format!("{}_matmul", config.output_name);
+    let matmul_node = encode_onnx_node(
+        "frankentorch_linear_matmul",
+        "MatMul",
+        &[config.input_name.as_str(), config.weight_name.as_str()],
+        &[matmul_output.as_str()],
+    );
+    push_message_field(&mut graph, 1, &matmul_node);
+
+    if let Some(name) = bias_name {
+        let add_node = encode_onnx_node(
+            "frankentorch_linear_bias",
+            "Add",
+            &[matmul_output.as_str(), name],
+            &[config.output_name.as_str()],
+        );
+        push_message_field(&mut graph, 1, &add_node);
+    } else {
+        let identity_node = encode_onnx_node(
+            "frankentorch_linear_output",
+            "Identity",
+            &[matmul_output.as_str()],
+            &[config.output_name.as_str()],
+        );
+        push_message_field(&mut graph, 1, &identity_node);
+    }
+
+    push_string_field(&mut graph, 2, &config.graph_name);
+    push_message_field(&mut graph, 5, &weight_initializer);
+    if let Some(initializer) = &bias_initializer {
+        push_message_field(&mut graph, 5, initializer);
+    }
+
+    let input_shape = onnx_linear_io_shape(config.batch_size, in_features)?;
+    let output_shape = onnx_linear_io_shape(config.batch_size, out_features)?;
+    let input_value = encode_onnx_value_info(&config.input_name, elem_type, &input_shape);
+    let output_value = encode_onnx_value_info(&config.output_name, elem_type, &output_shape);
+    push_message_field(&mut graph, 11, &input_value);
+    push_message_field(&mut graph, 12, &output_value);
+
+    let opset = encode_onnx_opset_import(config.opset_version);
+    let mut model = Vec::new();
+    push_i64_field(&mut model, 1, ONNX_IR_VERSION)?;
+    push_string_field(&mut model, 2, "frankentorch");
+    push_message_field(&mut model, 7, &graph);
+    push_message_field(&mut model, 8, &opset);
+    Ok(model)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OnnxDim {
+    Value(usize),
+    Param(String),
+}
+
+fn onnx_linear_io_shape(
+    batch_size: Option<usize>,
+    features: usize,
+) -> Result<Vec<OnnxDim>, TensorIOError> {
+    let mut shape = Vec::with_capacity(2);
+    match batch_size {
+        Some(batch) => {
+            usize_to_i64(batch, "ONNX batch dimension")?;
+            shape.push(OnnxDim::Value(batch));
+        }
+        None => shape.push(OnnxDim::Param("batch".to_string())),
+    }
+    usize_to_i64(features, "ONNX feature dimension")?;
+    shape.push(OnnxDim::Value(features));
+    Ok(shape)
+}
+
+fn validate_onnx_name(field: &str, value: &str) -> Result<(), TensorIOError> {
+    if value.is_empty() {
+        return Err(TensorIOError::Corrupt {
+            reason: format!("ONNX {field} must be non-empty"),
+        });
+    }
+    Ok(())
+}
+
+fn validate_onnx_linear_weight(weight: &DenseTensor) -> Result<[usize; 2], TensorIOError> {
+    if !matches!(weight.meta().dtype(), DType::F64 | DType::F32) {
+        return Err(TensorIOError::Corrupt {
+            reason: format!(
+                "ONNX Linear export supports F64/F32 weights, got {:?}",
+                weight.meta().dtype()
+            ),
+        });
+    }
+    let shape = weight.meta().shape();
+    if shape.len() != 2 {
+        return Err(TensorIOError::Corrupt {
+            reason: format!(
+                "ONNX Linear weight must be rank 2 [out_features, in_features], got {shape:?}"
+            ),
+        });
+    }
+    if shape[0] == 0 || shape[1] == 0 {
+        return Err(TensorIOError::Corrupt {
+            reason: "ONNX Linear weight dimensions must be non-zero".to_string(),
+        });
+    }
+    usize_to_i64(shape[0], "ONNX Linear out_features")?;
+    usize_to_i64(shape[1], "ONNX Linear in_features")?;
+    Ok([shape[0], shape[1]])
+}
+
+fn validate_onnx_linear_bias(
+    bias: &DenseTensor,
+    dtype: DType,
+    out_features: usize,
+) -> Result<Vec<f64>, TensorIOError> {
+    if bias.meta().dtype() != dtype {
+        return Err(TensorIOError::Corrupt {
+            reason: format!(
+                "ONNX Linear bias dtype {:?} does not match weight dtype {dtype:?}",
+                bias.meta().dtype()
+            ),
+        });
+    }
+    let shape = bias.meta().shape();
+    if shape != [out_features] {
+        return Err(TensorIOError::Corrupt {
+            reason: format!("ONNX Linear bias shape must be [{out_features}], got {shape:?}"),
+        });
+    }
+    contiguous_tensor_values_as_f64(bias)
+}
+
+fn transposed_linear_weight_values(
+    weight: &DenseTensor,
+    in_features: usize,
+    out_features: usize,
+) -> Result<Vec<f64>, TensorIOError> {
+    let values = contiguous_tensor_values_as_f64(weight)?;
+    let mut transposed = Vec::with_capacity(values.len());
+    for in_idx in 0..in_features {
+        for out_idx in 0..out_features {
+            transposed.push(values[out_idx * in_features + in_idx]);
+        }
+    }
+    Ok(transposed)
+}
+
+fn contiguous_tensor_values_as_f64(tensor: &DenseTensor) -> Result<Vec<f64>, TensorIOError> {
+    match tensor.meta().dtype() {
+        DType::F64 => Ok(tensor
+            .contiguous_values()
+            .map_err(TensorIOError::TensorError)?
+            .to_vec()),
+        DType::F32 => Ok(tensor
+            .contiguous_values_f32()
+            .map_err(TensorIOError::TensorError)?
+            .iter()
+            .map(|&value| f64::from(value))
+            .collect()),
+        dtype => Err(TensorIOError::Corrupt {
+            reason: format!("ONNX tensor dtype {dtype:?} cannot be exported as float data"),
+        }),
+    }
+}
+
+fn onnx_tensor_elem_type(dtype: DType) -> Result<i32, TensorIOError> {
+    match dtype {
+        DType::F64 => Ok(ONNX_TENSOR_PROTO_DOUBLE),
+        DType::F32 => Ok(ONNX_TENSOR_PROTO_FLOAT),
+        other => Err(TensorIOError::Corrupt {
+            reason: format!("ONNX tensor dtype {other:?} is unsupported"),
+        }),
+    }
+}
+
+fn encode_onnx_opset_import(version: i64) -> Vec<u8> {
+    let mut message = Vec::new();
+    push_i64_field(&mut message, 2, version).expect("positive opset version encodes");
+    message
+}
+
+fn encode_onnx_node(name: &str, op_type: &str, inputs: &[&str], outputs: &[&str]) -> Vec<u8> {
+    let mut message = Vec::new();
+    for input in inputs {
+        push_string_field(&mut message, 1, input);
+    }
+    for output in outputs {
+        push_string_field(&mut message, 2, output);
+    }
+    push_string_field(&mut message, 3, name);
+    push_string_field(&mut message, 4, op_type);
+    message
+}
+
+fn encode_onnx_tensor(
+    name: &str,
+    dims: &[usize],
+    dtype: DType,
+    values: &[f64],
+) -> Result<Vec<u8>, TensorIOError> {
+    let expected_len = dims.iter().try_fold(1usize, |acc, &dim| {
+        acc.checked_mul(dim).ok_or_else(|| TensorIOError::Corrupt {
+            reason: format!("ONNX tensor '{name}' shape overflow"),
+        })
+    })?;
+    if values.len() != expected_len {
+        return Err(TensorIOError::Corrupt {
+            reason: format!(
+                "ONNX tensor '{name}' value length {} does not match shape product {expected_len}",
+                values.len()
+            ),
+        });
+    }
+
+    let mut message = Vec::new();
+    for &dim in dims {
+        push_i64_field(&mut message, 1, usize_to_i64(dim, "ONNX tensor dim")?)?;
+    }
+    push_i32_field(&mut message, 2, onnx_tensor_elem_type(dtype)?)?;
+    match dtype {
+        DType::F64 => {
+            for &value in values {
+                push_f64_field(&mut message, 10, value);
+            }
+        }
+        DType::F32 => {
+            for &value in values {
+                #[allow(clippy::cast_possible_truncation, clippy::cast_precision_loss)]
+                push_f32_field(&mut message, 4, value as f32);
+            }
+        }
+        other => {
+            return Err(TensorIOError::Corrupt {
+                reason: format!("ONNX tensor dtype {other:?} is unsupported"),
+            });
+        }
+    }
+    push_string_field(&mut message, 8, name);
+    Ok(message)
+}
+
+fn encode_onnx_value_info(name: &str, elem_type: i32, shape: &[OnnxDim]) -> Vec<u8> {
+    let mut tensor_shape = Vec::new();
+    for dim in shape {
+        let mut dim_message = Vec::new();
+        match dim {
+            OnnxDim::Value(value) => {
+                push_i64_field(
+                    &mut dim_message,
+                    1,
+                    i64::try_from(*value).expect("validated dim"),
+                )
+                .expect("non-negative dim encodes");
+            }
+            OnnxDim::Param(param) => push_string_field(&mut dim_message, 2, param),
+        }
+        push_message_field(&mut tensor_shape, 1, &dim_message);
+    }
+
+    let mut tensor_type = Vec::new();
+    push_i32_field(&mut tensor_type, 1, elem_type).expect("positive elem_type encodes");
+    push_message_field(&mut tensor_type, 2, &tensor_shape);
+
+    let mut type_proto = Vec::new();
+    push_message_field(&mut type_proto, 1, &tensor_type);
+
+    let mut value_info = Vec::new();
+    push_string_field(&mut value_info, 1, name);
+    push_message_field(&mut value_info, 2, &type_proto);
+    value_info
+}
+
+fn usize_to_i64(value: usize, context: &str) -> Result<i64, TensorIOError> {
+    i64::try_from(value).map_err(|_| TensorIOError::Corrupt {
+        reason: format!("{context} exceeds ONNX int64 range"),
+    })
+}
+
+fn push_key(out: &mut Vec<u8>, field_number: u32, wire_type: u64) {
+    push_varint(out, (u64::from(field_number) << 3) | wire_type);
+}
+
+fn push_varint(out: &mut Vec<u8>, mut value: u64) {
+    while value >= 0x80 {
+        #[allow(clippy::cast_possible_truncation)]
+        out.push(((value & 0x7f) as u8) | 0x80);
+        value >>= 7;
+    }
+    #[allow(clippy::cast_possible_truncation)]
+    out.push(value as u8);
+}
+
+fn push_i64_field(out: &mut Vec<u8>, field_number: u32, value: i64) -> Result<(), TensorIOError> {
+    let encoded = u64::try_from(value).map_err(|_| TensorIOError::Corrupt {
+        reason: format!("ONNX field {field_number} cannot encode negative int64 {value}"),
+    })?;
+    push_key(out, field_number, ONNX_PROTOBUF_WIRE_VARINT);
+    push_varint(out, encoded);
+    Ok(())
+}
+
+fn push_i32_field(out: &mut Vec<u8>, field_number: u32, value: i32) -> Result<(), TensorIOError> {
+    let encoded = u64::try_from(value).map_err(|_| TensorIOError::Corrupt {
+        reason: format!("ONNX field {field_number} cannot encode negative int32 {value}"),
+    })?;
+    push_key(out, field_number, ONNX_PROTOBUF_WIRE_VARINT);
+    push_varint(out, encoded);
+    Ok(())
+}
+
+fn push_string_field(out: &mut Vec<u8>, field_number: u32, value: &str) {
+    push_bytes_field(out, field_number, value.as_bytes());
+}
+
+fn push_message_field(out: &mut Vec<u8>, field_number: u32, message: &[u8]) {
+    push_bytes_field(out, field_number, message);
+}
+
+fn push_bytes_field(out: &mut Vec<u8>, field_number: u32, bytes: &[u8]) {
+    push_key(out, field_number, ONNX_PROTOBUF_WIRE_LENGTH_DELIMITED);
+    push_varint(out, bytes.len() as u64);
+    out.extend_from_slice(bytes);
+}
+
+fn push_f64_field(out: &mut Vec<u8>, field_number: u32, value: f64) {
+    push_key(out, field_number, ONNX_PROTOBUF_WIRE_FIXED64);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
+fn push_f32_field(out: &mut Vec<u8>, field_number: u32, value: f32) {
+    push_key(out, field_number, ONNX_PROTOBUF_WIRE_FIXED32);
+    out.extend_from_slice(&value.to_le_bytes());
+}
+
 // ── SafeTensors Format Support ──────────────────────────────────────────
 
 use std::borrow::Cow;
@@ -2071,6 +2511,321 @@ mod tests {
         assert_eq!(proof_a.proof_hash, proof_b.proof_hash);
     }
 
+    #[derive(Debug)]
+    struct TestProtoField {
+        number: u32,
+        value: TestProtoValue,
+    }
+
+    #[derive(Debug)]
+    enum TestProtoValue {
+        Varint(u64),
+        Fixed32(u32),
+        Fixed64(u64),
+        Bytes(Vec<u8>),
+    }
+
+    fn read_test_varint(data: &[u8], pos: &mut usize) -> u64 {
+        let mut result = 0_u64;
+        let mut shift = 0_u32;
+        loop {
+            let byte = *data.get(*pos).expect("truncated varint");
+            *pos += 1;
+            result |= u64::from(byte & 0x7f) << shift;
+            if byte & 0x80 == 0 {
+                return result;
+            }
+            shift += 7;
+            assert!(shift < 64, "varint overflow");
+        }
+    }
+
+    fn read_test_bytes<const N: usize>(data: &[u8], pos: &mut usize) -> [u8; N] {
+        let end = pos.checked_add(N).expect("test fixed-width overflow");
+        let bytes: [u8; N] = data
+            .get(*pos..end)
+            .expect("truncated fixed-width field")
+            .try_into()
+            .expect("fixed-width slice length");
+        *pos = end;
+        bytes
+    }
+
+    fn parse_test_proto(data: &[u8]) -> Vec<TestProtoField> {
+        parse_test_proto_result(data).expect("test protobuf should parse")
+    }
+
+    fn parse_test_proto_result(data: &[u8]) -> Result<Vec<TestProtoField>, String> {
+        let mut pos = 0_usize;
+        let mut fields = Vec::new();
+        while pos < data.len() {
+            let key = read_test_varint(data, &mut pos);
+            let number = u32::try_from(key >> 3).expect("field number fits u32");
+            let wire_type = key & 0x07;
+            let value = match wire_type {
+                0 => TestProtoValue::Varint(read_test_varint(data, &mut pos)),
+                1 => TestProtoValue::Fixed64(u64::from_le_bytes(read_test_bytes(data, &mut pos))),
+                2 => {
+                    let len = usize::try_from(read_test_varint(data, &mut pos))
+                        .expect("length fits usize");
+                    let end = pos.checked_add(len).expect("length overflow");
+                    let bytes = data.get(pos..end).expect("truncated bytes field").to_vec();
+                    pos = end;
+                    TestProtoValue::Bytes(bytes)
+                }
+                5 => TestProtoValue::Fixed32(u32::from_le_bytes(read_test_bytes(data, &mut pos))),
+                other => return Err(format!("unsupported wire type {other}")),
+            };
+            fields.push(TestProtoField { number, value });
+        }
+        Ok(fields)
+    }
+
+    fn proto_varints(fields: &[TestProtoField], number: u32) -> Vec<u64> {
+        fields
+            .iter()
+            .filter_map(|field| match (&field.value, field.number == number) {
+                (TestProtoValue::Varint(value), true) => Some(*value),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn proto_strings(fields: &[TestProtoField], number: u32) -> Vec<String> {
+        fields
+            .iter()
+            .filter_map(|field| match (&field.value, field.number == number) {
+                (TestProtoValue::Bytes(value), true) => {
+                    Some(String::from_utf8(value.clone()).expect("utf8 string field"))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn proto_messages(fields: &[TestProtoField], number: u32) -> Vec<Vec<u8>> {
+        fields
+            .iter()
+            .filter_map(|field| match (&field.value, field.number == number) {
+                (TestProtoValue::Bytes(value), true) => Some(value.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn proto_f64s(fields: &[TestProtoField], number: u32) -> Vec<f64> {
+        fields
+            .iter()
+            .filter_map(|field| match (&field.value, field.number == number) {
+                (TestProtoValue::Fixed64(value), true) => {
+                    Some(f64::from_le_bytes(value.to_le_bytes()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn proto_f32s(fields: &[TestProtoField], number: u32) -> Vec<f32> {
+        fields
+            .iter()
+            .filter_map(|field| match (&field.value, field.number == number) {
+                (TestProtoValue::Fixed32(value), true) => {
+                    Some(f32::from_le_bytes(value.to_le_bytes()))
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn value_info_shape(value_info: &[u8]) -> (String, u64, Vec<String>) {
+        let value_fields = parse_test_proto(value_info);
+        let name = proto_strings(&value_fields, 1)
+            .into_iter()
+            .next()
+            .expect("value info name");
+        let type_proto = proto_messages(&value_fields, 2)
+            .into_iter()
+            .next()
+            .expect("value info type");
+        let type_fields = parse_test_proto(&type_proto);
+        let tensor_type = proto_messages(&type_fields, 1)
+            .into_iter()
+            .next()
+            .expect("tensor type");
+        let tensor_fields = parse_test_proto(&tensor_type);
+        let elem_type = proto_varints(&tensor_fields, 1)
+            .into_iter()
+            .next()
+            .expect("elem type");
+        let shape = proto_messages(&tensor_fields, 2)
+            .into_iter()
+            .next()
+            .expect("tensor shape");
+        let shape_fields = parse_test_proto(&shape);
+        let dims = proto_messages(&shape_fields, 1)
+            .into_iter()
+            .map(|dim| {
+                let fields = parse_test_proto(&dim);
+                if let Some(value) = proto_varints(&fields, 1).into_iter().next() {
+                    value.to_string()
+                } else {
+                    proto_strings(&fields, 2)
+                        .into_iter()
+                        .next()
+                        .expect("dim value or param")
+                }
+            })
+            .collect();
+        (name, elem_type, dims)
+    }
+
+    #[test]
+    fn linear_onnx_export_encodes_valid_graph_proto() {
+        use ft_core::{DenseTensor, Device};
+
+        let weight = DenseTensor::from_contiguous_values(
+            vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0],
+            vec![2, 3],
+            Device::Cpu,
+        )
+        .expect("weight tensor");
+        let bias = DenseTensor::from_contiguous_values(vec![0.5, -0.25], vec![2], Device::Cpu)
+            .expect("bias tensor");
+        let config =
+            super::OnnxLinearExportConfig::new("linear_graph", "input", "output", "linear.weight");
+        let encoded = super::export_linear_onnx_to_bytes(&config, &weight, Some(&bias))
+            .expect("linear ONNX export should succeed");
+
+        let model = parse_test_proto(&encoded);
+        assert_eq!(
+            proto_varints(&model, 1),
+            vec![super::ONNX_IR_VERSION as u64]
+        );
+        assert_eq!(proto_strings(&model, 2), vec!["frankentorch".to_string()]);
+
+        let opset = proto_messages(&model, 8)
+            .into_iter()
+            .next()
+            .expect("opset import");
+        assert_eq!(
+            proto_varints(&parse_test_proto(&opset), 2),
+            vec![super::ONNX_DEFAULT_OPSET_VERSION as u64]
+        );
+
+        let graph = proto_messages(&model, 7).into_iter().next().expect("graph");
+        let graph_fields = parse_test_proto(&graph);
+        assert_eq!(
+            proto_strings(&graph_fields, 2),
+            vec!["linear_graph".to_string()]
+        );
+
+        let node_ops: Vec<String> = proto_messages(&graph_fields, 1)
+            .iter()
+            .map(|node| {
+                proto_strings(&parse_test_proto(node), 4)
+                    .into_iter()
+                    .next()
+                    .expect("node op_type")
+            })
+            .collect();
+        assert_eq!(node_ops, vec!["MatMul".to_string(), "Add".to_string()]);
+
+        let initializers = proto_messages(&graph_fields, 5);
+        assert_eq!(initializers.len(), 2);
+        let weight_fields = parse_test_proto(&initializers[0]);
+        assert_eq!(
+            proto_strings(&weight_fields, 8),
+            vec!["linear.weight".to_string()]
+        );
+        assert_eq!(proto_varints(&weight_fields, 1), vec![3, 2]);
+        assert_eq!(proto_varints(&weight_fields, 2), vec![11]);
+        assert_eq!(
+            proto_f64s(&weight_fields, 10),
+            vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]
+        );
+
+        let bias_fields = parse_test_proto(&initializers[1]);
+        assert_eq!(proto_strings(&bias_fields, 8), vec!["bias".to_string()]);
+        assert_eq!(proto_varints(&bias_fields, 1), vec![2]);
+        assert_eq!(proto_f64s(&bias_fields, 10), vec![0.5, -0.25]);
+
+        let inputs = proto_messages(&graph_fields, 11);
+        let outputs = proto_messages(&graph_fields, 12);
+        assert_eq!(inputs.len(), 1);
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(
+            value_info_shape(&inputs[0]),
+            (
+                "input".to_string(),
+                11,
+                vec!["batch".to_string(), "3".to_string()]
+            )
+        );
+        assert_eq!(
+            value_info_shape(&outputs[0]),
+            (
+                "output".to_string(),
+                11,
+                vec!["batch".to_string(), "2".to_string()]
+            )
+        );
+    }
+
+    #[test]
+    fn linear_onnx_export_supports_f32_fixed_batch_without_bias() {
+        use ft_core::{DenseTensor, Device, TensorMeta};
+
+        let meta = TensorMeta::from_shape(vec![1, 2], super::DType::F32, Device::Cpu);
+        let weight = DenseTensor::from_storage_f32(meta, vec![0.25, -0.5]).expect("weight tensor");
+        let mut config = super::OnnxLinearExportConfig::new("linear_no_bias", "x", "y", "w");
+        config.bias_name = None;
+        config.batch_size = Some(4);
+
+        let encoded = super::export_linear_onnx_to_bytes(&config, &weight, None)
+            .expect("linear ONNX export should succeed");
+        let model = parse_test_proto(&encoded);
+        let graph = proto_messages(&model, 7).into_iter().next().expect("graph");
+        let graph_fields = parse_test_proto(&graph);
+        let node_ops: Vec<String> = proto_messages(&graph_fields, 1)
+            .iter()
+            .map(|node| {
+                proto_strings(&parse_test_proto(node), 4)
+                    .into_iter()
+                    .next()
+                    .expect("node op_type")
+            })
+            .collect();
+        assert_eq!(node_ops, vec!["MatMul".to_string(), "Identity".to_string()]);
+
+        let weight_fields = parse_test_proto(&proto_messages(&graph_fields, 5)[0]);
+        assert_eq!(proto_varints(&weight_fields, 1), vec![2, 1]);
+        assert_eq!(proto_varints(&weight_fields, 2), vec![1]);
+        assert_eq!(proto_f32s(&weight_fields, 4), vec![0.25, -0.5]);
+
+        let input = proto_messages(&graph_fields, 11)
+            .into_iter()
+            .next()
+            .expect("input value info");
+        assert_eq!(
+            value_info_shape(&input),
+            ("x".to_string(), 1, vec!["4".to_string(), "2".to_string()])
+        );
+    }
+
+    #[test]
+    fn linear_onnx_export_rejects_bad_bias_shape() {
+        use ft_core::{DenseTensor, Device};
+
+        let weight = DenseTensor::from_contiguous_values(vec![1.0, 2.0], vec![1, 2], Device::Cpu)
+            .expect("weight tensor");
+        let bias = DenseTensor::from_contiguous_values(vec![0.0, 1.0], vec![2], Device::Cpu)
+            .expect("bias tensor");
+        let config = super::OnnxLinearExportConfig::new("linear", "x", "y", "w");
+        let err = super::export_linear_onnx_to_bytes(&config, &weight, Some(&bias))
+            .expect_err("bias shape must be rejected");
+        assert!(err.to_string().contains("bias shape"));
+    }
+
     #[test]
     fn legacy_snapshot_wrappers_round_trip() {
         let entries = vec![SnapshotEntry {
@@ -2739,8 +3494,7 @@ mod tests {
         // "tensor error: " to the underlying DenseTensorError.
         // Use UnsupportedLayout as a deterministic wrappee.
         // Tracked under frankentorch-1okq.
-        let err: TensorIOError =
-            ft_core::DenseTensorError::UnsupportedLayout.into();
+        let err: TensorIOError = ft_core::DenseTensorError::UnsupportedLayout.into();
         insta::assert_snapshot!("tensor_error_wrapper_diagnostic", err.to_string());
     }
 
