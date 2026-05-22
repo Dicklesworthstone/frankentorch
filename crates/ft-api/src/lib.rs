@@ -14409,6 +14409,30 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place entr: element-wise entropy function (-x * log(x)).
+    pub fn tensor_entr_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_entr(target)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("entr_", target, None);
+        Ok(())
+    }
+
+    /// In-place zeta: Hurwitz zeta function.
+    pub fn tensor_zeta_(
+        &mut self,
+        target: TensorNodeId,
+        q: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_zeta(target, q)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("zeta_", target, None);
+        Ok(())
+    }
+
     /// In-place signum: -1 for negative, 0 for zero, +1 for positive.
     ///
     /// Equivalent to `tensor.sign_()` in PyTorch.
