@@ -6327,6 +6327,52 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Parametric ReLU activation.
+    ///
+    /// prelu(x, weight) = max(0,x) + weight * min(0,x)
+    /// Weight is a 1D tensor (per-channel) or scalar broadcasted.
+    /// Tracked under frankentorch-bf19.
+    pub fn tensor_prelu(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let weight_vals = self.tensor_values(weight)?;
+        let input_vals = self.tensor_values(input)?;
+
+        let result: Vec<f64> = if weight_vals.len() == 1 {
+            let w = weight_vals[0];
+            input_vals.iter().map(|&x| if x >= 0.0 { x } else { w * x }).collect()
+        } else {
+            let num_channels = weight_vals.len();
+            let channel_size: usize = if input_shape.len() >= 2 {
+                input_shape[2..].iter().product()
+            } else {
+                1
+            };
+            input_vals
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| {
+                    let c = if input_shape.len() >= 2 {
+                        (i / channel_size) % num_channels
+                    } else {
+                        i % num_channels
+                    };
+                    if x >= 0.0 { x } else { weight_vals[c] * x }
+                })
+                .collect()
+        };
+
+        let out = self.tensor_variable(result, input_shape, false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("prelu in={} weight={} out={}", input.0, weight.0, out.0),
+        );
+        Ok(out)
+    }
+
     pub fn tensor_rsqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.rsqrt(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -51467,5 +51513,18 @@ mod tests {
         assert!(vals[0].abs() < 1e-10); // celu(0) = 0
         assert!((vals[1] - 1.0).abs() < 1e-10); // celu(1) = 1
         assert!((vals[2] + 0.6321206).abs() < 1e-5); // celu(-1) = e^-1 - 1
+    }
+
+    #[test]
+    fn test_prelu_scalar_weight() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, -1.0, 2.0, -2.0], vec![4], false).unwrap();
+        let weight = s.tensor_variable(vec![0.25], vec![1], false).unwrap();
+        let result = s.tensor_prelu(input, weight).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[1] + 0.25).abs() < 1e-10); // -1 * 0.25
+        assert!((vals[2] - 2.0).abs() < 1e-10);
+        assert!((vals[3] + 0.5).abs() < 1e-10); // -2 * 0.25
     }
 }
