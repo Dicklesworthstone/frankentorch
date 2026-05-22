@@ -21818,6 +21818,15 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for `tensor_xlogy`. Equivalent to `torch.special.xlogy`.
+    pub fn tensor_special_xlogy(
+        &mut self,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_xlogy(x, y)
+    }
+
     /// In-place xlogy: target = target * log(other), with 0 * log(y) = 0 when y is not NaN.
     pub fn tensor_xlogy_(
         &mut self,
@@ -22018,6 +22027,14 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for `tensor_erfinv`. Equivalent to `torch.special.erfinv`.
+    pub fn tensor_special_erfinv(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfinv(input)
+    }
+
     /// Element-wise natural logarithm of the absolute value of the gamma function.
     ///
     /// Equivalent to `torch.special.gammaln(input)` / `torch.lgamma(input)`.
@@ -22121,6 +22138,14 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for `tensor_digamma`. Equivalent to `torch.special.digamma`.
+    pub fn tensor_special_digamma(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_digamma(input)
+    }
+
     /// Element-wise polygamma function of order n.
     ///
     /// Equivalent to `torch.special.polygamma(n, input)`.
@@ -22171,6 +22196,15 @@ impl FrankenTorchSession {
             format!("polygamma n={n} in={} out={}", input.0, out.0),
         );
         Ok(out)
+    }
+
+    /// Alias for `tensor_polygamma`. Equivalent to `torch.special.polygamma`.
+    pub fn tensor_special_polygamma(
+        &mut self,
+        n: u32,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_polygamma(n, input)
     }
 
     /// Modified Bessel function of the first kind, order 0.
@@ -22637,6 +22671,15 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for `tensor_xlog1py`. Equivalent to `torch.special.xlog1py`.
+    pub fn tensor_special_xlog1py(
+        &mut self,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_xlog1py(x, y)
+    }
+
     /// Scaled complementary error function: erfcx(x) = exp(x²) * erfc(x).
     ///
     /// Equivalent to `torch.special.erfcx(input)`.
@@ -22681,6 +22724,14 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for `tensor_erfcx`. Equivalent to `torch.special.erfcx`.
+    pub fn tensor_special_erfcx(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfcx(input)
+    }
+
     /// Hurwitz zeta function: zeta(s, a) = sum_{n=0}^{inf} (n+a)^(-s).
     ///
     /// Equivalent to `torch.special.zeta(input, q)`.
@@ -22720,6 +22771,15 @@ impl FrankenTorchSession {
             format!("zeta s={} a={} out={}", s.0, a.0, out.0),
         );
         Ok(out)
+    }
+
+    /// Alias for `tensor_zeta`. Equivalent to `torch.special.zeta`.
+    pub fn tensor_special_zeta(
+        &mut self,
+        s: TensorNodeId,
+        a: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_zeta(s, a)
     }
 
     /// Decompose floating-point numbers into mantissa and exponent.
@@ -23026,6 +23086,14 @@ impl FrankenTorchSession {
             format!("entr in={} out={}", input.0, out.0),
         );
         Ok(out)
+    }
+
+    /// Alias for `tensor_entr`. Equivalent to `torch.special.entr`.
+    pub fn tensor_special_entr(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_entr(input)
     }
 
     // ── logcumsumexp ─────────────────────────────────────────────────────
