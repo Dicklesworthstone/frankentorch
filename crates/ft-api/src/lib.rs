@@ -13086,6 +13086,40 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place ones: target = ones.
+    pub fn tensor_ones_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let numel = self.tensor_numel(target)?;
+        self.update_tensor_values_for_float(target, vec![1.0; numel], INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("ones_", target, None);
+        Ok(())
+    }
+
+    /// In-place Bernoulli: fill with 0 or 1 based on probability p.
+    pub fn tensor_bernoulli_(&mut self, target: TensorNodeId, p: f64) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let numel = self.tensor_numel(target)?;
+        let values: Vec<f64> = (0..numel)
+            .map(|_| if self.rng.next_f64() < p { 1.0 } else { 0.0 })
+            .collect();
+        self.update_tensor_values_for_float(target, values, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("bernoulli_", target, Some(format!("p={p}")));
+        Ok(())
+    }
+
+    /// In-place random: fill with uniform integers from [from, to).
+    pub fn tensor_random_(&mut self, target: TensorNodeId, from: i64, to: i64) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let numel = self.tensor_numel(target)?;
+        let range = (to - from) as f64;
+        let values: Vec<f64> = (0..numel)
+            .map(|_| from as f64 + (self.rng.next_f64() * range).floor())
+            .collect();
+        self.update_tensor_values_for_float(target, values, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("random_", target, Some(format!("from={from} to={to}")));
+        Ok(())
+    }
+
     /// In-place fill: target = fill_value.
     pub fn tensor_fill_(
         &mut self,
@@ -29927,6 +29961,38 @@ mod tests {
             .unwrap();
         s.tensor_fill_(a, 42.0).unwrap();
         assert_eq!(s.tensor_values(a).unwrap(), vec![42.0, 42.0, 42.0]);
+    }
+
+    #[test]
+    fn tensor_ones_in_place() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
+            .unwrap();
+        s.tensor_ones_(a).unwrap();
+        assert_eq!(s.tensor_values(a).unwrap(), vec![1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn tensor_bernoulli_in_place() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![0.5; 100], vec![100], false)
+            .unwrap();
+        s.tensor_bernoulli_(a, 0.5).unwrap();
+        let vals = s.tensor_values(a).unwrap();
+        assert!(vals.iter().all(|&v| v == 0.0 || v == 1.0));
+    }
+
+    #[test]
+    fn tensor_random_in_place() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s
+            .tensor_variable(vec![0.0; 100], vec![100], false)
+            .unwrap();
+        s.tensor_random_(a, 0, 10).unwrap();
+        let vals = s.tensor_values(a).unwrap();
+        assert!(vals.iter().all(|&v| v >= 0.0 && v < 10.0 && v.fract() == 0.0));
     }
 
     #[test]
