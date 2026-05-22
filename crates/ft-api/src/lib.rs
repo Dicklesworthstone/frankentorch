@@ -13,8 +13,8 @@ use ft_autograd::{
     UnaryOperationEvent,
 };
 use ft_core::{
-    BFloat16, Complex64, Complex128, DType, DenseI64Tensor, DenseTensor, ExecutionMode, Float16,
-    SparseCOOTensor, SparseCSRTensor, SparseTensorError, TensorCompatError, TensorMeta,
+    BFloat16, Complex64, Complex128, DType, DenseI64Tensor, DenseTensor, Device, ExecutionMode,
+    Float16, SparseCOOTensor, SparseCSRTensor, SparseTensorError, TensorCompatError, TensorMeta,
     TensorStorage, contiguous_strides,
 };
 use ft_dispatch::{
@@ -14372,6 +14372,15 @@ impl FrankenTorchSession {
     pub fn tensor_is_signed(&self, node: TensorNodeId) -> Result<bool, AutogradError> {
         let dtype = self.tensor_dtype(node)?;
         Ok(dtype.is_floating_point() || dtype.is_complex() || matches!(dtype, DType::I64 | DType::I32))
+    }
+
+    pub fn tensor_device(&self, node: TensorNodeId) -> Result<Device, AutogradError> {
+        let tensor = self.tensor_tape.tensor(node)?;
+        Ok(tensor.meta().device())
+    }
+
+    pub fn tensor_get_device(&self, node: TensorNodeId) -> Result<Device, AutogradError> {
+        self.tensor_device(node)
     }
 
     /// Alias for `tensor_dim`. Equivalent to `tensor.ndim` in PyTorch.
@@ -52649,5 +52658,13 @@ mod tests {
         assert!(s.tensor_is_floating_point(f64_tensor).unwrap());
         assert!(!s.tensor_is_complex(f64_tensor).unwrap());
         assert!(s.tensor_is_signed(f64_tensor).unwrap());
+    }
+
+    #[test]
+    fn test_tensor_device() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        assert_eq!(s.tensor_device(x).unwrap(), Device::Cpu);
+        assert_eq!(s.tensor_get_device(x).unwrap(), Device::Cpu);
     }
 }
