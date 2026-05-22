@@ -13751,6 +13751,134 @@ impl Module for ReflectionPad2d {
     }
 }
 
+/// Reflection padding for 3D inputs.
+///
+/// Padding order matches PyTorch: `(left, right, top, bottom, front, back)`.
+pub struct ReflectionPad3d {
+    pad_left: usize,
+    pad_right: usize,
+    pad_top: usize,
+    pad_bottom: usize,
+    pad_front: usize,
+    pad_back: usize,
+}
+
+impl ReflectionPad3d {
+    #[must_use]
+    pub fn new(padding: (usize, usize, usize, usize, usize, usize)) -> Self {
+        Self {
+            pad_left: padding.0,
+            pad_right: padding.1,
+            pad_top: padding.2,
+            pad_bottom: padding.3,
+            pad_front: padding.4,
+            pad_back: padding.5,
+        }
+    }
+}
+
+impl Module for ReflectionPad3d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = session.tensor_shape(input)?;
+        let ndim = input_shape.len();
+        if ndim < 3 {
+            return Err(incompatible_error(
+                "ReflectionPad3d requires at least 3D input",
+            ));
+        }
+
+        let d = input_shape[ndim - 3];
+        let h = input_shape[ndim - 2];
+        let w = input_shape[ndim - 1];
+        if self.pad_front >= d
+            || self.pad_back >= d
+            || self.pad_top >= h
+            || self.pad_bottom >= h
+            || self.pad_left >= w
+            || self.pad_right >= w
+        {
+            return Err(incompatible_error(
+                "ReflectionPad3d: padding must be < input size",
+            ));
+        }
+
+        let pad_d = checked_add(
+            self.pad_front,
+            self.pad_back,
+            "ReflectionPad3d padding overflow",
+        )?;
+        let pad_h = checked_add(
+            self.pad_top,
+            self.pad_bottom,
+            "ReflectionPad3d padding overflow",
+        )?;
+        let pad_w = checked_add(
+            self.pad_left,
+            self.pad_right,
+            "ReflectionPad3d padding overflow",
+        )?;
+        let new_d = checked_add(d, pad_d, "ReflectionPad3d output depth overflow")?;
+        let new_h = checked_add(h, pad_h, "ReflectionPad3d output height overflow")?;
+        let new_w = checked_add(w, pad_w, "ReflectionPad3d output width overflow")?;
+
+        let mut col_indices: Vec<f64> = Vec::with_capacity(new_w);
+        for j in 0..self.pad_left {
+            #[allow(clippy::cast_precision_loss)]
+            col_indices.push((self.pad_left - j) as f64);
+        }
+        for i in 0..w {
+            #[allow(clippy::cast_precision_loss)]
+            col_indices.push(i as f64);
+        }
+        for i in 0..self.pad_right {
+            #[allow(clippy::cast_precision_loss)]
+            col_indices.push((w - 2 - i) as f64);
+        }
+        let col_t = session.tensor_variable(col_indices, vec![new_w], false)?;
+        let after_w = session.tensor_index_select(input, ndim - 1, col_t)?;
+
+        let mut row_indices: Vec<f64> = Vec::with_capacity(new_h);
+        for j in 0..self.pad_top {
+            #[allow(clippy::cast_precision_loss)]
+            row_indices.push((self.pad_top - j) as f64);
+        }
+        for i in 0..h {
+            #[allow(clippy::cast_precision_loss)]
+            row_indices.push(i as f64);
+        }
+        for i in 0..self.pad_bottom {
+            #[allow(clippy::cast_precision_loss)]
+            row_indices.push((h - 2 - i) as f64);
+        }
+        let row_t = session.tensor_variable(row_indices, vec![new_h], false)?;
+        let after_h = session.tensor_index_select(after_w, ndim - 2, row_t)?;
+
+        let mut depth_indices: Vec<f64> = Vec::with_capacity(new_d);
+        for j in 0..self.pad_front {
+            #[allow(clippy::cast_precision_loss)]
+            depth_indices.push((self.pad_front - j) as f64);
+        }
+        for i in 0..d {
+            #[allow(clippy::cast_precision_loss)]
+            depth_indices.push(i as f64);
+        }
+        for i in 0..self.pad_back {
+            #[allow(clippy::cast_precision_loss)]
+            depth_indices.push((d - 2 - i) as f64);
+        }
+        let depth_t = session.tensor_variable(depth_indices, vec![new_d], false)?;
+        session.tensor_index_select(after_h, ndim - 3, depth_t)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 /// Replication padding for 1D inputs (3D tensors `[N, C, L]`).
 ///
 /// Pads by replicating the edge value: `[a, b, c, d]` with pad=2 -> `[a, a, a, b, c, d, d, d]`.
@@ -26283,6 +26411,45 @@ mod tests {
     }
 
     #[test]
+    fn reflection_pad3d_basic() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(
+                (1..=27).map(f64::from).collect(),
+                vec![1, 1, 3, 3, 3],
+                false,
+            )
+            .unwrap();
+        let pad = ReflectionPad3d::new((1, 1, 1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let shape = session.tensor_shape(output).unwrap();
+        assert_eq!(shape, vec![1, 1, 5, 5, 5]);
+        let vals = session.tensor_values(output).unwrap();
+
+        assert!((vals[0] - 14.0).abs() < 1e-10);
+        assert!((vals[31] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn reflection_pad3d_rejects_invalid_contracts() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![1.0; 8], vec![1, 1, 2, 2, 2], false)
+            .unwrap();
+        let too_large = ReflectionPad3d::new((2, 0, 0, 0, 0, 0));
+        assert!(too_large.forward(&mut session, input).is_err());
+
+        let rank2 = session
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let pad = ReflectionPad3d::new((0, 0, 0, 0, 0, 0));
+        let err = pad
+            .forward(&mut session, rank2)
+            .expect_err("rank-2 input must fail closed");
+        assert!(format!("{err:?}").contains("ReflectionPad3d requires at least 3D input"));
+    }
+
+    #[test]
     fn replication_pad1d_basic() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = session
@@ -26413,6 +26580,11 @@ mod tests {
     fn padding_no_parameters() {
         assert!(ReflectionPad1d::new((1, 1)).parameters().is_empty());
         assert!(ReflectionPad2d::new((1, 1, 1, 1)).parameters().is_empty());
+        assert!(
+            ReflectionPad3d::new((1, 1, 1, 1, 1, 1))
+                .parameters()
+                .is_empty()
+        );
         assert!(ReplicationPad1d::new((1, 1)).parameters().is_empty());
         assert!(ReplicationPad2d::new((1, 1, 1, 1)).parameters().is_empty());
         assert!(
@@ -26507,6 +26679,30 @@ mod tests {
         // Total grad mass equals output element count (5*5 = 25 ones).
         let total: f64 = grad.iter().sum();
         assert!((total - 25.0).abs() < 1e-9, "total grad mass = {}", total);
+    }
+
+    #[test]
+    fn reflection_pad3d_propagates_input_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = session
+            .tensor_variable(vec![1.0; 27], vec![1, 1, 3, 3, 3], true)
+            .unwrap();
+        let pad = ReflectionPad3d::new((1, 1, 1, 1, 1, 1));
+        let output = pad.forward(&mut session, input).unwrap();
+        let loss = session.tensor_sum(output).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let grad = session
+            .tensor_gradient(&report, input)
+            .expect("input gradient should exist");
+
+        assert_eq!(grad.len(), 27);
+        assert!(
+            grad.iter().all(|g| g.is_finite() && *g > 0.0),
+            "every input position is referenced at least once: {:?}",
+            grad
+        );
+        let total: f64 = grad.iter().sum();
+        assert!((total - 125.0).abs() < 1e-9, "total grad mass = {}", total);
     }
 
     #[test]
