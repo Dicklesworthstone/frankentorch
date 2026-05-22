@@ -5661,6 +5661,18 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    pub fn tensor_arcsin(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_asin(input)
+    }
+
+    pub fn tensor_arccos(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_acos(input)
+    }
+
+    pub fn tensor_arctan(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atan(input)
+    }
+
     pub fn tensor_sinh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.sinh(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -6368,6 +6380,18 @@ impl FrankenTorchSession {
         let ratio = self.tensor_div(num, den)?;
         let log_ratio = self.tensor_log(ratio)?;
         self.tensor_mul(log_ratio, half)
+    }
+
+    pub fn tensor_arcsinh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_asinh(input)
+    }
+
+    pub fn tensor_arccosh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_acosh(input)
+    }
+
+    pub fn tensor_arctanh(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atanh(input)
     }
 
     pub fn tensor_gelu(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
@@ -7146,6 +7170,14 @@ impl FrankenTorchSession {
         let (out, event) = self.tensor_tape.tensor_atan2(lhs, rhs, self.mode())?;
         self.record_tensor_operation(&event);
         Ok(out)
+    }
+
+    pub fn tensor_arctan2(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atan2(lhs, rhs)
     }
 
     /// Element-wise angle (in radians) for real tensors.
@@ -52462,5 +52494,35 @@ mod tests {
         let y_grad = s.tensor_accumulated_gradient(y).unwrap();
         assert!(y_grad.is_some());
         assert_eq!(y_grad.unwrap(), vec![1.0, 1.0]);
+    }
+
+    #[test]
+    fn test_arc_trig_aliases() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.5], vec![1], false).unwrap();
+        let arcsin = s.tensor_arcsin(x).unwrap();
+        let asin = s.tensor_asin(x).unwrap();
+        assert_eq!(s.tensor_values(arcsin).unwrap(), s.tensor_values(asin).unwrap());
+        let arccos = s.tensor_arccos(x).unwrap();
+        let acos = s.tensor_acos(x).unwrap();
+        assert_eq!(s.tensor_values(arccos).unwrap(), s.tensor_values(acos).unwrap());
+        let arctan = s.tensor_arctan(x).unwrap();
+        let atan = s.tensor_atan(x).unwrap();
+        assert_eq!(s.tensor_values(arctan).unwrap(), s.tensor_values(atan).unwrap());
+        let arcsinh = s.tensor_arcsinh(x).unwrap();
+        let asinh = s.tensor_asinh(x).unwrap();
+        assert_eq!(s.tensor_values(arcsinh).unwrap(), s.tensor_values(asinh).unwrap());
+        let y = s.tensor_variable(vec![1.5], vec![1], false).unwrap();
+        let arccosh = s.tensor_arccosh(y).unwrap();
+        let acosh = s.tensor_acosh(y).unwrap();
+        assert_eq!(s.tensor_values(arccosh).unwrap(), s.tensor_values(acosh).unwrap());
+        let arctanh = s.tensor_arctanh(x).unwrap();
+        let atanh = s.tensor_atanh(x).unwrap();
+        assert_eq!(s.tensor_values(arctanh).unwrap(), s.tensor_values(atanh).unwrap());
+        let a = s.tensor_variable(vec![1.0], vec![1], false).unwrap();
+        let b = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        let arctan2 = s.tensor_arctan2(a, b).unwrap();
+        let atan2 = s.tensor_atan2(a, b).unwrap();
+        assert_eq!(s.tensor_values(arctan2).unwrap(), s.tensor_values(atan2).unwrap());
     }
 }
