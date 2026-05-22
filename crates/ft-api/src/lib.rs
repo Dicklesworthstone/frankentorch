@@ -5309,6 +5309,34 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// In-place lerp: target = target + weight * (end - target).
+    pub fn tensor_lerp_(
+        &mut self,
+        target: TensorNodeId,
+        end: TensorNodeId,
+        weight: f64,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let target_vals = self.tensor_values(target)?;
+        let end_vals = self.tensor_values(end)?;
+        if target_vals.len() != end_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(target)?,
+                    rhs: self.tensor_shape(end)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = target_vals
+            .iter()
+            .zip(end_vals.iter())
+            .map(|(&s, &e)| s + weight * (e - s))
+            .collect();
+        self.update_tensor_values_for_float(target, result, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("lerp_", target, Some(format!("weight={weight}")));
+        Ok(())
+    }
+
     /// `torch.addcmul`: `input + value * tensor1 * tensor2`.
     ///
     /// Composed through autograd-aware primitives, so gradients flow to
@@ -5339,6 +5367,68 @@ impl FrankenTorchSession {
         let quot = self.tensor_div(tensor1, tensor2)?;
         let scaled = self.scale_by_constant(quot, value)?;
         self.tensor_add(input, scaled)
+    }
+
+    /// In-place addcmul: target += value * tensor1 * tensor2.
+    pub fn tensor_addcmul_(
+        &mut self,
+        target: TensorNodeId,
+        tensor1: TensorNodeId,
+        tensor2: TensorNodeId,
+        value: f64,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let target_vals = self.tensor_values(target)?;
+        let t1_vals = self.tensor_values(tensor1)?;
+        let t2_vals = self.tensor_values(tensor2)?;
+        if target_vals.len() != t1_vals.len() || target_vals.len() != t2_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(target)?,
+                    rhs: self.tensor_shape(tensor1)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = target_vals
+            .iter()
+            .zip(t1_vals.iter())
+            .zip(t2_vals.iter())
+            .map(|((&t, &t1), &t2)| t + value * t1 * t2)
+            .collect();
+        self.update_tensor_values_for_float(target, result, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("addcmul_", target, Some(format!("value={value}")));
+        Ok(())
+    }
+
+    /// In-place addcdiv: target += value * tensor1 / tensor2.
+    pub fn tensor_addcdiv_(
+        &mut self,
+        target: TensorNodeId,
+        tensor1: TensorNodeId,
+        tensor2: TensorNodeId,
+        value: f64,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let target_vals = self.tensor_values(target)?;
+        let t1_vals = self.tensor_values(tensor1)?;
+        let t2_vals = self.tensor_values(tensor2)?;
+        if target_vals.len() != t1_vals.len() || target_vals.len() != t2_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(target)?,
+                    rhs: self.tensor_shape(tensor1)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = target_vals
+            .iter()
+            .zip(t1_vals.iter())
+            .zip(t2_vals.iter())
+            .map(|((&t, &t1), &t2)| t + value * t1 / t2)
+            .collect();
+        self.update_tensor_values_for_float(target, result, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("addcdiv_", target, Some(format!("value={value}")));
+        Ok(())
     }
 
     /// Multiplies `node` by a non-grad scalar constant. `value == 1.0`
@@ -53892,6 +53982,33 @@ mod tests {
         s.tensor_triu_(b, 0).unwrap();
         let vals2 = s.tensor_values(b).unwrap();
         assert_eq!(vals2, vec![1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]);
+    }
+
+    #[test]
+    fn test_tensor_lerp_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let b = s.tensor_variable(vec![5.0, 6.0, 7.0], vec![3], false).unwrap();
+        s.tensor_lerp_(a, b, 0.5).unwrap();
+        let vals = s.tensor_values(a).unwrap();
+        assert_eq!(vals, vec![3.0, 4.0, 5.0]);
+    }
+
+    #[test]
+    fn test_tensor_addcmul_addcdiv_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let t1 = s.tensor_variable(vec![2.0, 3.0, 4.0], vec![3], false).unwrap();
+        let t2 = s.tensor_variable(vec![1.0, 2.0, 2.0], vec![3], false).unwrap();
+        s.tensor_addcmul_(a, t1, t2, 0.5).unwrap();
+        let vals = s.tensor_values(a).unwrap();
+        assert_eq!(vals, vec![2.0, 5.0, 7.0]);
+        let b = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let t3 = s.tensor_variable(vec![4.0, 6.0, 8.0], vec![3], false).unwrap();
+        let t4 = s.tensor_variable(vec![2.0, 2.0, 2.0], vec![3], false).unwrap();
+        s.tensor_addcdiv_(b, t3, t4, 1.0).unwrap();
+        let vals2 = s.tensor_values(b).unwrap();
+        assert_eq!(vals2, vec![3.0, 5.0, 7.0]);
     }
 
     #[test]
