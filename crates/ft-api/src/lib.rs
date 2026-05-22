@@ -11635,6 +11635,16 @@ impl FrankenTorchSession {
         self.tensor_adjoint(input)
     }
 
+    #[allow(non_snake_case)]
+    pub fn tensor_mT(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matrix_transpose(input)
+    }
+
+    #[allow(non_snake_case)]
+    pub fn tensor_mH(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_adjoint(input)
+    }
+
     /// Swap two dimensions; alias for `tensor_transpose`.
     ///
     /// Equivalent to `torch.swapaxes(input, dim0, dim1)`. PyTorch
@@ -52839,5 +52849,18 @@ mod tests {
         let y = s.tensor_variable(vec![-1.0, 0.5, 2.0], vec![3], false).unwrap();
         s.tensor_clamp_max_(y, 1.0).unwrap();
         assert_eq!(s.tensor_values(y).unwrap(), vec![-1.0, 0.5, 1.0]);
+    }
+
+    #[test]
+    fn test_mt_mh() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
+        let mt = s.tensor_mT(x).unwrap();
+        let matrix_t = s.tensor_matrix_transpose(x).unwrap();
+        assert_eq!(s.tensor_shape(mt).unwrap(), vec![3, 2]);
+        assert_eq!(s.tensor_values(mt).unwrap(), s.tensor_values(matrix_t).unwrap());
+        let mh = s.tensor_mH(x).unwrap();
+        let adjoint = s.tensor_adjoint(x).unwrap();
+        assert_eq!(s.tensor_values(mh).unwrap(), s.tensor_values(adjoint).unwrap());
     }
 }
