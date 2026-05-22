@@ -906,6 +906,16 @@ impl FrankenTorchSession {
         self.tensor_to_dtype(input, DType::I64)
     }
 
+    /// PyTorch-style alias for casting a tensor to bool.
+    ///
+    /// Equivalent to `tensor.bool()` in PyTorch.
+    ///
+    /// Tape-level Bool conversion is not yet implemented; this call
+    /// currently returns `AutogradError::DenseTensor(UnsupportedDType(Bool))`.
+    pub fn tensor_bool(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_to_dtype(input, DType::Bool)
+    }
+
     /// Cast a tensor to the given dtype.
     ///
     /// Supported floating-point casts today: F32 ↔ F64. F16 and BF16
@@ -53012,6 +53022,22 @@ mod tests {
                 )))
             ),
             "tensor_long should exist and return UnsupportedDType(I64) until tape-level I64 conversion lands"
+        );
+    }
+
+    #[test]
+    fn test_tensor_bool() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false).unwrap();
+        let bool_result = s.tensor_bool(x);
+        assert!(
+            matches!(
+                bool_result,
+                Err(AutogradError::DenseTensor(ft_core::DenseTensorError::UnsupportedDType(
+                    DType::Bool
+                )))
+            ),
+            "tensor_bool should exist and return UnsupportedDType(Bool) until tape-level Bool conversion lands"
         );
     }
 }
