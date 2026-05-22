@@ -14379,6 +14379,21 @@ impl FrankenTorchSession {
         })
     }
 
+    /// In-place sgn: alias for sign_ for real-valued tensors.
+    pub fn tensor_sgn_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.tensor_sign_(target)
+    }
+
+    /// In-place signbit: target = signbit(target) ? 1.0 : 0.0.
+    pub fn tensor_signbit_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_signbit(target)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("signbit_", target, None);
+        Ok(())
+    }
+
     /// In-place reciprocal: 1/x for each element.
     ///
     /// Equivalent to `tensor.reciprocal_()` in PyTorch.
