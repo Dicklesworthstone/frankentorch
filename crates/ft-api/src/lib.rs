@@ -19877,6 +19877,276 @@ impl FrankenTorchSession {
         self.tensor_complex(re_node, im_node)
     }
 
+    /// Compute the 2-D real FFT (non-redundant complex output).
+    ///
+    /// Equivalent to `torch.fft.rfft2(input)`.
+    /// For real input of shape [..., H, W], outputs complex of shape [..., H, W/2+1].
+    /// Tracked under frankentorch-ffpd.
+    pub fn tensor_rfft2(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "rfft2: autograd not supported (Wirtinger calculus not yet implemented)",
+                },
+            )));
+        }
+        let shape = self.tensor_shape(input)?;
+        if shape.len() < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "rfft2: input must be at least 2-D",
+                },
+            )));
+        }
+        let ndim = shape.len();
+        let vals = self.tensor_values(input)?;
+        let rows = shape[ndim - 2];
+        let cols = shape[ndim - 1];
+        let out_cols = cols / 2 + 1;
+        let batch_size: usize = shape[..ndim - 2].iter().product();
+
+        let mut re_tmp = vec![0.0_f64; batch_size * rows * cols];
+        let mut im_tmp = vec![0.0_f64; batch_size * rows * cols];
+
+        // FFT along columns (last dim) for each row
+        for b in 0..batch_size {
+            for r in 0..rows {
+                let start = b * rows * cols + r * cols;
+                let mut re_row: Vec<f64> = vals[start..start + cols].to_vec();
+                let mut im_row = vec![0.0_f64; cols];
+                Self::dft_inplace_1d(&mut re_row, &mut im_row, false);
+                re_tmp[start..start + cols].copy_from_slice(&re_row);
+                im_tmp[start..start + cols].copy_from_slice(&im_row);
+            }
+        }
+
+        // FFT along rows (second-to-last dim)
+        for b in 0..batch_size {
+            for c in 0..cols {
+                let mut re_col = vec![0.0_f64; rows];
+                let mut im_col = vec![0.0_f64; rows];
+                for r in 0..rows {
+                    re_col[r] = re_tmp[b * rows * cols + r * cols + c];
+                    im_col[r] = im_tmp[b * rows * cols + r * cols + c];
+                }
+                Self::dft_inplace_1d(&mut re_col, &mut im_col, false);
+                for r in 0..rows {
+                    re_tmp[b * rows * cols + r * cols + c] = re_col[r];
+                    im_tmp[b * rows * cols + r * cols + c] = im_col[r];
+                }
+            }
+        }
+
+        // Keep only the non-redundant frequencies (first out_cols columns)
+        let mut re_out = Vec::with_capacity(batch_size * rows * out_cols);
+        let mut im_out = Vec::with_capacity(batch_size * rows * out_cols);
+        for b in 0..batch_size {
+            for r in 0..rows {
+                for c in 0..out_cols {
+                    re_out.push(re_tmp[b * rows * cols + r * cols + c]);
+                    im_out.push(im_tmp[b * rows * cols + r * cols + c]);
+                }
+            }
+        }
+
+        let mut out_shape = shape[..ndim - 1].to_vec();
+        out_shape.push(out_cols);
+        let re_node = self.tensor_variable(re_out, out_shape.clone(), false)?;
+        let im_node = self.tensor_variable(im_out, out_shape, false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
+    /// Compute the inverse 2-D real FFT.
+    ///
+    /// Equivalent to `torch.fft.irfft2(input, s)`.
+    /// Input is complex of shape [..., H, W/2+1]. Output is real of shape [..., H, W].
+    /// If `s` is None, W is inferred as 2*(W/2+1 - 1) = original width.
+    /// Tracked under frankentorch-ffpd.
+    pub fn tensor_irfft2(
+        &mut self,
+        input: TensorNodeId,
+        s: Option<(usize, usize)>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "irfft2: autograd not supported",
+                },
+            )));
+        }
+        let dtype = self.tensor_dtype(input)?;
+        if dtype != DType::Complex128 && dtype != DType::Complex64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "irfft2: input must be complex",
+                },
+            )));
+        }
+
+        let shape = self.tensor_shape(input)?;
+        if shape.len() < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "irfft2: input must be at least 2-D",
+                },
+            )));
+        }
+
+        let real_view = self.tensor_view_as_real(input)?;
+        let vals = self.tensor_values(real_view)?;
+
+        let ndim = shape.len();
+        let rows = shape[ndim - 2];
+        let in_cols = shape[ndim - 1];
+        let (out_rows, out_cols) = s.unwrap_or((rows, (in_cols - 1) * 2));
+        let batch_size: usize = shape[..ndim - 2].iter().product();
+
+        let mut re_full = vec![0.0_f64; batch_size * out_rows * out_cols];
+        let mut im_full = vec![0.0_f64; batch_size * out_rows * out_cols];
+
+        // Reconstruct full spectrum using conjugate symmetry along last dim
+        for b in 0..batch_size {
+            for r in 0..rows.min(out_rows) {
+                // Copy input frequencies
+                for c in 0..in_cols.min(out_cols) {
+                    let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
+                    let out_idx = b * out_rows * out_cols + r * out_cols + c;
+                    re_full[out_idx] = vals[in_idx];
+                    im_full[out_idx] = vals[in_idx + 1];
+                }
+                // Mirror for remaining columns: X[N-k] = conj(X[k])
+                for c in 1..in_cols.min(out_cols) {
+                    let mirror = out_cols - c;
+                    if mirror < out_cols && mirror >= in_cols {
+                        let in_idx = (b * rows * in_cols + r * in_cols + c) * 2;
+                        let out_idx = b * out_rows * out_cols + r * out_cols + mirror;
+                        re_full[out_idx] = vals[in_idx];
+                        im_full[out_idx] = -vals[in_idx + 1];
+                    }
+                }
+            }
+        }
+
+        // Inverse FFT along rows (second-to-last dim)
+        for b in 0..batch_size {
+            for c in 0..out_cols {
+                let mut re_col = vec![0.0_f64; out_rows];
+                let mut im_col = vec![0.0_f64; out_rows];
+                for r in 0..out_rows {
+                    re_col[r] = re_full[b * out_rows * out_cols + r * out_cols + c];
+                    im_col[r] = im_full[b * out_rows * out_cols + r * out_cols + c];
+                }
+                Self::dft_inplace_1d(&mut re_col, &mut im_col, true);
+                for r in 0..out_rows {
+                    re_full[b * out_rows * out_cols + r * out_cols + c] = re_col[r];
+                    im_full[b * out_rows * out_cols + r * out_cols + c] = im_col[r];
+                }
+            }
+        }
+
+        // Inverse FFT along columns (last dim)
+        for b in 0..batch_size {
+            for r in 0..out_rows {
+                let start = b * out_rows * out_cols + r * out_cols;
+                let mut re_row: Vec<f64> = re_full[start..start + out_cols].to_vec();
+                let mut im_row: Vec<f64> = im_full[start..start + out_cols].to_vec();
+                Self::dft_inplace_1d(&mut re_row, &mut im_row, true);
+                re_full[start..start + out_cols].copy_from_slice(&re_row);
+            }
+        }
+
+        let mut out_shape = shape[..ndim - 2].to_vec();
+        out_shape.push(out_rows);
+        out_shape.push(out_cols);
+        self.tensor_variable(re_full, out_shape, false)
+    }
+
+    /// Compute the Hermitian FFT (complex Hermitian input -> real output).
+    ///
+    /// Equivalent to `torch.fft.hfft(input, n)`.
+    /// Input is complex of length n/2+1 representing a Hermitian-symmetric signal.
+    /// Output is real of length n.
+    /// Tracked under frankentorch-ffpd.
+    pub fn tensor_hfft(
+        &mut self,
+        input: TensorNodeId,
+        n: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "hfft: autograd not supported",
+                },
+            )));
+        }
+        let dtype = self.tensor_dtype(input)?;
+        if dtype != DType::Complex128 && dtype != DType::Complex64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "hfft: input must be complex",
+                },
+            )));
+        }
+
+        let real_view = self.tensor_view_as_real(input)?;
+        let vals = self.tensor_values(real_view)?;
+        let freq_len = vals.len() / 2;
+        let out_len = n.unwrap_or((freq_len - 1) * 2);
+
+        // Reconstruct full spectrum using conjugate symmetry, then FFT
+        let mut re_full = vec![0.0; out_len];
+        let mut im_full = vec![0.0; out_len];
+
+        for k in 0..freq_len.min(out_len) {
+            re_full[k] = vals[k * 2];
+            im_full[k] = vals[k * 2 + 1];
+        }
+        for k in 1..freq_len.min(out_len) {
+            let mirror = out_len - k;
+            if mirror < out_len {
+                re_full[mirror] = vals[k * 2];
+                im_full[mirror] = -vals[k * 2 + 1];
+            }
+        }
+
+        // Forward FFT (not inverse) to get real output
+        Self::dft_inplace_1d(&mut re_full, &mut im_full, false);
+
+        self.tensor_variable(re_full, vec![out_len], false)
+    }
+
+    /// Compute the inverse Hermitian FFT (real input -> complex Hermitian output).
+    ///
+    /// Equivalent to `torch.fft.ihfft(input)`.
+    /// Input is real of length n. Output is complex of length n/2+1.
+    /// Tracked under frankentorch-ffpd.
+    pub fn tensor_ihfft(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "ihfft: autograd not supported",
+                },
+            )));
+        }
+
+        let vals = self.tensor_values(input)?;
+        let n = vals.len();
+        let out_len = n / 2 + 1;
+
+        // Inverse FFT of real input
+        let mut re_buf = vals;
+        let mut im_buf = vec![0.0_f64; n];
+        Self::dft_inplace_1d(&mut re_buf, &mut im_buf, true);
+
+        // Keep only the first n/2+1 bins (Hermitian-symmetric)
+        let re_out: Vec<f64> = re_buf[..out_len].to_vec();
+        let im_out: Vec<f64> = im_buf[..out_len].to_vec();
+
+        let re_node = self.tensor_variable(re_out, vec![out_len], false)?;
+        let im_node = self.tensor_variable(im_out, vec![out_len], false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
     // ── logsumexp ────────────────────────────────────────────────────────
     /// Numerically stable log-sum-exp reduction along a dimension.
     ///
@@ -49663,5 +49933,83 @@ mod tests {
         assert!((vals[0] - 4.0).abs() < 1e-10);
         assert!((vals[1] - 5.0).abs() < 1e-10);
         assert!((vals[2] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_rfft2_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // 2x4 real input
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 4], false)
+            .unwrap();
+        let out = s.tensor_rfft2(input).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        // Output should be [2, 3] (4/2+1=3 columns)
+        assert_eq!(shape, vec![2, 3]);
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::Complex128);
+    }
+
+    #[test]
+    fn test_irfft2_roundtrip() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0], vec![2, 4], false)
+            .unwrap();
+        let freq = s.tensor_rfft2(input).unwrap();
+        let back = s.tensor_irfft2(freq, Some((2, 4))).unwrap();
+        let vals = s.tensor_values(back).unwrap();
+        // Should reconstruct original
+        for (i, expected) in [1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0].iter().enumerate() {
+            assert!(
+                (vals[i] - expected).abs() < 1e-10,
+                "irfft2 mismatch at {}: {} vs {}",
+                i,
+                vals[i],
+                expected
+            );
+        }
+    }
+
+    #[test]
+    fn test_hfft_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Complex input representing Hermitian-symmetric signal
+        let re = s.tensor_variable(vec![10.0, 1.0, 2.0], vec![3], false).unwrap();
+        let im = s.tensor_variable(vec![0.0, -1.0, 0.0], vec![3], false).unwrap();
+        let input = s.tensor_complex(re, im).unwrap();
+        let out = s.tensor_hfft(input, Some(4)).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![4]);
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::F64);
+    }
+
+    #[test]
+    fn test_ihfft_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        let out = s.tensor_ihfft(input).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        // Output should be [3] (4/2+1=3)
+        assert_eq!(shape, vec![3]);
+        assert_eq!(s.tensor_dtype(out).unwrap(), DType::Complex128);
+    }
+
+    #[test]
+    fn test_hfft_ihfft_roundtrip() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let original = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        let freq = s.tensor_ihfft(original).unwrap();
+        let back = s.tensor_hfft(freq, Some(4)).unwrap();
+        let vals = s.tensor_values(back).unwrap();
+        // Should reconstruct original
+        for (i, expected) in [1.0, 2.0, 3.0, 4.0].iter().enumerate() {
+            assert!(
+                (vals[i] - expected).abs() < 1e-10,
+                "hfft roundtrip mismatch at {}: {} vs {}",
+                i,
+                vals[i],
+                expected
+            );
+        }
     }
 }
