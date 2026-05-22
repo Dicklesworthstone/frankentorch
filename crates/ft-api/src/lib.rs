@@ -22001,6 +22001,76 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place bitwise AND: target = target & other.
+    pub fn tensor_bitwise_and_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_bitwise_and(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("bitwise_and_", target, None);
+        Ok(())
+    }
+
+    /// In-place bitwise OR: target = target | other.
+    pub fn tensor_bitwise_or_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_bitwise_or(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("bitwise_or_", target, None);
+        Ok(())
+    }
+
+    /// In-place bitwise XOR: target = target ^ other.
+    pub fn tensor_bitwise_xor_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_bitwise_xor(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("bitwise_xor_", target, None);
+        Ok(())
+    }
+
+    /// In-place left bit shift: target = target << other.
+    pub fn tensor_bitwise_left_shift_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_bitwise_left_shift(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("bitwise_left_shift_", target, None);
+        Ok(())
+    }
+
+    /// In-place right bit shift: target = target >> other.
+    pub fn tensor_bitwise_right_shift_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_bitwise_right_shift(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("bitwise_right_shift_", target, None);
+        Ok(())
+    }
+
     /// Element-wise entropy: -x * log(x).
     ///
     /// Equivalent to `torch.special.entr(input)`.
