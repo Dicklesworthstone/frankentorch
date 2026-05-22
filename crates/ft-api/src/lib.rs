@@ -13285,6 +13285,20 @@ impl FrankenTorchSession {
         self.apply_tensor_unary_in_place("frac_", target, None, |x| x - x.floor())
     }
 
+    /// In-place base-2 logarithm.
+    ///
+    /// Equivalent to `tensor.log2_()` in PyTorch.
+    pub fn tensor_log2_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("log2_", target, None, f64::log2)
+    }
+
+    /// In-place base-10 logarithm.
+    ///
+    /// Equivalent to `tensor.log10_()` in PyTorch.
+    pub fn tensor_log10_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("log10_", target, None, f64::log10)
+    }
+
     pub fn tensor_clamp_(
         &mut self,
         target: TensorNodeId,
@@ -53204,5 +53218,16 @@ mod tests {
         let x = s.tensor_variable(vec![1.5, -2.3, 3.0], vec![3], false).unwrap();
         s.tensor_frac_(x).unwrap();
         assert_eq!(s.tensor_shape(x).unwrap(), vec![3]);
+    }
+
+    #[test]
+    fn test_tensor_log2_log10_() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 4.0], vec![3], false).unwrap();
+        s.tensor_log2_(x).unwrap();
+        assert_eq!(s.tensor_shape(x).unwrap(), vec![3]);
+        let y = s.tensor_variable(vec![1.0, 10.0, 100.0], vec![3], false).unwrap();
+        s.tensor_log10_(y).unwrap();
+        assert_eq!(s.tensor_shape(y).unwrap(), vec![3]);
     }
 }
