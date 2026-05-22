@@ -13113,6 +13113,19 @@ impl FrankenTorchSession {
         self.tensor_poisson_nll_loss(input, target, log_input, full, eps, reduction)
     }
 
+    /// Scaled dot-product attention. Alias for tensor_scaled_dot_product_attention.
+    pub fn functional_scaled_dot_product_attention(
+        &mut self,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        attn_mask: Option<TensorNodeId>,
+        is_causal: bool,
+        scale: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_scaled_dot_product_attention(query, key, value, attn_mask, is_causal, scale)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
