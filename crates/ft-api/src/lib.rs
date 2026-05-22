@@ -14808,6 +14808,66 @@ impl FrankenTorchSession {
         Ok(indices)
     }
 
+    /// In-place flip along specified dimensions.
+    pub fn tensor_flip_(
+        &mut self,
+        target: TensorNodeId,
+        dims: &[usize],
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_flip(target, dims)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("flip_", target, Some(format!("dims={dims:?}")));
+        Ok(())
+    }
+
+    /// In-place roll (circular shift) along dim.
+    pub fn tensor_roll_(
+        &mut self,
+        target: TensorNodeId,
+        shift: i64,
+        dim: usize,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_roll(target, shift, dim)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("roll_", target, Some(format!("shift={shift} dim={dim}")));
+        Ok(())
+    }
+
+    /// In-place 90-degree rotation in the plane defined by dims.
+    pub fn tensor_rot90_(
+        &mut self,
+        target: TensorNodeId,
+        k: i32,
+        dims: [usize; 2],
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_rot90(target, k, dims)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("rot90_", target, Some(format!("k={k} dims={dims:?}")));
+        Ok(())
+    }
+
+    /// In-place flip left-right (along dim 1).
+    pub fn tensor_fliplr_(
+        &mut self,
+        target: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.tensor_flip_(target, &[1])
+    }
+
+    /// In-place flip up-down (along dim 0).
+    pub fn tensor_flipud_(
+        &mut self,
+        target: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.tensor_flip_(target, &[0])
+    }
+
     pub fn backward(&mut self, root: NodeId) -> Result<BackwardReport, AutogradError> {
         let options = BackwardOptions::for_mode(self.mode());
         self.backward_with_options(root, options)
@@ -54890,6 +54950,30 @@ mod tests {
         let x = s.tensor_variable(vec![4.0, 2.0, 3.0, 1.0], vec![4], false).unwrap();
         let _indices = s.tensor_cummin_(x).unwrap();
         assert_eq!(s.tensor_values(x).unwrap(), vec![4.0, 2.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_flip_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        s.tensor_flip_(x, &[0]).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![4.0, 3.0, 2.0, 1.0]);
+    }
+
+    #[test]
+    fn test_roll_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        s.tensor_roll_(x, 1, 0).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![4.0, 1.0, 2.0, 3.0]);
+    }
+
+    #[test]
+    fn test_rot90_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        s.tensor_rot90_(x, 1, [0, 1]).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![2.0, 4.0, 1.0, 3.0]);
     }
 
     #[test]
