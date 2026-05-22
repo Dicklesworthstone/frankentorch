@@ -22760,6 +22760,178 @@ impl FrankenTorchSession {
         self.tensor_variable(values, vec![out_len], false)
     }
 
+    // ── Signal Processing — Window Functions ───────────────────────────────
+
+    /// Create a Hann window of size `window_length`.
+    ///
+    /// Equivalent to `torch.hann_window(window_length, periodic)`.
+    /// The window is symmetric if `periodic=false`, periodic if `true`.
+    pub fn tensor_hann_window(
+        &mut self,
+        window_length: usize,
+        periodic: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if window_length == 0 {
+            return self.tensor_variable(vec![], vec![0], false);
+        }
+        if window_length == 1 {
+            return self.tensor_variable(vec![1.0], vec![1], false);
+        }
+        let n = if periodic {
+            window_length
+        } else {
+            window_length - 1
+        };
+        let values: Vec<f64> = (0..window_length)
+            .map(|i| {
+                let cos_val = (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
+                0.5 * (1.0 - cos_val)
+            })
+            .collect();
+        self.tensor_variable(values, vec![window_length], false)
+    }
+
+    /// Create a Hamming window of size `window_length`.
+    ///
+    /// Equivalent to `torch.hamming_window(window_length, periodic, alpha, beta)`.
+    /// Default alpha=0.54, beta=0.46 for standard Hamming window.
+    pub fn tensor_hamming_window(
+        &mut self,
+        window_length: usize,
+        periodic: bool,
+        alpha: f64,
+        beta: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if window_length == 0 {
+            return self.tensor_variable(vec![], vec![0], false);
+        }
+        if window_length == 1 {
+            return self.tensor_variable(vec![1.0], vec![1], false);
+        }
+        let n = if periodic {
+            window_length
+        } else {
+            window_length - 1
+        };
+        let values: Vec<f64> = (0..window_length)
+            .map(|i| {
+                let cos_val = (2.0 * std::f64::consts::PI * i as f64 / n as f64).cos();
+                alpha - beta * cos_val
+            })
+            .collect();
+        self.tensor_variable(values, vec![window_length], false)
+    }
+
+    /// Create a Blackman window of size `window_length`.
+    ///
+    /// Equivalent to `torch.blackman_window(window_length, periodic)`.
+    pub fn tensor_blackman_window(
+        &mut self,
+        window_length: usize,
+        periodic: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if window_length == 0 {
+            return self.tensor_variable(vec![], vec![0], false);
+        }
+        if window_length == 1 {
+            return self.tensor_variable(vec![1.0], vec![1], false);
+        }
+        let n = if periodic {
+            window_length
+        } else {
+            window_length - 1
+        };
+        let a0 = 0.42;
+        let a1 = 0.5;
+        let a2 = 0.08;
+        let values: Vec<f64> = (0..window_length)
+            .map(|i| {
+                let x = i as f64 / n as f64;
+                let cos1 = (2.0 * std::f64::consts::PI * x).cos();
+                let cos2 = (4.0 * std::f64::consts::PI * x).cos();
+                a0 - a1 * cos1 + a2 * cos2
+            })
+            .collect();
+        self.tensor_variable(values, vec![window_length], false)
+    }
+
+    /// Create a Bartlett window of size `window_length`.
+    ///
+    /// Equivalent to `torch.bartlett_window(window_length, periodic)`.
+    pub fn tensor_bartlett_window(
+        &mut self,
+        window_length: usize,
+        periodic: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if window_length == 0 {
+            return self.tensor_variable(vec![], vec![0], false);
+        }
+        if window_length == 1 {
+            return self.tensor_variable(vec![1.0], vec![1], false);
+        }
+        let n = if periodic {
+            window_length
+        } else {
+            window_length - 1
+        };
+        let half = n as f64 / 2.0;
+        let values: Vec<f64> = (0..window_length)
+            .map(|i| 1.0 - ((i as f64 - half) / half).abs())
+            .collect();
+        self.tensor_variable(values, vec![window_length], false)
+    }
+
+    /// Create a Kaiser window of size `window_length`.
+    ///
+    /// Equivalent to `torch.kaiser_window(window_length, periodic, beta)`.
+    /// Uses modified Bessel function I0.
+    pub fn tensor_kaiser_window(
+        &mut self,
+        window_length: usize,
+        periodic: bool,
+        beta: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if window_length == 0 {
+            return self.tensor_variable(vec![], vec![0], false);
+        }
+        if window_length == 1 {
+            return self.tensor_variable(vec![1.0], vec![1], false);
+        }
+        let n = if periodic {
+            window_length as f64
+        } else {
+            (window_length - 1) as f64
+        };
+        let denom = Self::bessel_i0(beta);
+        let values: Vec<f64> = (0..window_length)
+            .map(|i| {
+                let x = 2.0 * i as f64 / n - 1.0;
+                let arg = beta * (1.0 - x * x).sqrt();
+                Self::bessel_i0(arg) / denom
+            })
+            .collect();
+        self.tensor_variable(values, vec![window_length], false)
+    }
+
+    /// Modified Bessel function of the first kind, order 0.
+    fn bessel_i0(x: f64) -> f64 {
+        let ax = x.abs();
+        if ax < 3.75 {
+            let y = (x / 3.75).powi(2);
+            1.0 + y
+                * (3.5156229 + y * (3.0899424 + y * (1.2067492 + y * (0.2659732 + y * (0.0360768 + y * 0.0045813)))))
+        } else {
+            let y = 3.75 / ax;
+            (ax.exp() / ax.sqrt())
+                * (0.39894228
+                    + y * (0.01328592
+                        + y * (0.00225319
+                            + y * (-0.00157565
+                                + y * (0.00916281
+                                    + y * (-0.02057706 + y * (0.02635537 + y * (-0.01647633 + y * 0.00392377))))))))
+        }
+    }
+
     fn _compute_strides(shape: &[usize]) -> Vec<usize> {
         let ndim = shape.len();
         let mut strides = vec![0usize; ndim];
