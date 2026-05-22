@@ -14852,6 +14852,33 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// Check if tensor can be resized to match another tensor's shape.
+    ///
+    /// Equivalent to `torch.Tensor.resize_as_(other)`. In FrankenTorch,
+    /// true in-place resize of the underlying storage is not supported.
+    /// This function validates shapes match (no-op) or returns an error.
+    ///
+    /// For actual shape changes, create a new tensor with the desired
+    /// shape and copy values as needed.
+    pub fn tensor_resize_as_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let other_shape = self.tensor_shape(other)?;
+        let target_shape = self.tensor_shape(target)?;
+        if target_shape == other_shape {
+            self.record_tensor_in_place_operation("resize_as_", target, None);
+            return Ok(());
+        }
+        Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                reason: "resize_as_: in-place resize not supported; create new tensor with desired shape",
+            },
+        )))
+    }
+
     pub fn tensor_fill_diagonal_(
         &mut self,
         target: TensorNodeId,
