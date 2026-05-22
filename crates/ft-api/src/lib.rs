@@ -6168,6 +6168,43 @@ impl FrankenTorchSession {
         }
     }
 
+    /// In-place nextafter: target = nextafter(target, other).
+    pub fn tensor_nextafter_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let target_vals = self.tensor_values(target)?;
+        let other_vals = self.tensor_values(other)?;
+        if target_vals.len() != other_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(target)?,
+                    rhs: self.tensor_shape(other)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = target_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&x, &y)| {
+                if x.is_nan() || y.is_nan() {
+                    f64::NAN
+                } else if x == y {
+                    y
+                } else if x < y {
+                    x.next_up()
+                } else {
+                    x.next_down()
+                }
+            })
+            .collect();
+        self.update_tensor_values_for_float(target, result, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("nextafter_", target, None);
+        Ok(())
+    }
+
     /// Heaviside step function: `0 if x<0, 1 if x>0, values[i] if x==0`.
     ///
     /// Equivalent to `torch.heaviside(input, values)`. `values` must
@@ -7295,6 +7332,15 @@ impl FrankenTorchSession {
         exponent: f64,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_pow(input, exponent)
+    }
+
+    /// In-place float_power: target = target^exponent. Alias for tensor_pow_.
+    pub fn tensor_float_power_(
+        &mut self,
+        target: TensorNodeId,
+        exponent: f64,
+    ) -> Result<(), AutogradError> {
+        self.tensor_pow_(target, exponent)
     }
 
     /// Element-wise power with a tensor exponent: `input^exponent`.
@@ -54396,6 +54442,22 @@ mod tests {
         assert_eq!(vals3[0], 0.0);
         assert!((vals3[1] - 2.0).abs() < 1e-10);
         assert!((vals3[2] - 3.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_tensor_float_power_nextafter_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![2.0, 3.0, 4.0], vec![3], false).unwrap();
+        s.tensor_float_power_(a, 2.0).unwrap();
+        let vals = s.tensor_values(a).unwrap();
+        assert_eq!(vals, vec![4.0, 9.0, 16.0]);
+        let b = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let target = s.tensor_variable(vec![2.0, 3.0, 4.0], vec![3], false).unwrap();
+        s.tensor_nextafter_(b, target).unwrap();
+        let vals2 = s.tensor_values(b).unwrap();
+        assert!(vals2[0] > 1.0 && vals2[0] < 2.0);
+        assert!(vals2[1] > 2.0 && vals2[1] < 3.0);
+        assert!(vals2[2] > 3.0 && vals2[2] < 4.0);
     }
 
     #[test]
