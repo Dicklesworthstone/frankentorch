@@ -5990,6 +5990,182 @@ impl FrankenTorchSession {
         self.tensor_ne(a_bool, b_bool)
     }
 
+    /// Element-wise bitwise AND.
+    ///
+    /// Casts to i64, performs bitwise AND, casts back to f64. Non-differentiable.
+    pub fn tensor_bitwise_and(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "bitwise_and: autograd not supported (bitwise ops are non-differentiable)",
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        if input_vals.len() != other_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(input)?,
+                    rhs: self.tensor_shape(other)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &b)| ((a as i64) & (b as i64)) as f64)
+            .collect();
+        let shape = self.tensor_shape(input)?;
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Element-wise bitwise OR.
+    ///
+    /// Casts to i64, performs bitwise OR, casts back to f64. Non-differentiable.
+    pub fn tensor_bitwise_or(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "bitwise_or: autograd not supported (bitwise ops are non-differentiable)",
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        if input_vals.len() != other_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(input)?,
+                    rhs: self.tensor_shape(other)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &b)| ((a as i64) | (b as i64)) as f64)
+            .collect();
+        let shape = self.tensor_shape(input)?;
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Element-wise bitwise XOR.
+    ///
+    /// Casts to i64, performs bitwise XOR, casts back to f64. Non-differentiable.
+    pub fn tensor_bitwise_xor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "bitwise_xor: autograd not supported (bitwise ops are non-differentiable)",
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        if input_vals.len() != other_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(input)?,
+                    rhs: self.tensor_shape(other)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &b)| ((a as i64) ^ (b as i64)) as f64)
+            .collect();
+        let shape = self.tensor_shape(input)?;
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Element-wise bitwise left shift.
+    ///
+    /// Casts to i64, performs left shift, casts back to f64. Non-differentiable.
+    pub fn tensor_bitwise_left_shift(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "bitwise_left_shift: autograd not supported (bitwise ops are non-differentiable)",
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        if input_vals.len() != other_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(input)?,
+                    rhs: self.tensor_shape(other)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &b)| {
+                let shift = (b as u32).min(63);
+                ((a as i64).wrapping_shl(shift)) as f64
+            })
+            .collect();
+        let shape = self.tensor_shape(input)?;
+        self.tensor_variable(result, shape, false)
+    }
+
+    /// Element-wise bitwise right shift.
+    ///
+    /// Casts to i64, performs arithmetic right shift, casts back to f64. Non-differentiable.
+    pub fn tensor_bitwise_right_shift(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(other)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "bitwise_right_shift: autograd not supported (bitwise ops are non-differentiable)",
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        if input_vals.len() != other_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: self.tensor_shape(input)?,
+                    rhs: self.tensor_shape(other)?,
+                },
+            )));
+        }
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &b)| {
+                let shift = (b as u32).min(63);
+                ((a as i64).wrapping_shr(shift)) as f64
+            })
+            .collect();
+        let shape = self.tensor_shape(input)?;
+        self.tensor_variable(result, shape, false)
+    }
+
     /// Element-wise copysign: `|magnitude| * sign(sign_tensor)`.
     ///
     /// Equivalent to `torch.copysign(magnitude, sign)`. Both inputs
@@ -54205,6 +54381,24 @@ mod tests {
         let other = s.tensor_variable(vec![10.0, 20.0, 30.0, 40.0], vec![4], false).unwrap();
         s.tensor_where_(x, cond, other).unwrap();
         assert_eq!(s.tensor_values(x).unwrap(), vec![10.0, 2.0, 30.0, 4.0]);
+    }
+
+    #[test]
+    fn test_bitwise_ops() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![5.0, 3.0, 12.0], vec![3], false).unwrap();
+        let b = s.tensor_variable(vec![3.0, 5.0, 10.0], vec![3], false).unwrap();
+        let and_r = s.tensor_bitwise_and(a, b).unwrap();
+        assert_eq!(s.tensor_values(and_r).unwrap(), vec![1.0, 1.0, 8.0]);
+        let or_r = s.tensor_bitwise_or(a, b).unwrap();
+        assert_eq!(s.tensor_values(or_r).unwrap(), vec![7.0, 7.0, 14.0]);
+        let xor_r = s.tensor_bitwise_xor(a, b).unwrap();
+        assert_eq!(s.tensor_values(xor_r).unwrap(), vec![6.0, 6.0, 6.0]);
+        let shift = s.tensor_variable(vec![1.0, 2.0, 1.0], vec![3], false).unwrap();
+        let left = s.tensor_bitwise_left_shift(a, shift).unwrap();
+        assert_eq!(s.tensor_values(left).unwrap(), vec![10.0, 12.0, 24.0]);
+        let right = s.tensor_bitwise_right_shift(a, shift).unwrap();
+        assert_eq!(s.tensor_values(right).unwrap(), vec![2.0, 0.0, 6.0]);
     }
 
     #[test]
