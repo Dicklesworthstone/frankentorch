@@ -245,12 +245,22 @@ impl QuantizationParams {
 
     #[must_use]
     pub fn scale(&self) -> f64 {
-        f64::from_bits(self.scale_bits[0])
+        self.scale_at(0).unwrap_or(f64::NAN)
     }
 
     #[must_use]
     pub fn zero_point(&self) -> i64 {
-        self.zero_points[0]
+        self.zero_point_at(0).unwrap_or_default()
+    }
+
+    fn scale_at(&self, channel: usize) -> Option<f64> {
+        self.scale_bits
+            .get(channel)
+            .map(|bits| f64::from_bits(*bits))
+    }
+
+    fn zero_point_at(&self, channel: usize) -> Option<i64> {
+        self.zero_points.get(channel).copied()
     }
 
     #[must_use]
@@ -299,7 +309,12 @@ impl QuantizationParams {
                     rank: shape.len(),
                 });
             }
-            let expected = shape[axis];
+            let Some(&expected) = shape.get(axis) else {
+                return Err(TensorMetaError::InvalidQuantizationAxis {
+                    axis,
+                    rank: shape.len(),
+                });
+            };
             let actual = self.scale_bits.len();
             if expected != actual {
                 return Err(TensorMetaError::QuantizationChannelCountMismatch {
@@ -1449,34 +1464,62 @@ impl DenseTensor {
         };
         let start = self.meta.storage_offset();
         let end = Self::storage_span_required_len(&self.meta)?;
-        let dequantize = |flat_idx: usize, qvalue: f64| -> f64 {
-            let channel = qparams
-                .axis()
-                .map(|axis| Self::channel_index_for_flat(self.meta.shape(), axis, flat_idx))
-                .unwrap_or(0);
-            let scale = f64::from_bits(qparams.scale_bits[channel]);
+        let dequantize = |flat_idx: usize, qvalue: f64| -> Result<f64, DenseTensorError> {
+            let channel = match qparams.axis() {
+                Some(axis) => Self::channel_index_for_flat(self.meta.shape(), axis, flat_idx)
+                    .ok_or(DenseTensorError::Meta(
+                        TensorMetaError::InvalidQuantizationAxis {
+                            axis,
+                            rank: self.meta.shape().len(),
+                        },
+                    ))?,
+                None => 0,
+            };
+            let scale = qparams.scale_at(channel).ok_or(DenseTensorError::Meta(
+                TensorMetaError::QuantizationChannelCountMismatch {
+                    axis: qparams.axis().unwrap_or(0),
+                    expected: qparams.len(),
+                    actual: channel.saturating_add(1),
+                },
+            ))?;
+            let zero_point = qparams
+                .zero_point_at(channel)
+                .ok_or(DenseTensorError::Meta(
+                    TensorMetaError::QuantizationVectorLengthMismatch {
+                        scales: qparams.scale_bits.len(),
+                        zero_points: qparams.zero_points.len(),
+                    },
+                ))?;
             #[allow(clippy::cast_precision_loss)]
-            let zero_point = qparams.zero_points[channel] as f64;
-            (qvalue - zero_point) * scale
+            let zero_point = zero_point as f64;
+            Ok((qvalue - zero_point) * scale)
         };
         match &self.storage {
             TensorStorage::QInt8(v) => Ok(v[start..end]
                 .iter()
                 .enumerate()
                 .map(|(flat_idx, &q)| dequantize(flat_idx, f64::from(q)))
-                .collect()),
+                .collect::<Result<Vec<_>, _>>()?),
             TensorStorage::QUInt8(v) => Ok(v[start..end]
                 .iter()
                 .enumerate()
                 .map(|(flat_idx, &q)| dequantize(flat_idx, f64::from(q)))
-                .collect()),
+                .collect::<Result<Vec<_>, _>>()?),
             _ => Err(DenseTensorError::UnsupportedDType(self.meta.dtype())),
         }
     }
 
-    fn channel_index_for_flat(shape: &[usize], axis: usize, flat_idx: usize) -> usize {
-        let inner: usize = shape[axis + 1..].iter().copied().product();
-        (flat_idx / inner) % shape[axis]
+    fn channel_index_for_flat(shape: &[usize], axis: usize, flat_idx: usize) -> Option<usize> {
+        let &channel_count = shape.get(axis)?;
+        let inner: usize = shape
+            .get(axis.saturating_add(1)..)?
+            .iter()
+            .copied()
+            .product();
+        if channel_count == 0 || inner == 0 {
+            return None;
+        }
+        Some((flat_idx / inner) % channel_count)
     }
 
     #[must_use]

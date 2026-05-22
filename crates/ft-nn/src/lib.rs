@@ -15415,6 +15415,83 @@ impl QuantizedStorageDType {
     }
 }
 
+/// Quantization parameter layout for packed quantized linear weights.
+#[derive(Debug, Clone, PartialEq)]
+pub enum QuantizedLinearQParams {
+    PerTensor(QParams),
+    PerChannel { axis: usize, channels: Vec<QParams> },
+}
+
+impl QuantizedLinearQParams {
+    fn validate(
+        &self,
+        dtype: QuantizedStorageDType,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<(), AutogradError> {
+        match self {
+            Self::PerTensor(qparams) => dtype.validate_qparams(*qparams),
+            Self::PerChannel { axis, channels } => {
+                if *axis >= 2 {
+                    return Err(incompatible_error(
+                        "QuantizedLinear: per-channel axis must be 0 or 1",
+                    ));
+                }
+                let expected = if *axis == 0 {
+                    out_features
+                } else {
+                    in_features
+                };
+                if channels.len() != expected {
+                    return Err(incompatible_error(
+                        "QuantizedLinear: per-channel qparams length must match axis size",
+                    ));
+                }
+                for &qparams in channels {
+                    dtype.validate_qparams(qparams)?;
+                }
+                Ok(())
+            }
+        }
+    }
+
+    fn qparams_for_flat_weight(&self, flat_idx: usize, in_features: usize) -> QParams {
+        match self {
+            Self::PerTensor(qparams) => *qparams,
+            Self::PerChannel { axis, channels } => {
+                let out_channel = flat_idx / in_features;
+                let in_channel = flat_idx % in_features;
+                let channel = if *axis == 0 { out_channel } else { in_channel };
+                channels[channel]
+            }
+        }
+    }
+
+    #[must_use]
+    pub fn axis(&self) -> Option<usize> {
+        match self {
+            Self::PerTensor(_) => None,
+            Self::PerChannel { axis, .. } => Some(*axis),
+        }
+    }
+
+    #[must_use]
+    pub fn per_tensor(&self) -> Option<QParams> {
+        match self {
+            Self::PerTensor(qparams) => Some(*qparams),
+            Self::PerChannel { .. } => None,
+        }
+    }
+
+    #[must_use]
+    pub fn per_channel(&self) -> Option<&[QParams]> {
+        match self {
+            Self::PerTensor(_) => None,
+            Self::PerChannel { channels, .. } => Some(channels.as_slice()),
+        }
+    }
+}
+
 /// Packed quantized weight bytes for [`QuantizedLinear`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QuantizedLinearWeightStorage {
@@ -15429,10 +15506,32 @@ impl QuantizedLinearWeightStorage {
         qparams: QParams,
     ) -> Result<Self, AutogradError> {
         dtype.validate_qparams(qparams)?;
+        let qparam_layout = QuantizedLinearQParams::PerTensor(qparams);
+        Self::from_float_values_with_qparams(values, dtype, &qparam_layout, 1)
+    }
+
+    fn from_float_values_per_channel(
+        values: &[f64],
+        dtype: QuantizedStorageDType,
+        qparams: &QuantizedLinearQParams,
+        in_features: usize,
+        out_features: usize,
+    ) -> Result<Self, AutogradError> {
+        qparams.validate(dtype, in_features, out_features)?;
+        Self::from_float_values_with_qparams(values, dtype, qparams, in_features)
+    }
+
+    fn from_float_values_with_qparams(
+        values: &[f64],
+        dtype: QuantizedStorageDType,
+        qparams: &QuantizedLinearQParams,
+        in_features: usize,
+    ) -> Result<Self, AutogradError> {
         match dtype {
             QuantizedStorageDType::QInt8 => {
                 let mut packed = Vec::with_capacity(values.len());
-                for &value in values {
+                for (idx, &value) in values.iter().enumerate() {
+                    let qparams = qparams.qparams_for_flat_weight(idx, in_features);
                     let qvalue = quantize_f64_to_i64(value, qparams)?;
                     let packed_value = i8::try_from(qvalue).map_err(|_| {
                         incompatible_error("QuantizedLinear: qint8 value out of range")
@@ -15443,7 +15542,8 @@ impl QuantizedLinearWeightStorage {
             }
             QuantizedStorageDType::QUInt8 => {
                 let mut packed = Vec::with_capacity(values.len());
-                for &value in values {
+                for (idx, &value) in values.iter().enumerate() {
+                    let qparams = qparams.qparams_for_flat_weight(idx, in_features);
                     let qvalue = quantize_f64_to_i64(value, qparams)?;
                     let packed_value = u8::try_from(qvalue).map_err(|_| {
                         incompatible_error("QuantizedLinear: quint8 value out of range")
@@ -15508,27 +15608,60 @@ impl QuantizedLinearWeightStorage {
 
     fn to_dense_tensor(
         &self,
-        qparams: QParams,
+        qparams: &QuantizedLinearQParams,
         shape: Vec<usize>,
     ) -> Result<DenseTensor, AutogradError> {
-        self.dtype().validate_qparams(qparams)?;
-        match self {
-            Self::QInt8(values) => DenseTensor::from_contiguous_values_qint8(
-                values.clone(),
-                shape,
-                Device::Cpu,
-                qparams.scale,
-                qparams.zero_point,
-            )
-            .map_err(AutogradError::from),
-            Self::QUInt8(values) => DenseTensor::from_contiguous_values_quint8(
-                values.clone(),
-                shape,
-                Device::Cpu,
-                qparams.scale,
-                qparams.zero_point,
-            )
-            .map_err(AutogradError::from),
+        let dtype = self.dtype();
+        match qparams {
+            QuantizedLinearQParams::PerTensor(per_tensor) => {
+                dtype.validate_qparams(*per_tensor)?;
+                match self {
+                    Self::QInt8(values) => DenseTensor::from_contiguous_values_qint8(
+                        values.clone(),
+                        shape,
+                        Device::Cpu,
+                        per_tensor.scale,
+                        per_tensor.zero_point,
+                    )
+                    .map_err(AutogradError::from),
+                    Self::QUInt8(values) => DenseTensor::from_contiguous_values_quint8(
+                        values.clone(),
+                        shape,
+                        Device::Cpu,
+                        per_tensor.scale,
+                        per_tensor.zero_point,
+                    )
+                    .map_err(AutogradError::from),
+                }
+            }
+            QuantizedLinearQParams::PerChannel { axis, channels } => {
+                for &channel in channels {
+                    dtype.validate_qparams(channel)?;
+                }
+                let scales: Vec<f64> = channels.iter().map(|qparams| qparams.scale).collect();
+                let zero_points: Vec<i64> =
+                    channels.iter().map(|qparams| qparams.zero_point).collect();
+                match self {
+                    Self::QInt8(values) => DenseTensor::from_contiguous_values_qint8_per_channel(
+                        values.clone(),
+                        shape,
+                        Device::Cpu,
+                        scales,
+                        zero_points,
+                        *axis,
+                    )
+                    .map_err(AutogradError::from),
+                    Self::QUInt8(values) => DenseTensor::from_contiguous_values_quint8_per_channel(
+                        values.clone(),
+                        shape,
+                        Device::Cpu,
+                        scales,
+                        zero_points,
+                        *axis,
+                    )
+                    .map_err(AutogradError::from),
+                }
+            }
         }
     }
 }
@@ -15569,7 +15702,7 @@ fn dequantize_i64(value: i64, qparams: QParams) -> f64 {
 pub struct QuantizedLinear {
     weight: QuantizedLinearWeightStorage,
     weight_tensor: DenseTensor,
-    weight_qparams: QParams,
+    weight_qparams: QuantizedLinearQParams,
     bias: Option<Vec<f64>>,
     in_features: usize,
     out_features: usize,
@@ -15612,13 +15745,75 @@ impl QuantizedLinear {
             ));
         }
 
+        let per_tensor_qparams = weight_qparams;
         let weight = QuantizedLinearWeightStorage::from_float_values(
             &weight_values,
             weight_dtype,
+            per_tensor_qparams,
+        )?;
+        let weight_qparams = QuantizedLinearQParams::PerTensor(per_tensor_qparams);
+        let weight_tensor =
+            weight.to_dense_tensor(&weight_qparams, vec![out_features, in_features])?;
+        Ok(Self {
+            weight,
+            weight_tensor,
             weight_qparams,
+            bias,
+            in_features,
+            out_features,
+        })
+    }
+
+    pub fn from_float_weights_per_channel(
+        weight_values: Vec<f64>,
+        bias: Option<Vec<f64>>,
+        in_features: usize,
+        out_features: usize,
+        weight_dtype: QuantizedStorageDType,
+        channel_axis: usize,
+        channel_qparams: Vec<QParams>,
+    ) -> Result<Self, AutogradError> {
+        if in_features == 0 {
+            return Err(incompatible_error(
+                "QuantizedLinear: in_features must be > 0",
+            ));
+        }
+        if out_features == 0 {
+            return Err(incompatible_error(
+                "QuantizedLinear: out_features must be > 0",
+            ));
+        }
+        let expected_len = checked_mul(
+            out_features,
+            in_features,
+            "QuantizedLinear: weight shape overflow",
+        )?;
+        if weight_values.len() != expected_len {
+            return Err(incompatible_error(
+                "QuantizedLinear: weight length must equal out_features * in_features",
+            ));
+        }
+        if let Some(bias_values) = &bias
+            && bias_values.len() != out_features
+        {
+            return Err(incompatible_error(
+                "QuantizedLinear: bias length must equal out_features",
+            ));
+        }
+
+        let weight_qparams = QuantizedLinearQParams::PerChannel {
+            axis: channel_axis,
+            channels: channel_qparams,
+        };
+        let weight = QuantizedLinearWeightStorage::from_float_values_per_channel(
+            &weight_values,
+            weight_dtype,
+            &weight_qparams,
+            in_features,
+            out_features,
         )?;
         let weight_tensor =
-            weight.to_dense_tensor(weight_qparams, vec![out_features, in_features])?;
+            weight.to_dense_tensor(&weight_qparams, vec![out_features, in_features])?;
         Ok(Self {
             weight,
             weight_tensor,
@@ -15640,8 +15835,23 @@ impl QuantizedLinear {
     }
 
     #[must_use]
-    pub fn weight_qparams(&self) -> QParams {
-        self.weight_qparams
+    pub fn weight_qparams(&self) -> Option<QParams> {
+        self.weight_qparams.per_tensor()
+    }
+
+    #[must_use]
+    pub fn weight_qparam_layout(&self) -> &QuantizedLinearQParams {
+        &self.weight_qparams
+    }
+
+    #[must_use]
+    pub fn weight_quantization_axis(&self) -> Option<usize> {
+        self.weight_qparams.axis()
+    }
+
+    #[must_use]
+    pub fn weight_channel_qparams(&self) -> Option<&[QParams]> {
+        self.weight_qparams.per_channel()
     }
 
     #[must_use]
@@ -17634,7 +17844,11 @@ mod tests {
             linear.weight_storage().qint8_values(),
             Some(&[0, 2, -2, 4, -4, 1][..])
         );
-        assert_eq!(linear.weight_qparams(), qparams);
+        assert_eq!(linear.weight_qparams(), Some(qparams));
+        assert_eq!(
+            linear.weight_qparam_layout(),
+            &QuantizedLinearQParams::PerTensor(qparams)
+        );
         assert_eq!(linear.bias_values(), Some(&[0.1, -0.2][..]));
         assert_eq!(linear.weight_tensor().meta().dtype(), DType::QInt8);
         let weight_quantization = linear
@@ -17715,6 +17929,75 @@ mod tests {
     }
 
     #[test]
+    fn quantized_linear_qint8_per_channel_dequantizes_by_output_axis() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let channel_qparams = vec![
+            QParams {
+                scale: 0.5,
+                zero_point: 0,
+                qmin: -128,
+                qmax: 127,
+            },
+            QParams {
+                scale: 0.25,
+                zero_point: 0,
+                qmin: -128,
+                qmax: 127,
+            },
+        ];
+        let linear = QuantizedLinear::from_float_weights_per_channel(
+            vec![0.0, 0.5, 1.0, -0.25],
+            None,
+            2,
+            2,
+            QuantizedStorageDType::QInt8,
+            0,
+            channel_qparams.clone(),
+        )
+        .expect("per-channel quantized linear");
+
+        assert_eq!(linear.weight_quantization_axis(), Some(0));
+        assert_eq!(
+            linear.weight_qparam_layout(),
+            &QuantizedLinearQParams::PerChannel {
+                axis: 0,
+                channels: channel_qparams.clone()
+            }
+        );
+        assert_eq!(
+            linear.weight_channel_qparams(),
+            Some(channel_qparams.as_slice())
+        );
+        assert_eq!(
+            linear.weight_storage().qint8_values(),
+            Some(&[0, 1, 4, -1][..])
+        );
+        let weight_qparams = linear
+            .weight_tensor()
+            .meta()
+            .quantization()
+            .expect("weight qparams");
+        assert_eq!(weight_qparams.axis(), Some(0));
+        assert_eq!(weight_qparams.scales(), vec![0.5, 0.25]);
+        assert_eq!(
+            linear
+                .weight_tensor()
+                .dequantized_values_as_f64()
+                .expect("dequantized weights"),
+            vec![0.0, 0.5, 1.0, -0.25]
+        );
+
+        let input = session
+            .tensor_variable(vec![2.0, 4.0], vec![1, 2], false)
+            .expect("input");
+        let output = linear.forward(&mut session, input).expect("forward");
+        let values = session.tensor_values(output).expect("values");
+        assert_eq!(values.len(), 2);
+        assert!((values[0] - 2.0).abs() < 1e-12, "values[0]={}", values[0]);
+        assert!((values[1] - 1.0).abs() < 1e-12, "values[1]={}", values[1]);
+    }
+
+    #[test]
     fn quantized_linear_rejects_invalid_storage_contracts() {
         let valid = QParams {
             scale: 0.25,
@@ -17771,6 +18054,18 @@ mod tests {
                 1,
                 QuantizedStorageDType::QInt8,
                 qint8_with_uint_range,
+            )
+            .is_err()
+        );
+        assert!(
+            QuantizedLinear::from_float_weights_per_channel(
+                vec![0.0, 1.0],
+                None,
+                2,
+                1,
+                QuantizedStorageDType::QInt8,
+                0,
+                vec![valid, valid],
             )
             .is_err()
         );
