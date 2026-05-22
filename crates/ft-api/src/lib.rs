@@ -10827,6 +10827,51 @@ impl FrankenTorchSession {
         self.tensor_mul(input, mask)
     }
 
+    /// Alpha dropout for self-normalizing neural networks.
+    ///
+    /// Equivalent to `torch.nn.functional.alpha_dropout(input, p, training)`.
+    /// Designed to work with SELU activation to maintain self-normalizing property.
+    /// Uses fixed alpha and scale values derived from SELU parameters.
+    pub fn functional_alpha_dropout(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+        training: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "alpha_dropout: probability p must be in [0, 1]",
+                },
+            )));
+        }
+        if !training || p == 0.0 {
+            return Ok(input);
+        }
+        let shape = self.tensor_shape(input)?;
+        let numel = Self::checked_shape_numel(&shape, "alpha_dropout: shape overflow")?;
+        let alpha = 1.6732632423543772;
+        let scale = 1.0507009873554805;
+        let alpha_p = -alpha * scale;
+        let a = ((1.0 - p) * (1.0 + p * alpha_p * alpha_p)).sqrt().recip();
+        let b = -a * alpha_p * p;
+        let mask_vals: Vec<f64> = (0..numel)
+            .map(|_| {
+                if self.rng.next_f64() < p {
+                    alpha_p
+                } else {
+                    1.0
+                }
+            })
+            .collect();
+        let mask = self.tensor_variable(mask_vals, shape.clone(), false)?;
+        let masked = self.tensor_mul(input, mask)?;
+        let a_t = self.full(shape.clone(), a, false)?;
+        let b_t = self.full(shape, b, false)?;
+        let scaled = self.tensor_mul(masked, a_t)?;
+        self.tensor_add(scaled, b_t)
+    }
+
     /// Look up embeddings from a weight matrix.
     ///
     /// Equivalent to `torch.nn.functional.embedding(input, weight)`.
