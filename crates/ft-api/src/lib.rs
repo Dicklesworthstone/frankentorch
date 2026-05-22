@@ -17465,6 +17465,10 @@ impl FrankenTorchSession {
         )
     }
 
+    pub fn tensor_det(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_det(input)
+    }
+
     /// Compute sign and log-absolute-determinant of a square matrix.
     ///
     /// Returns `(sign, logabsdet)` as 0-D tensors where
@@ -52553,5 +52557,14 @@ mod tests {
         let clip_max = s.tensor_clip_max(x, 1.0).unwrap();
         let clamp_max = s.tensor_clamp_max(x, 1.0).unwrap();
         assert_eq!(s.tensor_values(clip_max).unwrap(), s.tensor_values(clamp_max).unwrap());
+    }
+
+    #[test]
+    fn test_tensor_det_alias() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let det = s.tensor_det(m).unwrap();
+        let linalg_det = s.tensor_linalg_det(m).unwrap();
+        assert_eq!(s.tensor_values(det).unwrap(), s.tensor_values(linalg_det).unwrap());
     }
 }
