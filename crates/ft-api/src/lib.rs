@@ -12617,6 +12617,64 @@ impl FrankenTorchSession {
         self.tensor_variable(result, shape, false)
     }
 
+    /// In-place lower triangular: zero elements above the k-th diagonal.
+    pub fn tensor_tril_(
+        &mut self,
+        target: TensorNodeId,
+        diagonal: i64,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let shape = self.tensor_shape(target)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tril_: input must be a 2-D tensor",
+                },
+            )));
+        }
+        let (m, n) = (shape[0], shape[1]);
+        let mut vals = self.tensor_values(target)?;
+        for i in 0..m {
+            for j in 0..n {
+                if (j as i64) > (i as i64) + diagonal {
+                    vals[i * n + j] = 0.0;
+                }
+            }
+        }
+        self.update_tensor_values_for_float(target, vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("tril_", target, Some(format!("diagonal={diagonal}")));
+        Ok(())
+    }
+
+    /// In-place upper triangular: zero elements below the k-th diagonal.
+    pub fn tensor_triu_(
+        &mut self,
+        target: TensorNodeId,
+        diagonal: i64,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let shape = self.tensor_shape(target)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "triu_: input must be a 2-D tensor",
+                },
+            )));
+        }
+        let (m, n) = (shape[0], shape[1]);
+        let mut vals = self.tensor_values(target)?;
+        for i in 0..m {
+            for j in 0..n {
+                if (j as i64) < (i as i64) + diagonal {
+                    vals[i * n + j] = 0.0;
+                }
+            }
+        }
+        self.update_tensor_values_for_float(target, vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("triu_", target, Some(format!("diagonal={diagonal}")));
+        Ok(())
+    }
+
     /// Embed src tensor at a selected index along a dimension.
     ///
     /// Equivalent to `torch.select_scatter(input, src, dim, index)`.
@@ -53821,6 +53879,19 @@ mod tests {
         assert_eq!(vals[1], 99.0);
         assert_eq!(vals[2], -99.0);
         assert_eq!(vals[3], 1.0);
+    }
+
+    #[test]
+    fn test_tensor_tril_triu_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], vec![3, 3], false).unwrap();
+        s.tensor_tril_(a, 0).unwrap();
+        let vals = s.tensor_values(a).unwrap();
+        assert_eq!(vals, vec![1.0, 0.0, 0.0, 4.0, 5.0, 0.0, 7.0, 8.0, 9.0]);
+        let b = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0], vec![3, 3], false).unwrap();
+        s.tensor_triu_(b, 0).unwrap();
+        let vals2 = s.tensor_values(b).unwrap();
+        assert_eq!(vals2, vec![1.0, 2.0, 3.0, 0.0, 5.0, 6.0, 0.0, 0.0, 9.0]);
     }
 
     #[test]
