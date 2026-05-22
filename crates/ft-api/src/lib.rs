@@ -12613,6 +12613,153 @@ impl FrankenTorchSession {
         Ok((output, updated_mean, updated_var))
     }
 
+    /// Softmax along dimension. Alias for tensor_softmax.
+    pub fn functional_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_softmax(input, dim)
+    }
+
+    /// Log-softmax along dimension. Alias for tensor_log_softmax.
+    pub fn functional_log_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_log_softmax(input, dim)
+    }
+
+    /// ReLU activation. Alias for tensor_relu.
+    pub fn functional_relu(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_relu(input)
+    }
+
+    /// ReLU6 activation. Alias for tensor_relu6.
+    pub fn functional_relu6(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_relu6(input)
+    }
+
+    /// Leaky ReLU activation. Alias for tensor_leaky_relu.
+    pub fn functional_leaky_relu(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_leaky_relu(input)
+    }
+
+    /// ELU activation. Alias for tensor_elu.
+    pub fn functional_elu(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_elu(input)
+    }
+
+    /// SELU activation. Alias for tensor_selu.
+    pub fn functional_selu(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_selu(input)
+    }
+
+    /// GELU activation. Alias for tensor_gelu.
+    pub fn functional_gelu(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gelu(input)
+    }
+
+    /// Sigmoid activation. Alias for tensor_sigmoid.
+    pub fn functional_sigmoid(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_sigmoid(input)
+    }
+
+    /// Tanh activation. Alias for tensor_tanh.
+    pub fn functional_tanh(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_tanh(input)
+    }
+
+    /// SiLU (Swish) activation. Alias for tensor_silu.
+    pub fn functional_silu(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_silu(input)
+    }
+
+    /// Mish activation. Alias for tensor_mish.
+    pub fn functional_mish(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_mish(input)
+    }
+
+    /// Hardtanh activation. Alias for tensor_hardtanh.
+    pub fn functional_hardtanh(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hardtanh(input)
+    }
+
+    /// Hardsigmoid activation. Alias for tensor_hardsigmoid.
+    pub fn functional_hardsigmoid(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hardsigmoid(input)
+    }
+
+    /// Hardswish activation. Alias for tensor_hardswish.
+    pub fn functional_hardswish(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hardswish(input)
+    }
+
+    /// Softplus activation. Alias for tensor_softplus.
+    pub fn functional_softplus(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_softplus(input)
+    }
+
+    /// Softsign activation. Alias for tensor_softsign.
+    pub fn functional_softsign(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_softsign(input)
+    }
+
+    /// PReLU activation. Alias for tensor_prelu.
+    pub fn functional_prelu(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_prelu(input, weight)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
