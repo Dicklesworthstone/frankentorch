@@ -14291,6 +14291,36 @@ impl FrankenTorchSession {
         self.apply_tensor_unary_in_place("erf_", target, None, libm::erf)
     }
 
+    /// In-place exp2: 2^x.
+    pub fn tensor_exp2_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("exp2_", target, None, libm::exp2)
+    }
+
+    /// In-place cbrt: cube root.
+    pub fn tensor_cbrt_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("cbrt_", target, None, libm::cbrt)
+    }
+
+    /// In-place softmax along dimension.
+    pub fn tensor_softmax_(&mut self, target: TensorNodeId, dim: usize) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_softmax(target, dim)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("softmax_", target, Some(format!("dim={dim}")));
+        Ok(())
+    }
+
+    /// In-place log_softmax along dimension.
+    pub fn tensor_log_softmax_(&mut self, target: TensorNodeId, dim: usize) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_log_softmax(target, dim)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("log_softmax_", target, Some(format!("dim={dim}")));
+        Ok(())
+    }
+
     /// In-place inverse error function.
     ///
     /// Equivalent to `tensor.erfinv_()` in PyTorch.
