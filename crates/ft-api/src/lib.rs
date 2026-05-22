@@ -14754,6 +14754,60 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place cumulative sum along dim.
+    pub fn tensor_cumsum_(
+        &mut self,
+        target: TensorNodeId,
+        dim: usize,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_cumsum(target, dim)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("cumsum_", target, Some(format!("dim={dim}")));
+        Ok(())
+    }
+
+    /// In-place cumulative product along dim.
+    pub fn tensor_cumprod_(
+        &mut self,
+        target: TensorNodeId,
+        dim: usize,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_cumprod(target, dim)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("cumprod_", target, Some(format!("dim={dim}")));
+        Ok(())
+    }
+
+    /// In-place cumulative max (returns indices separately).
+    pub fn tensor_cummax_(
+        &mut self,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let (values, indices) = self.tensor_cummax(target)?;
+        let result_vals = self.tensor_values(values)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("cummax_", target, None);
+        Ok(indices)
+    }
+
+    /// In-place cumulative min (returns indices separately).
+    pub fn tensor_cummin_(
+        &mut self,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let (values, indices) = self.tensor_cummin(target)?;
+        let result_vals = self.tensor_values(values)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("cummin_", target, None);
+        Ok(indices)
+    }
+
     pub fn backward(&mut self, root: NodeId) -> Result<BackwardReport, AutogradError> {
         let options = BackwardOptions::for_mode(self.mode());
         self.backward_with_options(root, options)
@@ -54804,6 +54858,38 @@ mod tests {
         assert!((vals[1] - 4.0).abs() < 1e-5);
         assert!((vals[2] - 3.0).abs() < 1e-5);
         assert!((vals[3] - 4.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_cumsum_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        s.tensor_cumsum_(x, 0).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![1.0, 3.0, 6.0, 10.0]);
+    }
+
+    #[test]
+    fn test_cumprod_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+        s.tensor_cumprod_(x, 0).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![1.0, 2.0, 6.0, 24.0]);
+    }
+
+    #[test]
+    fn test_cummax_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 3.0, 2.0, 4.0], vec![4], false).unwrap();
+        let _indices = s.tensor_cummax_(x).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![1.0, 3.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn test_cummin_inplace() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![4.0, 2.0, 3.0, 1.0], vec![4], false).unwrap();
+        let _indices = s.tensor_cummin_(x).unwrap();
+        assert_eq!(s.tensor_values(x).unwrap(), vec![4.0, 2.0, 2.0, 1.0]);
     }
 
     #[test]
