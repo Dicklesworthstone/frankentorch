@@ -18188,6 +18188,28 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Alias for tensor_logit for torch.special.logit parity.
+    ///
+    /// Tracked under frankentorch-hcy0.
+    pub fn tensor_special_logit(
+        &mut self,
+        input: TensorNodeId,
+        eps: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logit(input, eps)
+    }
+
+    /// Alias for tensor_sigmoid for torch.special.expit parity.
+    ///
+    /// expit(x) = sigmoid(x) = 1 / (1 + exp(-x))
+    /// Tracked under frankentorch-hcy0.
+    pub fn tensor_special_expit(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_sigmoid(input)
+    }
+
     /// Element-wise inverse error function.
     ///
     /// Equivalent to `torch.special.erfinv(input)`.
@@ -51229,5 +51251,27 @@ mod tests {
         assert!((vals[1] - 1.0).abs() < 1e-4); // ndtri(0.8413...) ≈ 1
         assert!((vals[2] + 1.0).abs() < 1e-4); // ndtri(0.1586...) ≈ -1
         assert!((vals[3] - 2.0).abs() < 1e-4); // ndtri(0.9772...) ≈ 2
+    }
+
+    #[test]
+    fn test_special_expit() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0, 1.0, -1.0], vec![3], false).unwrap();
+        let result = s.tensor_special_expit(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 0.5).abs() < 1e-10);
+        assert!((vals[1] - 0.7310586).abs() < 1e-5);
+        assert!((vals[2] - 0.2689414).abs() < 1e-5);
+    }
+
+    #[test]
+    fn test_special_logit() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.5, 0.7310586, 0.2689414], vec![3], false).unwrap();
+        let result = s.tensor_special_logit(input, None).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!(vals[0].abs() < 1e-5);
+        assert!((vals[1] - 1.0).abs() < 1e-4);
+        assert!((vals[2] + 1.0).abs() < 1e-4);
     }
 }
