@@ -6373,6 +6373,54 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Randomized Leaky ReLU (inference mode).
+    ///
+    /// rrelu(x, lower, upper) = x if x >= 0, else x * (lower + upper) / 2
+    /// Uses midpoint slope for deterministic inference.
+    /// Tracked under frankentorch-r8ik.
+    pub fn tensor_rrelu(
+        &mut self,
+        input: TensorNodeId,
+        lower: f64,
+        upper: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let slope = (lower + upper) / 2.0;
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals.iter().map(|&x| {
+                    if x >= 0.0 { x } else { slope * x }
+                }).collect();
+                Ok((values, shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "rrelu backward: gradient length mismatch",
+                        },
+                    )));
+                }
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| if x >= 0.0 { go } else { go * slope })
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("rrelu in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
     pub fn tensor_rsqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.rsqrt(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -51526,5 +51574,17 @@ mod tests {
         assert!((vals[1] + 0.25).abs() < 1e-10); // -1 * 0.25
         assert!((vals[2] - 2.0).abs() < 1e-10);
         assert!((vals[3] + 0.5).abs() < 1e-10); // -2 * 0.25
+    }
+
+    #[test]
+    fn test_rrelu_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, -1.0, 2.0, -2.0], vec![4], false).unwrap();
+        let result = s.tensor_rrelu(input, 0.1, 0.3).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - 1.0).abs() < 1e-10);
+        assert!((vals[1] + 0.2).abs() < 1e-10); // -1 * 0.2 (midpoint)
+        assert!((vals[2] - 2.0).abs() < 1e-10);
+        assert!((vals[3] + 0.4).abs() < 1e-10); // -2 * 0.2
     }
 }
