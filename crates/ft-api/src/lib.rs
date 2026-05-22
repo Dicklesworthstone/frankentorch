@@ -14433,6 +14433,16 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place gammaln: log-gamma function.
+    pub fn tensor_gammaln_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_gammaln(target)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("gammaln_", target, None);
+        Ok(())
+    }
+
     /// In-place signum: -1 for negative, 0 for zero, +1 for positive.
     ///
     /// Equivalent to `tensor.sign_()` in PyTorch.
