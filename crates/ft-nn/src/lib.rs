@@ -2106,6 +2106,95 @@ impl Module for Dropout {
     }
 }
 
+/// Channel-wise dropout for 1D feature maps.
+///
+/// Accepts unbatched `(C, L)` and batched `(N, C, L)` inputs.
+pub struct Dropout1d {
+    p: f64,
+    training: std::cell::Cell<bool>,
+}
+
+impl Dropout1d {
+    #[must_use]
+    pub fn new(p: f64) -> Self {
+        Self {
+            p,
+            training: std::cell::Cell::new(true),
+        }
+    }
+
+    pub fn train(&self, mode: bool) {
+        self.training.set(mode);
+    }
+
+    pub fn eval(&self) {
+        self.train(false);
+    }
+}
+
+impl Module for Dropout1d {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !self.p.is_finite() || !(0.0..=1.0).contains(&self.p) {
+            return Err(incompatible_error(
+                "dropout probability p must be finite and in [0, 1]",
+            ));
+        }
+        if !self.training.get() || self.p == 0.0 {
+            return Ok(input);
+        }
+
+        let shape = session.tensor_shape(input)?;
+        let (channels, spatial) = match shape.as_slice() {
+            [c, l] => (*c, *l),
+            [n, c, l] => (checked_mul(*n, *c, "Dropout1d channel size overflow")?, *l),
+            _ => {
+                return Err(incompatible_error(
+                    "Dropout1d expects 2D or 3D input ((C, L) or (N, C, L))",
+                ));
+            }
+        };
+
+        if self.p >= 1.0 {
+            let zeros = session.zeros(shape, false)?;
+            return session.tensor_mul(input, zeros);
+        }
+
+        let channel_rand = session.rand(vec![channels], false)?;
+        let channel_rand_vals = session.tensor_values(channel_rand)?;
+        let scale = 1.0 / (1.0 - self.p);
+        let mask_len = checked_mul(channels, spatial, "Dropout1d mask size overflow")?;
+        let mut mask_data = vec![0.0f64; mask_len];
+        for channel in 0..channels {
+            let keep = if channel_rand_vals[channel] > self.p {
+                scale
+            } else {
+                0.0
+            };
+            for s in 0..spatial {
+                mask_data[channel * spatial + s] = keep;
+            }
+        }
+        let mask = session.tensor_variable(mask_data, shape, false)?;
+        session.tensor_mul(input, mask)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
 /// Spatial dropout: drops entire channels for 2D feature maps (N, C, H, W).
 ///
 /// During training, randomly zeroes entire channels with probability `p`.
@@ -16730,7 +16819,95 @@ mod tests {
         }
     }
 
-    // ── Dropout2d / Dropout3d / AlphaDropout tests (bd-2f7k.11) ────────
+    // ── Dropout1d / Dropout2d / Dropout3d / AlphaDropout tests ─────────
+
+    #[test]
+    fn dropout1d_eval_mode_passes_through() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3], vec![2, 3], false)
+            .unwrap();
+        let d = Dropout1d::new(0.5);
+        d.eval();
+        let y = d.forward(&mut session, x).unwrap();
+        let vals = session.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![1.0; 2 * 3]);
+    }
+
+    #[test]
+    fn dropout1d_full_prob_zeros_batched_input() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3 * 4], vec![2, 3, 4], false)
+            .unwrap();
+        let d = Dropout1d::new(1.0);
+        let y = d.forward(&mut session, x).unwrap();
+        let vals = session.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![0.0; 2 * 3 * 4]);
+    }
+
+    #[test]
+    fn dropout1d_invalid_probability_fails_closed() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3], vec![2, 3], false)
+            .unwrap();
+
+        for p in [-0.1, 1.1, f64::NAN] {
+            let d = Dropout1d::new(p);
+            let err = d
+                .forward(&mut session, x)
+                .expect_err("invalid Dropout1d probability must fail closed");
+            assert!(matches!(
+                err,
+                AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "dropout probability p must be finite and in [0, 1]"
+                    }
+                ))
+            ));
+        }
+    }
+
+    #[test]
+    fn dropout1d_rejects_wrong_rank() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3 * 4 * 5], vec![2, 3, 4, 5], false)
+            .unwrap();
+        let d = Dropout1d::new(0.5);
+        let err = d
+            .forward(&mut session, x)
+            .expect_err("Dropout1d must reject rank-4 input");
+        assert!(format!("{err:?}").contains("Dropout1d expects 2D or 3D input"));
+    }
+
+    #[test]
+    fn dropout1d_channel_consistency_unbatched() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 8 * 3], vec![8, 3], false)
+            .unwrap();
+        let d = Dropout1d::new(0.5);
+        let y = d.forward(&mut session, x).unwrap();
+        let vals = session.tensor_values(y).unwrap();
+        for c in 0..8 {
+            let start = c * 3;
+            let first = vals[start];
+            for i in 0..3 {
+                assert!(
+                    (vals[start + i] - first).abs() < 1e-12,
+                    "channel {c}: temporal values differ"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn dropout1d_has_no_parameters() {
+        let d = Dropout1d::new(0.5);
+        assert!(d.parameters().is_empty());
+    }
 
     #[test]
     fn dropout2d_eval_mode_passes_through() {
