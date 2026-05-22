@@ -901,6 +901,18 @@ impl FrankenTorchSession {
         self.tensor_tape.to_dtype(input, dtype)
     }
 
+    /// Convert `input` to the same dtype as `other`.
+    ///
+    /// Equivalent to `input.type_as(other)` in PyTorch.
+    pub fn tensor_type_as(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let target_dtype = self.tensor_dtype(other)?;
+        self.tensor_to_dtype(input, target_dtype)
+    }
+
     /// Return the real component of a complex tensor.
     pub fn tensor_real(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let tensor = self.tensor_tape.tensor(input)?;
@@ -52365,5 +52377,16 @@ mod tests {
         assert!(!s.tensor_requires_grad(data).unwrap());
         let vals = s.tensor_values(data).unwrap();
         assert!((vals[0] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_type_as() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let template = s.tensor_variable(vec![0.0, 0.0], vec![2], false).unwrap();
+        // Both are f64, so type_as should return the same dtype
+        let result = s.tensor_type_as(x, template).unwrap();
+        let dtype = s.tensor_dtype(result).unwrap();
+        assert_eq!(dtype, s.tensor_dtype(template).unwrap());
     }
 }
