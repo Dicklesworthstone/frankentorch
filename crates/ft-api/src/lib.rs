@@ -18371,12 +18371,38 @@ impl FrankenTorchSession {
         self.tensor_shape(node)
     }
 
+    /// Return the size of a specific dimension.
+    ///
+    /// Equivalent to `tensor.size(dim)` in PyTorch.
+    pub fn tensor_size_dim(&self, node: TensorNodeId, dim: usize) -> Result<usize, AutogradError> {
+        let shape = self.tensor_shape(node)?;
+        if dim >= shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::InvalidDimension { dim, ndim: shape.len() },
+            )));
+        }
+        Ok(shape[dim])
+    }
+
     /// Return the stride of each dimension.
     ///
     /// Equivalent to `tensor.stride()` in PyTorch.
     pub fn tensor_stride(&self, node: TensorNodeId) -> Result<Vec<usize>, AutogradError> {
         let tensor = self.tensor_tape.tensor(node)?;
         Ok(tensor.meta().strides().to_vec())
+    }
+
+    /// Return the stride of a specific dimension.
+    ///
+    /// Equivalent to `tensor.stride(dim)` in PyTorch.
+    pub fn tensor_stride_dim(&self, node: TensorNodeId, dim: usize) -> Result<usize, AutogradError> {
+        let strides = self.tensor_stride(node)?;
+        if dim >= strides.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::InvalidDimension { dim, ndim: strides.len() },
+            )));
+        }
+        Ok(strides[dim])
     }
 
     /// Check if two tensors have the same shape.
