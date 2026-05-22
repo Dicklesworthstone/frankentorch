@@ -5367,6 +5367,20 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Compute sine and cosine simultaneously.
+    ///
+    /// Equivalent to `torch.sincos(input)`. Returns `(sin, cos)`.
+    /// More efficient than calling sin and cos separately when both are needed.
+    /// Tracked under frankentorch-y2ui.
+    pub fn tensor_sincos(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let sin_out = self.tensor_sin(input)?;
+        let cos_out = self.tensor_cos(input)?;
+        Ok((sin_out, cos_out))
+    }
+
     pub fn tensor_floor(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.floor(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -10294,6 +10308,51 @@ impl FrankenTorchSession {
         } else {
             self.tensor_reshape(gathered, indices_shape)
         }
+    }
+
+    /// Replace elements at flat indices with values.
+    ///
+    /// Equivalent to `torch.put(input, indices, values)`. Treats input
+    /// as flattened and places values at the corresponding flat indices.
+    /// Returns a new tensor with the same shape as input.
+    ///
+    /// Unlike scatter, indices and values are flat (1D). Autograd is not
+    /// supported (non-differentiable at replaced positions).
+    /// Tracked under frankentorch-y2ui.
+    pub fn tensor_put(
+        &mut self,
+        input: TensorNodeId,
+        indices: TensorNodeId,
+        values: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let indices_vals = self.tensor_values(indices)?;
+        let values_vals = self.tensor_values(values)?;
+
+        if indices_vals.len() != values_vals.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "put: indices and values must have the same length",
+                },
+            )));
+        }
+
+        let numel = Self::checked_shape_numel(&input_shape, "put: input shape volume overflow")?;
+        let mut result = self.tensor_values(input)?;
+
+        for (&idx, &val) in indices_vals.iter().zip(values_vals.iter()) {
+            let i = idx as usize;
+            if i >= numel {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "put: index out of bounds",
+                    },
+                )));
+            }
+            result[i] = val;
+        }
+
+        self.tensor_variable(result, input_shape, false)
     }
 
     /// Like `tensor_index_select`, but the input's gradient is also
@@ -50011,5 +50070,34 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    fn test_sincos_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0, std::f64::consts::FRAC_PI_2], vec![2], false).unwrap();
+        let (sin_out, cos_out) = s.tensor_sincos(input).unwrap();
+        let sin_vals = s.tensor_values(sin_out).unwrap();
+        let cos_vals = s.tensor_values(cos_out).unwrap();
+        // sin(0) = 0, sin(pi/2) = 1
+        assert!(sin_vals[0].abs() < 1e-10);
+        assert!((sin_vals[1] - 1.0).abs() < 1e-10);
+        // cos(0) = 1, cos(pi/2) = 0
+        assert!((cos_vals[0] - 1.0).abs() < 1e-10);
+        assert!(cos_vals[1].abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_put_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let indices = s.tensor_variable(vec![0.0, 3.0], vec![2], false).unwrap();
+        let values = s.tensor_variable(vec![10.0, 40.0], vec![2], false).unwrap();
+        let out = s.tensor_put(input, indices, values).unwrap();
+        let shape = s.tensor_shape(out).unwrap();
+        assert_eq!(shape, vec![2, 2]);
+        let vals = s.tensor_values(out).unwrap();
+        // Flat indices 0 and 3 should be replaced
+        assert_eq!(vals, vec![10.0, 2.0, 3.0, 40.0]);
     }
 }
