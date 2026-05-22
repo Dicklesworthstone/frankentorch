@@ -14595,6 +14595,96 @@ impl FrankenTorchSession {
         self.tensor_variable(vec![count], vec![1], false)
     }
 
+    /// Convert multi-dimensional indices to flat indices.
+    ///
+    /// Equivalent to `torch.ravel_multi_index(multi_index, shape)`.
+    /// `multi_index` is a list of index tensors, one per dimension.
+    /// Returns a tensor of flat indices. Tracked under frankentorch-xwas.
+    pub fn ravel_multi_index(
+        &mut self,
+        multi_index: &[TensorNodeId],
+        shape: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        if multi_index.len() != shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "ravel_multi_index: multi_index length must match shape length",
+                },
+            )));
+        }
+        if multi_index.is_empty() {
+            return self.tensor_variable(vec![], vec![0], false);
+        }
+
+        let ndim = shape.len();
+        let mut strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+
+        let first_vals = self.tensor_values(multi_index[0])?;
+        let n = first_vals.len();
+        let mut result = vec![0.0_f64; n];
+
+        for (dim, &idx_tensor) in multi_index.iter().enumerate() {
+            let idx_vals = self.tensor_values(idx_tensor)?;
+            if idx_vals.len() != n {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "ravel_multi_index: all index tensors must have same length",
+                    },
+                )));
+            }
+            for (i, &idx) in idx_vals.iter().enumerate() {
+                result[i] += idx * strides[dim] as f64;
+            }
+        }
+
+        self.tensor_variable(result, vec![n], false)
+    }
+
+    /// Convert flat indices to multi-dimensional indices.
+    ///
+    /// Equivalent to `torch.unravel_index(indices, shape)`.
+    /// Returns a tuple of index tensors, one per dimension.
+    /// Tracked under frankentorch-xwas.
+    pub fn unravel_index(
+        &mut self,
+        indices: TensorNodeId,
+        shape: &[usize],
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        let flat_indices = self.tensor_values(indices)?;
+        let ndim = shape.len();
+
+        if ndim == 0 {
+            return Ok(vec![]);
+        }
+
+        let mut strides = vec![1usize; ndim];
+        for i in (0..ndim.saturating_sub(1)).rev() {
+            strides[i] = strides[i + 1] * shape[i + 1];
+        }
+
+        let n = flat_indices.len();
+        let mut per_dim_indices: Vec<Vec<f64>> = vec![Vec::with_capacity(n); ndim];
+
+        for &flat_idx in &flat_indices {
+            let mut remaining = flat_idx as usize;
+            for (dim, &s) in strides.iter().enumerate() {
+                let dim_idx = remaining / s;
+                remaining %= s;
+                per_dim_indices[dim].push(dim_idx as f64);
+            }
+        }
+
+        let mut result = Vec::with_capacity(ndim);
+        for dim_indices in per_dim_indices {
+            let t = self.tensor_variable(dim_indices, vec![n], false)?;
+            result.push(t);
+        }
+        Ok(result)
+    }
+
     /// Compute the n-th discrete difference along the given dimension.
     ///
     /// Equivalent to `torch.diff(input, n=1, dim=-1)`.
@@ -50208,5 +50298,32 @@ mod tests {
         let q1 = s.tensor_nanquantile(input, 1.0).unwrap();
         assert!((s.tensor_values(q0).unwrap()[0] - 1.0).abs() < 1e-10);
         assert!((s.tensor_values(q1).unwrap()[0] - 4.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_ravel_multi_index_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // For shape [3, 4], index (1, 2) -> flat index 1*4 + 2 = 6
+        let idx0 = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let idx1 = s.tensor_variable(vec![2.0, 3.0], vec![2], false).unwrap();
+        let out = s.ravel_multi_index(&[idx0, idx1], &[3, 4]).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        assert!((vals[0] - 6.0).abs() < 1e-10); // 1*4 + 2
+        assert!((vals[1] - 11.0).abs() < 1e-10); // 2*4 + 3
+    }
+
+    #[test]
+    fn test_unravel_index_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // For shape [3, 4], flat index 6 -> (1, 2)
+        let indices = s.tensor_variable(vec![6.0, 11.0], vec![2], false).unwrap();
+        let result = s.unravel_index(indices, &[3, 4]).unwrap();
+        assert_eq!(result.len(), 2);
+        let dim0 = s.tensor_values(result[0]).unwrap();
+        let dim1 = s.tensor_values(result[1]).unwrap();
+        assert!((dim0[0] - 1.0).abs() < 1e-10);
+        assert!((dim0[1] - 2.0).abs() < 1e-10);
+        assert!((dim1[0] - 2.0).abs() < 1e-10);
+        assert!((dim1[1] - 3.0).abs() < 1e-10);
     }
 }
