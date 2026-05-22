@@ -7857,6 +7857,90 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// In-place greater-than comparison: target = (target > other) ? 1.0 : 0.0.
+    pub fn tensor_gt_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_gt(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("gt_", target, None);
+        Ok(())
+    }
+
+    /// In-place greater-equal comparison: target = (target >= other) ? 1.0 : 0.0.
+    pub fn tensor_ge_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_ge(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("ge_", target, None);
+        Ok(())
+    }
+
+    /// In-place less-than comparison: target = (target < other) ? 1.0 : 0.0.
+    pub fn tensor_lt_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_lt(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("lt_", target, None);
+        Ok(())
+    }
+
+    /// In-place less-equal comparison: target = (target <= other) ? 1.0 : 0.0.
+    pub fn tensor_le_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_le(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("le_", target, None);
+        Ok(())
+    }
+
+    /// In-place equality comparison: target = (target == other) ? 1.0 : 0.0.
+    pub fn tensor_eq_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_eq(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("eq_", target, None);
+        Ok(())
+    }
+
+    /// In-place not-equal comparison: target = (target != other) ? 1.0 : 0.0.
+    pub fn tensor_ne_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_ne(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("ne_", target, None);
+        Ok(())
+    }
+
     pub fn tensor_atan2(
         &mut self,
         lhs: TensorNodeId,
