@@ -1723,6 +1723,25 @@ impl Module for ReLU {
     }
 }
 
+/// ReLU6 activation module.
+///
+/// Applies `min(max(0, x), 6)` elementwise.
+pub struct ReLU6;
+
+impl Module for ReLU6 {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        session.tensor_clamp(input, 0.0, 6.0)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+}
+
 /// Sigmoid activation module.
 pub struct Sigmoid;
 
@@ -17942,6 +17961,7 @@ mod tests {
     #[test]
     fn activation_modules_have_no_parameters() {
         assert!(ReLU.parameters().is_empty());
+        assert!(ReLU6.parameters().is_empty());
         assert!(Sigmoid.parameters().is_empty());
         assert!(Tanh.parameters().is_empty());
         assert!(GELU.parameters().is_empty());
@@ -18057,6 +18077,45 @@ mod tests {
         assert_eq!(grad[1], 0.0); // x=0
         assert_eq!(grad[2], 1.0); // x=1
         assert_eq!(grad[3], 1.0); // x=2
+    }
+
+    #[test]
+    fn relu6_module_forward_clamps_to_unit_interval_ceiling() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![-2.0, 0.0, 3.5, 6.0, 9.0], vec![1, 5], false)
+            .expect("variable should succeed");
+
+        let y = ReLU6
+            .forward(&mut session, x)
+            .expect("relu6 forward should succeed");
+        let (values, meta) = session
+            .tensor_values_meta(y)
+            .expect("relu6 values should resolve");
+
+        assert_eq!(meta.shape(), &[1, 5]);
+        assert_eq!(values, vec![0.0, 0.0, 3.5, 6.0, 6.0]);
+    }
+
+    #[test]
+    fn relu6_backward_produces_clamp_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![-2.0, 0.0, 3.5, 6.0, 9.0], vec![5], true)
+            .expect("variable should succeed");
+
+        let y = ReLU6
+            .forward(&mut session, x)
+            .expect("relu6 forward should succeed");
+        let loss = session.tensor_sum(y).expect("sum should succeed");
+        let report = session
+            .tensor_backward(loss)
+            .expect("backward should succeed");
+        let grad = session
+            .tensor_gradient(&report, x)
+            .expect("input gradient should exist");
+
+        assert_eq!(grad, vec![0.0, 1.0, 1.0, 1.0, 0.0]);
     }
 
     #[test]
