@@ -22469,6 +22469,82 @@ impl FrankenTorchSession {
         self.tensor_linalg_qr(input, some)
     }
 
+    /// Compute the LU factorization of a square matrix.
+    ///
+    /// Equivalent to `torch.linalg.lu_factor`. Returns `(LU, pivots)` where:
+    /// - LU: packed LU factorization (n x n)
+    /// - pivots: pivot indices as an i64 tensor of shape [n]
+    ///
+    /// This is the `linalg`-prefixed version that returns pivots as a tensor
+    /// for PyTorch API compatibility. Use `tensor_lu_factor` if you prefer
+    /// pivots as a `Vec<usize>`.
+    pub fn tensor_linalg_lu_factor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (lu_node, pivots_vec) = self.tensor_lu_factor(input)?;
+        let n = pivots_vec.len();
+        let pivots_f64: Vec<f64> = pivots_vec.iter().map(|&p| p as f64).collect();
+        let pivots_node = self.tensor_variable(pivots_f64, vec![n], false)?;
+        Ok((lu_node, pivots_node))
+    }
+
+    /// Compute the LU factorization with info output.
+    ///
+    /// Equivalent to `torch.linalg.lu_factor_ex`. Returns `(LU, pivots, info)`:
+    /// - LU: packed LU factorization (n x n)
+    /// - pivots: pivot indices as an i64 tensor of shape [n]
+    /// - info: scalar tensor (0 if successful, otherwise indicates error)
+    pub fn tensor_linalg_lu_factor_ex(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        let (lu_node, pivots_node) = self.tensor_linalg_lu_factor(input)?;
+        let info_node = self.tensor_variable(vec![0.0], vec![1], false)?;
+        Ok((lu_node, pivots_node, info_node))
+    }
+
+    /// Solve a linear system using pre-computed LU factorization.
+    ///
+    /// Equivalent to `torch.linalg.lu_solve`. Takes:
+    /// - LU: packed LU factorization from `tensor_linalg_lu_factor`
+    /// - pivots: pivot indices tensor from `tensor_linalg_lu_factor`
+    /// - B: right-hand side tensor (shape [n] or [n, m])
+    ///
+    /// Returns the solution X such that A @ X = B.
+    pub fn tensor_linalg_lu_solve(
+        &mut self,
+        lu: TensorNodeId,
+        pivots: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let pivots_vals = self.tensor_values(pivots)?;
+        let pivots_usize: Vec<usize> = pivots_vals.iter().map(|&p| p as usize).collect();
+        self.tensor_lu_solve(lu, &pivots_usize, b)
+    }
+
+    /// Cross product of two 3-element vectors.
+    ///
+    /// Alias for `tensor_cross` to match `torch.linalg.cross`.
+    pub fn tensor_linalg_cross(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cross(input, other)
+    }
+
+    /// Compute the dot product of batches of vectors.
+    ///
+    /// Alias for `tensor_vecdot` to match `torch.linalg.vecdot`.
+    pub fn tensor_linalg_vecdot(
+        &mut self,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_vecdot(x, y)
+    }
+
     fn _compute_strides(shape: &[usize]) -> Vec<usize> {
         let ndim = shape.len();
         let mut strides = vec![0usize; ndim];
