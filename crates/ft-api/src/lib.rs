@@ -5622,6 +5622,38 @@ impl FrankenTorchSession {
         self.tensor_div(dot, denom)
     }
 
+    /// Pairwise distance between two tensors.
+    ///
+    /// Equivalent to `torch.nn.functional.pairwise_distance(x1, x2, p, eps)`.
+    /// Computes ||x1 - x2||_p along the last dimension.
+    pub fn tensor_pairwise_distance(
+        &mut self,
+        x1: TensorNodeId,
+        x2: TensorNodeId,
+        p: f64,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape1 = self.tensor_shape(x1)?;
+        let shape2 = self.tensor_shape(x2)?;
+        if shape1 != shape2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: shape1,
+                    rhs: shape2,
+                },
+            )));
+        }
+        let diff = self.tensor_sub(x1, x2)?;
+        let ndim = shape1.len();
+        let last_dim = if ndim > 0 { ndim - 1 } else { 0 };
+        // norm_dim returns the p-norm along the dimension
+        let dist = self.tensor_norm_dim(diff, p, last_dim)?;
+        // Add eps for numerical stability
+        let eps_shape = self.tensor_shape(dist)?;
+        let eps_t = self.full(eps_shape, eps, false)?;
+        self.tensor_add(dist, eps_t)
+    }
+
     /// Normalize a tensor along a dimension using Lp norm.
     ///
     /// Equivalent to `torch.nn.functional.normalize(input, p, dim, eps)`.
