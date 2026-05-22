@@ -12956,6 +12956,70 @@ impl FrankenTorchSession {
         self.tensor_margin_ranking_loss(input1, input2, target, margin, reduction)
     }
 
+    /// Threshold activation. Alias for tensor_threshold.
+    pub fn functional_threshold(
+        &mut self,
+        input: TensorNodeId,
+        threshold: f64,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_threshold(input, threshold, value)
+    }
+
+    /// CELU activation. Alias for tensor_celu.
+    pub fn functional_celu(
+        &mut self,
+        input: TensorNodeId,
+        alpha: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_celu(input, alpha)
+    }
+
+    /// RReLU activation. Alias for tensor_rrelu.
+    pub fn functional_rrelu(
+        &mut self,
+        input: TensorNodeId,
+        lower: f64,
+        upper: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_rrelu(input, lower, upper)
+    }
+
+    /// GLU activation. Alias for tensor_glu.
+    pub fn functional_glu(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_glu(input, dim)
+    }
+
+    /// Softshrink activation. Alias for tensor_softshrink.
+    pub fn functional_softshrink(
+        &mut self,
+        input: TensorNodeId,
+        lambd: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_softshrink(input, lambd)
+    }
+
+    /// Hardshrink activation. Alias for tensor_hardshrink.
+    pub fn functional_hardshrink(
+        &mut self,
+        input: TensorNodeId,
+        lambd: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hardshrink(input, lambd)
+    }
+
+    /// Tanhshrink activation. Alias for tensor_tanhshrink.
+    pub fn functional_tanhshrink(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_tanhshrink(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
