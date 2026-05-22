@@ -18083,6 +18083,124 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Decompose floating-point numbers into mantissa and exponent.
+    ///
+    /// Equivalent to `torch.frexp(input)`. Returns `(mantissa, exponent)` where:
+    /// - `mantissa` is in [0.5, 1.0) for positive values, (-1.0, -0.5] for negative
+    /// - `exponent` is the integer power of 2
+    /// - `input = mantissa * 2^exponent`
+    ///
+    /// For zero, both mantissa and exponent are 0.
+    /// For infinities and NaN, the results follow IEEE 754 semantics.
+    ///
+    /// Autograd is not implemented (non-differentiable due to integer exponent).
+    /// Tracked under frankentorch-zy52.
+    pub fn tensor_frexp(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (vals, shape) = {
+            let t = self.tensor_tape.tensor(input)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        let mut mantissa = Vec::with_capacity(vals.len());
+        let mut exponent = Vec::with_capacity(vals.len());
+        for &v in &vals {
+            let (m, e) = frexp_scalar(v);
+            mantissa.push(m);
+            exponent.push(e as f64);
+        }
+        let mantissa_node = self.tensor_tape.leaf(mantissa, shape.clone(), false)?;
+        let exponent_node = self.tensor_tape.leaf(exponent, shape, false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "frexp in={} mantissa={} exponent={}",
+                input.0, mantissa_node.0, exponent_node.0
+            ),
+        );
+        Ok((mantissa_node, exponent_node))
+    }
+
+    /// Element-wise greatest common divisor of two integer tensors.
+    ///
+    /// Equivalent to `torch.gcd(input, other)`. Inputs are treated as integers
+    /// (floor is applied implicitly). The result is always non-negative.
+    ///
+    /// Tracked under frankentorch-zy52.
+    pub fn tensor_gcd(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (a_vals, a_shape) = {
+            let t = self.tensor_tape.tensor(input)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        let (b_vals, b_shape) = {
+            let t = self.tensor_tape.tensor(other)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        if a_shape != b_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "gcd: inputs must have the same shape",
+                },
+            )));
+        }
+        let values: Vec<f64> = a_vals
+            .iter()
+            .zip(b_vals.iter())
+            .map(|(&a, &b)| gcd_scalar(a as i64, b as i64) as f64)
+            .collect();
+        let out = self.tensor_tape.leaf(values, a_shape, false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("gcd a={} b={} out={}", input.0, other.0, out.0),
+        );
+        Ok(out)
+    }
+
+    /// Element-wise least common multiple of two integer tensors.
+    ///
+    /// Equivalent to `torch.lcm(input, other)`. Inputs are treated as integers
+    /// (floor is applied implicitly). The result is always non-negative.
+    /// Returns 0 if either input is 0.
+    ///
+    /// Tracked under frankentorch-zy52.
+    pub fn tensor_lcm(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (a_vals, a_shape) = {
+            let t = self.tensor_tape.tensor(input)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        let (b_vals, b_shape) = {
+            let t = self.tensor_tape.tensor(other)?;
+            (t.storage()?.to_vec(), t.meta().shape().to_vec())
+        };
+        if a_shape != b_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "lcm: inputs must have the same shape",
+                },
+            )));
+        }
+        let values: Vec<f64> = a_vals
+            .iter()
+            .zip(b_vals.iter())
+            .map(|(&a, &b)| lcm_scalar(a as i64, b as i64) as f64)
+            .collect();
+        let out = self.tensor_tape.leaf(values, a_shape, false)?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("lcm a={} b={} out={}", input.0, other.0, out.0),
+        );
+        Ok(out)
+    }
+
     /// Element-wise entropy: -x * log(x).
     ///
     /// Equivalent to `torch.special.entr(input)`.
@@ -22501,6 +22619,51 @@ fn zeta_approx(s: f64, a: f64) -> f64 {
     sum += last_deriv / 12.0;
 
     sum
+}
+
+/// frexp: decompose float into mantissa and exponent.
+/// Returns (m, e) where input = m * 2^e, with |m| in [0.5, 1.0) for non-zero values.
+fn frexp_scalar(x: f64) -> (f64, i32) {
+    if x == 0.0 || x.is_nan() || x.is_infinite() {
+        return (x, 0);
+    }
+    let bits = x.to_bits();
+    let sign = bits >> 63;
+    let exp_bits = ((bits >> 52) & 0x7FF) as i32;
+    let mantissa_bits = bits & 0x000F_FFFF_FFFF_FFFF;
+
+    if exp_bits == 0 {
+        // Subnormal: normalize by multiplying by 2^52
+        let normalized = x * (1u64 << 52) as f64;
+        let (m, e) = frexp_scalar(normalized);
+        return (m, e - 52);
+    }
+
+    // Normal: extract exponent (biased by 1023) and build mantissa in [0.5, 1.0)
+    let exponent = exp_bits - 1022; // unbiased + 1 for [0.5, 1.0) range
+    let mantissa = f64::from_bits((sign << 63) | (0x3FE << 52) | mantissa_bits);
+    (mantissa, exponent)
+}
+
+/// Greatest common divisor using Euclidean algorithm.
+fn gcd_scalar(a: i64, b: i64) -> i64 {
+    let mut a = a.abs();
+    let mut b = b.abs();
+    while b != 0 {
+        let t = b;
+        b = a % b;
+        a = t;
+    }
+    a
+}
+
+/// Least common multiple: |a * b| / gcd(a, b).
+fn lcm_scalar(a: i64, b: i64) -> i64 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    let g = gcd_scalar(a, b);
+    (a.abs() / g) * b.abs()
 }
 
 /// Binary search: leftmost insertion position (lower_bound).
@@ -49441,5 +49604,64 @@ mod tests {
         let cast = s.with_autocast(DType::F64, |sess| sess.maybe_autocast(f32_in).unwrap());
         // F32 -> F64 is an UPCAST, autocast should leave it alone
         assert_eq!(cast, f32_in);
+    }
+
+    #[test]
+    fn test_frexp_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![8.0, -4.0, 0.5, 0.0], vec![4], false).unwrap();
+        let (mantissa, exponent) = s.tensor_frexp(input).unwrap();
+        let m_vals = s.tensor_values(mantissa).unwrap();
+        let e_vals = s.tensor_values(exponent).unwrap();
+        // 8 = 0.5 * 2^4, -4 = -0.5 * 2^3, 0.5 = 0.5 * 2^0, 0 = 0 * 2^0
+        assert!((m_vals[0] - 0.5).abs() < 1e-10);
+        assert!((e_vals[0] - 4.0).abs() < 1e-10);
+        assert!((m_vals[1] - (-0.5)).abs() < 1e-10);
+        assert!((e_vals[1] - 3.0).abs() < 1e-10);
+        assert!((m_vals[2] - 0.5).abs() < 1e-10);
+        assert!((e_vals[2] - 0.0).abs() < 1e-10);
+        assert!((m_vals[3]).abs() < 1e-10);
+        assert!((e_vals[3]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gcd_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![12.0, 15.0, 7.0, 0.0], vec![4], false).unwrap();
+        let b = s.tensor_variable(vec![8.0, 25.0, 11.0, 5.0], vec![4], false).unwrap();
+        let out = s.tensor_gcd(a, b).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // gcd(12,8)=4, gcd(15,25)=5, gcd(7,11)=1, gcd(0,5)=5
+        assert!((vals[0] - 4.0).abs() < 1e-10);
+        assert!((vals[1] - 5.0).abs() < 1e-10);
+        assert!((vals[2] - 1.0).abs() < 1e-10);
+        assert!((vals[3] - 5.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_lcm_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![4.0, 3.0, 7.0, 0.0], vec![4], false).unwrap();
+        let b = s.tensor_variable(vec![6.0, 5.0, 11.0, 5.0], vec![4], false).unwrap();
+        let out = s.tensor_lcm(a, b).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // lcm(4,6)=12, lcm(3,5)=15, lcm(7,11)=77, lcm(0,5)=0
+        assert!((vals[0] - 12.0).abs() < 1e-10);
+        assert!((vals[1] - 15.0).abs() < 1e-10);
+        assert!((vals[2] - 77.0).abs() < 1e-10);
+        assert!((vals[3]).abs() < 1e-10);
+    }
+
+    #[test]
+    fn test_gcd_negative() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![-12.0, 15.0, -7.0], vec![3], false).unwrap();
+        let b = s.tensor_variable(vec![8.0, -25.0, -11.0], vec![3], false).unwrap();
+        let out = s.tensor_gcd(a, b).unwrap();
+        let vals = s.tensor_values(out).unwrap();
+        // gcd(-12,8)=4, gcd(15,-25)=5, gcd(-7,-11)=1
+        assert!((vals[0] - 4.0).abs() < 1e-10);
+        assert!((vals[1] - 5.0).abs() < 1e-10);
+        assert!((vals[2] - 1.0).abs() < 1e-10);
     }
 }
