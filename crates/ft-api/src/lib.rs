@@ -19613,6 +19613,152 @@ impl FrankenTorchSession {
         self.tensor_variable(result, vec![out_len], false)
     }
 
+    /// Compute the 2-D Discrete Fourier Transform.
+    ///
+    /// Equivalent to `torch.fft.fft2(input)`.
+    /// Applies FFT along the last two dimensions. Input shape must be at least 2-D.
+    /// Output is Complex128.
+    pub fn tensor_fft2(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "fft2: autograd not supported (Wirtinger calculus not yet implemented)",
+                },
+            )));
+        }
+        let shape = self.tensor_shape(input)?;
+        if shape.len() < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "fft2: input must be at least 2-D",
+                },
+            )));
+        }
+        // Apply FFT along last dimension, then along second-to-last
+        let ndim = shape.len();
+        let vals = self.tensor_values(input)?;
+        let rows = shape[ndim - 2];
+        let cols = shape[ndim - 1];
+        let batch_size: usize = shape[..ndim - 2].iter().product();
+
+        let mut re_out = vec![0.0_f64; batch_size * rows * cols];
+        let mut im_out = vec![0.0_f64; batch_size * rows * cols];
+
+        // FFT along columns (last dim) for each row
+        for b in 0..batch_size {
+            for r in 0..rows {
+                let start = b * rows * cols + r * cols;
+                let mut re_row: Vec<f64> = vals[start..start + cols].to_vec();
+                let mut im_row = vec![0.0_f64; cols];
+                Self::dft_inplace_1d(&mut re_row, &mut im_row, false);
+                re_out[start..start + cols].copy_from_slice(&re_row);
+                im_out[start..start + cols].copy_from_slice(&im_row);
+            }
+        }
+
+        // FFT along rows (second-to-last dim)
+        for b in 0..batch_size {
+            for c in 0..cols {
+                let mut re_col = vec![0.0_f64; rows];
+                let mut im_col = vec![0.0_f64; rows];
+                for r in 0..rows {
+                    re_col[r] = re_out[b * rows * cols + r * cols + c];
+                    im_col[r] = im_out[b * rows * cols + r * cols + c];
+                }
+                Self::dft_inplace_1d(&mut re_col, &mut im_col, false);
+                for r in 0..rows {
+                    re_out[b * rows * cols + r * cols + c] = re_col[r];
+                    im_out[b * rows * cols + r * cols + c] = im_col[r];
+                }
+            }
+        }
+
+        let re_node = self.tensor_variable(re_out, shape.clone(), false)?;
+        let im_node = self.tensor_variable(im_out, shape, false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
+    /// Compute the 2-D Inverse Discrete Fourier Transform.
+    ///
+    /// Equivalent to `torch.fft.ifft2(input)`.
+    /// Applies inverse FFT along the last two dimensions. Input must be Complex128.
+    pub fn tensor_ifft2(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "ifft2: autograd not supported",
+                },
+            )));
+        }
+        let dtype = self.tensor_dtype(input)?;
+        if dtype != DType::Complex128 && dtype != DType::Complex64 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "ifft2: input must be complex",
+                },
+            )));
+        }
+
+        let shape = self.tensor_shape(input)?;
+        if shape.len() < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "ifft2: input must be at least 2-D",
+                },
+            )));
+        }
+
+        let real_view = self.tensor_view_as_real(input)?;
+        let vals = self.tensor_values(real_view)?;
+
+        let ndim = shape.len();
+        let rows = shape[ndim - 2];
+        let cols = shape[ndim - 1];
+        let batch_size: usize = shape[..ndim - 2].iter().product();
+
+        let mut re_out = vec![0.0_f64; batch_size * rows * cols];
+        let mut im_out = vec![0.0_f64; batch_size * rows * cols];
+
+        // Extract interleaved complex values
+        for i in 0..batch_size * rows * cols {
+            re_out[i] = vals[i * 2];
+            im_out[i] = vals[i * 2 + 1];
+        }
+
+        // Inverse FFT along rows (second-to-last dim)
+        for b in 0..batch_size {
+            for c in 0..cols {
+                let mut re_col = vec![0.0_f64; rows];
+                let mut im_col = vec![0.0_f64; rows];
+                for r in 0..rows {
+                    re_col[r] = re_out[b * rows * cols + r * cols + c];
+                    im_col[r] = im_out[b * rows * cols + r * cols + c];
+                }
+                Self::dft_inplace_1d(&mut re_col, &mut im_col, true);
+                for r in 0..rows {
+                    re_out[b * rows * cols + r * cols + c] = re_col[r];
+                    im_out[b * rows * cols + r * cols + c] = im_col[r];
+                }
+            }
+        }
+
+        // Inverse FFT along columns (last dim)
+        for b in 0..batch_size {
+            for r in 0..rows {
+                let start = b * rows * cols + r * cols;
+                let mut re_row: Vec<f64> = re_out[start..start + cols].to_vec();
+                let mut im_row: Vec<f64> = im_out[start..start + cols].to_vec();
+                Self::dft_inplace_1d(&mut re_row, &mut im_row, true);
+                re_out[start..start + cols].copy_from_slice(&re_row);
+                im_out[start..start + cols].copy_from_slice(&im_row);
+            }
+        }
+
+        let re_node = self.tensor_variable(re_out, shape.clone(), false)?;
+        let im_node = self.tensor_variable(im_out, shape, false)?;
+        self.tensor_complex(re_node, im_node)
+    }
+
     // ── logsumexp ────────────────────────────────────────────────────────
     /// Numerically stable log-sum-exp reduction along a dimension.
     ///
