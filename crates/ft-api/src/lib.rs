@@ -18610,6 +18610,59 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Log of standard Gaussian cumulative distribution function.
+    ///
+    /// Equivalent to `torch.special.log_ndtr(input)`.
+    /// Numerically stable for large negative values.
+    /// Tracked under frankentorch-v0nh.
+    pub fn tensor_log_ndtr(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let sqrt2_inv = 1.0 / std::f64::consts::SQRT_2;
+        let sqrt_2pi_inv = 1.0 / (2.0 * std::f64::consts::PI).sqrt();
+        let out = self.tensor_apply_function(
+            &[input],
+            move |ctx, inputs| {
+                let (vals, shape) = inputs[0];
+                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                let values: Vec<f64> = vals.iter().map(|&x| {
+                    let z = -x * sqrt2_inv;
+                    if z < 0.0 {
+                        (0.5 * libm::erfc(z)).ln()
+                    } else {
+                        (0.5 * libm::erfc(z)).ln()
+                    }
+                }).collect();
+                Ok((values, shape.to_vec()))
+            },
+            move |ctx, grad_outputs| {
+                let grad_out = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let x_vals = &saved[0];
+                if grad_out.len() != x_vals.len() {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "log_ndtr backward: incoming gradient length mismatch",
+                        },
+                    )));
+                }
+                let grad_in: Vec<f64> = x_vals
+                    .iter()
+                    .zip(grad_out.iter())
+                    .map(|(&x, &go)| {
+                        let pdf = sqrt_2pi_inv * (-0.5 * x * x).exp();
+                        let cdf = 0.5 * libm::erfc(-x * sqrt2_inv);
+                        go * pdf / cdf
+                    })
+                    .collect();
+                Ok(vec![Some(grad_in)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!("log_ndtr in={} out={}", input.0, out.0),
+        );
+        Ok(out)
+    }
+
     /// Multivariate log-gamma function.
     ///
     /// Equivalent to `torch.special.multigammaln(input, p)`.
@@ -51110,5 +51163,17 @@ mod tests {
         assert!((vals[1] - 0.8413447).abs() < 1e-5); // ndtr(1)
         assert!((vals[2] - 0.1586553).abs() < 1e-5); // ndtr(-1) = 1 - ndtr(1)
         assert!((vals[3] - 0.9772499).abs() < 1e-5); // ndtr(2)
+    }
+
+    #[test]
+    fn test_log_ndtr_basic() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(vec![0.0, 1.0, -1.0, -2.0], vec![4], false).unwrap();
+        let result = s.tensor_log_ndtr(input).unwrap();
+        let vals = s.tensor_values(result).unwrap();
+        assert!((vals[0] - (-0.693147)).abs() < 1e-5); // log(0.5)
+        assert!((vals[1] - (-0.172847)).abs() < 1e-5); // log(0.8413...)
+        assert!((vals[2] - (-1.841022)).abs() < 1e-5); // log(0.1586...)
+        assert!((vals[3] - (-3.783184)).abs() < 1e-5); // log(0.0227...)
     }
 }
