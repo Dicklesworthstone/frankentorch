@@ -2475,6 +2475,113 @@ impl Module for AlphaDropout {
     }
 }
 
+/// Feature-map alpha dropout for self-normalizing convolutional activations.
+///
+/// Accepts unbatched `(C, D, H, W)` and batched `(N, C, D, H, W)` inputs.
+pub struct FeatureAlphaDropout {
+    p: f64,
+    training: std::cell::Cell<bool>,
+}
+
+impl FeatureAlphaDropout {
+    #[must_use]
+    pub fn new(p: f64) -> Self {
+        Self {
+            p,
+            training: std::cell::Cell::new(true),
+        }
+    }
+
+    pub fn train(&self, mode: bool) {
+        self.training.set(mode);
+    }
+
+    pub fn eval(&self) {
+        self.train(false);
+    }
+}
+
+impl Module for FeatureAlphaDropout {
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !self.p.is_finite() || !(0.0..=1.0).contains(&self.p) {
+            return Err(incompatible_error(
+                "feature_alpha_dropout probability p must be finite and in [0, 1]",
+            ));
+        }
+        if !self.training.get() || self.p == 0.0 {
+            return Ok(input);
+        }
+
+        let shape = session.tensor_shape(input)?;
+        let (feature_maps, spatial) = match shape.as_slice() {
+            [c, d, h, w] => (
+                *c,
+                checked_shape_numel(&[*d, *h, *w], "FeatureAlphaDropout spatial shape overflow")?,
+            ),
+            [n, c, d, h, w] => (
+                checked_mul(*n, *c, "FeatureAlphaDropout feature-map count overflow")?,
+                checked_shape_numel(&[*d, *h, *w], "FeatureAlphaDropout spatial shape overflow")?,
+            ),
+            _ => {
+                return Err(incompatible_error(
+                    "FeatureAlphaDropout expects 4D or 5D input ((C, D, H, W) or (N, C, D, H, W))",
+                ));
+            }
+        };
+
+        let alpha_p = -AlphaDropout::SAT;
+        let a = ((1.0 - self.p) * (1.0 + self.p * alpha_p * alpha_p)).sqrt();
+        let a = 1.0 / a;
+        let b = a * self.p * AlphaDropout::SAT;
+
+        let rand_vals_id = session.rand(vec![feature_maps], false)?;
+        let rand = session.tensor_values(rand_vals_id)?;
+        let mask_len = checked_mul(
+            feature_maps,
+            spatial,
+            "FeatureAlphaDropout mask size overflow",
+        )?;
+        let mut mask_vals = vec![0.0f64; mask_len];
+        if spatial > 0 {
+            for (feature_map, chunk) in mask_vals.chunks_mut(spatial).enumerate() {
+                let sample = rand.get(feature_map).copied().ok_or_else(|| {
+                    incompatible_error("FeatureAlphaDropout random mask length mismatch")
+                })?;
+                let keep = if sample > self.p { 1.0 } else { 0.0 };
+                chunk.fill(keep);
+            }
+        }
+        let mask = session.tensor_variable(mask_vals, shape.clone(), false)?;
+
+        let ones_t = session.full(shape.clone(), 1.0, false)?;
+        let one_minus_mask = session.tensor_sub(ones_t, mask)?;
+        let sat_t = session.full(shape.clone(), AlphaDropout::SAT, false)?;
+        let drop_branch = session.tensor_mul(one_minus_mask, sat_t)?;
+        let keep_branch = session.tensor_mul(mask, input)?;
+        let pre_affine = session.tensor_add(keep_branch, drop_branch)?;
+        let a_t = session.full(shape.clone(), a, false)?;
+        let scaled = session.tensor_mul(pre_affine, a_t)?;
+        let b_t = session.full(shape, b, false)?;
+        session.tensor_add(scaled, b_t)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        Vec::new()
+    }
+
+    fn train(&self, mode: bool) {
+        self.training.set(mode);
+    }
+
+    fn is_training(&self) -> bool {
+        self.training.get()
+    }
+}
+
 /// Embedding lookup table: maps integer indices to dense vectors.
 ///
 /// Weight has shape `[num_embeddings, embedding_dim]`, initialized from N(0,1).
@@ -17166,6 +17273,108 @@ mod tests {
                 }
             ))
         ));
+    }
+
+    #[test]
+    fn feature_alpha_dropout_eval_passes_through() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 2 * 2 * 2], vec![2, 2, 2, 2], false)
+            .unwrap();
+        let d = FeatureAlphaDropout::new(0.5);
+        d.eval();
+        let y = d.forward(&mut session, x).unwrap();
+        let vals = session.tensor_values(y).unwrap();
+        assert_eq!(vals, vec![1.0; 2 * 2 * 2 * 2]);
+    }
+
+    #[test]
+    fn feature_alpha_dropout_invalid_probability_fails_closed() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 2 * 2 * 2], vec![2, 2, 2, 2], false)
+            .expect("variable");
+
+        for p in [-0.1, 1.1, f64::NAN, f64::INFINITY, f64::NEG_INFINITY] {
+            let d = FeatureAlphaDropout::new(p);
+            let err = d
+                .forward(&mut session, x)
+                .expect_err("invalid feature_alpha_dropout probability must fail closed");
+            assert!(
+                matches!(
+                    err,
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "feature_alpha_dropout probability p must be finite and in [0, 1]"
+                        }
+                    ))
+                ),
+                "p={p}: unexpected error {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn feature_alpha_dropout_rejects_wrong_rank() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3 * 4], vec![2, 3, 4], false)
+            .expect("variable");
+        let d = FeatureAlphaDropout::new(0.5);
+        let err = d
+            .forward(&mut session, x)
+            .expect_err("FeatureAlphaDropout must reject rank-3 input");
+        assert!(format!("{err:?}").contains("FeatureAlphaDropout expects 4D or 5D input"));
+    }
+
+    #[test]
+    fn feature_alpha_dropout_channel_consistency_batched() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 2 * 3 * 2 * 2 * 2], vec![2, 3, 2, 2, 2], false)
+            .expect("variable");
+        let d = FeatureAlphaDropout::new(0.5);
+        let y = d.forward(&mut session, x).unwrap();
+        let vals = session.tensor_values(y).unwrap();
+        let spatial = 8;
+        for (feature_map, chunk) in vals.chunks(spatial).enumerate() {
+            if let Some((&first, rest)) = chunk.split_first() {
+                for &value in rest {
+                    assert!(
+                        (value - first).abs() < 1e-12,
+                        "feature map {feature_map}: spatial values differ"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn feature_alpha_dropout_channel_consistency_unbatched() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0; 3 * 2 * 2 * 2], vec![3, 2, 2, 2], false)
+            .expect("variable");
+        let d = FeatureAlphaDropout::new(0.5);
+        let y = d.forward(&mut session, x).unwrap();
+        let vals = session.tensor_values(y).unwrap();
+        let spatial = 8;
+        for (feature_map, chunk) in vals.chunks(spatial).enumerate() {
+            if let Some((&first, rest)) = chunk.split_first() {
+                for &value in rest {
+                    assert!(
+                        (value - first).abs() < 1e-12,
+                        "feature map {feature_map}: spatial values differ"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn feature_alpha_dropout_has_no_parameters() {
+        let d = FeatureAlphaDropout::new(0.5);
+        assert!(d.parameters().is_empty());
     }
 
     // ── Loss function tests (bd-2f7k.10) ──────────────────────────────
