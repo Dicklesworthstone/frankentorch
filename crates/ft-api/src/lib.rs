@@ -13020,6 +13020,26 @@ impl FrankenTorchSession {
         self.tensor_tanhshrink(input)
     }
 
+    /// One-hot encoding. Alias for tensor_one_hot.
+    pub fn functional_one_hot(
+        &mut self,
+        input: TensorNodeId,
+        num_classes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_one_hot(input, num_classes)
+    }
+
+    /// Unfold (sliding local blocks). Alias for tensor_unfold.
+    pub fn functional_unfold(
+        &mut self,
+        input: TensorNodeId,
+        dimension: usize,
+        size: usize,
+        step: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_unfold(input, dimension, size, step)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
