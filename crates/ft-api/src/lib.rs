@@ -14140,6 +14140,45 @@ impl FrankenTorchSession {
         self.tensor_logical_xor(input, other)
     }
 
+    /// Check for NaN values. Alias for tensor_isnan.
+    pub fn functional_isnan(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isnan(input)
+    }
+
+    /// Check for infinite values. Alias for tensor_isinf.
+    pub fn functional_isinf(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isinf(input)
+    }
+
+    /// Check for finite values. Alias for tensor_isfinite.
+    pub fn functional_isfinite(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isfinite(input)
+    }
+
+    /// Check for positive infinity. Alias for tensor_isposinf.
+    pub fn functional_isposinf(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isposinf(input)
+    }
+
+    /// Check for negative infinity. Alias for tensor_isneginf.
+    pub fn functional_isneginf(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isneginf(input)
+    }
+
+    /// Check for real numbers. Alias for tensor_isreal.
+    pub fn functional_isreal(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isreal(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
