@@ -14060,6 +14060,51 @@ impl FrankenTorchSession {
         self.tensor_norm_dim(input, p, dim)
     }
 
+    /// Element-wise greater than. Alias for tensor_greater.
+    pub fn functional_greater(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_greater(lhs, rhs)
+    }
+
+    /// Element-wise greater than or equal. Alias for tensor_greater_equal.
+    pub fn functional_greater_equal(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_greater_equal(lhs, rhs)
+    }
+
+    /// Element-wise less than. Alias for tensor_less.
+    pub fn functional_less(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_less(lhs, rhs)
+    }
+
+    /// Element-wise less than or equal. Alias for tensor_less_equal.
+    pub fn functional_less_equal(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_less_equal(lhs, rhs)
+    }
+
+    /// Element-wise not equal. Alias for tensor_not_equal.
+    pub fn functional_not_equal(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_not_equal(lhs, rhs)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
