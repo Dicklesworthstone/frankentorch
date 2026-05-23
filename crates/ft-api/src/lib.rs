@@ -30842,6 +30842,56 @@ impl FrankenTorchSession {
         Ok((keep, new_scores))
     }
 
+    /// Generate anchor boxes for object detection.
+    ///
+    /// Creates anchors at each spatial location for given aspect ratios and scales.
+    /// Returns anchors in (x1, y1, x2, y2) format.
+    ///
+    /// Args:
+    /// - feature_map_size: (H, W) of feature map
+    /// - stride: stride between feature map and input image
+    /// - base_size: base anchor size
+    /// - ratios: aspect ratios (e.g., [0.5, 1.0, 2.0])
+    /// - scales: scale multipliers (e.g., [1.0, 2.0, 4.0])
+    ///
+    /// Returns: [H*W*num_anchors, 4] anchors
+    pub fn generate_anchors(
+        &mut self,
+        feature_map_size: (usize, usize),
+        stride: usize,
+        base_size: f64,
+        ratios: &[f64],
+        scales: &[f64],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (h, w) = feature_map_size;
+        let num_anchors = ratios.len() * scales.len();
+        let total_anchors = h * w * num_anchors;
+        let mut anchors = Vec::with_capacity(total_anchors * 4);
+        let half_base = base_size / 2.0;
+        for y in 0..h {
+            let center_y = (y * stride) as f64 + stride as f64 / 2.0;
+            for x in 0..w {
+                let center_x = (x * stride) as f64 + stride as f64 / 2.0;
+                for &ratio in ratios {
+                    let sqrt_ratio = ratio.sqrt();
+                    for &scale in scales {
+                        let anchor_w = base_size * scale / sqrt_ratio;
+                        let anchor_h = base_size * scale * sqrt_ratio;
+                        let x1 = center_x - anchor_w / 2.0;
+                        let y1 = center_y - anchor_h / 2.0;
+                        let x2 = center_x + anchor_w / 2.0;
+                        let y2 = center_y + anchor_h / 2.0;
+                        anchors.push(x1);
+                        anchors.push(y1);
+                        anchors.push(x2);
+                        anchors.push(y2);
+                    }
+                }
+            }
+        }
+        self.tensor_variable(anchors, vec![total_anchors, 4], false)
+    }
+
     /// Compute IoU (Intersection over Union) between two sets of boxes.
     ///
     /// Args:
