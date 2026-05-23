@@ -14734,6 +14734,42 @@ impl FrankenTorchSession {
         self.tensor_absolute(input)
     }
 
+    /// Addition. Alias for tensor_add.
+    pub fn functional_add(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_add(lhs, rhs)
+    }
+
+    /// Subtraction (short form). Alias for tensor_sub.
+    pub fn functional_sub(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_sub(lhs, rhs)
+    }
+
+    /// Multiplication (short form). Alias for tensor_mul.
+    pub fn functional_mul(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_mul(lhs, rhs)
+    }
+
+    /// Division (short form). Alias for tensor_div.
+    pub fn functional_div(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_div(lhs, rhs)
+    }
+
     /// Subtraction. Alias for tensor_subtract.
     pub fn functional_subtract(
         &mut self,
