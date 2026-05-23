@@ -51941,6 +51941,170 @@ impl FrankenTorchSession {
         let counts_tensor = counts.expect("counts requested");
         Ok((unique, counts_tensor))
     }
+
+    // ── Matrix Multiply with Add Utilities ─────────────────────────────────
+
+    /// Outer product of two vectors.
+    pub fn ger_tensor(
+        &mut self,
+        vec1: TensorNodeId,
+        vec2: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_ger(vec1, vec2)
+    }
+
+    /// Batch matrix multiply with add.
+    pub fn baddbmm_tensor(
+        &mut self,
+        input: TensorNodeId,
+        batch1: TensorNodeId,
+        batch2: TensorNodeId,
+        beta: f64,
+        alpha: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_baddbmm(input, batch1, batch2, beta, alpha)
+    }
+
+    /// Batch matrix multiply reduced to 2D with add.
+    pub fn addbmm_tensor(
+        &mut self,
+        input: TensorNodeId,
+        batch1: TensorNodeId,
+        batch2: TensorNodeId,
+        beta: f64,
+        alpha: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_addbmm(input, batch1, batch2, beta, alpha)
+    }
+
+    /// Rank-1 update: out = beta * input + alpha * vec1 ⊗ vec2.
+    pub fn addr_tensor(
+        &mut self,
+        input: TensorNodeId,
+        vec1: TensorNodeId,
+        vec2: TensorNodeId,
+        beta: f64,
+        alpha: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_addr(input, vec1, vec2, beta, alpha)
+    }
+
+    // ── Integration Utilities ──────────────────────────────────────────────
+
+    /// Trapezoidal integration.
+    pub fn trapezoid_tensor(
+        &mut self,
+        y: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trapezoid(y, None, dim)
+    }
+
+    /// Trapezoidal integration with x values.
+    pub fn trapezoid_with_x(
+        &mut self,
+        y: TensorNodeId,
+        x: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trapezoid(y, Some(x), dim)
+    }
+
+    // ── Linear Solve Utilities ─────────────────────────────────────────────
+
+    /// Solve linear system Ax = B.
+    pub fn solve_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_solve(a, b)
+    }
+
+    /// Least squares solution.
+    pub fn lstsq_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lstsq(a, b)
+    }
+
+    // ── Type Cast Utilities ────────────────────────────────────────────────
+
+    /// Cast tensor to different dtype.
+    pub fn to_dtype_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dtype: DType,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_to_dtype(input, dtype)
+    }
+
+    /// Cast to f32.
+    pub fn to_float32_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_to_f32(input)
+    }
+
+    /// Cast to f64.
+    pub fn to_float64_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_to_f64(input)
+    }
+
+    // ── Flip Utilities ─────────────────────────────────────────────────────
+
+    /// Flip tensor along dimensions.
+    pub fn flip_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dims: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_flip(input, dims)
+    }
+
+    /// Flip left-right (last dim).
+    pub fn fliplr_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fliplr(input)
+    }
+
+    /// Flip up-down (second to last dim).
+    pub fn flipud_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_flipud(input)
+    }
+
+    // ── Roll Utilities ─────────────────────────────────────────────────────
+
+    /// Roll tensor along dimension.
+    pub fn roll_tensor(
+        &mut self,
+        input: TensorNodeId,
+        shift: i64,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_roll(input, shift, dim)
+    }
+
+    /// Rotate 90 degrees.
+    pub fn rot90_tensor(
+        &mut self,
+        input: TensorNodeId,
+        k: i32,
+        dims: [usize; 2],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_rot90(input, k, dims)
+    }
 }
 
 pub use ft_autograd::{
