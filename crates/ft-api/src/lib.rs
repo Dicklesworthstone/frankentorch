@@ -26624,6 +26624,51 @@ impl FrankenTorchSession {
         Ok(shapes)
     }
 
+    /// Fuse convolutional weights and batch normalization parameters.
+    ///
+    /// Equivalent to `torch.nn.utils.fuse_conv_bn_weights`.
+    /// Computes fused weight and bias that absorb the BN transformation:
+    ///   w_fused = w * (gamma / sqrt(running_var + eps))
+    ///   b_fused = (bias - running_mean) * (gamma / sqrt(running_var + eps)) + beta
+    ///
+    /// Returns `(fused_weight, fused_bias)`.
+    pub fn fuse_conv_bn_weights(
+        &mut self,
+        conv_weight: TensorNodeId,
+        conv_bias: Option<TensorNodeId>,
+        bn_running_mean: TensorNodeId,
+        bn_running_var: TensorNodeId,
+        bn_gamma: TensorNodeId,
+        bn_beta: TensorNodeId,
+        eps: f64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let w_shape = self.tensor_shape(conv_weight)?;
+        if w_shape.is_empty() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "fuse_conv_bn_weights: conv_weight must be at least 1-D",
+                },
+            )));
+        }
+        let out_channels = w_shape[0];
+        let eps_tensor = self.full(vec![out_channels], eps, false)?;
+        let std = self.tensor_add(bn_running_var, eps_tensor)?;
+        let std = self.tensor_sqrt(std)?;
+        let scale = self.tensor_div(bn_gamma, std)?;
+        let mut scale_shape = vec![1usize; w_shape.len()];
+        scale_shape[0] = out_channels;
+        let scale_expanded = self.tensor_reshape(scale, scale_shape)?;
+        let fused_weight = self.tensor_mul(conv_weight, scale_expanded)?;
+        let bias = match conv_bias {
+            Some(b) => b,
+            None => self.tensor_zeros(vec![out_channels], false)?,
+        };
+        let shifted_bias = self.tensor_sub(bias, bn_running_mean)?;
+        let scaled_bias = self.tensor_mul(shifted_bias, scale)?;
+        let fused_bias = self.tensor_add(scaled_bias, bn_beta)?;
+        Ok((fused_weight, fused_bias))
+    }
+
     // ── RNN Sequence Utilities ─────────────────────────────────────────
 
     /// Pad a list of variable-length sequences with a given padding value.
