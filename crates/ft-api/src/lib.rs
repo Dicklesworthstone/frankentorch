@@ -31948,6 +31948,239 @@ impl FrankenTorchSession {
         Ok((trend_t, seasonal_t, residual_t))
     }
 
+    // ── Graph Neural Network Operations ────────────────────────────────
+
+    /// Scatter mean aggregation for GNN message passing.
+    ///
+    /// Aggregates source node features to destination nodes using mean.
+    /// Used in GCN, GraphSAGE, etc.
+    ///
+    /// Args:
+    /// - src: [E, D] source features (one per edge)
+    /// - index: [E] destination node indices
+    /// - num_nodes: total number of nodes
+    ///
+    /// Returns: [num_nodes, D] aggregated features
+    pub fn scatter_mean(
+        &mut self,
+        src: TensorNodeId,
+        index: TensorNodeId,
+        num_nodes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let src_shape = self.tensor_shape(src)?;
+        let idx_shape = self.tensor_shape(index)?;
+        if src_shape.len() != 2 || idx_shape.len() != 1 || src_shape[0] != idx_shape[0] {
+            return Err(Self::incompatible_tensor_args(
+                "scatter_mean: src must be [E, D], index must be [E]",
+            ));
+        }
+        let (e, d) = (src_shape[0], src_shape[1]);
+        let src_data = self.tensor_values(src)?;
+        let idx_data = self.tensor_values(index)?;
+        let mut output = vec![0.0; num_nodes * d];
+        let mut counts = vec![0usize; num_nodes];
+        for ei in 0..e {
+            let dst = idx_data[ei] as usize;
+            if dst < num_nodes {
+                counts[dst] += 1;
+                for di in 0..d {
+                    output[dst * d + di] += src_data[ei * d + di];
+                }
+            }
+        }
+        for ni in 0..num_nodes {
+            if counts[ni] > 0 {
+                for di in 0..d {
+                    output[ni * d + di] /= counts[ni] as f64;
+                }
+            }
+        }
+        self.tensor_variable(output, vec![num_nodes, d], false)
+    }
+
+    /// Scatter max aggregation for GNN message passing.
+    ///
+    /// Takes maximum of incoming messages per node.
+    /// Used in PointNet, DGCNN, etc.
+    pub fn scatter_max(
+        &mut self,
+        src: TensorNodeId,
+        index: TensorNodeId,
+        num_nodes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let src_shape = self.tensor_shape(src)?;
+        let idx_shape = self.tensor_shape(index)?;
+        if src_shape.len() != 2 || idx_shape.len() != 1 || src_shape[0] != idx_shape[0] {
+            return Err(Self::incompatible_tensor_args(
+                "scatter_max: src must be [E, D], index must be [E]",
+            ));
+        }
+        let (e, d) = (src_shape[0], src_shape[1]);
+        let src_data = self.tensor_values(src)?;
+        let idx_data = self.tensor_values(index)?;
+        let mut output = vec![f64::NEG_INFINITY; num_nodes * d];
+        for ei in 0..e {
+            let dst = idx_data[ei] as usize;
+            if dst < num_nodes {
+                for di in 0..d {
+                    output[dst * d + di] = output[dst * d + di].max(src_data[ei * d + di]);
+                }
+            }
+        }
+        for v in &mut output {
+            if v.is_infinite() {
+                *v = 0.0;
+            }
+        }
+        self.tensor_variable(output, vec![num_nodes, d], false)
+    }
+
+    /// Scatter sum aggregation for GNN message passing.
+    pub fn scatter_sum(
+        &mut self,
+        src: TensorNodeId,
+        index: TensorNodeId,
+        num_nodes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let src_shape = self.tensor_shape(src)?;
+        let idx_shape = self.tensor_shape(index)?;
+        if src_shape.len() != 2 || idx_shape.len() != 1 || src_shape[0] != idx_shape[0] {
+            return Err(Self::incompatible_tensor_args(
+                "scatter_sum: src must be [E, D], index must be [E]",
+            ));
+        }
+        let (e, d) = (src_shape[0], src_shape[1]);
+        let src_data = self.tensor_values(src)?;
+        let idx_data = self.tensor_values(index)?;
+        let mut output = vec![0.0; num_nodes * d];
+        for ei in 0..e {
+            let dst = idx_data[ei] as usize;
+            if dst < num_nodes {
+                for di in 0..d {
+                    output[dst * d + di] += src_data[ei * d + di];
+                }
+            }
+        }
+        self.tensor_variable(output, vec![num_nodes, d], false)
+    }
+
+    /// Edge index to adjacency matrix conversion.
+    ///
+    /// Converts sparse edge list [2, E] to dense adjacency matrix [N, N].
+    pub fn edge_index_to_adj(
+        &mut self,
+        edge_index: TensorNodeId,
+        num_nodes: usize,
+        add_self_loops: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(edge_index)?;
+        if shape.len() != 2 || shape[0] != 2 {
+            return Err(Self::incompatible_tensor_args(
+                "edge_index_to_adj: edge_index must be [2, E]",
+            ));
+        }
+        let e = shape[1];
+        let data = self.tensor_values(edge_index)?;
+        let mut adj = vec![0.0; num_nodes * num_nodes];
+        for ei in 0..e {
+            let src = data[ei] as usize;
+            let dst = data[e + ei] as usize;
+            if src < num_nodes && dst < num_nodes {
+                adj[src * num_nodes + dst] = 1.0;
+            }
+        }
+        if add_self_loops {
+            for i in 0..num_nodes {
+                adj[i * num_nodes + i] = 1.0;
+            }
+        }
+        self.tensor_variable(adj, vec![num_nodes, num_nodes], false)
+    }
+
+    /// Add self-loops to edge index.
+    ///
+    /// Appends (i, i) edges for all nodes.
+    pub fn add_self_loops(
+        &mut self,
+        edge_index: TensorNodeId,
+        num_nodes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(edge_index)?;
+        if shape.len() != 2 || shape[0] != 2 {
+            return Err(Self::incompatible_tensor_args(
+                "add_self_loops: edge_index must be [2, E]",
+            ));
+        }
+        let e = shape[1];
+        let data = self.tensor_values(edge_index)?;
+        let mut new_edges = Vec::with_capacity(2 * (e + num_nodes));
+        for i in 0..e {
+            new_edges.push(data[i]);
+        }
+        for i in 0..num_nodes {
+            new_edges.push(i as f64);
+        }
+        for i in 0..e {
+            new_edges.push(data[e + i]);
+        }
+        for i in 0..num_nodes {
+            new_edges.push(i as f64);
+        }
+        self.tensor_variable(new_edges, vec![2, e + num_nodes], false)
+    }
+
+    /// Compute node degrees from edge index.
+    ///
+    /// Args:
+    /// - edge_index: [2, E] edge list
+    /// - num_nodes: total number of nodes
+    /// - direction: "in" (in-degree), "out" (out-degree), or "both" (total)
+    pub fn degree(
+        &mut self,
+        edge_index: TensorNodeId,
+        num_nodes: usize,
+        direction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(edge_index)?;
+        if shape.len() != 2 || shape[0] != 2 {
+            return Err(Self::incompatible_tensor_args("degree: edge_index must be [2, E]"));
+        }
+        let e = shape[1];
+        let data = self.tensor_values(edge_index)?;
+        let mut degrees = vec![0.0; num_nodes];
+        match direction {
+            "out" => {
+                for i in 0..e {
+                    let src = data[i] as usize;
+                    if src < num_nodes {
+                        degrees[src] += 1.0;
+                    }
+                }
+            }
+            "in" => {
+                for i in 0..e {
+                    let dst = data[e + i] as usize;
+                    if dst < num_nodes {
+                        degrees[dst] += 1.0;
+                    }
+                }
+            }
+            "both" | _ => {
+                for i in 0..e {
+                    let src = data[i] as usize;
+                    let dst = data[e + i] as usize;
+                    if src < num_nodes {
+                        degrees[src] += 1.0;
+                    }
+                    if dst < num_nodes {
+                        degrees[dst] += 1.0;
+                    }
+                }
+            }
+        }
+        self.tensor_variable(degrees, vec![num_nodes], false)
+    }
+
     /// ArcFace (Additive Angular Margin) loss for face recognition.
     ///
     /// Given L2-normalized features [N, D] and L2-normalized weight [C, D],
