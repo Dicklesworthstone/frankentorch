@@ -14769,6 +14769,59 @@ impl FrankenTorchSession {
         self.tensor_renorm(input, p, dim, maxnorm)
     }
 
+    /// Cumulative maximum. Alias for tensor_cummax.
+    pub fn functional_cummax(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_cummax(input)
+    }
+
+    /// Cumulative minimum. Alias for tensor_cummin.
+    pub fn functional_cummin(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_cummin(input)
+    }
+
+    /// Log cumulative sum exp. Alias for tensor_logcumsumexp.
+    pub fn functional_logcumsumexp(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logcumsumexp(input, dim)
+    }
+
+    /// NaN-aware median. Alias for tensor_nanmedian.
+    pub fn functional_nanmedian(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanmedian(input)
+    }
+
+    /// Trapezoidal integration. Alias for tensor_trapezoid.
+    pub fn functional_trapezoid(
+        &mut self,
+        y: TensorNodeId,
+        x: Option<TensorNodeId>,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trapezoid(y, x, dim)
+    }
+
+    /// Trapezoidal integration (deprecated). Alias for tensor_trapz.
+    pub fn functional_trapz(
+        &mut self,
+        y: TensorNodeId,
+        x: Option<TensorNodeId>,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trapz(y, x, dim)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
