@@ -2471,6 +2471,152 @@ impl FrankenTorchSession {
         self.tensor_variable(values, shape, requires_grad)
     }
 
+    /// Create a tensor filled with binomial distributed random values.
+    ///
+    /// Samples from Binomial(n, p) - number of successes in n trials with probability p.
+    pub fn tensor_binomial(
+        &mut self,
+        n: u64,
+        p: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !(0.0..=1.0).contains(&p) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "binomial: p must be in [0, 1]",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                let mut successes = 0u64;
+                for _ in 0..n {
+                    if self.rng.next_f64() < p {
+                        successes += 1;
+                    }
+                }
+                successes as f64
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
+    /// Create a tensor filled with negative binomial distributed random values.
+    ///
+    /// Samples from NegativeBinomial(r, p) - number of failures before r successes.
+    pub fn tensor_negative_binomial(
+        &mut self,
+        r: f64,
+        p: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if r <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "negative_binomial: r must be positive",
+                },
+            )));
+        }
+        if !(0.0..=1.0).contains(&p) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "negative_binomial: p must be in [0, 1]",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                // NegBin(r,p) can be generated as Poisson(Gamma(r, p/(1-p)))
+                let lambda = self.sample_gamma(r) * p / (1.0 - p + 1e-10);
+                // Poisson sampling
+                let l = (-lambda).exp();
+                let mut k = 0u64;
+                let mut pp = 1.0;
+                loop {
+                    k += 1;
+                    pp *= self.rng.next_f64();
+                    if pp <= l {
+                        break;
+                    }
+                }
+                (k - 1) as f64
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
+    /// Create a tensor filled with Dirichlet distributed random values.
+    ///
+    /// Samples from Dir(alpha). The output shape is `shape + [len(alpha)]`.
+    pub fn tensor_dirichlet(
+        &mut self,
+        alpha: &[f64],
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if alpha.is_empty() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "dirichlet: alpha must not be empty",
+                },
+            )));
+        }
+        for &a in alpha {
+            if a <= 0.0 {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "dirichlet: all alpha values must be positive",
+                    },
+                )));
+            }
+        }
+        let k = alpha.len();
+        let numel: usize = shape.iter().product();
+        let mut values = Vec::with_capacity(numel * k);
+        for _ in 0..numel {
+            let gammas: Vec<f64> = alpha.iter().map(|&a| self.sample_gamma(a)).collect();
+            let sum: f64 = gammas.iter().sum();
+            for g in gammas {
+                values.push(g / sum);
+            }
+        }
+        let mut full_shape = shape;
+        full_shape.push(k);
+        self.tensor_variable(values, full_shape, requires_grad)
+    }
+
+    /// Create a tensor filled with Fisher-Snedecor (F) distributed random values.
+    ///
+    /// Samples from F(df1, df2) = (Chi2(df1)/df1) / (Chi2(df2)/df2).
+    pub fn tensor_fishersnedecor(
+        &mut self,
+        df1: f64,
+        df2: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if df1 <= 0.0 || df2 <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "fishersnedecor: df1 and df2 must be positive",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                let chi1 = self.sample_gamma(df1 / 2.0) * 2.0;
+                let chi2 = self.sample_gamma(df2 / 2.0) * 2.0;
+                (chi1 / df1) / (chi2 / df2)
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
     /// Create a tensor filled with von Mises distributed random values.
     ///
     /// Samples from vonMises(loc, concentration) on the circle.
@@ -18770,6 +18916,49 @@ impl FrankenTorchSession {
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_studentt(df, shape, requires_grad)
+    }
+
+    /// Binomial distribution. Alias for tensor_binomial.
+    pub fn functional_binomial(
+        &mut self,
+        n: u64,
+        p: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_binomial(n, p, shape, requires_grad)
+    }
+
+    /// Negative binomial distribution. Alias for tensor_negative_binomial.
+    pub fn functional_negative_binomial(
+        &mut self,
+        r: f64,
+        p: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_negative_binomial(r, p, shape, requires_grad)
+    }
+
+    /// Dirichlet distribution. Alias for tensor_dirichlet.
+    pub fn functional_dirichlet(
+        &mut self,
+        alpha: &[f64],
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_dirichlet(alpha, shape, requires_grad)
+    }
+
+    /// Fisher-Snedecor (F) distribution. Alias for tensor_fishersnedecor.
+    pub fn functional_fishersnedecor(
+        &mut self,
+        df1: f64,
+        df2: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fishersnedecor(df1, df2, shape, requires_grad)
     }
 
     pub fn tensor_argmax(
