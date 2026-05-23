@@ -13022,6 +13022,20 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Apply a 3D convolution.
+    ///
+    /// Alias for `functional_conv3d`.
+    pub fn tensor_conv3d(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+        stride: (usize, usize, usize),
+        padding: (usize, usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_conv3d(input, weight, bias, stride, padding)
+    }
+
     /// Apply 3D convolution.
     ///
     /// Equivalent to `torch.nn.functional.conv3d(input, weight, bias, stride, padding)`.
@@ -13443,6 +13457,49 @@ impl FrankenTorchSession {
             }
             None => Ok(result),
         }
+    }
+
+    /// Apply 1D average pooling. Alias for `functional_avg_pool1d`.
+    pub fn tensor_avg_pool1d(
+        &mut self,
+        input: TensorNodeId,
+        kernel_size: usize,
+        stride: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_avg_pool1d(input, kernel_size, stride)
+    }
+
+    /// Apply 1D max pooling. Alias for `functional_max_pool1d`.
+    pub fn tensor_max_pool1d(
+        &mut self,
+        input: TensorNodeId,
+        kernel_size: usize,
+        stride: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_max_pool1d(input, kernel_size, stride)
+    }
+
+    /// Apply 2D max pooling. Alias for `functional_max_pool2d`.
+    pub fn tensor_max_pool2d(
+        &mut self,
+        input: TensorNodeId,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_max_pool2d(input, kernel_size, stride)
+    }
+
+    /// Apply 2D average pooling. Alias for `functional_avg_pool2d`.
+    pub fn tensor_avg_pool2d(
+        &mut self,
+        input: TensorNodeId,
+        kernel_size: (usize, usize),
+        stride: (usize, usize),
+        padding: (usize, usize),
+        ceil_mode: bool,
+        count_include_pad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_avg_pool2d(input, kernel_size, stride, padding, ceil_mode, count_include_pad)
     }
 
     /// Apply 1D average pooling over `[N, C, L]`.
