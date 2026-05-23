@@ -27705,6 +27705,150 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    // ── Learning Rate Schedulers ───────────────────────────────────────
+
+    /// Cosine annealing learning rate schedule.
+    ///
+    /// Decays learning rate following a cosine curve from base_lr to eta_min.
+    /// lr = eta_min + (base_lr - eta_min) * (1 + cos(pi * t / T_max)) / 2
+    ///
+    /// Args:
+    /// - base_lr: initial learning rate
+    /// - step: current step/epoch
+    /// - t_max: maximum number of steps in a cycle
+    /// - eta_min: minimum learning rate (default 0.0)
+    pub fn cosine_annealing_lr(&self, base_lr: f64, step: usize, t_max: usize, eta_min: f64) -> f64 {
+        if t_max == 0 {
+            return base_lr;
+        }
+        let t = (step % t_max) as f64;
+        let t_max_f = t_max as f64;
+        eta_min + (base_lr - eta_min) * (1.0 + (std::f64::consts::PI * t / t_max_f).cos()) / 2.0
+    }
+
+    /// Cosine annealing with warm restarts (SGDR).
+    ///
+    /// Similar to cosine_annealing_lr but with restarts every T_0 * T_mult^i epochs.
+    ///
+    /// Args:
+    /// - base_lr: initial learning rate
+    /// - step: current step/epoch
+    /// - t_0: initial period length
+    /// - t_mult: period multiplier after each restart
+    /// - eta_min: minimum learning rate
+    pub fn cosine_annealing_warm_restarts_lr(
+        &self,
+        base_lr: f64,
+        step: usize,
+        t_0: usize,
+        t_mult: f64,
+        eta_min: f64,
+    ) -> f64 {
+        if t_0 == 0 {
+            return base_lr;
+        }
+        let mut t_cur = step;
+        let mut t_i = t_0;
+        while t_cur >= t_i {
+            t_cur -= t_i;
+            t_i = (t_i as f64 * t_mult).ceil() as usize;
+        }
+        let t_f = t_cur as f64 / t_i as f64;
+        eta_min + (base_lr - eta_min) * (1.0 + (std::f64::consts::PI * t_f).cos()) / 2.0
+    }
+
+    /// Step learning rate decay.
+    ///
+    /// Decays learning rate by gamma every step_size epochs.
+    /// lr = base_lr * gamma^(step // step_size)
+    pub fn step_lr(&self, base_lr: f64, step: usize, step_size: usize, gamma: f64) -> f64 {
+        if step_size == 0 {
+            return base_lr;
+        }
+        base_lr * gamma.powi((step / step_size) as i32)
+    }
+
+    /// Multi-step learning rate decay.
+    ///
+    /// Decays by gamma when step reaches each milestone.
+    pub fn multistep_lr(&self, base_lr: f64, step: usize, milestones: &[usize], gamma: f64) -> f64 {
+        let count = milestones.iter().filter(|&&m| step >= m).count();
+        base_lr * gamma.powi(count as i32)
+    }
+
+    /// Exponential learning rate decay.
+    ///
+    /// lr = base_lr * gamma^step
+    pub fn exponential_lr(&self, base_lr: f64, step: usize, gamma: f64) -> f64 {
+        base_lr * gamma.powi(step as i32)
+    }
+
+    /// Linear warmup schedule.
+    ///
+    /// Linearly increases from start_factor * base_lr to base_lr over warmup_steps.
+    pub fn linear_warmup_lr(
+        &self,
+        base_lr: f64,
+        step: usize,
+        warmup_steps: usize,
+        start_factor: f64,
+    ) -> f64 {
+        if warmup_steps == 0 || step >= warmup_steps {
+            return base_lr;
+        }
+        let progress = step as f64 / warmup_steps as f64;
+        base_lr * (start_factor + (1.0 - start_factor) * progress)
+    }
+
+    /// Polynomial learning rate decay.
+    ///
+    /// lr = (base_lr - end_lr) * (1 - step/total_steps)^power + end_lr
+    pub fn polynomial_lr(
+        &self,
+        base_lr: f64,
+        step: usize,
+        total_steps: usize,
+        power: f64,
+        end_lr: f64,
+    ) -> f64 {
+        if total_steps == 0 || step >= total_steps {
+            return end_lr;
+        }
+        let progress = step as f64 / total_steps as f64;
+        (base_lr - end_lr) * (1.0 - progress).powf(power) + end_lr
+    }
+
+    /// One-cycle learning rate policy (Smith & Topin).
+    ///
+    /// Three phases:
+    /// 1. Linear warmup from max_lr/div_factor to max_lr (pct_start of cycle)
+    /// 2. Cosine annealing from max_lr to max_lr/div_factor (to 1-final_div_pct)
+    /// 3. Linear decay to max_lr/(div_factor*final_div_factor)
+    pub fn one_cycle_lr(
+        &self,
+        max_lr: f64,
+        step: usize,
+        total_steps: usize,
+        pct_start: f64,
+        div_factor: f64,
+        final_div_factor: f64,
+    ) -> f64 {
+        if total_steps == 0 {
+            return max_lr;
+        }
+        let initial_lr = max_lr / div_factor;
+        let min_lr = initial_lr / final_div_factor;
+        let pct = step as f64 / total_steps as f64;
+        if pct < pct_start {
+            let scale = pct / pct_start;
+            initial_lr + (max_lr - initial_lr) * scale
+        } else {
+            let down_pct = (pct - pct_start) / (1.0 - pct_start);
+            let cos_scale = (1.0 + (std::f64::consts::PI * down_pct).cos()) / 2.0;
+            min_lr + (initial_lr - min_lr) * cos_scale
+        }
+    }
+
     // ── Weight Normalization Utilities ─────────────────────────────────
 
     /// Apply weight normalization to a weight tensor.
