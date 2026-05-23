@@ -46301,6 +46301,87 @@ impl FrankenTorchSession {
         Ok(vals.iter().all(|&v| v > 0.0))
     }
 
+    // ── Batch Utilities ───────────────────────────────────────────────────
+
+    /// Split tensor into batches.
+    pub fn batch_split(
+        &mut self,
+        x: TensorNodeId,
+        batch_size: usize,
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        let shape = self.tensor_shape(x)?;
+        let n = shape[0];
+        let num_batches = (n + batch_size - 1) / batch_size;
+        let mut batches = Vec::with_capacity(num_batches);
+        for i in 0..num_batches {
+            let start = i * batch_size;
+            let size = batch_size.min(n - start);
+            let batch = self.tensor_narrow(x, 0, start, size)?;
+            batches.push(batch);
+        }
+        Ok(batches)
+    }
+
+    /// Gather tensors from a list into one by concatenating along batch dim.
+    pub fn batch_gather(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        if tensors.is_empty() {
+            return Err(Self::incompatible_tensor_args("batch_gather: empty tensor list"));
+        }
+        self.tensor_cat(tensors, 0)
+    }
+
+    /// Apply a binary op element-wise between a batch and a single tensor.
+    pub fn batch_apply_single(
+        &mut self,
+        batch: TensorNodeId,
+        single: TensorNodeId,
+        op: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        match op {
+            "add" => self.tensor_add(batch, single),
+            "sub" => self.tensor_sub(batch, single),
+            "mul" => self.tensor_mul(batch, single),
+            "div" => self.tensor_div(batch, single),
+            _ => Err(Self::incompatible_tensor_args("batch_apply_single: unknown op")),
+        }
+    }
+
+    // ── Broadcasting Helpers ──────────────────────────────────────────────
+
+    /// Expand a 1D tensor to match a target's batch dimension.
+    pub fn expand_to_batch(
+        &mut self,
+        x: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let target_shape = self.tensor_shape(target)?;
+        if target_shape.is_empty() {
+            return Ok(x);
+        }
+        let batch_size = target_shape[0];
+        let x_shape = self.tensor_shape(x)?;
+        let mut new_shape = vec![batch_size];
+        new_shape.extend(x_shape);
+        self.tensor_expand(x, new_shape)
+    }
+
+    /// Reduce over batch dimension.
+    pub fn reduce_batch(
+        &mut self,
+        x: TensorNodeId,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        match reduction {
+            "mean" => self.tensor_mean_dim(x, 0),
+            "sum" => self.tensor_sum_dim(x, 0),
+            "max" => Ok(self.tensor_max_dim(x, 0)?.0),
+            "min" => Ok(self.tensor_min_dim(x, 0)?.0),
+            _ => Err(Self::incompatible_tensor_args("reduce_batch: unknown reduction")),
+        }
+    }
 }
 
 pub use ft_autograd::{
