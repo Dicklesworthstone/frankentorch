@@ -4358,6 +4358,153 @@ impl FrankenTorchSession {
             num_heads, dropout_p, attn_mask, key_padding_mask, need_weights, is_causal, batch_first)
     }
 
+    /// Generate sinusoidal positional encodings for transformer models.
+    ///
+    /// Equivalent to the positional encoding from "Attention is All You Need".
+    /// Returns tensor of shape `[max_len, d_model]` with sinusoidal patterns.
+    ///
+    /// PE(pos, 2i) = sin(pos / 10000^(2i/d_model))
+    /// PE(pos, 2i+1) = cos(pos / 10000^(2i/d_model))
+    pub fn sinusoidal_positional_encoding(
+        &mut self,
+        max_len: usize,
+        d_model: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if d_model == 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "sinusoidal_positional_encoding: d_model must be positive",
+                },
+            )));
+        }
+        let mut pe = vec![0.0_f64; max_len * d_model];
+        for pos in 0..max_len {
+            for i in 0..(d_model / 2) {
+                let angle = (pos as f64) / 10000.0_f64.powf((2 * i) as f64 / d_model as f64);
+                pe[pos * d_model + 2 * i] = angle.sin();
+                pe[pos * d_model + 2 * i + 1] = angle.cos();
+            }
+            if d_model % 2 == 1 {
+                let i = d_model / 2;
+                let angle = (pos as f64) / 10000.0_f64.powf((2 * i) as f64 / d_model as f64);
+                pe[pos * d_model + d_model - 1] = angle.sin();
+            }
+        }
+        self.tensor_variable(pe, vec![max_len, d_model], false)
+    }
+
+    /// Apply Rotary Position Embedding (RoPE) to query and key tensors.
+    ///
+    /// RoPE encodes position information through rotation matrices applied to
+    /// pairs of dimensions. Used in LLaMA, GPT-NeoX, and many modern LLMs.
+    ///
+    /// - `q`: query tensor `[..., seq_len, head_dim]`
+    /// - `k`: key tensor `[..., seq_len, head_dim]`
+    /// - `cos_cached`: precomputed cos values `[seq_len, head_dim/2]` or `[max_seq, head_dim/2]`
+    /// - `sin_cached`: precomputed sin values, same shape
+    /// - `position_ids`: optional position indices `[batch, seq_len]`
+    ///
+    /// Returns `(rotated_q, rotated_k)`.
+    pub fn apply_rotary_pos_emb(
+        &mut self,
+        q: TensorNodeId,
+        k: TensorNodeId,
+        cos_cached: TensorNodeId,
+        sin_cached: TensorNodeId,
+        position_ids: Option<TensorNodeId>,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let q_shape = self.tensor_shape(q)?;
+        let head_dim = *q_shape.last().ok_or(AutogradError::Dispatch(
+            ft_dispatch::DispatchError::Key(ft_dispatch::DispatchKeyError::IncompatibleSet {
+                reason: "apply_rotary_pos_emb: q must have at least 1 dimension",
+            }),
+        ))?;
+        if head_dim % 2 != 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "apply_rotary_pos_emb: head_dim must be even for RoPE",
+                },
+            )));
+        }
+        let cos = if let Some(pos_ids) = position_ids {
+            self.tensor_index_select(cos_cached, 0, pos_ids)?
+        } else {
+            cos_cached
+        };
+        let sin = if let Some(pos_ids) = position_ids {
+            self.tensor_index_select(sin_cached, 0, pos_ids)?
+        } else {
+            sin_cached
+        };
+        let rotate_half = |sess: &mut Self, x: TensorNodeId| -> Result<TensorNodeId, AutogradError> {
+            let shape = sess.tensor_shape(x)?;
+            let ndim = shape.len();
+            let half = head_dim / 2;
+            let x1 = sess.tensor_narrow(x, ndim - 1, 0, half)?;
+            let x2 = sess.tensor_narrow(x, ndim - 1, half, half)?;
+            let x2_neg = sess.tensor_neg(x2)?;
+            sess.tensor_cat(&[x2_neg, x1], ndim - 1)
+        };
+        let q_embed = {
+            let q_cos = self.tensor_mul(q, cos)?;
+            let q_rot = rotate_half(self, q)?;
+            let q_sin = self.tensor_mul(q_rot, sin)?;
+            self.tensor_add(q_cos, q_sin)?
+        };
+        let k_embed = {
+            let k_cos = self.tensor_mul(k, cos)?;
+            let k_rot = rotate_half(self, k)?;
+            let k_sin = self.tensor_mul(k_rot, sin)?;
+            self.tensor_add(k_cos, k_sin)?
+        };
+        Ok((q_embed, k_embed))
+    }
+
+    /// Precompute RoPE frequencies for given max_seq_len and head_dim.
+    ///
+    /// Returns `(cos_cached, sin_cached)` both of shape `[max_seq_len, head_dim/2]`.
+    /// These can be reused across batches and passed to `apply_rotary_pos_emb`.
+    pub fn precompute_rope_freqs(
+        &mut self,
+        max_seq_len: usize,
+        head_dim: usize,
+        base: f64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        if head_dim % 2 != 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "precompute_rope_freqs: head_dim must be even",
+                },
+            )));
+        }
+        let half_dim = head_dim / 2;
+        let mut freqs = vec![0.0_f64; half_dim];
+        for i in 0..half_dim {
+            freqs[i] = 1.0 / base.powf((2 * i) as f64 / head_dim as f64);
+        }
+        let mut cos_data = vec![0.0_f64; max_seq_len * half_dim];
+        let mut sin_data = vec![0.0_f64; max_seq_len * half_dim];
+        for pos in 0..max_seq_len {
+            for i in 0..half_dim {
+                let angle = (pos as f64) * freqs[i];
+                cos_data[pos * half_dim + i] = angle.cos();
+                sin_data[pos * half_dim + i] = angle.sin();
+            }
+        }
+        let cos_node = self.tensor_variable(cos_data, vec![max_seq_len, half_dim], false)?;
+        let sin_node = self.tensor_variable(sin_data, vec![max_seq_len, half_dim], false)?;
+        Ok((cos_node, sin_node))
+    }
+
+    /// Alias for `sinusoidal_positional_encoding`.
+    pub fn functional_sinusoidal_positional_encoding(
+        &mut self,
+        max_len: usize,
+        d_model: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.sinusoidal_positional_encoding(max_len, d_model)
+    }
+
     /// Tensor contraction over specified dimensions (generalised matrix multiply).
     ///
     /// `dims` is the number of trailing dimensions of `a` to contract with
