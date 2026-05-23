@@ -14336,6 +14336,33 @@ impl FrankenTorchSession {
         self.tensor_tile(input, dims)
     }
 
+    /// Find indices of nonzero elements. Alias for tensor_nonzero.
+    pub fn functional_nonzero(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nonzero(input)
+    }
+
+    /// Finite difference along last dimension. Alias for tensor_diff.
+    pub fn functional_diff(
+        &mut self,
+        input: TensorNodeId,
+        n: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_diff(input, n)
+    }
+
+    /// Select single index along dimension. Alias for tensor_select.
+    pub fn functional_select(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_select(input, dim, index)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
