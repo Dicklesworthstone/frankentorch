@@ -50605,6 +50605,592 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_log1p(input)
     }
+
+    // ── Special Functions Utilities ────────────────────────────────────────
+
+    /// Error function.
+    pub fn erf_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erf(input)
+    }
+
+    /// Complementary error function.
+    pub fn erfc_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfc(input)
+    }
+
+    /// Inverse error function.
+    pub fn erfinv_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfinv(input)
+    }
+
+    /// Scaled complementary error function: exp(x^2) * erfc(x).
+    pub fn erfcx_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfcx(input)
+    }
+
+    /// Log-gamma function.
+    pub fn lgamma_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lgamma(input)
+    }
+
+    /// Digamma (psi) function.
+    pub fn digamma_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_digamma(input)
+    }
+
+    /// Polygamma function of order n.
+    pub fn polygamma_tensor(
+        &mut self,
+        n: u32,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_polygamma(n, input)
+    }
+
+    /// Incomplete gamma function (lower regularized).
+    pub fn igamma_tensor(
+        &mut self,
+        a: TensorNodeId,
+        x: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_igamma(a, x)
+    }
+
+    /// Incomplete gamma function (upper regularized).
+    pub fn igammac_tensor(
+        &mut self,
+        a: TensorNodeId,
+        x: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_igammac(a, x)
+    }
+
+    /// Modified Bessel function I0.
+    pub fn i0_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_i0(input)
+    }
+
+    /// Exponentially scaled modified Bessel function I0.
+    pub fn i0e_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_i0e(input)
+    }
+
+    /// Modified Bessel function I1.
+    pub fn i1_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_i1(input)
+    }
+
+    /// Exponentially scaled modified Bessel function I1.
+    pub fn i1e_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_i1e(input)
+    }
+
+    /// Standard normal CDF.
+    pub fn ndtr_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_ndtr(input)
+    }
+
+    /// Inverse standard normal CDF.
+    pub fn ndtri_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_ndtri(input)
+    }
+
+    /// Log of the normal CDF.
+    pub fn log_ndtr_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_log_ndtr(input)
+    }
+
+    // ── Additional Trigonometric Utilities ─────────────────────────────────
+
+    /// Hyperbolic arcsine.
+    pub fn asinh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_asinh(input)
+    }
+
+    /// Hyperbolic arccosine.
+    pub fn acosh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_acosh(input)
+    }
+
+    /// Hyperbolic arctangent.
+    pub fn atanh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atanh(input)
+    }
+
+    /// Sinc function: sin(pi*x) / (pi*x).
+    pub fn sinc_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_sinc(input)
+    }
+
+    // ── Linear Algebra Utilities ───────────────────────────────────────────
+
+    /// Matrix determinant.
+    pub fn det_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_det(input)
+    }
+
+    /// Matrix log-determinant.
+    pub fn logdet_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logdet(input)
+    }
+
+    /// Sign and log-determinant together.
+    pub fn slogdet_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_slogdet(input)
+    }
+
+    /// Matrix inverse.
+    pub fn inv_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_inv(input)
+    }
+
+    /// Pseudo-inverse (Moore-Penrose).
+    pub fn pinv_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pinverse(input)
+    }
+
+    /// Matrix trace.
+    pub fn trace_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trace(input)
+    }
+
+    /// Matrix rank.
+    pub fn matrix_rank_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matrix_rank(input, Some(1e-10))
+    }
+
+    /// Matrix exponential.
+    pub fn matrix_exp_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matrix_exp(input)
+    }
+
+    /// Matrix power.
+    pub fn matrix_power_tensor(
+        &mut self,
+        input: TensorNodeId,
+        n: i32,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matrix_power(input, n)
+    }
+
+    /// Nuclear norm of matrix.
+    pub fn nuclear_norm(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_matrix_norm(input, "nuc")
+    }
+
+    /// Eigenvalues of symmetric/Hermitian matrix.
+    pub fn eigvalsh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_eigvalsh(input)
+    }
+
+    /// Cross product of two 3D vectors.
+    pub fn cross_product(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cross(a, b)
+    }
+
+    /// Kronecker product.
+    pub fn kron_product(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_kron(a, b)
+    }
+
+    // ── Comparison Utilities ───────────────────────────────────────────────
+
+    /// Element-wise equality comparison.
+    pub fn eq_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_eq(a, b)
+    }
+
+    /// Element-wise not-equal comparison.
+    pub fn ne_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_ne(a, b)
+    }
+
+    /// Element-wise greater-than comparison.
+    pub fn gt_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gt(a, b)
+    }
+
+    /// Element-wise greater-or-equal comparison.
+    pub fn ge_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_ge(a, b)
+    }
+
+    /// Element-wise less-than comparison.
+    pub fn lt_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lt(a, b)
+    }
+
+    /// Element-wise less-or-equal comparison.
+    pub fn le_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_le(a, b)
+    }
+
+    /// Check if two tensors are close (element-wise).
+    pub fn isclose_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+        rtol: f64,
+        atol: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isclose(a, b, rtol, atol, false)
+    }
+
+    /// Check if all elements of two tensors are close.
+    pub fn allclose_tensors(
+        &self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+        rtol: f64,
+        atol: f64,
+    ) -> Result<bool, AutogradError> {
+        self.tensor_allclose(a, b, rtol, atol, false)
+    }
+
+    // ── Sorting/Selection Utilities ────────────────────────────────────────
+
+    /// Top-k values along specified dimension.
+    pub fn topk_values(
+        &mut self,
+        input: TensorNodeId,
+        k: usize,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, _indices) = self.tensor_topk(input, k, dim, true, true)?;
+        Ok(values)
+    }
+
+    /// K-th smallest value.
+    pub fn kthvalue_val(
+        &mut self,
+        input: TensorNodeId,
+        k: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, _indices) = self.tensor_kthvalue(input, k)?;
+        Ok(values)
+    }
+
+    /// Median value of tensor.
+    pub fn median_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_median(input)
+    }
+
+    /// Quantile computation.
+    pub fn quantile_tensor(
+        &mut self,
+        input: TensorNodeId,
+        q: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_quantile(input, q)
+    }
+
+    /// Mode (most frequent value).
+    pub fn mode_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (values, _indices) = self.tensor_mode(input)?;
+        Ok(values)
+    }
+
+    // ── Tensor Manipulation Utilities ──────────────────────────────────────
+
+    /// Fractional part of tensor elements.
+    pub fn frac_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_frac(input)
+    }
+
+    /// Floating-point remainder.
+    pub fn fmod_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fmod(input, other)
+    }
+
+    /// C-style remainder (toward zero).
+    pub fn remainder_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_remainder(input, other)
+    }
+
+    /// Copy sign from second tensor.
+    pub fn copysign_tensor(
+        &mut self,
+        input: TensorNodeId,
+        sign: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_copysign(input, sign)
+    }
+
+    /// Next representable floating point value.
+    pub fn nextafter_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nextafter(input, other)
+    }
+
+    /// Load exponent onto significand (ldexp).
+    pub fn ldexp_tensor(
+        &mut self,
+        input: TensorNodeId,
+        exponent: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_ldexp(input, exponent)
+    }
+
+    /// Compute difference of tensor (n-th order).
+    pub fn diff_tensor(
+        &mut self,
+        input: TensorNodeId,
+        n: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_diff(input, n)
+    }
+
+    // ── Histogram Utilities ────────────────────────────────────────────────
+
+    /// Histogram with specified number of bins and range.
+    pub fn histogram_bins(
+        &mut self,
+        input: TensorNodeId,
+        bins: usize,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_histogram(input, bins, min_val, max_val, None, false)
+    }
+
+    /// Histogram counts only.
+    pub fn histc_tensor(
+        &mut self,
+        input: TensorNodeId,
+        bins: usize,
+        min: f64,
+        max: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_histc(input, bins, min, max)
+    }
+
+    /// Bucketize values into bins.
+    pub fn bucketize_tensor(
+        &mut self,
+        input: TensorNodeId,
+        boundaries: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_bucketize(input, boundaries, false)
+    }
+
+    /// Search sorted indices.
+    pub fn searchsorted_tensor(
+        &mut self,
+        sorted: TensorNodeId,
+        values: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_searchsorted(sorted, values, false)
+    }
+
+    // ── Reduction Utilities ────────────────────────────────────────────────
+
+    /// Count nonzero elements.
+    pub fn count_nonzero_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_count_nonzero(input)
+    }
+
+    /// Norm with custom p value.
+    pub fn norm_p(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_norm(input, p)
+    }
+
+    /// Euclidean (L2) norm.
+    pub fn euclidean_norm(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_norm(input, 2.0)
+    }
+
+    /// Infinity norm (max absolute value).
+    pub fn infinity_norm(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_norm(input, f64::INFINITY)
+    }
+
+    /// Negative infinity norm (min absolute value).
+    pub fn neg_infinity_norm(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_norm(input, f64::NEG_INFINITY)
+    }
+
+    /// Compute nansum (sum treating NaN as 0).
+    pub fn nansum_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nansum(input)
+    }
+
+    /// Compute nanmean (mean treating NaN as missing).
+    pub fn nanmean_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanmean(input)
+    }
+
+    // ── Boolean Reduction Utilities ────────────────────────────────────────
+
+    /// Check if any element is True (nonzero).
+    pub fn any_tensor(
+        &self,
+        input: TensorNodeId,
+    ) -> Result<bool, AutogradError> {
+        self.tensor_any(input)
+    }
+
+    /// Check if all elements are True (nonzero).
+    pub fn all_tensor(
+        &self,
+        input: TensorNodeId,
+    ) -> Result<bool, AutogradError> {
+        self.tensor_all(input)
+    }
 }
 
 pub use ft_autograd::{
