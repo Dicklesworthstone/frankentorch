@@ -14564,6 +14564,51 @@ impl FrankenTorchSession {
         self.tensor_count_nonzero(input)
     }
 
+    /// Max along dimension (values only). Alias for tensor_amax.
+    pub fn functional_amax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_amax(input, dim)
+    }
+
+    /// Min along dimension (values only). Alias for tensor_amin.
+    pub fn functional_amin(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_amin(input, dim)
+    }
+
+    /// Min and max along dimension. Alias for tensor_aminmax.
+    pub fn functional_aminmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_aminmax(input, dim)
+    }
+
+    /// Indices of non-zero elements. Alias for tensor_argwhere.
+    pub fn functional_argwhere(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_argwhere(input)
+    }
+
+    /// Indices that would sort tensor. Alias for tensor_argsort.
+    pub fn functional_argsort(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        descending: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_argsort(input, dim, descending)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
