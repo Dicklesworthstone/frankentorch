@@ -15288,6 +15288,132 @@ impl FrankenTorchSession {
         self.tensor_special_zeta(s, a)
     }
 
+    /// Base-2 exponential. Alias for tensor_special_exp2.
+    pub fn functional_special_exp2(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_exp2(input)
+    }
+
+    /// Base-2 logarithm. Alias for tensor_special_log2.
+    pub fn functional_special_log2(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_log2(input)
+    }
+
+    /// exp(x) - 1. Alias for tensor_special_expm1.
+    pub fn functional_special_expm1(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_expm1(input)
+    }
+
+    /// log(1 + x). Alias for tensor_special_log1p.
+    pub fn functional_special_log1p(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_log1p(input)
+    }
+
+    /// Softmax along dimension. Alias for tensor_special_softmax.
+    pub fn functional_special_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_softmax(input, dim)
+    }
+
+    /// Log-softmax along dimension. Alias for tensor_special_log_softmax.
+    pub fn functional_special_log_softmax(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_log_softmax(input, dim)
+    }
+
+    /// Psi (digamma) function. Alias for tensor_special_psi.
+    pub fn functional_special_psi(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_psi(input)
+    }
+
+    /// Softplus activation. Alias for tensor_special_softplus.
+    pub fn functional_special_softplus(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_softplus(input)
+    }
+
+    /// Round to nearest integer. Alias for tensor_special_round.
+    pub fn functional_special_round(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_round(input)
+    }
+
+    /// Normalized sinc function. Alias for tensor_special_sinc.
+    pub fn functional_special_sinc(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_sinc(input)
+    }
+
+    /// Polygamma function of order n. Alias for tensor_special_polygamma.
+    pub fn functional_special_polygamma(
+        &mut self,
+        n: u32,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_polygamma(n, input)
+    }
+
+    /// NaN-aware product. Alias for tensor_nanprod.
+    pub fn functional_nanprod(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanprod(input)
+    }
+
+    /// NaN-aware variance. Alias for tensor_nanvar.
+    pub fn functional_nanvar(
+        &mut self,
+        input: TensorNodeId,
+        correction: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanvar(input, correction)
+    }
+
+    /// NaN-aware standard deviation. Alias for tensor_nanstd.
+    pub fn functional_nanstd(
+        &mut self,
+        input: TensorNodeId,
+        correction: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanstd(input, correction)
+    }
+
+    /// NaN-aware quantile. Alias for tensor_nanquantile.
+    pub fn functional_nanquantile(
+        &mut self,
+        input: TensorNodeId,
+        q: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanquantile(input, q)
+    }
+
     /// Max along dimension with indices. Alias for tensor_max_dim.
     pub fn functional_max_dim(
         &mut self,
