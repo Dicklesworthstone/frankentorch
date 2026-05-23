@@ -10447,7 +10447,7 @@ impl TensorTape {
                     let contrib: Vec<f64> = incoming
                         .iter()
                         .zip(input_values.iter())
-                        .map(|(g, x)| g * if *x >= 0.0 { 1.0 } else { 0.01 })
+                        .map(|(g, x)| g * if *x > 0.0 { 1.0 } else { 0.01 })
                         .collect();
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -14433,8 +14433,9 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::LeakyRelu { input } => {
-                    // d(leaky_relu(x))/dx = 1 if x >= 0, else 0.01
-                    // Second derivative is 0 everywhere (step function).
+                    // d(leaky_relu(x))/dx = 1 if x > 0, else 0.01
+                    // PyTorch's leaky_relu_backward: x > 0 ? 1 : slope.
+                    // At x == 0 (or -0.0) and NaN, use the slope branch.
                     let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     let incoming_vals =
@@ -14442,7 +14443,7 @@ impl TensorTape {
                     let grad_vals: Vec<f64> = incoming_vals
                         .iter()
                         .zip(input_vals.iter())
-                        .map(|(g, x)| g * if *x >= 0.0 { 1.0 } else { 0.01 })
+                        .map(|(g, x)| g * if *x > 0.0 { 1.0 } else { 0.01 })
                         .collect();
                     let grad_in = self.leaf(grad_vals, input_shape, true)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
