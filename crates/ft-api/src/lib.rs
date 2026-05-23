@@ -14982,6 +14982,41 @@ impl FrankenTorchSession {
         self.tensor_view_as_complex(input)
     }
 
+    /// 2-D transpose. Alias for tensor_t.
+    pub fn functional_t(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_t(input)
+    }
+
+    /// 2-D transpose copy. Alias for tensor_t_copy.
+    pub fn functional_t_copy(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_t_copy(input)
+    }
+
+    /// Take elements by flattened index. Alias for tensor_take.
+    pub fn functional_take(
+        &mut self,
+        input: TensorNodeId,
+        indices: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_take(input, indices)
+    }
+
+    /// Take along dim (gather alias). Alias for tensor_take_along_dim.
+    pub fn functional_take_along_dim(
+        &mut self,
+        input: TensorNodeId,
+        indices: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_take_along_dim(input, indices, dim)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
