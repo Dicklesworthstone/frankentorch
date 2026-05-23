@@ -13383,6 +13383,14 @@ impl FrankenTorchSession {
         self.tensor_linalg_svd(input, full_matrices)
     }
 
+    /// Singular values only. Alias for tensor_svdvals.
+    pub fn functional_svdvals(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_svdvals(input)
+    }
+
     /// Matrix inverse. Alias for tensor_linalg_inv.
     pub fn functional_inv(
         &mut self,
@@ -13478,6 +13486,14 @@ impl FrankenTorchSession {
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_squeeze(input, dim)
+    }
+
+    /// Remove all size-one dimensions. Alias for tensor_squeeze_all.
+    pub fn functional_squeeze_all(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_squeeze_all(input)
     }
 
     /// Insert a size-one dimension. Alias for tensor_unsqueeze.
@@ -14409,6 +14425,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_digamma(input)
+    }
+
+    /// Trigamma function (derivative of digamma). Alias for tensor_trigamma.
+    pub fn functional_trigamma(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trigamma(input)
     }
 
     /// Element-wise power with tensor exponent. Alias for tensor_pow_tensor.
