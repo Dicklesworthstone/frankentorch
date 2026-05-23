@@ -52949,6 +52949,100 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_kl_div(input, target, reduction, log_target)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Embedding and similarity utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Embedding lookup.
+    pub fn embedding_tensor(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        padding_idx: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_embedding(input, weight, padding_idx)
+    }
+
+    /// Embedding bag (sum/mean/max over bags).
+    pub fn embedding_bag_tensor(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        offsets: TensorNodeId,
+        mode: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_embedding_bag(input, weight, offsets, mode)
+    }
+
+    /// Cosine similarity along dimension.
+    pub fn cosine_similarity_tensor(
+        &mut self,
+        x1: TensorNodeId,
+        x2: TensorNodeId,
+        dim: usize,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cosine_similarity(x1, x2, dim, eps)
+    }
+
+    /// Pairwise distance (p-norm of difference).
+    pub fn pairwise_distance_tensor(
+        &mut self,
+        x1: TensorNodeId,
+        x2: TensorNodeId,
+        p: f64,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pairwise_distance(x1, x2, p, eps)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Encoding and spatial transform utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// One-hot encoding of class indices.
+    pub fn one_hot_tensor(
+        &mut self,
+        input: TensorNodeId,
+        num_classes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_one_hot(input, num_classes)
+    }
+
+    /// Generate affine grid for spatial transform.
+    pub fn affine_grid_tensor(
+        &mut self,
+        theta: TensorNodeId,
+        output_size: Vec<usize>,
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_affine_grid(theta, output_size, align_corners)
+    }
+
+    /// Grid sample (spatial transform).
+    pub fn grid_sample_tensor(
+        &mut self,
+        input: TensorNodeId,
+        grid: TensorNodeId,
+        mode: GridSampleMode,
+        padding_mode: GridSamplePaddingMode,
+        align_corners: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_grid_sample(input, grid, mode, padding_mode, align_corners)
+    }
+
+    /// Interpolate/upsample tensor.
+    pub fn interpolate_tensor(
+        &mut self,
+        input: TensorNodeId,
+        size: Option<Vec<usize>>,
+        scale_factor: Option<Vec<f64>>,
+        mode: &str,
+        align_corners: Option<bool>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_interpolate(input, size, scale_factor, mode, align_corners)
+    }
 }
 
 pub use ft_autograd::{
