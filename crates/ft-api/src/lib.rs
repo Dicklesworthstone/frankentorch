@@ -31115,6 +31115,78 @@ impl FrankenTorchSession {
         self.tensor_div(intersection, union_safe)
     }
 
+    /// Convert boxes from (x1, y1, x2, y2) to (cx, cy, w, h) format.
+    pub fn box_xyxy_to_cxcywh(
+        &mut self,
+        boxes: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(boxes)?;
+        if shape.len() != 2 || shape[1] != 4 {
+            return Err(Self::incompatible_tensor_args("box_xyxy_to_cxcywh: boxes must be [N, 4]"));
+        }
+        let n = shape[0];
+        let x1 = self.tensor_narrow(boxes, 1, 0, 1)?;
+        let y1 = self.tensor_narrow(boxes, 1, 1, 1)?;
+        let x2 = self.tensor_narrow(boxes, 1, 2, 1)?;
+        let y2 = self.tensor_narrow(boxes, 1, 3, 1)?;
+        let two = self.full(vec![n, 1], 2.0, false)?;
+        let cx = self.tensor_add(x1, x2)?;
+        let cx = self.tensor_div(cx, two)?;
+        let cy = self.tensor_add(y1, y2)?;
+        let cy = self.tensor_div(cy, two)?;
+        let w = self.tensor_sub(x2, x1)?;
+        let h = self.tensor_sub(y2, y1)?;
+        self.tensor_cat(&[cx, cy, w, h], 1)
+    }
+
+    /// Convert boxes from (cx, cy, w, h) to (x1, y1, x2, y2) format.
+    pub fn box_cxcywh_to_xyxy(
+        &mut self,
+        boxes: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(boxes)?;
+        if shape.len() != 2 || shape[1] != 4 {
+            return Err(Self::incompatible_tensor_args("box_cxcywh_to_xyxy: boxes must be [N, 4]"));
+        }
+        let n = shape[0];
+        let cx = self.tensor_narrow(boxes, 1, 0, 1)?;
+        let cy = self.tensor_narrow(boxes, 1, 1, 1)?;
+        let w = self.tensor_narrow(boxes, 1, 2, 1)?;
+        let h = self.tensor_narrow(boxes, 1, 3, 1)?;
+        let two = self.full(vec![n, 1], 2.0, false)?;
+        let half_w = self.tensor_div(w, two)?;
+        let half_h = self.tensor_div(h, two)?;
+        let x1 = self.tensor_sub(cx, half_w)?;
+        let y1 = self.tensor_sub(cy, half_h)?;
+        let x2 = self.tensor_add(cx, half_w)?;
+        let y2 = self.tensor_add(cy, half_h)?;
+        self.tensor_cat(&[x1, y1, x2, y2], 1)
+    }
+
+    /// Compute box areas.
+    ///
+    /// Args:
+    /// - boxes: [N, 4] in format (x1, y1, x2, y2)
+    ///
+    /// Returns: [N] areas
+    pub fn box_area(
+        &mut self,
+        boxes: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(boxes)?;
+        if shape.len() != 2 || shape[1] != 4 {
+            return Err(Self::incompatible_tensor_args("box_area: boxes must be [N, 4]"));
+        }
+        let x1 = self.tensor_narrow(boxes, 1, 0, 1)?;
+        let y1 = self.tensor_narrow(boxes, 1, 1, 1)?;
+        let x2 = self.tensor_narrow(boxes, 1, 2, 1)?;
+        let y2 = self.tensor_narrow(boxes, 1, 3, 1)?;
+        let w = self.tensor_sub(x2, x1)?;
+        let h = self.tensor_sub(y2, y1)?;
+        let area = self.tensor_mul(w, h)?;
+        self.tensor_squeeze(area, 1)
+    }
+
     /// Compute IoU (Intersection over Union) between two sets of boxes.
     ///
     /// Args:
