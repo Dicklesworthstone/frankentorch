@@ -6534,6 +6534,156 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Multilabel margin loss for multi-label classification.
+    ///
+    /// Equivalent to `torch.nn.functional.multilabel_margin_loss`.
+    /// Loss = sum_j max(0, 1 - (x[y_j] - x[i])) / x.size(1) for i not in y and j in y
+    ///
+    /// - `input`: Shape (N, C), scores for each label
+    /// - `target`: Shape (N, C), target labels where positive indices are valid labels
+    ///   and negative values (e.g., -1) mark ignored positions
+    pub fn tensor_multilabel_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let target_shape = self.tensor_shape(target)?;
+        if input_shape.len() != 2 || target_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_margin_loss: input and target must be 2D (N, C)",
+                },
+            )));
+        }
+        if input_shape != target_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_margin_loss: input and target shapes must match",
+                },
+            )));
+        }
+        let n = input_shape[0];
+        let c = input_shape[1];
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let mut losses = Vec::with_capacity(n);
+        for i in 0..n {
+            let row_offset = i * c;
+            // Collect positive label indices (non-negative target values)
+            let positive_indices: Vec<usize> = (0..c)
+                .filter(|&j| target_vals[row_offset + j] >= 0.0)
+                .map(|j| target_vals[row_offset + j] as usize)
+                .filter(|&idx| idx < c)
+                .collect();
+            let mut sum = 0.0;
+            for &y_j in &positive_indices {
+                let x_y = input_vals[row_offset + y_j];
+                for k in 0..c {
+                    if !positive_indices.contains(&k) {
+                        let x_k = input_vals[row_offset + k];
+                        let margin_term = 1.0 - x_y + x_k;
+                        if margin_term > 0.0 {
+                            sum += margin_term;
+                        }
+                    }
+                }
+            }
+            losses.push(sum / c as f64);
+        }
+        let loss = self.tensor_variable(losses, vec![n], false)?;
+        match reduction {
+            "none" => Ok(loss),
+            "mean" => self.tensor_mean(loss),
+            "sum" => self.tensor_sum(loss),
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_margin_loss: reduction must be 'none', 'mean', or 'sum'",
+                },
+            ))),
+        }
+    }
+
+    /// Multilabel soft margin loss for multi-label classification.
+    ///
+    /// Equivalent to `torch.nn.functional.multilabel_soft_margin_loss`.
+    /// Loss = -1/C * sum_j (y_j * log(sigmoid(x_j)) + (1-y_j) * log(1-sigmoid(x_j)))
+    ///
+    /// - `input`: Shape (N, C), raw scores (logits)
+    /// - `target`: Shape (N, C), binary targets (0 or 1)
+    /// - `weight`: Optional per-label weights, shape (C,)
+    pub fn tensor_multilabel_soft_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        weight: Option<TensorNodeId>,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let target_shape = self.tensor_shape(target)?;
+        if input_shape.len() != 2 || target_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_soft_margin_loss: input and target must be 2D (N, C)",
+                },
+            )));
+        }
+        if input_shape != target_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_soft_margin_loss: input and target shapes must match",
+                },
+            )));
+        }
+        let n = input_shape[0];
+        let c = input_shape[1];
+        let weights = if let Some(w) = weight {
+            let w_shape = self.tensor_shape(w)?;
+            if w_shape.len() != 1 || w_shape[0] != c {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "multilabel_soft_margin_loss: weight must be 1D with length C",
+                    },
+                )));
+            }
+            Some(self.tensor_values(w)?)
+        } else {
+            None
+        };
+        let input_vals = self.tensor_values(input)?;
+        let target_vals = self.tensor_values(target)?;
+        let mut losses = Vec::with_capacity(n);
+        for i in 0..n {
+            let row_offset = i * c;
+            let mut sum = 0.0;
+            for j in 0..c {
+                let x = input_vals[row_offset + j];
+                let y = target_vals[row_offset + j];
+                let w = weights.as_ref().map_or(1.0, |ws| ws[j]);
+                // log(sigmoid(x)) = x - softplus(x) = -softplus(-x)
+                // log(1 - sigmoid(x)) = -softplus(x)
+                let softplus_x = (1.0 + x.exp()).ln();
+                let softplus_neg_x = (1.0 + (-x).exp()).ln();
+                let log_sigmoid = -softplus_neg_x;
+                let log_one_minus_sigmoid = -softplus_x;
+                sum += w * (y * log_sigmoid + (1.0 - y) * log_one_minus_sigmoid);
+            }
+            losses.push(-sum / c as f64);
+        }
+        let loss = self.tensor_variable(losses, vec![n], false)?;
+        match reduction {
+            "none" => Ok(loss),
+            "mean" => self.tensor_mean(loss),
+            "sum" => self.tensor_sum(loss),
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multilabel_soft_margin_loss: reduction must be 'none', 'mean', or 'sum'",
+                },
+            ))),
+        }
+    }
+
     pub fn tensor_trace(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.trace(input, self.mode())?;
         self.record_tensor_reduction_operation(&event);
@@ -13256,6 +13406,27 @@ impl FrankenTorchSession {
         reduction: &str,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_multi_margin_loss(input, target, p, margin, weight, reduction)
+    }
+
+    /// Multilabel margin loss. Alias for tensor_multilabel_margin_loss.
+    pub fn functional_multilabel_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_multilabel_margin_loss(input, target, reduction)
+    }
+
+    /// Multilabel soft margin loss. Alias for tensor_multilabel_soft_margin_loss.
+    pub fn functional_multilabel_soft_margin_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        weight: Option<TensorNodeId>,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_multilabel_soft_margin_loss(input, target, weight, reduction)
     }
 
     /// Threshold activation. Alias for tensor_threshold.
