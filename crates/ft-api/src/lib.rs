@@ -21444,6 +21444,24 @@ impl FrankenTorchSession {
         self.tensor_replication_pad2d(input, padding)
     }
 
+    /// 3D reflection padding. Alias for tensor_reflection_pad3d.
+    pub fn functional_reflection_pad3d(
+        &mut self,
+        input: TensorNodeId,
+        padding: (usize, usize, usize, usize, usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_reflection_pad3d(input, padding)
+    }
+
+    /// 3D replication padding. Alias for tensor_replication_pad3d.
+    pub fn functional_replication_pad3d(
+        &mut self,
+        input: TensorNodeId,
+        padding: (usize, usize, usize, usize, usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_replication_pad3d(input, padding)
+    }
+
     /// 1D zero padding. Alias for tensor_zero_pad1d.
     pub fn functional_zero_pad1d(
         &mut self,
@@ -31428,6 +31446,38 @@ impl FrankenTorchSession {
         self.tensor_pad_mode(
             input,
             &[padding.0, padding.1, padding.2, padding.3],
+            "replicate",
+            0.0,
+        )
+    }
+
+    /// Reflection padding for 3D tensors.
+    ///
+    /// Padding order: (left, right, top, bottom, front, back).
+    pub fn tensor_reflection_pad3d(
+        &mut self,
+        input: TensorNodeId,
+        padding: (usize, usize, usize, usize, usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pad_mode(
+            input,
+            &[padding.0, padding.1, padding.2, padding.3, padding.4, padding.5],
+            "reflect",
+            0.0,
+        )
+    }
+
+    /// Replication (edge) padding for 3D tensors.
+    ///
+    /// Padding order: (left, right, top, bottom, front, back).
+    pub fn tensor_replication_pad3d(
+        &mut self,
+        input: TensorNodeId,
+        padding: (usize, usize, usize, usize, usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pad_mode(
+            input,
+            &[padding.0, padding.1, padding.2, padding.3, padding.4, padding.5],
             "replicate",
             0.0,
         )
