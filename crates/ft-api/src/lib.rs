@@ -31068,6 +31068,53 @@ impl FrankenTorchSession {
         Ok(keep)
     }
 
+    /// Compute mask IoU for instance segmentation.
+    ///
+    /// Computes IoU between binary masks by summing pixel-wise
+    /// intersection and union.
+    ///
+    /// Args:
+    /// - masks1: [N, H, W] binary masks
+    /// - masks2: [M, H, W] binary masks
+    ///
+    /// Returns: [N, M] IoU matrix
+    pub fn mask_iou(
+        &mut self,
+        masks1: TensorNodeId,
+        masks2: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape1 = self.tensor_shape(masks1)?;
+        let shape2 = self.tensor_shape(masks2)?;
+        if shape1.len() != 3 {
+            return Err(Self::incompatible_tensor_args("mask_iou: masks1 must be [N, H, W]"));
+        }
+        if shape2.len() != 3 {
+            return Err(Self::incompatible_tensor_args("mask_iou: masks2 must be [M, H, W]"));
+        }
+        if shape1[1] != shape2[1] || shape1[2] != shape2[2] {
+            return Err(Self::incompatible_tensor_args("mask_iou: mask dimensions must match"));
+        }
+        let n = shape1[0];
+        let m = shape2[0];
+        let h = shape1[1];
+        let w = shape1[2];
+        let masks1_flat = self.tensor_reshape(masks1, vec![n, h * w])?;
+        let masks2_flat = self.tensor_reshape(masks2, vec![m, h * w])?;
+        let masks2_t = self.tensor_transpose(masks2_flat, 0, 1)?;
+        let intersection = self.tensor_matmul(masks1_flat, masks2_t)?;
+        let area1 = self.tensor_sum_dim(masks1_flat, 1)?;
+        let area2 = self.tensor_sum_dim(masks2_flat, 1)?;
+        let area1_exp = self.tensor_unsqueeze(area1, 1)?;
+        let area1_exp = self.tensor_expand(area1_exp, vec![n, m])?;
+        let area2_exp = self.tensor_unsqueeze(area2, 0)?;
+        let area2_exp = self.tensor_expand(area2_exp, vec![n, m])?;
+        let union = self.tensor_add(area1_exp, area2_exp)?;
+        let union = self.tensor_sub(union, intersection)?;
+        let eps = self.full(vec![n, m], 1e-7, false)?;
+        let union_safe = self.tensor_add(union, eps)?;
+        self.tensor_div(intersection, union_safe)
+    }
+
     /// Compute IoU (Intersection over Union) between two sets of boxes.
     ///
     /// Args:
