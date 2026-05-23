@@ -5638,6 +5638,156 @@ impl FrankenTorchSession {
         self.tensor_variable(result, vec![n, num_classes], false)
     }
 
+    /// Look up embeddings from a weight matrix.
+    ///
+    /// Equivalent to `torch.nn.functional.embedding(input, weight, padding_idx)`.
+    /// Returns embeddings for each index in input.
+    ///
+    /// - `input`: Indices into the embedding table, any shape
+    /// - `weight`: Embedding weight matrix, shape (num_embeddings, embedding_dim)
+    /// - `padding_idx`: If set, entries at this index are zeroed
+    pub fn tensor_embedding(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        padding_idx: Option<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let weight_shape = self.tensor_shape(weight)?;
+        if weight_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding: weight must be 2D (num_embeddings, embedding_dim)",
+                },
+            )));
+        }
+        let num_embeddings = weight_shape[0];
+        let embedding_dim = weight_shape[1];
+        let input_vals = self.tensor_values(input)?;
+        let weight_vals = self.tensor_values(weight)?;
+        let num_indices: usize = input_shape.iter().product();
+        let mut result = Vec::with_capacity(num_indices * embedding_dim);
+        for &idx in &input_vals {
+            let idx = idx as usize;
+            if idx >= num_embeddings {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "embedding: index out of range",
+                    },
+                )));
+            }
+            if padding_idx == Some(idx) {
+                result.extend(std::iter::repeat(0.0).take(embedding_dim));
+            } else {
+                let start = idx * embedding_dim;
+                result.extend_from_slice(&weight_vals[start..start + embedding_dim]);
+            }
+        }
+        let mut out_shape = input_shape;
+        out_shape.push(embedding_dim);
+        self.tensor_variable(result, out_shape, false)
+    }
+
+    /// Compute sums or means of embedding bags.
+    ///
+    /// Equivalent to `torch.nn.functional.embedding_bag(input, weight, offsets, mode)`.
+    /// Groups embeddings by offsets and reduces each group.
+    ///
+    /// - `input`: 1D tensor of indices
+    /// - `weight`: Embedding weight matrix, shape (num_embeddings, embedding_dim)
+    /// - `offsets`: 1D tensor of starting indices for each bag
+    /// - `mode`: "sum", "mean", or "max"
+    pub fn tensor_embedding_bag(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        offsets: TensorNodeId,
+        mode: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let weight_shape = self.tensor_shape(weight)?;
+        let offsets_shape = self.tensor_shape(offsets)?;
+        if input_shape.len() != 1 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding_bag: input must be 1D",
+                },
+            )));
+        }
+        if weight_shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding_bag: weight must be 2D",
+                },
+            )));
+        }
+        if offsets_shape.len() != 1 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "embedding_bag: offsets must be 1D",
+                },
+            )));
+        }
+        let num_embeddings = weight_shape[0];
+        let embedding_dim = weight_shape[1];
+        let num_bags = offsets_shape[0];
+        let input_vals = self.tensor_values(input)?;
+        let weight_vals = self.tensor_values(weight)?;
+        let offsets_vals = self.tensor_values(offsets)?;
+        let input_len = input_vals.len();
+        let mut result = Vec::with_capacity(num_bags * embedding_dim);
+        for b in 0..num_bags {
+            let start = offsets_vals[b] as usize;
+            let end = if b + 1 < num_bags {
+                offsets_vals[b + 1] as usize
+            } else {
+                input_len
+            };
+            let bag_size = end.saturating_sub(start);
+            let mut agg = vec![0.0_f64; embedding_dim];
+            for i in start..end.min(input_len) {
+                let idx = input_vals[i] as usize;
+                if idx >= num_embeddings {
+                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                        ft_dispatch::DispatchKeyError::IncompatibleSet {
+                            reason: "embedding_bag: index out of range",
+                        },
+                    )));
+                }
+                let emb_start = idx * embedding_dim;
+                for j in 0..embedding_dim {
+                    let val = weight_vals[emb_start + j];
+                    match mode {
+                        "sum" | "mean" => agg[j] += val,
+                        "max" => {
+                            if i == start || val > agg[j] {
+                                agg[j] = val;
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            if mode == "mean" && bag_size > 0 {
+                for v in &mut agg {
+                    *v /= bag_size as f64;
+                }
+            }
+            result.extend(agg);
+        }
+        match mode {
+            "sum" | "mean" | "max" => {}
+            _ => {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "embedding_bag: mode must be 'sum', 'mean', or 'max'",
+                    },
+                )));
+            }
+        }
+        self.tensor_variable(result, vec![num_bags, embedding_dim], false)
+    }
+
     /// Compute cosine similarity between tensors along a dimension.
     ///
     /// Equivalent to `torch.nn.functional.cosine_similarity(x1, x2, dim, eps)`.
@@ -11367,6 +11517,17 @@ impl FrankenTorchSession {
         let mut out_shape = input_shape;
         out_shape.push(emb_dim);
         self.tensor_reshape(selected, out_shape)
+    }
+
+    /// Embedding bag (sum/mean/max of embeddings). Alias for tensor_embedding_bag.
+    pub fn functional_embedding_bag(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        offsets: TensorNodeId,
+        mode: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_embedding_bag(input, weight, offsets, mode)
     }
 
     /// Apply a linear transformation: `y = x @ weight^T + bias`.
