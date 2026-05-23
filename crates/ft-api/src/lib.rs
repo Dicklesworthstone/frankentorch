@@ -26418,6 +26418,135 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    // ── Weight Normalization Utilities ─────────────────────────────────
+
+    /// Apply weight normalization to a weight tensor.
+    ///
+    /// Equivalent to `torch.nn.utils.weight_norm`.
+    /// Reparametrizes weight as `w = g * (v / ||v||)` where g is a scalar
+    /// and v is the original weight direction.
+    ///
+    /// Returns `(weight_g, weight_v)` where:
+    /// - `weight_g`: scalar magnitude per output feature `[out_features]`
+    /// - `weight_v`: unnormalized direction, same shape as weight
+    pub fn weight_norm_decompose(
+        &mut self,
+        weight: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let shape = self.tensor_shape(weight)?;
+        if dim >= shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "weight_norm_decompose: dim out of range",
+                },
+            )));
+        }
+        let v = weight;
+        let g_shape = vec![shape[dim]];
+        let g_vals = vec![1.0_f64; shape[dim]];
+        let g = self.tensor_variable(g_vals, g_shape, true)?;
+        Ok((g, v))
+    }
+
+    /// Compute the normalized weight from weight_norm parameters.
+    ///
+    /// Given `(g, v)` from `weight_norm_decompose`, computes `g * (v / ||v||)`.
+    pub fn weight_norm_compute(
+        &mut self,
+        weight_g: TensorNodeId,
+        weight_v: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let v_shape = self.tensor_shape(weight_v)?;
+        if dim >= v_shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "weight_norm_compute: dim out of range",
+                },
+            )));
+        }
+        let dims_to_reduce: Vec<usize> = (0..v_shape.len()).filter(|&d| d != dim).collect();
+        let mut norm_sq = weight_v;
+        for &d in &dims_to_reduce {
+            let sq = self.tensor_square(norm_sq)?;
+            norm_sq = self.tensor_sum_dim(sq, d)?;
+        }
+        let norm = self.tensor_sqrt(norm_sq)?;
+        let eps = 1e-12;
+        let eps_tensor = self.full(self.tensor_shape(norm)?, eps, false)?;
+        let norm_safe = self.tensor_add(norm, eps_tensor)?;
+        let v_normalized = self.tensor_div(weight_v, norm_safe)?;
+        let mut g_expanded = weight_g;
+        for d in 0..v_shape.len() {
+            if d != dim {
+                g_expanded = self.tensor_unsqueeze(g_expanded, d)?;
+            }
+        }
+        self.tensor_mul(g_expanded, v_normalized)
+    }
+
+    /// Apply spectral normalization to a weight tensor.
+    ///
+    /// Equivalent to `torch.nn.utils.spectral_norm`.
+    /// Normalizes weight by its spectral norm (largest singular value).
+    /// Uses power iteration to approximate the spectral norm.
+    ///
+    /// - `weight`: weight tensor to normalize
+    /// - `n_power_iterations`: number of power iterations (default: 1)
+    ///
+    /// Returns normalized weight `w / sigma(w)`.
+    pub fn spectral_norm(
+        &mut self,
+        weight: TensorNodeId,
+        n_power_iterations: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(weight)?;
+        if shape.len() < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "spectral_norm: weight must be at least 2-D",
+                },
+            )));
+        }
+        let out_features = shape[0];
+        let in_features: usize = shape[1..].iter().product();
+        let w_flat = self.tensor_reshape(weight, vec![out_features, in_features])?;
+        let mut u_data = vec![0.0_f64; out_features];
+        for i in 0..out_features {
+            u_data[i] = 1.0 / (out_features as f64).sqrt();
+        }
+        let mut u = self.tensor_variable(u_data, vec![out_features, 1], false)?;
+        let w_t = self.tensor_transpose(w_flat, 0, 1)?;
+        for _ in 0..n_power_iterations.max(1) {
+            let v = self.tensor_matmul(w_t, u)?;
+            let v_norm = self.tensor_norm(v, 2.0)?;
+            let v_norm_shape = self.tensor_shape(v_norm)?;
+            let eps = self.full(v_norm_shape, 1e-12, false)?;
+            let v_norm_safe = self.tensor_add(v_norm, eps)?;
+            let v_normalized = self.tensor_div(v, v_norm_safe)?;
+            let u_new = self.tensor_matmul(w_flat, v_normalized)?;
+            let u_norm = self.tensor_norm(u_new, 2.0)?;
+            let u_norm_shape = self.tensor_shape(u_norm)?;
+            let eps_u = self.full(u_norm_shape, 1e-12, false)?;
+            let u_norm_safe = self.tensor_add(u_norm, eps_u)?;
+            u = self.tensor_div(u_new, u_norm_safe)?;
+        }
+        let v_final = self.tensor_matmul(w_t, u)?;
+        let v_norm_final = self.tensor_norm(v_final, 2.0)?;
+        let v_norm_shape = self.tensor_shape(v_norm_final)?;
+        let eps = self.full(v_norm_shape, 1e-12, false)?;
+        let v_norm_safe = self.tensor_add(v_norm_final, eps)?;
+        let v_normalized = self.tensor_div(v_final, v_norm_safe)?;
+        let u_t = self.tensor_transpose(u, 0, 1)?;
+        let wv = self.tensor_matmul(w_flat, v_normalized)?;
+        let sigma_mat = self.tensor_matmul(u_t, wv)?;
+        let sigma_vals = self.tensor_values(sigma_mat)?;
+        let sigma_val = sigma_vals.first().copied().unwrap_or(1.0).max(1e-12);
+        let sigma_tensor = self.full(shape.clone(), sigma_val, false)?;
+        self.tensor_div(weight, sigma_tensor)
+    }
+
     // ── RNN Sequence Utilities ─────────────────────────────────────────
 
     /// Pad a list of variable-length sequences with a given padding value.
