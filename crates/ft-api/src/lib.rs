@@ -14422,6 +14422,68 @@ impl FrankenTorchSession {
         self.tensor_sinc(input)
     }
 
+    /// Degrees to radians. Alias for tensor_deg2rad.
+    pub fn functional_deg2rad(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_deg2rad(input)
+    }
+
+    /// Radians to degrees. Alias for tensor_rad2deg.
+    pub fn functional_rad2deg(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_rad2deg(input)
+    }
+
+    /// Clip values to range. Alias for tensor_clip.
+    pub fn functional_clip(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clip(input, min_val, max_val)
+    }
+
+    /// Clamp to minimum value. Alias for tensor_clamp_min.
+    pub fn functional_clamp_min(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp_min(input, min_val)
+    }
+
+    /// Clamp to maximum value. Alias for tensor_clamp_max.
+    pub fn functional_clamp_max(
+        &mut self,
+        input: TensorNodeId,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp_max(input, max_val)
+    }
+
+    /// Clip to minimum value. Alias for tensor_clip_min.
+    pub fn functional_clip_min(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clip_min(input, min_val)
+    }
+
+    /// Clip to maximum value. Alias for tensor_clip_max.
+    pub fn functional_clip_max(
+        &mut self,
+        input: TensorNodeId,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clip_max(input, max_val)
+    }
+
     /// Phase angle. Alias for tensor_angle.
     pub fn functional_angle(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.tensor_angle(input)
