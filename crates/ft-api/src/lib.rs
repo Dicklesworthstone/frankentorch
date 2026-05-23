@@ -17247,6 +17247,18 @@ impl FrankenTorchSession {
         self.tensor_dequantize_per_tensor(quantized, scale, zero_point)
     }
 
+    /// Fake quantization (quantize then dequantize). Alias for tensor_fake_quantize_per_tensor.
+    pub fn functional_fake_quantize_per_tensor(
+        &mut self,
+        input: TensorNodeId,
+        scale: f64,
+        zero_point: i64,
+        qmin: i64,
+        qmax: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fake_quantize_per_tensor(input, scale, zero_point, qmin, qmax)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
