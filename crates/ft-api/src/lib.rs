@@ -14739,6 +14739,36 @@ impl FrankenTorchSession {
         self.tensor_corrcoef(input)
     }
 
+    /// Copy diagonal. Alias for tensor_diagonal_copy.
+    pub fn functional_diagonal_copy(
+        &mut self,
+        input: TensorNodeId,
+        offset: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_diagonal_copy(input, offset)
+    }
+
+    /// Scatter into diagonal. Alias for tensor_diagonal_scatter.
+    pub fn functional_diagonal_scatter(
+        &mut self,
+        input: TensorNodeId,
+        src: TensorNodeId,
+        offset: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_diagonal_scatter(input, src, offset)
+    }
+
+    /// Renormalize sub-tensors. Alias for tensor_renorm.
+    pub fn functional_renorm(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+        dim: usize,
+        maxnorm: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_renorm(input, p, dim, maxnorm)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
