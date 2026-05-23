@@ -53085,6 +53085,63 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_vander(input, n, increasing)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Linear algebra decomposition utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Cholesky decomposition.
+    pub fn cholesky_tensor(
+        &mut self,
+        input: TensorNodeId,
+        upper: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cholesky(input, upper)
+    }
+
+    /// Solve linear system using Cholesky factor.
+    pub fn cholesky_solve_tensor(
+        &mut self,
+        b: TensorNodeId,
+        cholesky_factor: TensorNodeId,
+        upper: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cholesky_solve(b, cholesky_factor, upper)
+    }
+
+    /// QR decomposition.
+    pub fn qr_tensor(
+        &mut self,
+        input: TensorNodeId,
+        some: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_qr(input, some)
+    }
+
+    /// SVD decomposition.
+    pub fn svd_tensor(
+        &mut self,
+        input: TensorNodeId,
+        full_matrices: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_svd(input, full_matrices)
+    }
+
+    /// Eigendecomposition for symmetric/Hermitian matrices.
+    pub fn eigh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_eigh(input)
+    }
+
+    /// LU factorization.
+    pub fn lu_factor_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_lu_factor(input)
+    }
 }
 
 pub use ft_autograd::{
