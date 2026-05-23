@@ -49340,6 +49340,315 @@ impl FrankenTorchSession {
         let scaled = self.tensor_mul(input, std_t)?;
         self.tensor_add(scaled, mean_t)
     }
+
+    // ── Boolean Tensor Operations ─────────────────────────────────────────
+
+    /// Convert tensor to boolean mask (nonzero = true).
+    pub fn to_bool_mask(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let zero = self.full(vec![1], 0.0, false)?;
+        self.tensor_ne(input, zero)
+    }
+
+    /// Invert boolean mask.
+    pub fn invert_mask(
+        &mut self,
+        mask: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_not(mask)
+    }
+
+    // ── Embedding Utilities ───────────────────────────────────────────────
+
+    /// Apply embedding dropout (zero entire embedding vectors).
+    pub fn embedding_dropout(
+        &mut self,
+        embeddings: TensorNodeId,
+        p: f64,
+        training: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !training || p == 0.0 {
+            return Ok(embeddings);
+        }
+        let shape = self.tensor_shape(embeddings)?;
+        let batch_seq_shape = vec![shape[0], shape[1], 1];
+        let mask = self.tensor_randn(batch_seq_shape.clone(), false)?;
+        let threshold = self.full(batch_seq_shape, 1.0 - p, false)?;
+        let keep_mask = self.tensor_gt(mask, threshold)?;
+        let scale = 1.0 / (1.0 - p);
+        let scale_tensor = self.full(vec![1], scale, false)?;
+        let masked = self.tensor_mul(embeddings, keep_mask)?;
+        self.tensor_mul(masked, scale_tensor)
+    }
+
+    // ── Gradient Utilities ────────────────────────────────────────────────
+
+    /// Zero out gradients (returns zeros with same shape).
+    pub fn zero_grad_like(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        self.full(shape, 0.0, false)
+    }
+
+    // ── Linear Algebra Utilities ──────────────────────────────────────────
+
+    /// Solve linear system Ax = b.
+    pub fn solve_linear(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_solve(a, b)
+    }
+
+    /// Compute Cholesky decomposition (lower triangular).
+    pub fn cholesky_lower(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cholesky(input, false)
+    }
+
+    /// Compute Cholesky decomposition (upper triangular).
+    pub fn cholesky_upper(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cholesky(input, true)
+    }
+
+    /// Compute QR decomposition (reduced).
+    pub fn qr_reduced(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_qr(input, true)
+    }
+
+    /// Compute QR decomposition (full).
+    pub fn qr_full(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_qr(input, false)
+    }
+
+    /// Compute SVD (singular value decomposition).
+    pub fn svd_decomp(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_svd(input, true)
+    }
+
+    // ── Window Functions ──────────────────────────────────────────────────
+
+    /// Create Hann window.
+    pub fn hann_window_simple(
+        &mut self,
+        size: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hann_window(size, false)
+    }
+
+    /// Create Hamming window with default alpha/beta.
+    pub fn hamming_window_default(
+        &mut self,
+        size: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hamming_window(size, false, 0.54, 0.46)
+    }
+
+    /// Create Blackman window.
+    pub fn blackman_window_simple(
+        &mut self,
+        size: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_blackman_window(size, false)
+    }
+
+    // ── Moving Window Operations ──────────────────────────────────────────
+
+    /// Unfold tensor to extract sliding windows.
+    pub fn unfold_windows(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        size: usize,
+        step: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_unfold(input, dim, size, step)
+    }
+
+    // ── Tensor Properties ─────────────────────────────────────────────────
+
+    /// Get min value as f64.
+    pub fn min_value(&mut self, input: TensorNodeId) -> Result<f64, AutogradError> {
+        let min_t = self.tensor_amin(input, 0)?;
+        let shape = self.tensor_shape(min_t)?;
+        let flat = self.tensor_flatten(min_t, 0, shape.len().saturating_sub(1))?;
+        let vals = self.tensor_values(flat)?;
+        vals.into_iter()
+            .reduce(f64::min)
+            .ok_or_else(|| Self::incompatible_tensor_args("empty"))
+    }
+
+    /// Get max value as f64.
+    pub fn max_value(&mut self, input: TensorNodeId) -> Result<f64, AutogradError> {
+        let max_t = self.tensor_amax(input, 0)?;
+        let shape = self.tensor_shape(max_t)?;
+        let flat = self.tensor_flatten(max_t, 0, shape.len().saturating_sub(1))?;
+        let vals = self.tensor_values(flat)?;
+        vals.into_iter()
+            .reduce(f64::max)
+            .ok_or_else(|| Self::incompatible_tensor_args("empty"))
+    }
+
+    /// Get sum as f64.
+    pub fn sum_value(&mut self, input: TensorNodeId) -> Result<f64, AutogradError> {
+        let sum_t = self.tensor_sum(input)?;
+        let vals = self.tensor_values(sum_t)?;
+        Ok(vals[0])
+    }
+
+    /// Get mean as f64.
+    pub fn mean_value(&mut self, input: TensorNodeId) -> Result<f64, AutogradError> {
+        let mean_t = self.tensor_mean(input)?;
+        let vals = self.tensor_values(mean_t)?;
+        Ok(vals[0])
+    }
+
+    // ── Numerical Utilities ───────────────────────────────────────────────
+
+    /// Apply softmax temperature scaling.
+    pub fn softmax_with_temperature(
+        &mut self,
+        input: TensorNodeId,
+        temperature: f64,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let temp_tensor = self.full(vec![1], temperature, false)?;
+        let scaled = self.tensor_div(input, temp_tensor)?;
+        self.tensor_softmax(scaled, dim)
+    }
+
+    /// Gumbel-softmax (for differentiable sampling).
+    pub fn gumbel_softmax(
+        &mut self,
+        logits: TensorNodeId,
+        tau: f64,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(logits)?;
+        let requires_grad = self.tensor_tape.tensor_requires_grad(logits)?;
+        let u = self.tensor_rand(shape.clone(), requires_grad)?;
+        let eps = self.full(shape.clone(), 1e-20, false)?;
+        let u_safe = self.tensor_add(u, eps)?;
+        let neg_log_u = self.tensor_log(u_safe)?;
+        let neg_log_u_neg = self.tensor_neg(neg_log_u)?;
+        let neg_log_neg_log = self.tensor_log(neg_log_u_neg)?;
+        let gumbel = self.tensor_neg(neg_log_neg_log)?;
+        let perturbed = self.tensor_add(logits, gumbel)?;
+        self.softmax_with_temperature(perturbed, tau, dim)
+    }
+
+    // ── Sparse-like Operations ────────────────────────────────────────────
+
+    /// Create one-hot encoding.
+    pub fn one_hot_simple(
+        &mut self,
+        indices: TensorNodeId,
+        num_classes: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_one_hot(indices, num_classes)
+    }
+
+    // ── Clipping Operations ───────────────────────────────────────────────
+
+    /// Clip by value (both min and max).
+    pub fn clip_range(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, min_val, max_val)
+    }
+
+    /// Clip to minimum value only.
+    pub fn clip_min(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let min_tensor = self.full(vec![1], min_val, false)?;
+        self.tensor_maximum(input, min_tensor)
+    }
+
+    /// Clip to maximum value only.
+    pub fn clip_max(
+        &mut self,
+        input: TensorNodeId,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let max_tensor = self.full(vec![1], max_val, false)?;
+        self.tensor_minimum(input, max_tensor)
+    }
+
+    // ── Safe Math Operations ──────────────────────────────────────────────
+
+    /// Safe divide with epsilon for numerical stability.
+    pub fn safe_divide(
+        &mut self,
+        numerator: TensorNodeId,
+        denominator: TensorNodeId,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let eps_tensor = self.full(vec![1], eps, false)?;
+        let safe_denom = self.tensor_add(denominator, eps_tensor)?;
+        self.tensor_div(numerator, safe_denom)
+    }
+
+    /// Safe log with clamping.
+    pub fn safe_log_clamp(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let clamped = self.clip_min(input, min_val)?;
+        self.tensor_log(clamped)
+    }
+
+    /// Safe sqrt with clamping.
+    pub fn safe_sqrt_clamp(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let clamped = self.clip_min(input, min_val)?;
+        self.tensor_sqrt(clamped)
+    }
+
+    // ── Debugging Utilities ───────────────────────────────────────────────
+
+    /// Check for NaN or Inf values.
+    pub fn has_anomalies(&mut self, input: TensorNodeId) -> Result<bool, AutogradError> {
+        let is_finite = self.tensor_isfinite(input)?;
+        let all_finite = self.tensor_all(is_finite)?;
+        Ok(!all_finite)
+    }
+
+    /// Get basic tensor statistics as tuple (min, max, mean).
+    pub fn basic_stats(&mut self, input: TensorNodeId) -> Result<(f64, f64, f64), AutogradError> {
+        let min = self.min_value(input)?;
+        let max = self.max_value(input)?;
+        let mean = self.mean_value(input)?;
+        Ok((min, max, mean))
+    }
 }
 
 pub use ft_autograd::{
