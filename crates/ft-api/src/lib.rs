@@ -47910,6 +47910,149 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_exp2(input)
     }
+
+    // ── Trigonometric Shortcuts ──────────────────────────────────────────
+
+    /// Convert degrees to radians.
+    pub fn deg_to_rad(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_deg2rad(input)
+    }
+
+    /// Convert radians to degrees.
+    pub fn rad_to_deg(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_rad2deg(input)
+    }
+
+    /// Compute hypot(a, b) = sqrt(a^2 + b^2).
+    pub fn hypot_ab(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_hypot(a, b)
+    }
+
+    // ── Special Function Shortcuts ───────────────────────────────────────
+
+    /// Error function.
+    pub fn erf_fn(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erf(input)
+    }
+
+    /// Complementary error function.
+    pub fn erfc_fn(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfc(input)
+    }
+
+    /// Log-gamma function.
+    pub fn lgamma_fn(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lgamma(input)
+    }
+
+    /// Digamma function (psi).
+    pub fn digamma_fn(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_digamma(input)
+    }
+
+    // ── Logical Operations ───────────────────────────────────────────────
+
+    /// Logical AND of two tensors.
+    pub fn logical_and_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_and(a, b)
+    }
+
+    /// Logical OR of two tensors.
+    pub fn logical_or_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_or(a, b)
+    }
+
+    /// Logical XOR of two tensors.
+    pub fn logical_xor_tensors(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_xor(a, b)
+    }
+
+    /// Logical NOT of tensor.
+    pub fn logical_not_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_not(input)
+    }
+
+    // ── Checking Operations ──────────────────────────────────────────────
+
+    /// Check if values are NaN.
+    pub fn is_nan(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isnan(input)
+    }
+
+    /// Check if values are infinite.
+    pub fn is_inf(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isinf(input)
+    }
+
+    /// Check if values are finite.
+    pub fn is_finite(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isfinite(input)
+    }
+
+    // ── Clone/Copy Operations ────────────────────────────────────────────
+
+    /// Create a deep copy of the tensor (preserving grad tracking).
+    pub fn clone_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let requires_grad = self.tensor_tape.tensor_requires_grad(input)?;
+        self.tensor_clone(input, requires_grad)
+    }
+
+    /// Create a contiguous copy.
+    pub fn contiguous_copy(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_contiguous(input)
+    }
 }
 
 pub use ft_autograd::{
