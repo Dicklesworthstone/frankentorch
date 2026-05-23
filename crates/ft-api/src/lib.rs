@@ -14677,6 +14677,42 @@ impl FrankenTorchSession {
         self.tensor_quantile(input, q)
     }
 
+    /// Flip left-right (dim 1). Alias for tensor_fliplr.
+    pub fn functional_fliplr(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fliplr(input)
+    }
+
+    /// Flip up-down (dim 0). Alias for tensor_flipud.
+    pub fn functional_flipud(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_flipud(input)
+    }
+
+    /// Repeat each element. Alias for tensor_repeat_interleave.
+    pub fn functional_repeat_interleave(
+        &mut self,
+        input: TensorNodeId,
+        repeats: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_repeat_interleave(input, repeats)
+    }
+
+    /// Unfold copy. Alias for tensor_unfold_copy.
+    pub fn functional_unfold_copy(
+        &mut self,
+        input: TensorNodeId,
+        dimension: usize,
+        size: usize,
+        step: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_unfold_copy(input, dimension, size, step)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
