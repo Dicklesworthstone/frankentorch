@@ -14213,6 +14213,37 @@ impl FrankenTorchSession {
         self.tensor_hypot(x, y)
     }
 
+    /// Gauss error function. Alias for tensor_erf.
+    pub fn functional_erf(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erf(input)
+    }
+
+    /// Complementary error function. Alias for tensor_erfc.
+    pub fn functional_erfc(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfc(input)
+    }
+
+    /// Inverse error function. Alias for tensor_erfinv.
+    pub fn functional_erfinv(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_erfinv(input)
+    }
+
+    /// Log-gamma function. Alias for tensor_lgamma.
+    pub fn functional_lgamma(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lgamma(input)
+    }
+
+    /// Digamma function. Alias for tensor_digamma.
+    pub fn functional_digamma(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_digamma(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
