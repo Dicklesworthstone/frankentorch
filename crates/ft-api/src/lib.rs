@@ -55214,6 +55214,77 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_multilabel_soft_margin_loss(input, target, weight, reduction)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Math utilities (additional)
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Element-wise division (alias for div).
+    pub fn divide_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_divide(lhs, rhs)
+    }
+
+    /// True division (alias for div).
+    pub fn true_divide_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_true_divide(lhs, rhs)
+    }
+
+    /// Quotient and remainder of division.
+    pub fn divmod_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_divmod(lhs, rhs)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // FFT utilities (additional)
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Discrete Fourier Transform sample frequencies.
+    pub fn fft_fftfreq_tensor(
+        &mut self,
+        n: usize,
+        d: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fft_fftfreq(n, d)
+    }
+
+    /// Discrete Fourier Transform sample frequencies for real input.
+    pub fn fft_rfftfreq_tensor(
+        &mut self,
+        n: usize,
+        d: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fft_rfftfreq(n, d)
+    }
+
+    /// Shift zero-frequency component to center (fft.fftshift).
+    pub fn fft_fftshift_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: Option<&[usize]>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fft_fftshift(input, dim)
+    }
+
+    /// Inverse of fftshift (fft.ifftshift).
+    pub fn fft_ifftshift_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: Option<&[usize]>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fft_ifftshift(input, dim)
+    }
 }
 
 pub use ft_autograd::{
