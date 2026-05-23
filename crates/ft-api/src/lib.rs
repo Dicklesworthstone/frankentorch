@@ -54843,6 +54843,216 @@ impl FrankenTorchSession {
     ) -> Result<(TensorNodeId, Vec<TensorNodeId>), AutogradError> {
         self.tensor_histogramdd(input, bins, ranges, density)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Linear algebra utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Kronecker product of two tensors.
+    pub fn kron_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_kron(a, b)
+    }
+
+    /// LU decomposition returning (P, L, U).
+    pub fn linalg_lu_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_lu(input)
+    }
+
+    /// Solve linear system using LU factorization.
+    pub fn lu_solve_tensor(
+        &mut self,
+        lu_packed: TensorNodeId,
+        pivots: &[usize],
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lu_solve(lu_packed, pivots, b)
+    }
+
+    /// Solve linear system A @ X = B.
+    pub fn linalg_solve_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_solve(a, b)
+    }
+
+    /// Cholesky decomposition.
+    pub fn linalg_cholesky_tensor(
+        &mut self,
+        input: TensorNodeId,
+        upper: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_cholesky(input, upper)
+    }
+
+    /// Matrix inverse.
+    pub fn linalg_inv_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_inv(input)
+    }
+
+    /// Matrix product of multiple matrices.
+    pub fn linalg_multi_dot_tensor(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_multi_dot(tensors)
+    }
+
+    /// Eigendecomposition of symmetric matrix.
+    pub fn linalg_eigh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_eigh(input)
+    }
+
+    /// Eigenvalues of symmetric matrix.
+    pub fn linalg_eigvalsh_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_eigvalsh(input)
+    }
+
+    /// Singular value decomposition.
+    pub fn linalg_svd_tensor(
+        &mut self,
+        input: TensorNodeId,
+        full_matrices: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_svd(input, full_matrices)
+    }
+
+    /// Singular values only.
+    pub fn linalg_svdvals_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_svdvals(input)
+    }
+
+    /// Matrix determinant.
+    pub fn linalg_det_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_det(input)
+    }
+
+    /// Sign and log-absolute-determinant.
+    pub fn linalg_slogdet_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_slogdet(input)
+    }
+
+    /// Pseudoinverse of a matrix.
+    pub fn pinverse_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pinverse(input)
+    }
+
+    /// Pseudoinverse (linalg.pinv alias).
+    pub fn linalg_pinv_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_pinv(input)
+    }
+
+    /// QR decomposition.
+    pub fn linalg_qr_tensor(
+        &mut self,
+        input: TensorNodeId,
+        reduced: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_qr(input, reduced)
+    }
+
+    /// LU factorization returning (LU, pivots).
+    pub fn linalg_lu_factor_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_lu_factor(input)
+    }
+
+    /// Least squares solution.
+    pub fn linalg_lstsq_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_lstsq(a, b)
+    }
+
+    /// Condition number of a matrix.
+    pub fn linalg_cond_tensor(
+        &mut self,
+        input: TensorNodeId,
+        p: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_cond(input, p)
+    }
+
+    /// Numerical rank of a matrix.
+    pub fn linalg_matrix_rank_tensor(
+        &mut self,
+        input: TensorNodeId,
+        tol: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_matrix_rank(input, tol)
+    }
+
+    /// Matrix norm (Frobenius, nuclear, etc.).
+    pub fn matrix_norm_tensor(
+        &mut self,
+        input: TensorNodeId,
+        ord: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matrix_norm(input, ord)
+    }
+
+    /// Vector norm (flattened tensor).
+    pub fn linalg_vector_norm_tensor(
+        &mut self,
+        input: TensorNodeId,
+        ord: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_vector_norm(input, ord)
+    }
+
+    /// Vector dot product.
+    pub fn linalg_vecdot_tensor(
+        &mut self,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_vecdot(x, y)
+    }
+
+    /// Cross product of two vectors.
+    pub fn linalg_cross_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_cross(input, other)
+    }
 }
 
 pub use ft_autograd::{
