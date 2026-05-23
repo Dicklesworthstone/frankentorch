@@ -14822,6 +14822,56 @@ impl FrankenTorchSession {
         self.tensor_trapz(y, x, dim)
     }
 
+    /// Logit function. Alias for tensor_logit.
+    pub fn functional_logit(
+        &mut self,
+        input: TensorNodeId,
+        eps: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logit(input, eps)
+    }
+
+    /// Log-gamma function. Alias for tensor_gammaln.
+    pub fn functional_gammaln(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gammaln(input)
+    }
+
+    /// Bessel I0. Alias for tensor_i0.
+    pub fn functional_i0(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_i0(input)
+    }
+
+    /// Bessel I1. Alias for tensor_i1.
+    pub fn functional_i1(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_i1(input)
+    }
+
+    /// Multivariate log-gamma. Alias for tensor_mvlgamma.
+    pub fn functional_mvlgamma(
+        &mut self,
+        input: TensorNodeId,
+        p: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_mvlgamma(input, p)
+    }
+
+    /// Simultaneous sin and cos. Alias for tensor_sincos.
+    pub fn functional_sincos(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_sincos(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
