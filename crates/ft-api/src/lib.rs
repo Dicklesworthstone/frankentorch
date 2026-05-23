@@ -14298,6 +14298,63 @@ impl FrankenTorchSession {
         self.tensor_atan2(lhs, rhs)
     }
 
+    /// Inverse sine. Alias for tensor_arcsin.
+    pub fn functional_arcsin(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arcsin(input)
+    }
+
+    /// Inverse cosine. Alias for tensor_arccos.
+    pub fn functional_arccos(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arccos(input)
+    }
+
+    /// Inverse tangent. Alias for tensor_arctan.
+    pub fn functional_arctan(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arctan(input)
+    }
+
+    /// Two-argument inverse tangent. Alias for tensor_arctan2.
+    pub fn functional_arctan2(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arctan2(lhs, rhs)
+    }
+
+    /// Inverse hyperbolic sine. Alias for tensor_arcsinh.
+    pub fn functional_arcsinh(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arcsinh(input)
+    }
+
+    /// Inverse hyperbolic cosine. Alias for tensor_arccosh.
+    pub fn functional_arccosh(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arccosh(input)
+    }
+
+    /// Inverse hyperbolic tangent. Alias for tensor_arctanh.
+    pub fn functional_arctanh(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_arctanh(input)
+    }
+
     /// 3D cross product. Alias for tensor_cross.
     pub fn functional_cross(
         &mut self,
