@@ -15029,6 +15029,40 @@ impl FrankenTorchSession {
         self.tensor_linalg_cond(input, p)
     }
 
+    /// Select scatter. Alias for tensor_select_scatter.
+    pub fn functional_select_scatter(
+        &mut self,
+        input: TensorNodeId,
+        src: TensorNodeId,
+        dim: i64,
+        index: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_select_scatter(input, src, dim, index)
+    }
+
+    /// Slice scatter. Alias for tensor_slice_scatter.
+    pub fn functional_slice_scatter(
+        &mut self,
+        input: TensorNodeId,
+        src: TensorNodeId,
+        dim: i64,
+        start: Option<i64>,
+        end: Option<i64>,
+        step: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_slice_scatter(input, src, dim, start, end, step)
+    }
+
+    /// Triangular solve. Alias for tensor_triangular_solve.
+    pub fn functional_triangular_solve(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+        upper: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_triangular_solve(a, b, upper)
+    }
+
     /// Phase angle. Alias for tensor_angle.
     pub fn functional_angle(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.tensor_angle(input)
