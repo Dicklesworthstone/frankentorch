@@ -52239,6 +52239,327 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_randn_like(input, false)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Statistics utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Variance and mean along dimension.
+    pub fn var_mean_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        correction: i64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_var_mean(input, dim, correction)
+    }
+
+    /// Standard deviation and mean along dimension.
+    pub fn std_mean_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        correction: i64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_std_mean(input, dim, correction)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Shape manipulation utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Swap two dimensions (alias for transpose).
+    pub fn swapaxes_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim0: usize,
+        dim1: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_swapaxes(input, dim0, dim1)
+    }
+
+    /// Swap two dimensions (alias for transpose).
+    pub fn swapdims_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim0: usize,
+        dim1: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_swapdims(input, dim0, dim1)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Random sampling utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Bernoulli sampling with element-wise probabilities.
+    pub fn bernoulli_tensor(
+        &mut self,
+        prob: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_bernoulli(prob)
+    }
+
+    /// Poisson sampling with element-wise rates.
+    pub fn poisson_tensor(
+        &mut self,
+        rate: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_poisson(rate)
+    }
+
+    /// Exponential distribution with given lambda.
+    pub fn exponential_tensor(
+        &mut self,
+        lambd: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_exponential(lambd, shape, requires_grad)
+    }
+
+    /// Cauchy distribution with median and sigma.
+    pub fn cauchy_tensor(
+        &mut self,
+        median: f64,
+        sigma: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cauchy(median, sigma, shape, requires_grad)
+    }
+
+    /// Geometric distribution with success probability.
+    pub fn geometric_tensor(
+        &mut self,
+        p: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_geometric(p, shape, requires_grad)
+    }
+
+    /// Log-normal distribution with mean and std.
+    pub fn log_normal_tensor(
+        &mut self,
+        mean: f64,
+        std: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_log_normal(mean, std, shape, requires_grad)
+    }
+
+    /// Multinomial sampling from 1D probability tensor.
+    pub fn multinomial_tensor(
+        &mut self,
+        input: TensorNodeId,
+        num_samples: usize,
+        replacement: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_multinomial(input, num_samples, replacement)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Linear algebra product utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Vector dot product of two 1D tensors.
+    pub fn vdot_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_vdot(input, other)
+    }
+
+    /// Outer product of two 1D tensors.
+    pub fn outer_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_outer(lhs, rhs)
+    }
+
+    /// Inner product over last dimension.
+    pub fn inner_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_inner(a, b)
+    }
+
+    /// Tensor contraction over specified dimensions.
+    pub fn tensordot_tensor(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+        dims: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_tensordot(a, b, dims)
+    }
+
+    /// Einstein summation notation.
+    pub fn einsum_tensor(
+        &mut self,
+        equation: &str,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_einsum(equation, tensors)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // View/slice utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Move dimension from source to destination.
+    pub fn movedim_tensor(
+        &mut self,
+        input: TensorNodeId,
+        source: usize,
+        destination: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_movedim(input, source, destination)
+    }
+
+    /// Move dimension from source to destination (alias).
+    pub fn moveaxis_tensor(
+        &mut self,
+        input: TensorNodeId,
+        source: usize,
+        destination: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_moveaxis(input, source, destination)
+    }
+
+    /// Extract sliding windows from a tensor.
+    pub fn unfold_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dimension: usize,
+        size: usize,
+        step: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_unfold(input, dimension, size, step)
+    }
+
+    /// Compute both min and max along a dimension.
+    pub fn aminmax_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_aminmax(input, dim)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Cumulative operation utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Cumulative product along dimension.
+    pub fn cumprod_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cumprod(input, dim)
+    }
+
+    /// Cumulative maximum with indices.
+    pub fn cummax_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_cummax(input)
+    }
+
+    /// Cumulative minimum with indices.
+    pub fn cummin_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_cummin(input)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Grid/combinatorics utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Cartesian product of 1D tensors.
+    pub fn cartesian_prod_tensor(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cartesian_prod(tensors)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Reduction utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// NaN-aware variance.
+    pub fn nanvar_tensor(
+        &mut self,
+        input: TensorNodeId,
+        correction: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanvar(input, correction)
+    }
+
+    /// NaN-aware standard deviation.
+    pub fn nanstd_tensor(
+        &mut self,
+        input: TensorNodeId,
+        correction: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_nanstd(input, correction)
+    }
+
+    /// Product of all elements.
+    pub fn prod_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_prod(input)
+    }
+
+    /// Product along dimension.
+    pub fn prod_dim_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_prod_dim(input, dim)
+    }
+
+    /// Maximum along dimension (values only).
+    pub fn amax_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_amax(input, dim)
+    }
+
+    /// Minimum along dimension (values only).
+    pub fn amin_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_amin(input, dim)
+    }
+
+    /// Log-sum-exp along dimension.
+    pub fn logsumexp_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logsumexp(input, dim)
+    }
 }
 
 pub use ft_autograd::{
