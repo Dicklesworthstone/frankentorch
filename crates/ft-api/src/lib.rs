@@ -47210,6 +47210,183 @@ impl FrankenTorchSession {
         let shape = self.tensor_shape(input)?;
         self.tensor_variable(data, shape, true)
     }
+
+    // ── Tensor Arithmetic Utilities ──────────────────────────────────────
+
+    /// Compute element-wise power with scalar exponent.
+    pub fn pow_scalar(
+        &mut self,
+        input: TensorNodeId,
+        exponent: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let exp_tensor = self.full(vec![1], exponent, false)?;
+        self.tensor_pow_tensor(input, exp_tensor)
+    }
+
+    /// Compute cube of each element.
+    pub fn cube(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let sq = self.tensor_mul(input, input)?;
+        self.tensor_mul(sq, input)
+    }
+
+    /// Add scalar to tensor.
+    pub fn add_scalar(
+        &mut self,
+        input: TensorNodeId,
+        scalar: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let s = self.full(vec![1], scalar, false)?;
+        self.tensor_add(input, s)
+    }
+
+    /// Subtract scalar from tensor.
+    pub fn sub_scalar(
+        &mut self,
+        input: TensorNodeId,
+        scalar: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let s = self.full(vec![1], scalar, false)?;
+        self.tensor_sub(input, s)
+    }
+
+    /// Multiply tensor by scalar.
+    pub fn mul_scalar(
+        &mut self,
+        input: TensorNodeId,
+        scalar: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let s = self.full(vec![1], scalar, false)?;
+        self.tensor_mul(input, s)
+    }
+
+    /// Divide tensor by scalar.
+    pub fn div_scalar(
+        &mut self,
+        input: TensorNodeId,
+        scalar: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let s = self.full(vec![1], scalar, false)?;
+        self.tensor_div(input, s)
+    }
+
+    // ── Statistics Utilities ─────────────────────────────────────────────
+
+    /// Compute variance of all elements.
+    pub fn global_var(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let flat = self.flatten_all(input)?;
+        self.tensor_var(flat, 1)
+    }
+
+    /// Compute standard deviation of all elements.
+    pub fn global_std(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let var = self.global_var(input)?;
+        self.tensor_sqrt(var)
+    }
+
+    /// Compute median of all elements.
+    pub fn global_median(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let flat = self.flatten_all(input)?;
+        self.tensor_median(flat)
+    }
+
+    // ── Concatenation Utilities ──────────────────────────────────────────
+
+    /// Concatenate tensors along the first dimension.
+    pub fn cat_dim0(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cat(tensors, 0)
+    }
+
+    /// Concatenate tensors along the last dimension.
+    pub fn cat_last_dim(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        if tensors.is_empty() {
+            return Err(Self::incompatible_tensor_args("cat_last_dim: empty tensor list"));
+        }
+        let shape = self.tensor_shape(tensors[0])?;
+        let last_dim = shape.len() - 1;
+        self.tensor_cat(tensors, last_dim)
+    }
+
+    /// Stack tensors along a new first dimension.
+    pub fn stack_dim0(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_stack(tensors, 0)
+    }
+
+    // ── Random Utilities ─────────────────────────────────────────────────
+
+    /// Sample from standard normal distribution (mean=0, std=1).
+    pub fn randn_std(
+        &mut self,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_randn(shape, requires_grad)
+    }
+
+    /// Sample from uniform distribution [0, 1).
+    pub fn rand_01(
+        &mut self,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_uniform(0.0, 1.0, shape, requires_grad)
+    }
+
+    /// Sample from uniform distribution [-1, 1).
+    pub fn rand_symmetric(
+        &mut self,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_uniform(-1.0, 1.0, shape, requires_grad)
+    }
+
+    // ── Clipping Utilities ───────────────────────────────────────────────
+
+    /// Clip values to a symmetric range [-bound, bound].
+    pub fn clip_symmetric(
+        &mut self,
+        input: TensorNodeId,
+        bound: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, -bound, bound)
+    }
+
+    /// Clip to positive values only (equivalent to ReLU but more readable).
+    pub fn clip_positive(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp_min(input, 0.0)
+    }
+
+    /// Clip to [0, 1] range (useful for probabilities).
+    pub fn clip_probability(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, 0.0, 1.0)
+    }
 }
 
 pub use ft_autograd::{
