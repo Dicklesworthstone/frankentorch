@@ -30010,6 +30010,124 @@ impl FrankenTorchSession {
         self.tensor_mean(per_elem)
     }
 
+    /// Dice loss for segmentation tasks.
+    ///
+    /// Computes `1 - (2 * intersection + smooth) / (union + smooth)` where
+    /// intersection = sum(pred * target), union = sum(pred) + sum(target).
+    /// Common in medical image segmentation. Input/target are probability maps.
+    pub fn dice_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        smooth: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let in_shape = self.tensor_shape(input)?;
+        let tgt_shape = self.tensor_shape(target)?;
+        if in_shape != tgt_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: in_shape,
+                    rhs: tgt_shape,
+                },
+            )));
+        }
+        let intersection = self.tensor_mul(input, target)?;
+        let intersection_sum = self.tensor_sum(intersection)?;
+        let input_sum = self.tensor_sum(input)?;
+        let target_sum = self.tensor_sum(target)?;
+        let two = self.full(vec![1], 2.0, false)?;
+        let smooth_tensor = self.full(vec![1], smooth, false)?;
+        let numerator = self.tensor_mul(two, intersection_sum)?;
+        let numerator = self.tensor_add(numerator, smooth_tensor)?;
+        let denominator = self.tensor_add(input_sum, target_sum)?;
+        let denominator = self.tensor_add(denominator, smooth_tensor)?;
+        let dice_coeff = self.tensor_div(numerator, denominator)?;
+        let one = self.full(vec![1], 1.0, false)?;
+        self.tensor_sub(one, dice_coeff)
+    }
+
+    /// Tversky loss for segmentation tasks.
+    ///
+    /// Generalization of Dice loss with adjustable false positive/negative weights.
+    /// `loss = 1 - (TP + smooth) / (TP + alpha*FP + beta*FN + smooth)`
+    /// where TP = sum(pred * target), FP = sum(pred * (1-target)), FN = sum((1-pred) * target).
+    /// alpha=beta=0.5 reduces to Dice loss.
+    pub fn tversky_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        alpha: f64,
+        beta: f64,
+        smooth: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let in_shape = self.tensor_shape(input)?;
+        let tgt_shape = self.tensor_shape(target)?;
+        if in_shape != tgt_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: in_shape,
+                    rhs: tgt_shape,
+                },
+            )));
+        }
+        let ones = self.full(in_shape, 1.0, false)?;
+        let one_minus_input = self.tensor_sub(ones, input)?;
+        let one_minus_target = self.tensor_sub(ones, target)?;
+        let tp = self.tensor_mul(input, target)?;
+        let tp_sum = self.tensor_sum(tp)?;
+        let fp = self.tensor_mul(input, one_minus_target)?;
+        let fp_sum = self.tensor_sum(fp)?;
+        let fn_term = self.tensor_mul(one_minus_input, target)?;
+        let fn_sum = self.tensor_sum(fn_term)?;
+        let smooth_tensor = self.full(vec![1], smooth, false)?;
+        let numerator = self.tensor_add(tp_sum, smooth_tensor)?;
+        let alpha_fp = self.full(vec![1], alpha, false)?;
+        let alpha_fp = self.tensor_mul(alpha_fp, fp_sum)?;
+        let beta_fn = self.full(vec![1], beta, false)?;
+        let beta_fn = self.tensor_mul(beta_fn, fn_sum)?;
+        let denominator = self.tensor_add(tp_sum, alpha_fp)?;
+        let denominator = self.tensor_add(denominator, beta_fn)?;
+        let denominator = self.tensor_add(denominator, smooth_tensor)?;
+        let tversky = self.tensor_div(numerator, denominator)?;
+        let one = self.full(vec![1], 1.0, false)?;
+        self.tensor_sub(one, tversky)
+    }
+
+    /// IoU (Intersection over Union) loss for segmentation tasks.
+    ///
+    /// Computes `1 - (intersection + smooth) / (union + smooth)` where
+    /// intersection = sum(pred * target), union = sum(pred) + sum(target) - intersection.
+    /// Also known as Jaccard loss.
+    pub fn iou_loss(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        smooth: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let in_shape = self.tensor_shape(input)?;
+        let tgt_shape = self.tensor_shape(target)?;
+        if in_shape != tgt_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: in_shape,
+                    rhs: tgt_shape,
+                },
+            )));
+        }
+        let intersection = self.tensor_mul(input, target)?;
+        let intersection_sum = self.tensor_sum(intersection)?;
+        let input_sum = self.tensor_sum(input)?;
+        let target_sum = self.tensor_sum(target)?;
+        let smooth_tensor = self.full(vec![1], smooth, false)?;
+        let numerator = self.tensor_add(intersection_sum, smooth_tensor)?;
+        let union = self.tensor_add(input_sum, target_sum)?;
+        let union = self.tensor_sub(union, intersection_sum)?;
+        let denominator = self.tensor_add(union, smooth_tensor)?;
+        let iou = self.tensor_div(numerator, denominator)?;
+        let one = self.full(vec![1], 1.0, false)?;
+        self.tensor_sub(one, iou)
+    }
+
     /// Poisson negative log likelihood loss.
     ///
     /// Equivalent to `torch.nn.functional.poisson_nll_loss(input, target, log_input, full, eps)`.
