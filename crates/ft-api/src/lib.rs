@@ -229,6 +229,33 @@ impl FrankenTorchSession {
         self.runtime.set_mode(mode);
     }
 
+    /// Sample from Gamma(alpha, 1) using Marsaglia-Tsang's method.
+    fn sample_gamma(&mut self, alpha: f64) -> f64 {
+        if alpha < 1.0 {
+            // Use Ahrens-Dieter method for alpha < 1
+            let u = self.rng.next_f64();
+            return self.sample_gamma(1.0 + alpha) * u.powf(1.0 / alpha);
+        }
+        // Marsaglia-Tsang for alpha >= 1
+        let d = alpha - 1.0 / 3.0;
+        let c = 1.0 / (9.0 * d).sqrt();
+        loop {
+            let x = self.rng.next_normal();
+            let v_base = 1.0 + c * x;
+            if v_base <= 0.0 {
+                continue;
+            }
+            let v = v_base * v_base * v_base;
+            let u = self.rng.next_f64();
+            if u < 1.0 - 0.0331 * (x * x) * (x * x) {
+                return d * v;
+            }
+            if u.ln() < 0.5 * x * x + d * (1.0 - v + v.ln()) {
+                return d * v;
+            }
+        }
+    }
+
     /// Returns true if gradient computation is currently enabled.
     #[must_use]
     pub fn is_grad_enabled(&self) -> bool {
@@ -2340,6 +2367,59 @@ impl FrankenTorchSession {
             .map(|_| {
                 let u = self.rng.next_f64();
                 (scale * (std::f64::consts::PI * (u - 0.5)).tan()).abs()
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
+    /// Create a tensor filled with gamma-distributed random values.
+    ///
+    /// Samples from Gamma(concentration, rate) using Marsaglia-Tsang's method.
+    /// Note: rate = 1/scale (PyTorch uses concentration/rate parameterization).
+    pub fn tensor_gamma(
+        &mut self,
+        concentration: f64,
+        rate: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if concentration <= 0.0 || rate <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "gamma: concentration and rate must be positive",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| self.sample_gamma(concentration) / rate)
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
+    /// Create a tensor filled with beta-distributed random values.
+    ///
+    /// Samples from Beta(concentration1, concentration0) using gamma samples.
+    pub fn tensor_beta(
+        &mut self,
+        concentration1: f64,
+        concentration0: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if concentration1 <= 0.0 || concentration0 <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "beta: both concentrations must be positive",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                let x = self.sample_gamma(concentration1);
+                let y = self.sample_gamma(concentration0);
+                x / (x + y)
             })
             .collect();
         self.tensor_variable(values, shape, requires_grad)
@@ -16505,6 +16585,28 @@ impl FrankenTorchSession {
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_von_mises(loc, concentration, shape, requires_grad)
+    }
+
+    /// Gamma distribution samples. Alias for tensor_gamma.
+    pub fn functional_gamma(
+        &mut self,
+        concentration: f64,
+        rate: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gamma(concentration, rate, shape, requires_grad)
+    }
+
+    /// Beta distribution samples. Alias for tensor_beta.
+    pub fn functional_beta(
+        &mut self,
+        concentration1: f64,
+        concentration0: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_beta(concentration1, concentration0, shape, requires_grad)
     }
 
     /// Random integers with same shape. Alias for tensor_randint_like.
