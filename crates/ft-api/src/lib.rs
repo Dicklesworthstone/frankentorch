@@ -15230,6 +15230,82 @@ impl FrankenTorchSession {
         self.tensor_special_expit(input)
     }
 
+    /// Digamma function. Alias for tensor_special_digamma.
+    pub fn functional_special_digamma(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_digamma(input)
+    }
+
+    /// Entropy function. Alias for tensor_special_entr.
+    pub fn functional_special_entr(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_entr(input)
+    }
+
+    /// Scaled complementary error function. Alias for tensor_special_erfcx.
+    pub fn functional_special_erfcx(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_erfcx(input)
+    }
+
+    /// Inverse error function. Alias for tensor_special_erfinv.
+    pub fn functional_special_erfinv(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_erfinv(input)
+    }
+
+    /// Log-gamma function. Alias for tensor_special_gammaln.
+    pub fn functional_special_gammaln(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_gammaln(input)
+    }
+
+    /// x * log1p(y). Alias for tensor_special_xlog1py.
+    pub fn functional_special_xlog1py(
+        &mut self,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_xlog1py(x, y)
+    }
+
+    /// Hurwitz zeta function. Alias for tensor_special_zeta.
+    pub fn functional_special_zeta(
+        &mut self,
+        s: TensorNodeId,
+        a: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_zeta(s, a)
+    }
+
+    /// Max along dimension with indices. Alias for tensor_max_dim.
+    pub fn functional_max_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_max_dim(input, dim)
+    }
+
+    /// Min along dimension with indices. Alias for tensor_min_dim.
+    pub fn functional_min_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_min_dim(input, dim)
+    }
+
     /// Element-wise max. Alias for tensor_max.
     pub fn functional_max(
         &mut self,
