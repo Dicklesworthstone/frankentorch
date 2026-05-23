@@ -12629,6 +12629,20 @@ impl FrankenTorchSession {
     /// Equivalent to `torch.nn.functional.linear(input, weight, bias)`.
     /// `input`: `[*, in_features]`, `weight`: `[out_features, in_features]`,
     /// `bias` (optional): `[out_features]`.
+    pub fn tensor_linear(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_linear(input, weight, bias)
+    }
+
+    /// Apply a linear transformation: `y = x @ weight^T + bias`.
+    ///
+    /// Equivalent to `torch.nn.functional.linear(input, weight, bias)`.
+    /// `input`: `[*, in_features]`, `weight`: `[out_features, in_features]`,
+    /// `bias` (optional): `[out_features]`.
     pub fn functional_linear(
         &mut self,
         input: TensorNodeId,
@@ -12763,6 +12777,20 @@ impl FrankenTorchSession {
         self.functional_bilinear(input1, input2, weight, bias)
     }
 
+    /// Apply a 1D convolution.
+    ///
+    /// Alias for `functional_conv1d`.
+    pub fn tensor_conv1d(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+        stride: usize,
+        padding: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_conv1d(input, weight, bias, stride, padding)
+    }
+
     /// Apply a 1D convolution: `y = conv1d(input, weight, bias)`.
     ///
     /// Equivalent to `torch.nn.functional.conv1d(input, weight, bias, stride, padding)`.
@@ -12860,6 +12888,20 @@ impl FrankenTorchSession {
             }
             None => Ok(output),
         }
+    }
+
+    /// Apply a 2D convolution.
+    ///
+    /// Alias for `functional_conv2d`.
+    pub fn tensor_conv2d(
+        &mut self,
+        input: TensorNodeId,
+        weight: TensorNodeId,
+        bias: Option<TensorNodeId>,
+        stride: (usize, usize),
+        padding: (usize, usize),
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_conv2d(input, weight, bias, stride, padding)
     }
 
     /// Apply a 2D convolution: `y = conv2d(input, weight, bias)`.
