@@ -47387,6 +47387,138 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_clamp(input, 0.0, 1.0)
     }
+
+    // ── Linear Algebra Shortcuts ─────────────────────────────────────────
+
+    /// Compute trace of a square matrix.
+    pub fn trace_matrix(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_trace(input)
+    }
+
+    /// Compute matrix determinant.
+    pub fn det_matrix(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_det(input)
+    }
+
+    /// Compute matrix inverse.
+    pub fn inv_matrix(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_inv(input)
+    }
+
+    /// Transpose 2D matrix.
+    pub fn transpose_2d(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_transpose(input, 0, 1)
+    }
+
+    // ── Normalization Shortcuts ──────────────────────────────────────────
+
+    /// Apply L2 normalization along last dimension.
+    pub fn normalize_l2(
+        &mut self,
+        input: TensorNodeId,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let last_dim = shape.len() - 1;
+        let sq = self.tensor_mul(input, input)?;
+        let sum_sq = self.tensor_sum_dim(sq, last_dim)?;
+        let eps_t = self.full(vec![1], eps, false)?;
+        let sum_with_eps = self.tensor_add(sum_sq, eps_t)?;
+        let norm = self.tensor_sqrt(sum_with_eps)?;
+        let norm_expanded = self.tensor_unsqueeze(norm, last_dim)?;
+        self.tensor_div(input, norm_expanded)
+    }
+
+    /// Apply min-max normalization to [0, 1] range.
+    pub fn normalize_minmax(
+        &mut self,
+        input: TensorNodeId,
+        eps: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let flat = self.flatten_all(input)?;
+        let min_val = self.tensor_amin(flat, 0)?;
+        let max_val = self.tensor_amax(flat, 0)?;
+        let shifted = self.tensor_sub(input, min_val)?;
+        let range = self.tensor_sub(max_val, min_val)?;
+        let eps_t = self.full(vec![1], eps, false)?;
+        let safe_range = self.tensor_add(range, eps_t)?;
+        self.tensor_div(shifted, safe_range)
+    }
+
+    // ── Index Utilities ──────────────────────────────────────────────────
+
+    /// Create indices [0, 1, 2, ..., n-1].
+    pub fn arange_int(
+        &mut self,
+        n: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        self.tensor_variable(data, vec![n], false)
+    }
+
+    /// Create linearly spaced values.
+    pub fn linspace_simple(
+        &mut self,
+        start: f64,
+        end: f64,
+        steps: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linspace(start, end, steps, false)
+    }
+
+    /// Create logarithmically spaced values.
+    pub fn logspace_simple(
+        &mut self,
+        start: f64,
+        end: f64,
+        steps: usize,
+        base: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logspace(start, end, steps, base, false)
+    }
+
+    // ── Attention Helpers ────────────────────────────────────────────────
+
+    /// Create causal attention mask for sequence length.
+    pub fn create_causal_mask(
+        &mut self,
+        seq_len: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.causal_mask(seq_len)
+    }
+
+    /// Create padding attention mask from lengths.
+    pub fn create_padding_mask(
+        &mut self,
+        lengths: TensorNodeId,
+        max_len: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.lengths_to_mask(lengths, max_len)
+    }
+
+    /// Scale queries for attention (divide by sqrt(d_k)).
+    pub fn scale_for_attention(
+        &mut self,
+        query: TensorNodeId,
+        d_k: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let scale = 1.0 / (d_k as f64).sqrt();
+        let scale_t = self.full(vec![1], scale, false)?;
+        self.tensor_mul(query, scale_t)
+    }
 }
 
 pub use ft_autograd::{
