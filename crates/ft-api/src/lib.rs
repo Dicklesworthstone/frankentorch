@@ -30759,6 +30759,89 @@ impl FrankenTorchSession {
         self.nms(offset_boxes_tensor, scores, iou_threshold)
     }
 
+    /// Soft non-maximum suppression.
+    ///
+    /// Instead of removing overlapping boxes, decay their scores based on IoU.
+    /// Returns (indices, new_scores) for all boxes above score_threshold.
+    ///
+    /// Args:
+    /// - boxes: [N, 4] in format (x1, y1, x2, y2)
+    /// - scores: [N] confidence scores
+    /// - iou_threshold: IoU threshold for starting suppression
+    /// - score_threshold: minimum score to keep
+    /// - sigma: Gaussian decay parameter (typical 0.5)
+    /// - method: "linear" or "gaussian"
+    pub fn soft_nms(
+        &mut self,
+        boxes: TensorNodeId,
+        scores: TensorNodeId,
+        iou_threshold: f64,
+        score_threshold: f64,
+        sigma: f64,
+        method: &str,
+    ) -> Result<(Vec<usize>, Vec<f64>), AutogradError> {
+        let boxes_shape = self.tensor_shape(boxes)?;
+        let scores_shape = self.tensor_shape(scores)?;
+        if boxes_shape.len() != 2 || boxes_shape[1] != 4 {
+            return Err(Self::incompatible_tensor_args("soft_nms: boxes must be [N, 4]"));
+        }
+        if scores_shape.len() != 1 || scores_shape[0] != boxes_shape[0] {
+            return Err(Self::incompatible_tensor_args("soft_nms: scores must be [N]"));
+        }
+        let n = boxes_shape[0];
+        if n == 0 {
+            return Ok((vec![], vec![]));
+        }
+        let boxes_data = self.tensor_values(boxes)?;
+        let mut scores_vec = self.tensor_values(scores)?;
+        let use_gaussian = method == "gaussian";
+        let mut keep = Vec::new();
+        let mut new_scores = Vec::new();
+        for _ in 0..n {
+            let (max_idx, _) = scores_vec
+                .iter()
+                .enumerate()
+                .max_by(|(_, a), (_, b)| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal))
+                .unwrap_or((0, &f64::NEG_INFINITY));
+            if scores_vec[max_idx] < score_threshold {
+                break;
+            }
+            keep.push(max_idx);
+            new_scores.push(scores_vec[max_idx]);
+            let x1_i = boxes_data[max_idx * 4];
+            let y1_i = boxes_data[max_idx * 4 + 1];
+            let x2_i = boxes_data[max_idx * 4 + 2];
+            let y2_i = boxes_data[max_idx * 4 + 3];
+            let area_i = (x2_i - x1_i).max(0.0) * (y2_i - y1_i).max(0.0);
+            scores_vec[max_idx] = f64::NEG_INFINITY;
+            for j in 0..n {
+                if scores_vec[j] <= score_threshold {
+                    continue;
+                }
+                let x1_j = boxes_data[j * 4];
+                let y1_j = boxes_data[j * 4 + 1];
+                let x2_j = boxes_data[j * 4 + 2];
+                let y2_j = boxes_data[j * 4 + 3];
+                let area_j = (x2_j - x1_j).max(0.0) * (y2_j - y1_j).max(0.0);
+                let inter_x1 = x1_i.max(x1_j);
+                let inter_y1 = y1_i.max(y1_j);
+                let inter_x2 = x2_i.min(x2_j);
+                let inter_y2 = y2_i.min(y2_j);
+                let inter_area = (inter_x2 - inter_x1).max(0.0) * (inter_y2 - inter_y1).max(0.0);
+                let union_area = area_i + area_j - inter_area;
+                let iou = if union_area > 0.0 { inter_area / union_area } else { 0.0 };
+                if iou > iou_threshold {
+                    if use_gaussian {
+                        scores_vec[j] *= (-iou * iou / sigma).exp();
+                    } else {
+                        scores_vec[j] *= 1.0 - iou;
+                    }
+                }
+            }
+        }
+        Ok((keep, new_scores))
+    }
+
     /// Compute IoU (Intersection over Union) between two sets of boxes.
     ///
     /// Args:
