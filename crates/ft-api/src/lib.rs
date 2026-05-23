@@ -13635,6 +13635,67 @@ impl FrankenTorchSession {
         self.tensor_broadcast_tensors(tensors)
     }
 
+    /// Cumulative sum along dimension. Alias for tensor_cumsum.
+    pub fn functional_cumsum(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cumsum(input, dim)
+    }
+
+    /// Cumulative product along dimension. Alias for tensor_cumprod.
+    pub fn functional_cumprod(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cumprod(input, dim)
+    }
+
+    /// Sort tensor along dimension. Alias for tensor_sort.
+    pub fn functional_sort(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        descending: bool,
+    ) -> Result<(TensorNodeId, Vec<usize>), AutogradError> {
+        self.tensor_sort(input, dim, descending)
+    }
+
+    /// Return k largest/smallest elements. Alias for tensor_topk.
+    pub fn functional_topk(
+        &mut self,
+        input: TensorNodeId,
+        k: usize,
+        dim: usize,
+        largest: bool,
+        sorted: bool,
+    ) -> Result<(TensorNodeId, Vec<usize>), AutogradError> {
+        self.tensor_topk(input, k, dim, largest, sorted)
+    }
+
+    /// Find unique elements. Alias for tensor_unique.
+    pub fn functional_unique(
+        &mut self,
+        input: TensorNodeId,
+        sorted: bool,
+        return_inverse: bool,
+        return_counts: bool,
+    ) -> Result<(TensorNodeId, Option<TensorNodeId>, Option<TensorNodeId>), AutogradError> {
+        self.tensor_unique(input, sorted, return_inverse, return_counts)
+    }
+
+    /// Count occurrences of each value. Alias for tensor_bincount.
+    pub fn functional_bincount(
+        &mut self,
+        input: TensorNodeId,
+        weights: Option<TensorNodeId>,
+        minlength: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_bincount(input, weights, minlength)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
