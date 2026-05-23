@@ -10239,6 +10239,22 @@ impl FrankenTorchSession {
         Ok(out)
     }
 
+    /// Element-wise cube (x^3).
+    pub fn tensor_cube(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pow(input, 3.0)
+    }
+
+    /// Element-wise cube root (x^(1/3)).
+    ///
+    /// For autograd support, uses sign(x) * |x|^(1/3) to handle negative values.
+    pub fn tensor_cbrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        // cbrt(x) = sign(x) * |x|^(1/3)
+        let abs_input = self.tensor_abs(input)?;
+        let cbrt_abs = self.tensor_pow(abs_input, 1.0 / 3.0)?;
+        let sign = self.tensor_sign(input)?;
+        self.tensor_mul(sign, cbrt_abs)
+    }
+
     pub fn tensor_sqrt(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let (out, event) = self.tensor_tape.sqrt(input, self.mode())?;
         self.record_tensor_unary_operation(&event);
@@ -19268,6 +19284,22 @@ impl FrankenTorchSession {
         self.tensor_scalar(value, requires_grad)
     }
 
+    /// Element-wise cube. Alias for tensor_cube.
+    pub fn functional_cube(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cube(input)
+    }
+
+    /// Element-wise cube root. Alias for tensor_cbrt.
+    pub fn functional_cbrt(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cbrt(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
@@ -23156,6 +23188,13 @@ impl FrankenTorchSession {
     /// Equivalent to `tensor.square_()` in PyTorch.
     pub fn tensor_square_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
         self.apply_tensor_unary_in_place("square_", target, None, |x| x * x)
+    }
+
+    /// In-place cube (x^3).
+    ///
+    /// Equivalent to `tensor.cube_()`.
+    pub fn tensor_cube_(&mut self, target: TensorNodeId) -> Result<(), AutogradError> {
+        self.apply_tensor_unary_in_place("cube_", target, None, |x| x * x * x)
     }
 
     /// In-place power (x^exponent).
