@@ -2144,6 +2144,90 @@ impl FrankenTorchSession {
         self.tensor_variable(values, shape, requires_grad)
     }
 
+    /// Create a tensor filled with Laplace-distributed random values.
+    ///
+    /// Samples from Laplace(loc, scale) with PDF: exp(-|x-loc|/scale) / (2*scale).
+    pub fn tensor_laplace(
+        &mut self,
+        loc: f64,
+        scale: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if scale <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "laplace: scale must be positive",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                // Inverse CDF: loc - scale * sign(U-0.5) * ln(1 - 2|U-0.5|)
+                let u = self.rng.next_f64() - 0.5;
+                loc - scale * u.signum() * (1.0 - 2.0 * u.abs()).ln()
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
+    /// Create a tensor filled with Weibull-distributed random values.
+    ///
+    /// Samples from Weibull(scale, concentration) with scale λ and shape k.
+    pub fn tensor_weibull(
+        &mut self,
+        scale: f64,
+        concentration: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if scale <= 0.0 || concentration <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "weibull: scale and concentration must be positive",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                // Inverse CDF: scale * (-ln(1-U))^(1/k)
+                let u = self.rng.next_f64();
+                scale * (-((1.0 - u).ln())).powf(1.0 / concentration)
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
+    /// Create a tensor filled with logistic-distributed random values.
+    ///
+    /// Samples from Logistic(loc, scale).
+    pub fn tensor_logistic(
+        &mut self,
+        loc: f64,
+        scale: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if scale <= 0.0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "logistic: scale must be positive",
+                },
+            )));
+        }
+        let numel: usize = shape.iter().product();
+        let values: Vec<f64> = (0..numel)
+            .map(|_| {
+                // Inverse CDF: loc + scale * ln(U / (1-U))
+                let u = self.rng.next_f64();
+                loc + scale * (u / (1.0 - u)).ln()
+            })
+            .collect();
+        self.tensor_variable(values, shape, requires_grad)
+    }
+
     /// Alias for `randint`. Equivalent to `torch.randint(low, high, shape)`.
     pub fn tensor_randint(
         &mut self,
@@ -16170,6 +16254,39 @@ impl FrankenTorchSession {
         requires_grad: bool,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_gumbel(mu, beta, shape, requires_grad)
+    }
+
+    /// Laplace distribution samples. Alias for tensor_laplace.
+    pub fn functional_laplace(
+        &mut self,
+        loc: f64,
+        scale: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_laplace(loc, scale, shape, requires_grad)
+    }
+
+    /// Weibull distribution samples. Alias for tensor_weibull.
+    pub fn functional_weibull(
+        &mut self,
+        scale: f64,
+        concentration: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_weibull(scale, concentration, shape, requires_grad)
+    }
+
+    /// Logistic distribution samples. Alias for tensor_logistic.
+    pub fn functional_logistic(
+        &mut self,
+        loc: f64,
+        scale: f64,
+        shape: Vec<usize>,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logistic(loc, scale, shape, requires_grad)
     }
 
     /// Random integers with same shape. Alias for tensor_randint_like.
