@@ -53142,6 +53142,59 @@ impl FrankenTorchSession {
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
         self.tensor_linalg_lu_factor(input)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Dimension manipulation utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Ensure tensor has at least 1 dimension.
+    pub fn atleast_1d_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atleast_1d(input)
+    }
+
+    /// Ensure tensor has at least 2 dimensions.
+    pub fn atleast_2d_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atleast_2d(input)
+    }
+
+    /// Ensure tensor has at least 3 dimensions.
+    pub fn atleast_3d_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_atleast_3d(input)
+    }
+
+    /// Repeat each element multiple times.
+    pub fn repeat_interleave_tensor(
+        &mut self,
+        input: TensorNodeId,
+        repeats: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_repeat_interleave(input, repeats)
+    }
+
+    /// Row stack (vstack alias).
+    pub fn row_stack_tensor(
+        &mut self,
+        inputs: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_row_stack(inputs)
+    }
+
+    /// Column stack.
+    pub fn column_stack_tensor(
+        &mut self,
+        inputs: &[TensorNodeId],
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_column_stack(inputs)
+    }
 }
 
 pub use ft_autograd::{
