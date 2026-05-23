@@ -13989,6 +13989,252 @@ impl FrankenTorchSession {
         self.tensor_reshape(pooled, vec![n, c, d_out, h_out, w_out])
     }
 
+    /// Adaptive max pooling for 1-D input `[N, C, L]`.
+    ///
+    /// Equivalent to `torch.nn.functional.adaptive_max_pool1d(input, output_size)`.
+    /// Returns (output, indices) where indices contains the argmax positions.
+    pub fn functional_adaptive_max_pool1d(
+        &mut self,
+        input: TensorNodeId,
+        output_size: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.require_f64_tensor_storage(input)?;
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 3 {
+            return Err(Self::incompatible_tensor_args(
+                "adaptive_max_pool1d: input must be 3-D [N, C, L]",
+            ));
+        }
+        let (n, c, l_in) = (shape[0], shape[1], shape[2]);
+        let l_out = output_size;
+        if l_out == 0 {
+            let empty_out = self.empty(vec![n, c, 0], false)?;
+            let empty_idx = self.empty(vec![n, c, 0], false)?;
+            return Ok((empty_out, empty_idx));
+        }
+
+        let input_data = self.tensor_values(input)?;
+        let total_out = n * c * l_out;
+        let mut out_data = vec![f64::NEG_INFINITY; total_out];
+        let mut idx_data = vec![0.0; total_out];
+
+        for batch in 0..n {
+            for channel in 0..c {
+                for ol in 0..l_out {
+                    let (start, end) = Self::adaptive_avg_pool_window(
+                        ol,
+                        l_in,
+                        l_out,
+                        "adaptive_max_pool1d index overflow",
+                    )?;
+                    let mut max_val = f64::NEG_INFINITY;
+                    let mut max_idx = start;
+                    for il in start..end {
+                        let in_idx = batch * c * l_in + channel * l_in + il;
+                        if input_data[in_idx] > max_val {
+                            max_val = input_data[in_idx];
+                            max_idx = il;
+                        }
+                    }
+                    let out_idx = batch * c * l_out + channel * l_out + ol;
+                    out_data[out_idx] = max_val;
+                    idx_data[out_idx] = max_idx as f64;
+                }
+            }
+        }
+
+        let out_shape = vec![n, c, l_out];
+        let output = self.tensor_variable(out_data, out_shape.clone(), false)?;
+        let indices = self.tensor_variable(idx_data, out_shape, false)?;
+        Ok((output, indices))
+    }
+
+    /// Adaptive max pooling for 2-D input `[N, C, H, W]`.
+    ///
+    /// Equivalent to `torch.nn.functional.adaptive_max_pool2d(input, output_size)`.
+    /// Returns (output, indices) where indices contains the flattened argmax positions.
+    pub fn functional_adaptive_max_pool2d(
+        &mut self,
+        input: TensorNodeId,
+        output_size: (usize, usize),
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.require_f64_tensor_storage(input)?;
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 4 {
+            return Err(Self::incompatible_tensor_args(
+                "adaptive_max_pool2d: input must be 4-D [N, C, H, W]",
+            ));
+        }
+        let (n, c, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3]);
+        let (h_out, w_out) = output_size;
+        if h_out == 0 || w_out == 0 {
+            let empty_out = self.empty(vec![n, c, h_out, w_out], false)?;
+            let empty_idx = self.empty(vec![n, c, h_out, w_out], false)?;
+            return Ok((empty_out, empty_idx));
+        }
+
+        let input_data = self.tensor_values(input)?;
+        let total_out = n * c * h_out * w_out;
+        let mut out_data = vec![f64::NEG_INFINITY; total_out];
+        let mut idx_data = vec![0.0; total_out];
+
+        for batch in 0..n {
+            for channel in 0..c {
+                for oh in 0..h_out {
+                    let (h_start, h_end) = Self::adaptive_avg_pool_window(
+                        oh,
+                        h_in,
+                        h_out,
+                        "adaptive_max_pool2d index overflow",
+                    )?;
+                    for ow in 0..w_out {
+                        let (w_start, w_end) = Self::adaptive_avg_pool_window(
+                            ow,
+                            w_in,
+                            w_out,
+                            "adaptive_max_pool2d index overflow",
+                        )?;
+                        let mut max_val = f64::NEG_INFINITY;
+                        let mut max_idx = h_start * w_in + w_start;
+                        for ih in h_start..h_end {
+                            for iw in w_start..w_end {
+                                let in_idx = batch * c * h_in * w_in + channel * h_in * w_in + ih * w_in + iw;
+                                if input_data[in_idx] > max_val {
+                                    max_val = input_data[in_idx];
+                                    max_idx = ih * w_in + iw;
+                                }
+                            }
+                        }
+                        let out_idx = batch * c * h_out * w_out + channel * h_out * w_out + oh * w_out + ow;
+                        out_data[out_idx] = max_val;
+                        idx_data[out_idx] = max_idx as f64;
+                    }
+                }
+            }
+        }
+
+        let out_shape = vec![n, c, h_out, w_out];
+        let output = self.tensor_variable(out_data, out_shape.clone(), false)?;
+        let indices = self.tensor_variable(idx_data, out_shape, false)?;
+        Ok((output, indices))
+    }
+
+    /// Adaptive max pooling for 3-D input `[N, C, D, H, W]`.
+    ///
+    /// Equivalent to `torch.nn.functional.adaptive_max_pool3d(input, output_size)`.
+    /// Returns (output, indices) where indices contains the flattened argmax positions.
+    pub fn functional_adaptive_max_pool3d(
+        &mut self,
+        input: TensorNodeId,
+        output_size: (usize, usize, usize),
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.require_f64_tensor_storage(input)?;
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 5 {
+            return Err(Self::incompatible_tensor_args(
+                "adaptive_max_pool3d: input must be 5-D [N, C, D, H, W]",
+            ));
+        }
+        let (n, c, d_in, h_in, w_in) = (shape[0], shape[1], shape[2], shape[3], shape[4]);
+        let (d_out, h_out, w_out) = output_size;
+        if d_out == 0 || h_out == 0 || w_out == 0 {
+            let empty_out = self.empty(vec![n, c, d_out, h_out, w_out], false)?;
+            let empty_idx = self.empty(vec![n, c, d_out, h_out, w_out], false)?;
+            return Ok((empty_out, empty_idx));
+        }
+
+        let input_data = self.tensor_values(input)?;
+        let total_out = n * c * d_out * h_out * w_out;
+        let mut out_data = vec![f64::NEG_INFINITY; total_out];
+        let mut idx_data = vec![0.0; total_out];
+        let hw_in = h_in * w_in;
+
+        for batch in 0..n {
+            for channel in 0..c {
+                for od in 0..d_out {
+                    let (d_start, d_end) = Self::adaptive_avg_pool_window(
+                        od,
+                        d_in,
+                        d_out,
+                        "adaptive_max_pool3d index overflow",
+                    )?;
+                    for oh in 0..h_out {
+                        let (h_start, h_end) = Self::adaptive_avg_pool_window(
+                            oh,
+                            h_in,
+                            h_out,
+                            "adaptive_max_pool3d index overflow",
+                        )?;
+                        for ow in 0..w_out {
+                            let (w_start, w_end) = Self::adaptive_avg_pool_window(
+                                ow,
+                                w_in,
+                                w_out,
+                                "adaptive_max_pool3d index overflow",
+                            )?;
+                            let mut max_val = f64::NEG_INFINITY;
+                            let mut max_idx = d_start * hw_in + h_start * w_in + w_start;
+                            for id in d_start..d_end {
+                                for ih in h_start..h_end {
+                                    for iw in w_start..w_end {
+                                        let in_idx = batch * c * d_in * hw_in
+                                            + channel * d_in * hw_in
+                                            + id * hw_in
+                                            + ih * w_in
+                                            + iw;
+                                        if input_data[in_idx] > max_val {
+                                            max_val = input_data[in_idx];
+                                            max_idx = id * hw_in + ih * w_in + iw;
+                                        }
+                                    }
+                                }
+                            }
+                            let out_idx = batch * c * d_out * h_out * w_out
+                                + channel * d_out * h_out * w_out
+                                + od * h_out * w_out
+                                + oh * w_out
+                                + ow;
+                            out_data[out_idx] = max_val;
+                            idx_data[out_idx] = max_idx as f64;
+                        }
+                    }
+                }
+            }
+        }
+
+        let out_shape = vec![n, c, d_out, h_out, w_out];
+        let output = self.tensor_variable(out_data, out_shape.clone(), false)?;
+        let indices = self.tensor_variable(idx_data, out_shape, false)?;
+        Ok((output, indices))
+    }
+
+    /// Alias for `functional_adaptive_max_pool1d`.
+    pub fn tensor_adaptive_max_pool1d(
+        &mut self,
+        input: TensorNodeId,
+        output_size: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.functional_adaptive_max_pool1d(input, output_size)
+    }
+
+    /// Alias for `functional_adaptive_max_pool2d`.
+    pub fn tensor_adaptive_max_pool2d(
+        &mut self,
+        input: TensorNodeId,
+        output_size: (usize, usize),
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.functional_adaptive_max_pool2d(input, output_size)
+    }
+
+    /// Alias for `functional_adaptive_max_pool3d`.
+    pub fn tensor_adaptive_max_pool3d(
+        &mut self,
+        input: TensorNodeId,
+        output_size: (usize, usize, usize),
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.functional_adaptive_max_pool3d(input, output_size)
+    }
+
     /// Apply layer normalization over the trailing `normalized_shape` dimensions.
     ///
     /// Equivalent to `torch.nn.functional.layer_norm`.
