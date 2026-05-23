@@ -16403,6 +16403,33 @@ impl FrankenTorchSession {
         self.tensor_irfft(input, n)
     }
 
+    /// 2-D real FFT. Alias for tensor_rfft2.
+    pub fn functional_rfft2(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_rfft2(input)
+    }
+
+    /// 2-D inverse real FFT. Alias for tensor_irfft2.
+    pub fn functional_irfft2(
+        &mut self,
+        input: TensorNodeId,
+        s: Option<(usize, usize)>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_irfft2(input, s)
+    }
+
+    /// Inverse STFT. Alias for tensor_istft.
+    pub fn functional_istft(
+        &mut self,
+        input: TensorNodeId,
+        n_fft: usize,
+        options: IstftOptions,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_istft(input, n_fft, options)
+    }
+
     /// Hann window. Alias for tensor_hann_window.
     pub fn functional_hann_window(
         &mut self,
