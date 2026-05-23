@@ -4156,6 +4156,208 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Multi-head attention forward pass.
+    ///
+    /// Equivalent to `torch.nn.functional.multi_head_attention_forward`.
+    /// Projects query, key, value through linear layers, applies multi-head attention,
+    /// and projects output.
+    ///
+    /// - `query`: `[tgt_len, batch, embed_dim]` or `[batch, tgt_len, embed_dim]` (if batch_first)
+    /// - `key`: `[src_len, batch, embed_dim]` or `[batch, src_len, embed_dim]`
+    /// - `value`: `[src_len, batch, embed_dim]` or `[batch, src_len, embed_dim]`
+    /// - `in_proj_weight`: combined Q/K/V projection `[3*embed_dim, embed_dim]`
+    /// - `in_proj_bias`: combined bias `[3*embed_dim]` (optional)
+    /// - `out_proj_weight`: output projection `[embed_dim, embed_dim]`
+    /// - `out_proj_bias`: output bias `[embed_dim]` (optional)
+    /// - `num_heads`: number of attention heads
+    /// - `dropout_p`: dropout probability
+    /// - `batch_first`: if true, input shape is `[batch, seq, embed]`
+    ///
+    /// Returns `(attn_output, attn_weights)`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn multi_head_attention_forward(
+        &mut self,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        in_proj_weight: TensorNodeId,
+        in_proj_bias: Option<TensorNodeId>,
+        out_proj_weight: TensorNodeId,
+        out_proj_bias: Option<TensorNodeId>,
+        num_heads: usize,
+        dropout_p: f64,
+        attn_mask: Option<TensorNodeId>,
+        key_padding_mask: Option<TensorNodeId>,
+        need_weights: bool,
+        is_causal: bool,
+        batch_first: bool,
+    ) -> Result<(TensorNodeId, Option<TensorNodeId>), AutogradError> {
+        if num_heads == 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multi_head_attention_forward: num_heads must be positive",
+                },
+            )));
+        }
+        let q_shape = self.tensor_shape(query)?;
+        if q_shape.len() != 3 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multi_head_attention_forward: query must be 3-D",
+                },
+            )));
+        }
+        let (tgt_len, bsz, embed_dim) = if batch_first {
+            (q_shape[1], q_shape[0], q_shape[2])
+        } else {
+            (q_shape[0], q_shape[1], q_shape[2])
+        };
+        if embed_dim % num_heads != 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "multi_head_attention_forward: embed_dim must be divisible by num_heads",
+                },
+            )));
+        }
+        let head_dim = embed_dim / num_heads;
+        let k_shape = self.tensor_shape(key)?;
+        let src_len = if batch_first { k_shape[1] } else { k_shape[0] };
+
+        // Transpose to [seq, batch, embed] if batch_first
+        let (q, k, v) = if batch_first {
+            let q_t = self.tensor_transpose(query, 0, 1)?;
+            let k_t = self.tensor_transpose(key, 0, 1)?;
+            let v_t = self.tensor_transpose(value, 0, 1)?;
+            (q_t, k_t, v_t)
+        } else {
+            (query, key, value)
+        };
+
+        // Reshape [seq, batch, embed] -> [seq*batch, embed]
+        let q_flat = self.tensor_reshape(q, vec![tgt_len * bsz, embed_dim])?;
+        let k_flat = self.tensor_reshape(k, vec![src_len * bsz, embed_dim])?;
+        let v_flat = self.tensor_reshape(v, vec![src_len * bsz, embed_dim])?;
+
+        // Apply combined Q/K/V projection: [seq*batch, embed] @ [embed, 3*embed]^T
+        let in_proj_weight_t = self.tensor_transpose(in_proj_weight, 0, 1)?;
+        let w_q = self.tensor_narrow(in_proj_weight_t, 1, 0, embed_dim)?;
+        let w_k = self.tensor_narrow(in_proj_weight_t, 1, embed_dim, embed_dim)?;
+        let w_v = self.tensor_narrow(in_proj_weight_t, 1, 2 * embed_dim, embed_dim)?;
+        let q_proj = self.tensor_matmul(q_flat, w_q)?;
+        let k_proj = self.tensor_matmul(k_flat, w_k)?;
+        let v_proj = self.tensor_matmul(v_flat, w_v)?;
+
+        // Add biases if present
+        let (q_proj, k_proj, v_proj) = if let Some(bias) = in_proj_bias {
+            let q_bias = self.tensor_narrow(bias, 0, 0, embed_dim)?;
+            let k_bias = self.tensor_narrow(bias, 0, embed_dim, embed_dim)?;
+            let v_bias = self.tensor_narrow(bias, 0, 2 * embed_dim, embed_dim)?;
+            let q_proj = self.tensor_add(q_proj, q_bias)?;
+            let k_proj = self.tensor_add(k_proj, k_bias)?;
+            let v_proj = self.tensor_add(v_proj, v_bias)?;
+            (q_proj, k_proj, v_proj)
+        } else {
+            (q_proj, k_proj, v_proj)
+        };
+
+        // Reshape to [batch, num_heads, seq_len, head_dim]
+        let q_heads = self.tensor_reshape(q_proj, vec![tgt_len, bsz, num_heads, head_dim])?;
+        let q_heads = self.tensor_permute(q_heads, vec![1, 2, 0, 3])?;
+        let k_heads = self.tensor_reshape(k_proj, vec![src_len, bsz, num_heads, head_dim])?;
+        let k_heads = self.tensor_permute(k_heads, vec![1, 2, 0, 3])?;
+        let v_heads = self.tensor_reshape(v_proj, vec![src_len, bsz, num_heads, head_dim])?;
+        let v_heads = self.tensor_permute(v_heads, vec![1, 2, 0, 3])?;
+
+        // Apply key_padding_mask if present
+        let effective_mask = match (attn_mask, key_padding_mask) {
+            (Some(am), Some(kpm)) => {
+                // Combine: expand key_padding_mask and add to attn_mask
+                let kpm_expanded = self.tensor_unsqueeze(kpm, 1)?;
+                let kpm_expanded = self.tensor_unsqueeze(kpm_expanded, 2)?;
+                let kpm_shape = self.tensor_shape(kpm_expanded)?;
+                let zeros = self.tensor_zeros(kpm_shape, false)?;
+                let kpm_float = self.tensor_masked_fill(zeros, kpm_expanded, f64::NEG_INFINITY)?;
+                Some(self.tensor_add(am, kpm_float)?)
+            }
+            (Some(am), None) => Some(am),
+            (None, Some(kpm)) => {
+                let kpm_expanded = self.tensor_unsqueeze(kpm, 1)?;
+                let kpm_expanded = self.tensor_unsqueeze(kpm_expanded, 2)?;
+                let kpm_shape = self.tensor_shape(kpm_expanded)?;
+                let zeros = self.tensor_zeros(kpm_shape, false)?;
+                Some(self.tensor_masked_fill(zeros, kpm_expanded, f64::NEG_INFINITY)?)
+            }
+            (None, None) => None,
+        };
+
+        // Apply scaled_dot_product_attention
+        let attn_output = self.scaled_dot_product_attention(
+            q_heads, k_heads, v_heads, effective_mask, dropout_p, is_causal)?;
+
+        // Compute attention weights if needed
+        let attn_weights_out = if need_weights {
+            let scale = 1.0 / (head_dim as f64).sqrt();
+            let k_t = self.tensor_transpose(k_heads, 2, 3)?;
+            let scores = self.tensor_matmul(q_heads, k_t)?;
+            let scores_shape = self.tensor_shape(scores)?;
+            let scale_tensor = self.full(scores_shape.clone(), scale, false)?;
+            let scaled = self.tensor_mul(scores, scale_tensor)?;
+            let softmax_dim = scores_shape.len() - 1;
+            let weights = self.tensor_softmax(scaled, softmax_dim)?;
+            // Average over head dimension (dim 1)
+            let avg_weights = self.tensor_mean_dim(weights, 1)?;
+            Some(avg_weights)
+        } else {
+            None
+        };
+
+        // Reshape: [batch, num_heads, tgt_len, head_dim] -> [tgt_len, batch, embed_dim]
+        let attn_output = self.tensor_permute(attn_output, vec![2, 0, 1, 3])?;
+        let attn_output = self.tensor_reshape(attn_output, vec![tgt_len, bsz, embed_dim])?;
+
+        // Flatten for output projection
+        let attn_flat = self.tensor_reshape(attn_output, vec![tgt_len * bsz, embed_dim])?;
+        let out_proj_weight_t = self.tensor_transpose(out_proj_weight, 0, 1)?;
+        let mut output = self.tensor_matmul(attn_flat, out_proj_weight_t)?;
+        if let Some(bias) = out_proj_bias {
+            output = self.tensor_add(output, bias)?;
+        }
+        let output = self.tensor_reshape(output, vec![tgt_len, bsz, embed_dim])?;
+
+        // Transpose back if batch_first
+        let output = if batch_first {
+            self.tensor_transpose(output, 0, 1)?
+        } else {
+            output
+        };
+
+        Ok((output, attn_weights_out))
+    }
+
+    /// Alias for `multi_head_attention_forward`.
+    #[allow(clippy::too_many_arguments)]
+    pub fn functional_multi_head_attention_forward(
+        &mut self,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        in_proj_weight: TensorNodeId,
+        in_proj_bias: Option<TensorNodeId>,
+        out_proj_weight: TensorNodeId,
+        out_proj_bias: Option<TensorNodeId>,
+        num_heads: usize,
+        dropout_p: f64,
+        attn_mask: Option<TensorNodeId>,
+        key_padding_mask: Option<TensorNodeId>,
+        need_weights: bool,
+        is_causal: bool,
+        batch_first: bool,
+    ) -> Result<(TensorNodeId, Option<TensorNodeId>), AutogradError> {
+        self.multi_head_attention_forward(
+            query, key, value, in_proj_weight, in_proj_bias, out_proj_weight, out_proj_bias,
+            num_heads, dropout_p, attn_mask, key_padding_mask, need_weights, is_causal, batch_first)
+    }
+
     /// Tensor contraction over specified dimensions (generalised matrix multiply).
     ///
     /// `dims` is the number of trailing dimensions of `a` to contract with
