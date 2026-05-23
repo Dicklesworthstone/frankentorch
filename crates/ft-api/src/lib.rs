@@ -13923,6 +13923,15 @@ impl FrankenTorchSession {
         self.tensor_round(input)
     }
 
+    /// Round to given decimal places. Alias for tensor_round_decimals.
+    pub fn functional_round_decimals(
+        &mut self,
+        input: TensorNodeId,
+        decimals: i32,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_round_decimals(input, decimals)
+    }
+
     /// Element-wise truncation. Alias for tensor_trunc.
     pub fn functional_trunc(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         self.tensor_trunc(input)
