@@ -15025,6 +15025,70 @@ impl FrankenTorchSession {
         self.functional_group_norm(input, num_groups, weight, bias, eps)
     }
 
+    /// Local Response Normalization.
+    ///
+    /// Equivalent to `torch.nn.functional.local_response_norm(input, size, alpha, beta, k)`.
+    /// Normalizes over local input regions across channels. Used in AlexNet.
+    pub fn functional_local_response_norm(
+        &mut self,
+        input: TensorNodeId,
+        size: usize,
+        alpha: f64,
+        beta: f64,
+        k: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.len() < 3 {
+            return Err(Self::incompatible_tensor_args(
+                "local_response_norm: input must have at least 3 dimensions",
+            ));
+        }
+        if size == 0 || size % 2 == 0 {
+            return Err(Self::incompatible_tensor_args(
+                "local_response_norm: size must be a positive odd number",
+            ));
+        }
+
+        let data = self.tensor_values(input)?;
+        let channels = shape[1];
+        let spatial: usize = shape[2..].iter().product();
+        let batch_size = shape[0];
+        let half = size / 2;
+
+        let mut out_data = Vec::with_capacity(data.len());
+
+        for b in 0..batch_size {
+            for c in 0..channels {
+                let c_start = c.saturating_sub(half);
+                let c_end = (c + half + 1).min(channels);
+                for s in 0..spatial {
+                    let mut sum_sq = 0.0;
+                    for nc in c_start..c_end {
+                        let idx = b * channels * spatial + nc * spatial + s;
+                        sum_sq += data[idx] * data[idx];
+                    }
+                    let norm = (k + alpha * sum_sq / size as f64).powf(beta);
+                    let idx = b * channels * spatial + c * spatial + s;
+                    out_data.push(data[idx] / norm);
+                }
+            }
+        }
+
+        self.tensor_variable(out_data, shape, false)
+    }
+
+    /// Alias for `functional_local_response_norm`.
+    pub fn tensor_local_response_norm(
+        &mut self,
+        input: TensorNodeId,
+        size: usize,
+        alpha: f64,
+        beta: f64,
+        k: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.functional_local_response_norm(input, size, alpha, beta, k)
+    }
+
     /// Apply group normalization over channel groups.
     pub fn functional_group_norm(
         &mut self,
