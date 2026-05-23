@@ -32181,6 +32181,129 @@ impl FrankenTorchSession {
         self.tensor_variable(degrees, vec![num_nodes], false)
     }
 
+    // ── Gradient Checking Utilities ────────────────────────────────────
+
+    /// Compute numerical gradient using finite differences.
+    ///
+    /// For debugging autograd implementations. Uses central difference:
+    /// grad ~= (f(x+eps) - f(x-eps)) / (2*eps)
+    ///
+    /// Args:
+    /// - input: input tensor
+    /// - idx: linear index of element to perturb
+    /// - eps: perturbation size (default 1e-5)
+    /// - loss_fn: returns scalar output given perturbed input
+    ///
+    /// Returns: numerical gradient at specified index
+    pub fn numerical_gradient<F>(
+        &mut self,
+        input: TensorNodeId,
+        idx: usize,
+        eps: f64,
+        loss_fn: F,
+    ) -> Result<f64, AutogradError>
+    where
+        F: Fn(&mut Self, TensorNodeId) -> Result<f64, AutogradError>,
+    {
+        let data = self.tensor_values(input)?;
+        let shape = self.tensor_shape(input)?;
+        if idx >= data.len() {
+            return Err(Self::incompatible_tensor_args("numerical_gradient: idx out of bounds"));
+        }
+        let mut data_plus = data.clone();
+        data_plus[idx] += eps;
+        let input_plus = self.tensor_variable(data_plus, shape.clone(), false)?;
+        let loss_plus = loss_fn(self, input_plus)?;
+        let mut data_minus = data;
+        data_minus[idx] -= eps;
+        let input_minus = self.tensor_variable(data_minus, shape, false)?;
+        let loss_minus = loss_fn(self, input_minus)?;
+        Ok((loss_plus - loss_minus) / (2.0 * eps))
+    }
+
+    /// Check if two gradient vectors are approximately equal.
+    ///
+    /// Returns maximum absolute and relative errors between gradients.
+    pub fn gradient_check_stats(
+        analytical: &[f64],
+        numerical: &[f64],
+    ) -> (f64, f64) {
+        let mut max_abs_err = 0.0_f64;
+        let mut max_rel_err = 0.0_f64;
+        for (&a, &n) in analytical.iter().zip(numerical.iter()) {
+            let abs_err = (a - n).abs();
+            let rel_err = abs_err / (a.abs().max(n.abs()).max(1e-8));
+            max_abs_err = max_abs_err.max(abs_err);
+            max_rel_err = max_rel_err.max(rel_err);
+        }
+        (max_abs_err, max_rel_err)
+    }
+
+    /// Print tensor statistics for debugging.
+    ///
+    /// Returns: (min, max, mean, std, num_nan, num_inf)
+    pub fn tensor_stats(&self, node: TensorNodeId) -> Result<(f64, f64, f64, f64, usize, usize), AutogradError> {
+        let data = self.tensor_values(node)?;
+        if data.is_empty() {
+            return Ok((f64::NAN, f64::NAN, f64::NAN, f64::NAN, 0, 0));
+        }
+        let mut min = f64::INFINITY;
+        let mut max = f64::NEG_INFINITY;
+        let mut sum = 0.0;
+        let mut num_nan = 0;
+        let mut num_inf = 0;
+        for &v in &data {
+            if v.is_nan() {
+                num_nan += 1;
+            } else if v.is_infinite() {
+                num_inf += 1;
+            } else {
+                min = min.min(v);
+                max = max.max(v);
+                sum += v;
+            }
+        }
+        let n_valid = data.len() - num_nan - num_inf;
+        let mean = if n_valid > 0 { sum / n_valid as f64 } else { f64::NAN };
+        let var: f64 = data.iter()
+            .filter(|v| !v.is_nan() && !v.is_infinite())
+            .map(|&v| (v - mean).powi(2))
+            .sum::<f64>() / n_valid.max(1) as f64;
+        let std = var.sqrt();
+        Ok((min, max, mean, std, num_nan, num_inf))
+    }
+
+    /// Detect gradient anomalies (NaN, Inf, extreme values).
+    ///
+    /// Useful for debugging training instabilities.
+    pub fn detect_gradient_anomaly(&self, params: &[TensorNodeId], threshold: f64) -> Result<Vec<(TensorNodeId, String)>, AutogradError> {
+        let mut anomalies = Vec::new();
+        for &p in params {
+            if let Some(grad) = self.tensor_accumulated_gradient(p)? {
+                let mut has_nan = false;
+                let mut has_inf = false;
+                let mut max_abs = 0.0_f64;
+                for &g in &grad {
+                    if g.is_nan() {
+                        has_nan = true;
+                    } else if g.is_infinite() {
+                        has_inf = true;
+                    } else {
+                        max_abs = max_abs.max(g.abs());
+                    }
+                }
+                if has_nan {
+                    anomalies.push((p, "NaN gradient".to_string()));
+                } else if has_inf {
+                    anomalies.push((p, "Inf gradient".to_string()));
+                } else if max_abs > threshold {
+                    anomalies.push((p, format!("Large gradient: {:.2e}", max_abs)));
+                }
+            }
+        }
+        Ok(anomalies)
+    }
+
     /// ArcFace (Additive Angular Margin) loss for face recognition.
     ///
     /// Given L2-normalized features [N, D] and L2-normalized weight [C, D],
