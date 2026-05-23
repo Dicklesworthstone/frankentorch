@@ -15365,6 +15365,50 @@ impl FrankenTorchSession {
         self.tensor_linalg_det(input)
     }
 
+    /// p-norm of tensor. Alias for tensor_linalg_norm.
+    pub fn functional_linalg_norm(
+        &mut self,
+        input: TensorNodeId,
+        ord: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_norm(input, ord)
+    }
+
+    /// Solve linear system. Alias for tensor_linalg_solve.
+    pub fn functional_linalg_solve(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_solve(a, b)
+    }
+
+    /// SVD decomposition. Alias for tensor_linalg_svd.
+    pub fn functional_linalg_svd(
+        &mut self,
+        input: TensorNodeId,
+        full_matrices: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_svd(input, full_matrices)
+    }
+
+    /// Pseudo-inverse. Alias for tensor_linalg_pinv.
+    pub fn functional_linalg_pinv(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_linalg_pinv(input)
+    }
+
+    /// QR decomposition. Alias for tensor_linalg_qr.
+    pub fn functional_linalg_qr(
+        &mut self,
+        input: TensorNodeId,
+        reduced: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_linalg_qr(input, reduced)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
