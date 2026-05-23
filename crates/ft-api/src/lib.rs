@@ -46617,6 +46617,151 @@ impl FrankenTorchSession {
         }
         self.tensor_variable(result, vec![total_rows, total_cols], false)
     }
+
+    // ── Weight Decay Utilities ────────────────────────────────────────────
+
+    /// Apply L2 weight decay to weights.
+    ///
+    /// Returns weights - weight_decay * weights.
+    pub fn apply_weight_decay(
+        &mut self,
+        weights: TensorNodeId,
+        weight_decay: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let decay = self.full(vec![1], weight_decay, false)?;
+        let penalty = self.tensor_mul(weights, decay)?;
+        self.tensor_sub(weights, penalty)
+    }
+
+    /// Compute L2 regularization term.
+    ///
+    /// Returns sum of squared weights * lambda / 2.
+    pub fn l2_regularization(
+        &mut self,
+        weights: TensorNodeId,
+        lambda: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let sq = self.tensor_mul(weights, weights)?;
+        let sum = self.tensor_sum(sq)?;
+        let half_lambda = self.full(vec![1], lambda / 2.0, false)?;
+        self.tensor_mul(sum, half_lambda)
+    }
+
+    /// Compute L1 regularization term.
+    ///
+    /// Returns sum of absolute weights * lambda.
+    pub fn l1_regularization(
+        &mut self,
+        weights: TensorNodeId,
+        lambda: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let abs = self.tensor_abs(weights)?;
+        let sum = self.tensor_sum(abs)?;
+        let lam = self.full(vec![1], lambda, false)?;
+        self.tensor_mul(sum, lam)
+    }
+
+    // ── Learning Rate Utilities ───────────────────────────────────────────
+
+    /// Compute learning rate with linear warmup.
+    pub fn lr_linear_warmup(
+        current_step: usize,
+        warmup_steps: usize,
+        base_lr: f64,
+    ) -> f64 {
+        if current_step < warmup_steps {
+            base_lr * current_step as f64 / warmup_steps as f64
+        } else {
+            base_lr
+        }
+    }
+
+    /// Compute learning rate with cosine annealing.
+    pub fn lr_cosine_annealing(
+        current_step: usize,
+        total_steps: usize,
+        base_lr: f64,
+        min_lr: f64,
+    ) -> f64 {
+        if current_step >= total_steps {
+            return min_lr;
+        }
+        let progress = current_step as f64 / total_steps as f64;
+        min_lr + (base_lr - min_lr) * (1.0 + (std::f64::consts::PI * progress).cos()) / 2.0
+    }
+
+    /// Compute learning rate with warmup + cosine decay.
+    pub fn lr_warmup_cosine(
+        current_step: usize,
+        warmup_steps: usize,
+        total_steps: usize,
+        base_lr: f64,
+        min_lr: f64,
+    ) -> f64 {
+        if current_step < warmup_steps {
+            Self::lr_linear_warmup(current_step, warmup_steps, base_lr)
+        } else {
+            Self::lr_cosine_annealing(
+                current_step - warmup_steps,
+                total_steps - warmup_steps,
+                base_lr,
+                min_lr,
+            )
+        }
+    }
+
+    // ── Tokenizer Utilities ───────────────────────────────────────────────
+
+    /// Add BOS (Beginning of Sequence) token.
+    pub fn add_bos_token(
+        &mut self,
+        input: TensorNodeId,
+        bos_id: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.is_empty() {
+            return Err(Self::incompatible_tensor_args("add_bos_token: input cannot be scalar"));
+        }
+        let mut bos_shape = shape.clone();
+        bos_shape[shape.len() - 1] = 1;
+        let bos = self.full(bos_shape, bos_id, false)?;
+        self.tensor_cat(&[bos, input], shape.len() - 1)
+    }
+
+    /// Add EOS (End of Sequence) token.
+    pub fn add_eos_token(
+        &mut self,
+        input: TensorNodeId,
+        eos_id: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if shape.is_empty() {
+            return Err(Self::incompatible_tensor_args("add_eos_token: input cannot be scalar"));
+        }
+        let mut eos_shape = shape.clone();
+        eos_shape[shape.len() - 1] = 1;
+        let eos = self.full(eos_shape, eos_id, false)?;
+        self.tensor_cat(&[input, eos], shape.len() - 1)
+    }
+
+    /// Pad sequence to target length.
+    pub fn pad_sequence_to_length(
+        &mut self,
+        input: TensorNodeId,
+        target_length: usize,
+        pad_id: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let current_length = shape[shape.len() - 1];
+        if current_length >= target_length {
+            return Ok(input);
+        }
+        let pad_length = target_length - current_length;
+        let mut pad_shape = shape.clone();
+        pad_shape[shape.len() - 1] = pad_length;
+        let pad = self.full(pad_shape, pad_id, false)?;
+        self.tensor_cat(&[input, pad], shape.len() - 1)
+    }
 }
 
 pub use ft_autograd::{
