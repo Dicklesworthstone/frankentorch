@@ -13696,6 +13696,38 @@ impl FrankenTorchSession {
         self.tensor_bincount(input, weights, minlength)
     }
 
+    /// Clamp values to [min, max] range. Alias for tensor_clamp.
+    pub fn functional_clamp(
+        &mut self,
+        input: TensorNodeId,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_clamp(input, min_val, max_val)
+    }
+
+    /// Linear interpolation between tensors. Alias for tensor_lerp.
+    pub fn functional_lerp(
+        &mut self,
+        start: TensorNodeId,
+        end: TensorNodeId,
+        weight: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lerp(start, end, weight)
+    }
+
+    /// Batched addmm: beta*input + alpha*(batch1 @ batch2). Alias for tensor_baddbmm.
+    pub fn functional_baddbmm(
+        &mut self,
+        input: TensorNodeId,
+        batch1: TensorNodeId,
+        batch2: TensorNodeId,
+        beta: f64,
+        alpha: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_baddbmm(input, batch1, batch2, beta, alpha)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
