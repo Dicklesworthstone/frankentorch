@@ -5738,6 +5738,161 @@ impl FrankenTorchSession {
         Ok((hist, bin_edges))
     }
 
+    /// Compute a multi-dimensional histogram.
+    ///
+    /// Equivalent to `torch.histogramdd`. Input is a 2D tensor where each row is a sample
+    /// and each column is a dimension. Returns histogram counts and list of bin edges per dimension.
+    ///
+    /// `bins` specifies the number of bins per dimension.
+    /// `ranges` specifies (min, max) per dimension (or None for auto-range).
+    pub fn tensor_histogramdd(
+        &mut self,
+        input: TensorNodeId,
+        bins: &[usize],
+        ranges: Option<&[(f64, f64)]>,
+        density: bool,
+    ) -> Result<(TensorNodeId, Vec<TensorNodeId>), AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "histogramdd: autograd not supported (integer counts are non-differentiable)",
+                },
+            )));
+        }
+
+        let shape = self.tensor_shape(input)?;
+        if shape.len() != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "histogramdd: input must be 2D (N samples x D dimensions)",
+                },
+            )));
+        }
+        let n_samples = shape[0];
+        let n_dims = shape[1];
+
+        if bins.len() != n_dims {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "histogramdd: bins length must match number of dimensions",
+                },
+            )));
+        }
+        for &b in bins {
+            if b == 0 {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "histogramdd: all bin counts must be > 0",
+                    },
+                )));
+            }
+        }
+
+        if let Some(r) = ranges {
+            if r.len() != n_dims {
+                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                    ft_dispatch::DispatchKeyError::IncompatibleSet {
+                        reason: "histogramdd: ranges length must match number of dimensions",
+                    },
+                )));
+            }
+        }
+
+        let vals = self.tensor_values(input)?;
+
+        // Compute ranges per dimension
+        let dim_ranges: Vec<(f64, f64)> = if let Some(r) = ranges {
+            r.to_vec()
+        } else {
+            (0..n_dims)
+                .map(|d| {
+                    let mut lo = f64::INFINITY;
+                    let mut hi = f64::NEG_INFINITY;
+                    for s in 0..n_samples {
+                        let v = vals[s * n_dims + d];
+                        if v < lo {
+                            lo = v;
+                        }
+                        if v > hi {
+                            hi = v;
+                        }
+                    }
+                    if lo == hi {
+                        (lo - 0.5, hi + 0.5)
+                    } else {
+                        (lo, hi)
+                    }
+                })
+                .collect()
+        };
+
+        // Compute bin widths per dimension
+        let bin_widths: Vec<f64> = bins
+            .iter()
+            .zip(&dim_ranges)
+            .map(|(&b, &(lo, hi))| (hi - lo) / b as f64)
+            .collect();
+
+        // Initialize histogram counts
+        let total_bins: usize = bins.iter().product();
+        let mut counts = vec![0.0f64; total_bins];
+
+        // Process each sample
+        for s in 0..n_samples {
+            let mut bin_indices = Vec::with_capacity(n_dims);
+            let mut valid = true;
+            for d in 0..n_dims {
+                let v = vals[s * n_dims + d];
+                let (lo, hi) = dim_ranges[d];
+                if v < lo || v > hi {
+                    valid = false;
+                    break;
+                }
+                #[allow(clippy::cast_sign_loss, clippy::cast_possible_truncation)]
+                let raw_bin = ((v - lo) / bin_widths[d]) as usize;
+                let bin = raw_bin.min(bins[d] - 1);
+                bin_indices.push(bin);
+            }
+            if valid {
+                // Convert multi-index to linear index (row-major)
+                let mut linear_idx = 0;
+                let mut stride = 1;
+                for d in (0..n_dims).rev() {
+                    linear_idx += bin_indices[d] * stride;
+                    stride *= bins[d];
+                }
+                counts[linear_idx] += 1.0;
+            }
+        }
+
+        if density {
+            let total: f64 = counts.iter().sum();
+            let cell_volume: f64 = bin_widths.iter().product();
+            let scale = total * cell_volume;
+            if scale > 0.0 {
+                for count in &mut counts {
+                    *count /= scale;
+                }
+            }
+        }
+
+        let hist = self.tensor_variable(counts, bins.to_vec(), false)?;
+
+        // Create bin edge tensors for each dimension
+        let mut edge_tensors = Vec::with_capacity(n_dims);
+        for d in 0..n_dims {
+            let edge_count = bins[d] + 1;
+            let (lo, _) = dim_ranges[d];
+            let edges: Vec<f64> = (0..edge_count)
+                .map(|i| lo + bin_widths[d] * i as f64)
+                .collect();
+            let edge_tensor = self.tensor_variable(edges, vec![edge_count], false)?;
+            edge_tensors.push(edge_tensor);
+        }
+
+        Ok((hist, edge_tensors))
+    }
+
     /// Create a block diagonal matrix from provided 2-D tensors.
     ///
     /// Equivalent to `torch.block_diag(*tensors)`. Each tensor is placed
@@ -18977,6 +19132,17 @@ impl FrankenTorchSession {
         y: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_special_rel_entr(x, y)
+    }
+
+    /// Multi-dimensional histogram. Alias for tensor_histogramdd.
+    pub fn functional_histogramdd(
+        &mut self,
+        input: TensorNodeId,
+        bins: &[usize],
+        ranges: Option<&[(f64, f64)]>,
+        density: bool,
+    ) -> Result<(TensorNodeId, Vec<TensorNodeId>), AutogradError> {
+        self.tensor_histogramdd(input, bins, ranges, density)
     }
 
     pub fn tensor_argmax(
