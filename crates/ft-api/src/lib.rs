@@ -4594,6 +4594,52 @@ impl FrankenTorchSession {
         self.tensor_variable(mask, vec![seq_len, seq_len], false)
     }
 
+    /// Repeat key/value heads to match query heads for Grouped Query Attention.
+    ///
+    /// GQA uses fewer K/V heads than Q heads to reduce memory and compute.
+    /// This function repeats K/V heads to match the number of Q heads.
+    ///
+    /// - `kv`: K or V tensor of shape `[batch, num_kv_heads, seq_len, head_dim]`
+    /// - `num_q_heads`: number of query heads (must be divisible by num_kv_heads)
+    ///
+    /// Returns tensor of shape `[batch, num_q_heads, seq_len, head_dim]`.
+    ///
+    /// Used in LLaMA 2, Mistral, and other modern transformers.
+    pub fn repeat_kv(
+        &mut self,
+        kv: TensorNodeId,
+        num_q_heads: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(kv)?;
+        if shape.len() != 4 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "repeat_kv: input must be 4-D [batch, num_kv_heads, seq_len, head_dim]",
+                },
+            )));
+        }
+        let num_kv_heads = shape[1];
+        if num_q_heads % num_kv_heads != 0 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "repeat_kv: num_q_heads must be divisible by num_kv_heads",
+                },
+            )));
+        }
+        if num_q_heads == num_kv_heads {
+            return Ok(kv);
+        }
+        let n_rep = num_q_heads / num_kv_heads;
+        let batch_size = shape[0];
+        let seq_len = shape[2];
+        let head_dim = shape[3];
+        let expanded = self.tensor_unsqueeze(kv, 2)?;
+        let new_shape = vec![batch_size, num_kv_heads, n_rep, seq_len, head_dim];
+        let tiled = self.tensor_expand(expanded, new_shape.clone())?;
+        let final_shape = vec![batch_size, num_q_heads, seq_len, head_dim];
+        self.tensor_reshape(tiled, final_shape)
+    }
+
     /// Tensor contraction over specified dimensions (generalised matrix multiply).
     ///
     /// `dims` is the number of trailing dimensions of `a` to contract with
