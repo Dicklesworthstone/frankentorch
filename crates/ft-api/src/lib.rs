@@ -30128,6 +30128,84 @@ impl FrankenTorchSession {
         self.tensor_sub(one, iou)
     }
 
+    /// Contrastive loss for siamese networks.
+    ///
+    /// Given pairs of embeddings and a binary label (1=similar, 0=dissimilar):
+    /// `loss = y * d^2 + (1-y) * max(0, margin - d)^2`
+    /// where d = ||x1 - x2||_2 is the Euclidean distance.
+    pub fn contrastive_loss(
+        &mut self,
+        x1: TensorNodeId,
+        x2: TensorNodeId,
+        y: TensorNodeId,
+        margin: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let diff = self.tensor_sub(x1, x2)?;
+        let x1_shape = self.tensor_shape(x1)?;
+        let last_dim = x1_shape.len().saturating_sub(1);
+        let diff_sq = self.tensor_square(diff)?;
+        let dist_sq = self.tensor_sum_dim(diff_sq, last_dim)?;
+        let dist = self.tensor_sqrt(dist_sq)?;
+        let y_shape = self.tensor_shape(y)?;
+        let ones = self.full(y_shape.clone(), 1.0, false)?;
+        let one_minus_y = self.tensor_sub(ones, y)?;
+        let positive_loss = self.tensor_mul(y, dist_sq)?;
+        let margin_tensor = self.full(y_shape, margin, false)?;
+        let margin_diff = self.tensor_sub(margin_tensor, dist)?;
+        let margin_clamped = self.tensor_clamp_min(margin_diff, 0.0)?;
+        let margin_sq = self.tensor_square(margin_clamped)?;
+        let negative_loss = self.tensor_mul(one_minus_y, margin_sq)?;
+        let loss = self.tensor_add(positive_loss, negative_loss)?;
+        self.tensor_mean(loss)
+    }
+
+    /// InfoNCE (NT-Xent) loss for contrastive learning.
+    ///
+    /// Computes the InfoNCE loss used in SimCLR/CLIP:
+    /// For each anchor i, computes -log(exp(sim(i,i+)/tau) / sum_j(exp(sim(i,j)/tau)))
+    /// where i+ is the positive and all j are negatives.
+    ///
+    /// Input: embeddings [N, D] where consecutive pairs are positives.
+    /// Returns mean loss over all anchors.
+    pub fn info_nce_loss(
+        &mut self,
+        embeddings: TensorNodeId,
+        temperature: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(embeddings)?;
+        if shape.len() != 2 {
+            return Err(Self::incompatible_tensor_args(
+                "info_nce_loss: embeddings must be 2D [N, D]",
+            ));
+        }
+        let n = shape[0];
+        if n < 2 || n % 2 != 0 {
+            return Err(Self::incompatible_tensor_args(
+                "info_nce_loss: N must be even and >= 2 (pairs of positives)",
+            ));
+        }
+        let normalized = self.tensor_normalize(embeddings, 2.0, 1, 1e-12)?;
+        let transposed = self.tensor_transpose(normalized, 0, 1)?;
+        let sim_matrix = self.tensor_matmul(normalized, transposed)?;
+        let tau = self.full(vec![1], temperature, false)?;
+        let scaled_sim = self.tensor_div(sim_matrix, tau)?;
+        let n_half = n / 2;
+        let mut losses = Vec::with_capacity(n);
+        for i in 0..n {
+            let positive_idx = if i < n_half { i + n_half } else { i - n_half };
+            let row = self.tensor_narrow(scaled_sim, 0, i, 1)?;
+            let row = self.tensor_squeeze(row, 0)?;
+            let positive_score = self.tensor_narrow(row, 0, positive_idx, 1)?;
+            let exp_row = self.tensor_exp(row)?;
+            let sum_exp = self.tensor_sum(exp_row)?;
+            let log_sum_exp = self.tensor_log(sum_exp)?;
+            let loss_i = self.tensor_sub(log_sum_exp, positive_score)?;
+            losses.push(loss_i);
+        }
+        let stacked = self.tensor_cat(&losses, 0)?;
+        self.tensor_mean(stacked)
+    }
+
     /// Poisson negative log likelihood loss.
     ///
     /// Equivalent to `torch.nn.functional.poisson_nll_loss(input, target, log_input, full, eps)`.
