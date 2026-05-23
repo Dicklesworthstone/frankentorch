@@ -31015,6 +31015,194 @@ impl FrankenTorchSession {
         self.tensor_mean(stacked)
     }
 
+    /// Supervised Contrastive Loss (SupCon).
+    ///
+    /// Unlike InfoNCE which uses only augmentation-based positives,
+    /// SupCon uses class labels to identify all positives within the batch.
+    /// Loss: -sum_i( 1/|P(i)| * sum_{p in P(i)}( log(exp(z_i·z_p/tau) / sum_a(exp(z_i·z_a/tau))) ) )
+    ///
+    /// Args:
+    /// - embeddings: L2-normalized features [N, D]
+    /// - labels: class labels [N]
+    /// - temperature: temperature scaling factor
+    pub fn supcon_loss(
+        &mut self,
+        embeddings: TensorNodeId,
+        labels: TensorNodeId,
+        temperature: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(embeddings)?;
+        if shape.len() != 2 {
+            return Err(Self::incompatible_tensor_args("supcon_loss: embeddings must be [N, D]"));
+        }
+        let n = shape[0];
+        let label_data = self.tensor_values(labels)?;
+        let emb_data = self.tensor_values(embeddings)?;
+        let d = shape[1];
+        let normalized: Vec<f64> = (0..n)
+            .flat_map(|i| {
+                let start = i * d;
+                let end = start + d;
+                let norm: f64 = emb_data[start..end].iter().map(|x| x * x).sum::<f64>().sqrt().max(1e-12);
+                emb_data[start..end].iter().map(move |&x| x / norm)
+            })
+            .collect();
+        let mut sim_matrix = vec![0.0; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut dot = 0.0;
+                for k in 0..d {
+                    dot += normalized[i * d + k] * normalized[j * d + k];
+                }
+                sim_matrix[i * n + j] = dot / temperature;
+            }
+        }
+        let mut total_loss = 0.0;
+        let mut count = 0;
+        for i in 0..n {
+            let label_i = label_data[i] as i64;
+            let positives: Vec<usize> = (0..n)
+                .filter(|&j| j != i && label_data[j] as i64 == label_i)
+                .collect();
+            if positives.is_empty() {
+                continue;
+            }
+            let max_sim = sim_matrix[i * n..(i + 1) * n]
+                .iter()
+                .cloned()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let exp_sum: f64 = (0..n)
+                .filter(|&j| j != i)
+                .map(|j| (sim_matrix[i * n + j] - max_sim).exp())
+                .sum();
+            let log_denom = max_sim + exp_sum.ln();
+            let mut pos_loss = 0.0;
+            for &p in &positives {
+                pos_loss += sim_matrix[i * n + p] - log_denom;
+            }
+            total_loss -= pos_loss / positives.len() as f64;
+            count += 1;
+        }
+        let mean_loss = if count > 0 { total_loss / count as f64 } else { 0.0 };
+        self.tensor_variable(vec![mean_loss], vec![1], false)
+    }
+
+    /// Barlow Twins loss for self-supervised learning.
+    ///
+    /// Encourages embeddings of augmented views to be similar while
+    /// decorrelating feature dimensions. Loss = sum((C - I)^2) where
+    /// C is the cross-correlation matrix and I is identity.
+    ///
+    /// Args:
+    /// - z1, z2: embeddings of two augmented views [N, D]
+    /// - lambda_coeff: weight for off-diagonal terms (default 0.005)
+    pub fn barlow_twins_loss(
+        &mut self,
+        z1: TensorNodeId,
+        z2: TensorNodeId,
+        lambda_coeff: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape1 = self.tensor_shape(z1)?;
+        let shape2 = self.tensor_shape(z2)?;
+        if shape1 != shape2 || shape1.len() != 2 {
+            return Err(Self::incompatible_tensor_args(
+                "barlow_twins_loss: z1 and z2 must have same shape [N, D]",
+            ));
+        }
+        let (n, d) = (shape1[0], shape1[1]);
+        let mean1 = self.tensor_mean_dim(z1, 0)?;
+        let mean2 = self.tensor_mean_dim(z2, 0)?;
+        let z1_centered = self.tensor_sub(z1, mean1)?;
+        let z2_centered = self.tensor_sub(z2, mean2)?;
+        let std1 = self.tensor_std_dim(z1_centered, 0, 1)?;
+        let std2 = self.tensor_std_dim(z2_centered, 0, 1)?;
+        let eps = self.full(vec![d], 1e-6, false)?;
+        let std1_safe = self.tensor_add(std1, eps)?;
+        let std2_safe = self.tensor_add(std2, eps)?;
+        let z1_norm = self.tensor_div(z1_centered, std1_safe)?;
+        let z2_norm = self.tensor_div(z2_centered, std2_safe)?;
+        let z1_t = self.tensor_transpose(z1_norm, 0, 1)?;
+        let cross_corr = self.tensor_matmul(z1_t, z2_norm)?;
+        let scale = self.full(vec![d, d], 1.0 / n as f64, false)?;
+        let cross_corr = self.tensor_mul(cross_corr, scale)?;
+        let mut loss_diag = 0.0;
+        let mut loss_off = 0.0;
+        let cc_data = self.tensor_values(cross_corr)?;
+        for i in 0..d {
+            for j in 0..d {
+                let val = cc_data[i * d + j];
+                if i == j {
+                    loss_diag += (1.0 - val).powi(2);
+                } else {
+                    loss_off += val.powi(2);
+                }
+            }
+        }
+        let total_loss = loss_diag + lambda_coeff * loss_off;
+        self.tensor_variable(vec![total_loss], vec![1], false)
+    }
+
+    /// VICReg (Variance-Invariance-Covariance Regularization) loss.
+    ///
+    /// Three-term loss for self-supervised learning:
+    /// - Invariance: MSE between representations of augmented views
+    /// - Variance: hinge loss to keep std > 1
+    /// - Covariance: decorrelation of feature dimensions
+    ///
+    /// Args:
+    /// - z1, z2: embeddings of two views [N, D]
+    /// - sim_coeff, std_coeff, cov_coeff: loss term weights
+    pub fn vicreg_loss(
+        &mut self,
+        z1: TensorNodeId,
+        z2: TensorNodeId,
+        sim_coeff: f64,
+        std_coeff: f64,
+        cov_coeff: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape1 = self.tensor_shape(z1)?;
+        let shape2 = self.tensor_shape(z2)?;
+        if shape1 != shape2 || shape1.len() != 2 {
+            return Err(Self::incompatible_tensor_args("vicreg_loss: z1 and z2 must have same shape [N, D]"));
+        }
+        let (n, d) = (shape1[0], shape1[1]);
+        let diff = self.tensor_sub(z1, z2)?;
+        let diff_sq = self.tensor_mul(diff, diff)?;
+        let sim_loss = self.tensor_mean(diff_sq)?;
+        let mean1 = self.tensor_mean_dim(z1, 0)?;
+        let mean2 = self.tensor_mean_dim(z2, 0)?;
+        let z1_c = self.tensor_sub(z1, mean1)?;
+        let z2_c = self.tensor_sub(z2, mean2)?;
+        let std1 = self.tensor_std_dim(z1_c, 0, 1)?;
+        let std2 = self.tensor_std_dim(z2_c, 0, 1)?;
+        let std_data1 = self.tensor_values(std1)?;
+        let std_data2 = self.tensor_values(std2)?;
+        let var_loss: f64 = std_data1.iter().chain(std_data2.iter())
+            .map(|&s| (1.0 - s).max(0.0).powi(2))
+            .sum::<f64>() / (2.0 * d as f64);
+        let z1_t = self.tensor_transpose(z1_c, 0, 1)?;
+        let z2_t = self.tensor_transpose(z2_c, 0, 1)?;
+        let cov1 = self.tensor_matmul(z1_t, z1_c)?;
+        let cov2 = self.tensor_matmul(z2_t, z2_c)?;
+        let scale = self.full(vec![d, d], 1.0 / (n - 1).max(1) as f64, false)?;
+        let cov1 = self.tensor_mul(cov1, scale)?;
+        let cov2 = self.tensor_mul(cov2, scale)?;
+        let cov1_data = self.tensor_values(cov1)?;
+        let cov2_data = self.tensor_values(cov2)?;
+        let mut cov_loss = 0.0;
+        for i in 0..d {
+            for j in 0..d {
+                if i != j {
+                    cov_loss += cov1_data[i * d + j].powi(2) + cov2_data[i * d + j].powi(2);
+                }
+            }
+        }
+        cov_loss /= d as f64;
+        let sim_val = self.tensor_values(sim_loss)?[0];
+        let total = sim_coeff * sim_val + std_coeff * var_loss + cov_coeff * cov_loss;
+        self.tensor_variable(vec![total], vec![1], false)
+    }
+
     /// ArcFace (Additive Angular Margin) loss for face recognition.
     ///
     /// Given L2-normalized features [N, D] and L2-normalized weight [C, D],
