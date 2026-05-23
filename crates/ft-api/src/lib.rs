@@ -14512,6 +14512,58 @@ impl FrankenTorchSession {
         self.tensor_adjoint(input)
     }
 
+    /// Search sorted sequence. Alias for tensor_searchsorted.
+    pub fn functional_searchsorted(
+        &mut self,
+        sorted_sequence: TensorNodeId,
+        values: TensorNodeId,
+        right: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_searchsorted(sorted_sequence, values, right)
+    }
+
+    /// Map values to bucket indices. Alias for tensor_bucketize.
+    pub fn functional_bucketize(
+        &mut self,
+        input: TensorNodeId,
+        boundaries: TensorNodeId,
+        right: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_bucketize(input, boundaries, right)
+    }
+
+    /// Histogram with fixed bins. Alias for tensor_histc.
+    pub fn functional_histc(
+        &mut self,
+        input: TensorNodeId,
+        bins: usize,
+        min_val: f64,
+        max_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_histc(input, bins, min_val, max_val)
+    }
+
+    /// Full histogram with bin edges. Alias for tensor_histogram.
+    pub fn functional_histogram(
+        &mut self,
+        input: TensorNodeId,
+        bins: usize,
+        min_val: f64,
+        max_val: f64,
+        weight: Option<TensorNodeId>,
+        density: bool,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_histogram(input, bins, min_val, max_val, weight, density)
+    }
+
+    /// Count non-zero elements. Alias for tensor_count_nonzero.
+    pub fn functional_count_nonzero(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_count_nonzero(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
