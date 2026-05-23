@@ -31470,6 +31470,254 @@ impl FrankenTorchSession {
         self.tensor_variable(output, out_shape, false)
     }
 
+    // ── Image Augmentation Operations ──────────────────────────────────
+
+    /// Cutout augmentation: randomly mask out square regions.
+    ///
+    /// Sets random square patches to zero. Improves model robustness
+    /// by forcing reliance on multiple features.
+    ///
+    /// Args:
+    /// - images: [B, C, H, W] input images
+    /// - num_holes: number of patches to cut out
+    /// - hole_size: size of each square hole
+    pub fn cutout(
+        &mut self,
+        images: TensorNodeId,
+        num_holes: usize,
+        hole_size: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(images)?;
+        if shape.len() != 4 {
+            return Err(Self::incompatible_tensor_args("cutout: images must be [B, C, H, W]"));
+        }
+        let (b, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let mut data = self.tensor_values(images)?;
+        for bi in 0..b {
+            for _ in 0..num_holes {
+                let cy = self.rng.next_u64() as usize % h;
+                let cx = self.rng.next_u64() as usize % w;
+                let y1 = cy.saturating_sub(hole_size / 2);
+                let y2 = (cy + hole_size / 2 + 1).min(h);
+                let x1 = cx.saturating_sub(hole_size / 2);
+                let x2 = (cx + hole_size / 2 + 1).min(w);
+                for ci in 0..c {
+                    for yi in y1..y2 {
+                        for xi in x1..x2 {
+                            data[bi * c * h * w + ci * h * w + yi * w + xi] = 0.0;
+                        }
+                    }
+                }
+            }
+        }
+        self.tensor_variable(data, shape, false)
+    }
+
+    /// Random erasing augmentation.
+    ///
+    /// Like cutout but with random aspect ratio and fills with random values.
+    ///
+    /// Args:
+    /// - images: [B, C, H, W] input images
+    /// - p: probability of applying erasing
+    /// - scale: (min, max) fraction of image area to erase
+    /// - ratio: (min, max) aspect ratio of erased region
+    pub fn random_erasing(
+        &mut self,
+        images: TensorNodeId,
+        p: f64,
+        scale: (f64, f64),
+        ratio: (f64, f64),
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(images)?;
+        if shape.len() != 4 {
+            return Err(Self::incompatible_tensor_args(
+                "random_erasing: images must be [B, C, H, W]",
+            ));
+        }
+        let (b, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let area = (h * w) as f64;
+        let mut data = self.tensor_values(images)?;
+        for bi in 0..b {
+            if self.rng.next_f64() >= p {
+                continue;
+            }
+            for _ in 0..10 {
+                let target_area = area * (scale.0 + self.rng.next_f64() * (scale.1 - scale.0));
+                let aspect = ratio.0 * (ratio.1 / ratio.0).powf(self.rng.next_f64());
+                let rh = (target_area / aspect).sqrt() as usize;
+                let rw = (target_area * aspect).sqrt() as usize;
+                if rh < h && rw < w {
+                    let y = self.rng.next_u64() as usize % (h - rh);
+                    let x = self.rng.next_u64() as usize % (w - rw);
+                    for ci in 0..c {
+                        for yi in y..y + rh {
+                            for xi in x..x + rw {
+                                data[bi * c * h * w + ci * h * w + yi * w + xi] = self.rng.next_f64();
+                            }
+                        }
+                    }
+                    break;
+                }
+            }
+        }
+        self.tensor_variable(data, shape, false)
+    }
+
+    /// Random crop and resize.
+    ///
+    /// Crops a random region and resizes to target size.
+    /// Standard augmentation for image classification.
+    ///
+    /// Args:
+    /// - images: [B, C, H, W] input images
+    /// - output_size: (target_h, target_w)
+    /// - scale: (min, max) fraction of area to crop
+    /// - ratio: (min, max) aspect ratio of crop
+    pub fn random_resized_crop(
+        &mut self,
+        images: TensorNodeId,
+        output_size: (usize, usize),
+        scale: (f64, f64),
+        ratio: (f64, f64),
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(images)?;
+        if shape.len() != 4 {
+            return Err(Self::incompatible_tensor_args(
+                "random_resized_crop: images must be [B, C, H, W]",
+            ));
+        }
+        let (b, c, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let (out_h, out_w) = output_size;
+        let area = (h * w) as f64;
+        let data = self.tensor_values(images)?;
+        let mut output = vec![0.0; b * c * out_h * out_w];
+        for bi in 0..b {
+            let (crop_y, crop_x, crop_h, crop_w) = {
+                let mut found = None;
+                for _ in 0..10 {
+                    let target_area = area * (scale.0 + self.rng.next_f64() * (scale.1 - scale.0));
+                    let aspect = (ratio.0.ln() + self.rng.next_f64() * (ratio.1.ln() - ratio.0.ln())).exp();
+                    let ch = (target_area / aspect).sqrt() as usize;
+                    let cw = (target_area * aspect).sqrt() as usize;
+                    if ch > 0 && cw > 0 && ch <= h && cw <= w {
+                        let y = self.rng.next_u64() as usize % (h - ch + 1);
+                        let x = self.rng.next_u64() as usize % (w - cw + 1);
+                        found = Some((y, x, ch, cw));
+                        break;
+                    }
+                }
+                found.unwrap_or_else(|| {
+                    let min_dim = h.min(w);
+                    let offset_h = (h - min_dim) / 2;
+                    let offset_w = (w - min_dim) / 2;
+                    (offset_h, offset_w, min_dim, min_dim)
+                })
+            };
+            for ci in 0..c {
+                for oy in 0..out_h {
+                    for ox in 0..out_w {
+                        let sy = crop_y as f64 + (oy as f64 + 0.5) * crop_h as f64 / out_h as f64;
+                        let sx = crop_x as f64 + (ox as f64 + 0.5) * crop_w as f64 / out_w as f64;
+                        let iy = (sy as usize).min(h - 1);
+                        let ix = (sx as usize).min(w - 1);
+                        output[bi * c * out_h * out_w + ci * out_h * out_w + oy * out_w + ox] =
+                            data[bi * c * h * w + ci * h * w + iy * w + ix];
+                    }
+                }
+            }
+        }
+        self.tensor_variable(output, vec![b, c, out_h, out_w], false)
+    }
+
+    /// Color jitter augmentation.
+    ///
+    /// Randomly adjusts brightness, contrast, saturation, and hue.
+    ///
+    /// Args:
+    /// - images: [B, C, H, W] RGB images (C must be 3)
+    /// - brightness: max brightness adjustment factor
+    /// - contrast: max contrast adjustment factor
+    /// - saturation: max saturation adjustment factor
+    /// - hue: max hue shift (fraction of full rotation)
+    pub fn color_jitter(
+        &mut self,
+        images: TensorNodeId,
+        brightness: f64,
+        contrast: f64,
+        saturation: f64,
+        hue: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(images)?;
+        if shape.len() != 4 || shape[1] != 3 {
+            return Err(Self::incompatible_tensor_args(
+                "color_jitter: images must be [B, 3, H, W]",
+            ));
+        }
+        let (b, _, h, w) = (shape[0], shape[1], shape[2], shape[3]);
+        let mut data = self.tensor_values(images)?;
+        for bi in 0..b {
+            let b_factor = 1.0 + (self.rng.next_f64() * 2.0 - 1.0) * brightness;
+            let c_factor = 1.0 + (self.rng.next_f64() * 2.0 - 1.0) * contrast;
+            let s_factor = 1.0 + (self.rng.next_f64() * 2.0 - 1.0) * saturation;
+            let h_shift = (self.rng.next_f64() * 2.0 - 1.0) * hue;
+            let base = bi * 3 * h * w;
+            for yi in 0..h {
+                for xi in 0..w {
+                    let idx_r = base + yi * w + xi;
+                    let idx_g = base + h * w + yi * w + xi;
+                    let idx_b = base + 2 * h * w + yi * w + xi;
+                    let (mut r, mut g, mut b_val) = (data[idx_r], data[idx_g], data[idx_b]);
+                    r *= b_factor;
+                    g *= b_factor;
+                    b_val *= b_factor;
+                    let gray = 0.299 * r + 0.587 * g + 0.114 * b_val;
+                    r = gray + (r - gray) * c_factor;
+                    g = gray + (g - gray) * c_factor;
+                    b_val = gray + (b_val - gray) * c_factor;
+                    r = gray + (r - gray) * s_factor;
+                    g = gray + (g - gray) * s_factor;
+                    b_val = gray + (b_val - gray) * s_factor;
+                    if h_shift.abs() > 1e-6 {
+                        let max_c = r.max(g).max(b_val);
+                        let min_c = r.min(g).min(b_val);
+                        let chroma = max_c - min_c;
+                        if chroma > 1e-6 {
+                            let mut hue_angle = if (max_c - r).abs() < 1e-6 {
+                                ((g - b_val) / chroma) % 6.0
+                            } else if (max_c - g).abs() < 1e-6 {
+                                (b_val - r) / chroma + 2.0
+                            } else {
+                                (r - g) / chroma + 4.0
+                            };
+                            hue_angle = (hue_angle + h_shift * 6.0) % 6.0;
+                            if hue_angle < 0.0 {
+                                hue_angle += 6.0;
+                            }
+                            let x = chroma * (1.0 - ((hue_angle % 2.0) - 1.0).abs());
+                            let (r1, g1, b1) = match hue_angle as usize {
+                                0 => (chroma, x, 0.0),
+                                1 => (x, chroma, 0.0),
+                                2 => (0.0, chroma, x),
+                                3 => (0.0, x, chroma),
+                                4 => (x, 0.0, chroma),
+                                _ => (chroma, 0.0, x),
+                            };
+                            let m = min_c;
+                            r = r1 + m;
+                            g = g1 + m;
+                            b_val = b1 + m;
+                        }
+                    }
+                    data[idx_r] = r.clamp(0.0, 1.0);
+                    data[idx_g] = g.clamp(0.0, 1.0);
+                    data[idx_b] = b_val.clamp(0.0, 1.0);
+                }
+            }
+        }
+        self.tensor_variable(data, shape, false)
+    }
+
     /// ArcFace (Additive Angular Margin) loss for face recognition.
     ///
     /// Given L2-normalized features [N, D] and L2-normalized weight [C, D],
