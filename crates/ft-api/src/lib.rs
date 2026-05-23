@@ -54366,6 +54366,54 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_argwhere(input)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Mathematical function utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Element-wise sigmoid (expit): 1 / (1 + exp(-x)).
+    pub fn expit_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_expit(input)
+    }
+
+    /// Round towards zero (truncate fractional part).
+    pub fn fix_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_fix(input)
+    }
+
+    /// Natural log of gamma function.
+    pub fn gammaln_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gammaln(input)
+    }
+
+    /// Decompose floating point into mantissa and exponent.
+    pub fn frexp_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_frexp(input)
+    }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Type checking utilities
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Check if tensor has complex dtype.
+    pub fn is_complex_tensor(
+        &self,
+        node: TensorNodeId,
+    ) -> Result<bool, AutogradError> {
+        self.tensor_is_complex(node)
+    }
 }
 
 pub use ft_autograd::{
