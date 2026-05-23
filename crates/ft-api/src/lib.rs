@@ -14713,6 +14713,32 @@ impl FrankenTorchSession {
         self.tensor_unfold_copy(input, dimension, size, step)
     }
 
+    /// Remove consecutive duplicates. Alias for tensor_unique_consecutive.
+    pub fn functional_unique_consecutive(
+        &mut self,
+        input: TensorNodeId,
+        return_inverse: bool,
+        return_counts: bool,
+    ) -> Result<(TensorNodeId, Option<TensorNodeId>, Option<TensorNodeId>), AutogradError> {
+        self.tensor_unique_consecutive(input, return_inverse, return_counts)
+    }
+
+    /// Covariance matrix. Alias for tensor_cov.
+    pub fn functional_cov(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_cov(input)
+    }
+
+    /// Correlation coefficients. Alias for tensor_corrcoef.
+    pub fn functional_corrcoef(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_corrcoef(input)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
