@@ -15078,6 +15078,24 @@ impl FrankenTorchSession {
         self.tensor_trigamma(input)
     }
 
+    /// Regularized lower incomplete gamma function. Alias for tensor_igamma.
+    pub fn functional_igamma(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_igamma(input, other)
+    }
+
+    /// Regularized upper incomplete gamma function. Alias for tensor_igammac.
+    pub fn functional_igammac(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_igammac(input, other)
+    }
+
     /// Psi function (digamma alias). Alias for tensor_psi.
     pub fn functional_psi(
         &mut self,
@@ -30126,6 +30144,110 @@ impl FrankenTorchSession {
         Ok(())
     }
 
+    /// Regularized lower incomplete gamma function P(a, x).
+    ///
+    /// Equivalent to `torch.special.gammainc(input, other)`.
+    /// Computes the regularized lower incomplete gamma function.
+    pub fn tensor_igamma(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let other_shape = self.tensor_shape(other)?;
+        if input_shape != other_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: input_shape,
+                    rhs: other_shape,
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &x)| igamma_approx(a, x))
+            .collect();
+        self.tensor_variable(result, input_shape, false)
+    }
+
+    /// Alias for tensor_igamma matching torch.special.gammainc.
+    pub fn tensor_special_gammainc(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_igamma(input, other)
+    }
+
+    /// In-place igamma.
+    pub fn tensor_igamma_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_igamma(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("igamma_", target, None);
+        Ok(())
+    }
+
+    /// Regularized upper incomplete gamma function Q(a, x) = 1 - P(a, x).
+    ///
+    /// Equivalent to `torch.special.gammaincc(input, other)`.
+    /// Computes the regularized upper incomplete gamma function.
+    pub fn tensor_igammac(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let input_shape = self.tensor_shape(input)?;
+        let other_shape = self.tensor_shape(other)?;
+        if input_shape != other_shape {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
+                ft_kernel_cpu::KernelError::ShapeMismatch {
+                    lhs: input_shape,
+                    rhs: other_shape,
+                },
+            )));
+        }
+        let input_vals = self.tensor_values(input)?;
+        let other_vals = self.tensor_values(other)?;
+        let result: Vec<f64> = input_vals
+            .iter()
+            .zip(other_vals.iter())
+            .map(|(&a, &x)| igammac_approx(a, x))
+            .collect();
+        self.tensor_variable(result, input_shape, false)
+    }
+
+    /// Alias for tensor_igammac matching torch.special.gammaincc.
+    pub fn tensor_special_gammaincc(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_igammac(input, other)
+    }
+
+    /// In-place igammac.
+    pub fn tensor_igammac_(
+        &mut self,
+        target: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<(), AutogradError> {
+        self.validate_tensor_in_place_target(target)?;
+        let result = self.tensor_igammac(target, other)?;
+        let result_vals = self.tensor_values(result)?;
+        self.update_tensor_values_for_float(target, result_vals, INPLACE_FLOAT_REASON)?;
+        self.record_tensor_in_place_operation("igammac_", target, None);
+        Ok(())
+    }
+
     /// Modified Bessel function of the first kind, order 0.
     ///
     /// Equivalent to `torch.special.i0(input)`.
@@ -35846,6 +35968,105 @@ fn polygamma_approx(n: u32, mut x: f64) -> f64 {
             - factorial * np1 * (n_f + 2.0) / (120.0 * xn3));
 
     result
+}
+
+/// Regularized lower incomplete gamma function P(a, x) = γ(a, x) / Γ(a).
+///
+/// Uses series expansion for small x and continued fraction for large x.
+fn igamma_approx(a: f64, x: f64) -> f64 {
+    if x.is_nan() || a.is_nan() {
+        return f64::NAN;
+    }
+    if x < 0.0 || a <= 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 0.0;
+    }
+    // Use series expansion when x < a + 1
+    if x < a + 1.0 {
+        igamma_series(a, x)
+    } else {
+        // Use continued fraction via Q and compute P = 1 - Q
+        1.0 - igammac_cf(a, x)
+    }
+}
+
+/// Regularized upper incomplete gamma function Q(a, x) = Γ(a, x) / Γ(a) = 1 - P(a, x).
+fn igammac_approx(a: f64, x: f64) -> f64 {
+    if x.is_nan() || a.is_nan() {
+        return f64::NAN;
+    }
+    if x < 0.0 || a <= 0.0 {
+        return f64::NAN;
+    }
+    if x == 0.0 {
+        return 1.0;
+    }
+    if x < a + 1.0 {
+        1.0 - igamma_series(a, x)
+    } else {
+        igammac_cf(a, x)
+    }
+}
+
+/// Series expansion for igamma when x < a + 1.
+fn igamma_series(a: f64, x: f64) -> f64 {
+    let max_iter = 200;
+    let eps = 1e-15;
+    let ln_gamma_a = lgamma_approx(a);
+    let mut sum = 1.0 / a;
+    let mut term = sum;
+    for n in 1..max_iter {
+        term *= x / (a + n as f64);
+        sum += term;
+        if term.abs() < eps * sum.abs() {
+            break;
+        }
+    }
+    let log_result = a * x.ln() - x + sum.ln() - ln_gamma_a;
+    if log_result < -700.0 {
+        0.0
+    } else {
+        log_result.exp()
+    }
+}
+
+/// Continued fraction for igammac when x >= a + 1.
+fn igammac_cf(a: f64, x: f64) -> f64 {
+    let max_iter = 200;
+    let eps = 1e-15;
+    let tiny = 1e-30;
+    let ln_gamma_a = lgamma_approx(a);
+    // Modified Lentz's algorithm
+    let mut b = x + 1.0 - a;
+    let mut c = 1.0 / tiny;
+    let mut d = 1.0 / b;
+    let mut h = d;
+    for n in 1..max_iter {
+        let an = -(n as f64) * (n as f64 - a);
+        b += 2.0;
+        d = an * d + b;
+        if d.abs() < tiny {
+            d = tiny;
+        }
+        c = b + an / c;
+        if c.abs() < tiny {
+            c = tiny;
+        }
+        d = 1.0 / d;
+        let delta = d * c;
+        h *= delta;
+        if (delta - 1.0).abs() < eps {
+            break;
+        }
+    }
+    let log_result = a * x.ln() - x - ln_gamma_a + h.ln();
+    if log_result < -700.0 {
+        0.0
+    } else {
+        log_result.exp()
+    }
 }
 
 /// Scaled complementary error function: erfcx(x) = exp(x²) * erfc(x).
