@@ -45920,6 +45920,163 @@ impl FrankenTorchSession {
         let x2_t = self.tensor_transpose(x2_norm, 0, 1)?;
         self.tensor_matmul(x1_norm, x2_t)
     }
+
+    // ── Tensor Statistics ─────────────────────────────────────────────────
+
+    /// Exponential moving average update.
+    ///
+    /// Returns updated = decay * current + (1 - decay) * new_value.
+    pub fn ema_update(
+        &mut self,
+        current: TensorNodeId,
+        new_value: TensorNodeId,
+        decay: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let decay_tensor = self.full(vec![1], decay, false)?;
+        let one_minus_decay = self.full(vec![1], 1.0 - decay, false)?;
+        let scaled_current = self.tensor_mul(current, decay_tensor)?;
+        let scaled_new = self.tensor_mul(new_value, one_minus_decay)?;
+        self.tensor_add(scaled_current, scaled_new)
+    }
+
+    /// Running mean update for batch normalization.
+    ///
+    /// Returns updated = momentum * current + (1 - momentum) * batch_mean.
+    pub fn running_mean_update(
+        &mut self,
+        running_mean: TensorNodeId,
+        batch_mean: TensorNodeId,
+        momentum: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.ema_update(running_mean, batch_mean, momentum)
+    }
+
+    /// Running variance update for batch normalization.
+    pub fn running_var_update(
+        &mut self,
+        running_var: TensorNodeId,
+        batch_var: TensorNodeId,
+        momentum: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.ema_update(running_var, batch_var, momentum)
+    }
+
+    /// Compute batch mean and variance for normalization.
+    ///
+    /// Returns (mean, var) for input [N, ...].
+    pub fn batch_stats(
+        &mut self,
+        x: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let mean = self.tensor_mean_dim(x, 0)?;
+        let var = self.tensor_var_dim(x, 0, 0)?;
+        Ok((mean, var))
+    }
+
+    // ── Tensor Creation Shortcuts ─────────────────────────────────────────
+
+    /// Create diagonal matrix from 1D tensor.
+    pub fn diag_embed(
+        &mut self,
+        input: TensorNodeId,
+        offset: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(input)?;
+        let n = vals.len();
+        let size = n + offset.unsigned_abs() as usize;
+        let mut data = vec![0.0_f64; size * size];
+        for (i, &v) in vals.iter().enumerate() {
+            let row = if offset >= 0 { i } else { i + offset.unsigned_abs() as usize };
+            let col = if offset >= 0 { i + offset as usize } else { i };
+            if row < size && col < size {
+                data[row * size + col] = v;
+            }
+        }
+        self.tensor_variable(data, vec![size, size], false)
+    }
+
+    /// Create triangular matrix (lower or upper).
+    pub fn tri(
+        &mut self,
+        n: usize,
+        m: usize,
+        k: i64,
+        requires_grad: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let mut data = vec![0.0_f64; n * m];
+        for i in 0..n {
+            for j in 0..m {
+                if (j as i64) <= (i as i64) + k {
+                    data[i * m + j] = 1.0;
+                }
+            }
+        }
+        self.tensor_variable(data, vec![n, m], requires_grad)
+    }
+
+    /// Create Toeplitz matrix from first row and column.
+    pub fn toeplitz(
+        &mut self,
+        c: TensorNodeId,
+        r: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let c_vals = self.tensor_values(c)?;
+        let r_vals = self.tensor_values(r)?;
+        let n = c_vals.len();
+        let m = r_vals.len();
+        let mut data = vec![0.0_f64; n * m];
+        for i in 0..n {
+            for j in 0..m {
+                if i <= j {
+                    data[i * m + j] = r_vals[j - i];
+                } else {
+                    data[i * m + j] = c_vals[i - j];
+                }
+            }
+        }
+        self.tensor_variable(data, vec![n, m], false)
+    }
+
+    // ── Debugging Utilities ───────────────────────────────────────────────
+
+    /// Check if tensor contains NaN values.
+    pub fn has_nan(&self, x: TensorNodeId) -> Result<bool, AutogradError> {
+        let vals = self.tensor_values(x)?;
+        Ok(vals.iter().any(|v| v.is_nan()))
+    }
+
+    /// Check if tensor contains Inf values.
+    pub fn has_inf(&self, x: TensorNodeId) -> Result<bool, AutogradError> {
+        let vals = self.tensor_values(x)?;
+        Ok(vals.iter().any(|v| v.is_infinite()))
+    }
+
+    /// Replace NaN values with a specified value.
+    pub fn nan_to_num(
+        &mut self,
+        x: TensorNodeId,
+        nan_val: f64,
+        posinf_val: f64,
+        neginf_val: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let vals = self.tensor_values(x)?;
+        let shape = self.tensor_shape(x)?;
+        let new_vals: Vec<f64> = vals
+            .iter()
+            .map(|&v| {
+                if v.is_nan() {
+                    nan_val
+                } else if v == f64::INFINITY {
+                    posinf_val
+                } else if v == f64::NEG_INFINITY {
+                    neginf_val
+                } else {
+                    v
+                }
+            })
+            .collect();
+        self.tensor_variable(new_vals, shape, false)
+    }
 }
 
 pub use ft_autograd::{
