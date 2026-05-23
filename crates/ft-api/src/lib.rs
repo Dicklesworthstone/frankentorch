@@ -13548,6 +13548,93 @@ impl FrankenTorchSession {
         self.tensor_repeat(input, repeats)
     }
 
+    /// Select indices along dimension. Alias for tensor_index_select.
+    pub fn functional_index_select(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        indices: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_index_select(input, dim, indices)
+    }
+
+    /// Gather elements along dimension. Alias for tensor_gather.
+    pub fn functional_gather(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_gather(input, dim, index)
+    }
+
+    /// Scatter src into input at indices. Alias for tensor_scatter.
+    pub fn functional_scatter(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+        src: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_scatter(input, dim, index, src)
+    }
+
+    /// Scatter add src into input at indices. Alias for tensor_scatter_add.
+    pub fn functional_scatter_add(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        index: TensorNodeId,
+        src: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_scatter_add(input, dim, index, src)
+    }
+
+    /// Fill masked positions with value. Alias for tensor_masked_fill.
+    pub fn functional_masked_fill(
+        &mut self,
+        input: TensorNodeId,
+        mask: TensorNodeId,
+        value: f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_masked_fill(input, mask, value)
+    }
+
+    /// Select elements based on condition. Alias for tensor_where.
+    pub fn functional_where(
+        &mut self,
+        condition: TensorNodeId,
+        x: TensorNodeId,
+        y: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_where(condition, x, y)
+    }
+
+    /// Select elements where mask is true. Alias for tensor_masked_select.
+    pub fn functional_masked_select(
+        &mut self,
+        input: TensorNodeId,
+        mask: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_masked_select(input, mask)
+    }
+
+    /// Create coordinate grids from 1D inputs. Alias for tensor_meshgrid.
+    pub fn functional_meshgrid(
+        &mut self,
+        inputs: &[TensorNodeId],
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        self.tensor_meshgrid(inputs)
+    }
+
+    /// Broadcast tensors to common shape. Alias for tensor_broadcast_tensors.
+    pub fn functional_broadcast_tensors(
+        &mut self,
+        tensors: &[TensorNodeId],
+    ) -> Result<Vec<TensorNodeId>, AutogradError> {
+        self.tensor_broadcast_tensors(tensors)
+    }
+
     pub fn tensor_argmax(
         &mut self,
         input: TensorNodeId,
