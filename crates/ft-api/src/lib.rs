@@ -65620,6 +65620,136 @@ mod tests {
         assert!(grad[0].is_infinite() || grad[0].is_nan());
     }
 
+    // ---- property/differential tests ----
+
+    #[test]
+    fn property_eig_identity_eigenvalues_are_one() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let identity = session.tensor_eye(3, None, false).expect("eye");
+        let (evals, _evecs) = session.tensor_linalg_eig(identity).expect("eig");
+        let vals = session.tensor_values(evals).expect("vals");
+        // 3 eigenvalues, each (real, imag) = (1.0, 0.0)
+        for i in 0..3 {
+            assert!((vals[2 * i] - 1.0).abs() < 1e-10, "real part should be 1");
+            assert!(vals[2 * i + 1].abs() < 1e-10, "imag part should be 0");
+        }
+    }
+
+    #[test]
+    fn property_eig_trace_equals_sum_eigenvalues() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Create a 3x3 matrix with known trace
+        #[rustfmt::skip]
+        let mat = session.tensor_variable(
+            vec![
+                2.0, 1.0, 0.0,
+                0.0, 3.0, 1.0,
+                0.0, 0.0, 5.0,
+            ],
+            vec![3, 3],
+            false,
+        ).expect("mat");
+        let trace = 2.0 + 3.0 + 5.0; // = 10.0
+        let (evals, _) = session.tensor_linalg_eig(mat).expect("eig");
+        let vals = session.tensor_values(evals).expect("vals");
+        let sum_real: f64 = (0..3).map(|i| vals[2 * i]).sum();
+        assert!((sum_real - trace).abs() < 1e-8, "sum of eigenvalues should equal trace");
+    }
+
+    #[test]
+    fn property_gradient_sum_of_squares_is_2x() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], true).expect("x");
+        let x_sq = session.tensor_mul(x, x).expect("x^2");
+        let loss = session.tensor_sum(x_sq).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let grad = report.gradient(x).expect("grad");
+        // d/dx (sum x^2) = 2x
+        assert_eq!(grad, &[2.0, 4.0, 6.0, 8.0]);
+    }
+
+    #[test]
+    fn property_matmul_is_linear() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).expect("a");
+        let x = session.tensor_variable(vec![1.0, 1.0], vec![2, 1], false).expect("x");
+        let y = session.tensor_variable(vec![2.0, 2.0], vec![2, 1], false).expect("y");
+
+        // A(x + y) should equal Ax + Ay
+        let x_plus_y = session.tensor_add(x, y).expect("x+y");
+        let a_x_plus_y = session.tensor_matmul(a, x_plus_y).expect("A(x+y)");
+        let ax = session.tensor_matmul(a, x).expect("Ax");
+        let ay = session.tensor_matmul(a, y).expect("Ay");
+        let ax_plus_ay = session.tensor_add(ax, ay).expect("Ax+Ay");
+
+        let lhs = session.tensor_values(a_x_plus_y).expect("lhs");
+        let rhs = session.tensor_values(ax_plus_ay).expect("rhs");
+        for (l, r) in lhs.iter().zip(rhs.iter()) {
+            assert!((l - r).abs() < 1e-10, "matmul should be linear");
+        }
+    }
+
+    #[test]
+    fn property_softmax_sums_to_one() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let logits = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).expect("logits");
+        let probs = session.tensor_softmax(logits, 0).expect("softmax");
+        let sum = session.tensor_sum(probs).expect("sum");
+        let sum_val = session.tensor_values(sum).expect("sum_val")[0];
+        assert!((sum_val - 1.0).abs() < 1e-10, "softmax should sum to 1");
+    }
+
+    #[test]
+    fn property_transpose_is_involutive() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mat = session.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).expect("mat");
+        let t = session.tensor_transpose(mat, 0, 1).expect("transpose");
+        let tt = session.tensor_transpose(t, 0, 1).expect("transpose again");
+        let original = session.tensor_values(mat).expect("original");
+        let double_t = session.tensor_values(tt).expect("double_t");
+        assert_eq!(original, double_t, "transpose(transpose(A)) == A");
+    }
+
+    #[test]
+    fn property_exp_log_inverse() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).expect("x");
+        let exp_x = session.tensor_exp(x).expect("exp");
+        let log_exp_x = session.tensor_log(exp_x).expect("log(exp(x))");
+        let original = session.tensor_values(x).expect("original");
+        let roundtrip = session.tensor_values(log_exp_x).expect("roundtrip");
+        for (o, r) in original.iter().zip(roundtrip.iter()) {
+            assert!((o - r).abs() < 1e-10, "log(exp(x)) == x");
+        }
+    }
+
+    #[test]
+    fn differential_relu_grad_is_step() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![-2.0, -1.0, 0.0, 1.0, 2.0], vec![5], true).expect("x");
+        let relu_x = session.tensor_relu(x).expect("relu");
+        let loss = session.tensor_sum(relu_x).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let grad = report.gradient(x).expect("grad");
+        // ReLU gradient: 0 if x <= 0, 1 if x > 0
+        assert_eq!(grad, &[0.0, 0.0, 0.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn differential_sigmoid_bounded_gradient() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![-10.0, 0.0, 10.0], vec![3], true).expect("x");
+        let sig_x = session.tensor_sigmoid(x).expect("sigmoid");
+        let loss = session.tensor_sum(sig_x).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let grad = report.gradient(x).expect("grad");
+        // Sigmoid gradient: σ(x)(1-σ(x)), max at x=0 where grad=0.25
+        for &g in grad {
+            assert!(g >= 0.0 && g <= 0.25 + 1e-10, "sigmoid grad in [0, 0.25]");
+        }
+        assert!((grad[1] - 0.25).abs() < 1e-10, "gradient at x=0 should be 0.25");
+    }
+
     // ---- tensor creation ----
 
     #[test]
