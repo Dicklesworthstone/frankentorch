@@ -56205,6 +56205,67 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_isin(elements, test_elements)
     }
+
+    // ── Bitwise wrappers ─────────────────────────────────────────────────────
+
+    /// Element-wise left shift.
+    pub fn bitwise_left_shift_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_bitwise_left_shift(input, other)
+    }
+
+    /// Element-wise right shift.
+    pub fn bitwise_right_shift_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_bitwise_right_shift(input, other)
+    }
+
+    // ── Comparison aliases ───────────────────────────────────────────────────
+
+    /// Less than or equal comparison (alias for le_tensor).
+    pub fn le_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_le(lhs, rhs)
+    }
+
+    /// Less than comparison (alias for lt_tensor).
+    pub fn less_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_less(lhs, rhs)
+    }
+
+    /// Less than or equal comparison.
+    pub fn less_equal_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_less_equal(lhs, rhs)
+    }
+
+    // ── Signal processing wrappers ───────────────────────────────────────────
+
+    /// Inverse Short-Time Fourier Transform.
+    pub fn istft_tensor(
+        &mut self,
+        input: TensorNodeId,
+        n_fft: usize,
+        options: IstftOptions,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_istft(input, n_fft, options)
+    }
 }
 
 pub use ft_autograd::{
