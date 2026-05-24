@@ -56158,6 +56158,53 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_ihfft(input)
     }
+
+    // ── Logical wrappers ─────────────────────────────────────────────────────
+
+    /// Element-wise logical AND.
+    pub fn logical_and_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_and(input, other)
+    }
+
+    /// Element-wise logical OR.
+    pub fn logical_or_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_or(input, other)
+    }
+
+    /// Element-wise logical XOR.
+    pub fn logical_xor_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logical_xor(input, other)
+    }
+
+    /// Logit function (inverse of sigmoid).
+    pub fn logit_tensor(
+        &mut self,
+        input: TensorNodeId,
+        eps: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_logit(input, eps)
+    }
+
+    /// Check if elements are in test set.
+    pub fn isin_tensor(
+        &mut self,
+        elements: TensorNodeId,
+        test_elements: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isin(elements, test_elements)
+    }
 }
 
 pub use ft_autograd::{
