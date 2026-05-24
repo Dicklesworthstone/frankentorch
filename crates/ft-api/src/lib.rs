@@ -55632,6 +55632,44 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_select_scatter(input, src, dim, index)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Special and activation utilities (additional)
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// SiLU (Swish) activation: x * sigmoid(x).
+    pub fn silu_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_silu(input)
+    }
+
+    /// Softmax (torch.special.softmax alias).
+    pub fn special_softmax_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_softmax(input, dim)
+    }
+
+    /// Log softmax (torch.special.log_softmax alias).
+    pub fn special_log_softmax_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_log_softmax(input, dim)
+    }
+
+    /// Softplus (torch.special.softplus alias).
+    pub fn special_softplus_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_special_softplus(input)
+    }
 }
 
 pub use ft_autograd::{
