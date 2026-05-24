@@ -56368,6 +56368,63 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_max(lhs, rhs)
     }
+
+    // ── Reduction wrappers ───────────────────────────────────────────────────
+
+    /// Element-wise minimum of two tensors.
+    pub fn min_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_min(lhs, rhs)
+    }
+
+    /// Element-wise minimum (alias for min_tensor).
+    pub fn minimum_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_minimum(lhs, rhs)
+    }
+
+    /// Max along dimension, returning (values, indices).
+    pub fn max_dim_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_max_dim(input, dim)
+    }
+
+    /// Min along dimension, returning (values, indices).
+    pub fn min_dim_tensor(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_min_dim(input, dim)
+    }
+
+    /// Sum all elements.
+    pub fn sum_tensor(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_sum(input)
+    }
+
+    /// Mean of all elements.
+    pub fn mean_tensor(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_mean(input)
+    }
+
+    /// Standard deviation of all elements (Bessel's correction=1).
+    pub fn std_tensor(
+        &mut self,
+        input: TensorNodeId,
+        correction: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_std(input, correction)
+    }
 }
 
 pub use ft_autograd::{
