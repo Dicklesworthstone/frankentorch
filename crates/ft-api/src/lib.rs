@@ -56331,6 +56331,43 @@ impl FrankenTorchSession {
     ) -> Result<SparseCOOTensor, AutogradError> {
         self.tensor_to_sparse_coo(input)
     }
+
+    // ── Additional type/comparison/math wrappers ─────────────────────────────
+
+    /// Cast tensor to int64.
+    pub fn long_tensor(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_long(input)
+    }
+
+    /// Less than comparison.
+    pub fn lt_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lt(lhs, rhs)
+    }
+
+    /// Matrix multiplication.
+    pub fn matmul_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matmul(lhs, rhs)
+    }
+
+    /// Element-wise maximum of two tensors.
+    pub fn max_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_max(lhs, rhs)
+    }
 }
 
 pub use ft_autograd::{
