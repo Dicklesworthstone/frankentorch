@@ -55813,6 +55813,29 @@ impl FrankenTorchSession {
     ) -> Result<bool, AutogradError> {
         self.tensor_is_same_size(input, other)
     }
+
+    // ── Comparison wrappers ──────────────────────────────────────────────────
+
+    /// Element-wise approximate equality check with equal_nan option.
+    pub fn isclose_tensor(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+        rtol: f64,
+        atol: f64,
+        equal_nan: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_isclose(lhs, rhs, rtol, atol, equal_nan)
+    }
+
+    /// Element-wise least common multiple.
+    pub fn lcm_tensor(
+        &mut self,
+        input: TensorNodeId,
+        other: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_lcm(input, other)
+    }
 }
 
 pub use ft_autograd::{
