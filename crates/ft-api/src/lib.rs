@@ -55585,6 +55585,53 @@ impl FrankenTorchSession {
     ) -> Result<TensorNodeId, AutogradError> {
         self.tensor_logaddexp2(a, b)
     }
+
+    // ══════════════════════════════════════════════════════════════════════════════
+    // Neural network utilities (additional)
+    // ══════════════════════════════════════════════════════════════════════════════
+
+    /// Scaled dot-product attention.
+    #[allow(clippy::too_many_arguments)]
+    pub fn scaled_dot_product_attention_tensor(
+        &mut self,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        attn_mask: Option<TensorNodeId>,
+        is_causal: bool,
+        scale: Option<f64>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_scaled_dot_product_attention(query, key, value, attn_mask, is_causal, scale)
+    }
+
+    /// Pixel shuffle for sub-pixel convolution upscaling.
+    pub fn pixel_shuffle_tensor(
+        &mut self,
+        input: TensorNodeId,
+        upscale_factor: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pixel_shuffle(input, upscale_factor)
+    }
+
+    /// Pixel unshuffle (reverse of pixel shuffle).
+    pub fn pixel_unshuffle_tensor(
+        &mut self,
+        input: TensorNodeId,
+        downscale_factor: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_pixel_unshuffle(input, downscale_factor)
+    }
+
+    /// Scatter values at selected index along dimension.
+    pub fn select_scatter_tensor(
+        &mut self,
+        input: TensorNodeId,
+        src: TensorNodeId,
+        dim: i64,
+        index: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_select_scatter(input, src, dim, index)
+    }
 }
 
 pub use ft_autograd::{
