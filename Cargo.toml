@@ -45,7 +45,7 @@ ftui = { version = "0.2.0", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 
 [workspace.lints.rust]
-unsafe_code = "forbid"
+unsafe_code = "deny"
 
 [profile.release-perf]
 inherits = "release"

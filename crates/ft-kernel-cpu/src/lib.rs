@@ -1,9 +1,44 @@
-#![forbid(unsafe_code)]
+#![deny(unsafe_code)]
 
 use std::fmt;
 
 use rayon::prelude::*;
 use wide::{f32x8, f64x4};
+
+#[allow(unsafe_code)]
+mod gemm {
+    pub fn dgemm(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+        // SAFETY: matrixmultiply::dgemm requires valid pointers and correct dimensions.
+        // We verify:
+        // - a.len() >= m*k (verified by caller via ensure_storage_len)
+        // - b.len() >= k*n (verified by caller)
+        // - c.len() >= m*n (allocated by caller)
+        // Row-major layout: row stride = inner dimension, column stride = 1
+        unsafe {
+            matrixmultiply::dgemm(
+                m, k, n,
+                1.0,
+                a.as_ptr(), k as isize, 1,
+                b.as_ptr(), n as isize, 1,
+                0.0,
+                c.as_mut_ptr(), n as isize, 1,
+            );
+        }
+    }
+
+    pub fn sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        unsafe {
+            matrixmultiply::sgemm(
+                m, k, n,
+                1.0,
+                a.as_ptr(), k as isize, 1,
+                b.as_ptr(), n as isize, 1,
+                0.0,
+                c.as_mut_ptr(), n as isize, 1,
+            );
+        }
+    }
+}
 
 use ft_core::{
     Complex128, ScalarTensor, SparseCOOTensor, SparseTensorError, TensorCompatError, TensorMeta,
@@ -1933,32 +1968,6 @@ pub fn div_tensor_broadcast_f64(
     elementwise_broadcast_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| l / r)
 }
 
-fn simd_dot_pairwise_f64(a: &[f64], b: &[f64], b_stride: usize) -> f64 {
-    let len = a.len();
-    let mut products = Vec::with_capacity(len);
-
-    let simd_len = len / SIMD_WIDTH * SIMD_WIDTH;
-    for i in (0..simd_len).step_by(SIMD_WIDTH) {
-        let va = f64x4::new([a[i], a[i + 1], a[i + 2], a[i + 3]]);
-        let vb = f64x4::new([
-            b[i * b_stride],
-            b[(i + 1) * b_stride],
-            b[(i + 2) * b_stride],
-            b[(i + 3) * b_stride],
-        ]);
-        let prod = va * vb;
-        products.extend_from_slice(prod.as_array_ref());
-    }
-
-    for i in simd_len..len {
-        products.push(a[i] * b[i * b_stride]);
-    }
-
-    pairwise_sum_f64(&products)
-}
-
-const MATMUL_TILE: usize = 64;
-
 pub fn matmul_tensor_contiguous_f64(
     lhs: &[f64],
     rhs: &[f64],
@@ -1979,47 +1988,13 @@ pub fn matmul_tensor_contiguous_f64(
 
     let mut out = vec![0.0_f64; out_numel];
 
-    if m * k * n >= PARALLEL_THRESHOLD {
-        out.par_chunks_mut(n)
-            .enumerate()
-            .for_each(|(row, out_row)| {
-                let lhs_row = &lhs[lhs_start + row * k..lhs_start + (row + 1) * k];
-                for col in 0..n {
-                    let rhs_col = &rhs[rhs_start + col..];
-                    out_row[col] = simd_dot_pairwise_f64(lhs_row, rhs_col, n);
-                }
-            });
-    } else if m >= MATMUL_TILE || n >= MATMUL_TILE || k >= MATMUL_TILE {
-        for i0 in (0..m).step_by(MATMUL_TILE) {
-            let i1 = (i0 + MATMUL_TILE).min(m);
-            for j0 in (0..n).step_by(MATMUL_TILE) {
-                let j1 = (j0 + MATMUL_TILE).min(n);
-                for k0 in (0..k).step_by(MATMUL_TILE) {
-                    let k1 = (k0 + MATMUL_TILE).min(k);
-                    for i in i0..i1 {
-                        let lhs_row = &lhs[lhs_start + i * k + k0..lhs_start + i * k + k1];
-                        for j in j0..j1 {
-                            let rhs_col = &rhs[rhs_start + k0 * n + j..];
-                            out[i * n + j] += simd_dot_pairwise_f64(lhs_row, rhs_col, n);
-                        }
-                    }
-                }
-            }
-        }
-    } else {
-        let mut scratch = vec![0.0_f64; k];
-        for row in 0..m {
-            let lhs_row_base = lhs_start + row * k;
-            for col in 0..n {
-                for (inner, slot) in scratch.iter_mut().enumerate() {
-                    let lhs_idx = lhs_row_base + inner;
-                    let rhs_idx = rhs_start + inner * n + col;
-                    *slot = lhs[lhs_idx] * rhs[rhs_idx];
-                }
-                out[row * n + col] = pairwise_sum_f64(&scratch);
-            }
-        }
-    }
+    // Use optimized GEMM via matrixmultiply crate
+    gemm::dgemm(
+        m, k, n,
+        &lhs[lhs_start..],
+        &rhs[rhs_start..],
+        &mut out,
+    );
 
     Ok(out)
 }
@@ -2084,30 +2059,33 @@ pub fn addmm_tensor_contiguous_f64(
     }
     ensure_storage_len(input, input_meta, "input")?;
 
-    // Push-based output skips the m*n zero-init memset
-    // (frankentorch-u04j; mirrors the matmul z588 / bmm mg2p
-    // fixes). The (row, col) loop nest already proceeds in
-    // row-major order.
-    let mut out = Vec::with_capacity(out_numel);
-    // Same gather-then-pairwise pattern as `matmul_tensor_contiguous_f64`
-    // (commit 35a7760). One scratch buffer per call carries the K
-    // products into the pairwise summer; for K > 128 this tightens
-    // the dot-product accumulation from O(K · ε) to O(log K · ε).
-    let mut scratch = vec![0.0_f64; k];
-    for row in 0..m {
-        for col in 0..n {
-            for (inner, slot) in scratch.iter_mut().enumerate() {
-                *slot = mat1[mat1_start + row * k + inner] * mat2[mat2_start + inner * n + col];
-            }
-            let acc = pairwise_sum_f64(&scratch);
-            let bias_idx = if input_1d {
-                input_offset + col
-            } else {
-                input_offset + row * n + col
-            };
-            out.push(beta * input[bias_idx] + alpha * acc);
-        }
-    }
+    // Use optimized GEMM for mat1 @ mat2
+    let mut gemm_out = vec![0.0_f64; out_numel];
+    gemm::dgemm(
+        m, k, n,
+        &mat1[mat1_start..],
+        &mat2[mat2_start..],
+        &mut gemm_out,
+    );
+
+    // Apply: out = beta * input + alpha * (mat1 @ mat2)
+    let out: Vec<f64> = if input_1d {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| {
+                let col = i % n;
+                beta * input[input_offset + col] + alpha * g
+            })
+            .collect()
+    } else {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| beta * input[input_offset + i] + alpha * g)
+            .collect()
+    };
+
     Ok(out)
 }
 
@@ -2305,31 +2283,21 @@ pub fn bmm_tensor_contiguous_f64(
 
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    // Push-based output skips the batch*m*n zero-init memset
-    // that every cell would immediately overwrite (frankentorch-mg2p);
-    // also avoids pre-touching the output tensor before the
-    // real computation begins, easing cache pressure on the
-    // attention-BMM hot path.
-    let mut out = Vec::with_capacity(out_numel);
+    let mut out = vec![0.0_f64; out_numel];
 
-    // One scratch buffer for the entire bmm, reused across all
-    // (batch, row, col) cells. Same pairwise dot-product pattern as
-    // the matmul fix; for K > 128 the cumulative error tightens
-    // from O(K · ε) to O(log K · ε) per output cell.
-    let mut scratch = vec![0.0_f64; k];
+    // Use optimized GEMM for each batch
     for b in 0..batch {
         let lhs_base = lhs_start + b * lhs_batch_stride;
         let rhs_base = rhs_start + b * rhs_batch_stride;
-        for row in 0..m {
-            for col in 0..n {
-                for (inner, slot) in scratch.iter_mut().enumerate() {
-                    *slot = lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
-                }
-                out.push(pairwise_sum_f64(&scratch));
-            }
-        }
+        let out_base = b * out_batch_stride;
+        gemm::dgemm(
+            m, k, n,
+            &lhs[lhs_base..],
+            &rhs[rhs_base..],
+            &mut out[out_base..out_base + out_batch_stride],
+        );
     }
-    let _ = out_batch_stride;
+
     Ok(out)
 }
 
@@ -6369,26 +6337,16 @@ pub fn matmul_tensor_contiguous_f32(
     ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    // Push-based output mirrors the f64 fix (frankentorch-z588):
-    // skip the m*n zero-init memset since every cell gets
-    // unconditionally overwritten in row-major order.
-    let mut out = Vec::with_capacity(out_numel);
+    let mut out = vec![0.0f32; out_numel];
 
-    // F32 mirror of the f64 pairwise-dot-product fix. F32 has only
-    // a 24-bit mantissa so the precision gap between
-    // sequential-sum vs pairwise-sum on a K = 1024 dot product is
-    // ~5 mantissa bits — visibly degrades training stability if
-    // not addressed.
-    let mut scratch = vec![0.0f32; k];
-    for row in 0..m {
-        let lhs_row_base = lhs_start + row * k;
-        for col in 0..n {
-            for (inner, slot) in scratch.iter_mut().enumerate() {
-                *slot = lhs[lhs_row_base + inner] * rhs[rhs_start + inner * n + col];
-            }
-            out.push(pairwise_sum_f32(&scratch));
-        }
-    }
+    // Use optimized GEMM via matrixmultiply crate
+    gemm::sgemm(
+        m, k, n,
+        &lhs[lhs_start..],
+        &rhs[rhs_start..],
+        &mut out,
+    );
+
     Ok(out)
 }
 
@@ -6495,24 +6453,21 @@ pub fn bmm_tensor_contiguous_f32(
     ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
-    // Push-based output mirrors the f64 fix (frankentorch-mg2p):
-    // skip the batch*m*n zero-init memset since every cell gets
-    // unconditionally overwritten in row-major order.
-    let mut out = Vec::with_capacity(out_numel);
-    let mut scratch = vec![0.0f32; k];
+    let mut out = vec![0.0f32; out_numel];
+
+    // Use optimized GEMM for each batch
     for b in 0..batch {
         let lhs_base = lhs_start + b * lhs_batch_stride;
         let rhs_base = rhs_start + b * rhs_batch_stride;
-        for row in 0..m {
-            for col in 0..n {
-                for (inner, slot) in scratch.iter_mut().enumerate() {
-                    *slot = lhs[lhs_base + row * k + inner] * rhs[rhs_base + inner * n + col];
-                }
-                out.push(pairwise_sum_f32(&scratch));
-            }
-        }
+        let out_base = b * out_batch_stride;
+        gemm::sgemm(
+            m, k, n,
+            &lhs[lhs_base..],
+            &rhs[rhs_base..],
+            &mut out[out_base..out_base + out_batch_stride],
+        );
     }
-    let _ = out_batch_stride;
+
     Ok(out)
 }
 
@@ -8027,23 +7982,34 @@ pub fn addmm_tensor_contiguous_f32(
         });
     }
     ensure_storage_len_f32(input, input_meta, "input")?;
-    // Push-based output mirrors the f64 fix (frankentorch-u04j).
-    let mut out = Vec::with_capacity(out_numel);
-    let mut scratch = vec![0.0f32; k];
-    for row in 0..m {
-        for col in 0..n {
-            for (inner, slot) in scratch.iter_mut().enumerate() {
-                *slot = mat1[mat1_start + row * k + inner] * mat2[mat2_start + inner * n + col];
-            }
-            let acc = pairwise_sum_f32(&scratch);
-            let bias_idx = if input_1d {
-                input_offset + col
-            } else {
-                input_offset + row * n + col
-            };
-            out.push(beta * input[bias_idx] + alpha * acc);
-        }
-    }
+
+    // Use optimized GEMM for mat1 @ mat2
+    let mut gemm_out = vec![0.0f32; out_numel];
+    gemm::sgemm(
+        m, k, n,
+        &mat1[mat1_start..],
+        &mat2[mat2_start..],
+        &mut gemm_out,
+    );
+
+    // Apply: out = beta * input + alpha * (mat1 @ mat2)
+    let out: Vec<f32> = if input_1d {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| {
+                let col = i % n;
+                beta * input[input_offset + col] + alpha * g
+            })
+            .collect()
+    } else {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| beta * input[input_offset + i] + alpha * g)
+            .collect()
+    };
+
     Ok(out)
 }
 
