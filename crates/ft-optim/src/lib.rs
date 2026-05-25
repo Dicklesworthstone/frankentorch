@@ -5131,6 +5131,228 @@ impl SparseAdam {
     }
 }
 
+// ── frankentorch-ulg7: Muon optimizer ────────────────────────────────────
+
+/// Muon optimizer: Momentum with Orthogonalization of Updates.
+///
+/// Muon orthogonalizes the momentum vector using Newton-Schulz iterations,
+/// which approximates Gram-Schmidt orthogonalization efficiently. This helps
+/// escape saddle points and improves convergence on certain problems.
+///
+/// The update rule is:
+/// 1. m_t = beta * m_{t-1} + g_t
+/// 2. m_ortho = newton_schulz_ortho(m_t)
+/// 3. θ_{t+1} = θ_t - lr * m_ortho
+///
+/// Newton-Schulz iteration: X_{k+1} = X_k @ (1.5*I - 0.5*X_k^T @ X_k)
+///
+/// Equivalent to experimental `torch.optim.Muon`.
+pub struct Muon {
+    params: Vec<TensorNodeId>,
+    lr: f64,
+    momentum: f64,
+    ns_steps: usize,
+    weight_decay: f64,
+    m: Vec<Option<Vec<f64>>>,
+}
+
+impl Muon {
+    /// Create a new Muon optimizer.
+    ///
+    /// Defaults: lr, momentum=0.95, ns_steps=5, weight_decay=0.0
+    pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
+        let n = params.len();
+        Self {
+            params,
+            lr,
+            momentum: 0.95,
+            ns_steps: 5,
+            weight_decay: 0.0,
+            m: vec![None; n],
+        }
+    }
+
+    /// Set momentum coefficient (default: 0.95).
+    #[must_use]
+    pub fn momentum(mut self, momentum: f64) -> Self {
+        self.momentum = momentum;
+        self
+    }
+
+    /// Set number of Newton-Schulz iterations (default: 5).
+    #[must_use]
+    pub fn ns_steps(mut self, ns_steps: usize) -> Self {
+        self.ns_steps = ns_steps;
+        self
+    }
+
+    /// Set weight decay (default: 0.0).
+    #[must_use]
+    pub fn weight_decay(mut self, weight_decay: f64) -> Self {
+        self.weight_decay = weight_decay;
+        self
+    }
+
+    fn validate_hyperparams(&self) -> Result<(), AutogradError> {
+        if !self.lr.is_finite() || self.lr < 0.0 {
+            return Err(optimizer_hparam_error(
+                "muon requires a finite non-negative learning rate",
+            ));
+        }
+        if !self.momentum.is_finite() || !(0.0..1.0).contains(&self.momentum) {
+            return Err(optimizer_hparam_error("muon momentum must be in [0, 1)"));
+        }
+        if self.ns_steps == 0 {
+            return Err(optimizer_hparam_error("muon requires ns_steps >= 1"));
+        }
+        if !self.weight_decay.is_finite() || self.weight_decay < 0.0 {
+            return Err(optimizer_hparam_error(
+                "muon requires finite non-negative weight_decay",
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl Optimizer for Muon {
+    fn get_lr(&self) -> f64 {
+        self.lr
+    }
+
+    fn set_lr(&mut self, lr: f64) {
+        self.lr = lr;
+    }
+
+    fn step(
+        &mut self,
+        session: &mut FrankenTorchSession,
+        _report: &TensorBackwardReport,
+    ) -> Result<(), AutogradError> {
+        self.validate_hyperparams()?;
+
+        for (i, &param) in self.params.iter().enumerate() {
+            let grad = match session.tensor_grad(param)? {
+                Some(g) => g,
+                None => continue,
+            };
+            let param_vals = session.tensor_values(param)?;
+            let numel = param_vals.len();
+
+            // Apply weight decay to gradient
+            let grad = if self.weight_decay > 0.0 {
+                grad.iter()
+                    .zip(param_vals.iter())
+                    .map(|(&g, &p)| g + self.weight_decay * p)
+                    .collect::<Vec<_>>()
+            } else {
+                grad
+            };
+
+            // Update momentum: m = beta * m + g
+            let m = self.m[i].get_or_insert_with(|| vec![0.0; numel]);
+            for (j, &g) in grad.iter().enumerate() {
+                m[j] = self.momentum * m[j] + g;
+            }
+
+            // Newton-Schulz orthogonalization
+            // For vectors, we approximate orthogonalization by normalizing
+            // For matrices (2D params), we use Newton-Schulz
+            let m_ortho = newton_schulz_ortho(m, self.ns_steps);
+
+            // Update parameters
+            let update: Vec<f64> = m_ortho.iter().map(|&v| self.lr * v).collect();
+            apply_param_update(session, param, &update)?;
+        }
+        Ok(())
+    }
+
+    fn zero_grad(&mut self, session: &mut FrankenTorchSession) -> Result<(), AutogradError> {
+        zero_param_gradients(session, &self.params)
+    }
+}
+
+/// Newton-Schulz orthogonalization: X' = X @ (1.5*I - 0.5*X^T @ X)
+/// For a 1D vector, this just normalizes. For matrices, it orthogonalizes rows.
+fn newton_schulz_ortho(m: &[f64], ns_steps: usize) -> Vec<f64> {
+    let numel = m.len();
+    if numel == 0 {
+        return Vec::new();
+    }
+
+    // Compute norm for scaling
+    let norm: f64 = m.iter().map(|&x| x * x).sum::<f64>().sqrt();
+    if norm < 1e-12 {
+        return vec![0.0; numel];
+    }
+
+    // For 1D vectors or small tensors, just normalize
+    // Newton-Schulz is primarily for weight matrices
+    if numel < 16 {
+        return m.iter().map(|&x| x / norm).collect();
+    }
+
+    // Reshape to approximate 2D (rows x cols) for Newton-Schulz
+    let (rows, cols) = factorize_approx_square(numel);
+
+    // Scale input to have reasonable spectral norm
+    let scale = 1.0 / norm.max(1.0);
+    let mut x: Vec<f64> = m.iter().map(|&v| v * scale).collect();
+
+    // Newton-Schulz iterations
+    for _ in 0..ns_steps {
+        // Compute X^T @ X (cols x cols)
+        let mut xtx = vec![0.0; cols * cols];
+        for i in 0..cols {
+            for j in 0..cols {
+                let mut sum = 0.0;
+                for k in 0..rows {
+                    let xi = x.get(k * cols + i).copied().unwrap_or(0.0);
+                    let xj = x.get(k * cols + j).copied().unwrap_or(0.0);
+                    sum += xi * xj;
+                }
+                xtx[i * cols + j] = sum;
+            }
+        }
+
+        // Compute X @ (1.5*I - 0.5*X^T @ X)
+        let mut x_new = vec![0.0; numel];
+        for r in 0..rows {
+            for c in 0..cols {
+                let mut sum = 0.0;
+                for k in 0..cols {
+                    let xrk = x.get(r * cols + k).copied().unwrap_or(0.0);
+                    // (1.5*I - 0.5*X^T @ X)[k,c]
+                    let ident = if k == c { 1.5 } else { 0.0 };
+                    let xtx_kc = xtx[k * cols + c];
+                    sum += xrk * (ident - 0.5 * xtx_kc);
+                }
+                if let Some(slot) = x_new.get_mut(r * cols + c) {
+                    *slot = sum;
+                }
+            }
+        }
+        x = x_new;
+    }
+
+    // Scale back to original magnitude
+    let x_norm: f64 = x.iter().map(|&v| v * v).sum::<f64>().sqrt();
+    if x_norm < 1e-12 {
+        return m.iter().map(|&v| v / norm).collect();
+    }
+    x.iter().map(|&v| v * (norm / x_norm)).collect()
+}
+
+/// Factorize numel into approximate (rows, cols) for matrix operations.
+fn factorize_approx_square(numel: usize) -> (usize, usize) {
+    let sqrt_n = (numel as f64).sqrt() as usize;
+    for cols in (1..=sqrt_n).rev() {
+        if numel % cols == 0 {
+            return (numel / cols, cols);
+        }
+    }
+    (numel, 1)
+}
+
 // ── frankentorch-iha: Mixed precision GradScaler ────────────────────────
 
 /// Gradient scaler for mixed precision training.
