@@ -14851,19 +14851,17 @@ impl FrankenTorchSession {
         let patch_width = Self::checked_mul(in_channels, kernel_h, "conv2d patch width overflow")?;
         let patch_width = Self::checked_mul(patch_width, kernel_w, "conv2d patch width overflow")?;
         let patch_count = Self::checked_mul(output_h, output_w, "conv2d patch count overflow")?;
-        let mut patches = Vec::with_capacity(patch_count);
-        for out_h in 0..output_h {
-            let row_start = Self::checked_mul(out_h, stride_h, "conv2d row start overflow")?;
-            let row_slice = self.tensor_narrow(padded, 2, row_start, kernel_h)?;
-            for out_w in 0..output_w {
-                let col_start = Self::checked_mul(out_w, stride_w, "conv2d col start overflow")?;
-                let patch = self.tensor_narrow(row_slice, 3, col_start, kernel_w)?;
-                let flat = self.tensor_reshape(patch, vec![batch_size, 1, patch_width])?;
-                patches.push(flat);
-            }
-        }
 
-        let unfolded = self.tensor_cat(&patches, 1)?;
+        // Use unfold to extract all patches in O(1) tensor operations instead
+        // of O(output_h * output_w) narrow+reshape calls.
+        // unfold(dim=2) → [batch, in_ch, out_h, padded_w, kernel_h]
+        // unfold(dim=3) → [batch, in_ch, out_h, out_w, kernel_h, kernel_w]
+        let unfolded_h = self.tensor_unfold(padded, 2, kernel_h, stride_h)?;
+        let unfolded_hw = self.tensor_unfold(unfolded_h, 3, kernel_w, stride_w)?;
+        // Permute to [batch, out_h, out_w, in_ch, kernel_h, kernel_w]
+        let permuted = self.tensor_permute(unfolded_hw, vec![0, 2, 3, 1, 4, 5])?;
+        // Reshape to [batch, out_h*out_w, in_ch*kernel_h*kernel_w]
+        let unfolded = self.tensor_reshape(permuted, vec![batch_size, patch_count, patch_width])?;
         let weight_flat = self.tensor_reshape(weight, vec![out_channels, patch_width])?;
         let weight_t = self.tensor_transpose(weight_flat, 0, 1)?;
         let weight_us = self.tensor_unsqueeze(weight_t, 0)?;
