@@ -14511,14 +14511,17 @@ impl FrankenTorchSession {
         bias: Option<TensorNodeId>,
     ) -> Result<TensorNodeId, AutogradError> {
         let weight_t = self.tensor_transpose(weight, 0, 1)?;
-        let output = self.tensor_matmul(input, weight_t)?;
         match bias {
             Some(b) => {
-                let out_shape = self.tensor_shape(output)?;
-                let expanded = self.tensor_expand(b, out_shape)?;
-                self.tensor_add(output, expanded)
+                let input_shape = self.tensor_shape(input)?;
+                let weight_shape = self.tensor_shape(weight)?;
+                let out_features = weight_shape[0];
+                let mut out_shape = input_shape.clone();
+                *out_shape.last_mut().unwrap() = out_features;
+                let bias_expanded = self.tensor_expand(b, out_shape)?;
+                self.tensor_addmm(bias_expanded, input, weight_t, 1.0, 1.0)
             }
-            None => Ok(output),
+            None => self.tensor_matmul(input, weight_t),
         }
     }
 
