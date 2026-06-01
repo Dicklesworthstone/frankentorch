@@ -261,11 +261,7 @@ impl RandomSampler {
         if self.size == 0 {
             return 0;
         }
-        if self.replacement {
-            self.num_samples
-        } else {
-            self.num_samples.min(self.size)
-        }
+        self.num_samples
     }
 
     pub fn is_empty(&self) -> bool {
@@ -282,11 +278,19 @@ impl RandomSampler {
                 .map(|_| rng.next_below(self.size))
                 .collect()
         } else {
-            let mut idx: Vec<usize> = (0..self.size).collect();
-            rng.shuffle(&mut idx);
-            let target = self.num_samples.min(self.size);
-            idx.truncate(target);
-            idx
+            let mut result = Vec::with_capacity(self.num_samples);
+            for _ in 0..(self.num_samples / self.size) {
+                let mut idx: Vec<usize> = (0..self.size).collect();
+                rng.shuffle(&mut idx);
+                result.extend(idx);
+            }
+            let remainder = self.num_samples % self.size;
+            if remainder > 0 {
+                let mut idx: Vec<usize> = (0..self.size).collect();
+                rng.shuffle(&mut idx);
+                result.extend(idx.into_iter().take(remainder));
+            }
+            result
         }
     }
 }
@@ -382,6 +386,11 @@ impl WeightedRandomSampler {
                 ));
             }
             total += w;
+            if !total.is_finite() {
+                return Err(transform_config_error(
+                    "WeightedRandomSampler: sum of weights must be finite",
+                ));
+            }
             cumulative.push(total);
         }
 
@@ -1793,14 +1802,22 @@ mod tests {
     }
 
     #[test]
-    fn random_sampler_num_samples_clamped_without_replacement() {
+    fn random_sampler_num_samples_repeats_shuffled_passes_without_replacement() {
         let s = RandomSampler::new(3).with_num_samples(5).with_seed(123);
         let indices = s.indices();
-        assert_eq!(indices.len(), 3);
-        assert_eq!(s.len(), 3);
+        assert_eq!(indices.len(), 5);
+        assert_eq!(s.len(), 5);
+        assert!(indices.iter().all(|&i| i < 3));
+
+        let mut first_pass = indices[..3].to_vec();
+        first_pass.sort();
+        assert_eq!(first_pass, vec![0, 1, 2]);
+
+        let remainder: std::collections::HashSet<usize> = indices[3..].iter().copied().collect();
+        assert_eq!(remainder.len(), 2);
+
         let unique: std::collections::HashSet<usize> = indices.iter().copied().collect();
         assert_eq!(unique.len(), 3);
-        assert!(indices.iter().all(|&i| i < 3));
     }
 
     #[test]
@@ -1839,6 +1856,19 @@ mod tests {
     fn weighted_random_sampler_rejects_infinity_weight() {
         let s = WeightedRandomSampler::new(vec![f64::INFINITY, 1.0], 50).with_seed(42);
         assert!(s.indices().is_err());
+    }
+
+    #[test]
+    fn weighted_random_sampler_rejects_overflowed_weight_sum() {
+        let s = WeightedRandomSampler::new(vec![f64::MAX, f64::MAX], 16).with_seed(42);
+        let message = s
+            .indices()
+            .expect_err("overflowed total weight must fail closed")
+            .to_string();
+        assert!(
+            message.contains("sum of weights must be finite"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
