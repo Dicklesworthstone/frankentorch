@@ -892,87 +892,19 @@ pub fn load_state_dict_from_bytes(
 
         let tensor = match dtype {
             DType::F64 => {
-                let needed = numel.checked_mul(8).ok_or_else(|| TensorIOError::Corrupt {
-                    reason: format!("byte count overflow for f64 tensor '{key}'"),
-                })?;
-                let end = pos
-                    .checked_add(needed)
-                    .ok_or_else(|| TensorIOError::Corrupt {
-                        reason: format!("byte count overflow for f64 tensor '{key}'"),
-                    })?;
-                if end > data.len() {
-                    return Err(TensorIOError::Corrupt {
-                        reason: "truncated f64 data".to_string(),
-                    });
-                }
-                let mut values = Vec::with_capacity(numel);
-                for _ in 0..numel {
-                    let bytes = read_fixed_bytes::<8>(data, &mut pos, "truncated f64 data")?;
-                    values.push(f64::from_le_bytes(bytes));
-                }
+                let values = read_f64_payload(data, &mut pos, numel, &key)?;
                 DenseTensor::from_storage(meta, values)?
             }
             DType::F32 => {
-                let needed = numel.checked_mul(4).ok_or_else(|| TensorIOError::Corrupt {
-                    reason: format!("byte count overflow for f32 tensor '{key}'"),
-                })?;
-                let end = pos
-                    .checked_add(needed)
-                    .ok_or_else(|| TensorIOError::Corrupt {
-                        reason: format!("byte count overflow for f32 tensor '{key}'"),
-                    })?;
-                if end > data.len() {
-                    return Err(TensorIOError::Corrupt {
-                        reason: "truncated f32 data".to_string(),
-                    });
-                }
-                let mut values = Vec::with_capacity(numel);
-                for _ in 0..numel {
-                    let bytes = read_fixed_bytes::<4>(data, &mut pos, "truncated f32 data")?;
-                    values.push(f32::from_le_bytes(bytes));
-                }
+                let values = read_f32_payload(data, &mut pos, numel, &key)?;
                 DenseTensor::from_storage_f32(meta, values)?
             }
             DType::F16 => {
-                let needed = numel.checked_mul(2).ok_or_else(|| TensorIOError::Corrupt {
-                    reason: format!("byte count overflow for f16 tensor '{key}'"),
-                })?;
-                let end = pos
-                    .checked_add(needed)
-                    .ok_or_else(|| TensorIOError::Corrupt {
-                        reason: format!("byte count overflow for f16 tensor '{key}'"),
-                    })?;
-                if end > data.len() {
-                    return Err(TensorIOError::Corrupt {
-                        reason: "truncated f16 data".to_string(),
-                    });
-                }
-                let mut values = Vec::with_capacity(numel);
-                for _ in 0..numel {
-                    let bytes = read_fixed_bytes::<2>(data, &mut pos, "truncated f16 data")?;
-                    values.push(Float16::from_le_bytes(bytes));
-                }
+                let values = read_f16_payload(data, &mut pos, numel, &key)?;
                 DenseTensor::from_storage_f16(meta, values)?
             }
             DType::BF16 => {
-                let needed = numel.checked_mul(2).ok_or_else(|| TensorIOError::Corrupt {
-                    reason: format!("byte count overflow for bf16 tensor '{key}'"),
-                })?;
-                let end = pos
-                    .checked_add(needed)
-                    .ok_or_else(|| TensorIOError::Corrupt {
-                        reason: format!("byte count overflow for bf16 tensor '{key}'"),
-                    })?;
-                if end > data.len() {
-                    return Err(TensorIOError::Corrupt {
-                        reason: "truncated bf16 data".to_string(),
-                    });
-                }
-                let mut values = Vec::with_capacity(numel);
-                for _ in 0..numel {
-                    let bytes = read_fixed_bytes::<2>(data, &mut pos, "truncated bf16 data")?;
-                    values.push(BFloat16::from_le_bytes(bytes));
-                }
+                let values = read_bf16_payload(data, &mut pos, numel, &key)?;
                 DenseTensor::from_storage_bf16(meta, values)?
             }
             _ => {
@@ -995,6 +927,102 @@ pub fn load_state_dict_from_bytes(
     }
 
     Ok(result)
+}
+
+fn native_payload_end(
+    pos: usize,
+    numel: usize,
+    bytes_per_value: usize,
+    dtype: &str,
+    key: &str,
+) -> Result<usize, TensorIOError> {
+    let needed = numel
+        .checked_mul(bytes_per_value)
+        .ok_or_else(|| TensorIOError::Corrupt {
+            reason: format!("byte count overflow for {dtype} tensor '{key}'"),
+        })?;
+    pos.checked_add(needed)
+        .ok_or_else(|| TensorIOError::Corrupt {
+            reason: format!("byte count overflow for {dtype} tensor '{key}'"),
+        })
+}
+
+fn native_payload<'a>(
+    data: &'a [u8],
+    pos: &mut usize,
+    numel: usize,
+    bytes_per_value: usize,
+    dtype: &str,
+    key: &str,
+    truncated_reason: &'static str,
+) -> Result<&'a [u8], TensorIOError> {
+    let end = native_payload_end(*pos, numel, bytes_per_value, dtype, key)?;
+    if end > data.len() {
+        return Err(TensorIOError::Corrupt {
+            reason: truncated_reason.to_string(),
+        });
+    }
+    let payload = &data[*pos..end];
+    *pos = end;
+    Ok(payload)
+}
+
+fn read_f64_payload(
+    data: &[u8],
+    pos: &mut usize,
+    numel: usize,
+    key: &str,
+) -> Result<Vec<f64>, TensorIOError> {
+    let payload = native_payload(data, pos, numel, 8, "f64", key, "truncated f64 data")?;
+    let mut values = Vec::with_capacity(numel);
+    for chunk in payload.chunks_exact(8) {
+        values.push(f64::from_le_bytes([
+            chunk[0], chunk[1], chunk[2], chunk[3], chunk[4], chunk[5], chunk[6], chunk[7],
+        ]));
+    }
+    Ok(values)
+}
+
+fn read_f32_payload(
+    data: &[u8],
+    pos: &mut usize,
+    numel: usize,
+    key: &str,
+) -> Result<Vec<f32>, TensorIOError> {
+    let payload = native_payload(data, pos, numel, 4, "f32", key, "truncated f32 data")?;
+    let mut values = Vec::with_capacity(numel);
+    for chunk in payload.chunks_exact(4) {
+        values.push(f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]));
+    }
+    Ok(values)
+}
+
+fn read_f16_payload(
+    data: &[u8],
+    pos: &mut usize,
+    numel: usize,
+    key: &str,
+) -> Result<Vec<Float16>, TensorIOError> {
+    let payload = native_payload(data, pos, numel, 2, "f16", key, "truncated f16 data")?;
+    let mut values = Vec::with_capacity(numel);
+    for chunk in payload.chunks_exact(2) {
+        values.push(Float16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Ok(values)
+}
+
+fn read_bf16_payload(
+    data: &[u8],
+    pos: &mut usize,
+    numel: usize,
+    key: &str,
+) -> Result<Vec<BFloat16>, TensorIOError> {
+    let payload = native_payload(data, pos, numel, 2, "bf16", key, "truncated bf16 data")?;
+    let mut values = Vec::with_capacity(numel);
+    for chunk in payload.chunks_exact(2) {
+        values.push(BFloat16::from_le_bytes([chunk[0], chunk[1]]));
+    }
+    Ok(values)
 }
 
 fn read_u32(data: &[u8], pos: &mut usize) -> Result<u32, TensorIOError> {
@@ -3394,6 +3422,28 @@ mod tests {
             loaded["bfloat"].typed_storage().as_bf16().unwrap(),
             vals.as_slice()
         );
+    }
+
+    #[test]
+    fn native_format_bulk_decode_preserves_exact_f32_bytes() {
+        let mut expected = Vec::new();
+        expected.extend_from_slice(b"FTSV");
+        expected.extend_from_slice(&1_u32.to_le_bytes());
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.push(b'w');
+        expected.extend_from_slice(&1_u64.to_le_bytes());
+        expected.extend_from_slice(&2_u64.to_le_bytes());
+        expected.push(super::FT_DTYPE_TAG_F32);
+        expected.extend_from_slice(&1.0_f32.to_le_bytes());
+        expected.extend_from_slice(&(-2.5_f32).to_le_bytes());
+
+        let loaded = load_state_dict_from_bytes(&expected).unwrap();
+        let values = loaded["w"].contiguous_values_f32().unwrap();
+        assert_eq!(values, &[1.0, -2.5]);
+
+        let roundtrip = super::encode_state_dict_to_bytes(&loaded).unwrap();
+        assert_eq!(roundtrip, expected);
     }
 
     #[test]
