@@ -703,7 +703,8 @@ pub fn save_state_dict<P: AsRef<Path>>(
 fn encode_state_dict_to_bytes(
     state_dict: &BTreeMap<String, DenseTensor>,
 ) -> Result<Vec<u8>, TensorIOError> {
-    let mut encoded = Vec::new();
+    let mut encoded =
+        Vec::with_capacity(native_state_dict_encoded_capacity(state_dict).unwrap_or(0));
     // Magic
     encoded.extend_from_slice(FT_MAGIC);
     // Version
@@ -782,6 +783,27 @@ fn encode_state_dict_to_bytes(
     }
 
     Ok(encoded)
+}
+
+fn native_state_dict_encoded_capacity(state_dict: &BTreeMap<String, DenseTensor>) -> Option<usize> {
+    let mut capacity = FT_MAGIC.len().checked_add(4)?.checked_add(8)?;
+    for (key, tensor) in state_dict {
+        let meta = tensor.meta();
+        dtype_to_tag(meta.dtype())?;
+        let numel = meta.numel();
+        if numel == usize::MAX {
+            return None;
+        }
+        let value_bytes = numel.checked_mul(meta.dtype().element_size())?;
+        capacity = capacity
+            .checked_add(8)?
+            .checked_add(key.len())?
+            .checked_add(8)?
+            .checked_add(meta.shape().len().checked_mul(8)?)?
+            .checked_add(1)?
+            .checked_add(value_bytes)?;
+    }
+    Some(capacity)
 }
 
 /// Load a state dict from a FrankenTorch native format file.
@@ -3439,6 +3461,10 @@ mod tests {
         expected.extend_from_slice(&(-2.5_f32).to_le_bytes());
 
         let loaded = load_state_dict_from_bytes(&expected).unwrap();
+        assert_eq!(
+            super::native_state_dict_encoded_capacity(&loaded),
+            Some(expected.len())
+        );
         let values = loaded["w"].contiguous_values_f32().unwrap();
         assert_eq!(values, &[1.0, -2.5]);
 
