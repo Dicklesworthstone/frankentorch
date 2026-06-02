@@ -14794,6 +14794,140 @@ impl TensorTape {
                         rule: "d(trace(X))/dX=grad_out*I (cg)",
                     });
                 }
+                TensorNodeOp::Sort {
+                    input,
+                    dim,
+                    ref indices,
+                    ref input_shape,
+                } => {
+                    // Backward scatter-adds the incoming gradient back to the
+                    // pre-sort positions (`indices[out] = orig_d`). Express it as
+                    // a differentiable ScatterAdd (src = incoming) on a zero base
+                    // so a second backward routes through the sort permutation
+                    // instead of dead-ending at a detached leaf. Sort preserves
+                    // shape, so the index tensor shape is the input shape.
+                    let input_numel =
+                        Self::checked_shape_numel(input_shape, "sort cg backward shape overflow")?;
+                    let index_f64: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
+                    let incoming_vals = self.nodes[incoming_id.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let zeros = self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
+                    let grad_in = self.scatter_add(
+                        zeros,
+                        incoming_id,
+                        dim,
+                        &index_f64,
+                        input_shape.clone(),
+                        &incoming_vals,
+                    )?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(sort(x))/dx=scatter_add(grad) (cg)",
+                    });
+                }
+                TensorNodeOp::TopK {
+                    input,
+                    dim,
+                    k,
+                    ref indices,
+                    ref input_shape,
+                } => {
+                    // Backward scatter-adds the incoming top-k gradient back to
+                    // the selected input positions. ScatterAdd on a zero base
+                    // keeps it differentiable for double-backward. The index
+                    // tensor shape is the output shape (input shape with dim = k).
+                    let input_numel =
+                        Self::checked_shape_numel(input_shape, "topk cg backward shape overflow")?;
+                    let mut output_shape = input_shape.clone();
+                    output_shape[dim] = k;
+                    let index_f64: Vec<f64> = indices.iter().map(|&i| i as f64).collect();
+                    let incoming_vals = self.nodes[incoming_id.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let zeros = self.leaf(vec![0.0; input_numel], input_shape.clone(), false)?;
+                    let grad_in = self.scatter_add(
+                        zeros,
+                        incoming_id,
+                        dim,
+                        &index_f64,
+                        output_shape,
+                        &incoming_vals,
+                    )?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(topk(x))/dx=scatter_add(grad) (cg)",
+                    });
+                }
+                TensorNodeOp::Fmod { lhs, rhs } => {
+                    // d(fmod(a,b))/da = 1 (passthrough); d/db = -trunc(a/b), which
+                    // is piecewise-constant. grad_a routes incoming straight
+                    // through; grad_b gates incoming by the constant factor via
+                    // cg_mul, keeping both dependent on the incoming gradient so a
+                    // second backward routes correctly (fmod'' = 0 a.e.).
+                    let lhs_vals = self.nodes[lhs.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let rhs_vals = self.nodes[rhs.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let shape = self.nodes[lhs.0].tensor.meta().shape().to_vec();
+                    let factor: Vec<f64> = lhs_vals
+                        .iter()
+                        .zip(rhs_vals.iter())
+                        .map(|(a, b)| -(a / b).trunc())
+                        .collect();
+                    let factor_leaf = self.leaf(factor, shape, false)?;
+                    let grad_rhs = self.cg_mul(incoming_id, factor_leaf)?;
+                    self.cg_accumulate(lhs, &mut grad_nodes, incoming_id)?;
+                    self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(fmod(a,b))/da=1; db=-trunc(a/b) (cg)",
+                    });
+                }
+                TensorNodeOp::Remainder { lhs, rhs } => {
+                    // d(remainder(a,b))/da = 1 (passthrough); d/db = -floor(a/b),
+                    // piecewise-constant. Same cg routing as Fmod (remainder'' = 0).
+                    let lhs_vals = self.nodes[lhs.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let rhs_vals = self.nodes[rhs.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let shape = self.nodes[lhs.0].tensor.meta().shape().to_vec();
+                    let factor: Vec<f64> = lhs_vals
+                        .iter()
+                        .zip(rhs_vals.iter())
+                        .map(|(a, b)| -(a / b).floor())
+                        .collect();
+                    let factor_leaf = self.leaf(factor, shape, false)?;
+                    let grad_rhs = self.cg_mul(incoming_id, factor_leaf)?;
+                    self.cg_accumulate(lhs, &mut grad_nodes, incoming_id)?;
+                    self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
+                    Self::complete_dependency(&mut pending, lhs, &mut queue)?;
+                    Self::complete_dependency(&mut pending, rhs, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(remainder(a,b))/da=1; db=-floor(a/b) (cg)",
+                    });
+                }
                 // For unsupported ops, fall back to non-differentiable gradient
                 _ => {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -24781,19 +24915,214 @@ mod tests {
             .expect("first backward");
         // First-order: d/dX = 2*X gated to the diagonal = [6, 0, 0, 10].
         let gx = report1.gradient(x).expect("gx");
-        assert!((gx[0] - 6.0).abs() < 1e-9, "gx[0] expected 6.0, got {}", gx[0]);
-        assert!((gx[1] - 0.0).abs() < 1e-9, "gx[1] expected 0.0, got {}", gx[1]);
-        assert!((gx[2] - 0.0).abs() < 1e-9, "gx[2] expected 0.0, got {}", gx[2]);
-        assert!((gx[3] - 10.0).abs() < 1e-9, "gx[3] expected 10.0, got {}", gx[3]);
+        assert!(
+            (gx[0] - 6.0).abs() < 1e-9,
+            "gx[0] expected 6.0, got {}",
+            gx[0]
+        );
+        assert!(
+            (gx[1] - 0.0).abs() < 1e-9,
+            "gx[1] expected 0.0, got {}",
+            gx[1]
+        );
+        assert!(
+            (gx[2] - 0.0).abs() < 1e-9,
+            "gx[2] expected 0.0, got {}",
+            gx[2]
+        );
+        assert!(
+            (gx[3] - 10.0).abs() < 1e-9,
+            "gx[3] expected 10.0, got {}",
+            gx[3]
+        );
 
         // Second derivative: d(2*X_diag)/dX = 2 on the diagonal = [2, 0, 0, 2].
         let dx_node = report1.gradient_node(x).expect("gradient node for x");
         let report2 = tape.backward(dx_node).expect("second backward");
         let g2 = report2.gradient(x).expect("second gradient");
-        assert!((g2[0] - 2.0).abs() < 1e-9, "d2[0] expected 2.0, got {}", g2[0]);
-        assert!((g2[1] - 0.0).abs() < 1e-9, "d2[1] expected 0.0, got {}", g2[1]);
-        assert!((g2[2] - 0.0).abs() < 1e-9, "d2[2] expected 0.0, got {}", g2[2]);
-        assert!((g2[3] - 2.0).abs() < 1e-9, "d2[3] expected 2.0, got {}", g2[3]);
+        assert!(
+            (g2[0] - 2.0).abs() < 1e-9,
+            "d2[0] expected 2.0, got {}",
+            g2[0]
+        );
+        assert!(
+            (g2[1] - 0.0).abs() < 1e-9,
+            "d2[1] expected 0.0, got {}",
+            g2[1]
+        );
+        assert!(
+            (g2[2] - 0.0).abs() < 1e-9,
+            "d2[2] expected 0.0, got {}",
+            g2[2]
+        );
+        assert!(
+            (g2[3] - 2.0).abs() < 1e-9,
+            "d2[3] expected 2.0, got {}",
+            g2[3]
+        );
+    }
+
+    #[test]
+    fn create_graph_sort_second_derivative_routes_through_permutation() {
+        // L = sum(sort(x)^2) = sum(x^2). sort is a constant permutation, so the
+        // gradient scatters 2*y back to the pre-sort positions => grad_x = 2*x,
+        // and the second backward (ones-seeded) recovers 2 everywhere. Proves the
+        // sort gradient stays dependent on the incoming gradient (was fail-loud).
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![3.0, 1.0, 2.0], vec![3], true).expect("x");
+        let (y, _idx, _) = tape.sort(x, 0, false, ExecutionMode::Strict).expect("sort");
+        let (ys, _) = tape.mul(y, y, ExecutionMode::Strict).expect("ys");
+        let (s, _) = tape.sum(ys, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        // grad_x = 2*x = [6, 2, 4].
+        let gx = report1.gradient(x).expect("gx");
+        assert!(
+            (gx[0] - 6.0).abs() < 1e-9,
+            "gx[0] expected 6.0, got {}",
+            gx[0]
+        );
+        assert!(
+            (gx[1] - 2.0).abs() < 1e-9,
+            "gx[1] expected 2.0, got {}",
+            gx[1]
+        );
+        assert!(
+            (gx[2] - 4.0).abs() < 1e-9,
+            "gx[2] expected 4.0, got {}",
+            gx[2]
+        );
+        // Second derivative: d(2x)/dx = 2 everywhere.
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let g2 = report2.gradient(x).expect("second gradient");
+        for (i, &v) in g2.iter().enumerate() {
+            assert!((v - 2.0).abs() < 1e-9, "d2[{i}] expected 2.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn create_graph_topk_second_derivative_routes_through_selection() {
+        // L = sum(topk(x,2)^2). top-2 largest of [3,1,2,5] is [5,3] at orig idx
+        // {3,0}. grad scatters 2*y back to those positions => grad_x = 2*x there,
+        // 0 elsewhere; second backward recovers 2 on the selected positions.
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![3.0, 1.0, 2.0, 5.0], vec![4], true)
+            .expect("x");
+        let (y, _idx, _) = tape
+            .topk(x, 2, 0, true, true, ExecutionMode::Strict)
+            .expect("topk");
+        let (ys, _) = tape.mul(y, y, ExecutionMode::Strict).expect("ys");
+        let (s, _) = tape.sum(ys, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        // grad_x = 2*x on the selected positions {0,3} = [6, 0, 0, 10].
+        let gx = report1.gradient(x).expect("gx");
+        assert!(
+            (gx[0] - 6.0).abs() < 1e-9,
+            "gx[0] expected 6.0, got {}",
+            gx[0]
+        );
+        assert!(
+            (gx[1] - 0.0).abs() < 1e-9,
+            "gx[1] expected 0.0, got {}",
+            gx[1]
+        );
+        assert!(
+            (gx[2] - 0.0).abs() < 1e-9,
+            "gx[2] expected 0.0, got {}",
+            gx[2]
+        );
+        assert!(
+            (gx[3] - 10.0).abs() < 1e-9,
+            "gx[3] expected 10.0, got {}",
+            gx[3]
+        );
+        // Second derivative: 2 on selected positions, 0 elsewhere.
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let g2 = report2.gradient(x).expect("second gradient");
+        assert!(
+            (g2[0] - 2.0).abs() < 1e-9,
+            "d2[0] expected 2.0, got {}",
+            g2[0]
+        );
+        assert!(
+            (g2[1] - 0.0).abs() < 1e-9,
+            "d2[1] expected 0.0, got {}",
+            g2[1]
+        );
+        assert!(
+            (g2[2] - 0.0).abs() < 1e-9,
+            "d2[2] expected 0.0, got {}",
+            g2[2]
+        );
+        assert!(
+            (g2[3] - 2.0).abs() < 1e-9,
+            "d2[3] expected 2.0, got {}",
+            g2[3]
+        );
+    }
+
+    #[test]
+    fn create_graph_fmod_gradients() {
+        // fmod(a,b): d/da = 1, d/db = -trunc(a/b). create_graph must not fail-loud.
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![5.5, 7.0], vec![2], true).expect("a");
+        let b = tape.leaf(vec![3.0, 2.0], vec![2], true).expect("b");
+        let (f, _) = tape.tensor_fmod(a, b, ExecutionMode::Strict).expect("fmod");
+        let (s, _) = tape.sum(f, ExecutionMode::Strict).expect("sum");
+        let report = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("backward");
+        assert_eq!(report.gradient(a).expect("ga"), &[1.0, 1.0]);
+        // -trunc(5.5/3)=-1, -trunc(7/2)=-3.
+        assert_eq!(report.gradient(b).expect("gb"), &[-1.0, -3.0]);
+    }
+
+    #[test]
+    fn create_graph_remainder_gradients() {
+        // remainder(a,b): d/da = 1, d/db = -floor(a/b). create_graph must not fail-loud.
+        let mut tape = TensorTape::new();
+        let a = tape.leaf(vec![5.5, -7.0], vec![2], true).expect("a");
+        let b = tape.leaf(vec![3.0, 2.0], vec![2], true).expect("b");
+        let (r, _) = tape
+            .tensor_remainder(a, b, ExecutionMode::Strict)
+            .expect("remainder");
+        let (s, _) = tape.sum(r, ExecutionMode::Strict).expect("sum");
+        let report = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("backward");
+        assert_eq!(report.gradient(a).expect("ga"), &[1.0, 1.0]);
+        // -floor(5.5/3)=-1, -floor(-7/2)=-floor(-3.5)=-(-4)=4.
+        assert_eq!(report.gradient(b).expect("gb"), &[-1.0, 4.0]);
     }
 
     #[test]
