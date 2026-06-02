@@ -10,5 +10,12 @@ ft-api = { workspace = true }
 ft-autograd = { workspace = true }
 ft-dispatch = { workspace = true }
 
+[dev-dependencies]
+criterion = { workspace = true }
+
+[[bench]]
+name = "dataloader_bench"
+harness = false
+
 [lints]
 workspace = true

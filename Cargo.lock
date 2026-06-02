@@ -553,6 +553,7 @@ dependencies = [
 name = "ft-data"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ft-api",
  "ft-autograd",
  "ft-core",
