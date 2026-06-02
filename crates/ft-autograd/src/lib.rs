@@ -14710,24 +14710,19 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Softplus { input } => {
-                    // d(softplus(x))/dx = sigmoid(x) = 1 / (1 + exp(-x))
-                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals =
-                        self.nodes[incoming_id.0].tensor.contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
-                        .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| {
-                            let grad = if *x > 20.0 {
-                                1.0
-                            } else {
-                                1.0 / (1.0 + (-x).exp())
-                            };
-                            g * grad
-                        })
-                        .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    // d(softplus(x))/dx = sigmoid(x). Using the output y = softplus(x) >= 0,
+                    // sigmoid(x) = 1 - exp(-y), which is numerically stable (exp argument <= 0)
+                    // and composes from cg primitives so the gradient node depends on the input.
+                    // Double-backward is then correct: softplus''(x) = sigmoid(x)*(1-sigmoid(x))
+                    // is nonzero; a detached leaf dropped it.
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel =
+                        Self::checked_shape_numel(&shape, "softplus backward shape overflow")?;
+                    let one = self.leaf(vec![1.0; numel], shape, false)?;
+                    let neg_out = self.cg_neg(node_id)?;
+                    let exp_neg_out = self.cg_exp(neg_out)?;
+                    let sigmoid = self.cg_sub(one, exp_neg_out)?;
+                    let grad_in = self.cg_mul(incoming_id, sigmoid)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -14737,23 +14732,28 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Mish { input } => {
-                    // mish(x) = x * tanh(softplus(x))
-                    // d/dx = tanh(sp) + x * sigmoid(x) * (1 - tanh(sp)^2)
-                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let input_vals = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals =
-                        self.nodes[incoming_id.0].tensor.contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
-                        .iter()
-                        .zip(input_vals.iter())
-                        .map(|(g, x)| {
-                            let sp = if *x > 20.0 { *x } else { x.exp().ln_1p() };
-                            let tsp = sp.tanh();
-                            let sig = 1.0 / (1.0 + (-x).exp());
-                            g * (tsp + x * sig * (1.0 - tsp * tsp))
-                        })
-                        .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    // mish(x) = x * tanh(softplus(x));
+                    // d/dx = tanh(sp) + x * sigmoid(x) * (1 - tanh(sp)^2),  sp = softplus(x).
+                    // Let u = 1 + exp(x) = exp(sp). Then tanh(sp) = (u^2-1)/(u^2+1) and
+                    // sigmoid(x) = exp(x)/u, both composable from cg primitives. Building the
+                    // derivative this way keeps the gradient node dependent on the input, so
+                    // double-backward is correct instead of silently zero (was a detached leaf).
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel = Self::checked_shape_numel(&shape, "mish backward shape overflow")?;
+                    let one = self.leaf(vec![1.0; numel], shape, false)?;
+                    let ex = self.cg_exp(input)?; // exp(x)
+                    let u = self.cg_add(one, ex)?; // 1 + exp(x)
+                    let u_sq = self.cg_mul(u, u)?;
+                    let num = self.cg_sub(u_sq, one)?; // u^2 - 1
+                    let den = self.cg_add(u_sq, one)?; // u^2 + 1
+                    let tanh_sp = self.cg_div(num, den)?; // tanh(softplus(x))
+                    let sigmoid = self.cg_div(ex, u)?; // exp(x)/(1+exp(x))
+                    let tanh_sq = self.cg_mul(tanh_sp, tanh_sp)?;
+                    let one_minus_t2 = self.cg_sub(one, tanh_sq)?;
+                    let x_sig = self.cg_mul(input, sigmoid)?;
+                    let term2 = self.cg_mul(x_sig, one_minus_t2)?;
+                    let deriv = self.cg_add(tanh_sp, term2)?;
+                    let grad_in = self.cg_mul(incoming_id, deriv)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -24471,6 +24471,97 @@ mod tests {
         let gx = report.gradient(x).expect("gx")[0];
         // At x=0: sp=ln(2)≈0.693, tanh(0.693)≈0.6, so grad≈0.6
         assert!(gx > 0.5 && gx < 0.7);
+    }
+
+    #[test]
+    fn create_graph_softplus_second_derivative() {
+        // softplus'(x) = sigmoid(x); softplus''(x) = sigmoid(x)*(1 - sigmoid(x)).
+        // Elementwise + smooth, so the second backward (seeded with ones) recovers the
+        // diagonal curvature directly. A detached gradient leaf would return zero here.
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![0.0, 1.0], vec![2], true).expect("x");
+        let (sp, _) = tape.softplus(x, ExecutionMode::Strict).expect("softplus");
+        let (s, _) = tape.sum(sp, ExecutionMode::Strict).expect("sum");
+        let rep1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        let g = rep1.gradient(x).expect("g");
+        let sig0 = 1.0 / (1.0 + 1.0_f64); // sigmoid(0) = 0.5
+        let sig1 = 1.0 / (1.0 + (-1.0_f64).exp());
+        assert!((g[0] - sig0).abs() < 1e-9);
+        assert!((g[1] - sig1).abs() < 1e-9);
+        let dx = rep1.gradient_node(x).expect("gradient node");
+        let rep2 = tape.backward(dx).expect("second backward");
+        let h = rep2.gradient(x).expect("second gradient");
+        assert!(
+            (h[0] - sig0 * (1.0 - sig0)).abs() < 1e-9,
+            "softplus''(0) should be 0.25, got {}",
+            h[0]
+        );
+        assert!(
+            (h[1] - sig1 * (1.0 - sig1)).abs() < 1e-9,
+            "softplus''(1) mismatch, got {}",
+            h[1]
+        );
+    }
+
+    #[test]
+    fn create_graph_mish_second_derivative_matches_fd() {
+        // mish'' has a messy closed form; verify the second backward against a central
+        // finite difference of mish'(x). Elementwise, so the ones-seeded second backward
+        // yields the diagonal curvature mish''(x_i).
+        let x0 = vec![0.5, -1.3, 2.0];
+        let n = x0.len();
+        let mish_grad = |xv: &[f64]| -> Vec<f64> {
+            let mut tape = TensorTape::new();
+            let x = tape.leaf(xv.to_vec(), vec![xv.len()], true).expect("x");
+            let (m, _) = tape.mish(x, ExecutionMode::Strict).expect("mish");
+            let (s, _) = tape.sum(m, ExecutionMode::Strict).expect("sum");
+            let rep = tape.backward(s).expect("backward");
+            rep.gradient(x).expect("g").to_vec()
+        };
+
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(x0.clone(), vec![n], true).expect("x");
+        let (m, _) = tape.mish(x, ExecutionMode::Strict).expect("mish");
+        let (s, _) = tape.sum(m, ExecutionMode::Strict).expect("sum");
+        let rep1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        let dx = rep1.gradient_node(x).expect("gradient node");
+        let rep2 = tape.backward(dx).expect("second backward");
+        let h = rep2.gradient(x).expect("second gradient");
+
+        let eps = 1e-6;
+        for i in 0..n {
+            let mut xp = x0.clone();
+            xp[i] += eps;
+            let mut xm = x0.clone();
+            xm[i] -= eps;
+            let fd = (mish_grad(&xp)[i] - mish_grad(&xm)[i]) / (2.0 * eps);
+            assert!(
+                (h[i] - fd).abs() < 1e-5,
+                "mish''[{i}] mismatch: analytic {} vs fd {}",
+                h[i],
+                fd
+            );
+        }
+        assert!(
+            h.iter().any(|v| v.abs() > 1e-6),
+            "mish second derivative should be nonzero (proves it is not detached)"
+        );
     }
 
     // ── frankentorch-igu: Property-based tests for tensor autograd ─────
