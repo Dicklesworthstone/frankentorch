@@ -7,13 +7,53 @@ use wide::{f32x8, f64x4};
 
 #[allow(unsafe_code)]
 mod gemm {
+    use rayon::prelude::*;
+
+    // Above this many fused multiply-adds, split the GEMM across output row
+    // blocks and run them on the rayon pool. `matrixmultiply` is single-threaded,
+    // so a large solo matmul (the torch→ATen/MKL gap is multi-threaded BLAS) left
+    // all but one core idle. Each block is an independent matrixmultiply call over
+    // a contiguous row range of A and C: for a given output element the
+    // k-accumulation order is fixed by the micro-kernel and does NOT depend on the
+    // row count, so the parallel result is bit-for-bit identical to the single
+    // call (proved by `gemm_row_split_matches_single_bit_exact`).
+    const PAR_MIN_FLOPS: u128 = 1 << 20;
+    const MIN_BLOCK_ROWS: usize = 8;
+
+    fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
+        rayon::current_num_threads() > 1
+            && m > MIN_BLOCK_ROWS
+            && (m as u128) * (k as u128) * (n as u128) >= PAR_MIN_FLOPS
+    }
+
+    fn block_rows(m: usize) -> usize {
+        let threads = rayon::current_num_threads().max(1);
+        m.div_ceil(threads).max(MIN_BLOCK_ROWS)
+    }
+
     pub fn dgemm(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..k * n];
+        let c = &mut c[..m * n];
+        if !should_parallelize(m, k, n) {
+            dgemm_block(m, k, n, a, b, c);
+            return;
+        }
+        let br = block_rows(m);
+        c.par_chunks_mut(br * n)
+            .zip(a.par_chunks(br * k))
+            .for_each(|(c_blk, a_blk)| {
+                dgemm_block(c_blk.len() / n, k, n, a_blk, b, c_blk);
+            });
+    }
+
+    pub fn dgemm_block(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
         // SAFETY: matrixmultiply::dgemm requires valid pointers and correct dimensions.
-        // We verify:
-        // - a.len() >= m*k (verified by caller via ensure_storage_len)
-        // - b.len() >= k*n (verified by caller)
-        // - c.len() >= m*n (allocated by caller)
-        // Row-major layout: row stride = inner dimension, column stride = 1
+        // a.len() == m*k, b.len() == k*n, c.len() == m*n (sliced exactly by `dgemm`).
+        // Row-major layout: row stride = inner dimension, column stride = 1.
         unsafe {
             matrixmultiply::dgemm(
                 m,
@@ -35,6 +75,26 @@ mod gemm {
     }
 
     pub fn sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..k * n];
+        let c = &mut c[..m * n];
+        if !should_parallelize(m, k, n) {
+            sgemm_block(m, k, n, a, b, c);
+            return;
+        }
+        let br = block_rows(m);
+        c.par_chunks_mut(br * n)
+            .zip(a.par_chunks(br * k))
+            .for_each(|(c_blk, a_blk)| {
+                sgemm_block(c_blk.len() / n, k, n, a_blk, b, c_blk);
+            });
+    }
+
+    pub fn sgemm_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        // SAFETY: see `dgemm_block`; slices are sized exactly by `sgemm`.
         unsafe {
             matrixmultiply::sgemm(
                 m,
@@ -9787,6 +9847,52 @@ mod tests {
         let out = add_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta)
             .expect("empty tensors should succeed without touching storage");
         assert!(out.is_empty());
+    }
+
+    #[test]
+    fn gemm_row_split_matches_single_bit_exact() {
+        // Isomorphism proof for the parallel GEMM lever: splitting the output into
+        // row blocks must reproduce the single matrixmultiply call BIT-FOR-BIT.
+        // Values are chosen so partial sums lose precision (reassociation WOULD
+        // change the low bits), so a passing test means the k-accumulation order
+        // is genuinely preserved across the row split.
+        let (m, k, n) = (130usize, 64usize, 130usize); // flops >= 1<<20 -> parallel path
+        let a: Vec<f64> = (0..m * k)
+            .map(|i| ((i % 13) as f64 - 6.0) * 0.3 + (i as f64) * 1e-7)
+            .collect();
+        let b: Vec<f64> = (0..k * n)
+            .map(|i| ((i % 7) as f64 - 3.0) * 0.25 - (i as f64) * 1e-7)
+            .collect();
+        let mut c_single = vec![0.0_f64; m * n];
+        crate::gemm::dgemm_block(m, k, n, &a, &b, &mut c_single);
+        let mut c_par = vec![0.0_f64; m * n];
+        crate::gemm::dgemm(m, k, n, &a, &b, &mut c_par);
+        for (idx, (s, p)) in c_single.iter().zip(c_par.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                p.to_bits(),
+                "f64 GEMM row-split diverged at {idx}: single {s} vs parallel {p}"
+            );
+        }
+
+        // Same for f32.
+        let af: Vec<f32> = (0..m * k)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.2 + (i as f32) * 1e-5)
+            .collect();
+        let bf: Vec<f32> = (0..k * n)
+            .map(|i| ((i % 5) as f32 - 2.0) * 0.3 - (i as f32) * 1e-5)
+            .collect();
+        let mut cf_single = vec![0.0_f32; m * n];
+        crate::gemm::sgemm_block(m, k, n, &af, &bf, &mut cf_single);
+        let mut cf_par = vec![0.0_f32; m * n];
+        crate::gemm::sgemm(m, k, n, &af, &bf, &mut cf_par);
+        for (idx, (s, p)) in cf_single.iter().zip(cf_par.iter()).enumerate() {
+            assert_eq!(
+                s.to_bits(),
+                p.to_bits(),
+                "f32 GEMM row-split diverged at {idx}: single {s} vs parallel {p}"
+            );
+        }
     }
 
     #[test]
