@@ -77,3 +77,9 @@ Delta:
 - `sha256sum -c artifacts/optimization/golden_checksums.txt --ignore-missing` passed
 - `git diff --check` passed
 - `ubs crates/ft-core/src/lib.rs crates/ft-core/benches/core_bench.rs crates/ft-core/Cargo.toml` passed with 0 critical findings
+
+## Landing Note
+
+The pass files landed in commit `ff8bf16` through a shared-index race while
+validation was still running. This artifact note records the evidence correction
+and keeps the performance numbers explicit in the follow-up commit message.
