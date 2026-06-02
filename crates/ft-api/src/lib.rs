@@ -28288,26 +28288,81 @@ impl FrankenTorchSession {
         inputs: &[TensorNodeId],
         v: &[Vec<f64>],
     ) -> Result<Vec<Option<Vec<f64>>>, AutogradError> {
-        // HVP = d/dx (v^T @ grad(f))
-        // First compute grad(f) with create_graph=true
-        let grads = self.tensor_autograd_grad(&[output], inputs, None, true, true)?;
+        self.hessian_vector_product(output, inputs, v)
+    }
 
-        // Compute v^T @ grad for each input
-        let mut vdotg_sum = 0.0;
-        for (i, grad_opt) in grads.iter().enumerate() {
-            if let Some(g) = grad_opt {
-                let vi = v.get(i).map(|x| x.as_slice()).unwrap_or(&[]);
-                for (gj, vj) in g.iter().zip(vi.iter()) {
-                    vdotg_sum += gj * vj;
-                }
+    /// Compute the vector-Hessian product (VHP).
+    ///
+    /// Equivalent to `torch.autograd.functional.vhp(func, inputs, v)`.
+    /// Given a scalar function f, computes `vᵀ H`. The Hessian of a scalar
+    /// function is symmetric, so this equals the Hessian-vector product `H v`.
+    ///
+    /// # Arguments
+    /// * `output` - Scalar output of the function (shape `[1]` or `[]`)
+    /// * `inputs` - Input tensors
+    /// * `v` - Vectors to multiply with the Hessian, one per input
+    pub fn tensor_functional_vhp(
+        &mut self,
+        output: TensorNodeId,
+        inputs: &[TensorNodeId],
+        v: &[Vec<f64>],
+    ) -> Result<Vec<Option<Vec<f64>>>, AutogradError> {
+        self.hessian_vector_product(output, inputs, v)
+    }
+
+    /// Shared core for `hvp`/`vhp`: `H v` via the double-backward trick.
+    ///
+    /// A first `create_graph` backward exposes the gradient `g = ∇f` as
+    /// differentiable tape nodes (`gradient_node`). The scalar
+    /// `s = Σᵢ ⟨gᵢ, vᵢ⟩` (with each `vᵢ` a non-grad constant) then satisfies
+    ///   ∂s/∂xⱼ = Σᵢ vᵢ · ∂gᵢ/∂xⱼ = Σᵢ vᵢ Hᵢⱼ = (H v)ⱼ,
+    /// so a second backward over `s` yields the Hessian-vector product exactly.
+    /// Returns `None` for any input not connected to `output`.
+    fn hessian_vector_product(
+        &mut self,
+        output: TensorNodeId,
+        inputs: &[TensorNodeId],
+        v: &[Vec<f64>],
+    ) -> Result<Vec<Option<Vec<f64>>>, AutogradError> {
+        let first = BackwardOptions::for_mode(self.mode())
+            .with_create_graph(true)
+            .with_retain_graph(true);
+        let report1 = self.tensor_backward_with_options(output, first)?;
+
+        let mut s_node: Option<TensorNodeId> = None;
+        for (i, &inp) in inputs.iter().enumerate() {
+            let Some(grad_node) = report1.gradient_node(inp) else {
+                continue;
+            };
+            let shape = self.tensor_shape(inp)?;
+            let numel: usize = shape.iter().product();
+            let vi = v.get(i).ok_or_else(|| {
+                Self::incompatible_tensor_args("hessian product: one v vector required per input")
+            })?;
+            if vi.len() != numel {
+                return Err(Self::incompatible_tensor_args(
+                    "hessian product: each v vector must match its input's element count",
+                ));
             }
+            let v_tensor = self.tensor_variable(vi.clone(), shape, false)?;
+            let prod = self.tensor_mul(grad_node, v_tensor)?;
+            let dotted = self.tensor_sum(prod)?;
+            s_node = Some(match s_node {
+                Some(acc) => self.tensor_add(acc, dotted)?,
+                None => dotted,
+            });
         }
 
-        // Create a scalar tensor for the dot product
-        let vdotg = self.tensor_variable(vec![vdotg_sum], vec![1], true)?;
+        let Some(s_node) = s_node else {
+            return Ok(inputs.iter().map(|_| None).collect());
+        };
 
-        // Differentiate again to get HVP
-        self.tensor_autograd_grad(&[vdotg], inputs, None, false, false)
+        let report2 =
+            self.tensor_backward_with_options(s_node, BackwardOptions::for_mode(self.mode()))?;
+        Ok(inputs
+            .iter()
+            .map(|&inp| report2.gradient(inp).map(<[f64]>::to_vec))
+            .collect())
     }
 
     pub fn tensor_set_accumulated_gradient(
@@ -88996,6 +89051,55 @@ mod tests {
         let err =
             s.tensor_autograd_grad(&[y], &[x], Some(&[vec![1.0, 2.0], vec![3.0, 4.0]]), false, false);
         assert!(err.is_err());
+    }
+
+    // f(x,y) = x²y + y³ ; ∇f = [2xy, x²+3y²] ; H = [[2y, 2x], [2x, 6y]].
+    // At (1,2): H = [[4, 2], [2, 12]].
+    fn build_xy2_plus_y3(s: &mut FrankenTorchSession) -> (TensorNodeId, TensorNodeId, TensorNodeId) {
+        let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let y = s.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let x2 = s.tensor_mul(x, x).unwrap();
+        let x2y = s.tensor_mul(x2, y).unwrap();
+        let y2 = s.tensor_mul(y, y).unwrap();
+        let y3 = s.tensor_mul(y2, y).unwrap();
+        let f = s.tensor_add(x2y, y3).unwrap();
+        (x, y, f)
+    }
+
+    #[test]
+    fn functional_hvp_matches_hessian_vector_product() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (x, y, f) = build_xy2_plus_y3(&mut s);
+        // H @ [1, 0]ᵀ = [4, 2].
+        let hv = s
+            .tensor_functional_hvp(f, &[x, y], &[vec![1.0], vec![0.0]])
+            .unwrap();
+        assert_eq!(hv[0].as_ref().unwrap(), &[4.0]);
+        assert_eq!(hv[1].as_ref().unwrap(), &[2.0]);
+    }
+
+    #[test]
+    fn functional_hvp_second_column() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (x, y, f) = build_xy2_plus_y3(&mut s);
+        // H @ [0, 1]ᵀ = [2, 12].
+        let hv = s
+            .tensor_functional_hvp(f, &[x, y], &[vec![0.0], vec![1.0]])
+            .unwrap();
+        assert_eq!(hv[0].as_ref().unwrap(), &[2.0]);
+        assert_eq!(hv[1].as_ref().unwrap(), &[12.0]);
+    }
+
+    #[test]
+    fn functional_vhp_equals_hvp_for_symmetric_hessian() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (x, y, f) = build_xy2_plus_y3(&mut s);
+        // vᵀH with v = [1, 1] = [4+2, 2+12] = [6, 14].
+        let vh = s
+            .tensor_functional_vhp(f, &[x, y], &[vec![1.0], vec![1.0]])
+            .unwrap();
+        assert_eq!(vh[0].as_ref().unwrap(), &[6.0]);
+        assert_eq!(vh[1].as_ref().unwrap(), &[14.0]);
     }
 
     #[test]
