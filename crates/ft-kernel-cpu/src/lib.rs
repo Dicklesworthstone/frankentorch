@@ -4116,28 +4116,34 @@ pub fn sort_tensor_contiguous_f64(
     let mut sorted_values = vec![0.0; numel];
     let mut indices = vec![0usize; numel];
 
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let mut lane: Vec<(usize, f64)> = (0..dim_size)
-                .map(|d| {
-                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    (d, data[idx])
-                })
-                .collect();
+    // Each `outer` owns a contiguous block of dim_size*inner_size in both
+    // outputs, and every lane sorts independently. Parallelize over outer blocks
+    // (sorting is compute-bound). The per-lane stable sort with the fixed
+    // comparator is identical regardless of scheduling, so values AND indices are
+    // bit-for-bit identical to the serial version.
+    let block = dim_size * inner_size;
+    sorted_values
+        .par_chunks_mut(block)
+        .zip(indices.par_chunks_mut(block))
+        .zip(data[..numel].par_chunks(block))
+        .for_each(|((sv_block, idx_block), in_block)| {
+            for inner in 0..inner_size {
+                let mut lane: Vec<(usize, f64)> = (0..dim_size)
+                    .map(|d| (d, in_block[d * inner_size + inner]))
+                    .collect();
 
-            if descending {
-                lane.sort_by(|a, b| nan_greatest_cmp_f64(b.1, a.1));
-            } else {
-                lane.sort_by(|a, b| nan_greatest_cmp_f64(a.1, b.1));
-            }
+                if descending {
+                    lane.sort_by(|a, b| nan_greatest_cmp_f64(b.1, a.1));
+                } else {
+                    lane.sort_by(|a, b| nan_greatest_cmp_f64(a.1, b.1));
+                }
 
-            for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
-                let out_idx = outer * dim_size * inner_size + out_d * inner_size + inner;
-                sorted_values[out_idx] = val;
-                indices[out_idx] = orig_d;
+                for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
+                    sv_block[out_d * inner_size + inner] = val;
+                    idx_block[out_d * inner_size + inner] = orig_d;
+                }
             }
-        }
-    }
+        });
 
     Ok((sorted_values, indices))
 }
@@ -7985,26 +7991,29 @@ pub fn sort_tensor_contiguous_f32(
     let data = &input[offset..];
     let mut sorted_values = vec![0.0f32; numel];
     let mut indices = vec![0usize; numel];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let mut lane: Vec<(usize, f32)> = (0..dim_size)
-                .map(|d| {
-                    let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                    (d, data[idx])
-                })
-                .collect();
-            if descending {
-                lane.sort_by(|a, b| nan_greatest_cmp_f32(b.1, a.1));
-            } else {
-                lane.sort_by(|a, b| nan_greatest_cmp_f32(a.1, b.1));
+    // F32 mirror: parallelize over independent per-outer blocks; bit-identical
+    // to the serial version (stable sort, fixed comparator). See the f64 path.
+    let block = dim_size * inner_size;
+    sorted_values
+        .par_chunks_mut(block)
+        .zip(indices.par_chunks_mut(block))
+        .zip(data[..numel].par_chunks(block))
+        .for_each(|((sv_block, idx_block), in_block)| {
+            for inner in 0..inner_size {
+                let mut lane: Vec<(usize, f32)> = (0..dim_size)
+                    .map(|d| (d, in_block[d * inner_size + inner]))
+                    .collect();
+                if descending {
+                    lane.sort_by(|a, b| nan_greatest_cmp_f32(b.1, a.1));
+                } else {
+                    lane.sort_by(|a, b| nan_greatest_cmp_f32(a.1, b.1));
+                }
+                for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
+                    sv_block[out_d * inner_size + inner] = val;
+                    idx_block[out_d * inner_size + inner] = orig_d;
+                }
             }
-            for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
-                let out_idx = outer * dim_size * inner_size + out_d * inner_size + inner;
-                sorted_values[out_idx] = val;
-                indices[out_idx] = orig_d;
-            }
-        }
-    }
+        });
     Ok((sorted_values, indices))
 }
 
@@ -12376,6 +12385,62 @@ mod tests {
     }
 
     // ---- sort ----
+
+    #[test]
+    fn sort_parallel_matches_serial_bit_exact() {
+        // Isomorphism proof for parallelizing sort-along-dim over lanes: the
+        // parallel kernel must reproduce the serial per-lane stable sort
+        // BIT-FOR-BIT — identical sorted values AND identical original-index
+        // tie-breaks. Uses a strided shape (inner_size > 1) and a last-dim shape.
+        for (shape, dim, desc) in [
+            (vec![13usize, 32usize, 4usize], 1usize, false), // strided, inner=4
+            (vec![97usize, 64usize], 1usize, true),          // last dim, descending
+        ] {
+            let numel: usize = shape.iter().product();
+            let reduce = shape[dim];
+            let inner: usize = shape[dim + 1..].iter().product();
+            let outer: usize = shape[..dim].iter().product();
+            // Include duplicates so the stable tie-break is actually exercised.
+            let data: Vec<f64> = (0..numel)
+                .map(|i| ((i * 37 + 11) % 19) as f64 * 0.5)
+                .collect();
+            let meta = TensorMeta::from_shape(shape.clone(), DType::F64, Device::Cpu);
+
+            let mut sv_ref = vec![0.0_f64; numel];
+            let mut idx_ref = vec![0usize; numel];
+            for o in 0..outer {
+                for i in 0..inner {
+                    let mut lane: Vec<(usize, f64)> = (0..reduce)
+                        .map(|d| (d, data[o * reduce * inner + d * inner + i]))
+                        .collect();
+                    if desc {
+                        lane.sort_by(|a, b| super::nan_greatest_cmp_f64(b.1, a.1));
+                    } else {
+                        lane.sort_by(|a, b| super::nan_greatest_cmp_f64(a.1, b.1));
+                    }
+                    for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
+                        let idx = o * reduce * inner + out_d * inner + i;
+                        sv_ref[idx] = val;
+                        idx_ref[idx] = orig_d;
+                    }
+                }
+            }
+
+            let (sv, idx) =
+                super::sort_tensor_contiguous_f64(&data, &meta, dim, desc).expect("sort");
+            assert_eq!(
+                idx, idx_ref,
+                "sort indices diverged for {shape:?} dim {dim}"
+            );
+            for k in 0..numel {
+                assert_eq!(
+                    sv[k].to_bits(),
+                    sv_ref[k].to_bits(),
+                    "sort values diverged at {k} for {shape:?} dim {dim}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn sort_1d_ascending() {
