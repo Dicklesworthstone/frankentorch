@@ -643,7 +643,7 @@ impl Optimizer for AdamW {
                 .ok_or_else(|| optimizer_state_error("optimizer step state length mismatch"))?;
             let t = checked_next_step_count(current_step, "adamw step counter overflow")?;
 
-            let param_values = session.tensor_values(param)?;
+            let mut param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
             let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
 
@@ -684,24 +684,23 @@ impl Optimizer for AdamW {
             // Decoupled weight decay is equivalent to subtracting
             // `lr * weight_decay * param` before the Adam update; combine both
             // deltas so failed state validation cannot partially mutate weights.
-            let update: Vec<f64> = next_m
-                .iter()
+            for ((p, m_val), v_val) in param_values
+                .iter_mut()
+                .zip(next_m.iter())
                 .zip(next_v.iter())
-                .zip(param_values.iter())
-                .map(|((m_val, v_val), p)| {
-                    let m_hat = m_val / bias_correction1;
-                    let v_hat = v_val / bias_correction2;
-                    let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                    let decay_delta = if self.weight_decay == 0.0 {
-                        0.0
-                    } else {
-                        p * self.lr * self.weight_decay
-                    };
-                    decay_delta + adam_delta
-                })
-                .collect();
+            {
+                let m_hat = m_val / bias_correction1;
+                let v_hat = v_val / bias_correction2;
+                let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                let decay_delta = if self.weight_decay == 0.0 {
+                    0.0
+                } else {
+                    *p * self.lr * self.weight_decay
+                };
+                *p -= decay_delta + adam_delta;
+            }
 
-            apply_param_update(session, param, &update)?;
+            session.tensor_update_param_values(param, param_values)?;
             self.step_counts[i] = t;
             self.m[i] = Some(next_m);
             self.v[i] = Some(next_v);
@@ -5360,7 +5359,7 @@ fn newton_schulz_ortho(m: &[f64], ns_steps: usize) -> Vec<f64> {
 fn factorize_approx_square(numel: usize) -> (usize, usize) {
     let sqrt_n = (numel as f64).sqrt() as usize;
     for cols in (1..=sqrt_n).rev() {
-        if numel % cols == 0 {
+        if numel.is_multiple_of(cols) {
             return (numel / cols, cols);
         }
     }
@@ -6836,6 +6835,28 @@ mod tests {
             "AdamW should decrease x: before={}, after={}",
             x_before,
             x_after
+        );
+    }
+
+    #[test]
+    fn adamw_first_step_matches_exact_decoupled_decay_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(vec![1.0, 2.0], vec![2], true)
+            .expect("var");
+        let mut optimizer = AdamW::new(vec![x], 0.1);
+
+        let loss_sum = session.tensor_sum(x).expect("sum");
+        let report = session.tensor_backward(loss_sum).expect("backward");
+        optimizer.step(&mut session, &report).expect("step");
+
+        let values = session.tensor_values(x).expect("values");
+        assert_eq!(values, vec![0.899000001, 1.898000001]);
+        assert_eq!(optimizer.step_counts[0], 1);
+        assert_eq!(optimizer.m[0].as_deref(), Some(&[1.0 - 0.9, 1.0 - 0.9][..]));
+        assert_eq!(
+            optimizer.v[0].as_deref(),
+            Some(&[1.0 - 0.999, 1.0 - 0.999][..])
         );
     }
 
@@ -10651,7 +10672,10 @@ mod tests {
             let (rows, cols) = super::factorize_approx_square(numel);
             assert_eq!(rows * cols, numel, "product must reconstruct numel={numel}");
             assert!(cols <= rows, "cols<=rows expected for numel={numel}");
-            assert!(cols >= 1 && rows >= 1, "dims must be positive for numel={numel}");
+            assert!(
+                cols >= 1 && rows >= 1,
+                "dims must be positive for numel={numel}"
+            );
         }
     }
 
@@ -10659,7 +10683,7 @@ mod tests {
     fn newton_schulz_ortho_empty_and_zero_inputs() {
         assert!(super::newton_schulz_ortho(&[], 5).is_empty());
         // All-zero input is below the degeneracy threshold -> all-zero output.
-        let zeros = super::newton_schulz_ortho(&vec![0.0; 20], 5);
+        let zeros = super::newton_schulz_ortho(&[0.0; 20], 5);
         assert_eq!(zeros.len(), 20);
         assert!(zeros.iter().all(|&v| v == 0.0));
     }
@@ -10705,7 +10729,9 @@ mod tests {
     fn backward_sum_sq(session: &mut FrankenTorchSession, x: TensorNodeId) -> TensorBackwardReport {
         let sq = session.tensor_mul(x, x).expect("mul should succeed");
         let loss = session.tensor_sum(sq).expect("sum should succeed");
-        session.tensor_backward(loss).expect("backward should succeed")
+        session
+            .tensor_backward(loss)
+            .expect("backward should succeed")
     }
 
     #[test]
@@ -10719,7 +10745,8 @@ mod tests {
         let grad_norm = 2.0 * frob_norm(&before); // d/dx sum(x^2) = 2x
         let report = backward_sum_sq(&mut session, x);
         let mut opt = Muon::new(vec![x], lr);
-        opt.step(&mut session, &report).expect("step should succeed");
+        opt.step(&mut session, &report)
+            .expect("step should succeed");
         let after = session.tensor_values(x).expect("values");
         let delta: Vec<f64> = before.iter().zip(&after).map(|(b, a)| a - b).collect();
         assert!(after.iter().all(|v| v.is_finite()));
@@ -10741,7 +10768,11 @@ mod tests {
             opt.step(&mut session, &report).expect("step");
             session.tensor_values(x).expect("values")
         };
-        assert_eq!(run(), run(), "Muon has no RNG; identical inputs -> identical output");
+        assert_eq!(
+            run(),
+            run(),
+            "Muon has no RNG; identical inputs -> identical output"
+        );
     }
 
     #[test]
@@ -10775,7 +10806,10 @@ mod tests {
         let no_wd = step_with_wd(0.0);
         let with_wd = step_with_wd(0.1);
         assert!(
-            no_wd.iter().zip(&with_wd).any(|(a, b)| (a - b).abs() > 1e-9),
+            no_wd
+                .iter()
+                .zip(&with_wd)
+                .any(|(a, b)| (a - b).abs() > 1e-9),
             "weight decay must alter the resulting parameters"
         );
     }
@@ -10790,7 +10824,11 @@ mod tests {
         {
             let (mut session, x) = make();
             let report = backward_sum_sq(&mut session, x);
-            assert!(Muon::new(vec![x], -1.0).step(&mut session, &report).is_err());
+            assert!(
+                Muon::new(vec![x], -1.0)
+                    .step(&mut session, &report)
+                    .is_err()
+            );
         }
         // momentum >= 1
         {

@@ -1,0 +1,1 @@
+adamw_first_step_values_lr0.1_weight_decay0.01_grad1=[0.899000001, 1.898000001]

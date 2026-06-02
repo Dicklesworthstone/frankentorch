@@ -1,0 +1,4 @@
+adamw_first_step_lr0.1_wd0.01_beta0.9_0.999_grad1_values=[0.899000001, 1.898000001]
+adamw_first_step_m=[0.09999999999999998, 0.09999999999999998]
+adamw_first_step_v=[0.0010000000000000009, 0.0010000000000000009]
+adamw_first_step_count=1

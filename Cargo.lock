@@ -606,6 +606,7 @@ dependencies = [
 name = "ft-optim"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ft-api",
  "ft-autograd",
  "ft-core",

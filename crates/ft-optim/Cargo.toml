@@ -11,7 +11,12 @@ ft-autograd = { workspace = true }
 ft-dispatch = { workspace = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 ft-nn = { workspace = true }
+
+[[bench]]
+name = "optimizer_bench"
+harness = false
 
 [lints]
 workspace = true
