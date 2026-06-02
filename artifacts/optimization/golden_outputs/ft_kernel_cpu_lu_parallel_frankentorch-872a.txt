@@ -1,0 +1,11 @@
+frankentorch-872a lu_parallel_golden
+n=128
+selected_pivots:
+0: 0
+1: 1
+127: 127
+selected_lu_bits:
+0: 0x3ff0000000000000
+1: 0x0000000000000000
+129: 0x3ff0000000000000
+16383: 0x3ff0000000000000

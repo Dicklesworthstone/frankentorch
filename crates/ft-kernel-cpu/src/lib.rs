@@ -4322,12 +4322,28 @@ pub fn lu_factor_contiguous_f64(
             continue;
         }
 
-        // Elimination
-        for i in (k + 1)..n {
-            let multiplier = lu[i * n + k] / diag;
-            lu[i * n + k] = multiplier; // Store L factor
-            for j in (k + 1)..n {
-                lu[i * n + j] -= multiplier * lu[k * n + j];
+        // Elimination: rows below the pivot are independent once the pivot row
+        // is fixed. Keep pivot search/swaps serial, then split only this
+        // trailing row update across Rayon workers.
+        const LU_PAR_MIN_ROWS: usize = 64;
+        let rows_below = n - k - 1;
+        if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
+            let (head, tail) = lu.split_at_mut((k + 1) * n);
+            let pivot_row = &head[k * n..(k + 1) * n];
+            tail.par_chunks_mut(n).for_each(|row_i| {
+                let multiplier = row_i[k] / diag;
+                row_i[k] = multiplier; // Store L factor
+                for j in (k + 1)..n {
+                    row_i[j] -= multiplier * pivot_row[j];
+                }
+            });
+        } else {
+            for i in (k + 1)..n {
+                let multiplier = lu[i * n + k] / diag;
+                lu[i * n + k] = multiplier; // Store L factor
+                for j in (k + 1)..n {
+                    lu[i * n + j] -= multiplier * lu[k * n + j];
+                }
             }
         }
     }
@@ -12548,6 +12564,97 @@ mod tests {
                 "{msg}: element {i} differs: {av} vs {bv} (tol={tol})"
             );
         }
+    }
+
+    #[test]
+    fn lu_factor_matches_reference_gaussian_elimination() {
+        // Regression guard: lu_factor_contiguous_f64 reproduces a straightforward
+        // reference Gaussian elimination with partial pivoting BIT-FOR-BIT (same
+        // pivots, same LU bits) on a larger well-conditioned matrix.
+        let n = 200usize;
+        // Diagonally dominant so pivoting is well-defined and no near-singular
+        // `continue` fires; fractional values so rounding actually matters.
+        let mut a = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = ((i * 31 + j * 17) % 97) as f64 * 0.013 - 0.5;
+            }
+            a[i * n + i] += n as f64; // dominant diagonal
+        }
+
+        // Serial reference: identical algorithm to lu_factor_contiguous_f64 but
+        // with the trailing update forced serial.
+        let mut lu_ref = a.clone();
+        let mut piv_ref: Vec<usize> = (0..n).collect();
+        for k in 0..n {
+            let mut max_val = lu_ref[k * n + k].abs();
+            let mut max_row = k;
+            for i in (k + 1)..n {
+                let v = lu_ref[i * n + k].abs();
+                if v > max_val {
+                    max_val = v;
+                    max_row = i;
+                }
+            }
+            if max_row != k {
+                piv_ref.swap(k, max_row);
+                for j in 0..n {
+                    lu_ref.swap(k * n + j, max_row * n + j);
+                }
+            }
+            let diag = lu_ref[k * n + k];
+            if diag.abs() < f64::EPSILON * 1e3 {
+                continue;
+            }
+            for i in (k + 1)..n {
+                let m = lu_ref[i * n + k] / diag;
+                lu_ref[i * n + k] = m;
+                for j in (k + 1)..n {
+                    lu_ref[i * n + j] -= m * lu_ref[k * n + j];
+                }
+            }
+        }
+
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let result = super::lu_factor_contiguous_f64(&a, &meta).expect("lu_factor");
+        assert_eq!(result.pivots, piv_ref, "pivot order diverged");
+        for (idx, (&actual, &expected)) in result.lu.iter().zip(lu_ref.iter()).enumerate() {
+            assert_eq!(
+                actual.to_bits(),
+                expected.to_bits(),
+                "LU factor diverged at {idx}"
+            );
+        }
+    }
+
+    #[test]
+    fn lu_factor_parallel_golden_output_matches_fixture() {
+        use std::fmt::Write as _;
+
+        let n = 128usize; // > LU_PAR_MIN_ROWS -> parallel path when the pool has >1 thread
+        let mut a = vec![0.0_f64; n * n];
+        for i in 0..n {
+            a[i * n + i] = 1.0;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let result = super::lu_factor_contiguous_f64(&a, &meta).expect("lu_factor");
+
+        let mut output = String::from("frankentorch-872a lu_parallel_golden\nn=128\n");
+        output.push_str("selected_pivots:\n");
+        for idx in [0usize, 1, n - 1] {
+            let _ = writeln!(&mut output, "{idx}: {}", result.pivots[idx]);
+        }
+        output.push_str("selected_lu_bits:\n");
+        for idx in [0usize, 1, n + 1, n * n - 1] {
+            let _ = writeln!(&mut output, "{idx}: {:#018x}", result.lu[idx].to_bits());
+        }
+
+        assert_eq!(
+            output,
+            include_str!(
+                "../../../artifacts/optimization/golden_outputs/ft_kernel_cpu_lu_parallel_frankentorch-872a.txt"
+            )
+        );
     }
 
     #[test]

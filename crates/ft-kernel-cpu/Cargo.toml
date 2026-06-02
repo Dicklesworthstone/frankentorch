@@ -29,6 +29,10 @@ name = "softmax_bench"
 harness = false
 
 [[bench]]
+name = "linalg_bench"
+harness = false
+
+[[bench]]
 name = "sort_bench"
 harness = false
 
