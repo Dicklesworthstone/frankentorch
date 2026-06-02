@@ -28365,6 +28365,47 @@ impl FrankenTorchSession {
             .collect())
     }
 
+    /// Compute the full Jacobian of `output` with respect to each input.
+    ///
+    /// Equivalent to `torch.autograd.functional.jacobian`. Returns, per input,
+    /// the Jacobian flattened in row-major order with logical shape
+    /// `[output_numel, input_numel]`: row `j` is `∂output_j/∂input` (the
+    /// gradient of the `j`-th output element). An input not connected to
+    /// `output` yields an all-zero block.
+    ///
+    /// This is reverse-mode: it runs one backward pass per output element
+    /// (`output_numel` passes), matching PyTorch's default `jacobian`.
+    pub fn tensor_functional_jacobian(
+        &mut self,
+        output: TensorNodeId,
+        inputs: &[TensorNodeId],
+    ) -> Result<Vec<Vec<f64>>, AutogradError> {
+        let out_numel: usize = self.tensor_shape(output)?.iter().product();
+        let in_numels: Vec<usize> = inputs
+            .iter()
+            .map(|&inp| self.tensor_shape(inp).map(|s| s.iter().product()))
+            .collect::<Result<_, _>>()?;
+        let mut jac: Vec<Vec<f64>> = in_numels
+            .iter()
+            .map(|&n| vec![0.0; out_numel * n])
+            .collect();
+
+        for j in 0..out_numel {
+            let mut seed = vec![0.0; out_numel];
+            seed[j] = 1.0;
+            // A VJP with the unit seed eⱼ yields exactly row j of the Jacobian:
+            //   result_i = Σ_k J[k,i] (eⱼ)_k = J[j,i].
+            let row = self.tensor_autograd_grad(&[output], inputs, Some(&[seed]), true, false)?;
+            for (i, grad_opt) in row.iter().enumerate() {
+                if let Some(g) = grad_opt {
+                    let n = in_numels[i];
+                    jac[i][j * n..j * n + n].copy_from_slice(g);
+                }
+            }
+        }
+        Ok(jac)
+    }
+
     pub fn tensor_set_accumulated_gradient(
         &mut self,
         node: TensorNodeId,
@@ -89100,6 +89141,29 @@ mod tests {
             .unwrap();
         assert_eq!(vh[0].as_ref().unwrap(), &[6.0]);
         assert_eq!(vh[1].as_ref().unwrap(), &[14.0]);
+    }
+
+    #[test]
+    fn functional_jacobian_linear_map_recovers_weight_matrix() {
+        // y = W @ x with constant W ⇒ J = W (row-major [out, in]).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let w = s
+            .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false)
+            .unwrap();
+        let x = s.tensor_variable(vec![5.0, 7.0], vec![2, 1], true).unwrap();
+        let y = s.tensor_matmul(w, x).unwrap();
+        let jac = s.tensor_functional_jacobian(y, &[x]).unwrap();
+        // Row 0 = ∂y0/∂x = [1,2]; row 1 = ∂y1/∂x = [3,4].
+        assert_eq!(jac[0], vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn functional_jacobian_elementwise_square_is_diagonal() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, 3.0], vec![2], true).unwrap();
+        let y = s.tensor_mul(x, x).unwrap(); // J = diag(2x) = diag([4,6])
+        let jac = s.tensor_functional_jacobian(y, &[x]).unwrap();
+        assert_eq!(jac[0], vec![4.0, 0.0, 0.0, 6.0]);
     }
 
     #[test]
