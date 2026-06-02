@@ -1,0 +1,3 @@
+functional_linear_with_bias values: [11.0, 21.0]
+session_tensor_addmm values: [14.0, 25.0, 20.0, 31.0]
+session_tensor_addmm_scaled values: [17.0, 22.0, 27.0, 32.0]
