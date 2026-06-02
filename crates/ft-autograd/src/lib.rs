@@ -13955,26 +13955,21 @@ impl TensorTape {
                 }
                 TensorNodeOp::Outer { lhs, rhs } => {
                     // outer(x,y)[i,j] = x[i]*y[j]. Shape: [m] x [n] -> [m,n].
-                    // d/dx = incoming @ y (sum cols), d/dy = incoming.T @ x (sum rows).
-                    let lhs_shape = self.nodes[lhs.0].tensor.meta().shape().to_vec();
-                    let rhs_shape = self.nodes[rhs.0].tensor.meta().shape().to_vec();
-                    let m = lhs_shape[0];
-                    let n = rhs_shape[0];
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let lhs_vals = self.nodes[lhs.0].tensor.contiguous_values_as_f64()?;
-                    let rhs_vals = self.nodes[rhs.0].tensor.contiguous_values_as_f64()?;
-                    let mut grad_lhs_data = vec![0.0; m];
-                    let mut grad_rhs_data = vec![0.0; n];
-                    for i in 0..m {
-                        for j in 0..n {
-                            grad_lhs_data[i] += incoming_vals[i * n + j] * rhs_vals[j];
-                            grad_rhs_data[j] += incoming_vals[i * n + j] * lhs_vals[i];
-                        }
-                    }
-                    let grad_lhs = self.leaf(grad_lhs_data, lhs_shape.clone(), true)?;
-                    let grad_rhs = self.leaf(grad_rhs_data, rhs_shape.clone(), true)?;
+                    // d/dx = grad @ y (sum over j), d/dy = x^T @ grad (sum over i).
+                    // Compose through batched bmm (x and y reshaped to rank-3) so the
+                    // gradients stay differentiable and the bilinear cross second
+                    // derivative survives double-backward instead of being dropped.
+                    let m = self.nodes[lhs.0].tensor.meta().shape()[0];
+                    let n = self.nodes[rhs.0].tensor.meta().shape()[0];
+                    let incoming_2d = self.cg_reshape(incoming_id, vec![1, m, n])?;
+                    // grad_x = incoming[m,n] @ y[n,1] -> [m]
+                    let y_col = self.cg_reshape(rhs, vec![1, n, 1])?;
+                    let gx = self.cg_bmm(incoming_2d, y_col)?;
+                    let grad_lhs = self.cg_reshape(gx, vec![m])?;
+                    // grad_y = x[1,m] @ incoming[m,n] -> [n]
+                    let x_row = self.cg_reshape(lhs, vec![1, 1, m])?;
+                    let gy = self.cg_bmm(x_row, incoming_2d)?;
+                    let grad_rhs = self.cg_reshape(gy, vec![n])?;
                     self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
                     self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -13998,44 +13993,22 @@ impl TensorTape {
                             .into(),
                         ));
                     }
-                    let batch = lhs_shape[0];
-                    let m = lhs_shape[1];
-                    let k = lhs_shape[2];
-                    let n = rhs_shape[2];
-                    let lhs_vals = self.nodes[lhs.0].tensor.contiguous_values_as_f64()?;
-                    let rhs_vals = self.nodes[rhs.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals = self.nodes[incoming_id.0]
-                        .tensor
-                        .contiguous_values_as_f64()?;
-                    let lhs_batch_stride = m * k;
-                    let rhs_batch_stride = k * n;
-                    let out_batch_stride = m * n;
-                    let mut grad_lhs_data = vec![0.0; batch * m * k];
-                    let mut grad_rhs_data = vec![0.0; batch * k * n];
-                    for b in 0..batch {
-                        for i in 0..m {
-                            for j in 0..k {
-                                let mut acc = 0.0;
-                                for l in 0..n {
-                                    acc += incoming_vals[b * out_batch_stride + i * n + l]
-                                        * rhs_vals[b * rhs_batch_stride + j * n + l];
-                                }
-                                grad_lhs_data[b * lhs_batch_stride + i * k + j] = acc;
+                    if lhs_shape[0] != rhs_shape[0] || lhs_shape[2] != rhs_shape[1] {
+                        return Err(AutogradError::Dispatch(
+                            DispatchKeyError::IncompatibleSet {
+                                reason: "bmm create_graph backward received incompatible operand shapes",
                             }
-                        }
-                        for i in 0..k {
-                            for j in 0..n {
-                                let mut acc = 0.0;
-                                for l in 0..m {
-                                    acc += lhs_vals[b * lhs_batch_stride + l * k + i]
-                                        * incoming_vals[b * out_batch_stride + l * n + j];
-                                }
-                                grad_rhs_data[b * rhs_batch_stride + i * n + j] = acc;
-                            }
-                        }
+                            .into(),
+                        ));
                     }
-                    let grad_lhs = self.leaf(grad_lhs_data, lhs_shape, true)?;
-                    let grad_rhs = self.leaf(grad_rhs_data, rhs_shape, true)?;
+                    // Compose the gradients from differentiable cg nodes (bmm + transpose)
+                    // rather than detached leaves, so double-backward through bmm/matmul is
+                    // correct (bmm is bilinear: the mixed second derivative d^2/dA dB is
+                    // nonzero). grad_A = grad @ B^T, grad_B = A^T @ grad, per batch.
+                    let rhs_t = self.cg_transpose_last2(rhs)?;
+                    let grad_lhs = self.cg_bmm(incoming_id, rhs_t)?;
+                    let lhs_t = self.cg_transpose_last2(lhs)?;
+                    let grad_rhs = self.cg_bmm(lhs_t, incoming_id)?;
                     self.cg_accumulate(lhs, &mut grad_nodes, grad_lhs)?;
                     self.cg_accumulate(rhs, &mut grad_nodes, grad_rhs)?;
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
@@ -15028,6 +15001,147 @@ impl TensorTape {
             tensor: DenseTensor::from_storage(meta, result)?,
             requires_grad,
             op: TensorNodeOp::Mul { lhs, rhs },
+        });
+        Ok(out)
+    }
+
+    /// Helper: transpose the last two dims of a (batched) tensor for create_graph
+    /// backward, producing a differentiable `Transpose` node so the second backward
+    /// routes correctly. Materializes contiguous transposed storage, matching the
+    /// eager-view convention used elsewhere in the tape.
+    fn cg_transpose_last2(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, shape, data, dtype, device) = {
+            let node = self.node(input)?;
+            (
+                node.requires_grad,
+                node.tensor.meta().shape().to_vec(),
+                node.tensor.contiguous_values_as_f64()?,
+                node.tensor.meta().dtype(),
+                node.tensor.meta().device(),
+            )
+        };
+        if shape.len() < 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "create_graph: cg_transpose_last2 requires rank >= 2",
+                },
+            )));
+        }
+        let d0 = shape.len() - 2;
+        let d1 = shape.len() - 1;
+        let m = shape[d0];
+        let n = shape[d1];
+        let batch: usize = shape[..d0].iter().product();
+        let mut result = vec![0.0; data.len()];
+        for b in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    result[b * n * m + j * m + i] = data[b * m * n + i * n + j];
+                }
+            }
+        }
+        let mut new_shape = shape;
+        new_shape.swap(d0, d1);
+        let meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Transpose {
+                input,
+                dim0: d0,
+                dim1: d1,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Helper: batched matmul `[B,M,K] @ [B,K,N] -> [B,M,N]` for create_graph backward,
+    /// producing a differentiable `Bmm` node so double-backward through bmm/matmul
+    /// composes (instead of being lost to a detached leaf).
+    fn cg_bmm(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, lhs_shape, rhs_shape, lhs_data, rhs_data, dtype, device) = {
+            let l = self.node(lhs)?;
+            let r = self.node(rhs)?;
+            (
+                l.requires_grad || r.requires_grad,
+                l.tensor.meta().shape().to_vec(),
+                r.tensor.meta().shape().to_vec(),
+                l.tensor.contiguous_values_as_f64()?,
+                r.tensor.contiguous_values_as_f64()?,
+                l.tensor.meta().dtype(),
+                l.tensor.meta().device(),
+            )
+        };
+        if lhs_shape.len() != 3
+            || rhs_shape.len() != 3
+            || lhs_shape[0] != rhs_shape[0]
+            || lhs_shape[2] != rhs_shape[1]
+        {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "create_graph: cg_bmm shape mismatch",
+                },
+            )));
+        }
+        let batch = lhs_shape[0];
+        let m = lhs_shape[1];
+        let k = lhs_shape[2];
+        let n = rhs_shape[2];
+        let mut result = vec![0.0; batch * m * n];
+        for b in 0..batch {
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0;
+                    for p in 0..k {
+                        acc +=
+                            lhs_data[b * m * k + i * k + p] * rhs_data[b * k * n + p * n + j];
+                    }
+                    result[b * m * n + i * n + j] = acc;
+                }
+            }
+        }
+        let meta = ft_core::TensorMeta::from_shape(vec![batch, m, n], dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Bmm { lhs, rhs },
+        });
+        Ok(out)
+    }
+
+    /// Helper: reshape (same element order, same numel) for create_graph backward,
+    /// producing a differentiable `Reshape` node. Used to bridge vectors/matrices into
+    /// the rank-3 layout `cg_bmm` expects and back.
+    fn cg_reshape(
+        &mut self,
+        input: TensorNodeId,
+        new_shape: Vec<usize>,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, original_shape, data, dtype, device) = {
+            let node = self.node(input)?;
+            (
+                node.requires_grad,
+                node.tensor.meta().shape().to_vec(),
+                node.tensor.contiguous_values_as_f64()?,
+                node.tensor.meta().dtype(),
+                node.tensor.meta().device(),
+            )
+        };
+        let meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, data)?,
+            requires_grad,
+            op: TensorNodeOp::Reshape {
+                input,
+                original_shape,
+            },
         });
         Ok(out)
     }
@@ -23830,10 +23944,18 @@ mod tests {
                 },
             )
             .expect("backward");
+        // First-order (regression guard for the bmm-composed rewrite):
         // d/dx = sum_j(y[j]) = 12.0 for each x element
         assert_eq!(report.gradient(x).expect("gx"), &[12.0, 12.0]);
         // d/dy = sum_i(x[i]) = 3.0 for each y element
         assert_eq!(report.gradient(y).expect("gy"), &[3.0, 3.0, 3.0]);
+
+        // Second-order cross term: gx[i] = sum_j y[j], so d(sum gx)/dy[j] = m (len of x).
+        // This was silently zero under the old detached-leaf gradient.
+        let dgx = report.gradient_node(x).expect("gradient node for x");
+        let (p, _) = tape.sum(dgx, ExecutionMode::Strict).expect("sum(gx)");
+        let rep2 = tape.backward(p).expect("second backward");
+        assert_eq!(rep2.gradient(y).expect("d(sum gx)/dy"), &[2.0, 2.0, 2.0]);
     }
 
     #[test]
@@ -23865,6 +23987,50 @@ mod tests {
         // d/dA = ones @ B^T, d/dB = A^T @ ones
         assert_eq!(ga, &[3.0, 7.0, 11.0, 3.0, 7.0, 11.0]);
         assert_eq!(gb, &[5.0, 5.0, 7.0, 7.0, 9.0, 9.0]);
+    }
+
+    #[test]
+    fn create_graph_bmm_second_derivative_cross_term() {
+        // bmm is bilinear: d/dA(L) depends on B (and vice-versa), so the mixed second
+        // derivative d^2/dA dB is nonzero. The old detached-leaf gradient made this
+        // silently zero. For L = sum(A @ B) with A:[1,M,K], B:[1,K,N]:
+        //   gA[i,p] = sum_j B[p,j]  =>  d(sum gA)/dB[p,j] = M  (number of A rows)
+        let m = 2usize;
+        let mut tape = TensorTape::new();
+        let a = tape
+            .leaf(vec![0.5, -1.0, 2.0, 0.25], vec![1, 2, 2], true)
+            .expect("a");
+        let b = tape
+            .leaf(vec![1.5, 0.5, -0.5, 3.0], vec![1, 2, 2], true)
+            .expect("b");
+        let (c, _) = tape.bmm(a, b, ExecutionMode::Strict).expect("bmm");
+        let (s, _) = tape.sum(c, ExecutionMode::Strict).expect("sum");
+        let rep1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        // First-order regression guard (composition must match the old leaf values).
+        let ga = rep1.gradient(a).expect("ga");
+        let gb = rep1.gradient(b).expect("gb");
+        assert_eq!(ga, &[2.0, 2.5, 2.0, 2.5]); // B row sums [1.5+0.5, -0.5+3.0]
+        assert_eq!(gb, &[2.5, 2.5, -0.75, -0.75]); // A col sums [0.5+2.0, -1.0+0.25]
+
+        // Second-order: differentiate sum(gA) w.r.t. B. The cross Hessian is M everywhere.
+        let dga = rep1.gradient_node(a).expect("gradient node for a");
+        let (pa, _) = tape.sum(dga, ExecutionMode::Strict).expect("sum(gA)");
+        let rep2 = tape.backward(pa).expect("second backward");
+        let hb = rep2.gradient(b).expect("d(sum gA)/dB");
+        for (idx, &v) in hb.iter().enumerate() {
+            assert!(
+                (v - m as f64).abs() < 1e-9,
+                "cross Hessian d(sum gA)/dB[{idx}] = {v}, expected {m}"
+            );
+        }
     }
 
     #[test]
