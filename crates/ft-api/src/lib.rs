@@ -58856,10 +58856,10 @@ fn bessel_j0_scalar(x: f64) -> f64 {
     } else {
         let z = 8.0 / ax;
         let y = z * z;
-        let xx = ax - 0.785398163397448;
+        let xx = ax - std::f64::consts::FRAC_PI_4;
         let p = eval_poly_f64(y, &[1.0, -0.1098628627e-2, 0.2734510407e-4, -0.2073370639e-5, 0.2093887211e-6]);
         let q = eval_poly_f64(y, &[-0.1562499995e-1, 0.1430488765e-3, -0.6911147651e-5, 0.7621095161e-6, -0.934945152e-7]);
-        (0.636619772 / ax).sqrt() * (xx.cos() * p - z * xx.sin() * q)
+        (std::f64::consts::FRAC_2_PI / ax).sqrt() * (xx.cos() * p - z * xx.sin() * q)
     }
 }
 
@@ -58884,7 +58884,7 @@ fn bessel_j1_scalar(x: f64) -> f64 {
         let xx = ax - 2.356194491;
         let p = eval_poly_f64(y, &[1.0, 0.183105e-2, -0.3516396496e-4, 0.2457520174e-5, -0.240337019e-6]);
         let q = eval_poly_f64(y, &[0.04687499995, -0.2002690873e-3, 0.8449199096e-5, -0.88228987e-6, 0.105787412e-6]);
-        let result = (0.636619772 / ax).sqrt() * (xx.cos() * p - z * xx.sin() * q);
+        let result = (std::f64::consts::FRAC_2_PI / ax).sqrt() * (xx.cos() * p - z * xx.sin() * q);
         if x < 0.0 { -result } else { result }
     }
 }
@@ -58902,14 +58902,14 @@ fn bessel_y0_scalar(x: f64) -> f64 {
         let den = eval_poly_f64(y, &[
             40076544269.0, 745249964.8, 7189466.438, 47447.26470, 226.1030244, 1.0,
         ]);
-        num / den + 0.636619772 * bessel_j0_scalar(x) * x.ln()
+        num / den + std::f64::consts::FRAC_2_PI * bessel_j0_scalar(x) * x.ln()
     } else {
         let z = 8.0 / x;
         let y = z * z;
-        let xx = x - 0.785398163397448;
+        let xx = x - std::f64::consts::FRAC_PI_4;
         let p = eval_poly_f64(y, &[1.0, -0.1098628627e-2, 0.2734510407e-4, -0.2073370639e-5, 0.2093887211e-6]);
         let q = eval_poly_f64(y, &[-0.1562499995e-1, 0.1430488765e-3, -0.6911147651e-5, 0.7621095161e-6, -0.934945152e-7]);
-        (0.636619772 / x).sqrt() * (xx.sin() * p + z * xx.cos() * q)
+        (std::f64::consts::FRAC_2_PI / x).sqrt() * (xx.sin() * p + z * xx.cos() * q)
     }
 }
 
@@ -58926,14 +58926,14 @@ fn bessel_y1_scalar(x: f64) -> f64 {
         let den = eval_poly_f64(y, &[
             0.2499580570e14, 0.4244419664e12, 0.3733650367e10, 0.2245904002e8, 0.1020426050e6, 0.3549632885e3, 1.0,
         ]);
-        num / den + 0.636619772 * (bessel_j1_scalar(x) * x.ln() - 1.0 / x)
+        num / den + std::f64::consts::FRAC_2_PI * (bessel_j1_scalar(x) * x.ln() - 1.0 / x)
     } else {
         let z = 8.0 / x;
         let y = z * z;
         let xx = x - 2.356194491;
         let p = eval_poly_f64(y, &[1.0, 0.183105e-2, -0.3516396496e-4, 0.2457520174e-5, -0.240337019e-6]);
         let q = eval_poly_f64(y, &[0.04687499995, -0.2002690873e-3, 0.8449199096e-5, -0.88228987e-6, 0.105787412e-6]);
-        (0.636619772 / x).sqrt() * (xx.sin() * p + z * xx.cos() * q)
+        (std::f64::consts::FRAC_2_PI / x).sqrt() * (xx.sin() * p + z * xx.cos() * q)
     }
 }
 
