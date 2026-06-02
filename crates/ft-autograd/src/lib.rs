@@ -15057,6 +15057,103 @@ impl TensorTape {
                         )));
                     }
                 }
+                TensorNodeOp::NormDim {
+                    input,
+                    p,
+                    dim,
+                    ref input_shape,
+                } => {
+                    // Per-slice norm along `dim`, p in {1, 2}. Broadcast the
+                    // (reduced) incoming gradient back along `dim` via the same
+                    // reshape-to-size-1 + Expand mechanism as SumDim, so the
+                    // Expand backward re-sums the broadcast dim on a further pass.
+                    let reduce_size = input_shape[dim];
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        input_shape,
+                        dim,
+                        "norm_dim cg backward shape volume overflow",
+                    )?;
+                    let incoming_vals = self.nodes[incoming_id.0]
+                        .tensor
+                        .contiguous_values_as_f64()
+                        .map_err(AutogradError::DenseTensor)?;
+                    let mut bshape = input_shape.clone();
+                    bshape[dim] = 1;
+                    // Broadcast incoming along dim.
+                    let reshaped_inc = self.reshape(incoming_id, bshape.clone())?;
+                    let mut inc_expanded = vec![0.0; input_numel];
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let g = incoming_vals[outer * inner_size + inner];
+                            for r in 0..reduce_size {
+                                inc_expanded
+                                    [outer * reduce_size * inner_size + r * inner_size + inner] = g;
+                            }
+                        }
+                    }
+                    let inc_full =
+                        self.cg_expand(reshaped_inc, inc_expanded, input_shape.clone())?;
+                    if p == 2.0 {
+                        // d/dx_i = grad_slice * x_i / norm_slice. Reuse the NormDim
+                        // output node as the divisor (broadcast along dim) so the
+                        // second backward routes d(norm)/dx through NormDim's own
+                        // backward, giving the exact per-slice Hessian.
+                        let norm_vals = self.nodes[node_id.0]
+                            .tensor
+                            .contiguous_values_as_f64()
+                            .map_err(AutogradError::DenseTensor)?;
+                        let reshaped_norm = self.reshape(node_id, bshape)?;
+                        // Substitute 1.0 for zero-norm slices to avoid div-by-zero;
+                        // those slices have x=0 so the numerator is 0 and grad=0,
+                        // matching the first-order backward.
+                        let mut norm_expanded = vec![1.0; input_numel];
+                        for outer in 0..outer_size {
+                            for inner in 0..inner_size {
+                                let nv = norm_vals[outer * inner_size + inner];
+                                let safe = if nv == 0.0 { 1.0 } else { nv };
+                                for r in 0..reduce_size {
+                                    norm_expanded[outer * reduce_size * inner_size
+                                        + r * inner_size
+                                        + inner] = safe;
+                                }
+                            }
+                        }
+                        let norm_full =
+                            self.cg_expand(reshaped_norm, norm_expanded, input_shape.clone())?;
+                        let numerator = self.cg_mul(inc_full, input)?;
+                        let grad_in = self.cg_div(numerator, norm_full)?;
+                        self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                        Self::complete_dependency(&mut pending, input, &mut queue)?;
+                        steps.push(TensorBackwardStep {
+                            node: node_id,
+                            incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                            rule: "d(norm_dim2(x))/dx=grad*x/norm (cg)",
+                        });
+                    } else if p == 1.0 {
+                        // d/dx_i = grad_slice * sign(x_i), gated by a constant sign leaf.
+                        let input_values = self.nodes[input.0]
+                            .tensor
+                            .contiguous_values_as_f64()
+                            .map_err(AutogradError::DenseTensor)?;
+                        let signs: Vec<f64> =
+                            input_values.iter().map(|v| v.signum()).collect();
+                        let sign_leaf = self.leaf(signs, input_shape.clone(), false)?;
+                        let grad_in = self.cg_mul(inc_full, sign_leaf)?;
+                        self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
+                        Self::complete_dependency(&mut pending, input, &mut queue)?;
+                        steps.push(TensorBackwardStep {
+                            node: node_id,
+                            incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                            rule: "d(norm_dim1(x))/dx=grad*sign(x) (cg)",
+                        });
+                    } else {
+                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "create_graph for norm_dim supports only p=1 and p=2",
+                            },
+                        )));
+                    }
+                }
                 // For unsupported ops, fall back to non-differentiable gradient
                 _ => {
                     return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -25398,6 +25495,61 @@ mod tests {
             )
             .expect("backward");
         assert_eq!(report.gradient(x).expect("gx"), &[1.0, -1.0]);
+    }
+
+    #[test]
+    fn create_graph_norm_dim2_second_derivative_per_slice_hessian() {
+        // L = sum(norm_dim(x, p=2, dim=1)) over rows [3,4] (norm 5) and [6,8]
+        // (norm 10). First-order grad = x_row / norm_row = [.6,.8, .6,.8]. The
+        // per-slice Hessian is block-diagonal; the ones-seeded second backward
+        // gives each block's row sums: row0 [.032,-.024], row1 [.016,-.012].
+        // Proves the norm_dim gradient routes d(norm)/dx through the NormDim node.
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![3.0, 4.0, 6.0, 8.0], vec![2, 2], true)
+            .expect("x");
+        let (n, _) = tape.norm_dim(x, 2.0, 1, ExecutionMode::Strict).expect("norm_dim");
+        let (s, _) = tape.sum(n, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        let gx = report1.gradient(x).expect("gx");
+        for (i, &e) in [0.6, 0.8, 0.6, 0.8].iter().enumerate() {
+            assert!((gx[i] - e).abs() < 1e-9, "gx[{i}] expected {e}, got {}", gx[i]);
+        }
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let g2 = report2.gradient(x).expect("second gradient");
+        for (i, &e) in [0.032, -0.024, 0.016, -0.012].iter().enumerate() {
+            assert!((g2[i] - e).abs() < 1e-9, "d2[{i}] expected {e}, got {}", g2[i]);
+        }
+    }
+
+    #[test]
+    fn create_graph_norm_dim1_gradients() {
+        // norm_dim p=1: d/dx = sign(x) per element. create_graph must not fail-loud.
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![3.0, -4.0, -1.0, 2.0], vec![2, 2], true)
+            .expect("x");
+        let (n, _) = tape.norm_dim(x, 1.0, 1, ExecutionMode::Strict).expect("norm_dim");
+        let (s, _) = tape.sum(n, ExecutionMode::Strict).expect("sum");
+        let report = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("backward");
+        assert_eq!(report.gradient(x).expect("gx"), &[1.0, -1.0, -1.0, 1.0]);
     }
 
     #[test]
