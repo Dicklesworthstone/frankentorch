@@ -1,0 +1,25 @@
+Command:
+rch exec -- cargo bench -p ft-api --bench ops_bench -- conv2d/hw/32 --warm-up-time 1 --measurement-time 5 --sample-size 20
+
+Initial rch baseline:
+worker vmi1149989
+conv2d/hw/32 time: [123.77 ms 127.28 ms 131.94 ms]
+throughput: [1.9868 Melem/s 2.0595 Melem/s 2.1180 Melem/s]
+
+Control baseline after worker mismatch:
+The first after run selected worker ts2, so the single uncommitted lever was
+temporarily restored to the pre-change form and the same rch command was rerun.
+
+worker ts2
+conv2d/hw/32 time: [213.39 ms 216.47 ms 219.95 ms]
+throughput: [1.1918 Melem/s 1.2110 Melem/s 1.2285 Melem/s]
+
+Comparison anchor:
+benchmarks/pytorch_baseline.json conv2d_32x32 p50_us=3582.44
+
+Profile-backed target:
+The 20260601 perf scenario ranks conv2d as a >3x row. After pass 6, conv2d/hw/32
+still measured p50 220.58 ms on the previous rch run. tensor_unfold still cloned
+the whole gather table so forward and backward closures each owned a full copy.
+functional_conv2d calls tensor_unfold twice before bmm, so this duplicate
+allocation/copy sits directly on the profiled patch-extraction path.

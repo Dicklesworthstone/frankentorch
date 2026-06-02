@@ -1,0 +1,14 @@
+Command:
+rch exec -- cargo bench -p ft-api --bench ops_bench -- conv2d/hw/32 --warm-up-time 1 --measurement-time 5 --sample-size 20
+
+Observed result:
+worker ts2
+conv2d/hw/32 time: [205.82 ms 206.43 ms 207.18 ms]
+throughput: [1.2653 Melem/s 1.2699 Melem/s 1.2737 Melem/s]
+
+Delta:
+Same-worker control baseline p50 216.47 ms -> 206.43 ms, 10.04 ms faster,
+4.64% improvement.
+
+Decision:
+Keep. Opportunity score: impact 1 x confidence 3 / effort 1 = 3.0.

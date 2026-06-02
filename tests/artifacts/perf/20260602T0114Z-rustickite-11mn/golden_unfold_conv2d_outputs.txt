@@ -1,0 +1,6 @@
+unfold_1d_shape=[3, 3]
+unfold_1d_values=[1.0, 2.0, 3.0, 2.0, 3.0, 4.0, 3.0, 4.0, 5.0]
+unfold_step2_shape=[2, 2]
+unfold_sum_grad=[1.0, 2.0, 2.0, 1.0]
+functional_conv2d_with_bias_shape=[1, 1, 1, 1]
+functional_conv2d_with_bias_values=[6.0]

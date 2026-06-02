@@ -45329,7 +45329,8 @@ impl FrankenTorchSession {
             }
             gather.push(in_flat);
         }
-        let gather_for_fwd = gather.clone();
+        let gather: Arc<[usize]> = gather.into();
+        let gather_for_fwd = Arc::clone(&gather);
         let gather_for_bwd = gather;
         let out_shape_clone = out_shape.clone();
 
