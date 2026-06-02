@@ -507,6 +507,7 @@ dependencies = [
  "ft-kernel-cpu",
  "ft-runtime",
  "libm",
+ "rayon",
 ]
 
 [[package]]
