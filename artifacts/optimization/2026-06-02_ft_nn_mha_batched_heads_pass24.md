@@ -124,6 +124,7 @@ Delta:
 - `rch exec -- cargo test -p ft-nn mha_batched_heads_golden_output_matches_fixture -- --nocapture` passed.
 - `rch exec -- cargo test -p ft-nn mha -- --nocapture` passed: 7/7 MHA tests, including backward gradients.
 - `rch exec -- cargo bench -p ft-nn --bench nn_bench -- multihead_attention/forward_8x64x128_h8 --warm-up-time 1 --measurement-time 5 --sample-size 20` passed before and after.
+- Closeout confirmation benchmark on worker `vmi1149989`: `[18.123 ms 19.576 ms 21.615 ms]`.
 - `rch exec -- cargo check -p ft-nn --all-targets` passed; RCH later reported a target-artifact retrieval warning, but the remote command finished with exit 0.
 - `rch exec -- cargo clippy -p ft-nn --all-targets --no-deps -- -D warnings` passed.
 - `rch exec -- cargo fmt -p ft-nn --check` passed after formatting the long `session.full` line.
