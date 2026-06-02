@@ -23,6 +23,16 @@ fn bench_special(c: &mut Criterion) {
         b.iter(|| black_box(s.digamma_tensor(black_box(x)).unwrap()));
     });
 
+    // igamma(a, x): regularized lower incomplete gamma — power series / continued
+    // fraction per element (heavy iterative, binary op via par_zip_map_f64). 1M.
+    c.bench_function("igamma_1m", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // a > 0, x > 0.
+        let a = s.tensor_rand(vec![n], false).unwrap();
+        let x = s.tensor_rand(vec![n], false).unwrap();
+        b.iter(|| black_box(s.tensor_igamma(black_box(a), black_box(x)).unwrap()));
+    });
+
     // polygamma(2, x): Hurwitz-zeta series per element — the heaviest scalar
     // special function (routed through par_map_f64). 1M elements.
     c.bench_function("polygamma2_1m", |b| {

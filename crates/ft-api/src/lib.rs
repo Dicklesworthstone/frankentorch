@@ -41831,11 +41831,7 @@ impl FrankenTorchSession {
         }
         let input_vals = self.tensor_values(input)?;
         let other_vals = self.tensor_values(other)?;
-        let result: Vec<f64> = input_vals
-            .iter()
-            .zip(other_vals.iter())
-            .map(|(&a, &x)| igamma_approx(a, x))
-            .collect();
+        let result: Vec<f64> = par_zip_map_f64(&input_vals, &other_vals, igamma_approx);
         self.tensor_variable(result, input_shape, false)
     }
 
@@ -41883,11 +41879,7 @@ impl FrankenTorchSession {
         }
         let input_vals = self.tensor_values(input)?;
         let other_vals = self.tensor_values(other)?;
-        let result: Vec<f64> = input_vals
-            .iter()
-            .zip(other_vals.iter())
-            .map(|(&a, &x)| igammac_approx(a, x))
-            .collect();
+        let result: Vec<f64> = par_zip_map_f64(&input_vals, &other_vals, igammac_approx);
         self.tensor_variable(result, input_shape, false)
     }
 
@@ -42456,11 +42448,7 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let values: Vec<f64> = s_vals
-            .iter()
-            .zip(a_vals.iter())
-            .map(|(&s_val, &a_val)| zeta_approx(s_val, a_val))
-            .collect();
+        let values: Vec<f64> = par_zip_map_f64(&s_vals, &a_vals, zeta_approx);
         let out = self.tensor_tape.leaf(values, s_shape, false)?;
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
@@ -80197,6 +80185,43 @@ mod tests {
         for (idx, (g, &x)) in grad.iter().zip(pdata.iter()).enumerate() {
             let want = 1.0_f64 * super::polygamma_approx(3, x);
             assert_eq!(g.to_bits(), want.to_bits(), "polygamma bwd @{idx}");
+        }
+    }
+
+    #[test]
+    fn igamma_igammac_zeta_parallel_match_serial_bit_exact() {
+        // Isomorphism proof for routing the heavy binary specials (incomplete
+        // gamma + Hurwitz zeta) through par_zip_map_f64: with > 8192 elements the
+        // rayon path runs and must equal the serial zip-map BIT-FOR-BIT.
+        let n_elems = 1usize << 14;
+        // igamma/igammac: a > 0, x > 0.
+        let a: Vec<f64> = (0..n_elems).map(|i| 0.1 + (i % 197) as f64 * 0.05).collect();
+        let x: Vec<f64> = (0..n_elems).map(|i| 0.1 + (i % 211) as f64 * 0.04).collect();
+        // zeta: s > 1 (convergent), q > 0.
+        let sv: Vec<f64> = (0..n_elems).map(|i| 1.5 + (i % 97) as f64 * 0.05).collect();
+        let qv: Vec<f64> = (0..n_elems).map(|i| 0.5 + (i % 89) as f64 * 0.07).collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let at = s.tensor_variable(a.clone(), vec![n_elems], false).unwrap();
+        let xt = s.tensor_variable(x.clone(), vec![n_elems], false).unwrap();
+        let st = s.tensor_variable(sv.clone(), vec![n_elems], false).unwrap();
+        let qt = s.tensor_variable(qv.clone(), vec![n_elems], false).unwrap();
+
+        let ig = s.tensor_igamma(at, xt).unwrap();
+        let igc = s.tensor_igammac(at, xt).unwrap();
+        let z = s.tensor_zeta(st, qt).unwrap();
+
+        let ig_got = s.tensor_values(ig).unwrap();
+        for (idx, ((g, &av), &xv)) in ig_got.iter().zip(a.iter()).zip(x.iter()).enumerate() {
+            assert_eq!(g.to_bits(), super::igamma_approx(av, xv).to_bits(), "igamma @{idx}");
+        }
+        let igc_got = s.tensor_values(igc).unwrap();
+        for (idx, ((g, &av), &xv)) in igc_got.iter().zip(a.iter()).zip(x.iter()).enumerate() {
+            assert_eq!(g.to_bits(), super::igammac_approx(av, xv).to_bits(), "igammac @{idx}");
+        }
+        let z_got = s.tensor_values(z).unwrap();
+        for (idx, ((g, &svv), &qvv)) in z_got.iter().zip(sv.iter()).zip(qv.iter()).enumerate() {
+            assert_eq!(g.to_bits(), super::zeta_approx(svv, qvv).to_bits(), "zeta @{idx}");
         }
     }
 
