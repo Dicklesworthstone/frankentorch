@@ -15,8 +15,13 @@ asupersync = { workspace = true, optional = true }
 ftui = { workspace = true, optional = true }
 
 [dev-dependencies]
+criterion = { workspace = true }
 ft-serialize = { workspace = true }
 insta = "1.43.1"
+
+[[bench]]
+name = "runtime_bench"
+harness = false
 
 [lints]
 workspace = true

@@ -620,6 +620,7 @@ name = "ft-runtime"
 version = "0.1.0"
 dependencies = [
  "asupersync",
+ "criterion",
  "ft-core",
  "ft-serialize",
  "ftui",

@@ -66,7 +66,7 @@ impl RuntimeContext {
         let mut ledger = EvidenceLedger::new();
         ledger.record(
             EvidenceKind::Policy,
-            format!("mode initialized to {mode:?}"),
+            policy_summary("mode initialized to ", mode),
         );
         Self { mode, ledger }
     }
@@ -78,8 +78,10 @@ impl RuntimeContext {
 
     pub fn set_mode(&mut self, mode: ExecutionMode) {
         self.mode = mode;
-        self.ledger
-            .record(EvidenceKind::Policy, format!("mode switched to {mode:?}"));
+        self.ledger.record(
+            EvidenceKind::Policy,
+            policy_summary("mode switched to ", mode),
+        );
     }
 
     #[must_use]
@@ -199,6 +201,21 @@ fn now_unix_ms() -> u128 {
         .map_or(0, |duration| duration.as_millis())
 }
 
+fn execution_mode_label(mode: ExecutionMode) -> &'static str {
+    match mode {
+        ExecutionMode::Strict => "Strict",
+        ExecutionMode::Hardened => "Hardened",
+    }
+}
+
+fn policy_summary(prefix: &str, mode: ExecutionMode) -> String {
+    let label = execution_mode_label(mode);
+    let mut summary = String::with_capacity(prefix.len() + label.len());
+    summary.push_str(prefix);
+    summary.push_str(label);
+    summary
+}
+
 #[cfg(test)]
 mod tests {
     use ft_core::ExecutionMode;
@@ -228,6 +245,28 @@ mod tests {
 
         assert_eq!(ctx.mode(), ExecutionMode::Hardened);
         assert_eq!(ctx.ledger().len(), 2);
+    }
+
+    #[test]
+    fn runtime_policy_evidence_golden_summary_matches_fixture() {
+        use std::fmt::Write as _;
+
+        let mut ctx = RuntimeContext::new(ExecutionMode::Strict);
+        ctx.set_mode(ExecutionMode::Hardened);
+        let mut summary = String::new();
+        summary.push_str("runtime_policy=ft_runtime_policy_pass20\n");
+        let _ = writeln!(&mut summary, "mode={:?}", ctx.mode());
+        let _ = writeln!(&mut summary, "entries={}", ctx.ledger().len());
+        for (idx, entry) in ctx.ledger().entries().iter().enumerate() {
+            let _ = writeln!(&mut summary, "{idx}:{:?}:{}", entry.kind, entry.summary);
+        }
+
+        assert_eq!(
+            summary,
+            include_str!(
+                "../../../artifacts/optimization/golden_outputs/ft_runtime_policy_pass20.txt"
+            )
+        );
     }
 
     #[test]

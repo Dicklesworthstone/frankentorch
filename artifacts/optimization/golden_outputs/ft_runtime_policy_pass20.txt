@@ -1,0 +1,5 @@
+runtime_policy=ft_runtime_policy_pass20
+mode=Hardened
+entries=2
+0:Policy:mode initialized to Strict
+1:Policy:mode switched to Hardened
