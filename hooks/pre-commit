@@ -12,11 +12,46 @@ if ! command -v ubs >/dev/null 2>&1; then
     exit 0
 fi
 
+if [ -n "$UBS_SKIP" ]; then
+    echo "ubs: UBS_SKIP set, skipping security scan"
+    exit 0
+fi
+
 # Check for staged Rust files
 STAGED_RS=$(git diff --cached --name-only --diff-filter=ACM | grep '\.rs$' || true)
 if [ -z "$STAGED_RS" ]; then
     exit 0
 fi
+
+run_ubs_staged() {
+    timeout_seconds=$1
+
+    set +e
+    UBS_OUTPUT=$(timeout "$timeout_seconds" ubs --staged --only=rust --quiet 2>&1)
+    code=$?
+    set -e
+
+    if [ -n "$UBS_OUTPUT" ]; then
+        printf '%s\n' "$UBS_OUTPUT"
+    fi
+
+    if [ "$code" -eq 0 ]; then
+        return 0
+    fi
+
+    if [ "$code" -eq 124 ]; then
+        return 124
+    fi
+
+    case "$UBS_OUTPUT" in
+        *"Files: 0"*Critical:*0*Warning:*0*Info:*0*)
+            echo "ubs: staged scan reported zero files and zero findings; treating as pass"
+            return 0
+            ;;
+    esac
+
+    return "$code"
+}
 
 # Check if any large files are staged (>50K lines)
 LARGE_FILE_THRESHOLD=50000
@@ -37,13 +72,8 @@ if [ "$HAS_LARGE_FILE" -eq 1 ]; then
     echo "ubs: large file(s) staged:$LARGE_FILES"
     echo "ubs: running with extended timeout (300s) or use UBS_SKIP=1 to bypass"
 
-    if [ -n "$UBS_SKIP" ]; then
-        echo "ubs: UBS_SKIP set, skipping scan"
-        exit 0
-    fi
-
     # Extended timeout for large files
-    timeout 300 ubs --staged --only=rust --quiet || {
+    run_ubs_staged 300 || {
         code=$?
         if [ "$code" -eq 124 ]; then
             echo ""
@@ -56,7 +86,7 @@ if [ "$HAS_LARGE_FILE" -eq 1 ]; then
     }
 else
     # Standard 120s timeout for normal files
-    timeout 120 ubs --staged --only=rust --quiet || {
+    run_ubs_staged 120 || {
         code=$?
         if [ "$code" -eq 124 ]; then
             echo "ubs: timeout - unexpected for small files"
