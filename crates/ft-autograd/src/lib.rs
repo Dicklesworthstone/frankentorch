@@ -14594,24 +14594,24 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Rsqrt { input } => {
-                    // rsqrt(x) = x^(-1/2), d/dx = -0.5 * x^(-3/2) = -0.5 * rsqrt(x)^3
-                    // Using output value: d/dx rsqrt(x) = -0.5 * y^3 where y = rsqrt(x)
-                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
-                    let output_vals = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
-                    let incoming_vals =
-                        self.nodes[incoming_id.0].tensor.contiguous_values_as_f64()?;
-                    let grad_vals: Vec<f64> = incoming_vals
-                        .iter()
-                        .zip(output_vals.iter())
-                        .map(|(g, y)| g * (-0.5 * y * y * y))
-                        .collect();
-                    let grad_in = self.leaf(grad_vals, input_shape, true)?;
+                    // rsqrt(x) = x^(-1/2), d/dx = -0.5 * x^(-3/2) = -0.5 * y^3 where y = rsqrt(x).
+                    // Compose the gradient from cg primitives (rather than baking it into a
+                    // detached leaf) so the gradient node still depends on the output `node_id`
+                    // (hence on `input`). This makes double-backward correct:
+                    // rsqrt''(x) = 0.75 * x^(-5/2) is nonzero, and a detached leaf would drop it.
+                    let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let numel = Self::checked_shape_numel(&shape, "rsqrt backward shape overflow")?;
+                    let neg_half = self.leaf(vec![-0.5; numel], shape, false)?;
+                    let y_sq = self.cg_mul(node_id, node_id)?;
+                    let y_cubed = self.cg_mul(y_sq, node_id)?;
+                    let coeff = self.cg_mul(neg_half, y_cubed)?;
+                    let grad_in = self.cg_mul(incoming_id, coeff)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
                         incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
-                        rule: "d(rsqrt(x))/dx=-0.5*y^3 (cg)",
+                        rule: "d(rsqrt(x))/dx=-0.5*y^3*grad (cg)",
                     });
                 }
                 TensorNodeOp::Hardswish { input } => {
@@ -24123,6 +24123,46 @@ mod tests {
         assert!((gx[0] - (-0.0625)).abs() < 1e-9);
         // x=1: rsqrt(1) = 1.0, d/dx = -0.5 * 1.0^3 = -0.5
         assert!((gx[1] - (-0.5)).abs() < 1e-9);
+    }
+
+    #[test]
+    fn create_graph_rsqrt_second_derivative() {
+        // rsqrt'(x) = -0.5 x^(-3/2); rsqrt''(x) = 0.75 x^(-5/2).
+        // The first-order gradient node must depend on the input so a second backward
+        // recovers the (nonzero) curvature instead of silently returning zero.
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![4.0, 1.0], vec![2], true).expect("x");
+        let (r, _) = tape.rsqrt(x, ExecutionMode::Strict).expect("rsqrt");
+        let (s, _) = tape.sum(r, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                s,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward");
+        // First-order still correct (regression guard for the cg rewrite).
+        let gx = report1.gradient(x).expect("gx");
+        assert!((gx[0] - (-0.0625)).abs() < 1e-9);
+        assert!((gx[1] - (-0.5)).abs() < 1e-9);
+
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let g2 = report2.gradient(x).expect("second gradient");
+        // rsqrt''(4) = 0.75 * 4^(-5/2) = 0.75 / 32 = 0.0234375
+        assert!(
+            (g2[0] - 0.023_437_5).abs() < 1e-9,
+            "rsqrt''(4) should be 0.0234375, got {}",
+            g2[0]
+        );
+        // rsqrt''(1) = 0.75 * 1 = 0.75
+        assert!(
+            (g2[1] - 0.75).abs() < 1e-9,
+            "rsqrt''(1) should be 0.75, got {}",
+            g2[1]
+        );
     }
 
     #[test]
