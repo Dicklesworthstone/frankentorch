@@ -1,0 +1,22 @@
+pow_parallel_matches_elementwise_bit_exact fixture
+numel: 16384
+parallel_threshold: 8192
+exponent_f64: 2.5
+exponent_f32: 2.5
+comparison: production parallel path output bits == scalar powf_torch_signed_zero reference bits
+
+f64 sample bits:
+idx 0: input=1.00000000000000002e-3 value=3.16227766016837919e-8 bits=0x3e60fa3389d6eb40
+idx 1: input=1.39999999999999986e-2 value=2.31910327497504878e-5 bits=0x3ef8514ba2b21cff
+idx 16: input=2.08999999999999991e-1 value=1.99694321413754761e-2 bits=0x3f9472dde7de1ac0
+idx 8191: input=5.59999999999999942e-1 value=2.34676751298461550e-1 bits=0x3fce09e345faad70
+idx 8192: input=5.72999999999999954e-1 value=2.48534426537035252e-1 bits=0x3fcfcff9e0f40e1f
+idx 16383: input=1.13199999999999990e0 value=1.36337732617292384e0 bits=0x3ff5d064be405483
+
+f32 sample bits:
+idx 0: input=1.000000047e-3 value=3.162277906e-8 bits=0x3307d19d
+idx 1: input=1.800000109e-2 value=4.346916830e-5 bits=0x383652aa
+idx 16: input=2.730000019e-1 value=3.894095868e-2 bits=0x3d1f808e
+idx 8191: input=5.200000107e-2 value=6.166069070e-4 bits=0x3a21a3ca
+idx 8192: input=6.900000572e-2 value=1.250612666e-3 bits=0x3aa3eb99
+idx 16383: input=1.200000048e-1 value=4.988306668e-3 bits=0x3ba374f3
