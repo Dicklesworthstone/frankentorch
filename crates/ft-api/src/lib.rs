@@ -11200,7 +11200,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| chebyshev_t_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_t_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11213,7 +11213,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| chebyshev_u_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_u_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11226,7 +11226,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| chebyshev_v_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_v_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11239,7 +11239,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| chebyshev_w_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_w_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11252,10 +11252,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals
-            .iter()
-            .map(|&x| shifted_chebyshev_t_scalar(n, x))
-            .collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_t_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11268,10 +11265,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals
-            .iter()
-            .map(|&x| shifted_chebyshev_u_scalar(n, x))
-            .collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_u_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11284,10 +11278,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals
-            .iter()
-            .map(|&x| shifted_chebyshev_v_scalar(n, x))
-            .collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_v_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11300,10 +11291,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals
-            .iter()
-            .map(|&x| shifted_chebyshev_w_scalar(n, x))
-            .collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_w_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11316,7 +11304,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| hermite_h_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| hermite_h_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11329,7 +11317,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| hermite_he_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| hermite_he_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11342,7 +11330,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| laguerre_l_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| laguerre_l_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11355,7 +11343,7 @@ impl FrankenTorchSession {
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| legendre_p_scalar(n, x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, |x| legendre_p_scalar(n, x));
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -59528,6 +59516,19 @@ fn erfinv_positive_approx(p: f64, q: f64) -> f64 {
 /// evaluated across the rayon pool (below it, thread overhead is not worth it).
 const PARALLEL_ELEMENTWISE_MIN: usize = 8192;
 
+/// Apply a pure per-element function across `vals`, on the rayon pool for large
+/// inputs. The map has no accumulation order, so the result is bit-for-bit
+/// identical to the serial `vals.iter().map(f).collect()` regardless of how many
+/// threads run it — used for the compute-bound special-function kernels.
+fn par_map_f64<F: Fn(f64) -> f64 + Sync>(vals: &[f64], f: F) -> Vec<f64> {
+    use rayon::prelude::*;
+    if vals.len() >= PARALLEL_ELEMENTWISE_MIN {
+        vals.par_iter().map(|&x| f(x)).collect()
+    } else {
+        vals.iter().map(|&x| f(x)).collect()
+    }
+}
+
 fn lgamma_approx(x: f64) -> f64 {
     libm::lgamma(x)
 }
@@ -80030,6 +80031,46 @@ mod tests {
             v[0],
             expected
         );
+    }
+
+    #[test]
+    fn orthogonal_polynomials_parallel_match_serial_bit_exact() {
+        // Isomorphism proof for parallelizing the orthogonal-polynomial special
+        // functions via par_map_f64: with > 8192 elements the rayon path runs and
+        // must equal the serial per-element recurrence BIT-FOR-BIT.
+        let n_elems = 1usize << 14;
+        let data: Vec<f64> = (0..n_elems)
+            .map(|i| ((i % 401) as f64 / 200.0) - 1.0) // in [-1, 1]
+            .collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(data.clone(), vec![n_elems], false).unwrap();
+
+        let deg = 20i64;
+        let cases: &[(&str, TensorNodeId)] = &[
+            (
+                "legendre",
+                s.tensor_special_legendre_polynomial_p(input, deg).unwrap(),
+            ),
+            (
+                "chebyshev_t",
+                s.tensor_special_chebyshev_polynomial_t(input, deg).unwrap(),
+            ),
+            (
+                "hermite_he",
+                s.tensor_special_hermite_polynomial_he(input, 10).unwrap(),
+            ),
+        ];
+        let refs: Vec<Vec<f64>> = vec![
+            data.iter().map(|&x| super::legendre_p_scalar(deg, x)).collect(),
+            data.iter().map(|&x| super::chebyshev_t_scalar(deg, x)).collect(),
+            data.iter().map(|&x| super::hermite_he_scalar(10, x)).collect(),
+        ];
+        for ((name, node), reference) in cases.iter().zip(refs.iter()) {
+            let got = s.tensor_values(*node).unwrap();
+            for (idx, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
+                assert_eq!(g.to_bits(), r.to_bits(), "{name} diverged at {idx}");
+            }
+        }
     }
 
     #[test]
