@@ -23,6 +23,22 @@ fn bench_special(c: &mut Criterion) {
         b.iter(|| black_box(s.digamma_tensor(black_box(x)).unwrap()));
     });
 
+    // Bessel j0: A&S polynomial / asymptotic approximation per element
+    // (no-autograd forward map, routed through par_map_f64). 1M elements.
+    c.bench_function("bessel_j0_1m", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n], false).unwrap();
+        b.iter(|| black_box(s.tensor_special_bessel_j0(black_box(x)).unwrap()));
+    });
+
+    // Bessel k0: exp/log + series per element (heavier than j0). 1M elements.
+    c.bench_function("bessel_k0_1m", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // k0 is defined for x > 0.
+        let x = s.tensor_rand(vec![n], false).unwrap();
+        b.iter(|| black_box(s.tensor_special_modified_bessel_k0(black_box(x)).unwrap()));
+    });
+
     // Orthogonal polynomials: degree-n recurrence per element (the most
     // compute-bound special functions). 256K elements, degree 64.
     let np = 1usize << 18;

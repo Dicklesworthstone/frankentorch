@@ -11103,7 +11103,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_j0_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_j0_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11115,7 +11115,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_j1_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_j1_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11127,7 +11127,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_y0_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_y0_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11139,7 +11139,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_y1_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_y1_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11151,7 +11151,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_k0_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_k0_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11163,7 +11163,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_k1_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_k1_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11175,7 +11175,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_k0e_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_k0e_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -11187,7 +11187,7 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = vals.iter().map(|&x| bessel_k1e_scalar(x)).collect();
+        let result: Vec<f64> = par_map_f64(&vals, bessel_k1e_scalar);
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
@@ -80069,6 +80069,51 @@ mod tests {
             let got = s.tensor_values(*node).unwrap();
             for (idx, (g, r)) in got.iter().zip(reference.iter()).enumerate() {
                 assert_eq!(g.to_bits(), r.to_bits(), "{name} diverged at {idx}");
+            }
+        }
+    }
+
+    #[test]
+    fn bessel_jyk_parallel_match_serial_bit_exact() {
+        // Isomorphism proof for routing the no-autograd Bessel j/y/k family
+        // through par_map_f64: with > 8192 elements the rayon path runs and must
+        // equal the serial per-element map BIT-FOR-BIT (pure map, no accum order).
+        let n_elems = 1usize << 14;
+        // Positive domain: y0/y1/k0/k1 are only defined for x > 0.
+        let data: Vec<f64> = (0..n_elems).map(|i| 0.05 + (i % 997) as f64 * 0.02).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s.tensor_variable(data.clone(), vec![n_elems], false).unwrap();
+
+        let cases: &[(&str, TensorNodeId, fn(f64) -> f64)] = &[
+            ("j0", s.tensor_special_bessel_j0(input).unwrap(), super::bessel_j0_scalar),
+            ("j1", s.tensor_special_bessel_j1(input).unwrap(), super::bessel_j1_scalar),
+            ("y0", s.tensor_special_bessel_y0(input).unwrap(), super::bessel_y0_scalar),
+            ("y1", s.tensor_special_bessel_y1(input).unwrap(), super::bessel_y1_scalar),
+            (
+                "k0",
+                s.tensor_special_modified_bessel_k0(input).unwrap(),
+                super::bessel_k0_scalar,
+            ),
+            (
+                "k1",
+                s.tensor_special_modified_bessel_k1(input).unwrap(),
+                super::bessel_k1_scalar,
+            ),
+            (
+                "k0e",
+                s.tensor_special_scaled_modified_bessel_k0(input).unwrap(),
+                super::bessel_k0e_scalar,
+            ),
+            (
+                "k1e",
+                s.tensor_special_scaled_modified_bessel_k1(input).unwrap(),
+                super::bessel_k1e_scalar,
+            ),
+        ];
+        for (name, node, scalar) in cases.iter() {
+            let got = s.tensor_values(*node).unwrap();
+            for (idx, (g, &x)) in got.iter().zip(data.iter()).enumerate() {
+                assert_eq!(g.to_bits(), scalar(x).to_bits(), "{name} diverged at {idx}");
             }
         }
     }
