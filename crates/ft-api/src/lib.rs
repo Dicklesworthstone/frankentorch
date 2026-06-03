@@ -11235,6 +11235,43 @@ impl FrankenTorchSession {
         self.tensor_variable(result, meta.shape().to_vec(), false)
     }
 
+    /// Like `special_unary_with_deriv` but for a degree-parameterized special
+    /// function `fwd(n, x)` whose scalar derivative in x is `deriv(n, x)`. Used
+    /// for the orthogonal-polynomial family, where the degree `n` is an integer
+    /// constant (non-differentiable) and only the `x` gradient flows.
+    fn special_unary_n_with_deriv(
+        &mut self,
+        input: TensorNodeId,
+        n: i64,
+        fwd: fn(i64, f64) -> f64,
+        deriv: fn(i64, f64) -> f64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if self.tensor_requires_grad(input)? {
+            return self.tensor_apply_function(
+                &[input],
+                move |ctx, inputs| {
+                    let (vals, in_shape) = inputs[0];
+                    let result = par_map_f64(vals, |x| fwd(n, x));
+                    ctx.save_for_backward(vals.to_vec(), in_shape.to_vec());
+                    Ok((result, in_shape.to_vec()))
+                },
+                move |ctx, grad_outputs| {
+                    let x = &ctx.saved_tensors()[0];
+                    let g = grad_outputs[0];
+                    let grad_in: Vec<f64> = x
+                        .iter()
+                        .zip(g.iter())
+                        .map(|(&xi, &gi)| deriv(n, xi) * gi)
+                        .collect();
+                    Ok(vec![Some(grad_in)])
+                },
+            );
+        }
+        let (vals, meta) = self.tensor_values_meta(input)?;
+        let result: Vec<f64> = par_map_f64(&vals, |x| fwd(n, x));
+        self.tensor_variable(result, meta.shape().to_vec(), false)
+    }
+
     pub fn tensor_special_bessel_j0(
         &mut self,
         input: TensorNodeId,
@@ -11338,9 +11375,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_t_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // d/dx T_n(x) = n * U_{n-1}(x).
+        self.special_unary_n_with_deriv(input, n, chebyshev_t_scalar, |n, x| {
+            if n <= 0 {
+                0.0
+            } else {
+                n as f64 * chebyshev_u_scalar(n - 1, x)
+            }
+        })
     }
 
     /// Chebyshev polynomial of the second kind U_n(x).
@@ -11442,9 +11484,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| hermite_h_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // d/dx H_n(x) = 2n * H_{n-1}(x).
+        self.special_unary_n_with_deriv(input, n, hermite_h_scalar, |n, x| {
+            if n <= 0 {
+                0.0
+            } else {
+                2.0 * n as f64 * hermite_h_scalar(n - 1, x)
+            }
+        })
     }
 
     /// Probabilist's Hermite polynomial He_n(x).
@@ -11455,9 +11502,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| hermite_he_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // d/dx He_n(x) = n * He_{n-1}(x).
+        self.special_unary_n_with_deriv(input, n, hermite_he_scalar, |n, x| {
+            if n <= 0 {
+                0.0
+            } else {
+                n as f64 * hermite_he_scalar(n - 1, x)
+            }
+        })
     }
 
     /// Laguerre polynomial L_n(x).
@@ -11468,9 +11520,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| laguerre_l_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // x L_n'(x) = n (L_n(x) - L_{n-1}(x)) ⇒ L_n'(x) = n (L_n - L_{n-1}) / x.
+        self.special_unary_n_with_deriv(input, n, laguerre_l_scalar, |n, x| {
+            if n <= 0 {
+                0.0
+            } else {
+                n as f64 * (laguerre_l_scalar(n, x) - laguerre_l_scalar(n - 1, x)) / x
+            }
+        })
     }
 
     /// Legendre polynomial P_n(x).
@@ -11481,9 +11538,16 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| legendre_p_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // (x²-1) P_n'(x) = n (x P_n(x) - P_{n-1}(x))
+        //   ⇒ P_n'(x) = n (x P_n - P_{n-1}) / (x² - 1).  Singular at x = ±1.
+        self.special_unary_n_with_deriv(input, n, legendre_p_scalar, |n, x| {
+            if n <= 0 {
+                0.0
+            } else {
+                n as f64 * (x * legendre_p_scalar(n, x) - legendre_p_scalar(n - 1, x))
+                    / (x * x - 1.0)
+            }
+        })
     }
 
     /// Numerically stable log of the standard normal CDF.
@@ -82334,6 +82398,57 @@ mod tests {
                 let fd = (fp - fm) / (2.0 * eps);
                 assert!(
                     (grad[i] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
+                    "{name} backward mismatch at x={x}: analytic={}, fd={fd}",
+                    grad[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn orthogonal_polynomial_backward_matches_finite_difference_and_value_parity() {
+        // Each polynomial's x-derivative (via sibling-degree evaluators) must
+        // match a central finite difference, and the grad-path forward must be
+        // bit-identical to the non-grad path. Test points avoid each family's
+        // derivative singularities (laguerre at x=0, legendre at x=±1).
+        type ApiFn = fn(&mut FrankenTorchSession, TensorNodeId, i64) -> Result<TensorNodeId, AutogradError>;
+        let cases: &[(&str, ApiFn, i64, &[f64])] = &[
+            ("chebyshev_t", |s, x, n| s.tensor_special_chebyshev_polynomial_t(x, n), 4, &[-0.3, 0.2, 0.6]),
+            ("hermite_h", |s, x, n| s.tensor_special_hermite_polynomial_h(x, n), 3, &[-0.5, 0.4, 1.2]),
+            ("hermite_he", |s, x, n| s.tensor_special_hermite_polynomial_he(x, n), 4, &[-0.5, 0.4, 1.2]),
+            ("laguerre_l", |s, x, n| s.tensor_special_laguerre_polynomial_l(x, n), 3, &[0.5, 1.3, 2.7]),
+            ("legendre_p", |s, x, n| s.tensor_special_legendre_polynomial_p(x, n), 4, &[-0.4, 0.2, 0.6]),
+        ];
+        let eps = 1e-7;
+        for (name, fwd, n, xs) in cases.iter() {
+            let n = *n;
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let data = xs.to_vec();
+            // Value parity.
+            let a_ng = s.tensor_variable(data.clone(), vec![data.len()], false).unwrap();
+            let o_ng = fwd(&mut s, a_ng, n).unwrap();
+            let v_ng = s.tensor_values(o_ng).unwrap();
+            let a_g = s.tensor_variable(data.clone(), vec![data.len()], true).unwrap();
+            let o_g = fwd(&mut s, a_g, n).unwrap();
+            let v_g = s.tensor_values(o_g).unwrap();
+            for (p, q) in v_ng.iter().zip(v_g.iter()) {
+                assert_eq!(p.to_bits(), q.to_bits(), "{name} grad/non-grad value mismatch");
+            }
+            // Backward with ones upstream → grad_in[i] = deriv(n, x_i).
+            let loss = s.tensor_sum(o_g).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            let grad = s.tensor_gradient(&report, a_g).expect("poly grad present");
+            for (i, &x) in xs.iter().enumerate() {
+                let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+                let xp = s2.tensor_variable(vec![x + eps], vec![1], false).unwrap();
+                let xm = s2.tensor_variable(vec![x - eps], vec![1], false).unwrap();
+                let op = fwd(&mut s2, xp, n).unwrap();
+                let fp = s2.tensor_values(op).unwrap()[0];
+                let om = fwd(&mut s2, xm, n).unwrap();
+                let fm = s2.tensor_values(om).unwrap()[0];
+                let fd = (fp - fm) / (2.0 * eps);
+                assert!(
+                    (grad[i] - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
                     "{name} backward mismatch at x={x}: analytic={}, fd={fd}",
                     grad[i]
                 );
