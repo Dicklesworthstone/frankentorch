@@ -39426,6 +39426,80 @@ impl FrankenTorchSession {
     /// (standard matrix-calculus identity: dY = -A^{-1} dA A^{-1}).
     /// Saves Y for backward to avoid recomputing the inverse.
     /// Tracked under frankentorch-frq7 (child of frankentorch-tw0y).
+    /// Inverse of a multi-dimensional tensor (the multiplicative inverse for
+    /// `tensordot`). Equivalent to `torch.linalg.tensorinv(A, ind)`.
+    ///
+    /// `A` is regarded as a matrix by splitting its dimensions at `ind`:
+    /// reshape to `(prod(shape[ind:]), prod(shape[:ind]))`, which must be square,
+    /// invert it, and reshape the result to `shape[ind:] ++ shape[:ind]`. Both
+    /// reshapes are contiguous, matching numpy/torch exactly; the gradient flows
+    /// through the autograd-aware `linalg_inv`.
+    pub fn tensor_linalg_tensorinv(
+        &mut self,
+        input: TensorNodeId,
+        ind: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if ind == 0 || ind >= shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensorinv: ind must satisfy 0 < ind < input.ndim",
+                },
+            )));
+        }
+        let m: usize = shape[..ind].iter().product(); // prod(shape[:ind])
+        let n: usize = shape[ind..].iter().product(); // prod(shape[ind:])
+        if m != n {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensorinv: prod(shape[:ind]) must equal prod(shape[ind:])",
+                },
+            )));
+        }
+        let mat = self.tensor_reshape(input, vec![n, m])?;
+        let inv = self.tensor_linalg_inv(mat)?;
+        let mut out_shape: Vec<usize> = shape[ind..].to_vec();
+        out_shape.extend_from_slice(&shape[..ind]);
+        self.tensor_reshape(inv, out_shape)
+    }
+
+    /// Solve the tensor equation `tensordot(A, X) = B` for `X`. Equivalent to
+    /// `torch.linalg.tensorsolve(A, B)` (default axes).
+    ///
+    /// `A` has shape `B.shape ++ X.shape`; it is reshaped to
+    /// `(prod(B.shape), prod(X.shape))` (which must be square), `B` is
+    /// flattened, the square system is solved, and the result is reshaped to
+    /// `X.shape = A.shape[B.ndim:]`. Gradient flows through `linalg_solve`.
+    pub fn tensor_linalg_tensorsolve(
+        &mut self,
+        a: TensorNodeId,
+        b: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let a_shape = self.tensor_shape(a)?;
+        let b_shape = self.tensor_shape(b)?;
+        if a_shape.len() < b_shape.len() || a_shape[..b_shape.len()] != b_shape[..] {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensorsolve: A.shape must begin with B.shape",
+                },
+            )));
+        }
+        let pb: usize = b_shape.iter().product(); // prod(B.shape)
+        let x_shape: Vec<usize> = a_shape[b_shape.len()..].to_vec();
+        let px: usize = x_shape.iter().product(); // prod(X.shape)
+        if pb != px {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "tensorsolve: prod(B.shape) must equal prod(X.shape)",
+                },
+            )));
+        }
+        let a_mat = self.tensor_reshape(a, vec![pb, px])?;
+        let b_vec = self.tensor_reshape(b, vec![pb])?;
+        let x_vec = self.tensor_linalg_solve(a_mat, b_vec)?;
+        self.tensor_reshape(x_vec, x_shape)
+    }
+
     pub fn tensor_linalg_inv(
         &mut self,
         input: TensorNodeId,
@@ -74990,6 +75064,60 @@ mod tests {
         assert!(vals[1].abs() < 1e-10);
         assert!(vals[2].abs() < 1e-10);
         assert!((vals[3] - 1.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn tensorinv_and_tensorsolve_match_matrix_inv_and_solve_with_gradient() {
+        let m = vec![
+            4.0, 7.0, 2.0, 1.0, //
+            3.0, 6.0, 1.0, 2.0, //
+            2.0, 1.0, 5.0, 3.0, //
+            1.0, 0.0, 2.0, 4.0,
+        ];
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // tensorinv(M, ind=1) on a 4x4 reduces to inv(M) (both reshapes identity).
+        let a2 = s.tensor_variable(m.clone(), vec![4, 4], false).unwrap();
+        let inv_direct = s.tensor_linalg_inv(a2).unwrap();
+        let inv_d = s.tensor_values(inv_direct).unwrap();
+        let a3 = s.tensor_variable(m.clone(), vec![4, 4], false).unwrap();
+        let tinv = s.tensor_linalg_tensorinv(a3, 1).unwrap();
+        assert_eq!(s.tensor_shape(tinv).unwrap(), vec![4, 4]);
+        let tinv_v = s.tensor_values(tinv).unwrap();
+        for (a, b) in inv_d.iter().zip(tinv_v.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "tensorinv != inv");
+        }
+        // Higher-dim: M as (2,2,4), ind=2 → reshape to (4,4)=M, inv, → (4,2,2).
+        let at = s.tensor_variable(m.clone(), vec![2, 2, 4], false).unwrap();
+        let tinv2 = s.tensor_linalg_tensorinv(at, 2).unwrap();
+        assert_eq!(s.tensor_shape(tinv2).unwrap(), vec![4, 2, 2]);
+        let tinv2_v = s.tensor_values(tinv2).unwrap();
+        for (a, b) in inv_d.iter().zip(tinv2_v.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "tensorinv(2,2,4) flat != inv flat");
+        }
+
+        // tensorsolve(A_4x4, b_4) == linalg_solve(A, b).
+        let b = vec![1.0, 2.0, -1.0, 3.0];
+        let asA = s.tensor_variable(m.clone(), vec![4, 4], false).unwrap();
+        let bv = s.tensor_variable(b.clone(), vec![4], false).unwrap();
+        let solve_direct = s.tensor_linalg_solve(asA, bv).unwrap();
+        let sd = s.tensor_values(solve_direct).unwrap();
+        let asA2 = s.tensor_variable(m.clone(), vec![4, 4], false).unwrap();
+        let bv2 = s.tensor_variable(b.clone(), vec![4], false).unwrap();
+        let ts = s.tensor_linalg_tensorsolve(asA2, bv2).unwrap();
+        assert_eq!(s.tensor_shape(ts).unwrap(), vec![4]);
+        let ts_v = s.tensor_values(ts).unwrap();
+        for (a, c) in sd.iter().zip(ts_v.iter()) {
+            assert_eq!(a.to_bits(), c.to_bits(), "tensorsolve != solve");
+        }
+
+        // Gradient flows through tensorinv (loss = sum of the inverse tensor).
+        let ag = s.tensor_variable(m.clone(), vec![2, 2, 4], true).unwrap();
+        let tig = s.tensor_linalg_tensorinv(ag, 2).unwrap();
+        let loss = s.tensor_sum(tig).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, ag).expect("tensorinv grad present");
+        assert_eq!(grad.len(), 16);
+        assert!(grad.iter().any(|g| g.abs() > 1e-9), "tensorinv gradient is all-zero");
     }
 
     #[test]
