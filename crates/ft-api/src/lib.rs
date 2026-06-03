@@ -39230,6 +39230,80 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        let input_meta = self.tensor_tape.tensor_meta(input)?.clone();
+        if self.tensor_requires_grad(input)? {
+            // Reverse-mode backward of Y = expm(A). The adjoint of the Fréchet
+            // derivative of expm at A equals the Fréchet derivative at A^T, and
+            // that derivative is the top-right n×n block of the matrix exponential
+            // of the 2n×2n block-triangular matrix
+            //     M = [[A^T, grad_Y], [0, A^T]]   →   expm(M)[0:n, n:2n] = grad_A
+            // (Higham, "Functions of Matrices", §10.2 / Al-Mohy & Higham 2009).
+            // Forward reuses the same matrix_exp_contiguous_f64 kernel, so the
+            // returned value is bit-identical to the non-grad path; only the
+            // previously-severed gradient (this op silently returned a non-grad
+            // leaf) is restored. frankentorch-rl4g.
+            let shape = input_meta.shape();
+            if shape.len() == 2 && shape[0] == shape[1] && input_meta.dtype() == DType::F64 {
+                let device = input_meta.device();
+                let out = self.tensor_apply_function(
+                    &[input],
+                    move |ctx, inputs| {
+                        let (values, in_shape) = inputs[0];
+                        let meta = TensorMeta::from_shape(in_shape.to_vec(), DType::F64, device);
+                        let y = ft_kernel_cpu::matrix_exp_contiguous_f64(values, &meta)
+                            .map_err(|e| {
+                                AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                            })?;
+                        // Save A (the input) — backward needs A^T.
+                        ctx.save_for_backward(values.to_vec(), in_shape.to_vec());
+                        Ok((y, in_shape.to_vec()))
+                    },
+                    move |ctx, grad_outputs| {
+                        let saved = ctx.saved_tensors();
+                        let a = &saved[0];
+                        let grad_y = grad_outputs[0];
+                        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                        let n = (a.len() as f64).sqrt().round() as usize;
+                        // Build the 2n×2n augmented matrix M = [[A^T, grad_Y],
+                        // [0, A^T]] in row-major order.
+                        let m2 = 2 * n;
+                        let mut aug = vec![0.0_f64; m2 * m2];
+                        for i in 0..n {
+                            for j in 0..n {
+                                let at = a[j * n + i]; // A^T[i][j] = A[j][i]
+                                aug[i * m2 + j] = at; // (0,0) block
+                                aug[(i + n) * m2 + (j + n)] = at; // (1,1) block
+                                aug[i * m2 + (j + n)] = grad_y[i * n + j]; // (0,1) block
+                            }
+                        }
+                        let meta2 =
+                            TensorMeta::from_shape(vec![m2, m2], DType::F64, device);
+                        let expm = ft_kernel_cpu::matrix_exp_contiguous_f64(&aug, &meta2)
+                            .map_err(|e| {
+                                AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                            })?;
+                        // grad_A = top-right n×n block of expm(M).
+                        let mut grad_a = vec![0.0_f64; n * n];
+                        for i in 0..n {
+                            for j in 0..n {
+                                grad_a[i * n + j] = expm[i * m2 + (j + n)];
+                            }
+                        }
+                        Ok(vec![Some(grad_a)])
+                    },
+                )?;
+                self.runtime.ledger_mut().record(
+                    EvidenceKind::Dispatch,
+                    format!("matrix_exp input={} out={} (autograd)", input.0, out.0),
+                );
+                return Ok(out);
+            }
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "matrix_exp: autograd only supported for a square F64 matrix",
+                },
+            )));
+        }
         let (values, meta) = self.tensor_values_meta(input)?;
         let result = ft_kernel_cpu::matrix_exp_contiguous_f64(&values, &meta)
             .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
@@ -73572,6 +73646,53 @@ mod tests {
         let result = s.tensor_matrix_exp(a).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!((vals[0] - 3.0f64.exp()).abs() < 1e-8);
+    }
+
+    #[test]
+    fn matrix_exp_backward_matches_finite_difference_and_value_parity() {
+        use ft_core::{DType, Device};
+        let n = 3usize;
+        // A general (non-symmetric) matrix with modest norm.
+        #[rustfmt::skip]
+        let a = vec![
+            0.2, -0.5, 0.1,
+            0.3, 0.0, -0.4,
+            -0.2, 0.6, 0.15,
+        ];
+        let v = vec![0.1, -0.2, 0.05, 0.3, -0.1, 0.15, -0.25, 0.2, 0.1];
+
+        // Bit-exact forward parity: the requires_grad path must return the same
+        // matrix exponential as the non-grad path (same kernel).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a_ng = s.tensor_variable(a.clone(), vec![n, n], false).unwrap();
+        let y_ng = s.tensor_matrix_exp(a_ng).unwrap();
+        let y_ng_v = s.tensor_values(y_ng).unwrap();
+        let a_g = s.tensor_variable(a.clone(), vec![n, n], true).unwrap();
+        let y_g = s.tensor_matrix_exp(a_g).unwrap();
+        let y_g_v = s.tensor_values(y_g).unwrap();
+        for (x, y) in y_ng_v.iter().zip(y_g_v.iter()) {
+            assert_eq!(x.to_bits(), y.to_bits(), "matrix_exp grad/non-grad value mismatch");
+        }
+
+        // FD verification of the restored gradient: loss = sum(expm(A)^2).
+        let loss_of = |mat: &[f64]| -> f64 {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let e = ft_kernel_cpu::matrix_exp_contiguous_f64(mat, &meta).unwrap();
+            e.iter().map(|x| x * x).sum::<f64>()
+        };
+        let sq = s.tensor_mul(y_g, y_g).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s.tensor_gradient(&report, a_g).expect("matrix_exp grad present");
+        let analytic: f64 = grad_a.iter().zip(v.iter()).map(|(g, vv)| g * vv).sum();
+        let eps = 1e-6;
+        let a_plus: Vec<f64> = a.iter().zip(v.iter()).map(|(x, vv)| x + eps * vv).collect();
+        let a_minus: Vec<f64> = a.iter().zip(v.iter()).map(|(x, vv)| x - eps * vv).collect();
+        let fd = (loss_of(&a_plus) - loss_of(&a_minus)) / (2.0 * eps);
+        assert!(
+            (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "matrix_exp backward mismatch: analytic={analytic}, fd={fd}"
+        );
     }
 
     #[test]
