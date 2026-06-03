@@ -1,0 +1,4 @@
+0b433ed430a6c5ea1c8a1dbefb4b8927e6e905dd48ba6a6f96787546c819fd9d  tests/artifacts/perf/20260603T1702Z-boldox-fftn-stage-twiddles/criterion_fftn_baseline.txt
+88d6c912941d6e0ae43c2b2b42bb77e15f0d74aa48039dd0ccf52a73cb5e0338  tests/artifacts/perf/20260603T1702Z-boldox-fftn-stage-twiddles/criterion_fftn_after.txt
+6d8125e930542cdca095877031ba6abc20920742b6de0dda3550a4dab7100496  tests/artifacts/perf/20260603T1702Z-boldox-fftn-stage-twiddles/golden_fftn_outputs.txt
+8a28e5739b4db1f5ba900f172571f77445b6b1e2ce5eb3096c23508b1d3ca4de  tests/artifacts/perf/20260603T1702Z-boldox-fftn-stage-twiddles/isomorphism_proof.md

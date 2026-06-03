@@ -1,0 +1,25 @@
+case=fftn_stage_twiddle_plan_fixture
+reference=dft_stage_twiddles_match_per_butterfly_reference_bit_exact + fft_along_dim_parallel_match_serial_bit_exact
+shape=[2,8] dim=[1] dtype=Complex128
+fixture=input row-major impulses; each lane has x[0]=1.0 and all other samples 0.0
+format=idx:re_bits_hex:im_bits_hex
+0:3ff0000000000000:0000000000000000
+1:3ff0000000000000:0000000000000000
+2:3ff0000000000000:0000000000000000
+3:3ff0000000000000:0000000000000000
+4:3ff0000000000000:0000000000000000
+5:3ff0000000000000:0000000000000000
+6:3ff0000000000000:0000000000000000
+7:3ff0000000000000:0000000000000000
+8:3ff0000000000000:0000000000000000
+9:3ff0000000000000:0000000000000000
+10:3ff0000000000000:0000000000000000
+11:3ff0000000000000:0000000000000000
+12:3ff0000000000000:0000000000000000
+13:3ff0000000000000:0000000000000000
+14:3ff0000000000000:0000000000000000
+15:3ff0000000000000:0000000000000000
+
+large-bit-exact-tests:
+dft_stage_twiddles_match_per_butterfly_reference_bit_exact uses n=2048 for forward and inverse, builds the shared twiddle table, and compares every output bit against the per-butterfly inline cos/sin reference.
+fft_along_dim_parallel_match_serial_bit_exact uses 16 lanes x 512, triggers the parallel fftn path, and compares every real/imag output bit against serial dft_inplace_1d.

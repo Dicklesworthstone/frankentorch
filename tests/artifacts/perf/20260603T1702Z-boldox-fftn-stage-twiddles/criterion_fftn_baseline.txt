@@ -1,0 +1,7 @@
+command: rch exec -- cargo bench -p ft-api --bench ops_bench -- fftn/512x2048_dim1 --warm-up-time 1 --measurement-time 5 --sample-size 10
+worker: vmi1293453
+target: fftn/512x2048_dim1
+baseline: before frankentorch-rdem
+
+fftn/512x2048_dim1      time:   [22.417 ms 26.137 ms 29.363 ms]
+                        thrpt:  [35.711 Melem/s 40.119 Melem/s 46.775 Melem/s]

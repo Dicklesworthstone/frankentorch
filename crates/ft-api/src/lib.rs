@@ -46759,7 +46759,33 @@ impl FrankenTorchSession {
     /// If `inverse` is true, computes the inverse DFT (positive
     /// twiddle exponent + 1/N normalization).
     /// frankentorch-hpo6.
+    fn fft_stage_twiddles(n: usize, inverse: bool) -> Vec<(f64, f64)> {
+        let sign = if inverse { 1.0 } else { -1.0 };
+        let two_pi = 2.0 * std::f64::consts::PI;
+        let mut twiddles = Vec::with_capacity(n.saturating_sub(1));
+        let mut stage = 2usize;
+        while stage <= n {
+            let half = stage / 2;
+            let angle_step = sign * two_pi / stage as f64;
+            twiddles.extend((0..half).map(|k| {
+                let angle = angle_step * k as f64;
+                (angle.cos(), angle.sin())
+            }));
+            stage *= 2;
+        }
+        twiddles
+    }
+
     fn dft_inplace_1d(re: &mut [f64], im: &mut [f64], inverse: bool) {
+        Self::dft_inplace_1d_with_stage_twiddles(re, im, inverse, None);
+    }
+
+    fn dft_inplace_1d_with_stage_twiddles(
+        re: &mut [f64],
+        im: &mut [f64],
+        inverse: bool,
+        shared_twiddles: Option<&[(f64, f64)]>,
+    ) {
         let n = re.len();
         assert_eq!(re.len(), im.len(), "dft_inplace_1d re/im length mismatch");
         if n <= 1 {
@@ -46788,25 +46814,43 @@ impl FrankenTorchSession {
             let sign = if inverse { 1.0 } else { -1.0 };
             let two_pi = 2.0 * std::f64::consts::PI;
             let mut stage = 2usize;
+            let mut twiddle_offset = 0usize;
             while stage <= n {
                 let half = stage / 2;
-                let angle_step = sign * two_pi / stage as f64;
-                let twiddles: Vec<(f64, f64)> = (0..half)
-                    .map(|k| {
-                        let angle = angle_step * k as f64;
-                        (angle.cos(), angle.sin())
-                    })
-                    .collect();
-                for start in (0..n).step_by(stage) {
-                    for (k, (w_re, w_im)) in twiddles.iter().copied().enumerate() {
-                        let idx = start + k;
-                        let jdx = start + k + half;
-                        let tw_re = w_re * re[jdx] - w_im * im[jdx];
-                        let tw_im = w_re * im[jdx] + w_im * re[jdx];
-                        re[jdx] = re[idx] - tw_re;
-                        im[jdx] = im[idx] - tw_im;
-                        re[idx] += tw_re;
-                        im[idx] += tw_im;
+                if let Some(twiddles) = shared_twiddles {
+                    let stage_twiddles = &twiddles[twiddle_offset..twiddle_offset + half];
+                    twiddle_offset += half;
+                    for start in (0..n).step_by(stage) {
+                        for (k, (w_re, w_im)) in stage_twiddles.iter().copied().enumerate() {
+                            let idx = start + k;
+                            let jdx = start + k + half;
+                            let tw_re = w_re * re[jdx] - w_im * im[jdx];
+                            let tw_im = w_re * im[jdx] + w_im * re[jdx];
+                            re[jdx] = re[idx] - tw_re;
+                            im[jdx] = im[idx] - tw_im;
+                            re[idx] += tw_re;
+                            im[idx] += tw_im;
+                        }
+                    }
+                } else {
+                    let angle_step = sign * two_pi / stage as f64;
+                    let twiddles: Vec<(f64, f64)> = (0..half)
+                        .map(|k| {
+                            let angle = angle_step * k as f64;
+                            (angle.cos(), angle.sin())
+                        })
+                        .collect();
+                    for start in (0..n).step_by(stage) {
+                        for (k, (w_re, w_im)) in twiddles.iter().copied().enumerate() {
+                            let idx = start + k;
+                            let jdx = start + k + half;
+                            let tw_re = w_re * re[jdx] - w_im * im[jdx];
+                            let tw_im = w_re * im[jdx] + w_im * re[jdx];
+                            re[jdx] = re[idx] - tw_re;
+                            im[jdx] = im[idx] - tw_im;
+                            re[idx] += tw_re;
+                            im[idx] += tw_im;
+                        }
                     }
                 }
                 stage *= 2;
@@ -46890,15 +46934,24 @@ impl FrankenTorchSession {
         // to the serial loop. (Strided non-last-dim transforms keep the serial
         // gather/scatter — fftn drives the last dim first anyway.)
         let num_lanes = stride_outer * stride_inner;
+        let shared_twiddles = (num_lanes >= 2 && dim_size.is_power_of_two())
+            .then(|| Self::fft_stage_twiddles(dim_size, inverse));
         if stride_inner == 1 && num_lanes >= 2 && total_elements >= PARALLEL_ELEMENTWISE_MIN {
             use rayon::prelude::*;
+            let shared_twiddles = shared_twiddles.as_deref();
             re_data
                 .par_chunks_mut(dim_size)
                 .zip(im_data.par_chunks_mut(dim_size))
                 .for_each(|(re_slice, im_slice)| {
-                    Self::dft_inplace_1d(re_slice, im_slice, inverse);
+                    Self::dft_inplace_1d_with_stage_twiddles(
+                        re_slice,
+                        im_slice,
+                        inverse,
+                        shared_twiddles,
+                    );
                 });
         } else {
+            let shared_twiddles = shared_twiddles.as_deref();
             for outer in 0..stride_outer {
                 for inner in 0..stride_inner {
                     let mut re_slice = vec![0.0_f64; dim_size];
@@ -46908,7 +46961,12 @@ impl FrankenTorchSession {
                         re_slice[k] = re_data[idx];
                         im_slice[k] = im_data[idx];
                     }
-                    Self::dft_inplace_1d(&mut re_slice, &mut im_slice, inverse);
+                    Self::dft_inplace_1d_with_stage_twiddles(
+                        &mut re_slice,
+                        &mut im_slice,
+                        inverse,
+                        shared_twiddles,
+                    );
                     for k in 0..dim_size {
                         let idx = outer * dim_size * stride_inner + k * stride_inner + inner;
                         re_data[idx] = re_slice[k];
@@ -84987,7 +85045,13 @@ mod tests {
             let mut want_im = got_im.clone();
 
             reference_dft_inplace_1d(&mut want_re, &mut want_im, inverse);
-            FrankenTorchSession::dft_inplace_1d(&mut got_re, &mut got_im, inverse);
+            let twiddles = FrankenTorchSession::fft_stage_twiddles(n, inverse);
+            FrankenTorchSession::dft_inplace_1d_with_stage_twiddles(
+                &mut got_re,
+                &mut got_im,
+                inverse,
+                Some(&twiddles),
+            );
 
             for (idx, (got, want)) in got_re.iter().zip(want_re.iter()).enumerate() {
                 assert_eq!(got.to_bits(), want.to_bits(), "dft re @{idx}");
