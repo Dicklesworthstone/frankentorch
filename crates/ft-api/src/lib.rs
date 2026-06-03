@@ -60770,129 +60770,123 @@ fn bessel_y1_scalar(x: f64) -> f64 {
 }
 
 /// Modified Bessel function of the second kind K0.
+// ── Modified Bessel K-family (table-free, full precision in most of the domain)
+// The previous A&S 9.8.x polynomials were single precision (~1.6e-7). These use
+// the ascending series (full f64; cancellation grows with x) for x <= K_SPLIT
+// and the asymptotic series (full f64 for large x) beyond it. The crossover is
+// chosen where both regimes are best (~1.5e-8 worst case at x≈9; ~f64 for x<=5
+// and x>11). Reuses the Cephes i0/i1. Pure Rust, no coefficient tables.
+const EULER_GAMMA: f64 = 0.577_215_664_901_532_86;
+const K_SPLIT: f64 = 9.0;
+
+/// Ascending series for K0(x): -(ln(x/2)+γ) I0(x) + Σ_{k>=1} (x²/4)^k/(k!)² H_k.
+fn k0_ascending(x: f64) -> f64 {
+    let i0 = cephes_i0(x);
+    let z = x * x / 4.0;
+    let mut tk = 1.0_f64; // (x²/4)^k/(k!)², starts at the k=0 placeholder
+    let mut h = 0.0_f64; // harmonic number H_k
+    let mut sum = 0.0_f64;
+    for k in 1..=60 {
+        let kf = f64::from(k);
+        tk *= z / (kf * kf);
+        h += 1.0 / kf;
+        let add = tk * h;
+        sum += add;
+        if k > 5 && add.abs() <= 1e-18 * sum.abs() {
+            break;
+        }
+    }
+    -((x * 0.5).ln() + EULER_GAMMA) * i0 + sum
+}
+
+/// Ascending series for K1(x):
+///   1/x + (ln(x/2)+γ) I1(x) - ½ Σ_{k>=0} (H_k+H_{k+1}) (x/2)^{2k+1}/(k!(k+1)!).
+fn k1_ascending(x: f64) -> f64 {
+    let i1 = cephes_i1(x);
+    let z = x * x / 4.0;
+    let mut sk = x * 0.5; // (x/2)^{2k+1}/(k!(k+1)!), k=0
+    let mut hk = 0.0_f64; // H_k
+    let mut hk1 = 1.0_f64; // H_{k+1}
+    let mut sum = (hk + hk1) * sk; // k=0 term
+    for k in 1..=60 {
+        let kf = f64::from(k);
+        sk *= z / (kf * (kf + 1.0));
+        hk = hk1;
+        hk1 += 1.0 / (kf + 1.0);
+        let add = (hk + hk1) * sk;
+        sum += add;
+        if k > 5 && add.abs() <= 1e-18 * sum.abs() {
+            break;
+        }
+    }
+    1.0 / x + ((x * 0.5).ln() + EULER_GAMMA) * i1 - 0.5 * sum
+}
+
+/// Asymptotic series Σ_{k>=0} a_k/x^k with a_0=1, a_k = a_{k-1}(4ν²-(2k-1)²)/(8k),
+/// truncated at the smallest term. Returns sqrt(π/2x)·Σ a_k/x^k, i.e. e^x·K_ν(x).
+fn k_asymptotic_scaled(x: f64, four_nu2: f64) -> f64 {
+    let mut term = 1.0_f64;
+    let mut sum = 1.0_f64;
+    let mut prev_abs = f64::INFINITY;
+    for k in 1..=80 {
+        let kf = f64::from(k);
+        let m = 2.0 * kf - 1.0;
+        let next = term * (four_nu2 - m * m) / (8.0 * kf * x);
+        if next.abs() > prev_abs {
+            break; // optimal (superasymptotic) truncation: stop when terms grow
+        }
+        sum += next;
+        prev_abs = next.abs();
+        term = next;
+    }
+    (std::f64::consts::PI / (2.0 * x)).sqrt() * sum
+}
+
+/// Modified Bessel function of the second kind K0(x), x > 0.
 fn bessel_k0_scalar(x: f64) -> f64 {
     if x.is_nan() || x <= 0.0 {
         return f64::NAN;
     }
-    if x <= 2.0 {
-        let y = x * x / 4.0;
-        -x.ln() * bessel_i0_scalar(x)
-            + eval_poly_f64(
-                y,
-                &[
-                    -0.57721566,
-                    0.42278420,
-                    0.23069756,
-                    0.03488590,
-                    0.00262698,
-                    0.00010750,
-                    0.00000740,
-                ],
-            )
+    if x <= K_SPLIT {
+        k0_ascending(x)
     } else {
-        let y = 2.0 / x;
-        (-x).exp() / x.sqrt()
-            * eval_poly_f64(
-                y,
-                &[
-                    1.25331414,
-                    -0.07832358,
-                    0.02189568,
-                    -0.01062446,
-                    0.00587872,
-                    -0.00251540,
-                    0.00053208,
-                ],
-            )
+        k_asymptotic_scaled(x, 0.0) * (-x).exp()
     }
 }
 
-/// Modified Bessel function of the second kind K1.
+/// Modified Bessel function of the second kind K1(x), x > 0.
 fn bessel_k1_scalar(x: f64) -> f64 {
     if x.is_nan() || x <= 0.0 {
         return f64::NAN;
     }
-    if x <= 2.0 {
-        let y = x * x / 4.0;
-        x.ln() * bessel_i1_scalar(x)
-            + (1.0 / x)
-                * eval_poly_f64(
-                    y,
-                    &[
-                        1.0,
-                        0.15443144,
-                        -0.67278579,
-                        -0.18156897,
-                        -0.01919402,
-                        -0.00110404,
-                        -0.00004686,
-                    ],
-                )
+    if x <= K_SPLIT {
+        k1_ascending(x)
     } else {
-        let y = 2.0 / x;
-        (-x).exp() / x.sqrt()
-            * eval_poly_f64(
-                y,
-                &[
-                    1.25331414,
-                    0.23498619,
-                    -0.03655620,
-                    0.01504268,
-                    -0.00780353,
-                    0.00325614,
-                    -0.00068245,
-                ],
-            )
+        k_asymptotic_scaled(x, 4.0) * (-x).exp()
     }
 }
 
-/// Scaled modified Bessel K0: exp(x) * K0(x).
+/// Scaled modified Bessel K0: exp(x) * K0(x), x > 0.
 fn bessel_k0e_scalar(x: f64) -> f64 {
     if x.is_nan() || x <= 0.0 {
         return f64::NAN;
     }
-    if x <= 2.0 {
-        bessel_k0_scalar(x) * x.exp()
+    if x <= K_SPLIT {
+        k0_ascending(x) * x.exp()
     } else {
-        let y = 2.0 / x;
-        (1.0 / x.sqrt())
-            * eval_poly_f64(
-                y,
-                &[
-                    1.25331414,
-                    -0.07832358,
-                    0.02189568,
-                    -0.01062446,
-                    0.00587872,
-                    -0.00251540,
-                    0.00053208,
-                ],
-            )
+        k_asymptotic_scaled(x, 0.0)
     }
 }
 
-/// Scaled modified Bessel K1: exp(x) * K1(x).
+/// Scaled modified Bessel K1: exp(x) * K1(x), x > 0.
 fn bessel_k1e_scalar(x: f64) -> f64 {
     if x.is_nan() || x <= 0.0 {
         return f64::NAN;
     }
-    if x <= 2.0 {
-        bessel_k1_scalar(x) * x.exp()
+    if x <= K_SPLIT {
+        k1_ascending(x) * x.exp()
     } else {
-        let y = 2.0 / x;
-        (1.0 / x.sqrt())
-            * eval_poly_f64(
-                y,
-                &[
-                    1.25331414,
-                    0.23498619,
-                    -0.03655620,
-                    0.01504268,
-                    -0.00780353,
-                    0.00325614,
-                    -0.00068245,
-                ],
-            )
+        k_asymptotic_scaled(x, 4.0)
     }
 }
 
@@ -82317,6 +82311,41 @@ mod tests {
             assert!(rel(super::bessel_i0e_scalar(xv), super::bessel_i0_scalar(xv) * e), "i0e({xv})");
             assert!(rel(super::bessel_i1e_scalar(xv), super::bessel_i1_scalar(xv) * e), "i1e({xv})");
         }
+    }
+
+    #[test]
+    fn bessel_k_family_matches_f64_reference_values() {
+        // K0/K1 reference values from scipy.special.kv. The previous A&S
+        // polynomials were ~1.6e-7; the ascending-series branch (x <= 9) reaches
+        // f64 for x <= ~5, so 1e-12 confirms the upgrade.
+        let rel = |got: f64, want: f64| (got - want).abs() <= 1e-12 * (1.0 + want.abs());
+        assert!(rel(super::bessel_k0_scalar(0.5), 0.9244190712276659));
+        assert!(rel(super::bessel_k0_scalar(1.0), 0.42102443824070834));
+        assert!(rel(super::bessel_k0_scalar(2.0), 0.11389387274953353));
+        assert!(rel(super::bessel_k0_scalar(5.0), 0.0036910983340425947));
+        assert!(rel(super::bessel_k1_scalar(0.5), 1.6564411200033007));
+        assert!(rel(super::bessel_k1_scalar(1.0), 0.6019072301972346));
+        assert!(rel(super::bessel_k1_scalar(2.0), 0.1398658818165224));
+        assert!(rel(super::bessel_k1_scalar(5.0), 0.004044613445452164));
+        // Scaled forms equal K·e^x.
+        for &xv in &[0.5_f64, 2.0, 5.0] {
+            let e = xv.exp();
+            assert!(rel(super::bessel_k0e_scalar(xv), super::bessel_k0_scalar(xv) * e), "k0e({xv})");
+            assert!(rel(super::bessel_k1e_scalar(xv), super::bessel_k1_scalar(xv) * e), "k1e({xv})");
+        }
+        // The ascending (x<=9) and asymptotic (x>9) branches must agree at the
+        // x=9 split (both ~1.5e-8 there), which validates the asymptotic branch
+        // without needing uncertain large-x reference constants.
+        let emx = (-9.0_f64).exp();
+        let k0_asc = super::bessel_k0_scalar(9.0); // ascending
+        let k0_asy = super::k_asymptotic_scaled(9.0, 0.0) * emx;
+        assert!((k0_asc - k0_asy).abs() <= 1e-7 * (1.0 + k0_asc.abs()), "K0 split: asc={k0_asc} asy={k0_asy}");
+        let k1_asc = super::bessel_k1_scalar(9.0);
+        let k1_asy = super::k_asymptotic_scaled(9.0, 4.0) * emx;
+        assert!((k1_asc - k1_asy).abs() <= 1e-7 * (1.0 + k1_asc.abs()), "K1 split: asc={k1_asc} asy={k1_asy}");
+        // Domain contract preserved: x<=0 / NaN → NaN.
+        assert!(super::bessel_k0_scalar(0.0).is_nan());
+        assert!(super::bessel_k1_scalar(-1.0).is_nan());
     }
 
     #[test]
