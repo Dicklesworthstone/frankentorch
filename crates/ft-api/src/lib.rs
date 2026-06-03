@@ -1794,6 +1794,13 @@ impl FrankenTorchSession {
             1.0
         };
         let window_pad = (n_fft - win_length) / 2;
+        let mut dft_twiddles = vec![(0.0_f64, 0.0_f64); freq_bins * n_fft];
+        for k in 0..freq_bins {
+            for n in 0..n_fft {
+                let angle = 2.0 * std::f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
+                dft_twiddles[k * n_fft + n] = (angle.cos(), angle.sin());
+            }
+        }
 
         match base_dtype {
             DType::F32 => {
@@ -1816,10 +1823,9 @@ impl FrankenTorchSession {
                         let mut re = 0.0;
                         let mut im = 0.0;
                         for (n, &sample) in all_frames[fbase..fbase + n_fft].iter().enumerate() {
-                            let angle =
-                                2.0 * std::f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
-                            re += sample * angle.cos();
-                            im -= sample * angle.sin();
+                            let (tw_re, tw_im) = dft_twiddles[k * n_fft + n];
+                            re += sample * tw_re;
+                            im -= sample * tw_im;
                         }
                         *slot = ft_core::Complex64::new((re * scale) as f32, (im * scale) as f32);
                     }
@@ -1876,10 +1882,9 @@ impl FrankenTorchSession {
                         let mut re = 0.0;
                         let mut im = 0.0;
                         for (n, &sample) in all_frames[fbase..fbase + n_fft].iter().enumerate() {
-                            let angle =
-                                2.0 * std::f64::consts::PI * k as f64 * n as f64 / n_fft as f64;
-                            re += sample * angle.cos();
-                            im -= sample * angle.sin();
+                            let (tw_re, tw_im) = dft_twiddles[k * n_fft + n];
+                            re += sample * tw_re;
+                            im -= sample * tw_im;
                         }
                         *slot = ft_core::Complex128::new(re * scale, im * scale);
                     }

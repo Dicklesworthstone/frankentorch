@@ -1,0 +1,6 @@
+command: rch exec -- cargo bench -p ft-api --bench ops_bench -- stft/len32768_nfft512 --warm-up-time 1 --measurement-time 5 --sample-size 10
+worker: vmi1227854
+benchmark: stft/len32768_nfft512
+time: [8.9232 ms 9.1057 ms 9.3781 ms]
+throughput: [3.4941 Melem/s 3.5986 Melem/s 3.6722 Melem/s]
+note: a prior rch attempt failed open to local and measured [5.8276 ms 6.2184 ms 6.4608 ms]; that local fallback is intentionally not used as campaign evidence.

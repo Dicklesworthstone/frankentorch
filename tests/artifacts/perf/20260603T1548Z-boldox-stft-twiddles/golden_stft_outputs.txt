@@ -1,0 +1,21 @@
+stft_twiddle_precompute fixture
+reference: tensor_stft_rectangular_window_known_values + stft_parallel_match_serial_bit_exact
+shape: [3, 2] Complex128
+input: [1.0, 2.0, 3.0, 4.0, 0.0, 0.0]
+n_fft: 4
+hop_length: 2
+win_length: 4
+center: false
+onesided: true
+normalized: false
+
+complex_values_row_major_freq_by_frame:
+0: re=10.0 im=0.0
+1: re=7.0 im=0.0
+2: re=-2.0 im=2.0
+3: re=3.0 im=-4.0
+4: re=-2.0 im=0.0
+5: re=-1.0 im=0.0
+
+large-bit-exact-test:
+stft_parallel_match_serial_bit_exact passed via rch. It checks len=8192, n_fft=128, hop=64, center=true, onesided=true, freq_bins*frames >= PARALLEL_ELEMENTWISE_MIN, and compares every real/imag output bit against a serial direct-DFT reference.

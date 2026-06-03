@@ -1,0 +1,6 @@
+command: rch exec -- cargo bench -p ft-api --bench ops_bench -- stft/len32768_nfft512 --warm-up-time 1 --measurement-time 5 --sample-size 10
+worker: vmi1156319
+benchmark: stft/len32768_nfft512
+time: [187.98 ms 200.34 ms 215.69 ms]
+throughput: [151.92 Kelem/s 163.56 Kelem/s 174.32 Kelem/s]
+outliers: 1 high mild out of 10
