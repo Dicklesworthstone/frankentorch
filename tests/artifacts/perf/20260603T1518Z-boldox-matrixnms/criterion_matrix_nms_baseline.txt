@@ -1,0 +1,14 @@
+Command:
+rch exec -- cargo bench -p ft-api --bench ops_bench -- matrix_nms/256x48x48 --warm-up-time 1 --measurement-time 5 --sample-size 20
+
+Worker:
+vmi1153651
+
+Baseline:
+matrix_nms/256x48x48 time [57.077 ms 86.618 ms 127.85 ms]
+throughput [1.1810 Gelem/s 1.7432 Gelem/s 2.6455 Gelem/s]
+20 samples, 100 iterations, 2 high severe outliers.
+
+Profile-backed target:
+Matrix NMS was dominated by the O(K^2 * H*W) mask-IoU sweep. The scalar path
+re-thresholded both masks for every selected pair.

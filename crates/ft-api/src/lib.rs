@@ -36598,35 +36598,47 @@ impl FrankenTorchSession {
         let top_k = pre_nms_top_k.min(n);
         indices.truncate(top_k);
         let k = indices.len();
-        // The K x K mask-IoU matrix is an O(K^2 * H*W) pairwise sweep
-        // (compute-bound). The serial form writes the symmetric pair (i,j)+(j,i)
-        // from one computation, which couples rows. Since IoU is symmetric and
-        // deterministic, instead let each row i compute IoU(i, j) for every j and
-        // write only its own row; the value at [j, i] is then produced by row j
-        // and is bit-for-bit identical (same masked products, same summation
-        // order, same union). That makes the rows independent and contiguous, so
-        // distribute them across Rayon workers (at the cost of computing each IoU
-        // twice — cheap next to the parallel win). Diagonal entries stay 0.
+        let bits_per_word = u64::BITS as usize;
+        let words_per_mask = mask_area.div_ceil(bits_per_word);
+        let mut packed_masks = vec![0_u64; k * words_per_mask];
+        let mut mask_areas = vec![0_usize; k];
+        for (row_idx, &mask_idx) in indices.iter().enumerate() {
+            let mask = &masks_data[mask_idx * mask_area..(mask_idx + 1) * mask_area];
+            let packed =
+                &mut packed_masks[row_idx * words_per_mask..(row_idx + 1) * words_per_mask];
+            let mut area = 0_usize;
+            for (pixel_idx, &value) in mask.iter().enumerate() {
+                if value > 0.5 {
+                    packed[pixel_idx / bits_per_word] |= 1_u64 << (pixel_idx % bits_per_word);
+                    area += 1;
+                }
+            }
+            mask_areas[row_idx] = area;
+        }
+
+        // The K x K mask-IoU matrix is an O(K^2 * H*W) pairwise sweep. Threshold
+        // each selected mask once into packed u64 words, then compute pairwise
+        // intersections via bitwise AND + popcount. The original loop only summed
+        // 0/1 mask indicators, so these integer counts are exactly the same f64
+        // values before the unchanged decay math below.
         let mut iou_matrix = vec![0.0_f64; k * k];
         let compute_row = |i: usize, row: &mut [f64]| {
-            let mi = &masks_data[indices[i] * mask_area..(indices[i] + 1) * mask_area];
+            let row_start = i * words_per_mask;
+            let row_words = &packed_masks[row_start..row_start + words_per_mask];
+            let row_area = mask_areas[i];
             for (j, slot) in row.iter_mut().enumerate() {
                 if j == i {
                     continue;
                 }
-                let mj = &masks_data[indices[j] * mask_area..(indices[j] + 1) * mask_area];
-                let mut inter = 0.0_f64;
-                let mut union_i = 0.0_f64;
-                let mut union_j = 0.0_f64;
-                for (a, b) in mi.iter().zip(mj.iter()) {
-                    let ai = if *a > 0.5 { 1.0 } else { 0.0 };
-                    let bi = if *b > 0.5 { 1.0 } else { 0.0 };
-                    inter += ai * bi;
-                    union_i += ai;
-                    union_j += bi;
+                let other_start = j * words_per_mask;
+                let other_words = &packed_masks[other_start..other_start + words_per_mask];
+                let mut inter = 0_usize;
+                for (&a, &b) in row_words.iter().zip(other_words.iter()) {
+                    inter += (a & b).count_ones() as usize;
                 }
-                let union_val = (union_i + union_j - inter).max(1e-6_f64);
-                *slot = inter / union_val;
+                let union_count = row_area + mask_areas[j] - inter;
+                let union_val = (union_count as f64).max(1e-6_f64);
+                *slot = (inter as f64) / union_val;
             }
         };
         if k >= 2 && k * k >= PARALLEL_ELEMENTWISE_MIN {

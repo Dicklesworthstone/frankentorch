@@ -1,0 +1,15 @@
+Command:
+rch exec -- cargo bench -p ft-api --bench ops_bench -- matrix_nms/256x48x48 --warm-up-time 1 --measurement-time 5 --sample-size 20
+
+Worker:
+vmi1293453
+
+After:
+matrix_nms/256x48x48 time [4.0367 ms 4.1755 ms 4.3428 ms]
+throughput [34.769 Gelem/s 36.162 Gelem/s 37.405 Gelem/s]
+20 samples, 1260 iterations, 1 high mild outlier.
+
+Delta:
+Cross-worker p50 86.618 ms -> 4.1755 ms, about 20.7x faster.
+Confidence is capped for cross-worker comparison, but the effect size is far
+above shared-host Criterion noise.
