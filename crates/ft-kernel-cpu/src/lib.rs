@@ -17,7 +17,7 @@ mod gemm {
     // k-accumulation order is fixed by the micro-kernel and does NOT depend on the
     // row count, so the parallel result is bit-for-bit identical to the single
     // call (proved by `gemm_row_split_matches_single_bit_exact`).
-    const PAR_MIN_FLOPS: u128 = 1 << 20;
+    const PAR_MIN_FLOPS: u128 = 1 << 29;
     const MIN_BLOCK_ROWS: usize = 8;
 
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {

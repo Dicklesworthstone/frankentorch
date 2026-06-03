@@ -1,0 +1,8 @@
+ft_kernel_cpu_gemm_crossover=frankentorch-kgs4.4
+par_min_flops=536870912
+matmul_512_flops=134217728
+matmul_1024_flops=1073741824
+expected_512_parallel=false
+expected_1024_parallel=true
+f64_2x3_times_3x2=[58.0, 64.0, 139.0, 154.0]
+f32_2x3_times_3x2=[58.0, 64.0, 139.0, 154.0]
