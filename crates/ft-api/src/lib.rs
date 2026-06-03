@@ -39252,9 +39252,55 @@ impl FrankenTorchSession {
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
         if self.tensor_requires_grad(input)? {
+            // Symmetric eigenvalue backward: with A = V diag(λ) V^T (V the
+            // orthonormal eigenvectors), d λ_k / d A = v_k v_k^T, so
+            //   grad_A = V diag(grad_λ) V^T = sum_k grad_λ_k · v_k v_k^T,
+            // which is symmetric. eigvalsh and eigh return identical eigenvalues
+            // (eigvalsh delegates to eigh), so the forward value matches the
+            // non-grad path exactly. frankentorch-rl4g.
+            let input_meta = self.tensor_tape.tensor_meta(input)?.clone();
+            let shape = input_meta.shape();
+            if shape.len() == 2 && shape[0] == shape[1] && input_meta.dtype() == DType::F64 {
+                let device = input_meta.device();
+                let out = self.tensor_apply_function(
+                    &[input],
+                    move |ctx, inputs| {
+                        let (values, in_shape) = inputs[0];
+                        let meta = TensorMeta::from_shape(in_shape.to_vec(), DType::F64, device);
+                        let r = ft_kernel_cpu::eigh_contiguous_f64(values, &meta).map_err(|e| {
+                            AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                        })?;
+                        let n = r.n;
+                        ctx.save_for_backward(r.eigenvectors, vec![n, n]);
+                        Ok((r.eigenvalues, vec![n]))
+                    },
+                    move |ctx, grad_outputs| {
+                        let saved = ctx.saved_tensors();
+                        let v = &saved[0]; // V (n x n, eigenvectors in columns).
+                        let grad_l = grad_outputs[0]; // grad w.r.t. eigenvalues, [n].
+                        let n = grad_l.len();
+                        let mut grad_a = vec![0.0_f64; n * n];
+                        for i in 0..n {
+                            for j in 0..n {
+                                let mut s = 0.0_f64;
+                                for k in 0..n {
+                                    s += v[i * n + k] * grad_l[k] * v[j * n + k];
+                                }
+                                grad_a[i * n + j] = s;
+                            }
+                        }
+                        Ok(vec![Some(grad_a)])
+                    },
+                )?;
+                self.runtime.ledger_mut().record(
+                    EvidenceKind::Dispatch,
+                    format!("linalg_eigvalsh input={} out={} (autograd)", input.0, out.0),
+                );
+                return Ok(out);
+            }
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "linalg_eigvalsh: autograd not supported (eigenvalue backward not yet implemented). Tracked under frankentorch-rl4g.",
+                    reason: "linalg_eigvalsh: autograd only supported for a square F64 matrix",
                 },
             )));
         }
@@ -79249,6 +79295,64 @@ mod tests {
         assert!(
             (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
             "cholesky upper backward mismatch: analytic={analytic}, fd={fd}"
+        );
+    }
+
+    #[test]
+    fn eigvalsh_backward_matches_finite_difference() {
+        use ft_core::{DType, Device};
+        let n = 4usize;
+        // Symmetric A = B B^T + distinct diagonal shifts (well-separated spectrum).
+        let mut b = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                b[i * n + j] = ((i + 2 * j) % 5) as f64 * 0.1 + 0.05;
+            }
+        }
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for k in 0..n {
+                    s += b[i * n + k] * b[j * n + k];
+                }
+                a[i * n + j] = s;
+            }
+            a[i * n + i] += (i + 1) as f64 * 2.0;
+        }
+        let mut v = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                let val = ((i + 3 * j) % 4) as f64 * 0.1 - 0.15;
+                v[i * n + j] = val;
+                v[j * n + i] = val;
+            }
+        }
+
+        // loss(M) = sum of squares of the symmetric eigenvalues of M.
+        let loss_of = |mat: &[f64]| -> f64 {
+            let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+            let ev = ft_kernel_cpu::eigvalsh_contiguous_f64(mat, &meta).unwrap();
+            ev.iter().map(|x| x * x).sum::<f64>()
+        };
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let at = s.tensor_variable(a.clone(), vec![n, n], true).unwrap();
+        let evals = s.tensor_linalg_eigvalsh(at).unwrap();
+        let sq = s.tensor_mul(evals, evals).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s.tensor_gradient(&report, at).expect("eigvalsh grad present");
+        let analytic: f64 = grad_a.iter().zip(v.iter()).map(|(g, vv)| g * vv).sum();
+
+        let eps = 1e-6;
+        let a_plus: Vec<f64> = a.iter().zip(v.iter()).map(|(x, vv)| x + eps * vv).collect();
+        let a_minus: Vec<f64> = a.iter().zip(v.iter()).map(|(x, vv)| x - eps * vv).collect();
+        let fd = (loss_of(&a_plus) - loss_of(&a_minus)) / (2.0 * eps);
+
+        assert!(
+            (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "eigvalsh backward mismatch: analytic={analytic}, fd={fd}"
         );
     }
 
