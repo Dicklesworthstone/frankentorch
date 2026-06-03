@@ -38293,6 +38293,120 @@ impl FrankenTorchSession {
     /// Returns the symmetric `grad_A` (row-major n x n). Standard differentiable
     /// Cholesky: `phi = tril_half_diag(L^T grad_L)`, `A_bar = L^-T phi L^-1`,
     /// `grad_A = (A_bar + A_bar^T)/2`.
+    /// Reverse-mode VJP of the reduced SVD A = U diag(S) Vh for the tall/square
+    /// case (m >= n, so k = n and V is square), distinct positive singular values.
+    /// Derived from dP = U^T dA V = dS + ΩU S - S ΩV (ΩU=U^T dU, ΩV=V^T dV skew):
+    ///   M[i][i] = gS_i
+    ///   M[i][j] = (S_j (a_ij - a_ji) + S_i (b_ij - b_ji)) / (S_j^2 - S_i^2), i≠j
+    /// with a = U^T gU, b = V^T gV; then
+    ///   grad_A = U M V^T + (I - U U^T) gU diag(1/S) V^T
+    /// (the projection term carries the gU component outside col(U) when m > k).
+    /// Linear in (gU, gS, gV): callers zero the grads of the outputs they don't
+    /// carry. `gv` is supplied in the V basis (n x k), `vh` is k x n (V = Vh^T).
+    #[allow(clippy::too_many_arguments)]
+    fn svd_backward_tall(
+        u: &[f64],
+        s: &[f64],
+        vh: &[f64],
+        gu: &[f64],
+        gs: &[f64],
+        gv: &[f64],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> Vec<f64> {
+        // a = U^T gU  (k x k): a[i][j] = Σ_p U[p][i] gU[p][j]
+        let mut a = vec![0.0_f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0_f64;
+                for p in 0..m {
+                    acc += u[p * k + i] * gu[p * k + j];
+                }
+                a[i * k + j] = acc;
+            }
+        }
+        // b = V^T gV  (k x k): b[i][j] = Σ_p V[p][i] gV[p][j], V[p][i] = Vh[i][p]
+        let mut b = vec![0.0_f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0_f64;
+                for p in 0..n {
+                    acc += vh[i * n + p] * gv[p * k + j];
+                }
+                b[i * k + j] = acc;
+            }
+        }
+        // M (k x k).
+        let mut mmat = vec![0.0_f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                if i == j {
+                    mmat[i * k + j] = gs[i];
+                } else {
+                    let num = s[j] * (a[i * k + j] - a[j * k + i])
+                        + s[i] * (b[i * k + j] - b[j * k + i]);
+                    mmat[i * k + j] = num / (s[j] * s[j] - s[i] * s[i]);
+                }
+            }
+        }
+        // term1 = U M V^T : (U M)[p][j] then × Vh.
+        let mut um = vec![0.0_f64; m * k];
+        for p in 0..m {
+            for j in 0..k {
+                let mut acc = 0.0_f64;
+                for i in 0..k {
+                    acc += u[p * k + i] * mmat[i * k + j];
+                }
+                um[p * k + j] = acc;
+            }
+        }
+        let mut grad_a = vec![0.0_f64; m * n];
+        for p in 0..m {
+            for q in 0..n {
+                let mut acc = 0.0_f64;
+                for j in 0..k {
+                    acc += um[p * k + j] * vh[j * n + q];
+                }
+                grad_a[p * n + q] = acc;
+            }
+        }
+        // Projection term: (I - U U^T) gU diag(1/S) V^T (nonzero only via gU).
+        // W = gU diag(1/S); projW = W - U (U^T W); add projW V^T.
+        let mut w = vec![0.0_f64; m * k];
+        for p in 0..m {
+            for j in 0..k {
+                w[p * k + j] = gu[p * k + j] / s[j];
+            }
+        }
+        // UtW = U^T W (k x k)
+        let mut utw = vec![0.0_f64; k * k];
+        for i in 0..k {
+            for j in 0..k {
+                let mut acc = 0.0_f64;
+                for p in 0..m {
+                    acc += u[p * k + i] * w[p * k + j];
+                }
+                utw[i * k + j] = acc;
+            }
+        }
+        for p in 0..m {
+            for q in 0..n {
+                let mut acc = 0.0_f64;
+                for j in 0..k {
+                    // projW[p][j] = W[p][j] - Σ_i U[p][i] UtW[i][j]
+                    let mut proj = w[p * k + j];
+                    for i in 0..k {
+                        proj -= u[p * k + i] * utw[i * k + j];
+                    }
+                    acc += proj * vh[j * n + q];
+                }
+                grad_a[p * n + q] += acc;
+            }
+        }
+        grad_a
+    }
+
     /// Reverse-mode VJP of the reduced QR factorization for the tall case
     /// (m >= n), full-rank R. Implements the standard formula
     ///   M  = R @ grad_R^T - grad_Q^T @ Q              (n x n)
@@ -39680,9 +39794,110 @@ impl FrankenTorchSession {
         full_matrices: bool,
     ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
         if self.tensor_requires_grad(input)? {
+            // SVD backward via the three-independent-nodes pattern (like eigh/qr):
+            // U, S, Vh are independent functions of A, so the chain rule sums
+            // their grad_A contributions. Each node recomputes the deterministic
+            // reduced SVD (bit-identical outputs) and calls svd_backward_tall with
+            // the other two output gradients zeroed. Supported for the standard
+            // differentiable case: reduced SVD, tall/square input (m >= n, so
+            // V is square — no V_perp term), distinct positive singular values.
+            // frankentorch-rl4g.
+            let input_meta = self.tensor_tape.tensor_meta(input)?.clone();
+            let shape = input_meta.shape();
+            if !full_matrices
+                && shape.len() == 2
+                && shape[0] >= shape[1]
+                && input_meta.dtype() == DType::F64
+            {
+                let device = input_meta.device();
+                // Each forward saves (U, S, Vh); backward derives k=S.len(),
+                // m=U.len()/k, n=Vh.len()/k.
+                let svd_forward = move |output: u8| {
+                    move |ctx: &mut FunctionCtx, inputs: &[(&[f64], &[usize])]| {
+                        let (values, in_shape) = inputs[0];
+                        let meta = TensorMeta::from_shape(in_shape.to_vec(), DType::F64, device);
+                        let r = ft_kernel_cpu::svd_contiguous_f64(values, &meta, false)
+                            .map_err(|e| {
+                                AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+                            })?;
+                        let (mm, nn, kk) = (r.m, r.n, r.k);
+                        ctx.save_for_backward(r.u.clone(), vec![mm, kk]);
+                        ctx.save_for_backward(r.s.clone(), vec![kk]);
+                        ctx.save_for_backward(r.vh.clone(), vec![kk, nn]);
+                        match output {
+                            0 => Ok((r.u, vec![mm, kk])),
+                            1 => Ok((r.s, vec![kk])),
+                            _ => Ok((r.vh, vec![kk, nn])),
+                        }
+                    }
+                };
+                let u_node = self.tensor_apply_function(
+                    &[input],
+                    svd_forward(0),
+                    move |ctx, grad_outputs| {
+                        let saved = ctx.saved_tensors();
+                        let (u, s, vh) = (&saved[0], &saved[1], &saved[2]);
+                        let k = s.len();
+                        let m = u.len() / k;
+                        let n = vh.len() / k;
+                        let gu = grad_outputs[0];
+                        let zs = vec![0.0_f64; k];
+                        let zv = vec![0.0_f64; n * k];
+                        let grad_a = Self::svd_backward_tall(u, s, vh, gu, &zs, &zv, m, n, k);
+                        Ok(vec![Some(grad_a)])
+                    },
+                )?;
+                let s_node = self.tensor_apply_function(
+                    &[input],
+                    svd_forward(1),
+                    move |ctx, grad_outputs| {
+                        let saved = ctx.saved_tensors();
+                        let (u, s, vh) = (&saved[0], &saved[1], &saved[2]);
+                        let k = s.len();
+                        let m = u.len() / k;
+                        let n = vh.len() / k;
+                        let gs = grad_outputs[0];
+                        let zu = vec![0.0_f64; m * k];
+                        let zv = vec![0.0_f64; n * k];
+                        let grad_a = Self::svd_backward_tall(u, s, vh, &zu, gs, &zv, m, n, k);
+                        Ok(vec![Some(grad_a)])
+                    },
+                )?;
+                let vh_node = self.tensor_apply_function(
+                    &[input],
+                    svd_forward(2),
+                    move |ctx, grad_outputs| {
+                        let saved = ctx.saved_tensors();
+                        let (u, s, vh) = (&saved[0], &saved[1], &saved[2]);
+                        let k = s.len();
+                        let m = u.len() / k;
+                        let n = vh.len() / k;
+                        let gvh = grad_outputs[0]; // k x n
+                        // Convert grad wrt Vh to the V basis: gV[p][j] = gVh[j][p].
+                        let mut gv = vec![0.0_f64; n * k];
+                        for j in 0..k {
+                            for p in 0..n {
+                                gv[p * k + j] = gvh[j * n + p];
+                            }
+                        }
+                        let zu = vec![0.0_f64; m * k];
+                        let zs = vec![0.0_f64; k];
+                        let grad_a = Self::svd_backward_tall(u, s, vh, &zu, &zs, &gv, m, n, k);
+                        Ok(vec![Some(grad_a)])
+                    },
+                )?;
+                self.runtime.ledger_mut().record(
+                    EvidenceKind::Dispatch,
+                    format!(
+                        "linalg_svd input={} u={} s={} vh={} (autograd)",
+                        input.0, u_node.0, s_node.0, vh_node.0
+                    ),
+                );
+                return Ok((u_node, s_node, vh_node));
+            }
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
-                    reason: "linalg_svd: autograd not supported (SVD backward not yet implemented). Tracked under frankentorch-rl4g.",
+                    reason: "linalg_svd: autograd only supported for reduced SVD of a tall/square (m>=n) F64 matrix",
                 },
             )));
         }
@@ -74596,22 +74811,26 @@ mod tests {
 
     #[test]
     fn linalg_svd_class_ops_fail_loud_on_requires_grad() {
-        // Regression for frankentorch-rl4g: linalg_svd used to silently sever
-        // autograd by extracting tensor_values and rebuilding non-grad leaves.
-        // It still fails loud when input requires_grad — matches the parking-lot
-        // pattern of pvfk (det/slogdet) and 3v6e (stft/istft).
-        // NOTE: eigvalsh, cholesky, svdvals, eigh, and qr have since gained real
-        // autograd backward (frankentorch-rl4g), so they are covered by their
-        // own finite-difference tests and intentionally excluded here.
+        // Regression for frankentorch-rl4g: the symmetric/SVD decomposition
+        // family (cholesky, eigvalsh, eigh, svdvals, svd, qr) has all gained real
+        // autograd backward, each covered by its own finite-difference test. The
+        // remaining decompositions — linalg_eig / linalg_eigvals (general
+        // non-symmetric, complex eigenvalues) — are EXCLUDED by the complex-
+        // autograd port policy and must still fail loud on requires_grad.
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = s
             .tensor_variable(vec![2.0, 0.5, 0.5, 1.0], vec![2, 2], true)
             .unwrap();
 
-        let svd_err = s
-            .tensor_linalg_svd(a, false)
-            .expect_err("svd must fail loud on requires_grad");
-        assert!(format!("{svd_err:?}").contains("autograd not supported"));
+        let eig_err = s
+            .tensor_linalg_eig(a)
+            .expect_err("eig must fail loud on requires_grad");
+        assert!(format!("{eig_err:?}").contains("autograd not supported"));
+
+        let eigvals_err = s
+            .tensor_linalg_eigvals(a)
+            .expect_err("eigvals must fail loud on requires_grad");
+        assert!(format!("{eigvals_err:?}").contains("autograd not supported"));
     }
 
     #[test]
@@ -79913,6 +80132,145 @@ mod tests {
         assert!(
             (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
             "eigh eigenvector backward mismatch: analytic={analytic}, fd={fd}"
+        );
+    }
+
+    // Tall 4x3 full-rank matrix with well-separated singular values, shared by
+    // the three svd backward tests. m=4 > k=3 exercises the (I-UU^T) term.
+    fn svd_test_matrix() -> (usize, usize, Vec<f64>, Vec<f64>) {
+        let (m, n) = (4usize, 3usize);
+        #[rustfmt::skip]
+        let a = vec![
+            3.0, 0.2, -0.1,
+            0.1, 2.0, 0.3,
+            -0.2, 0.4, 1.0,
+            0.5, -0.3, 0.2,
+        ];
+        let dir: Vec<f64> = (0..m * n)
+            .map(|i| ((i * 7 + 3) % 11) as f64 * 0.03 - 0.15)
+            .collect();
+        (m, n, a, dir)
+    }
+
+    #[test]
+    fn svd_singular_value_backward_matches_finite_difference_and_value_parity() {
+        use ft_core::{DType, Device};
+        let (m, n, a, dir) = svd_test_matrix();
+
+        // Value parity: grad-path S bit-identical to the non-grad path.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a_ng = s.tensor_variable(a.clone(), vec![m, n], false).unwrap();
+        let (_u0, s0, _v0) = s.tensor_linalg_svd(a_ng, false).unwrap();
+        let s0_v = s.tensor_values(s0).unwrap();
+        let a_g = s.tensor_variable(a.clone(), vec![m, n], true).unwrap();
+        let (_ug, sg, _vg) = s.tensor_linalg_svd(a_g, false).unwrap();
+        let sg_v = s.tensor_values(sg).unwrap();
+        for (x, y) in s0_v.iter().zip(sg_v.iter()) {
+            assert_eq!(x.to_bits(), y.to_bits(), "svd S grad/non-grad value mismatch");
+        }
+
+        // loss = Σ σ²; FD via svdvals.
+        let loss_of = |mat: &[f64]| -> f64 {
+            let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+            let sv = ft_kernel_cpu::svdvals_contiguous_f64(mat, &meta).unwrap();
+            sv.iter().map(|x| x * x).sum::<f64>()
+        };
+        let sq = s.tensor_mul(sg, sg).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s.tensor_gradient(&report, a_g).expect("svd S grad present");
+        let analytic: f64 = grad_a.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
+        let eps = 1e-6;
+        let ap: Vec<f64> = a.iter().zip(dir.iter()).map(|(x, d)| x + eps * d).collect();
+        let am: Vec<f64> = a.iter().zip(dir.iter()).map(|(x, d)| x - eps * d).collect();
+        let fd = (loss_of(&ap) - loss_of(&am)) / (2.0 * eps);
+        assert!(
+            (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "svd S backward mismatch: analytic={analytic}, fd={fd}"
+        );
+    }
+
+    #[test]
+    fn svd_left_vector_backward_matches_finite_difference() {
+        use ft_core::{DType, Device};
+        let (m, n, a, dir) = svd_test_matrix();
+        let k = n;
+        // Gauge-invariant loss on U: Σ_p (c^T u_p)² (u_p = column p of U).
+        let c = vec![1.0, -0.5, 0.3, 0.8];
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a_g = s.tensor_variable(a.clone(), vec![m, n], true).unwrap();
+        let (ug, _sg, _vg) = s.tensor_linalg_svd(a_g, false).unwrap();
+        let c_t = s.tensor_variable(c.clone(), vec![1, m], false).unwrap();
+        let cu = s.tensor_matmul(c_t, ug).unwrap(); // [1, k] = c^T U
+        let sq = s.tensor_mul(cu, cu).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s.tensor_gradient(&report, a_g).expect("svd U grad present");
+        let analytic: f64 = grad_a.iter().zip(dir.iter()).map(|(g, d)| g * d).sum();
+
+        let loss_of = |mat: &[f64]| -> f64 {
+            let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+            let r = ft_kernel_cpu::svd_contiguous_f64(mat, &meta, false).unwrap();
+            let mut acc = 0.0;
+            for p in 0..k {
+                let mut dot = 0.0;
+                for i in 0..m {
+                    dot += c[i] * r.u[i * k + p];
+                }
+                acc += dot * dot;
+            }
+            acc
+        };
+        let eps = 1e-6;
+        let ap: Vec<f64> = a.iter().zip(dir.iter()).map(|(x, d)| x + eps * d).collect();
+        let am: Vec<f64> = a.iter().zip(dir.iter()).map(|(x, d)| x - eps * d).collect();
+        let fd = (loss_of(&ap) - loss_of(&am)) / (2.0 * eps);
+        assert!(
+            (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "svd U backward mismatch: analytic={analytic}, fd={fd}"
+        );
+    }
+
+    #[test]
+    fn svd_right_vector_backward_matches_finite_difference() {
+        use ft_core::{DType, Device};
+        let (m, n, a, dir) = svd_test_matrix();
+        let k = n;
+        // Gauge-invariant loss on Vh: Σ_p (Vh[p,:] · d)² (right singular vectors).
+        let dd = vec![0.7, -0.4, 0.9];
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a_g = s.tensor_variable(a.clone(), vec![m, n], true).unwrap();
+        let (_ug, _sg, vhg) = s.tensor_linalg_svd(a_g, false).unwrap();
+        let d_t = s.tensor_variable(dd.clone(), vec![n, 1], false).unwrap();
+        let vd = s.tensor_matmul(vhg, d_t).unwrap(); // [k, 1] = Vh d
+        let sq = s.tensor_mul(vd, vd).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad_a = s.tensor_gradient(&report, a_g).expect("svd Vh grad present");
+        let analytic: f64 = grad_a.iter().zip(dir.iter()).map(|(g, dv)| g * dv).sum();
+
+        let loss_of = |mat: &[f64]| -> f64 {
+            let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+            let r = ft_kernel_cpu::svd_contiguous_f64(mat, &meta, false).unwrap();
+            let mut acc = 0.0;
+            for p in 0..k {
+                let mut dot = 0.0;
+                for q in 0..n {
+                    dot += r.vh[p * n + q] * dd[q];
+                }
+                acc += dot * dot;
+            }
+            acc
+        };
+        let eps = 1e-6;
+        let ap: Vec<f64> = a.iter().zip(dir.iter()).map(|(x, dv)| x + eps * dv).collect();
+        let am: Vec<f64> = a.iter().zip(dir.iter()).map(|(x, dv)| x - eps * dv).collect();
+        let fd = (loss_of(&ap) - loss_of(&am)) / (2.0 * eps);
+        assert!(
+            (analytic - fd).abs() <= 1e-4 * (1.0 + fd.abs()),
+            "svd Vh backward mismatch: analytic={analytic}, fd={fd}"
         );
     }
 
