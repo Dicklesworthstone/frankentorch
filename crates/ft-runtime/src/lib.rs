@@ -30,6 +30,12 @@ impl EvidenceLedger {
         Self::default()
     }
 
+    fn with_capacity(capacity: usize) -> Self {
+        Self {
+            entries: Vec::with_capacity(capacity),
+        }
+    }
+
     pub fn record(&mut self, kind: EvidenceKind, summary: impl Into<String>) {
         self.entries.push(EvidenceEntry {
             ts_unix_ms: now_unix_ms(),
@@ -63,7 +69,7 @@ pub struct RuntimeContext {
 impl RuntimeContext {
     #[must_use]
     pub fn new(mode: ExecutionMode) -> Self {
-        let mut ledger = EvidenceLedger::new();
+        let mut ledger = EvidenceLedger::with_capacity(2);
         ledger.record(
             EvidenceKind::Policy,
             policy_summary("mode initialized to ", mode),
