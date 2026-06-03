@@ -230,6 +230,19 @@ fn bench_fft2(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_rfft2(c: &mut Criterion) {
+    let mut group = c.benchmark_group("rfft2");
+    // Batched 2-D real FFT: same row+col compute-bound passes as fft2.
+    let (batch, rows, cols) = (32usize, 128usize, 128usize);
+    group.throughput(Throughput::Elements((batch * rows * cols) as u64));
+    group.bench_function("32x128x128", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_randn(vec![batch, rows, cols], false).unwrap();
+        b.iter(|| black_box(session.tensor_rfft2(black_box(x)).unwrap()));
+    });
+    group.finish();
+}
+
 fn bench_fft_1d(c: &mut Criterion) {
     let mut group = c.benchmark_group("fft_1d");
     // Single large power-of-two 1-D FFT: isolates dft_inplace_1d (one lane, no
@@ -328,6 +341,7 @@ criterion_group!(
     bench_interpolate_trilinear,
     bench_grid_sample,
     bench_fft2,
+    bench_rfft2,
     bench_fft_1d,
     bench_fftn,
 );
