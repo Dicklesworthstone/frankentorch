@@ -7,7 +7,26 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
     cholesky_contiguous_f64, det_contiguous_f64, eigh_contiguous_f64, svd_contiguous_f64,
+    svdvals_contiguous_f64,
 };
+
+fn bench_svdvals(c: &mut Criterion) {
+    // Values-only SVD: a bidiagonalize-then-bidiagonal-QR path can skip all
+    // U/V accumulation. Tall shapes maximize the saved O(m n^2) U work.
+    for &(m, n) in &[(256usize, 128usize), (384usize, 128usize)] {
+        let mut a = vec![0.0_f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                a[i * n + j] = (((i * 53 + j * 131 + 7) % 251) as f64) * 0.01 - 1.25
+                    + ((i as f64) * 0.013).sin();
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+        c.bench_function(&format!("svdvals_f64_{m}x{n}"), |bch| {
+            bch.iter(|| black_box(svdvals_contiguous_f64(black_box(&a), &meta).unwrap()))
+        });
+    }
+}
 
 fn bench_svd(c: &mut Criterion) {
     // Tall and square cases; SVD reduces to a symmetric eigenproblem on A^T A.
@@ -88,5 +107,5 @@ fn bench_cholesky(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_lu, bench_cholesky, bench_eigh, bench_svd);
+criterion_group!(benches, bench_lu, bench_cholesky, bench_eigh, bench_svd, bench_svdvals);
 criterion_main!(benches);

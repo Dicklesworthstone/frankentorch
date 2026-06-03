@@ -5839,6 +5839,186 @@ fn golub_reinsch_svd(a: &mut [f64], m: usize, n: usize) -> Result<(Vec<f64>, Vec
     Ok((w, v))
 }
 
+/// Singular VALUES only of a real `m x n` matrix with `m >= n`, row-major.
+///
+/// Same Householder bidiagonalization + implicit-shift QR recurrence as
+/// [`golub_reinsch_svd`], but it never accumulates the `U`/`V` rotation
+/// matrices (the Givens rotations are applied only to the diagonal `w` and
+/// super-diagonal `rv1`). The `w` recurrence is identical to the full routine's,
+/// so the returned values match the full SVD's singular values to working
+/// precision while skipping the O(m n^2) U accumulation and all per-rotation
+/// matrix updates. `a` is used as scratch and overwritten. Returns the `n`
+/// non-negative singular values in bidiagonal order (caller sorts).
+fn golub_reinsch_singular_values(
+    a: &mut [f64],
+    m: usize,
+    n: usize,
+) -> Result<Vec<f64>, KernelError> {
+    let mut w = vec![0.0f64; n];
+    let mut rv1 = vec![0.0f64; n];
+    let mut g = 0.0f64;
+    let mut scale = 0.0f64;
+    let mut anorm = 0.0f64;
+
+    // --- Householder reduction to bidiagonal form (identical to the full SVD) ---
+    for i in 0..n {
+        let l = i + 1;
+        rv1[i] = scale * g;
+        g = 0.0;
+        let mut s = 0.0;
+        scale = 0.0;
+        if i < m {
+            for k in i..m {
+                scale += a[k * n + i].abs();
+            }
+            if scale != 0.0 {
+                for k in i..m {
+                    a[k * n + i] /= scale;
+                    s += a[k * n + i] * a[k * n + i];
+                }
+                let f = a[i * n + i];
+                g = -nr_sign(s.sqrt(), f);
+                let h = f * g - s;
+                a[i * n + i] = f - g;
+                for j in l..n {
+                    let mut s2 = 0.0;
+                    for k in i..m {
+                        s2 += a[k * n + i] * a[k * n + j];
+                    }
+                    let f2 = s2 / h;
+                    for k in i..m {
+                        a[k * n + j] += f2 * a[k * n + i];
+                    }
+                }
+                for k in i..m {
+                    a[k * n + i] *= scale;
+                }
+            }
+        }
+        w[i] = scale * g;
+        g = 0.0;
+        s = 0.0;
+        scale = 0.0;
+        if i < m && i != n - 1 {
+            for k in l..n {
+                scale += a[i * n + k].abs();
+            }
+            if scale != 0.0 {
+                for k in l..n {
+                    a[i * n + k] /= scale;
+                    s += a[i * n + k] * a[i * n + k];
+                }
+                let f = a[i * n + l];
+                g = -nr_sign(s.sqrt(), f);
+                let h = f * g - s;
+                a[i * n + l] = f - g;
+                for k in l..n {
+                    rv1[k] = a[i * n + k] / h;
+                }
+                for j in l..m {
+                    let mut s2 = 0.0;
+                    for k in l..n {
+                        s2 += a[j * n + k] * a[i * n + k];
+                    }
+                    for k in l..n {
+                        a[j * n + k] += s2 * rv1[k];
+                    }
+                }
+                for k in l..n {
+                    a[i * n + k] *= scale;
+                }
+            }
+        }
+        anorm = anorm.max(w[i].abs() + rv1[i].abs());
+    }
+
+    // --- Diagonalize the bidiagonal form, tracking only w / rv1 (no U, no V) ---
+    for k in (0..n).rev() {
+        for _its in 0..30 {
+            let mut flag = true;
+            let mut l = k;
+            let mut nm;
+            loop {
+                nm = l.saturating_sub(1);
+                if l == 0 || (rv1[l].abs() + anorm) == anorm {
+                    flag = false;
+                    break;
+                }
+                if (w[nm].abs() + anorm) == anorm {
+                    break;
+                }
+                l -= 1;
+            }
+            if flag {
+                let mut c = 0.0;
+                let mut s = 1.0;
+                for i in l..=k {
+                    let f = s * rv1[i];
+                    rv1[i] = c * rv1[i];
+                    if (f.abs() + anorm) == anorm {
+                        break;
+                    }
+                    g = w[i];
+                    let h = eigh_pythag(f, g);
+                    w[i] = h;
+                    let hinv = 1.0 / h;
+                    c = g * hinv;
+                    s = -f * hinv;
+                }
+            }
+            let z = w[k];
+            if l == k {
+                if z < 0.0 {
+                    w[k] = -z;
+                }
+                break;
+            }
+            if _its == 29 {
+                return Err(KernelError::SingularMatrix { size: n });
+            }
+            let mut x = w[l];
+            nm = k - 1;
+            let mut y = w[nm];
+            g = rv1[nm];
+            let mut h = rv1[k];
+            let mut f = ((y - z) * (y + z) + (g - h) * (g + h)) / (2.0 * h * y);
+            g = eigh_pythag(f, 1.0);
+            f = ((x - z) * (x + z) + h * ((y / (f + nr_sign(g, f))) - h)) / x;
+            let mut c = 1.0;
+            let mut s = 1.0;
+            for j in l..=nm {
+                let i = j + 1;
+                g = rv1[i];
+                y = w[i];
+                h = s * g;
+                g = c * g;
+                let mut zz = eigh_pythag(f, h);
+                rv1[j] = zz;
+                c = f / zz;
+                s = h / zz;
+                f = x * c + g * s;
+                g = g * c - x * s;
+                h = y * s;
+                y *= c;
+                zz = eigh_pythag(f, h);
+                w[j] = zz;
+                if zz != 0.0 {
+                    let zinv = 1.0 / zz;
+                    c = f * zinv;
+                    s = h * zinv;
+                }
+                f = c * g + s * y;
+                x = c * y - s * g;
+            }
+            rv1[l] = 0.0;
+            rv1[k] = f;
+            w[k] = x;
+        }
+    }
+
+    Ok(w)
+}
+
 /// SVD for tall/square matrices (m >= n) via Golub-Reinsch bidiagonalization.
 fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdResult, KernelError> {
     let k = n; // since m >= n, k = min(m,n) = n
@@ -5860,7 +6040,13 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
         }
     }
 
-    // Extract singular values from column norms of `work`
+    // Singular values are the bidiagonal-QR diagonal `w_bidiag` directly (each
+    // already non-negative). Using `w_bidiag` here — rather than re-deriving via
+    // `work` column norms — makes the full SVD's `s` BIT-IDENTICAL to the
+    // dedicated values-only path (`svdvals_contiguous_f64`), which runs the same
+    // `w` recurrence without U/V accumulation. `col_norms` (the actual norms,
+    // = w_bidiag up to U_b's unit-length rounding) is retained to re-normalize
+    // the `work` columns into the orthonormal U.
     let mut singular_values = Vec::with_capacity(k);
     let mut col_norms = Vec::with_capacity(k);
     for j in 0..k {
@@ -5868,9 +6054,8 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
         for i in 0..m {
             norm += work[i * n + j] * work[i * n + j];
         }
-        let norm = norm.sqrt();
-        col_norms.push(norm);
-        singular_values.push(norm);
+        col_norms.push(norm.sqrt());
+        singular_values.push(w_bidiag[j]);
     }
 
     // Sort singular values in descending order
@@ -5968,14 +6153,52 @@ fn svd_tall(a: &[f64], m: usize, n: usize, full_matrices: bool) -> Result<SvdRes
     Ok(SvdResult { u, s, vh, m, n, k })
 }
 
-/// Compute just the singular values of an (m x n) matrix.
+/// Compute just the singular values of an (m x n) matrix, sorted descending.
 ///
-/// More efficient than full SVD when U and Vh are not needed.
+/// Uses the dedicated values-only Golub-Reinsch path
+/// ([`golub_reinsch_singular_values`]): bidiagonalize then run the implicit-shift
+/// QR recurrence on the bidiagonal alone, skipping all U/V accumulation. The
+/// `w` recurrence is identical to the full SVD's, so the values agree with
+/// `svd_contiguous_f64(..).s` to working precision while avoiding the O(m n^2)
+/// U accumulation and every per-rotation matrix update. Wide matrices reduce to
+/// the tall case via transpose (the singular values of `A` and `A^T` are equal).
 pub fn svdvals_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
-    // For now, compute full SVD and return just S.
-    // A dedicated implementation could skip computing U/V for better efficiency.
-    let result = svd_contiguous_f64(data, meta, false)?;
-    Ok(result.s)
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let m = shape[0];
+    let n = shape[1];
+    if m == 0 || n == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = meta.storage_offset();
+    let mut a = vec![0.0f64; m * n];
+    for i in 0..m {
+        for j in 0..n {
+            a[i * n + j] = data[offset + i * n + j];
+        }
+    }
+
+    let mut s = if m >= n {
+        golub_reinsch_singular_values(&mut a, m, n)?
+    } else {
+        // Transpose to (n x m) so it is tall; sv(A) == sv(A^T).
+        let mut at = vec![0.0f64; n * m];
+        for i in 0..m {
+            for j in 0..n {
+                at[j * m + i] = a[i * n + j];
+            }
+        }
+        golub_reinsch_singular_values(&mut at, n, m)?
+    };
+    // Sort descending, matching svd_contiguous_f64's ordering.
+    s.sort_by(|x, y| y.total_cmp(x));
+    Ok(s)
 }
 
 /// Result of QR decomposition.
@@ -13848,6 +14071,33 @@ mod tests {
                 (a_val - b_val).abs() < 1e-10,
                 "mismatch at [{i}]: {a_val} vs {b_val}"
             );
+        }
+    }
+
+    #[test]
+    fn svdvals_matches_full_svd_tall_and_wide() {
+        // The values-only Golub-Reinsch path must agree with the full SVD's
+        // singular values for both tall (m > n) and wide (m < n) inputs, at a
+        // size where bidiagonalization + several QR sweeps are exercised.
+        for &(m, n) in &[(40usize, 24usize), (24usize, 40usize)] {
+            let mut a = vec![0.0f64; m * n];
+            for i in 0..m {
+                for j in 0..n {
+                    a[i * n + j] = (((i * 53 + j * 29 + 11) % 101) as f64) * 0.07 - 3.0
+                        + ((i as f64) * 0.3 - (j as f64) * 0.2).cos();
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+            let full = super::svd_contiguous_f64(&a, &meta, false).unwrap();
+            let vals_only = super::svdvals_contiguous_f64(&a, &meta).unwrap();
+            assert_eq!(full.s.len(), vals_only.len(), "{m}x{n} length");
+            assert_eq!(vals_only.len(), m.min(n));
+            for (i, (&fv, &vv)) in full.s.iter().zip(vals_only.iter()).enumerate() {
+                assert!(
+                    (fv - vv).abs() < 1e-9 * (1.0 + fv.abs()),
+                    "{m}x{n} singular value [{i}]: full {fv} vs values-only {vv}"
+                );
+            }
         }
     }
 
