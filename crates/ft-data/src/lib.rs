@@ -468,6 +468,39 @@ impl WeightedRandomSampler {
             return Ok(result);
         }
 
+        if self.weights.len() == 4 {
+            let first_threshold = cumulative.first().copied().ok_or_else(|| {
+                transform_config_error(
+                    "WeightedRandomSampler: weights must produce cumulative thresholds",
+                )
+            })? / total;
+            let second_threshold = cumulative.get(1).copied().ok_or_else(|| {
+                transform_config_error(
+                    "WeightedRandomSampler: weights must produce cumulative thresholds",
+                )
+            })? / total;
+            let third_threshold = cumulative.get(2).copied().ok_or_else(|| {
+                transform_config_error(
+                    "WeightedRandomSampler: weights must produce cumulative thresholds",
+                )
+            })? / total;
+            let mut rng = SimpleRng::new(self.seed);
+            let mut result = Vec::with_capacity(self.num_samples);
+            for _ in 0..self.num_samples {
+                let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+                result.push(if u <= first_threshold {
+                    0
+                } else if u <= second_threshold {
+                    1
+                } else if u <= third_threshold {
+                    2
+                } else {
+                    3
+                });
+            }
+            return Ok(result);
+        }
+
         for threshold in &mut cumulative {
             *threshold /= total;
         }
@@ -1976,6 +2009,21 @@ mod tests {
             vec![
                 2, 1, 2, 1, 1, 2, 2, 2, 2, 1, 2, 1, 2, 2, 1, 2, 2, 2, 2, 2, 2, 2, 0, 2, 0, 0, 2, 2,
                 0, 2, 1, 2,
+            ]
+        );
+    }
+
+    #[test]
+    fn weighted_random_sampler_four_weight_fast_path_preserves_order() {
+        let indices = WeightedRandomSampler::new(vec![1.0, 2.0, 3.0, 4.0], 32)
+            .with_seed(0x5151_0004)
+            .indices()
+            .expect("weighted samples");
+        assert_eq!(
+            indices,
+            vec![
+                3, 2, 3, 2, 3, 2, 3, 3, 3, 3, 2, 2, 2, 3, 2, 2, 3, 0, 1, 2, 1, 3, 3, 2, 3, 2, 3, 2,
+                3, 3, 1, 2,
             ]
         );
     }

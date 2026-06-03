@@ -37887,6 +37887,100 @@ impl FrankenTorchSession {
     ///
     /// Equivalent to `torch.diff(input, n=1, dim=-1)`.
     /// For n=1: `out[i] = input[i+1] - input[i]`.
+    /// Finite-difference gradient estimate along `dim`, with uniform `spacing`
+    /// and `edge_order` (1 or 2). Equivalent to `torch.gradient(input,
+    /// spacing=spacing, dim=dim, edge_order=edge_order)` for a single dim (torch
+    /// returns a 1-tuple; this returns that tensor).
+    ///
+    /// Interior points use the central difference `(x[i+1]-x[i-1])/(2h)`;
+    /// boundaries use a first- or second-order one-sided difference. Composed
+    /// from autograd-aware narrow/cat/scalar ops, so the (linear) gradient flows
+    /// automatically. The output has the same shape as the input.
+    pub fn tensor_gradient_dim(
+        &mut self,
+        input: TensorNodeId,
+        dim: usize,
+        spacing: f64,
+        edge_order: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        if dim >= shape.len() {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "gradient: dim out of range",
+                },
+            )));
+        }
+        if edge_order != 1 && edge_order != 2 {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "gradient: edge_order must be 1 or 2",
+                },
+            )));
+        }
+        let len = shape[dim];
+        let min_len = edge_order + 1; // edge_order=1 needs >=2, edge_order=2 needs >=3
+        if len < min_len {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "gradient: dimension too small for the requested edge_order",
+                },
+            )));
+        }
+        let inv_2h = 1.0 / (2.0 * spacing);
+        let inv_h = 1.0 / spacing;
+
+        // Interior: (x[2:] - x[:-2]) / (2h), giving the len-2 central differences.
+        let upper = self.tensor_narrow(input, dim, 2, len - 2)?;
+        let lower = self.tensor_narrow(input, dim, 0, len - 2)?;
+        let interior_raw = self.tensor_sub(upper, lower)?;
+        let interior = self.tensor_mul_scalar(interior_raw, inv_2h)?;
+
+        let (first, last) = if edge_order == 1 {
+            // g[0] = (x[1]-x[0])/h ; g[-1] = (x[-1]-x[-2])/h
+            let f = {
+                let x1 = self.tensor_narrow(input, dim, 1, 1)?;
+                let x0 = self.tensor_narrow(input, dim, 0, 1)?;
+                let d = self.tensor_sub(x1, x0)?;
+                self.tensor_mul_scalar(d, inv_h)?
+            };
+            let l = {
+                let xn = self.tensor_narrow(input, dim, len - 1, 1)?;
+                let xn1 = self.tensor_narrow(input, dim, len - 2, 1)?;
+                let d = self.tensor_sub(xn, xn1)?;
+                self.tensor_mul_scalar(d, inv_h)?
+            };
+            (f, l)
+        } else {
+            // edge_order == 2 (second-order one-sided):
+            //   g[0]  = (-3 x[0] + 4 x[1] - x[2]) / (2h)
+            //   g[-1] = ( 3 x[-1] - 4 x[-2] + x[-3]) / (2h)
+            let f = {
+                let x0 = self.tensor_narrow(input, dim, 0, 1)?;
+                let x1 = self.tensor_narrow(input, dim, 1, 1)?;
+                let x2 = self.tensor_narrow(input, dim, 2, 1)?;
+                let a = self.tensor_mul_scalar(x0, -3.0)?;
+                let b = self.tensor_mul_scalar(x1, 4.0)?;
+                let ab = self.tensor_add(a, b)?;
+                let raw = self.tensor_sub(ab, x2)?;
+                self.tensor_mul_scalar(raw, inv_2h)?
+            };
+            let l = {
+                let xn = self.tensor_narrow(input, dim, len - 1, 1)?;
+                let xn1 = self.tensor_narrow(input, dim, len - 2, 1)?;
+                let xn2 = self.tensor_narrow(input, dim, len - 3, 1)?;
+                let a = self.tensor_mul_scalar(xn, 3.0)?;
+                let b = self.tensor_mul_scalar(xn1, -4.0)?;
+                let ab = self.tensor_add(a, b)?;
+                let raw = self.tensor_add(ab, xn2)?;
+                self.tensor_mul_scalar(raw, inv_2h)?
+            };
+            (f, l)
+        };
+
+        self.tensor_cat(&[first, interior, last], dim)
+    }
+
     pub fn tensor_diff(
         &mut self,
         input: TensorNodeId,
@@ -72188,6 +72282,40 @@ mod tests {
         assert!((v[1] - 2.0 / std::f64::consts::PI).abs() < 1e-12);
         assert!(v[2].abs() < 1e-12);
         assert!(v[3].abs() < 1e-12);
+    }
+
+    #[test]
+    fn gradient_dim_matches_torch_finite_differences() {
+        let data = vec![1.0, 2.0, 4.0, 7.0, 11.0];
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // edge_order=1, spacing=1: g0=x1-x0=1; interior central (x[i+1]-x[i-1])/2;
+        // g_last=x4-x3=4.
+        let x = s.tensor_variable(data.clone(), vec![5], false).unwrap();
+        let g = s.tensor_gradient_dim(x, 0, 1.0, 1).unwrap();
+        assert_eq!(s.tensor_values(g).unwrap(), vec![1.0, 1.5, 2.5, 3.5, 4.0]);
+        // edge_order=2: g0=(-3·1+4·2-4)/2=0.5; g_last=(3·11-4·7+4)/2=4.5.
+        let x2 = s.tensor_variable(data.clone(), vec![5], false).unwrap();
+        let g2 = s.tensor_gradient_dim(x2, 0, 1.0, 2).unwrap();
+        assert_eq!(s.tensor_values(g2).unwrap(), vec![0.5, 1.5, 2.5, 3.5, 4.5]);
+        // spacing=2 scales by 1/h.
+        let x3 = s.tensor_variable(data.clone(), vec![5], false).unwrap();
+        let g3 = s.tensor_gradient_dim(x3, 0, 2.0, 1).unwrap();
+        assert_eq!(s.tensor_values(g3).unwrap(), vec![0.5, 0.75, 1.25, 1.75, 2.0]);
+        // 2-D along dim=1: each row independently.
+        let m = s
+            .tensor_variable(vec![1.0, 2.0, 4.0, 0.0, 10.0, 20.0], vec![2, 3], false)
+            .unwrap();
+        let gm = s.tensor_gradient_dim(m, 1, 1.0, 1).unwrap();
+        assert_eq!(s.tensor_shape(gm).unwrap(), vec![2, 3]);
+        // row0 [1,2,4]: g=[1, (4-1)/2=1.5, 4-2=2]; row1 [0,10,20]: [10, 10, 10].
+        assert_eq!(s.tensor_values(gm).unwrap(), vec![1.0, 1.5, 2.0, 10.0, 10.0, 10.0]);
+        // Gradient flows (linear op).
+        let xg = s.tensor_variable(data.clone(), vec![5], true).unwrap();
+        let gg = s.tensor_gradient_dim(xg, 0, 1.0, 1).unwrap();
+        let loss = s.tensor_sum(gg).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, xg).expect("gradient_dim grad present");
+        assert_eq!(grad.len(), 5);
     }
 
     #[test]

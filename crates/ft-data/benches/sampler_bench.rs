@@ -40,6 +40,17 @@ fn bench_random_sampler(c: &mut Criterion) {
         );
     });
 
+    group.bench_function("weighted_four_positive_4x1m", |b| {
+        b.iter_batched(
+            || {
+                WeightedRandomSampler::new(vec![1.0, 2.0, 3.0, 4.0], 1_000_000)
+                    .with_seed(0x5151_0004)
+            },
+            |sampler| black_box(sampler.indices().expect("weighted samples")),
+            BatchSize::SmallInput,
+        );
+    });
+
     group.finish();
 }
 
