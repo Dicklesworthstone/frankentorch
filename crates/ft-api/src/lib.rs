@@ -11436,9 +11436,8 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_u_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // U_n'(x) = ((n+1)·T_{n+1}(x) − x·U_n(x)) / (x²−1).
+        self.special_unary_n_with_deriv(input, n, chebyshev_u_scalar, chebyshev_u_deriv)
     }
 
     /// Chebyshev polynomial of the third kind V_n(x).
@@ -11449,9 +11448,10 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_v_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // V_n = U_n − U_{n-1} ⇒ V_n' = U_n' − U_{n-1}'.
+        self.special_unary_n_with_deriv(input, n, chebyshev_v_scalar, |n, x| {
+            chebyshev_u_deriv(n, x) - chebyshev_u_deriv(n - 1, x)
+        })
     }
 
     /// Chebyshev polynomial of the fourth kind W_n(x).
@@ -11462,9 +11462,10 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| chebyshev_w_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // W_n = U_n + U_{n-1} ⇒ W_n' = U_n' + U_{n-1}'.
+        self.special_unary_n_with_deriv(input, n, chebyshev_w_scalar, |n, x| {
+            chebyshev_u_deriv(n, x) + chebyshev_u_deriv(n - 1, x)
+        })
     }
 
     /// Shifted Chebyshev polynomial T*_n(x) = T_n(2x-1).
@@ -11475,9 +11476,14 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_t_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // T*_n(x) = T_n(2x−1) ⇒ deriv = 2·T_n'(2x−1) = 2n·U_{n-1}(2x−1).
+        self.special_unary_n_with_deriv(input, n, shifted_chebyshev_t_scalar, |n, x| {
+            if n <= 0 {
+                0.0
+            } else {
+                2.0 * n as f64 * chebyshev_u_scalar(n - 1, 2.0 * x - 1.0)
+            }
+        })
     }
 
     /// Shifted Chebyshev polynomial U*_n(x) = U_n(2x-1).
@@ -11488,9 +11494,10 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_u_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // U*_n(x) = U_n(2x−1) ⇒ deriv = 2·U_n'(2x−1).
+        self.special_unary_n_with_deriv(input, n, shifted_chebyshev_u_scalar, |n, x| {
+            2.0 * chebyshev_u_deriv(n, 2.0 * x - 1.0)
+        })
     }
 
     /// Shifted Chebyshev polynomial V*_n(x) = V_n(2x-1).
@@ -11501,9 +11508,11 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_v_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // V*_n(x) = V_n(2x−1) ⇒ deriv = 2·(U_n'(2x−1) − U_{n-1}'(2x−1)).
+        self.special_unary_n_with_deriv(input, n, shifted_chebyshev_v_scalar, |n, x| {
+            let y = 2.0 * x - 1.0;
+            2.0 * (chebyshev_u_deriv(n, y) - chebyshev_u_deriv(n - 1, y))
+        })
     }
 
     /// Shifted Chebyshev polynomial W*_n(x) = W_n(2x-1).
@@ -11514,9 +11523,11 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         n: i64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (vals, meta) = self.tensor_values_meta(input)?;
-        let result: Vec<f64> = par_map_f64(&vals, |x| shifted_chebyshev_w_scalar(n, x));
-        self.tensor_variable(result, meta.shape().to_vec(), false)
+        // W*_n(x) = W_n(2x−1) ⇒ deriv = 2·(U_n'(2x−1) + U_{n-1}'(2x−1)).
+        self.special_unary_n_with_deriv(input, n, shifted_chebyshev_w_scalar, |n, x| {
+            let y = 2.0 * x - 1.0;
+            2.0 * (chebyshev_u_deriv(n, y) + chebyshev_u_deriv(n - 1, y))
+        })
     }
 
     /// Physicist's Hermite polynomial H_n(x).
@@ -61060,6 +61071,17 @@ fn chebyshev_u_scalar(n: i64, x: f64) -> f64 {
     }
 }
 
+/// Derivative of the second-kind Chebyshev polynomial: U_n'(x).
+/// U_0(x)=1 ⇒ 0; for n≥1, U_n'(x) = ((n+1)·T_{n+1}(x) − x·U_n(x)) / (x²−1)
+/// (a polynomial; the x=±1 pole is removable). The derivatives of the third and
+/// fourth kinds follow from V_n=U_n−U_{n-1} and W_n=U_n+U_{n-1}.
+fn chebyshev_u_deriv(n: i64, x: f64) -> f64 {
+    if n <= 0 {
+        return 0.0;
+    }
+    ((n + 1) as f64 * chebyshev_t_scalar(n + 1, x) - x * chebyshev_u_scalar(n, x)) / (x * x - 1.0)
+}
+
 /// Chebyshev polynomial of third kind V_n(x).
 /// V_n(x) = (T_n(x) + T_{n+1}(x)) / (1 + x) for x != -1.
 /// Actually uses definition V_n(x) = cos((n+0.5)θ)/cos(θ/2) where x=cos(θ).
@@ -83112,6 +83134,13 @@ mod tests {
         type ApiFn = fn(&mut FrankenTorchSession, TensorNodeId, i64) -> Result<TensorNodeId, AutogradError>;
         let cases: &[(&str, ApiFn, i64, &[f64])] = &[
             ("chebyshev_t", |s, x, n| s.tensor_special_chebyshev_polynomial_t(x, n), 4, &[-0.3, 0.2, 0.6]),
+            ("chebyshev_u", |s, x, n| s.tensor_special_chebyshev_polynomial_u(x, n), 4, &[-0.3, 0.2, 0.6]),
+            ("chebyshev_v", |s, x, n| s.tensor_special_chebyshev_polynomial_v(x, n), 4, &[-0.3, 0.2, 0.6]),
+            ("chebyshev_w", |s, x, n| s.tensor_special_chebyshev_polynomial_w(x, n), 4, &[-0.3, 0.2, 0.6]),
+            ("shifted_t", |s, x, n| s.tensor_special_shifted_chebyshev_polynomial_t(x, n), 4, &[0.15, 0.55, 0.8]),
+            ("shifted_u", |s, x, n| s.tensor_special_shifted_chebyshev_polynomial_u(x, n), 4, &[0.15, 0.55, 0.8]),
+            ("shifted_v", |s, x, n| s.tensor_special_shifted_chebyshev_polynomial_v(x, n), 4, &[0.15, 0.55, 0.8]),
+            ("shifted_w", |s, x, n| s.tensor_special_shifted_chebyshev_polynomial_w(x, n), 4, &[0.15, 0.55, 0.8]),
             ("hermite_h", |s, x, n| s.tensor_special_hermite_polynomial_h(x, n), 3, &[-0.5, 0.4, 1.2]),
             ("hermite_he", |s, x, n| s.tensor_special_hermite_polynomial_he(x, n), 4, &[-0.5, 0.4, 1.2]),
             ("laguerre_l", |s, x, n| s.tensor_special_laguerre_polynomial_l(x, n), 3, &[0.5, 1.3, 2.7]),
