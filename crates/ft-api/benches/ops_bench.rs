@@ -230,6 +230,26 @@ fn bench_fft2(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lrn(c: &mut Criterion) {
+    let mut group = c.benchmark_group("local_response_norm");
+    // [N, C, H, W] LRN: a powf per output element over a local channel window ->
+    // compute-bound, parallel over (batch, channel) rows.
+    let (n, ch, h, w) = (8usize, 64usize, 56usize, 56usize);
+    group.throughput(Throughput::Elements((n * ch * h * w) as u64));
+    group.bench_function("8x64x56x56", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_randn(vec![n, ch, h, w], false).unwrap();
+        b.iter(|| {
+            black_box(
+                session
+                    .tensor_local_response_norm(black_box(x), 5, 1e-4, 0.75, 2.0)
+                    .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
 fn bench_rope_freqs(c: &mut Criterion) {
     let mut group = c.benchmark_group("rope_freqs");
     // RoPE cos/sin tables [max_seq_len, head_dim/2]: cos + sin per element ->
@@ -455,6 +475,7 @@ criterion_group!(
     bench_interpolate_trilinear,
     bench_grid_sample,
     bench_fft2,
+    bench_lrn,
     bench_rope_freqs,
     bench_sinusoidal_pe,
     bench_istft,

@@ -17214,23 +17214,40 @@ impl FrankenTorchSession {
         let batch_size = shape[0];
         let half = size / 2;
 
-        let mut out_data = Vec::with_capacity(data.len());
-
-        for b in 0..batch_size {
-            for c in 0..channels {
-                let c_start = c.saturating_sub(half);
-                let c_end = (c + half + 1).min(channels);
-                for s in 0..spatial {
-                    let mut sum_sq = 0.0;
-                    for nc in c_start..c_end {
-                        let idx = b * channels * spatial + nc * spatial + s;
-                        sum_sq += data[idx] * data[idx];
-                    }
-                    let norm = (k + alpha * sum_sq / size as f64).powf(beta);
-                    let idx = b * channels * spatial + c * spatial + s;
-                    out_data.push(data[idx] / norm);
+        // Each (batch, channel) pair owns a contiguous `spatial`-length output
+        // row, and every element does a local-window sum-of-squares plus a powf
+        // (compute-bound). Distribute the (b, c) rows across Rayon workers; the
+        // per-element arithmetic, window-summation order and linear write
+        // position are unchanged, so the result is bit-for-bit identical to the
+        // serial push loop.
+        let mut out_data = vec![0.0_f64; data.len()];
+        let fill_row = |bc: usize, row: &mut [f64]| {
+            let b = bc / channels;
+            let c = bc % channels;
+            let c_start = c.saturating_sub(half);
+            let c_end = (c + half + 1).min(channels);
+            let base = b * channels * spatial;
+            for (s, slot) in row.iter_mut().enumerate() {
+                let mut sum_sq = 0.0;
+                for nc in c_start..c_end {
+                    let idx = base + nc * spatial + s;
+                    sum_sq += data[idx] * data[idx];
                 }
+                let norm = (k + alpha * sum_sq / size as f64).powf(beta);
+                *slot = data[base + c * spatial + s] / norm;
             }
+        };
+        if data.len() >= PARALLEL_ELEMENTWISE_MIN && batch_size * channels >= 2 {
+            use rayon::prelude::*;
+            out_data
+                .par_chunks_mut(spatial)
+                .enumerate()
+                .for_each(|(bc, row)| fill_row(bc, row));
+        } else {
+            out_data
+                .chunks_mut(spatial)
+                .enumerate()
+                .for_each(|(bc, row)| fill_row(bc, row));
         }
 
         self.tensor_variable(out_data, shape, false)
@@ -81299,6 +81316,46 @@ mod tests {
         }
         for (idx, (g, w)) in got_sin.iter().zip(want_sin.iter()).enumerate() {
             assert_eq!(g.to_bits(), w.to_bits(), "rope sin @{idx}");
+        }
+    }
+
+    #[test]
+    fn local_response_norm_parallel_match_serial_bit_exact() {
+        // data.len() >= PARALLEL_ELEMENTWISE_MIN and batch*channels >= 2 so the
+        // rayon (b,c)-row path runs; it must match the serial reference BIT-FOR-BIT.
+        use super::FrankenTorchSession;
+        let (n, ch, hh, ww) = (4usize, 8usize, 16usize, 16usize); // 8192 elements
+        let (size, alpha, beta, k) = (5usize, 1e-4_f64, 0.75_f64, 2.0_f64);
+        let spatial = hh * ww;
+        let half = size / 2;
+        let data: Vec<f64> = (0..n * ch * spatial)
+            .map(|i| ((i % 251) as f64) * 0.013 - 1.5)
+            .collect();
+
+        let mut want = Vec::with_capacity(data.len());
+        for b in 0..n {
+            for c in 0..ch {
+                let c_start = c.saturating_sub(half);
+                let c_end = (c + half + 1).min(ch);
+                for s in 0..spatial {
+                    let mut sum_sq = 0.0;
+                    for nc in c_start..c_end {
+                        let idx = b * ch * spatial + nc * spatial + s;
+                        sum_sq += data[idx] * data[idx];
+                    }
+                    let norm = (k + alpha * sum_sq / size as f64).powf(beta);
+                    want.push(data[b * ch * spatial + c * spatial + s] / norm);
+                }
+            }
+        }
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(data.clone(), vec![n, ch, hh, ww], false).unwrap();
+        let y = s.tensor_local_response_norm(x, size, alpha, beta, k).unwrap();
+        let got = s.tensor_values(y).unwrap();
+        assert_eq!(got.len(), want.len());
+        for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "lrn @{idx}");
         }
     }
 
