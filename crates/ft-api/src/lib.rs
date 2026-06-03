@@ -10354,6 +10354,20 @@ impl FrankenTorchSession {
         self.tensor_where(zero_mask, ones, ratio)
     }
 
+    /// Airy function of the first kind, Ai(x).
+    ///
+    /// Equivalent to `torch.special.airy_ai(input)`. Elementwise. Like the other
+    /// Airy/Bessel special functions in torch.special, this is forward-only
+    /// (torch registers no backward for it), so the result is a non-grad leaf.
+    pub fn tensor_special_airy_ai(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (vals, meta) = self.tensor_values_meta(input)?;
+        let result: Vec<f64> = par_map_f64(&vals, airy_ai_scalar);
+        self.tensor_variable(result, meta.shape().to_vec(), false)
+    }
+
     /// L2 hypotenuse.
     ///
     /// Equivalent to `torch.hypot(x, y)`. Element-wise. Uses the stable
@@ -61235,6 +61249,87 @@ fn legendre_p_scalar(n: i64, x: f64) -> f64 {
     }
 }
 
+/// Airy function of the first kind, Ai(x). Table-free, full precision over the
+/// whole real line via three regimes:
+///   |x| <= 6 : Maclaurin Ai = c1·f(x) − c2·g(x), where f''=xf (f(0)=1,f'(0)=0)
+///              and g''=xg (g(0)=0,g'(0)=1), so f = Σ x^{3k}/Π and g = Σ x^{3k+1}/Π.
+///   x  >  6 : decaying asymptotic (e^{-ζ}/(2√π x^{1/4})) Σ (−1)^k u_k ζ^{-k}.
+///   x  < −6 : oscillatory asymptotic with ζ = (2/3)|x|^{3/2}.
+/// The asymptotic coefficients use u_0=1, u_k = u_{k-1}(6k−5)(6k−3)(6k−1)/((2k−1)·216·k),
+/// truncated at the smallest term (superasymptotic).
+fn airy_ai_scalar(x: f64) -> f64 {
+    if x.is_nan() {
+        return f64::NAN;
+    }
+    const C1: f64 = 0.355_028_053_887_817_24; // Ai(0)  = 1/(3^{2/3} Γ(2/3))
+    const C2: f64 = 0.258_819_403_792_806_80; // -Ai'(0) = 1/(3^{1/3} Γ(1/3))
+    let sqrt_pi = std::f64::consts::PI.sqrt();
+
+    if x.abs() <= 6.0 {
+        let x3 = x * x * x;
+        let mut f = 1.0_f64; // f(x) = Σ_k c_{3k} x^{3k}
+        let mut fterm = 1.0_f64; // c_{3k} x^{3k}, k=0
+        let mut g = x; // g(x) = Σ_k d_{3k+1} x^{3k+1}
+        let mut gterm = x; // d_{3k+1} x^{3k+1}, k=0
+        for k in 1..=50 {
+            let kf = f64::from(k);
+            fterm *= x3 / ((3.0 * kf) * (3.0 * kf - 1.0));
+            f += fterm;
+            gterm *= x3 / ((3.0 * kf + 1.0) * (3.0 * kf));
+            g += gterm;
+            if k > 5 && fterm.abs() <= 1e-18 * f.abs() && gterm.abs() <= 1e-18 * (g.abs() + 1e-300)
+            {
+                break;
+            }
+        }
+        return C1 * f - C2 * g;
+    }
+
+    if x > 6.0 {
+        let zeta = (2.0 / 3.0) * x.powf(1.5);
+        let mut term = 1.0_f64; // (−1)^k u_k / ζ^k, k=0
+        let mut sum = 1.0_f64;
+        let mut prev = f64::INFINITY;
+        for k in 1..=60 {
+            let kf = f64::from(k);
+            let ratio =
+                (6.0 * kf - 5.0) * (6.0 * kf - 3.0) * (6.0 * kf - 1.0) / ((2.0 * kf - 1.0) * 216.0 * kf);
+            term *= -ratio / zeta;
+            if term.abs() > prev {
+                break; // optimal (superasymptotic) truncation
+            }
+            prev = term.abs();
+            sum += term;
+        }
+        return (-zeta).exp() / (2.0 * sqrt_pi * x.powf(0.25)) * sum;
+    }
+
+    // x < -6: oscillatory asymptotic. y = -x, ζ = (2/3) y^{3/2}.
+    let y = -x;
+    let zeta = (2.0 / 3.0) * y.powf(1.5);
+    let mut tj = 1.0_f64; // u_j / ζ^j, j=0
+    let mut even = 1.0_f64; // Σ_k (−1)^k u_{2k} / ζ^{2k}
+    let mut odd = 0.0_f64; // Σ_k (−1)^k u_{2k+1} / ζ^{2k+1}
+    let mut prev = f64::INFINITY;
+    for j in 1..=60 {
+        let jf = f64::from(j);
+        let ratio =
+            (6.0 * jf - 5.0) * (6.0 * jf - 3.0) * (6.0 * jf - 1.0) / ((2.0 * jf - 1.0) * 216.0 * jf);
+        tj *= ratio / zeta; // u_j / ζ^j
+        if tj.abs() > prev {
+            break; // optimal truncation
+        }
+        prev = tj.abs();
+        if j % 2 == 0 {
+            even += if (j / 2) % 2 == 0 { tj } else { -tj };
+        } else {
+            odd += if ((j - 1) / 2) % 2 == 0 { tj } else { -tj };
+        }
+    }
+    let phase = zeta + std::f64::consts::FRAC_PI_4;
+    (phase.sin() * even - phase.cos() * odd) / (sqrt_pi * y.powf(0.25))
+}
+
 /// Numerically stable scalar log_ndtr (frankentorch-2mb1).
 ///
 /// For `x >= -1` returns `log(0.5 * erfc(-x / sqrt(2)))` directly.
@@ -82613,6 +82708,42 @@ mod tests {
         assert!(super::bessel_y0_scalar(-1.0).is_nan());
         assert!(super::bessel_y0_scalar(0.0).is_nan());
         assert!(super::bessel_y1_scalar(f64::NAN).is_nan());
+    }
+
+    #[test]
+    fn airy_ai_matches_f64_reference_values_across_regimes() {
+        // Reference values from scipy.special.airy(x)[0] = Ai(x). All three
+        // regimes are exercised: Maclaurin (|x|<=6), decaying asymptotic (x>6),
+        // oscillatory asymptotic (x<-6).
+        let close = |got: f64, want: f64, tol: f64| (got - want).abs() <= tol * (1.0 + want.abs());
+        // Maclaurin (less cancellation near 0 → tighter).
+        assert!(close(super::airy_ai_scalar(0.0), 0.3550280538878172, 1e-13), "Ai(0)={}", super::airy_ai_scalar(0.0));
+        assert!(close(super::airy_ai_scalar(1.0), 0.13529241631288141, 1e-12), "Ai(1)");
+        assert!(close(super::airy_ai_scalar(-1.0), 0.5355608832923521, 1e-12), "Ai(-1)");
+        assert!(close(super::airy_ai_scalar(2.0), 0.03492413042327235, 1e-12), "Ai(2)");
+        assert!(close(super::airy_ai_scalar(-2.0), 0.22740742820168561, 1e-12), "Ai(-2)");
+        // Larger |x| in Maclaurin: more cancellation, looser tolerance.
+        assert!(close(super::airy_ai_scalar(5.0), 1.0834442525400821e-04, 1e-8), "Ai(5)={}", super::airy_ai_scalar(5.0));
+        assert!(close(super::airy_ai_scalar(-5.0), 0.3507610090241138, 1e-9), "Ai(-5)={}", super::airy_ai_scalar(-5.0));
+        // Positive asymptotic (x>6).
+        assert!(close(super::airy_ai_scalar(10.0), 1.1047532552898687e-10, 1e-9), "Ai(10)={}", super::airy_ai_scalar(10.0));
+        // Negative oscillatory asymptotic (x<-6) — validates the phase.
+        assert!(close(super::airy_ai_scalar(-10.0), 0.04024123848335255, 1e-9), "Ai(-10)={}", super::airy_ai_scalar(-10.0));
+        // Cross-branch continuity at the |x|=6 splits (Maclaurin vs asymptotic).
+        // The transition region is the least accurate (~1e-7, like the K-family);
+        // a small jump here only confirms the two branches agree, not f64 parity.
+        let dp = (super::airy_ai_scalar(6.0) - super::airy_ai_scalar(6.0 + 1e-7)).abs();
+        assert!(dp <= 1e-7, "Ai +split discontinuity {dp}");
+        let dn = (super::airy_ai_scalar(-6.0) - super::airy_ai_scalar(-6.0 - 1e-7)).abs();
+        assert!(dn <= 1e-7, "Ai -split discontinuity {dn}");
+        assert!(super::airy_ai_scalar(f64::NAN).is_nan());
+        // API surface produces the same values.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.0, 1.0, -1.0], vec![3], false).unwrap();
+        let out = s.tensor_special_airy_ai(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!((v[0] - 0.3550280538878172).abs() < 1e-13);
+        assert!((v[2] - 0.5355608832923521).abs() < 1e-12);
     }
 
     #[test]
