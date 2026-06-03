@@ -525,6 +525,13 @@ const TYPE_PRIORITY: [DispatchKey; 5] = [
 ];
 
 const BACKEND_PRIORITY: [DispatchKey; 1] = [DispatchKey::CPU];
+const AUTOGRAD_CPU_BIT: u64 = DispatchKey::AutogradCPU.bit();
+const CPU_BIT: u64 = DispatchKey::CPU.bit();
+const SCALAR_BINARY_TYPE_KEY_MASK: u64 = DispatchKey::AutogradCPU.bit()
+    | DispatchKey::CompositeExplicitAutograd.bit()
+    | DispatchKey::CompositeImplicitAutograd.bit()
+    | CPU_BIT
+    | DispatchKey::BackendSelect.bit();
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
 pub struct DispatchKeySet {
@@ -622,13 +629,18 @@ impl DispatchKeySet {
         if self.is_empty() {
             return Err(DispatchKeyError::EmptySet);
         }
-        if self.has(DispatchKey::AutogradCPU) && !self.has(DispatchKey::CPU) {
+        let bits = self.bits();
+        if (bits & AUTOGRAD_CPU_BIT) != 0 && (bits & CPU_BIT) == 0 {
             return Err(DispatchKeyError::IncompatibleSet {
                 reason: "AutogradCPU requires CPU backend availability",
             });
         }
-        self.highest_priority_type_id()?;
-        self.highest_priority_backend_type_id()?;
+        if (bits & SCALAR_BINARY_TYPE_KEY_MASK) == 0 {
+            return Err(DispatchKeyError::NoTypeKey);
+        }
+        if (bits & CPU_BIT) == 0 {
+            return Err(DispatchKeyError::NoBackendKey);
+        }
         Ok(())
     }
 }
