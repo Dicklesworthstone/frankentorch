@@ -5,7 +5,26 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
-use ft_kernel_cpu::{cholesky_contiguous_f64, det_contiguous_f64};
+use ft_kernel_cpu::{cholesky_contiguous_f64, det_contiguous_f64, eigh_contiguous_f64};
+
+fn bench_eigh(c: &mut Criterion) {
+    for &n in &[128usize, 256usize] {
+        // Symmetric, well-conditioned: A = (B + B^T)/2 + n*I.
+        let mut a = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let bij = ((i * 31 + j * 17) % 97) as f64 * 0.013 - 0.5;
+                let bji = ((j * 31 + i * 17) % 97) as f64 * 0.013 - 0.5;
+                a[i * n + j] = 0.5 * (bij + bji);
+            }
+            a[i * n + i] += n as f64;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        c.bench_function(&format!("eigh_f64_{n}x{n}"), |bch| {
+            bch.iter(|| black_box(eigh_contiguous_f64(black_box(&a), &meta).unwrap()))
+        });
+    }
+}
 
 fn bench_lu(c: &mut Criterion) {
     for &n in &[768usize, 1536usize] {
@@ -51,5 +70,5 @@ fn bench_cholesky(c: &mut Criterion) {
     }
 }
 
-criterion_group!(benches, bench_lu, bench_cholesky);
+criterion_group!(benches, bench_lu, bench_cholesky, bench_eigh);
 criterion_main!(benches);

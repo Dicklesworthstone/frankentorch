@@ -647,58 +647,115 @@ impl Optimizer for AdamW {
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
             let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
 
-            let next_m: Vec<f64> = match &self.m[i] {
-                Some(m) => {
-                    ensure_state_len(
-                        grad.len(),
-                        m.len(),
-                        "adamw first-moment state length mismatch with gradient length",
-                    )?;
-                    m.iter()
-                        .zip(grad.iter())
-                        .map(|(m_val, g)| self.beta1 * m_val + (1.0 - self.beta1) * g)
-                        .collect()
-                }
-                None => grad.iter().map(|g| (1.0 - self.beta1) * g).collect(),
-            };
-
-            let next_v: Vec<f64> = match &self.v[i] {
-                Some(v) => {
-                    ensure_state_len(
-                        grad.len(),
-                        v.len(),
-                        "adamw second-moment state length mismatch with gradient length",
-                    )?;
-                    v.iter()
-                        .zip(grad.iter())
-                        .map(|(v_val, g)| self.beta2 * v_val + (1.0 - self.beta2) * g * g)
-                        .collect()
-                }
-                None => grad.iter().map(|g| (1.0 - self.beta2) * g * g).collect(),
-            };
-
             // Bias-corrected estimates
             let bias_correction1 = adam_bias_correction(self.beta1, t);
             let bias_correction2 = adam_bias_correction(self.beta2, t);
 
             // Decoupled weight decay is equivalent to subtracting
-            // `lr * weight_decay * param` before the Adam update; combine both
-            // deltas so failed state validation cannot partially mutate weights.
-            for ((p, m_val), v_val) in param_values
-                .iter_mut()
-                .zip(next_m.iter())
-                .zip(next_v.iter())
-            {
-                let m_hat = m_val / bias_correction1;
-                let v_hat = v_val / bias_correction2;
-                let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                let decay_delta = if self.weight_decay == 0.0 {
-                    0.0
-                } else {
-                    *p * self.lr * self.weight_decay
-                };
-                *p -= decay_delta + adam_delta;
+            // `lr * weight_decay * param` before the Adam update. Build the
+            // next state locally and only commit it after the parameter write,
+            // preserving fail-closed state behavior.
+            let mut next_m = Vec::with_capacity(grad.len());
+            let mut next_v = Vec::with_capacity(grad.len());
+
+            match (&self.m[i], &self.v[i]) {
+                (Some(m), Some(v)) => {
+                    ensure_state_len(
+                        grad.len(),
+                        m.len(),
+                        "adamw first-moment state length mismatch with gradient length",
+                    )?;
+                    ensure_state_len(
+                        grad.len(),
+                        v.len(),
+                        "adamw second-moment state length mismatch with gradient length",
+                    )?;
+                    for (((p, g), m_prev), v_prev) in param_values
+                        .iter_mut()
+                        .zip(grad.iter())
+                        .zip(m.iter())
+                        .zip(v.iter())
+                    {
+                        let m_val = self.beta1 * m_prev + (1.0 - self.beta1) * g;
+                        let v_val = self.beta2 * v_prev + (1.0 - self.beta2) * g * g;
+                        let m_hat = m_val / bias_correction1;
+                        let v_hat = v_val / bias_correction2;
+                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                        let decay_delta = if self.weight_decay == 0.0 {
+                            0.0
+                        } else {
+                            *p * self.lr * self.weight_decay
+                        };
+                        *p -= decay_delta + adam_delta;
+                        next_m.push(m_val);
+                        next_v.push(v_val);
+                    }
+                }
+                (Some(m), None) => {
+                    ensure_state_len(
+                        grad.len(),
+                        m.len(),
+                        "adamw first-moment state length mismatch with gradient length",
+                    )?;
+                    for ((p, g), m_prev) in param_values.iter_mut().zip(grad.iter()).zip(m.iter()) {
+                        let m_val = self.beta1 * m_prev + (1.0 - self.beta1) * g;
+                        let v_val = (1.0 - self.beta2) * g * g;
+                        let m_hat = m_val / bias_correction1;
+                        let v_hat = v_val / bias_correction2;
+                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                        let decay_delta = if self.weight_decay == 0.0 {
+                            0.0
+                        } else {
+                            *p * self.lr * self.weight_decay
+                        };
+                        *p -= decay_delta + adam_delta;
+                        next_m.push(m_val);
+                        next_v.push(v_val);
+                    }
+                }
+                (None, Some(v)) => {
+                    ensure_state_len(
+                        grad.len(),
+                        v.len(),
+                        "adamw second-moment state length mismatch with gradient length",
+                    )?;
+                    for ((p, g), v_prev) in param_values.iter_mut().zip(grad.iter()).zip(v.iter()) {
+                        let m_val = (1.0 - self.beta1) * g;
+                        let v_val = self.beta2 * v_prev + (1.0 - self.beta2) * g * g;
+                        let m_hat = m_val / bias_correction1;
+                        let v_hat = v_val / bias_correction2;
+                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                        let decay_delta = if self.weight_decay == 0.0 {
+                            0.0
+                        } else {
+                            *p * self.lr * self.weight_decay
+                        };
+                        *p -= decay_delta + adam_delta;
+                        next_m.push(m_val);
+                        next_v.push(v_val);
+                    }
+                }
+                (None, None) => {
+                    for (p, g) in param_values.iter_mut().zip(grad.iter()) {
+                        let m_val = (1.0 - self.beta1) * g;
+                        let v_val = (1.0 - self.beta2) * g * g;
+                        let m_hat = m_val / bias_correction1;
+                        let v_hat = v_val / bias_correction2;
+                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
+                        let decay_delta = if self.weight_decay == 0.0 {
+                            0.0
+                        } else {
+                            *p * self.lr * self.weight_decay
+                        };
+                        *p -= decay_delta + adam_delta;
+                        next_m.push(m_val);
+                        next_v.push(v_val);
+                    }
+                }
             }
+
+            debug_assert_eq!(next_m.len(), grad.len());
+            debug_assert_eq!(next_v.len(), grad.len());
 
             session.tensor_update_param_values(param, param_values)?;
             self.step_counts[i] = t;

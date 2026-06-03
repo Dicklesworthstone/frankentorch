@@ -7,7 +7,7 @@ use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
     log_softmax_dim_tensor_contiguous_f32, log_softmax_dim_tensor_contiguous_f64,
-    softmax_dim_tensor_contiguous_f64,
+    softmax_dim_tensor_contiguous_f32, softmax_dim_tensor_contiguous_f64,
 };
 
 fn bench_softmax(c: &mut Criterion) {
@@ -35,6 +35,14 @@ fn bench_softmax(c: &mut Criterion) {
             black_box(
                 log_softmax_dim_tensor_contiguous_f32(black_box(&data32), &meta32, 1)
                     .expect("valid log_softmax input"),
+            )
+        })
+    });
+    c.bench_function("softmax_f32_8192x1024_dim1", |b| {
+        b.iter(|| {
+            black_box(
+                softmax_dim_tensor_contiguous_f32(black_box(&data32), &meta32, 1)
+                    .expect("valid softmax input"),
             )
         })
     });
