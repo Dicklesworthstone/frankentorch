@@ -26247,6 +26247,17 @@ impl FrankenTorchSession {
         }
     }
 
+    /// Diagonal of a matrix along its last two dimensions. Equivalent to
+    /// `torch.linalg.diagonal(A, offset=offset)` (whose default `dim1=-2,
+    /// dim2=-1` matches `tensor_diagonal`'s last-two-dim convention).
+    pub fn tensor_linalg_diagonal(
+        &mut self,
+        input: TensorNodeId,
+        offset: i64,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_diagonal(input, offset)
+    }
+
     pub fn tensor_diagonal(
         &mut self,
         input: TensorNodeId,
@@ -40267,6 +40278,16 @@ impl FrankenTorchSession {
     ///
     /// Uses scaling-and-squaring with Padé [6/6] approximation.
     /// NOT element-wise exp — this is the matrix exponential.
+    /// Matrix exponential, `expm(A)`. Equivalent to `torch.linalg.matrix_exp`
+    /// (the canonical namespace; `torch.matrix_exp` is deprecated in favor of
+    /// it). Delegates to the autograd-aware `tensor_matrix_exp`.
+    pub fn tensor_linalg_matrix_exp(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.tensor_matrix_exp(input)
+    }
+
     pub fn tensor_matrix_exp(
         &mut self,
         input: TensorNodeId,
@@ -75002,6 +75023,41 @@ mod tests {
         let result = s.tensor_matrix_exp(a).unwrap();
         let vals = s.tensor_values(result).unwrap();
         assert!((vals[0] - 3.0f64.exp()).abs() < 1e-8);
+    }
+
+    #[test]
+    fn linalg_matrix_exp_and_diagonal_aliases_match_underlying() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        #[rustfmt::skip]
+        let m = vec![
+            1.0, 2.0, 3.0,
+            4.0, 5.0, 6.0,
+            7.0, 8.0, 9.0,
+        ];
+        // linalg.matrix_exp == matrix_exp, and the alias is autograd-aware.
+        let a = s.tensor_variable(m.clone(), vec![3, 3], false).unwrap();
+        let e1 = s.tensor_matrix_exp(a).unwrap();
+        let e2 = s.tensor_linalg_matrix_exp(a).unwrap();
+        for (x, y) in s.tensor_values(e1).unwrap().iter().zip(s.tensor_values(e2).unwrap().iter()) {
+            assert_eq!(x.to_bits(), y.to_bits(), "linalg.matrix_exp != matrix_exp");
+        }
+        let ag = s.tensor_variable(m.clone(), vec![3, 3], true).unwrap();
+        let eg = s.tensor_linalg_matrix_exp(ag).unwrap();
+        let loss = s.tensor_sum(eg).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, ag).expect("linalg.matrix_exp grad present");
+        assert!(grad.iter().any(|g| g.abs() > 1e-9), "linalg.matrix_exp gradient is all-zero");
+        // linalg.diagonal == diagonal (main + offset diagonals).
+        let d = s.tensor_variable(m.clone(), vec![3, 3], false).unwrap();
+        for off in [-1_i64, 0, 1] {
+            let n1 = s.tensor_diagonal(d, off).unwrap();
+            let v1 = s.tensor_values(n1).unwrap();
+            let n2 = s.tensor_linalg_diagonal(d, off).unwrap();
+            let v2 = s.tensor_values(n2).unwrap();
+            assert_eq!(v1, v2, "linalg.diagonal != diagonal at offset {off}");
+        }
+        let nd = s.tensor_linalg_diagonal(d, 0).unwrap();
+        assert_eq!(s.tensor_values(nd).unwrap(), vec![1.0, 5.0, 9.0]);
     }
 
     #[test]
