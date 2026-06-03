@@ -24358,9 +24358,10 @@ impl FrankenTorchSession {
         }
 
         let numel = Self::checked_shape_numel(&input_shape, "put: input shape volume overflow")?;
-        let mut result = self.tensor_values(input)?;
 
-        for (&idx, &val) in indices_vals.iter().zip(values_vals.iter()) {
+        // Resolve + bounds-check the (non-differentiable) destination indices.
+        let mut idx_usize: Vec<usize> = Vec::with_capacity(indices_vals.len());
+        for &idx in &indices_vals {
             let i = idx as usize;
             if i >= numel {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
@@ -24369,6 +24370,46 @@ impl FrankenTorchSession {
                     },
                 )));
             }
+            idx_usize.push(i);
+        }
+
+        if self.tensor_requires_grad(input)? || self.tensor_requires_grad(values)? {
+            // put overwrites input[idx] = value at each (flat) index, so the
+            // gradient splits: grad flows to `input` everywhere except the
+            // overwritten slots (zeroed there), and to `values` from the slot each
+            // value was written to (grad_values[j] = grad_out[idx[j]] — matching
+            // torch's take(grad, index), so duplicate indices each receive the
+            // upstream gradient at that position). Forward is identical to the
+            // non-grad path → value bit-identical. frankentorch-avfl.
+            let idx_fwd = idx_usize.clone();
+            return self.tensor_apply_function(
+                &[input, values],
+                move |_ctx, inputs| {
+                    let (in_vals, in_shape) = inputs[0];
+                    let (val_vals, _) = inputs[1];
+                    let mut result = in_vals.to_vec();
+                    for (&i, &v) in idx_fwd.iter().zip(val_vals.iter()) {
+                        result[i] = v;
+                    }
+                    Ok((result, in_shape.to_vec()))
+                },
+                move |_ctx, grad_outputs| {
+                    let g = grad_outputs[0];
+                    let mut grad_input = g.to_vec();
+                    let mut grad_values = vec![0.0_f64; idx_usize.len()];
+                    for (j, &i) in idx_usize.iter().enumerate() {
+                        grad_values[j] = g[i];
+                    }
+                    for &i in &idx_usize {
+                        grad_input[i] = 0.0;
+                    }
+                    Ok(vec![Some(grad_input), Some(grad_values)])
+                },
+            );
+        }
+
+        let mut result = self.tensor_values(input)?;
+        for (&i, &val) in idx_usize.iter().zip(values_vals.iter()) {
             result[i] = val;
         }
 
@@ -43279,46 +43320,85 @@ impl FrankenTorchSession {
         // recurrence + asymptotic series), so evaluate large tensors across the
         // rayon pool. Pure per-element maps -> bit-for-bit identical to serial
         // (PARALLEL_ELEMENTWISE_MIN gate avoids thread overhead on small tensors).
-        let out = self.tensor_apply_function(
-            &[input],
-            |ctx, inputs| {
-                let (vals, shape) = inputs[0];
-                // Save x for the digamma backward.
-                ctx.save_for_backward(vals.to_vec(), shape.to_vec());
-                let values: Vec<f64> = if vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-                    vals.par_iter().map(|&x| lgamma_approx(x)).collect()
-                } else {
-                    vals.iter().map(|&x| lgamma_approx(x)).collect()
-                };
-                Ok((values, shape.to_vec()))
-            },
-            |ctx, grad_outputs| {
-                let grad_out = grad_outputs[0];
-                let saved = ctx.saved_tensors();
-                let x_vals = &saved[0];
-                if grad_out.len() != x_vals.len() {
-                    return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                        ft_dispatch::DispatchKeyError::IncompatibleSet {
-                            reason: "gammaln backward: incoming gradient length mismatch",
-                        },
-                    )));
+        let out = if !self.tensor_tape.tensor_requires_grad(input)?
+            || !self.tensor_tape.is_grad_enabled()
+        {
+            let (meta, values) = {
+                let tensor = self.tensor_tape.tensor(input)?;
+                let meta = tensor.meta().clone();
+                let vals = tensor.contiguous_values_as_f64()?;
+                (meta, par_map_f64(&vals, lgamma_approx))
+            };
+            let dtype = meta.dtype();
+            let output = match dtype {
+                DType::F64 => DenseTensor::from_storage(meta, values)?,
+                DType::F32 => DenseTensor::from_storage_f32(
+                    meta,
+                    values.into_iter().map(|value| value as f32).collect(),
+                )?,
+                DType::F16 => DenseTensor::from_storage_f16(
+                    meta,
+                    values
+                        .into_iter()
+                        .map(|value| Float16::from_f32(value as f32))
+                        .collect(),
+                )?,
+                DType::BF16 => DenseTensor::from_storage_bf16(
+                    meta,
+                    values
+                        .into_iter()
+                        .map(|value| BFloat16::from_f32(value as f32))
+                        .collect(),
+                )?,
+                other => {
+                    return Err(AutogradError::DenseTensor(
+                        ft_core::DenseTensorError::UnsupportedDType(other),
+                    ));
                 }
-                let grad_in: Vec<f64> = if x_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
-                    x_vals
-                        .par_iter()
-                        .zip(grad_out.par_iter())
-                        .map(|(&x, &go)| go * digamma_approx(x))
-                        .collect()
-                } else {
-                    x_vals
-                        .iter()
-                        .zip(grad_out.iter())
-                        .map(|(&x, &go)| go * digamma_approx(x))
-                        .collect()
-                };
-                Ok(vec![Some(grad_in)])
-            },
-        )?;
+            };
+            self.tensor_variable_from_storage(output, false)
+        } else {
+            self.tensor_apply_function(
+                &[input],
+                |ctx, inputs| {
+                    let (vals, shape) = inputs[0];
+                    // Save x for the digamma backward.
+                    ctx.save_for_backward(vals.to_vec(), shape.to_vec());
+                    let values: Vec<f64> = if vals.len() >= PARALLEL_ELEMENTWISE_MIN {
+                        vals.par_iter().map(|&x| lgamma_approx(x)).collect()
+                    } else {
+                        vals.iter().map(|&x| lgamma_approx(x)).collect()
+                    };
+                    Ok((values, shape.to_vec()))
+                },
+                |ctx, grad_outputs| {
+                    let grad_out = grad_outputs[0];
+                    let saved = ctx.saved_tensors();
+                    let x_vals = &saved[0];
+                    if grad_out.len() != x_vals.len() {
+                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "gammaln backward: incoming gradient length mismatch",
+                            },
+                        )));
+                    }
+                    let grad_in: Vec<f64> = if x_vals.len() >= PARALLEL_ELEMENTWISE_MIN {
+                        x_vals
+                            .par_iter()
+                            .zip(grad_out.par_iter())
+                            .map(|(&x, &go)| go * digamma_approx(x))
+                            .collect()
+                    } else {
+                        x_vals
+                            .iter()
+                            .zip(grad_out.iter())
+                            .map(|(&x, &go)| go * digamma_approx(x))
+                            .collect()
+                    };
+                    Ok(vec![Some(grad_in)])
+                },
+            )?
+        };
         self.runtime.ledger_mut().record(
             EvidenceKind::Dispatch,
             format!("gammaln in={} out={}", input.0, out.0),
@@ -84348,6 +84428,120 @@ mod tests {
     }
 
     #[test]
+    fn gammaln_no_grad_fast_path_golden_summary_matches_fixture() {
+        use std::fmt::Write as _;
+
+        fn digest_bits(values: &[f64]) -> u64 {
+            let mut digest = 0xcbf2_9ce4_8422_2325_u64;
+            for value in values {
+                digest ^= value.to_bits();
+                digest = digest.wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            digest
+        }
+
+        let n = super::PARALLEL_ELEMENTWISE_MIN + 17;
+        let data: Vec<f64> = (0..n)
+            .map(|idx| {
+                let lane = (idx % 997) as f64;
+                0.25 + lane.mul_add(0.017, (idx / 997) as f64 * 0.000_031)
+            })
+            .collect();
+
+        let mut fast = FrankenTorchSession::new(ExecutionMode::Strict);
+        let fast_input = fast.tensor_variable(data.clone(), vec![n], false).unwrap();
+        let fast_out = fast.tensor_gammaln(fast_input).unwrap();
+        let fast_values = fast.tensor_values(fast_out).unwrap();
+
+        let mut tracked = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tracked_input = tracked.tensor_variable(data.clone(), vec![n], true).unwrap();
+        let tracked_out = tracked.tensor_gammaln(tracked_input).unwrap();
+        let tracked_values = tracked.tensor_values(tracked_out).unwrap();
+
+        for (idx, ((&x, &fast_value), &tracked_value)) in data
+            .iter()
+            .zip(fast_values.iter())
+            .zip(tracked_values.iter())
+            .enumerate()
+        {
+            let serial = super::lgamma_approx(x);
+            assert_eq!(
+                serial.to_bits(),
+                fast_value.to_bits(),
+                "no-grad fast path diverged from serial lgamma at {idx}"
+            );
+            assert_eq!(
+                tracked_value.to_bits(),
+                fast_value.to_bits(),
+                "tracked and no-grad paths diverged at {idx}"
+            );
+        }
+
+        assert!(!fast.tensor_requires_grad(fast_out).unwrap());
+        assert!(tracked.tensor_requires_grad(tracked_out).unwrap());
+
+        let mut summary = String::new();
+        let fast_evidence = fast.evidence();
+        let tracked_evidence = tracked.evidence();
+        let _ = writeln!(&mut summary, "bead=frankentorch-kgs4.31");
+        let _ = writeln!(&mut summary, "op=tensor_gammaln_no_grad_fast_path");
+        let _ = writeln!(&mut summary, "n={n}");
+        let _ = writeln!(&mut summary, "shape={:?}", fast.tensor_shape(fast_out).unwrap());
+        let _ = writeln!(&mut summary, "dtype={:?}", fast.tensor_dtype(fast_out).unwrap());
+        let _ = writeln!(
+            &mut summary,
+            "fast_requires_grad={}",
+            fast.tensor_requires_grad(fast_out).unwrap()
+        );
+        let _ = writeln!(
+            &mut summary,
+            "tracked_requires_grad={}",
+            tracked.tensor_requires_grad(tracked_out).unwrap()
+        );
+        let _ = writeln!(&mut summary, "fast_digest=0x{:016x}", digest_bits(&fast_values));
+        let _ = writeln!(
+            &mut summary,
+            "tracked_digest=0x{:016x}",
+            digest_bits(&tracked_values)
+        );
+        let _ = writeln!(
+            &mut summary,
+            "fast_ledger_kind={:?}",
+            fast_evidence.last().unwrap().kind
+        );
+        let _ = writeln!(
+            &mut summary,
+            "fast_ledger_summary={}",
+            fast_evidence.last().unwrap().summary
+        );
+        let _ = writeln!(
+            &mut summary,
+            "tracked_ledger_kind={:?}",
+            tracked_evidence.last().unwrap().kind
+        );
+        let _ = writeln!(
+            &mut summary,
+            "tracked_ledger_summary={}",
+            tracked_evidence.last().unwrap().summary
+        );
+        for &idx in &[0usize, 1, 127, 8192, n - 1] {
+            let _ = writeln!(
+                &mut summary,
+                "sample[{idx}]=input_bits=0x{:016x} output_bits=0x{:016x}",
+                data[idx].to_bits(),
+                fast_values[idx].to_bits()
+            );
+        }
+
+        assert_eq!(
+            include_str!(
+                "../../../artifacts/optimization/golden_outputs/ft_api_lgamma_no_grad_fast_path_pass27.txt"
+            ),
+            summary
+        );
+    }
+
+    #[test]
     fn gammaln_known_values() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // lgamma(1) = 0, lgamma(2) = 0, lgamma(0.5) = ln(sqrt(pi))
@@ -91900,6 +92094,40 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         // Flat indices 0 and 3 should be replaced
         assert_eq!(vals, vec![10.0, 2.0, 3.0, 40.0]);
+    }
+
+    #[test]
+    fn put_backward_splits_to_input_and_values_and_value_parity() {
+        // input [1,2,3,4] (2x2), put values [10,40] at flat indices [0,3].
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let indices = vec![0.0, 3.0];
+        let values = vec![10.0, 40.0];
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Value parity.
+        let in_ng = s.tensor_variable(input.clone(), vec![2, 2], false).unwrap();
+        let idx_ng = s.tensor_variable(indices.clone(), vec![2], false).unwrap();
+        let val_ng = s.tensor_variable(values.clone(), vec![2], false).unwrap();
+        let o_ng = s.tensor_put(in_ng, idx_ng, val_ng).unwrap();
+        let v_ng = s.tensor_values(o_ng).unwrap();
+        let in_g = s.tensor_variable(input.clone(), vec![2, 2], true).unwrap();
+        let idx_g = s.tensor_variable(indices.clone(), vec![2], false).unwrap();
+        let val_g = s.tensor_variable(values.clone(), vec![2], true).unwrap();
+        let o_g = s.tensor_put(in_g, idx_g, val_g).unwrap();
+        let v_g = s.tensor_values(o_g).unwrap();
+        for (a, b) in v_ng.iter().zip(v_g.iter()) {
+            assert_eq!(a.to_bits(), b.to_bits(), "put grad/non-grad value mismatch");
+        }
+        // Weighted loss = sum(out * w), w = [5,6,7,8]. grad_out = w.
+        //   grad_input = w with put slots (0,3) zeroed = [0,6,7,0].
+        //   grad_values[j] = w[idx[j]] = [w[0], w[3]] = [5, 8].
+        let w = s.tensor_variable(vec![5.0, 6.0, 7.0, 8.0], vec![2, 2], false).unwrap();
+        let weighted = s.tensor_mul(o_g, w).unwrap();
+        let loss = s.tensor_sum(weighted).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let gin = s.tensor_gradient(&report, in_g).expect("put grad_input present");
+        let gval = s.tensor_gradient(&report, val_g).expect("put grad_values present");
+        assert_eq!(gin, vec![0.0, 6.0, 7.0, 0.0]);
+        assert_eq!(gval, vec![5.0, 8.0]);
     }
 
     #[test]
