@@ -4421,11 +4421,20 @@ impl MultiheadAttention {
         let q_proj = self.q_proj.forward(session, q_flat)?;
         let q = session.tensor_reshape(q_proj, vec![batch_size, seq_len_q, embed_dim])?;
 
-        let k_flat = session.tensor_reshape(key, vec![batch_size * seq_len_k, embed_dim])?;
+        let self_attention_input = query == key && key == value;
+        let k_flat = if self_attention_input {
+            q_flat
+        } else {
+            session.tensor_reshape(key, vec![batch_size * seq_len_k, embed_dim])?
+        };
         let k_proj = self.k_proj.forward(session, k_flat)?;
         let k = session.tensor_reshape(k_proj, vec![batch_size, seq_len_k, embed_dim])?;
 
-        let v_flat = session.tensor_reshape(value, vec![batch_size * seq_len_k, embed_dim])?;
+        let v_flat = if self_attention_input {
+            q_flat
+        } else {
+            session.tensor_reshape(value, vec![batch_size * seq_len_k, embed_dim])?
+        };
         let v_proj = self.v_proj.forward(session, v_flat)?;
         let v = session.tensor_reshape(v_proj, vec![batch_size, seq_len_k, embed_dim])?;
 
@@ -20994,6 +21003,45 @@ mod tests {
             output,
             include_str!(
                 "../../../artifacts/optimization/golden_outputs/ft_nn_mha_batched_heads_pass24.txt"
+            )
+        );
+    }
+
+    fn mha_self_flat_reuse_golden_summary() -> String {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mha = MultiheadAttention::new(&mut session, 4, 2).expect("mha");
+        let x = session
+            .tensor_variable(
+                vec![0.25, -0.5, 0.75, 1.0, -1.25, 1.5, -1.75, 2.0],
+                vec![1, 2, 4],
+                true,
+            )
+            .expect("variable");
+        let y = mha.forward(&mut session, x).expect("forward");
+        let (vals, meta) = session.tensor_values_meta(y).expect("values");
+        let loss = session.tensor_sum(y).expect("sum");
+        let loss_vals = session.tensor_values(loss).expect("loss values");
+        let report = session.tensor_backward(loss).expect("backward");
+        let x_grad = session.tensor_gradient(&report, x).expect("input gradient");
+        let mut output = format!(
+            "shape={:?}\nvalues={vals:.17?}\nloss={loss_vals:.17?}\nx_grad={x_grad:.17?}\n",
+            meta.shape()
+        );
+        for (idx, param) in mha.parameters().into_iter().enumerate() {
+            let grad = session
+                .tensor_gradient(&report, param)
+                .expect("parameter gradient");
+            output.push_str(&format!("param_grad_{idx}={grad:.17?}\n"));
+        }
+        output
+    }
+
+    #[test]
+    fn mha_self_flat_reuse_golden_output_matches_fixture() {
+        assert_eq!(
+            mha_self_flat_reuse_golden_summary(),
+            include_str!(
+                "../../../artifacts/optimization/golden_outputs/ft_nn_mha_self_flat_reuse_frankentorch-l3mm.txt"
             )
         );
     }
