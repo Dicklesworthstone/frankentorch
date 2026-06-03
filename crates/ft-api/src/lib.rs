@@ -10330,6 +10330,30 @@ impl FrankenTorchSession {
         self.tensor_where(zero_mask, ones, ratio)
     }
 
+    /// Spherical Bessel function of the first kind, order 0.
+    ///
+    /// Equivalent to `torch.special.spherical_bessel_j0(input)`:
+    ///   j0(x) = sin(x) / x,  with the removable singularity j0(0) = 1.
+    /// Composed from autograd-aware primitives, so the gradient
+    /// (j0'(x) = cos(x)/x − sin(x)/x², and j0'(0) = 0) flows automatically;
+    /// the x = 0 branch is the constant 1, matching torch's zero gradient there.
+    pub fn tensor_special_spherical_bessel_j0(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
+        let sin_x = self.tensor_sin(input)?;
+        // Safe denominator: x where x != 0, else 1 (the masked value is discarded
+        // by the final where, so it only needs to avoid a 0/0 NaN).
+        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let zero_mask = self.tensor_eq(input, zeros)?;
+        let ones = self.full(shape, 1.0, false)?;
+        let safe_denom = self.tensor_where(zero_mask, ones, input)?;
+        let ratio = self.tensor_div(sin_x, safe_denom)?;
+        // At x = 0 → 1.0; otherwise sin(x)/x.
+        self.tensor_where(zero_mask, ones, ratio)
+    }
+
     /// L2 hypotenuse.
     ///
     /// Equivalent to `torch.hypot(x, y)`. Element-wise. Uses the stable
@@ -71974,6 +71998,40 @@ mod tests {
         assert!((v[1] - 2.0 / std::f64::consts::PI).abs() < 1e-12);
         assert!(v[2].abs() < 1e-12);
         assert!(v[3].abs() < 1e-12);
+    }
+
+    #[test]
+    fn spherical_bessel_j0_values_and_gradient() {
+        // j0(x) = sin(x)/x, j0(0) = 1. Closed values: j0(π)=0, j0(π/2)=2/π.
+        let pi = std::f64::consts::PI;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![0.0, pi / 2.0, pi, 1.0], vec![4], false)
+            .unwrap();
+        let out = s.tensor_special_spherical_bessel_j0(x).unwrap();
+        let v = s.tensor_values(out).unwrap();
+        assert!((v[0] - 1.0).abs() < 1e-12, "j0(0) = {}", v[0]); // removable singularity
+        assert!((v[1] - 2.0 / pi).abs() < 1e-12, "j0(π/2) = {}", v[1]);
+        assert!(v[2].abs() < 1e-12, "j0(π) = {}", v[2]);
+        assert!((v[3] - 1.0_f64.sin()).abs() < 1e-12, "j0(1) = {}", v[3]);
+
+        // Gradient j0'(x) = cos(x)/x − sin(x)/x²; FD-verify (and j0'(0)=0).
+        let xg = s.tensor_variable(vec![0.0, 1.3, 2.7], vec![3], true).unwrap();
+        let og = s.tensor_special_spherical_bessel_j0(xg).unwrap();
+        let loss = s.tensor_sum(og).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, xg).expect("j0 grad present");
+        assert!(grad[0].abs() < 1e-12, "j0'(0) should be 0, got {}", grad[0]);
+        let eps = 1e-6;
+        for (i, &xv) in [0.0_f64, 1.3, 2.7].iter().enumerate() {
+            let j0 = |t: f64| if t == 0.0 { 1.0 } else { t.sin() / t };
+            let fd = (j0(xv + eps) - j0(xv - eps)) / (2.0 * eps);
+            assert!(
+                (grad[i] - fd).abs() <= 1e-5 * (1.0 + fd.abs()),
+                "j0 grad[{i}] at x={xv} = {}, fd = {fd}",
+                grad[i]
+            );
+        }
     }
 
     #[test]
