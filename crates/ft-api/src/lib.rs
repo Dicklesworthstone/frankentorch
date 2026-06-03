@@ -8915,7 +8915,6 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let lp_vals = self.tensor_values(log_probs)?;
         let tgt_vals = self.tensor_values(targets)?;
         let in_lens = self.tensor_values(input_lengths)?;
         let tgt_lens = self.tensor_values(target_lengths)?;
@@ -8926,65 +8925,175 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let mut losses = Vec::with_capacity(batch_size);
-        let mut tgt_offset = 0usize;
-        for b in 0..batch_size {
-            let in_len = in_lens[b] as usize;
-            let tgt_len = tgt_lens[b] as usize;
-            if in_len > t_len {
-                return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
-                    ft_dispatch::DispatchKeyError::IncompatibleSet {
-                        reason: "ctc_loss: input length exceeds time dimension",
-                    },
-                )));
-            }
-            let target_seq: Vec<usize> = tgt_vals[tgt_offset..tgt_offset + tgt_len]
-                .iter()
-                .map(|&x| x as usize)
-                .collect();
-            tgt_offset += tgt_len;
-            // CTC forward pass with alpha probabilities
-            // State space: 2*L + 1 where L is target length (interleaved with blanks)
-            let state_len = 2 * tgt_len + 1;
-            let neg_inf = f64::NEG_INFINITY;
-            let mut alpha = vec![vec![neg_inf; state_len]; in_len + 1];
-            alpha[0][0] = 0.0; // Start at blank
-            if state_len > 1 {
-                alpha[0][1] = 0.0; // Or first label
-            }
-            let get_label =
-                |s: usize| -> usize { if s % 2 == 0 { blank } else { target_seq[s / 2] } };
-            for t in 0..in_len {
-                let lp_offset = (t * batch_size + b) * num_classes;
-                for s in 0..state_len {
-                    let label = get_label(s);
-                    let lp = lp_vals[lp_offset + label];
-                    let mut score = alpha[t][s];
-                    if s > 0 {
-                        score = log_sum_exp(score, alpha[t][s - 1]);
+        // Route through apply_function so the gradient reaches `log_probs`
+        // (targets and the length arrays are integer/non-differentiable). The
+        // CTC gradient w.r.t. log_probs is the negative occupation density
+        // d(-logZ)/d log_probs[t][k] = -gamma_t(k), where gamma is the sum over
+        // CTC states s with label(s)=k of the forward-backward occupation
+        // alpha_t(s)*beta_t(s)/Z. We recompute alpha (matching the forward) and
+        // beta (the time-reversed recursion) in the backward pass.
+        let tgt_vals_bwd = tgt_vals.clone();
+        let in_lens_bwd = in_lens.clone();
+        let tgt_lens_bwd = tgt_lens.clone();
+        let loss = self.tensor_apply_function(
+            &[log_probs],
+            move |ctx, inputs| {
+                let (lp_vals, _shape) = inputs[0];
+                let mut losses = Vec::with_capacity(batch_size);
+                let mut tgt_offset = 0usize;
+                for b in 0..batch_size {
+                    let in_len = in_lens[b] as usize;
+                    let tgt_len = tgt_lens[b] as usize;
+                    if in_len > t_len {
+                        return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                            ft_dispatch::DispatchKeyError::IncompatibleSet {
+                                reason: "ctc_loss: input length exceeds time dimension",
+                            },
+                        )));
                     }
-                    if s > 1 && get_label(s) != get_label(s - 2) {
-                        score = log_sum_exp(score, alpha[t][s - 2]);
+                    let target_seq: Vec<usize> = tgt_vals[tgt_offset..tgt_offset + tgt_len]
+                        .iter()
+                        .map(|&x| x as usize)
+                        .collect();
+                    tgt_offset += tgt_len;
+                    // CTC forward pass with alpha probabilities
+                    // State space: 2*L + 1 where L is target length (interleaved with blanks)
+                    let state_len = 2 * tgt_len + 1;
+                    let neg_inf = f64::NEG_INFINITY;
+                    let mut alpha = vec![vec![neg_inf; state_len]; in_len + 1];
+                    alpha[0][0] = 0.0; // Start at blank
+                    if state_len > 1 {
+                        alpha[0][1] = 0.0; // Or first label
                     }
-                    alpha[t + 1][s] = score + lp;
+                    let get_label =
+                        |s: usize| -> usize { if s % 2 == 0 { blank } else { target_seq[s / 2] } };
+                    for t in 0..in_len {
+                        let lp_offset = (t * batch_size + b) * num_classes;
+                        for s in 0..state_len {
+                            let label = get_label(s);
+                            let lp = lp_vals[lp_offset + label];
+                            let mut score = alpha[t][s];
+                            if s > 0 {
+                                score = log_sum_exp(score, alpha[t][s - 1]);
+                            }
+                            if s > 1 && get_label(s) != get_label(s - 2) {
+                                score = log_sum_exp(score, alpha[t][s - 2]);
+                            }
+                            alpha[t + 1][s] = score + lp;
+                        }
+                    }
+                    let final_score = if state_len > 1 {
+                        log_sum_exp(alpha[in_len][state_len - 1], alpha[in_len][state_len - 2])
+                    } else if state_len == 1 {
+                        alpha[in_len][0]
+                    } else {
+                        0.0
+                    };
+                    let loss = -final_score;
+                    let loss = if zero_infinity && !loss.is_finite() {
+                        0.0
+                    } else {
+                        loss
+                    };
+                    losses.push(loss);
                 }
-            }
-            let final_score = if state_len > 1 {
-                log_sum_exp(alpha[in_len][state_len - 1], alpha[in_len][state_len - 2])
-            } else if state_len == 1 {
-                alpha[in_len][0]
-            } else {
-                0.0
-            };
-            let loss = -final_score;
-            let loss = if zero_infinity && !loss.is_finite() {
-                0.0
-            } else {
-                loss
-            };
-            losses.push(loss);
-        }
-        let loss = self.tensor_variable(losses, vec![batch_size], false)?;
+                ctx.save_for_backward(lp_vals.to_vec(), vec![t_len, batch_size, num_classes]);
+                Ok((losses, vec![batch_size]))
+            },
+            move |ctx, grad_outputs| {
+                let g = grad_outputs[0];
+                let saved = ctx.saved_tensors();
+                let lp_vals = &saved[0];
+                let neg_inf = f64::NEG_INFINITY;
+                let mut grad = vec![0.0f64; t_len * batch_size * num_classes];
+                let mut tgt_offset = 0usize;
+                for b in 0..batch_size {
+                    let in_len = in_lens_bwd[b] as usize;
+                    let tgt_len = tgt_lens_bwd[b] as usize;
+                    let target_seq: Vec<usize> = tgt_vals_bwd[tgt_offset..tgt_offset + tgt_len]
+                        .iter()
+                        .map(|&x| x as usize)
+                        .collect();
+                    tgt_offset += tgt_len;
+                    let gb = g[b];
+                    if in_len == 0 || gb == 0.0 {
+                        continue;
+                    }
+                    let state_len = 2 * tgt_len + 1;
+                    let get_label =
+                        |s: usize| -> usize { if s % 2 == 0 { blank } else { target_seq[s / 2] } };
+                    // Forward variable alpha (A_t(s) = alpha[t+1][s]).
+                    let mut alpha = vec![vec![neg_inf; state_len]; in_len + 1];
+                    alpha[0][0] = 0.0;
+                    if state_len > 1 {
+                        alpha[0][1] = 0.0;
+                    }
+                    for t in 0..in_len {
+                        let lp_offset = (t * batch_size + b) * num_classes;
+                        for s in 0..state_len {
+                            let lp = lp_vals[lp_offset + get_label(s)];
+                            let mut score = alpha[t][s];
+                            if s > 0 {
+                                score = log_sum_exp(score, alpha[t][s - 1]);
+                            }
+                            if s > 1 && get_label(s) != get_label(s - 2) {
+                                score = log_sum_exp(score, alpha[t][s - 2]);
+                            }
+                            alpha[t + 1][s] = score + lp;
+                        }
+                    }
+                    let logz = if state_len > 1 {
+                        log_sum_exp(alpha[in_len][state_len - 1], alpha[in_len][state_len - 2])
+                    } else {
+                        alpha[in_len][0]
+                    };
+                    if !logz.is_finite() {
+                        // Infeasible alignment / zeroed infinity -> no gradient.
+                        continue;
+                    }
+                    // Backward variable beta (B_t(s), emission at t included).
+                    let mut beta = vec![vec![neg_inf; state_len]; in_len];
+                    let last_off = ((in_len - 1) * batch_size + b) * num_classes;
+                    beta[in_len - 1][state_len - 1] =
+                        lp_vals[last_off + get_label(state_len - 1)];
+                    if state_len > 1 {
+                        beta[in_len - 1][state_len - 2] =
+                            lp_vals[last_off + get_label(state_len - 2)];
+                    }
+                    for t in (0..in_len.saturating_sub(1)).rev() {
+                        let lp_offset = (t * batch_size + b) * num_classes;
+                        for s in 0..state_len {
+                            let mut acc = beta[t + 1][s];
+                            if s + 1 < state_len {
+                                acc = log_sum_exp(acc, beta[t + 1][s + 1]);
+                            }
+                            if s + 2 < state_len && get_label(s + 2) != get_label(s) {
+                                acc = log_sum_exp(acc, beta[t + 1][s + 2]);
+                            }
+                            if acc > neg_inf {
+                                beta[t][s] = lp_vals[lp_offset + get_label(s)] + acc;
+                            }
+                        }
+                    }
+                    // grad log_probs[t][k] = gb * (-gamma_t(k)),
+                    // gamma_t(s) = exp(alpha_t(s) + beta_t(s) - y_t(label(s)) - logZ).
+                    for t in 0..in_len {
+                        let lp_offset = (t * batch_size + b) * num_classes;
+                        for s in 0..state_len {
+                            let a = alpha[t + 1][s];
+                            let bta = beta[t][s];
+                            if a == neg_inf || bta == neg_inf {
+                                continue;
+                            }
+                            let k = get_label(s);
+                            let occ = (a + bta - lp_vals[lp_offset + k] - logz).exp();
+                            grad[lp_offset + k] -= gb * occ;
+                        }
+                    }
+                }
+                Ok(vec![Some(grad)])
+            },
+        )?;
         match reduction {
             "none" => Ok(loss),
             "mean" => self.tensor_mean(loss),
@@ -78155,6 +78264,69 @@ mod tests {
             .tensor_gradient(&report, input)
             .expect("tensor_multilabel_soft_margin_loss must propagate gradient through input");
         assert_eq!(grad, &vec![-0.25, 0.25]);
+    }
+
+    #[test]
+    fn tensor_ctc_loss_propagates_gradient_to_log_probs() {
+        // Regression: tensor_ctc_loss rebuilt a requires_grad=false leaf,
+        // severing the gradient to log_probs (CTC could not train). Now uses the
+        // forward-backward (alpha/beta) occupation: grad = -gamma_t(k).
+        // T=4, N=1, C=3, blank=0, target=[1,2].
+        let lp = vec![
+            -1.2, -0.5, -2.0, // t0
+            -0.7, -1.0, -1.5, // t1
+            -2.1, -0.3, -1.1, // t2
+            -0.9, -1.3, -0.8, // t3
+        ];
+        let (t_len, n, c) = (4usize, 1usize, 3usize);
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let log_probs = s.tensor_variable(lp.clone(), vec![t_len, n, c], true).unwrap();
+        let targets = s.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+        let in_lens = s.tensor_variable(vec![4.0], vec![1], false).unwrap();
+        let tgt_lens = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        let loss = s
+            .tensor_ctc_loss(log_probs, targets, in_lens, tgt_lens, 0, "sum", false)
+            .unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s
+            .tensor_gradient(&report, log_probs)
+            .expect("tensor_ctc_loss must propagate gradient to log_probs")
+            .to_vec();
+
+        // Occupation invariant: for each time step the per-class gamma sums to 1,
+        // so the gradient over classes sums to -1 (reduction="sum", grad_out=1).
+        for t in 0..t_len {
+            let row_sum: f64 = (0..c).map(|k| grad[t * c + k]).sum();
+            assert!(
+                (row_sum + 1.0).abs() < 1e-9,
+                "ctc grad row {t} sums to {row_sum}, expected -1"
+            );
+        }
+
+        // Finite-difference check of every entry against the analytic gradient.
+        let loss_at = |vals: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let lpn = s2.tensor_variable(vals.to_vec(), vec![t_len, n, c], false).unwrap();
+            let tg = s2.tensor_variable(vec![1.0, 2.0], vec![2], false).unwrap();
+            let il = s2.tensor_variable(vec![4.0], vec![1], false).unwrap();
+            let tl = s2.tensor_variable(vec![2.0], vec![1], false).unwrap();
+            let l = s2.tensor_ctc_loss(lpn, tg, il, tl, 0, "sum", false).unwrap();
+            s2.tensor_values(l).unwrap()[0]
+        };
+        let eps = 1e-6;
+        for i in 0..lp.len() {
+            let mut up = lp.clone();
+            up[i] += eps;
+            let mut dn = lp.clone();
+            dn[i] -= eps;
+            let fd = (loss_at(&up) - loss_at(&dn)) / (2.0 * eps);
+            assert!(
+                (fd - grad[i]).abs() < 1e-4,
+                "ctc grad[{i}] = {} but FD = {fd}",
+                grad[i]
+            );
+        }
     }
 
     #[test]
