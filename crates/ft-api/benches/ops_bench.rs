@@ -230,6 +230,22 @@ fn bench_fft2(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_irfft2(c: &mut Criterion) {
+    let mut group = c.benchmark_group("irfft2");
+    // Inverse 2-D real FFT from a complex half-spectrum [batch, rows, cols/2+1]
+    // -> real [batch, rows, cols]. Same row+col compute-bound passes.
+    let (batch, rows, in_cols) = (32usize, 128usize, 65usize); // out_cols = 128
+    group.throughput(Throughput::Elements((batch * rows * (in_cols - 1) * 2) as u64));
+    group.bench_function("32x128x128", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let re = session.tensor_randn(vec![batch, rows, in_cols], false).unwrap();
+        let im = session.tensor_randn(vec![batch, rows, in_cols], false).unwrap();
+        let cplx = session.tensor_complex(re, im).unwrap();
+        b.iter(|| black_box(session.tensor_irfft2(black_box(cplx), None).unwrap()));
+    });
+    group.finish();
+}
+
 fn bench_rfft2(c: &mut Criterion) {
     let mut group = c.benchmark_group("rfft2");
     // Batched 2-D real FFT: same row+col compute-bound passes as fft2.
@@ -341,6 +357,7 @@ criterion_group!(
     bench_interpolate_trilinear,
     bench_grid_sample,
     bench_fft2,
+    bench_irfft2,
     bench_rfft2,
     bench_fft_1d,
     bench_fftn,
