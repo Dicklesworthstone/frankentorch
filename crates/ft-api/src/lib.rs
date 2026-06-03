@@ -8321,6 +8321,51 @@ impl FrankenTorchSession {
         self.tensor_nll_loss(log_probs, target, reduction)
     }
 
+    /// Cross-entropy with label smoothing, matching
+    /// `torch.nn.functional.cross_entropy(input, target, label_smoothing=ε,
+    /// reduction=reduction)` for class-index targets.
+    ///
+    /// With log-probabilities `log_p = log_softmax(input)`:
+    ///   loss_i = (1−ε)·nll_loss(log_p, target)_i + ε·(−mean_c log_p[i, c])
+    /// then reduced. ε=0 reduces to plain cross-entropy.
+    pub fn tensor_cross_entropy_label_smoothing(
+        &mut self,
+        input: TensorNodeId,
+        target: TensorNodeId,
+        label_smoothing: f64,
+        reduction: &str,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if !(0.0..=1.0).contains(&label_smoothing) {
+            return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cross_entropy: label_smoothing must be in [0, 1]",
+                },
+            )));
+        }
+        if label_smoothing == 0.0 {
+            return self.tensor_cross_entropy(input, target, reduction);
+        }
+        let log_probs = self.tensor_log_softmax(input, 1)?;
+        // Per-sample negative log-likelihood at the target class.
+        let nll = self.tensor_nll_loss(log_probs, target, "none")?;
+        // Per-sample smoothing term: −mean over the class dimension of log_p.
+        let mean_lp = self.tensor_mean_dim(log_probs, 1)?;
+        let smooth = self.tensor_neg(mean_lp)?;
+        let nll_w = self.tensor_mul_scalar(nll, 1.0 - label_smoothing)?;
+        let smooth_w = self.tensor_mul_scalar(smooth, label_smoothing)?;
+        let loss = self.tensor_add(nll_w, smooth_w)?;
+        match reduction {
+            "none" => Ok(loss),
+            "mean" => self.tensor_mean(loss),
+            "sum" => self.tensor_sum(loss),
+            _ => Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet {
+                    reason: "cross_entropy: reduction must be 'none', 'mean', or 'sum'",
+                },
+            ))),
+        }
+    }
+
     /// Kullback-Leibler divergence loss.
     ///
     /// Equivalent to `torch.nn.functional.kl_div(input, target, reduction, log_target)`.
@@ -67829,6 +67874,42 @@ mod tests {
             (val - 3.0_f64.ln()).abs() < 0.01,
             "full smoothing = uniform loss = log(3), got {val}"
         );
+    }
+
+    #[test]
+    fn cross_entropy_label_smoothing_reduction_aware_matches_torch() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // input [[1,2,3]], target [2], ε=0.1. log_softmax = [-2.407606,
+        // -1.407606, -0.407606]; nll = 0.407606; smooth = -mean = 1.407606;
+        // loss = 0.9·0.407606 + 0.1·1.407606 = 0.507606. (matches torch CE)
+        let logits = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false).unwrap();
+        let t = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        let mean = s.tensor_cross_entropy_label_smoothing(logits, t, 0.1, "mean").unwrap();
+        assert!((s.tensor_values(mean).unwrap()[0] - 0.507606).abs() < 1e-5);
+
+        // ε=0 matches plain cross_entropy.
+        let l0 = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false).unwrap();
+        let t0 = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        let s0 = s.tensor_cross_entropy_label_smoothing(l0, t0, 0.0, "mean").unwrap();
+        let p0 = s.tensor_cross_entropy(l0, t0, "mean").unwrap();
+        assert!((s.tensor_values(s0).unwrap()[0] - s.tensor_values(p0).unwrap()[0]).abs() < 1e-12);
+
+        // none/sum reductions over a 2-sample batch.
+        let lb = s.tensor_variable(vec![1.0, 2.0, 3.0, 0.0, 1.0, 0.0], vec![2, 3], false).unwrap();
+        let tb = s.tensor_variable(vec![2.0, 0.0], vec![2], false).unwrap();
+        let none = s.tensor_cross_entropy_label_smoothing(lb, tb, 0.1, "none").unwrap();
+        let nv = s.tensor_values(none).unwrap();
+        assert_eq!(nv.len(), 2);
+        let sum = s.tensor_cross_entropy_label_smoothing(lb, tb, 0.1, "sum").unwrap();
+        let sv = s.tensor_values(sum).unwrap()[0];
+        assert!((sv - (nv[0] + nv[1])).abs() < 1e-12, "sum != Σ none");
+        // Gradient flows to logits.
+        let lg = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], true).unwrap();
+        let tg = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+        let lossg = s.tensor_cross_entropy_label_smoothing(lg, tg, 0.1, "mean").unwrap();
+        let report = s.tensor_backward(lossg).unwrap();
+        let grad = s.tensor_gradient(&report, lg).expect("CE label-smoothing grad present");
+        assert!(grad.iter().any(|g| g.abs() > 1e-9), "CE label-smoothing grad all-zero");
     }
 
     // ---- kernel where tests ----
