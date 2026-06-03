@@ -4064,6 +4064,15 @@ fn nan_greatest_cmp_f64(a: f64, b: f64) -> std::cmp::Ordering {
     }
 }
 
+fn topk_lane_cmp_f64(a: &(usize, f64), b: &(usize, f64), largest: bool) -> std::cmp::Ordering {
+    let value_order = if largest {
+        nan_greatest_cmp_f64(b.1, a.1)
+    } else {
+        nan_greatest_cmp_f64(a.1, b.1)
+    };
+    value_order.then_with(|| a.0.cmp(&b.0))
+}
+
 /// F32 companion to [`nan_greatest_cmp_f64`].
 fn nan_greatest_cmp_f32(a: f32, b: f32) -> std::cmp::Ordering {
     match (a.is_nan(), b.is_nan()) {
@@ -4186,8 +4195,8 @@ pub fn topk_tensor_contiguous_f64(
     // Each `outer` owns a contiguous input block (dim_size*inner_size) and a
     // contiguous output block (k*inner_size); both yield outer_size chunks, so
     // the par_chunks zip aligns by outer. Every lane selects independently with
-    // the same stable sort + fixed comparator, so values AND indices are
-    // bit-for-bit identical to the serial version (sorting is compute-bound).
+    // a total value+original-index order equivalent to the serial stable sort,
+    // so values AND indices are bit-for-bit identical.
     let in_block = dim_size * inner_size;
     let out_block = k * inner_size;
     let in_total = outer_size * in_block;
@@ -4201,19 +4210,28 @@ pub fn topk_tensor_contiguous_f64(
                     .map(|d| (d, in_block_data[d * inner_size + inner]))
                     .collect();
 
-                if largest {
-                    lane.sort_by(|a, b| nan_greatest_cmp_f64(b.1, a.1));
-                } else {
-                    lane.sort_by(|a, b| nan_greatest_cmp_f64(a.1, b.1));
+                if k < dim_size {
+                    let (selected, _, _) =
+                        lane.select_nth_unstable_by(k, |a, b| topk_lane_cmp_f64(a, b, largest));
+                    if sorted {
+                        selected.sort_by(|a, b| topk_lane_cmp_f64(a, b, largest));
+                    } else {
+                        selected.sort_by_key(|(orig_idx, _)| *orig_idx);
+                    }
+                    for (out_d, (orig_d, val)) in selected.iter().copied().enumerate() {
+                        ov_block[out_d * inner_size + inner] = val;
+                        oi_block[out_d * inner_size + inner] = orig_d;
+                    }
+                    continue;
                 }
 
-                let mut selected: Vec<(usize, f64)> = lane[..k].to_vec();
+                lane.sort_by(|a, b| topk_lane_cmp_f64(a, b, largest));
+                let selected = &mut lane[..k];
                 if !sorted {
-                    // Return in original index order (stable).
                     selected.sort_by_key(|(orig_idx, _)| *orig_idx);
                 }
 
-                for (out_d, (orig_d, val)) in selected.into_iter().enumerate() {
+                for (out_d, (orig_d, val)) in selected.iter().copied().enumerate() {
                     ov_block[out_d * inner_size + inner] = val;
                     oi_block[out_d * inner_size + inner] = orig_d;
                 }
@@ -12504,10 +12522,10 @@ mod tests {
 
     #[test]
     fn topk_parallel_matches_serial_bit_exact() {
-        // Isomorphism proof for parallelizing topk-along-dim over lanes: the
-        // parallel kernel must reproduce the serial per-lane select BIT-FOR-BIT —
-        // identical values AND original indices, in both sorted modes. Strided +
-        // last-dim shapes; duplicates exercise the stable tie-break.
+        // Isomorphism proof for topk-along-dim over lanes: the optimized kernel
+        // must reproduce the old serial full-sort select BIT-FOR-BIT — identical
+        // values AND original indices, in both sorted modes. Duplicates, signed
+        // zeros, and NaN payloads exercise stable tie-breaking.
         for (shape, dim, k, largest, srt) in [
             (vec![11usize, 24usize, 3usize], 1usize, 5usize, true, true),
             (vec![11usize, 24usize, 3usize], 1usize, 5usize, true, false),
@@ -12517,7 +12535,19 @@ mod tests {
             let inner: usize = shape[dim + 1..].iter().product();
             let outer: usize = shape[..dim].iter().product();
             let numel: usize = shape.iter().product();
-            let data: Vec<f64> = (0..numel).map(|i| ((i * 53 + 7) % 17) as f64 * 0.25).collect();
+            let mut data: Vec<f64> = (0..numel)
+                .map(|i| ((i * 53 + 7) % 17) as f64 * 0.25)
+                .collect();
+            for i in (0..numel).step_by(37) {
+                let payload = u64::try_from(i & 0xff).expect("masked payload fits u64");
+                data[i] = f64::from_bits(0x7ff8_0000_0000_0000 | payload);
+            }
+            for i in (11..numel).step_by(41) {
+                data[i] = -0.0;
+            }
+            for i in (17..numel).step_by(43) {
+                data[i] = 0.0;
+            }
 
             let mut v_ref = vec![0.0_f64; outer * k * inner];
             let mut i_ref = vec![0usize; outer * k * inner];
@@ -12546,7 +12576,10 @@ mod tests {
             let meta = TensorMeta::from_shape(shape.clone(), DType::F64, Device::Cpu);
             let (v, i) = super::topk_tensor_contiguous_f64(&data, &meta, k, dim, largest, srt)
                 .expect("topk");
-            assert_eq!(i, i_ref, "topk indices diverged {shape:?} k={k} sorted={srt}");
+            assert_eq!(
+                i, i_ref,
+                "topk indices diverged {shape:?} k={k} sorted={srt}"
+            );
             for t in 0..v.len() {
                 assert_eq!(
                     v[t].to_bits(),
