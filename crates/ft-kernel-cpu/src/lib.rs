@@ -4214,6 +4214,20 @@ fn sort_radix_key_f64(x: f64) -> u64 {
     }
 }
 
+/// f32 analogue of [`sort_radix_key_f64`]: order-preserving map f32 -> u32 with
+/// `-0.0` canonicalised to `+0.0`. Widened to u64 for [`sort_radix_perm`] with
+/// the high 32 bits zero, so the four high byte-passes are single-bucket and
+/// auto-skipped — the radix runs in just 4 effective passes for f32.
+#[inline]
+fn sort_radix_key_f32(x: f32) -> u32 {
+    let bits = if x == 0.0 { 0 } else { x.to_bits() };
+    if bits >> 31 == 1 {
+        !bits
+    } else {
+        bits | (1u32 << 31)
+    }
+}
+
 /// Stable LSD radix sort: fills `perm` with the ascending-by-`keys` permutation
 /// of `0..keys.len()`, ties preserving original index order (matching the stable
 /// comparison sort bit-for-bit). `scratch` is reused as the ping-pong buffer.
@@ -8818,14 +8832,47 @@ pub fn sort_tensor_contiguous_f32(
     let mut sorted_values = vec![0.0f32; numel];
     let mut indices = vec![0usize; numel];
     // F32 mirror: parallelize over independent per-outer blocks; bit-identical
-    // to the serial version (stable sort, fixed comparator). See the f64 path.
+    // to the serial version. Long (>= SORT_RADIX_MIN_LEN) NaN-free lanes take the
+    // O(n) stable LSD radix path (4 effective passes for the 32-bit key); shorter
+    // or NaN-bearing lanes fall back to the comparison sort, which alone
+    // reproduces PyTorch's "NaN is greatest" placement. See the f64 path.
     let block = dim_size * inner_size;
+    let use_radix = dim_size >= SORT_RADIX_MIN_LEN && dim_size <= u32::MAX as usize;
     sorted_values
         .par_chunks_mut(block)
         .zip(indices.par_chunks_mut(block))
         .zip(data[..numel].par_chunks(block))
         .for_each(|((sv_block, idx_block), in_block)| {
+            let mut keys: Vec<u64> = Vec::new();
+            let mut perm: Vec<u32> = Vec::new();
+            let mut scratch: Vec<u32> = Vec::new();
             for inner in 0..inner_size {
+                let mut radix_ok = use_radix;
+                if radix_ok {
+                    keys.clear();
+                    for d in 0..dim_size {
+                        let x = in_block[d * inner_size + inner];
+                        if x.is_nan() {
+                            radix_ok = false;
+                            break;
+                        }
+                        let k = sort_radix_key_f32(x);
+                        // High 32 bits stay zero -> the four top passes auto-skip.
+                        keys.push(u64::from(if descending { !k } else { k }));
+                    }
+                }
+
+                if radix_ok {
+                    sort_radix_perm(&keys, &mut perm, &mut scratch);
+                    for (out_d, &p) in perm.iter().enumerate() {
+                        let orig_d = p as usize;
+                        sv_block[out_d * inner_size + inner] =
+                            in_block[orig_d * inner_size + inner];
+                        idx_block[out_d * inner_size + inner] = orig_d;
+                    }
+                    continue;
+                }
+
                 let mut lane: Vec<(usize, f32)> = (0..dim_size)
                     .map(|d| (d, in_block[d * inner_size + inner]))
                     .collect();
@@ -13406,6 +13453,53 @@ mod tests {
                         sv[k].to_bits(),
                         val.to_bits(),
                         "radix value diverged at row {r} pos {out_d} (desc={desc})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn sort_f32_radix_path_matches_comparison_bit_exact() {
+        // f32 radix path (4 effective passes via the high-zero u64 key). Same
+        // obligations as f64: a 512-long lane with duplicates, negatives, and
+        // both signed zeros must match the stable comparison sort bit-for-bit
+        // (values via to_bits AND original indices) in both directions.
+        let (rows, cols) = (6usize, 512usize);
+        assert!(cols >= super::SORT_RADIX_MIN_LEN, "lane must hit radix path");
+        let numel = rows * cols;
+        let data: Vec<f32> = (0..numel)
+            .map(|i| match i % 7 {
+                0 => 0.0f32,
+                1 => -0.0f32,
+                2 => -((i % 23) as f32) * 0.25,
+                _ => ((i * 2654435761usize) % 211) as f32 * 0.125,
+            })
+            .collect();
+        let meta = TensorMeta::from_shape(vec![rows, cols], DType::F32, Device::Cpu);
+
+        for desc in [false, true] {
+            let (sv, idx) = super::sort_tensor_contiguous_f32(&data, &meta, 1, desc)
+                .expect("f32 radix sort should succeed");
+            for r in 0..rows {
+                let base = r * cols;
+                let mut lane: Vec<(usize, f32)> =
+                    (0..cols).map(|d| (d, data[base + d])).collect();
+                if desc {
+                    lane.sort_by(|a, b| super::nan_greatest_cmp_f32(b.1, a.1));
+                } else {
+                    lane.sort_by(|a, b| super::nan_greatest_cmp_f32(a.1, b.1));
+                }
+                for (out_d, (orig_d, val)) in lane.into_iter().enumerate() {
+                    let k = base + out_d;
+                    assert_eq!(
+                        idx[k], orig_d,
+                        "f32 radix index diverged at row {r} pos {out_d} (desc={desc})"
+                    );
+                    assert_eq!(
+                        sv[k].to_bits(),
+                        val.to_bits(),
+                        "f32 radix value diverged at row {r} pos {out_d} (desc={desc})"
                     );
                 }
             }

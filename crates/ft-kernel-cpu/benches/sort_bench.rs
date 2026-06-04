@@ -4,7 +4,7 @@
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
-use ft_kernel_cpu::sort_tensor_contiguous_f64;
+use ft_kernel_cpu::{sort_tensor_contiguous_f32, sort_tensor_contiguous_f64};
 
 fn bench_sort(c: &mut Criterion) {
     let (rows, cols) = (8192usize, 1024usize);
@@ -22,5 +22,23 @@ fn bench_sort(c: &mut Criterion) {
     });
 }
 
-criterion_group!(benches, bench_sort);
+fn bench_sort_f32(c: &mut Criterion) {
+    // f32 key is 4 bytes -> the LSD radix runs 4 effective passes (vs ~10
+    // comparisons), a far better crossover than f64's 8-byte key.
+    let (rows, cols) = (8192usize, 1024usize);
+    let data: Vec<f32> = (0..rows * cols)
+        .map(|i| ((i * 2654435761usize) % 100003) as f32 * 0.001)
+        .collect();
+    let meta = TensorMeta::from_shape(vec![rows, cols], DType::F32, Device::Cpu);
+    c.bench_function("sort_f32_8192x1024_dim1", |b| {
+        b.iter(|| {
+            black_box(
+                sort_tensor_contiguous_f32(black_box(&data), &meta, 1, false)
+                    .expect("valid sort input"),
+            )
+        })
+    });
+}
+
+criterion_group!(benches, bench_sort, bench_sort_f32);
 criterion_main!(benches);
