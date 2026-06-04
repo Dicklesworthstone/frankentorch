@@ -342,6 +342,19 @@ impl FrankenTorchSession {
         *self.grad_enabled_stack.last().unwrap_or(&true)
     }
 
+    /// Number of nodes currently retained in the autograd tensor tape.
+    ///
+    /// The tape is an append-only arena: every op (including under `no_grad`)
+    /// pushes a node that owns its output tensor, and there is currently no
+    /// node-free/clear path (see bead frankentorch-v2os). This monotonically
+    /// increasing count is therefore a direct proxy for tape memory — expose it
+    /// so long-running training/inference loops can monitor growth and recreate
+    /// the session before it leaks unbounded, until a safe clear/truncate lands.
+    #[must_use]
+    pub fn autograd_graph_node_count(&self) -> usize {
+        self.tensor_tape.node_count()
+    }
+
     /// Enter a no_grad context: disable gradient tracking for subsequent operations.
     pub fn no_grad_enter(&mut self) {
         self.grad_enabled_stack.push(false);
@@ -71823,6 +71836,28 @@ mod tests {
         assert!(!session.is_grad_enabled());
         session.no_grad_exit();
         assert!(session.is_grad_enabled());
+    }
+
+    #[test]
+    fn autograd_graph_node_count_tracks_tape_growth_even_under_no_grad() {
+        // Observability for the unbounded-tape leak (bead frankentorch-v2os):
+        // the count must strictly increase as ops run, INCLUDING under no_grad,
+        // since every op still appends a node that owns its output tensor.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false).unwrap();
+        let before = session.autograd_graph_node_count();
+        session.no_grad_enter();
+        let mut t = x;
+        for _ in 0..16 {
+            t = session.tensor_neg(t).unwrap();
+        }
+        session.no_grad_exit();
+        let after = session.autograd_graph_node_count();
+        assert!(
+            after >= before + 16,
+            "tape grew by {} for 16 no_grad ops (before={before}, after={after})",
+            after - before
+        );
     }
 
     #[test]
