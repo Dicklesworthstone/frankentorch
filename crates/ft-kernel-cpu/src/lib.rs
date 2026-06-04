@@ -2375,6 +2375,59 @@ pub fn linear_tensor_f64(
     y
 }
 
+/// Backward of `y = x @ weight^T + bias` (the [`linear_tensor_f64`] forward).
+///
+/// Given `dy` (gradient of `y`, row-major `[batch, out_features]`), the saved
+/// `x` (`[batch, in_features]`) and `weight` (`[out_features, in_features]`),
+/// returns `(dx, dweight, dbias?)`:
+///   - `dx = dy @ weight`           `[batch, in]`  — weight read as `[out,in]`, no transpose
+///   - `dweight = dy^T @ x`         `[out, in]`
+///   - `dbias = sum_batch(dy)`      `[out]`        (only if `need_bias`)
+///
+/// These are mathematically identical to the transpose-then-`addmm` path's
+/// backward (`d(addmm)/dx = dy @ weight`; `d_weight_t = x^T @ dy`, transposed
+/// back to `dy^T @ x`), so gradients match it to tolerance.
+#[must_use]
+pub fn linear_backward_f64(
+    dy: &[f64],
+    x: &[f64],
+    weight: &[f64],
+    batch: usize,
+    in_features: usize,
+    out_features: usize,
+    need_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    // dx = dy @ weight : [batch,out] @ [out,in] -> [batch,in].
+    let mut dx = vec![0.0f64; batch * in_features];
+    gemm::dgemm(batch, out_features, in_features, dy, weight, &mut dx);
+    // dweight = dy^T @ x : materialise dy^T [out,batch] (grad-sized, contiguous
+    // write — far smaller/cheaper than the 8MB strided weight transpose this
+    // whole path exists to avoid), then [out,batch] @ [batch,in] -> [out,in].
+    let mut dyt = vec![0.0f64; out_features * batch];
+    for b in 0..batch {
+        let row = &dy[b * out_features..(b + 1) * out_features];
+        for (o, &v) in row.iter().enumerate() {
+            dyt[o * batch + b] = v;
+        }
+    }
+    let mut dweight = vec![0.0f64; out_features * in_features];
+    gemm::dgemm(out_features, batch, in_features, &dyt, x, &mut dweight);
+    // dbias = sum over the batch rows of dy.
+    let dbias = if need_bias {
+        let mut db = vec![0.0f64; out_features];
+        for b in 0..batch {
+            let row = &dy[b * out_features..(b + 1) * out_features];
+            for (o, &v) in row.iter().enumerate() {
+                db[o] += v;
+            }
+        }
+        Some(db)
+    } else {
+        None
+    };
+    (dx, dweight, dbias)
+}
+
 /// f32 mirror of [`linear_tensor_f64`].
 #[must_use]
 pub fn linear_tensor_f32(

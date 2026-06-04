@@ -15416,6 +15416,78 @@ impl FrankenTorchSession {
             }
         }
 
+        // Fused GRAD fast path (f64): a custom Linear autograd op whose forward is
+        // transpose-free (dgemm_bt) and whose backward is analytic
+        // (linear_backward_f64: dx=dy@W, dW=dy^T@x, db=sum dy) — mathematically the
+        // SAME gradients as the transpose+addmm path, but the forward no longer
+        // materialises the 8MB strided weight transpose on every training step.
+        let grad_needed = self.tensor_tape.tensor_requires_grad(input)?
+            || self.tensor_tape.tensor_requires_grad(weight)?
+            || bias_grad;
+        if grad_needed && in_dtype == DType::F64 && self.tensor_dtype(weight)? == DType::F64 {
+            let in_shape = self.tensor_shape(input)?;
+            let w_shape = self.tensor_shape(weight)?;
+            let bias_dtype_ok = match bias {
+                Some(b) => self.tensor_dtype(b)? == DType::F64,
+                None => true,
+            };
+            if w_shape.len() == 2 && !in_shape.is_empty() && bias_dtype_ok {
+                let in_features = *in_shape.last().unwrap();
+                let out_features = w_shape[0];
+                let batch: usize = in_shape[..in_shape.len() - 1].iter().product();
+                let bias_ok = match bias {
+                    Some(b) => self.tensor_shape(b)? == vec![out_features],
+                    None => true,
+                };
+                if w_shape[1] == in_features
+                    && batch > 0
+                    && in_features > 0
+                    && out_features > 0
+                    && bias_ok
+                {
+                    let has_bias = bias.is_some();
+                    let mut inputs = vec![input, weight];
+                    if let Some(b) = bias {
+                        inputs.push(b);
+                    }
+                    return self.tensor_apply_function(
+                        &inputs,
+                        move |ctx, ins| {
+                            let (x, xs) = ins[0];
+                            let (w, ws) = ins[1];
+                            let bias_v = if has_bias { Some(ins[2].0) } else { None };
+                            let y = ft_kernel_cpu::linear_tensor_f64(
+                                x, w, bias_v, batch, in_features, out_features,
+                            );
+                            ctx.save_for_backward(x.to_vec(), xs.to_vec());
+                            ctx.save_for_backward(w.to_vec(), ws.to_vec());
+                            let mut out_shape = xs.to_vec();
+                            *out_shape.last_mut().unwrap() = out_features;
+                            Ok((y, out_shape))
+                        },
+                        move |ctx, grad_outputs| {
+                            let dy = grad_outputs[0];
+                            let saved = ctx.saved_tensors();
+                            let (dx, dw, db) = ft_kernel_cpu::linear_backward_f64(
+                                dy,
+                                &saved[0],
+                                &saved[1],
+                                batch,
+                                in_features,
+                                out_features,
+                                has_bias,
+                            );
+                            let mut grads = vec![Some(dx), Some(dw)];
+                            if let Some(db) = db {
+                                grads.push(Some(db));
+                            }
+                            Ok(grads)
+                        },
+                    );
+                }
+            }
+        }
+
         let weight_t = self.tensor_transpose(weight, 0, 1)?;
         match bias {
             Some(b) => self.tensor_addmm(b, input, weight_t, 1.0, 1.0),
@@ -81539,6 +81611,71 @@ mod tests {
         assert_eq!(fv.len(), rv.len());
         for (idx, (f, r)) in fv.iter().zip(rv.iter()).enumerate() {
             assert_eq!(f.to_bits(), r.to_bits(), "f32 linear diverged at {idx}");
+        }
+    }
+
+    #[test]
+    fn functional_linear_f64_grad_fused_matches_analytic() {
+        // The fused grad path (custom Linear op: dgemm_bt forward + analytic
+        // backward) must produce the correct forward output AND the correct
+        // input/weight/bias gradients. With loss = sum(y), dy = 1 everywhere, so
+        // the gradients have simple closed forms (independent of the autograd
+        // machinery, so this is a ground-truth check, not a circular one):
+        //   y[b][o] = sum_i x[b][i] W[o][i] + bias[o]
+        //   dx[b][i] = sum_o W[o][i]   (column sum of W; same for every b)
+        //   dW[o][i] = sum_b x[b][i]   (same for every o)
+        //   db[o]    = batch
+        let (batch, in_f, out_f) = (8usize, 20usize, 14usize);
+        let xv: Vec<f64> = (0..batch * in_f)
+            .map(|i| ((i % 9) as f64 - 4.0) * 0.21 + (i as f64) * 1e-3)
+            .collect();
+        let wv: Vec<f64> = (0..out_f * in_f)
+            .map(|i| ((i % 5) as f64 - 2.0) * 0.17 - (i as f64) * 1e-3)
+            .collect();
+        let bv: Vec<f64> = (0..out_f).map(|j| (j as f64) * 0.11 - 0.7).collect();
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![batch, in_f], true).unwrap();
+        let w = s.tensor_variable(wv.clone(), vec![out_f, in_f], true).unwrap();
+        let b = s.tensor_variable(bv.clone(), vec![out_f], true).unwrap();
+        let y = s.functional_linear(x, w, Some(b)).unwrap();
+        let loss = s.tensor_sum(y).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let yv = s.tensor_values(y).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let gw = s.tensor_grad(w).unwrap().unwrap();
+        let gb = s.tensor_grad(b).unwrap().unwrap();
+
+        let tol = 1e-9;
+        // Forward.
+        for b_ in 0..batch {
+            for o in 0..out_f {
+                let mut e = bv[o];
+                for i in 0..in_f {
+                    e += xv[b_ * in_f + i] * wv[o * in_f + i];
+                }
+                assert!((yv[b_ * out_f + o] - e).abs() <= tol + tol * e.abs());
+            }
+        }
+        // dx[b][i] = sum_o W[o][i].
+        for b_ in 0..batch {
+            for i in 0..in_f {
+                let e: f64 = (0..out_f).map(|o| wv[o * in_f + i]).sum();
+                let g = gx[b_ * in_f + i];
+                assert!((g - e).abs() <= tol + tol * e.abs(), "dx[{b_}][{i}]: {g} vs {e}");
+            }
+        }
+        // dW[o][i] = sum_b x[b][i].
+        for o in 0..out_f {
+            for i in 0..in_f {
+                let e: f64 = (0..batch).map(|b_| xv[b_ * in_f + i]).sum();
+                let g = gw[o * in_f + i];
+                assert!((g - e).abs() <= tol + tol * e.abs(), "dW[{o}][{i}]: {g} vs {e}");
+            }
+        }
+        // db[o] = batch.
+        for o in 0..out_f {
+            assert!((gb[o] - batch as f64).abs() <= tol);
         }
     }
 

@@ -209,6 +209,30 @@ fn bench_add(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_linear_train(c: &mut Criterion) {
+    // Forward + backward of a Linear layer (f64, requires_grad) — the training
+    // hot path. Exercises the fused grad Linear op (transpose-free dgemm_bt fwd +
+    // analytic linear_backward_f64) vs the materialise-transpose addmm path.
+    let mut group = c.benchmark_group("linear_train");
+    let batch = 32;
+    let in_features = 512;
+    for hidden in [512, 1024, 2048].iter() {
+        let h = *hidden;
+        group.bench_with_input(BenchmarkId::new("hidden", h), &h, |b, &h| {
+            b.iter(|| {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = session.tensor_randn(vec![batch, in_features], true).unwrap();
+                let w = session.tensor_randn(vec![h, in_features], true).unwrap();
+                let bias = session.tensor_randn(vec![h], true).unwrap();
+                let y = session.tensor_linear(x, w, Some(bias)).unwrap();
+                let loss = session.tensor_sum(y).unwrap();
+                black_box(session.tensor_backward(loss).unwrap())
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_backward_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("backward_matmul");
 
@@ -633,6 +657,7 @@ criterion_group!(
     bench_pow,
     bench_add,
     bench_backward_matmul,
+    bench_linear_train,
     bench_linear_forward,
     bench_interpolate_bicubic,
     bench_interpolate_trilinear,
