@@ -247,6 +247,19 @@ fn bench_linear_forward(c: &mut Criterion) {
             b.iter(|| black_box(session.tensor_linear(x, w, Some(bias)).unwrap()));
         });
     }
+    // f32 (the common ML dtype): exercises the sgemm_bt fused-linear path.
+    for hidden in [1024, 2048].iter() {
+        let h = *hidden;
+        let batch = 32;
+        let in_features = 512;
+        group.bench_with_input(BenchmarkId::new("f32_hidden", h), &h, |b, &h| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session.randn_f32(vec![batch, in_features], false).unwrap();
+            let w = session.randn_f32(vec![h, in_features], false).unwrap();
+            let bias = session.randn_f32(vec![h], false).unwrap();
+            b.iter(|| black_box(session.tensor_linear(x, w, Some(bias)).unwrap()));
+        });
+    }
     group.finish();
 }
 

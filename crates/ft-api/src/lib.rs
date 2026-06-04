@@ -15355,19 +15355,21 @@ impl FrankenTorchSession {
         weight: TensorNodeId,
         bias: Option<TensorNodeId>,
     ) -> Result<TensorNodeId, AutogradError> {
-        // Fused no-grad fast path: y = x @ weight^T (+ bias) via dgemm_bt, which
-        // reads `weight` [out, in] directly and NEVER materialises its (cache-
+        // Fused no-grad fast path: y = x @ weight^T (+ bias) via dgemm_bt/sgemm_bt,
+        // which read `weight` [out, in] directly and NEVER materialise its (cache-
         // unfriendly) transpose — the dominant cost of the addmm/matmul path. f64
-        // only; anything else (grad, non-f64, odd shapes) falls through unchanged.
+        // and f32; anything else (grad, mixed/other dtype, odd shapes) falls
+        // through unchanged.
         let bias_grad = match bias {
             Some(b) => self.tensor_tape.tensor_requires_grad(b)?,
             None => false,
         };
+        let in_dtype = self.tensor_dtype(input)?;
         if !self.tensor_tape.tensor_requires_grad(input)?
             && !self.tensor_tape.tensor_requires_grad(weight)?
             && !bias_grad
-            && self.tensor_dtype(input)? == DType::F64
-            && self.tensor_dtype(weight)? == DType::F64
+            && (in_dtype == DType::F64 || in_dtype == DType::F32)
+            && self.tensor_dtype(weight)? == in_dtype
         {
             let in_shape = self.tensor_shape(input)?;
             let w_shape = self.tensor_shape(weight)?;
@@ -15385,23 +15387,31 @@ impl FrankenTorchSession {
                     && out_features > 0
                     && bias_ok
                 {
-                    let x = self.tensor_values(input)?;
-                    let w = self.tensor_values(weight)?;
-                    let bias_vals = match bias {
-                        Some(b) => Some(self.tensor_values(b)?),
-                        None => None,
-                    };
-                    let y = ft_kernel_cpu::linear_tensor_f64(
-                        &x,
-                        &w,
-                        bias_vals.as_deref(),
-                        batch,
-                        in_features,
-                        out_features,
-                    );
                     let mut out_shape = in_shape;
                     *out_shape.last_mut().unwrap() = out_features;
-                    return self.tensor_variable(y, out_shape, false);
+                    if in_dtype == DType::F64 {
+                        let x = self.tensor_values(input)?;
+                        let w = self.tensor_values(weight)?;
+                        let bias_vals = match bias {
+                            Some(b) => Some(self.tensor_values(b)?),
+                            None => None,
+                        };
+                        let y = ft_kernel_cpu::linear_tensor_f64(
+                            &x, &w, bias_vals.as_deref(), batch, in_features, out_features,
+                        );
+                        return self.tensor_variable(y, out_shape, false);
+                    }
+                    // f32
+                    let x = self.tensor_values_f32(input)?;
+                    let w = self.tensor_values_f32(weight)?;
+                    let bias_vals = match bias {
+                        Some(b) => Some(self.tensor_values_f32(b)?),
+                        None => None,
+                    };
+                    let y = ft_kernel_cpu::linear_tensor_f32(
+                        &x, &w, bias_vals.as_deref(), batch, in_features, out_features,
+                    );
+                    return self.tensor_tape.leaf_f32(y, out_shape, false);
                 }
             }
         }
@@ -81501,6 +81511,35 @@ mod tests {
         // [1,1] @ I + [10,20] = [11, 21]
         assert!((vals[0] - 11.0).abs() < 1e-10);
         assert!((vals[1] - 21.0).abs() < 1e-10);
+    }
+
+    #[test]
+    fn functional_linear_f32_fused_matches_transpose_path_bit_exact() {
+        // The no-grad f32 fused path (sgemm_bt, transpose-free) must produce the
+        // SAME bits as the materialise-transpose-then-addmm path it replaces.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (batch, in_f, out_f) = (12usize, 40usize, 28usize);
+        let x: Vec<f32> = (0..batch * in_f)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.31 + (i as f32) * 1e-4)
+            .collect();
+        let w: Vec<f32> = (0..out_f * in_f)
+            .map(|i| ((i % 7) as f32 - 3.0) * 0.27 - (i as f32) * 1e-4)
+            .collect();
+        let bias: Vec<f32> = (0..out_f).map(|j| (j as f32) * 0.13 - 1.5).collect();
+        let xt = s.tensor_tape.leaf_f32(x, vec![batch, in_f], false).unwrap();
+        let wt = s.tensor_tape.leaf_f32(w, vec![out_f, in_f], false).unwrap();
+        let bt = s.tensor_tape.leaf_f32(bias, vec![out_f], false).unwrap();
+        // Fused path (taken automatically for no-grad f32).
+        let fused = s.functional_linear(xt, wt, Some(bt)).unwrap();
+        // Reference: explicit transpose + addmm (the pre-fusion path).
+        let w_tr = s.tensor_transpose(wt, 0, 1).unwrap();
+        let reference = s.tensor_addmm(bt, xt, w_tr, 1.0, 1.0).unwrap();
+        let fv = s.tensor_values_f32(fused).unwrap();
+        let rv = s.tensor_values_f32(reference).unwrap();
+        assert_eq!(fv.len(), rv.len());
+        for (idx, (f, r)) in fv.iter().zip(rv.iter()).enumerate() {
+            assert_eq!(f.to_bits(), r.to_bits(), "f32 linear diverged at {idx}");
+        }
     }
 
     #[test]

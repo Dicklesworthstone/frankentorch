@@ -288,6 +288,62 @@ mod gemm {
         }
     }
 
+    /// f32 mirror of `dgemm_bt`: `C[m,n] = A[m,k] @ B^T` where `B` is `[n,k]`.
+    pub fn sgemm_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..n * k];
+        let c = &mut c[..m * n];
+        if should_parallelize_cols(m, k, n) {
+            let nb = block_cols(n);
+            let blocks: Vec<(usize, Vec<f32>)> = (0..n.div_ceil(nb))
+                .into_par_iter()
+                .map(|blk| {
+                    let n0 = blk * nb;
+                    let bw = (n0 + nb).min(n) - n0;
+                    let mut ct = vec![0.0f32; m * bw];
+                    // SAFETY: a is m*k; b[n0*k ..] holds bw rows of k; ct is m*bw.
+                    unsafe {
+                        matrixmultiply::sgemm(
+                            m, k, bw, 1.0, a.as_ptr(), k as isize, 1,
+                            b.as_ptr().add(n0 * k), 1, k as isize,
+                            0.0, ct.as_mut_ptr(), bw as isize, 1,
+                        );
+                    }
+                    (n0, ct)
+                })
+                .collect();
+            for (n0, ct) in &blocks {
+                let bw = ct.len() / m;
+                for i in 0..m {
+                    c[i * n + n0..i * n + n0 + bw].copy_from_slice(&ct[i * bw..i * bw + bw]);
+                }
+            }
+        } else if should_parallelize(m, k, n) {
+            let br = block_rows(m);
+            c.par_chunks_mut(br * n)
+                .zip(a.par_chunks(br * k))
+                .for_each(|(c_blk, a_blk)| {
+                    sgemm_bt_block(c_blk.len() / n, k, n, a_blk, b, c_blk);
+                });
+        } else {
+            sgemm_bt_block(m, k, n, a, b, c);
+        }
+    }
+
+    fn sgemm_bt_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        // SAFETY: a is m*k, b is n*k (read as B^T via rsb=1,csb=k), c is m*n.
+        unsafe {
+            matrixmultiply::sgemm(
+                m, k, n, 1.0, a.as_ptr(), k as isize, 1,
+                b.as_ptr(), 1, k as isize,
+                0.0, c.as_mut_ptr(), n as isize, 1,
+            );
+        }
+    }
+
     pub fn sgemm_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
         // SAFETY: see `dgemm_block`; slices are sized exactly by `sgemm`.
         unsafe {
@@ -2309,6 +2365,28 @@ pub fn linear_tensor_f64(
 ) -> Vec<f64> {
     let mut y = vec![0.0f64; batch * out_features];
     gemm::dgemm_bt(batch, in_features, out_features, x, weight, &mut y);
+    if let Some(b) = bias {
+        for row in y.chunks_exact_mut(out_features) {
+            for (yj, bj) in row.iter_mut().zip(b.iter()) {
+                *yj += *bj;
+            }
+        }
+    }
+    y
+}
+
+/// f32 mirror of [`linear_tensor_f64`].
+#[must_use]
+pub fn linear_tensor_f32(
+    x: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_features: usize,
+    out_features: usize,
+) -> Vec<f32> {
+    let mut y = vec![0.0f32; batch * out_features];
+    gemm::sgemm_bt(batch, in_features, out_features, x, weight, &mut y);
     if let Some(b) = bias {
         for row in y.chunks_exact_mut(out_features) {
             for (yj, bj) in row.iter_mut().zip(b.iter()) {
@@ -11567,6 +11645,27 @@ mod tests {
                     r.to_bits(),
                     g.to_bits(),
                     "dgemm_bt diverged at {idx} for ({m},{k},{n}): ref {r} vs bt {g}"
+                );
+            }
+
+            // f32 sgemm_bt mirror.
+            let af: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+            let bf: Vec<f32> = b.iter().map(|&v| v as f32).collect();
+            let mut btf = vec![0.0f32; k * n];
+            for j in 0..n {
+                for l in 0..k {
+                    btf[l * n + j] = bf[j * k + l];
+                }
+            }
+            let mut cf_ref = vec![0.0f32; m * n];
+            crate::gemm::sgemm(m, k, n, &af, &btf, &mut cf_ref);
+            let mut cf_bt = vec![0.0f32; m * n];
+            crate::gemm::sgemm_bt(m, k, n, &af, &bf, &mut cf_bt);
+            for (idx, (r, g)) in cf_ref.iter().zip(cf_bt.iter()).enumerate() {
+                assert_eq!(
+                    r.to_bits(),
+                    g.to_bits(),
+                    "sgemm_bt diverged at {idx} for ({m},{k},{n}): ref {r} vs bt {g}"
                 );
             }
         }
