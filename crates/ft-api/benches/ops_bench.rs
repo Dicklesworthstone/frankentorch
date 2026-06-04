@@ -209,6 +209,28 @@ fn bench_add(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sdpa(c: &mut Criterion) {
+    // Scaled-dot-product attention, no-grad f64. num_bh=16, seq=512, d=64 -> the
+    // score matrix is 16*512*512*8 = 33.5MB; the fused kernel never materialises
+    // it (nor the scale tensor / softmax intermediate the op-graph path streams).
+    let mut group = c.benchmark_group("sdpa");
+    let (bh, seq, d) = (16usize, 512usize, 64usize);
+    group.bench_function("nograd_16x512x64", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let q = session.tensor_randn(vec![bh, seq, d], false).unwrap();
+        let k = session.tensor_randn(vec![bh, seq, d], false).unwrap();
+        let v = session.tensor_randn(vec![bh, seq, d], false).unwrap();
+        b.iter(|| {
+            black_box(
+                session
+                    .scaled_dot_product_attention(q, k, v, None, 0.0, false)
+                    .unwrap(),
+            )
+        });
+    });
+    group.finish();
+}
+
 fn bench_linear_train(c: &mut Criterion) {
     // Forward + backward of a Linear layer (f64, requires_grad) — the training
     // hot path. Exercises the fused grad Linear op (transpose-free dgemm_bt fwd +
@@ -658,6 +680,7 @@ criterion_group!(
     bench_add,
     bench_backward_matmul,
     bench_linear_train,
+    bench_sdpa,
     bench_linear_forward,
     bench_interpolate_bicubic,
     bench_interpolate_trilinear,

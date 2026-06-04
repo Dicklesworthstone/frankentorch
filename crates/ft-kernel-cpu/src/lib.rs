@@ -2355,6 +2355,91 @@ pub fn div_tensor_broadcast_f64(
 /// transpose-then-matmul path. Result is `[batch, out]`, bit-for-bit identical
 /// to that path.
 #[must_use]
+/// Fused scaled-dot-product attention forward (f64), the flash-attention memory
+/// pattern: process one block of `BR` query rows at a time so only that block's
+/// score tile `[BR, seq_k]` is ever materialised — NEVER the full
+/// `[num_bh, seq_q, seq_k]` score matrix (16MB at seq=512/heads=8), the scale
+/// tensor, or the softmax intermediate that the op-graph path allocates and
+/// streams through memory three times.
+///
+/// Inputs are row-major `[num_bh, seq_q, d_k]` (q), `[num_bh, seq_k, d_k]` (k),
+/// `[num_bh, seq_k, d_v]` (v). Output is `[num_bh, seq_q, d_v]`. `scale`
+/// multiplies the scores pre-softmax; `causal` masks key positions `j > i`.
+///
+/// The two tile matmuls reuse the vectorised `matrixmultiply` microkernels
+/// (`dgemm_bt` reads K in its natural `[seq_k, d_k]` layout — no transpose; the
+/// score tile feeds `dgemm` against V), so the QK^T scores are bit-identical to
+/// the materialised `bmm(Q, K^T)` path; the softmax (max-subtract, scalar `exp`,
+/// divide by the running sum) matches the reference to tolerance.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn sdpa_forward_f64(
+    q: &[f64],
+    k: &[f64],
+    v: &[f64],
+    num_bh: usize,
+    seq_q: usize,
+    seq_k: usize,
+    d_k: usize,
+    d_v: usize,
+    scale: f64,
+    causal: bool,
+) -> Vec<f64> {
+    const BR: usize = 64;
+    let mut out = vec![0.0f64; num_bh * seq_q * d_v];
+    let q_stride = seq_q * d_k;
+    let k_stride = seq_k * d_k;
+    let v_stride = seq_k * d_v;
+    let o_stride = seq_q * d_v;
+    out.par_chunks_mut(o_stride)
+        .enumerate()
+        .for_each(|(bh, o_chunk)| {
+            let qh = &q[bh * q_stride..bh * q_stride + q_stride];
+            let kh = &k[bh * k_stride..bh * k_stride + k_stride];
+            let vh = &v[bh * v_stride..bh * v_stride + v_stride];
+            // Scratch score tile, reused across the head's query blocks.
+            let mut scores = vec![0.0f64; BR.min(seq_q) * seq_k];
+            let mut q0 = 0;
+            while q0 < seq_q {
+                let br = (q0 + BR).min(seq_q) - q0;
+                let q_block = &qh[q0 * d_k..(q0 + br) * d_k];
+                let sc = &mut scores[..br * seq_k];
+                // scores[br, seq_k] = q_block[br, d_k] @ kh^T  (kh is [seq_k, d_k]).
+                gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, sc);
+                // Per row: scale, (causal mask), stable softmax.
+                for r in 0..br {
+                    let qi = q0 + r;
+                    let limit = if causal { (qi + 1).min(seq_k) } else { seq_k };
+                    let row = &mut sc[r * seq_k..(r + 1) * seq_k];
+                    let mut m = f64::NEG_INFINITY;
+                    for s in row.iter_mut().take(limit) {
+                        *s *= scale;
+                        if *s > m {
+                            m = *s;
+                        }
+                    }
+                    let mut sum = 0.0f64;
+                    for s in row.iter_mut().take(limit) {
+                        let e = (*s - m).exp();
+                        *s = e;
+                        sum += e;
+                    }
+                    for s in row.iter_mut().take(limit) {
+                        *s /= sum;
+                    }
+                    for s in row.iter_mut().skip(limit) {
+                        *s = 0.0;
+                    }
+                }
+                // out_block[br, d_v] = sc[br, seq_k] @ vh[seq_k, d_v].
+                let o_block = &mut o_chunk[q0 * d_v..(q0 + br) * d_v];
+                gemm::dgemm(br, seq_k, d_v, sc, vh, o_block);
+                q0 += br;
+            }
+        });
+    out
+}
+
 pub fn linear_tensor_f64(
     x: &[f64],
     weight: &[f64],
