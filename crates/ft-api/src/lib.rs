@@ -95950,26 +95950,18 @@ mod tests {
         let x = s
             .tensor_variable(vec![1.0, 2.0, 3.0], vec![3], false)
             .unwrap();
-        let cfloat_result = s.tensor_cfloat(x);
-        let cdouble_result = s.tensor_cdouble(x);
-        assert!(
-            matches!(
-                cfloat_result,
-                Err(AutogradError::DenseTensor(
-                    ft_core::DenseTensorError::UnsupportedDType(DType::Complex64)
-                ))
-            ),
-            "tensor_cfloat should return UnsupportedDType(Complex64) until tape-level Complex64 conversion lands"
-        );
-        assert!(
-            matches!(
-                cdouble_result,
-                Err(AutogradError::DenseTensor(
-                    ft_core::DenseTensorError::UnsupportedDType(DType::Complex128)
-                ))
-            ),
-            "tensor_cdouble should return UnsupportedDType(Complex128) until tape-level Complex128 conversion lands"
-        );
+        // Real -> complex cast: dtype becomes complex, real part preserved,
+        // imaginary part zero. (Full coverage in
+        // cfloat_cdouble_cast_real_and_complex; this guards the PyTorch-named
+        // aliases specifically.)
+        let cfloat = s.tensor_cfloat(x).unwrap();
+        assert_eq!(s.tensor_dtype(cfloat).unwrap(), DType::Complex64);
+        let cdouble = s.tensor_cdouble(x).unwrap();
+        assert_eq!(s.tensor_dtype(cdouble).unwrap(), DType::Complex128);
+        let re = s.tensor_real(cdouble).unwrap();
+        let im = s.tensor_imag(cdouble).unwrap();
+        assert_eq!(s.tensor_values(re).unwrap(), vec![1.0, 2.0, 3.0]);
+        assert_eq!(s.tensor_values(im).unwrap(), vec![0.0, 0.0, 0.0]);
     }
 
     #[test]
