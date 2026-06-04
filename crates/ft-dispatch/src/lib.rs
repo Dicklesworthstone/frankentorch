@@ -1,7 +1,7 @@
 #![forbid(unsafe_code)]
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, hash_map::Entry},
     fmt,
     hash::{BuildHasherDefault, Hasher},
     sync::Arc,
@@ -945,14 +945,59 @@ impl Hasher for SchemaNameHasher {
             self.hash = self.hash.wrapping_mul(0x0000_0100_0000_01b3);
         }
     }
+
+    fn write_u64(&mut self, value: u64) {
+        self.hash = value;
+    }
 }
 
 type SchemaNameBuildHasher = BuildHasherDefault<SchemaNameHasher>;
 
+#[derive(Clone)]
+enum SchemaIndexBucket {
+    Single(usize),
+    Collision(Vec<usize>),
+}
+
+impl SchemaIndexBucket {
+    fn index_for_name(
+        &self,
+        entries: &[SchemaDispatchEntry],
+        normalized_name: &str,
+    ) -> Option<usize> {
+        match self {
+            Self::Single(entry_index) => entry_matches_name(entries, *entry_index, normalized_name),
+            Self::Collision(entry_indices) => entry_indices
+                .iter()
+                .find_map(|entry_index| entry_matches_name(entries, *entry_index, normalized_name)),
+        }
+    }
+
+    fn push_collision(&mut self, entry_index: usize) {
+        match self {
+            Self::Single(existing_index) => {
+                *self = Self::Collision(vec![*existing_index, entry_index]);
+            }
+            Self::Collision(entry_indices) => entry_indices.push(entry_index),
+        }
+    }
+}
+
+fn entry_matches_name(
+    entries: &[SchemaDispatchEntry],
+    entry_index: usize,
+    normalized_name: &str,
+) -> Option<usize> {
+    entries
+        .get(entry_index)
+        .filter(|entry| entry.normalized_name == normalized_name)
+        .map(|_| entry_index)
+}
+
 #[derive(Clone, Default)]
 pub struct SchemaRegistry {
     entries: Vec<SchemaDispatchEntry>,
-    name_to_index: HashMap<String, usize, SchemaNameBuildHasher>,
+    name_digest_to_index: HashMap<u64, SchemaIndexBucket, SchemaNameBuildHasher>,
 }
 
 impl fmt::Debug for SchemaRegistry {
@@ -1014,7 +1059,11 @@ impl SchemaRegistry {
                 schema.op.unambiguous_name(),
             ),
         };
-        if self.name_to_index.contains_key(normalized_name.as_str()) {
+        let name_digest = digest64(normalized_name.as_str());
+        if self
+            .index_for_name(name_digest, normalized_name.as_str())
+            .is_some()
+        {
             return Err(SchemaRegistryError::DuplicateSchema {
                 name: normalized_name,
             });
@@ -1027,8 +1076,6 @@ impl SchemaRegistry {
         })?;
 
         let entry_index = self.entries.len();
-        self.name_to_index
-            .insert(normalized_name.clone(), entry_index);
         self.entries.push(SchemaDispatchEntry {
             normalized_name: normalized_name.clone(),
             op,
@@ -1036,6 +1083,14 @@ impl SchemaRegistry {
             is_out_variant,
             schema_digest,
         });
+        match self.name_digest_to_index.entry(name_digest) {
+            Entry::Vacant(entry) => {
+                entry.insert(SchemaIndexBucket::Single(entry_index));
+            }
+            Entry::Occupied(mut entry) => {
+                entry.get_mut().push_collision(entry_index);
+            }
+        }
         Ok(normalized_name)
     }
 
@@ -1043,7 +1098,8 @@ impl SchemaRegistry {
         &self,
         normalized_name: &str,
     ) -> Result<&SchemaDispatchEntry, SchemaRegistryError> {
-        if let Some(&entry_index) = self.name_to_index.get(normalized_name)
+        let name_digest = digest64(normalized_name);
+        if let Some(entry_index) = self.index_for_name(name_digest, normalized_name)
             && let Some(entry) = self.entries.get(entry_index)
         {
             return Ok(entry);
@@ -1059,6 +1115,12 @@ impl SchemaRegistry {
         ordered_entries
             .sort_unstable_by(|left, right| left.normalized_name.cmp(&right.normalized_name));
         ordered_entries.into_iter()
+    }
+
+    fn index_for_name(&self, name_digest: u64, normalized_name: &str) -> Option<usize> {
+        self.name_digest_to_index
+            .get(&name_digest)
+            .and_then(|bucket| bucket.index_for_name(&self.entries, normalized_name))
     }
 }
 
@@ -6066,9 +6128,9 @@ mod tests {
 
     use super::{
         BinaryOp, ComparisonOp, DispatchError, DispatchKey, DispatchKeyError, DispatchKeySet,
-        OpSchemaError, ParsedSchemaInput, SchemaDispatchError, SchemaRegistry, SchemaRegistryError,
-        TYPE_PRIORITY, UnaryOp, dispatch_keyset_for_tensor_meta, dispatch_keyset_for_tensors,
-        dispatch_scalar_binary, dispatch_scalar_binary_registered,
+        OpSchemaError, ParsedSchemaInput, SchemaDispatchError, SchemaIndexBucket, SchemaRegistry,
+        SchemaRegistryError, TYPE_PRIORITY, UnaryOp, digest64, dispatch_keyset_for_tensor_meta,
+        dispatch_keyset_for_tensors, dispatch_scalar_binary, dispatch_scalar_binary_registered,
         dispatch_scalar_binary_with_keyset, dispatch_scalar_comparison, dispatch_scalar_unary,
         dispatch_tensor_binary_contiguous_f64, dispatch_tensor_binary_contiguous_f64_with_keyset,
         dispatch_tensor_comparison_contiguous_f64, dispatch_tensor_unary_contiguous_f64,
@@ -6971,6 +7033,37 @@ mod tests {
             .register(&parsed, keyset)
             .expect_err("duplicate registration must fail");
         assert!(matches!(err, SchemaRegistryError::DuplicateSchema { .. }));
+    }
+
+    #[test]
+    fn schema_registry_digest_bucket_collision_checks_full_name() {
+        let keyset =
+            schema_dispatch_keyset_from_tags(&["CPU", "AutogradCPU"]).expect("keyset should parse");
+        let parsed_add = parse_schema_or_name("add.alpha").expect("add schema should parse");
+        let parsed_sub = parse_schema_or_name("sub.beta").expect("sub schema should parse");
+
+        let mut registry = SchemaRegistry::new();
+        registry
+            .register(&parsed_add, keyset)
+            .expect("add schema should register");
+        registry
+            .register(&parsed_sub, keyset)
+            .expect("sub schema should register");
+
+        let collision_digest = digest64("add_alpha");
+        registry
+            .name_digest_to_index
+            .insert(collision_digest, SchemaIndexBucket::Collision(vec![0, 1]));
+
+        assert_eq!(
+            registry.index_for_name(collision_digest, "add_alpha"),
+            Some(0)
+        );
+        assert_eq!(
+            registry.index_for_name(collision_digest, "sub_beta"),
+            Some(1)
+        );
+        assert_eq!(registry.index_for_name(collision_digest, "mul_gamma"), None);
     }
 
     #[test]
