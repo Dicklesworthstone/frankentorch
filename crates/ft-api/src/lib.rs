@@ -47647,7 +47647,6 @@ impl FrankenTorchSession {
 
         let mut re_tmp = vec![0.0_f64; batch_size * rows * cols];
         let mut im_tmp = vec![0.0_f64; batch_size * rows * cols];
-        let plane = rows * cols;
         let parallel = batch_size * rows * cols >= PARALLEL_ELEMENTWISE_MIN;
 
         // FFT along columns (last dim) for each row — contiguous cols blocks, run
@@ -47676,54 +47675,61 @@ impl FrankenTorchSession {
             }
         }
 
-        // FFT along rows (second-to-last dim) — strided columns, distribute the
-        // batch planes (reused scratch per worker). Bit-for-bit identical.
+        // Real-input rfft: only the first `out_cols = cols/2 + 1` columns
+        // survive (the rest are conjugate-redundant). Extract them BEFORE the
+        // row transform and skip the row-FFT of the redundant upper half
+        // entirely — ~halving the row-pass work. Each surviving column's row
+        // transform is the same independent `dft_inplace_1d` on the same column
+        // data as the full-then-trim version, so the output is bit-for-bit
+        // unchanged.
+        let red_plane = rows * out_cols;
+        let mut re_out = vec![0.0_f64; batch_size * red_plane];
+        let mut im_out = vec![0.0_f64; batch_size * red_plane];
+        for b in 0..batch_size {
+            for r in 0..rows {
+                let src = b * rows * cols + r * cols;
+                let dst = b * red_plane + r * out_cols;
+                re_out[dst..dst + out_cols].copy_from_slice(&re_tmp[src..src + out_cols]);
+                im_out[dst..dst + out_cols].copy_from_slice(&im_tmp[src..src + out_cols]);
+            }
+        }
+
+        // FFT along rows on the reduced [.., rows, out_cols] planes — strided
+        // columns, distribute the batch planes (reused scratch per worker).
         if parallel && batch_size >= 2 {
             use rayon::prelude::*;
-            re_tmp
-                .par_chunks_mut(plane)
-                .zip(im_tmp.par_chunks_mut(plane))
+            re_out
+                .par_chunks_mut(red_plane)
+                .zip(im_out.par_chunks_mut(red_plane))
                 .for_each(|(re_b, im_b)| {
                     let mut re_col = vec![0.0_f64; rows];
                     let mut im_col = vec![0.0_f64; rows];
-                    for c in 0..cols {
+                    for c in 0..out_cols {
                         for r in 0..rows {
-                            re_col[r] = re_b[r * cols + c];
-                            im_col[r] = im_b[r * cols + c];
+                            re_col[r] = re_b[r * out_cols + c];
+                            im_col[r] = im_b[r * out_cols + c];
                         }
                         Self::dft_inplace_1d(&mut re_col, &mut im_col, false);
                         for r in 0..rows {
-                            re_b[r * cols + c] = re_col[r];
-                            im_b[r * cols + c] = im_col[r];
+                            re_b[r * out_cols + c] = re_col[r];
+                            im_b[r * out_cols + c] = im_col[r];
                         }
                     }
                 });
         } else {
             for b in 0..batch_size {
-                for c in 0..cols {
+                for c in 0..out_cols {
                     let mut re_col = vec![0.0_f64; rows];
                     let mut im_col = vec![0.0_f64; rows];
                     for r in 0..rows {
-                        re_col[r] = re_tmp[b * rows * cols + r * cols + c];
-                        im_col[r] = im_tmp[b * rows * cols + r * cols + c];
+                        re_col[r] = re_out[b * red_plane + r * out_cols + c];
+                        im_col[r] = im_out[b * red_plane + r * out_cols + c];
                     }
                     Self::dft_inplace_1d(&mut re_col, &mut im_col, false);
                     for r in 0..rows {
-                        re_tmp[b * rows * cols + r * cols + c] = re_col[r];
-                        im_tmp[b * rows * cols + r * cols + c] = im_col[r];
+                        re_out[b * red_plane + r * out_cols + c] = re_col[r];
+                        im_out[b * red_plane + r * out_cols + c] = im_col[r];
                     }
-                }
-            }
-        }
-
-        // Keep only the non-redundant frequencies (first out_cols columns)
-        let mut re_out = Vec::with_capacity(batch_size * rows * out_cols);
-        let mut im_out = Vec::with_capacity(batch_size * rows * out_cols);
-        for b in 0..batch_size {
-            for r in 0..rows {
-                for c in 0..out_cols {
-                    re_out.push(re_tmp[b * rows * cols + r * cols + c]);
-                    im_out.push(im_tmp[b * rows * cols + r * cols + c]);
                 }
             }
         }
