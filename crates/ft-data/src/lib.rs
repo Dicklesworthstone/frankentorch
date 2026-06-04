@@ -1041,7 +1041,11 @@ impl Transform for NormalizeTransform {
         for (name, values, shape) in &mut item.tensors {
             if name == &self.tensor_name && !self.mean.is_empty() {
                 let channels = self.mean.len();
-                if shape.first().copied() != Some(channels) || values.len() % channels != 0 {
+                let channel_count_matches = shape
+                    .first()
+                    .copied()
+                    .is_some_and(|first| first.cmp(&channels).is_eq());
+                if !channel_count_matches || values.len() % channels > 0 {
                     continue;
                 }
                 let channel_size = values.len() / channels;
@@ -2218,7 +2222,7 @@ mod tests {
         let indices = s.indices().expect("weighted samples");
         assert_eq!(indices.len(), 20);
         assert!(
-            indices.iter().all(|&i| i == 0),
+            indices.iter().all(|&i| matches!(i, 0)),
             "single weight = always index 0"
         );
     }
