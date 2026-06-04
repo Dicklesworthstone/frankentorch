@@ -583,6 +583,7 @@ const FT_DTYPE_TAG_BF16: u8 = 3;
 const FT_MIN_NATIVE_TENSOR_HEADER_BYTES: usize = 8 + 8 + 1; // key_len + ndim + dtype tag
 const FT_NATIVE_SAVE_BUFFER_BYTES: usize = 1024 * 1024;
 const FT_NATIVE_F32_VALUE_CHUNK_BYTES: usize = 64 * 1024;
+const FT_NATIVE_HALF_VALUE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Errors from tensor state dict save/load operations.
 #[derive(Debug, Clone, PartialEq)]
@@ -821,9 +822,7 @@ fn write_state_dict_to_writer<W: Write>(
                         reason: format!("tensor storage does not match dtype for '{key}'"),
                     });
                 };
-                for value in &values[start..end] {
-                    write_native_bytes(writer, &value.to_le_bytes(), io_path)?;
-                }
+                write_native_f16_values(writer, &values[start..end], io_path)?;
             }
             DType::BF16 => {
                 let (start, end) = contiguous_native_storage_bounds(tensor, key)?;
@@ -832,9 +831,7 @@ fn write_state_dict_to_writer<W: Write>(
                         reason: format!("tensor storage does not match dtype for '{key}'"),
                     });
                 };
-                for value in &values[start..end] {
-                    write_native_bytes(writer, &value.to_le_bytes(), io_path)?;
-                }
+                write_native_bf16_values(writer, &values[start..end], io_path)?;
             }
             other => {
                 return Err(TensorIOError::Corrupt {
@@ -862,6 +859,40 @@ fn write_native_f32_values<W: Write>(
 ) -> Result<(), TensorIOError> {
     let values_per_chunk = FT_NATIVE_F32_VALUE_CHUNK_BYTES / std::mem::size_of::<f32>();
     let mut bytes = Vec::with_capacity(FT_NATIVE_F32_VALUE_CHUNK_BYTES);
+    for chunk in values.chunks(values_per_chunk) {
+        bytes.clear();
+        for &value in chunk {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        write_native_bytes(writer, &bytes, io_path)?;
+    }
+    Ok(())
+}
+
+fn write_native_f16_values<W: Write>(
+    writer: &mut W,
+    values: &[Float16],
+    io_path: &str,
+) -> Result<(), TensorIOError> {
+    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<Float16>();
+    let mut bytes = Vec::with_capacity(FT_NATIVE_HALF_VALUE_CHUNK_BYTES);
+    for chunk in values.chunks(values_per_chunk) {
+        bytes.clear();
+        for &value in chunk {
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        write_native_bytes(writer, &bytes, io_path)?;
+    }
+    Ok(())
+}
+
+fn write_native_bf16_values<W: Write>(
+    writer: &mut W,
+    values: &[BFloat16],
+    io_path: &str,
+) -> Result<(), TensorIOError> {
+    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<BFloat16>();
+    let mut bytes = Vec::with_capacity(FT_NATIVE_HALF_VALUE_CHUNK_BYTES);
     for chunk in values.chunks(values_per_chunk) {
         bytes.clear();
         for &value in chunk {
@@ -3521,6 +3552,49 @@ mod tests {
         summary
     }
 
+    fn native_f16_bf16_save_bulk_summary(state_dict: &BTreeMap<String, DenseTensor>) -> String {
+        use std::fmt::Write as _;
+
+        let encoded = super::encode_state_dict_to_bytes(state_dict).unwrap();
+        let mut summary = String::new();
+        writeln!(
+            &mut summary,
+            "native_state_dict=ft_serialize_f16_bf16_save_chunk_buffer_frankentorch-kgs4-43"
+        )
+        .unwrap();
+        writeln!(&mut summary, "total_len={}", encoded.len()).unwrap();
+        writeln!(&mut summary, "encoded_hex={}", hex_lower(&encoded)).unwrap();
+        for (key, tensor) in state_dict {
+            let bits = match tensor.meta().dtype() {
+                DType::F16 => tensor
+                    .typed_storage()
+                    .as_f16()
+                    .unwrap()
+                    .iter()
+                    .map(|value| format!("{:04x}", value.to_bits()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                DType::BF16 => tensor
+                    .typed_storage()
+                    .as_bf16()
+                    .unwrap()
+                    .iter()
+                    .map(|value| format!("{:04x}", value.to_bits()))
+                    .collect::<Vec<_>>()
+                    .join(","),
+                other => format!("unexpected-{other:?}"),
+            };
+            writeln!(
+                &mut summary,
+                "key={key} dtype={:?} shape={:?} bits={bits}",
+                tensor.meta().dtype(),
+                tensor.meta().shape()
+            )
+            .unwrap();
+        }
+        summary
+    }
+
     fn test_temp_path(basename: &str) -> std::path::PathBuf {
         let thread_id = format!("{:?}", std::thread::current().id());
         let thread_id_sanitized: String = thread_id
@@ -3885,6 +3959,53 @@ mod tests {
                 "../../../artifacts/optimization/golden_outputs/ft_serialize_f64_save_bulk_frankentorch-kgs4-37.txt"
             )
         );
+    }
+
+    #[test]
+    fn native_format_f16_bf16_save_bulk_golden_summary_matches_fixture() {
+        let mut sd = BTreeMap::new();
+        sd.insert(
+            "z.f16".to_string(),
+            DenseTensor::from_contiguous_values_f16(
+                vec![
+                    Float16::from_bits(0x0000),
+                    Float16::from_bits(0x8000),
+                    Float16::from_bits(0x0001),
+                    Float16::from_bits(0x7c00),
+                ],
+                vec![4],
+                Device::Cpu,
+            )
+            .unwrap(),
+        );
+        sd.insert(
+            "a.bf16".to_string(),
+            DenseTensor::from_contiguous_values_bf16(
+                vec![
+                    BFloat16::from_bits(0x0000),
+                    BFloat16::from_bits(0x8000),
+                    BFloat16::from_bits(0x0001),
+                    BFloat16::from_bits(0x7f80),
+                ],
+                vec![4],
+                Device::Cpu,
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            native_f16_bf16_save_bulk_summary(&sd),
+            include_str!(
+                "../../../artifacts/optimization/golden_outputs/ft_serialize_f16_bf16_save_chunk_buffer_frankentorch-kgs4-43.txt"
+            )
+        );
+
+        let path = test_temp_path("ft_test_f16_bf16_chunked_native_save");
+        let _ = std::fs::remove_file(&path);
+        save_state_dict(&sd, &path).unwrap();
+        let saved = std::fs::read(&path).unwrap();
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(saved, super::encode_state_dict_to_bytes(&sd).unwrap());
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
-use ft_core::{DenseTensor, Device};
+use ft_core::{BFloat16, DenseTensor, Device, Float16};
 use ft_serialize::{load_state_dict_from_bytes, save_state_dict};
 
 fn native_many_small_f64_payload(tensors: usize, width: usize) -> Vec<u8> {
@@ -63,9 +63,33 @@ fn native_single_f64_state_dict(len: usize) -> BTreeMap<String, DenseTensor> {
     state_dict
 }
 
+fn native_single_f16_state_dict(len: usize) -> BTreeMap<String, DenseTensor> {
+    let values = (0..len)
+        .map(|idx| Float16::from_f32(idx as f32 * 0.000_001))
+        .collect::<Vec<_>>();
+    let tensor =
+        DenseTensor::from_contiguous_values_f16(values, vec![len], Device::Cpu).expect("tensor");
+    let mut state_dict = BTreeMap::new();
+    state_dict.insert("layer.0000.weight".to_string(), tensor);
+    state_dict
+}
+
+fn native_single_bf16_state_dict(len: usize) -> BTreeMap<String, DenseTensor> {
+    let values = (0..len)
+        .map(|idx| BFloat16::from_f32(idx as f32 * 0.000_001))
+        .collect::<Vec<_>>();
+    let tensor =
+        DenseTensor::from_contiguous_values_bf16(values, vec![len], Device::Cpu).expect("tensor");
+    let mut state_dict = BTreeMap::new();
+    state_dict.insert("layer.0000.weight".to_string(), tensor);
+    state_dict
+}
+
 fn bench_native_save(c: &mut Criterion) {
     let state_dict_f32 = native_single_f32_state_dict(1_000_000);
     let state_dict_f64 = native_single_f64_state_dict(1_000_000);
+    let state_dict_f16 = native_single_f16_state_dict(1_000_000);
+    let state_dict_bf16 = native_single_bf16_state_dict(1_000_000);
     let mut group = c.benchmark_group("native_state_dict");
     group.bench_function("save_single_f32_1m", |b| {
         b.iter(|| {
@@ -75,6 +99,16 @@ fn bench_native_save(c: &mut Criterion) {
     group.bench_function("save_single_f64_1m", |b| {
         b.iter(|| {
             save_state_dict(black_box(&state_dict_f64), black_box("/dev/null")).expect("save")
+        });
+    });
+    group.bench_function("save_single_f16_1m", |b| {
+        b.iter(|| {
+            save_state_dict(black_box(&state_dict_f16), black_box("/dev/null")).expect("save")
+        });
+    });
+    group.bench_function("save_single_bf16_1m", |b| {
+        b.iter(|| {
+            save_state_dict(black_box(&state_dict_bf16), black_box("/dev/null")).expect("save")
         });
     });
     group.finish();
