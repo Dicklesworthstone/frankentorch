@@ -1,10 +1,6 @@
 #![forbid(unsafe_code)]
 
-use std::{
-    collections::{BTreeMap, btree_map::Entry},
-    fmt,
-    sync::Arc,
-};
+use std::{collections::HashMap, fmt, sync::Arc};
 
 use ft_core::{
     BFloat16, DType, Device, ExecutionMode, Float16, ScalarTensor, TensorCompatError, TensorMeta,
@@ -921,10 +917,32 @@ impl fmt::Display for SchemaRegistryError {
 
 impl std::error::Error for SchemaRegistryError {}
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Clone, Default)]
 pub struct SchemaRegistry {
-    entries: BTreeMap<String, SchemaDispatchEntry>,
+    entries: Vec<SchemaDispatchEntry>,
+    name_to_index: HashMap<String, usize>,
 }
+
+impl fmt::Debug for SchemaRegistry {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("SchemaRegistry")
+            .field("entries", &self.iter().collect::<Vec<_>>())
+            .finish()
+    }
+}
+
+impl PartialEq for SchemaRegistry {
+    fn eq(&self, other: &Self) -> bool {
+        self.len() == other.len()
+            && self.entries.iter().all(|entry| {
+                other
+                    .lookup(entry.normalized_name.as_str())
+                    .is_ok_and(|other_entry| other_entry == entry)
+            })
+    }
+}
+
+impl Eq for SchemaRegistry {}
 
 impl SchemaRegistry {
     #[must_use]
@@ -964,14 +982,11 @@ impl SchemaRegistry {
                 schema.op.unambiguous_name(),
             ),
         };
-        let vacant_entry = match self.entries.entry(normalized_name) {
-            Entry::Vacant(entry) => entry,
-            Entry::Occupied(entry) => {
-                return Err(SchemaRegistryError::DuplicateSchema {
-                    name: entry.key().clone(),
-                });
-            }
-        };
+        if self.name_to_index.contains_key(normalized_name.as_str()) {
+            return Err(SchemaRegistryError::DuplicateSchema {
+                name: normalized_name,
+            });
+        }
 
         let op = BinaryOp::from_schema_base(name.base.as_str()).ok_or_else(|| {
             SchemaRegistryError::UnsupportedOperator {
@@ -979,8 +994,10 @@ impl SchemaRegistry {
             }
         })?;
 
-        let normalized_name = vacant_entry.key().clone();
-        vacant_entry.insert(SchemaDispatchEntry {
+        let entry_index = self.entries.len();
+        self.name_to_index
+            .insert(normalized_name.clone(), entry_index);
+        self.entries.push(SchemaDispatchEntry {
             normalized_name: normalized_name.clone(),
             op,
             keyset,
@@ -994,15 +1011,22 @@ impl SchemaRegistry {
         &self,
         normalized_name: &str,
     ) -> Result<&SchemaDispatchEntry, SchemaRegistryError> {
-        self.entries
-            .get(normalized_name)
-            .ok_or_else(|| SchemaRegistryError::MissingSchema {
-                name: normalized_name.to_string(),
-            })
+        if let Some(&entry_index) = self.name_to_index.get(normalized_name)
+            && let Some(entry) = self.entries.get(entry_index)
+        {
+            return Ok(entry);
+        }
+
+        Err(SchemaRegistryError::MissingSchema {
+            name: normalized_name.to_string(),
+        })
     }
 
     pub fn iter(&self) -> impl Iterator<Item = &SchemaDispatchEntry> {
-        self.entries.values()
+        let mut ordered_entries = self.entries.iter().collect::<Vec<_>>();
+        ordered_entries
+            .sort_unstable_by(|left, right| left.normalized_name.cmp(&right.normalized_name));
+        ordered_entries.into_iter()
     }
 }
 
@@ -8676,6 +8700,32 @@ mod tests {
         assert_eq!(names.len(), 2);
         assert!(names.contains(&"add"));
         assert!(names.contains(&"sub"));
+    }
+
+    #[test]
+    fn schema_registry_iter_and_eq_are_order_stable() {
+        let keyset =
+            super::DispatchKeySet::from_keys(&[DispatchKey::CPU, DispatchKey::AutogradCPU]);
+        let parsed_add = parse_schema_or_name("add.alpha").unwrap();
+        let parsed_matmul = parse_schema_or_name("matmul.gamma").unwrap();
+        let parsed_sub = parse_schema_or_name("sub.beta").unwrap();
+
+        let mut forward = SchemaRegistry::new();
+        forward.register(&parsed_add, keyset).unwrap();
+        forward.register(&parsed_matmul, keyset).unwrap();
+        forward.register(&parsed_sub, keyset).unwrap();
+
+        let mut reverse = SchemaRegistry::new();
+        reverse.register(&parsed_sub, keyset).unwrap();
+        reverse.register(&parsed_matmul, keyset).unwrap();
+        reverse.register(&parsed_add, keyset).unwrap();
+
+        let names: Vec<&str> = reverse
+            .iter()
+            .map(|entry| entry.normalized_name.as_str())
+            .collect();
+        assert_eq!(names, vec!["add_alpha", "matmul_gamma", "sub_beta"]);
+        assert_eq!(forward, reverse);
     }
 
     // ── bd-2rfh: DispatchKeyError::NoTypeKey and NoBackendKey ──
