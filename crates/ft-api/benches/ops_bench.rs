@@ -244,6 +244,37 @@ fn bench_layer_norm(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_rms_norm(c: &mut Criterion) {
+    // RMSNorm over the last dim (LLaMA-style), no-grad and grad f64.
+    let mut group = c.benchmark_group("rms_norm");
+    let (rows, hidden) = (2048usize, 1024usize);
+    group.bench_function("nograd_2048x1024", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_randn(vec![rows, hidden], false).unwrap();
+        let w = session.tensor_randn(vec![hidden], false).unwrap();
+        b.iter(|| {
+            black_box(
+                session
+                    .functional_rms_norm(x, vec![hidden], Some(w), 1e-6)
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("grad_2048x1024", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session.tensor_randn(vec![rows, hidden], true).unwrap();
+            let w = session.tensor_randn(vec![hidden], true).unwrap();
+            let out = session
+                .functional_rms_norm(x, vec![hidden], Some(w), 1e-6)
+                .unwrap();
+            let loss = session.tensor_sum(out).unwrap();
+            black_box(session.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
 fn bench_sdpa(c: &mut Criterion) {
     // Scaled-dot-product attention, no-grad f64. num_bh=16, seq=512, d=64 -> the
     // score matrix is 16*512*512*8 = 33.5MB; the fused kernel never materialises
@@ -745,6 +776,7 @@ criterion_group!(
     bench_linear_train,
     bench_sdpa,
     bench_layer_norm,
+    bench_rms_norm,
     bench_linear_forward,
     bench_interpolate_bicubic,
     bench_interpolate_trilinear,

@@ -2743,6 +2743,97 @@ pub fn layer_norm_backward_f64(
     (dx, dweight, dbias)
 }
 
+/// Fused RMSNorm forward (f64): per row of `[batch, norm_size]`, computes
+/// `y = x / sqrt(mean(x²) + eps) * weight` in one streaming pass (no mean
+/// subtraction — modern-LLM RMSNorm), never materialising the op-graph
+/// intermediates (square, broadcast mean, eps tensor, …). Parallel over rows.
+#[must_use]
+pub fn rms_norm_forward_f64(
+    x: &[f64],
+    weight: Option<&[f64]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f64,
+) -> Vec<f64> {
+    let inv_n = 1.0 / norm_size as f64;
+    let mut out = vec![0.0f64; batch * norm_size];
+    out.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mut ss = 0.0f64;
+            for &v in xrow {
+                ss += v * v;
+            }
+            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+            for j in 0..norm_size {
+                let mut y = xrow[j] * rstd;
+                if let Some(w) = weight {
+                    y *= w[j];
+                }
+                orow[j] = y;
+            }
+        });
+    out
+}
+
+/// Backward of [`rms_norm_forward_f64`]. Given `dy`, the saved `x` and optional
+/// `weight`, returns `(dx, dweight?)`. With `g[j] = dy[j]·w[j]`,
+/// `rstd = 1/sqrt(mean(x²)+eps)`, `c = Σ_j g[j]·x[j]`:
+///   `dx[i] = rstd·g[i] − (rstd³·c/N)·x[i]`,
+///   `dweight[j] = Σ_rows dy[j]·x[j]·rstd`.
+/// `dx` is parallel over rows; `dweight` a deterministic serial row reduction.
+#[must_use]
+pub fn rms_norm_backward_f64(
+    dy: &[f64],
+    x: &[f64],
+    weight: Option<&[f64]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f64,
+) -> (Vec<f64>, Option<Vec<f64>>) {
+    let inv_n = 1.0 / norm_size as f64;
+    let mut dx = vec![0.0f64; batch * norm_size];
+    dx.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, dxrow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+            let mut ss = 0.0f64;
+            for &v in xrow {
+                ss += v * v;
+            }
+            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+            let mut c = 0.0f64;
+            for j in 0..norm_size {
+                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+                c += g * xrow[j];
+            }
+            let coef = rstd * rstd * rstd * c * inv_n;
+            for j in 0..norm_size {
+                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+                dxrow[j] = rstd * g - coef * xrow[j];
+            }
+        });
+    let dweight = weight.map(|_| {
+        let mut dw = vec![0.0f64; norm_size];
+        for r in 0..batch {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+            let mut ss = 0.0f64;
+            for &v in xrow {
+                ss += v * v;
+            }
+            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+            for j in 0..norm_size {
+                dw[j] += dyrow[j] * xrow[j] * rstd;
+            }
+        }
+        dw
+    });
+    (dx, dweight)
+}
+
 pub fn linear_tensor_f64(
     x: &[f64],
     weight: &[f64],
