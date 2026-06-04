@@ -4734,6 +4734,16 @@ pub fn lu_solve_contiguous_f64(
     // Forward substitution: L * y = P * b. The inner `rhs` loop is deliberate:
     // each L coefficient is loaded once and applied across all RHS columns
     // (cache/SIMD-amortized), which beats a per-column solve that re-streams L.
+    //
+    // DELIBERATELY SERIAL — do not rayon-parallelize the trailing-row updates.
+    // Measured (inv via lu_solve, num_rhs = n): a per-step row fan-out gated on
+    // work REGRESSED inv ~2x (256: 49->132ms, 512: 199->380ms). The updates are
+    // memory-bound rank-1 AXPYs and the k-loop is sequential, so each step is a
+    // short parallel region; ~2n rayon join barriers plus shared-memory-bandwidth
+    // contention swamp the gain. (Contrast cholesky, whose per-column inner DOT
+    // products are compute-bound and do parallelize ~1.7x.) The real lever here is
+    // a cache-BLOCKED triangular solve (TRSM via the cache-blocked dgemm), not
+    // thread-level parallelism. See project_perf_binding_constraints memory.
     for k in 0..n {
         for i in (k + 1)..n {
             let l_ik = factor.lu[i * n + k];
