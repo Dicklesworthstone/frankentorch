@@ -3120,6 +3120,72 @@ pub fn batch_norm_apply_f64(
     out
 }
 
+/// Training backward of BatchNorm (NCHW) given the batch `mean`/`var` used in the
+/// forward and the affine `weight`. Returns `(dx, dweight, dbias)`.
+///
+/// Per channel `c` (reduction over the `batch·spatial` strided elements):
+///   `dbias[c] = Σ dy`,  `dweight[c] = Σ dy·xhat`   (xhat = (x−mean)·rstd),
+/// and since `Σ dxhat = w·dbias` and `Σ dxhat·xhat = w·dweight` (dxhat = dy·w):
+///   `dx[i] = rstd/M·(M·dy[i]·w − w·dbias[c] − xhat[i]·w·dweight[c])`.
+/// Pass A (per-channel reductions) is parallel over channels; pass B (dx) over
+/// the NCHW blocks. `dweight`/`dbias` come deterministic from pass A.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn batch_norm_backward_f64(
+    dy: &[f64],
+    x: &[f64],
+    weight: &[f64],
+    mean: &[f64],
+    var: &[f64],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let m = (batch * spatial) as f64;
+    let inv_m = 1.0 / m;
+    let cs = channels * spatial;
+    let mut dweight = vec![0.0f64; channels];
+    let mut dbias = vec![0.0f64; channels];
+    dweight
+        .par_iter_mut()
+        .zip(dbias.par_iter_mut())
+        .enumerate()
+        .for_each(|(c, (dwc, dbc))| {
+            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let mut sw = 0.0f64;
+            let mut sb = 0.0f64;
+            for n in 0..batch {
+                let base = n * cs + c * spatial;
+                for s in 0..spatial {
+                    let dyi = dy[base + s];
+                    let xhat = (x[base + s] - mean[c]) * rstd;
+                    sw += dyi * xhat;
+                    sb += dyi;
+                }
+            }
+            *dwc = sw;
+            *dbc = sb;
+        });
+    let mut dx = vec![0.0f64; x.len()];
+    dx.par_chunks_mut(spatial)
+        .enumerate()
+        .for_each(|(idx, dxrow)| {
+            let c = idx % channels;
+            let base = idx * spatial;
+            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let w = weight[c];
+            let c1 = w * dbias[c];
+            let c2 = w * dweight[c];
+            for s in 0..spatial {
+                let xhat = (x[base + s] - mean[c]) * rstd;
+                let dxhat = dy[base + s] * w;
+                dxrow[s] = rstd * inv_m * (m * dxhat - c1 - xhat * c2);
+            }
+        });
+    (dx, dweight, dbias)
+}
+
 pub fn linear_tensor_f64(
     x: &[f64],
     weight: &[f64],

@@ -19433,6 +19433,97 @@ impl FrankenTorchSession {
             return Ok((out_t, None, None));
         }
 
+        // Fused GRAD fast path (f64, TRAINING, affine weight+bias present): a custom
+        // autograd op (fused forward + batch_norm_backward_f64) for the output;
+        // running stats updated detached (same as the no-grad path). Eval-grad /
+        // non-affine / non-f64 fall through to the op-graph.
+        if training {
+            if let (Some(w), Some(bs)) = (weight, bias) {
+                if bn_grad
+                    && self.tensor_dtype(input)? == DType::F64
+                    && self.tensor_dtype(w)? == DType::F64
+                    && self.tensor_dtype(bs)? == DType::F64
+                {
+                    let spatial = height * width;
+                    let x = self.tensor_values(input)?;
+                    let (mean, var) =
+                        ft_kernel_cpu::batch_norm_stats_f64(&x, batch_size, channels, spatial);
+                    let updated_mean = match running_mean {
+                        Some(rm) => {
+                            let rmv = self.tensor_values(rm)?;
+                            let um: Vec<f64> = rmv
+                                .iter()
+                                .zip(mean.iter())
+                                .map(|(&r, &m)| (1.0 - momentum) * r + momentum * m)
+                                .collect();
+                            Some(self.tensor_variable(um, vec![channels], false)?)
+                        }
+                        None => None,
+                    };
+                    let updated_var = match running_var {
+                        Some(rv) => {
+                            let bessel = if sample_count > 1 {
+                                sample_count as f64 / (sample_count as f64 - 1.0)
+                            } else {
+                                1.0
+                            };
+                            let rvv = self.tensor_values(rv)?;
+                            let uv: Vec<f64> = rvv
+                                .iter()
+                                .zip(var.iter())
+                                .map(|(&r, &v)| (1.0 - momentum) * r + momentum * v * bessel)
+                                .collect();
+                            Some(self.tensor_variable(uv, vec![channels], false)?)
+                        }
+                        None => None,
+                    };
+                    let (m_fwd, v_fwd) = (mean.clone(), var.clone());
+                    let (m_bwd, v_bwd) = (mean, var);
+                    let (bsz, ch, sp, eps_c) = (batch_size, channels, spatial, eps);
+                    let ishape = input_shape.clone();
+                    let out_t = self.tensor_apply_function(
+                        &[input, w, bs],
+                        move |ctx, ins| {
+                            let (xv, _) = ins[0];
+                            let (wv, _) = ins[1];
+                            let (bv, _) = ins[2];
+                            let out = ft_kernel_cpu::batch_norm_apply_f64(
+                                xv,
+                                &m_fwd,
+                                &v_fwd,
+                                Some(wv),
+                                Some(bv),
+                                bsz,
+                                ch,
+                                sp,
+                                eps_c,
+                            );
+                            ctx.save_for_backward(xv.to_vec(), ishape.clone());
+                            ctx.save_for_backward(wv.to_vec(), vec![ch]);
+                            Ok((out, ishape.clone()))
+                        },
+                        move |ctx, grad_outputs| {
+                            let dy = grad_outputs[0];
+                            let saved = ctx.saved_tensors();
+                            let (dx, dw, db) = ft_kernel_cpu::batch_norm_backward_f64(
+                                dy,
+                                &saved[0],
+                                &saved[1],
+                                &m_bwd,
+                                &v_bwd,
+                                bsz,
+                                ch,
+                                sp,
+                                eps_c,
+                            );
+                            Ok(vec![Some(dx), Some(dw), Some(db)])
+                        },
+                    )?;
+                    return Ok((out_t, updated_mean, updated_var));
+                }
+            }
+        }
+
         let permuted = self.tensor_permute(input, vec![0, 2, 3, 1])?;
         let flat = self.tensor_reshape(permuted, vec![sample_count, channels])?;
         let (normalized_flat, updated_mean, updated_var) = if training {
@@ -83046,6 +83137,76 @@ mod tests {
                     "running_var",
                 );
             }
+        }
+    }
+
+    #[test]
+    fn functional_batch_norm2d_grad_matches_finite_diff() {
+        // Fused training-mode BatchNorm2d grad must compute the true gradient of
+        // the forward (dx/dweight/dbias) — validated against central finite
+        // differences of the (no-grad, fused) forward.
+        let (n, ch, h, w) = (3usize, 4usize, 2usize, 3usize);
+        let xv: Vec<f64> = (0..n * ch * h * w)
+            .map(|i| ((i % 11) as f64 - 5.0) * 0.3 + (i as f64) * 0.01)
+            .collect();
+        let wv: Vec<f64> = (0..ch).map(|c| 0.7 + 0.1 * c as f64).collect();
+        let bv: Vec<f64> = (0..ch).map(|c| 0.05 * c as f64 - 0.1).collect();
+        let rm: Vec<f64> = vec![0.0; ch];
+        let rv: Vec<f64> = vec![1.0; ch];
+        let (mom, eps) = (0.1, 1e-5);
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, ch, h, w], true).unwrap();
+        let wt = s.tensor_variable(wv.clone(), vec![ch], true).unwrap();
+        let bt = s.tensor_variable(bv.clone(), vec![ch], true).unwrap();
+        let rmt = s.tensor_variable(rm.clone(), vec![ch], false).unwrap();
+        let rvt = s.tensor_variable(rv.clone(), vec![ch], false).unwrap();
+        let (out, _, _) = s
+            .functional_batch_norm2d(x, Some(rmt), Some(rvt), Some(wt), Some(bt), true, mom, eps)
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let gw = s.tensor_grad(wt).unwrap().unwrap();
+        let gb = s.tensor_grad(bt).unwrap().unwrap();
+
+        let loss_fn = |xs: &[f64], ws: &[f64], bs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, ch, h, w], false).unwrap();
+            let wi = s2.tensor_variable(ws.to_vec(), vec![ch], false).unwrap();
+            let bi = s2.tensor_variable(bs.to_vec(), vec![ch], false).unwrap();
+            let rmi = s2.tensor_variable(rm.clone(), vec![ch], false).unwrap();
+            let rvi = s2.tensor_variable(rv.clone(), vec![ch], false).unwrap();
+            let (o, _, _) = s2
+                .functional_batch_norm2d(xi, Some(rmi), Some(rvi), Some(wi), Some(bi), true, mom, eps)
+                .unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        let check = |g: f64, fd: f64, what: &str, idx: usize| {
+            assert!(
+                (g - fd).abs() <= 1e-4 + 1e-4 * fd.abs(),
+                "{what}[{idx}]: analytic {g} vs finite-diff {fd}"
+            );
+        };
+        for i in 0..n * ch * h * w {
+            let (mut xp, mut xm) = (xv.clone(), xv.clone());
+            xp[i] += hh;
+            xm[i] -= hh;
+            let fd = (loss_fn(&xp, &wv, &bv) - loss_fn(&xm, &wv, &bv)) / (2.0 * hh);
+            check(gx[i], fd, "dx", i);
+        }
+        for j in 0..ch {
+            let (mut wp, mut wm) = (wv.clone(), wv.clone());
+            wp[j] += hh;
+            wm[j] -= hh;
+            let fdw = (loss_fn(&xv, &wp, &bv) - loss_fn(&xv, &wm, &bv)) / (2.0 * hh);
+            check(gw[j], fdw, "dweight", j);
+            let (mut bp, mut bm) = (bv.clone(), bv.clone());
+            bp[j] += hh;
+            bm[j] -= hh;
+            let fdb = (loss_fn(&xv, &wv, &bp) - loss_fn(&xv, &wv, &bm)) / (2.0 * hh);
+            check(gb[j], fdb, "dbias", j);
         }
     }
 

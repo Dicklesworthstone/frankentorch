@@ -270,6 +270,24 @@ fn bench_batch_norm(c: &mut Criterion) {
             });
         });
     }
+    // Training forward + backward.
+    group.bench_function("grad_train_32x256x28x28", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session.tensor_randn(vec![n, ch, h, w], true).unwrap();
+            let rm = session.tensor_randn(vec![ch], false).unwrap();
+            let rv = session
+                .tensor_variable(vec![1.0; ch], vec![ch], false)
+                .unwrap();
+            let wt = session.tensor_randn(vec![ch], true).unwrap();
+            let bias = session.tensor_randn(vec![ch], true).unwrap();
+            let (out, _, _) = session
+                .functional_batch_norm2d(x, Some(rm), Some(rv), Some(wt), Some(bias), true, 0.1, 1e-5)
+                .unwrap();
+            let loss = session.tensor_sum(out).unwrap();
+            black_box(session.tensor_backward(loss).unwrap())
+        });
+    });
     group.finish();
 }
 
