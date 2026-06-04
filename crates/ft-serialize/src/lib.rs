@@ -3453,6 +3453,14 @@ mod tests {
         DenseTensor::from_contiguous_values_f32(values, shape, Device::Cpu).unwrap()
     }
 
+    fn f64_tensor_from_bits(bits: &[u64], shape: Vec<usize>) -> DenseTensor {
+        let values = bits
+            .iter()
+            .map(|bits| f64::from_bits(*bits))
+            .collect::<Vec<_>>();
+        DenseTensor::from_contiguous_values(values, shape, Device::Cpu).unwrap()
+    }
+
     fn native_f32_save_bulk_summary(state_dict: &BTreeMap<String, DenseTensor>) -> String {
         use std::fmt::Write as _;
 
@@ -3470,6 +3478,36 @@ mod tests {
             let bits = values
                 .iter()
                 .map(|value| format!("{:08x}", value.to_bits()))
+                .collect::<Vec<_>>()
+                .join(",");
+            writeln!(
+                &mut summary,
+                "key={key} dtype={:?} shape={:?} bits={bits}",
+                tensor.meta().dtype(),
+                tensor.meta().shape()
+            )
+            .unwrap();
+        }
+        summary
+    }
+
+    fn native_f64_save_bulk_summary(state_dict: &BTreeMap<String, DenseTensor>) -> String {
+        use std::fmt::Write as _;
+
+        let encoded = super::encode_state_dict_to_bytes(state_dict).unwrap();
+        let mut summary = String::new();
+        writeln!(
+            &mut summary,
+            "native_state_dict=ft_serialize_f64_save_bulk_frankentorch-kgs4-37"
+        )
+        .unwrap();
+        writeln!(&mut summary, "total_len={}", encoded.len()).unwrap();
+        writeln!(&mut summary, "encoded_hex={}", hex_lower(&encoded)).unwrap();
+        for (key, tensor) in state_dict {
+            let values = tensor.contiguous_values().unwrap();
+            let bits = values
+                .iter()
+                .map(|value| format!("{:016x}", value.to_bits()))
                 .collect::<Vec<_>>()
                 .join(",");
             writeln!(
@@ -3813,6 +3851,38 @@ mod tests {
             native_f32_save_bulk_summary(&sd),
             include_str!(
                 "../../../artifacts/optimization/golden_outputs/ft_serialize_f32_save_bulk_pass26.txt"
+            )
+        );
+    }
+
+    #[test]
+    fn native_format_f64_save_bulk_golden_summary_matches_fixture() {
+        let mut sd = BTreeMap::new();
+        sd.insert(
+            "z.edge".to_string(),
+            f64_tensor_from_bits(
+                &[
+                    0x0000_0000_0000_0000,
+                    0x8000_0000_0000_0000,
+                    0x0000_0000_0000_0001,
+                    0x7ff0_0000_0000_0000,
+                    0xfff0_0000_0000_0000,
+                    0x7ff8_0000_0000_0001,
+                    0x7ff0_0000_0000_0001,
+                    0x3ff0_0000_0000_0000,
+                ],
+                vec![8],
+            ),
+        );
+        sd.insert(
+            "a.norm".to_string(),
+            f64_tensor_from_bits(&[0xc004_0000_0000_0000, 0x3ff4_0000_0000_0000], vec![2]),
+        );
+
+        assert_eq!(
+            native_f64_save_bulk_summary(&sd),
+            include_str!(
+                "../../../artifacts/optimization/golden_outputs/ft_serialize_f64_save_bulk_frankentorch-kgs4-37.txt"
             )
         );
     }

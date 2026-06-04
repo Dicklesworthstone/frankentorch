@@ -52,11 +52,30 @@ fn native_single_f32_state_dict(len: usize) -> BTreeMap<String, DenseTensor> {
     state_dict
 }
 
+fn native_single_f64_state_dict(len: usize) -> BTreeMap<String, DenseTensor> {
+    let values = (0..len)
+        .map(|idx| idx as f64 * 0.000_001)
+        .collect::<Vec<_>>();
+    let tensor =
+        DenseTensor::from_contiguous_values(values, vec![len], Device::Cpu).expect("tensor");
+    let mut state_dict = BTreeMap::new();
+    state_dict.insert("layer.0000.weight".to_string(), tensor);
+    state_dict
+}
+
 fn bench_native_save(c: &mut Criterion) {
-    let state_dict = native_single_f32_state_dict(1_000_000);
+    let state_dict_f32 = native_single_f32_state_dict(1_000_000);
+    let state_dict_f64 = native_single_f64_state_dict(1_000_000);
     let mut group = c.benchmark_group("native_state_dict");
     group.bench_function("save_single_f32_1m", |b| {
-        b.iter(|| save_state_dict(black_box(&state_dict), black_box("/dev/null")).expect("save"));
+        b.iter(|| {
+            save_state_dict(black_box(&state_dict_f32), black_box("/dev/null")).expect("save")
+        });
+    });
+    group.bench_function("save_single_f64_1m", |b| {
+        b.iter(|| {
+            save_state_dict(black_box(&state_dict_f64), black_box("/dev/null")).expect("save")
+        });
     });
     group.finish();
 }

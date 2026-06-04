@@ -34,6 +34,12 @@ fn transform_config_error(reason: &'static str) -> AutogradError {
     ))
 }
 
+fn dataloader_error(reason: &'static str) -> AutogradError {
+    AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+        ft_dispatch::DispatchKeyError::IncompatibleSet { reason },
+    ))
+}
+
 // ── Data Item ────────────────────────────────────────────────────────────
 
 /// A single data sample returned by a `Dataset`.
@@ -87,6 +93,14 @@ pub trait Dataset {
     /// # Panics
     /// May panic if `index >= self.len()`.
     fn get(&self, index: usize) -> DataItem;
+
+    fn collate_indices(
+        &self,
+        _indices: &[usize],
+        _session: &mut FrankenTorchSession,
+    ) -> Option<Result<Batch, AutogradError>> {
+        None
+    }
 }
 
 // ── TensorDataset ────────────────────────────────────────────────────────
@@ -134,6 +148,14 @@ impl Dataset for TensorDataset {
 
     fn get(&self, index: usize) -> DataItem {
         self.items[index].clone()
+    }
+
+    fn collate_indices(
+        &self,
+        indices: &[usize],
+        session: &mut FrankenTorchSession,
+    ) -> Option<Result<Batch, AutogradError>> {
+        Some(collate_tensor_dataset_items(session, &self.items, indices))
     }
 }
 
@@ -727,11 +749,11 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
             return Ok(None);
         }
 
-        // Collect samples for this batch
-        let mut samples = Vec::with_capacity(batch_size);
         let dataset_len = self.dataset.len();
-        for i in 0..batch_size {
-            let idx = self.indices[self.position + i];
+        let batch_start = self.position;
+        let batch_end = batch_start + batch_size;
+        let batch_indices = &self.indices[batch_start..batch_end];
+        for &idx in batch_indices {
             if idx >= dataset_len {
                 return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                     ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -739,9 +761,18 @@ impl<'a, D: Dataset> DataLoader<'a, D> {
                     },
                 )));
             }
+        }
+        self.position = batch_end;
+
+        if let Some(batch) = self.dataset.collate_indices(batch_indices, session) {
+            return batch.map(Some);
+        }
+
+        // Collect samples for this batch
+        let mut samples = Vec::with_capacity(batch_size);
+        for &idx in batch_indices {
             samples.push(self.dataset.get(idx));
         }
-        self.position += batch_size;
 
         // Collate: stack tensors along a new batch dimension
         let batch = collate(session, &samples, batch_size)?;
@@ -831,6 +862,84 @@ fn collate(
         for sample in samples {
             let (_, ref vals, _) = sample.tensors[tensor_idx];
             batched_values.extend_from_slice(vals);
+        }
+
+        let mut batched_shape = Vec::with_capacity(1 + first_shape.len());
+        batched_shape.push(batch_size);
+        batched_shape.extend_from_slice(first_shape);
+
+        let tensor = session.tensor_variable(batched_values, batched_shape, false)?;
+        batch_tensors.push((name.clone(), tensor));
+    }
+
+    Ok(Batch {
+        tensors: batch_tensors,
+    })
+}
+
+fn collate_tensor_dataset_items(
+    session: &mut FrankenTorchSession,
+    items: &[DataItem],
+    indices: &[usize],
+) -> Result<Batch, AutogradError> {
+    if indices.is_empty() {
+        return Ok(Batch {
+            tensors: Vec::new(),
+        });
+    }
+
+    let first = items
+        .get(indices[0])
+        .ok_or_else(|| dataloader_error("DataLoader: sampler index out of range for dataset"))?;
+    let num_tensors = first.tensors.len();
+    let mut batch_tensors = Vec::with_capacity(num_tensors);
+
+    for tensor_idx in 0..num_tensors {
+        let (ref name, ref first_values, ref first_shape) = first.tensors[tensor_idx];
+        let sample_numel =
+            checked_shape_numel(first_shape, "DataLoader: sample shape volume overflow")?;
+        if first_values.len() != sample_numel {
+            return Err(dataloader_error(
+                "DataLoader: sample values length does not match declared tensor shape",
+            ));
+        }
+
+        for &sample_index in indices.iter().skip(1) {
+            let sample = items.get(sample_index).ok_or_else(|| {
+                dataloader_error("DataLoader: sampler index out of range for dataset")
+            })?;
+            if sample.tensors.len() != num_tensors {
+                return Err(dataloader_error(
+                    "DataLoader: samples have different numbers of tensors",
+                ));
+            }
+            let (ref sample_name, ref sample_values, ref sample_shape) = sample.tensors[tensor_idx];
+            if sample_name != name {
+                return Err(dataloader_error(
+                    "DataLoader: tensor names differ across samples in batch",
+                ));
+            }
+            if sample_shape != first_shape {
+                return Err(dataloader_error(
+                    "DataLoader: tensor shapes differ across samples in batch",
+                ));
+            }
+            if sample_values.len() != sample_numel {
+                return Err(dataloader_error(
+                    "DataLoader: sample values length does not match declared tensor shape",
+                ));
+            }
+        }
+
+        let batch_size = indices.len();
+        let batch_numel = checked_mul(batch_size, sample_numel, "DataLoader: batch size overflow")?;
+        let mut batched_values = Vec::with_capacity(batch_numel);
+        for &sample_index in indices {
+            let sample = items.get(sample_index).ok_or_else(|| {
+                dataloader_error("DataLoader: sampler index out of range for dataset")
+            })?;
+            let (_, ref values, _) = sample.tensors[tensor_idx];
+            batched_values.extend_from_slice(values);
         }
 
         let mut batched_shape = Vec::with_capacity(1 + first_shape.len());
