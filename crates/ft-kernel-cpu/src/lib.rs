@@ -2090,6 +2090,42 @@ fn pairwise_sum_f64(values: &[f64]) -> f64 {
     pairwise_sum_f64(&values[..mid]) + pairwise_sum_f64(&values[mid..])
 }
 
+/// Parallel `pairwise_sum_f64` for large FULL reductions. Splits the SAME
+/// `mid = len/2` tree via `rayon::join` down to `PAR_BLOCK`, then runs the
+/// serial pairwise sum below — the associativity (`left + right` at every node)
+/// is unchanged, so the result is BIT-FOR-BIT identical to `pairwise_sum_f64`.
+/// (Not used inside the per-row softmax/norm loops, where the reduction is small
+/// and rayon would only add overhead.)
+fn pairwise_sum_f64_par(values: &[f64]) -> f64 {
+    // Small PAR_BLOCK leaf so large reductions spread across all cores; the
+    // call site gates the whole reduction on SUM_PARALLEL_THRESHOLD (below that,
+    // rayon::join overhead exceeds the gain — a 100k sum REGRESSED 2.6x while a
+    // 1M sum sped up 9.2x).
+    const PAR_BLOCK: usize = 1 << 14;
+    if values.len() <= PAR_BLOCK {
+        return pairwise_sum_f64(values);
+    }
+    let mid = values.len() / 2;
+    let (left, right) = values.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_sum_f64_par(left),
+        || pairwise_sum_f64_par(right),
+    );
+    ls + rs
+}
+
+/// `pairwise_sum_f64`, parallelised only for large FULL reductions.
+const SUM_PARALLEL_THRESHOLD: usize = 1 << 19; // 524288
+
+#[inline]
+fn pairwise_sum_f64_maybe_par(values: &[f64]) -> f64 {
+    if values.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_sum_f64_par(values)
+    } else {
+        pairwise_sum_f64(values)
+    }
+}
+
 /// Like `pairwise_sum_f64`, but applies a closure `f` to each element
 /// before adding. Used by norm helpers — `norm_l1` sums `|x|`,
 /// `norm_l2` sums `x*x`, generic `norm_lp` sums `|x|^p` — to inherit
@@ -2116,7 +2152,7 @@ pub fn sum_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f64
         return Ok(0.0);
     }
     let offset = meta.storage_offset();
-    Ok(pairwise_sum_f64(&input[offset..offset + numel]))
+    Ok(pairwise_sum_f64_maybe_par(&input[offset..offset + numel]))
 }
 
 pub fn mean_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f64, KernelError> {
@@ -2126,7 +2162,7 @@ pub fn mean_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f6
     if numel == 0 {
         return Ok(f64::NAN);
     }
-    let sum = pairwise_sum_f64(&input[offset..offset + numel]);
+    let sum = pairwise_sum_f64_maybe_par(&input[offset..offset + numel]);
     #[allow(clippy::cast_precision_loss)]
     let n = numel as f64;
     Ok(sum / n)
@@ -13449,6 +13485,20 @@ mod tests {
         for (i, (&o, &x)) in so.iter().zip(pos.iter()).enumerate() {
             assert_eq!(o.to_bits(), x.sqrt().to_bits(), "sqrt @{i}");
         }
+    }
+
+    #[test]
+    fn pairwise_sum_parallel_matches_serial_bit_exact() {
+        // The parallel reduction splits the SAME mid tree via rayon::join, so it
+        // must equal the serial pairwise sum to the bit (above the threshold).
+        let numel = (1 << 19) + 123;
+        let v: Vec<f64> = (0..numel).map(|i| ((i * 17 + 3) % 251) as f64 * 0.013 - 1.5).collect();
+        let serial = super::pairwise_sum_f64(&v);
+        let parallel = super::pairwise_sum_f64_par(&v);
+        assert_eq!(serial.to_bits(), parallel.to_bits(), "{serial} vs {parallel}");
+        let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
+        let s = super::sum_tensor_contiguous_f64(&v, &meta).expect("sum");
+        assert_eq!(s.to_bits(), serial.to_bits());
     }
 
     #[test]
