@@ -3247,6 +3247,111 @@ pub fn conv2d_backward_f64(
     (dpadded, dweight, dbias)
 }
 
+/// Fused max-pool3d forward (f64): per output, the max over its `kd×kh×kw`
+/// window of `[batch, ch, id, ih, iw]`. Parallel over `(batch,ch)` volumes.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_forward_f64(
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; batch * ch * od * oh * ow];
+    out.par_chunks_mut(od * oh * ow).enumerate().for_each(|(plane, orow)| {
+        let ibase = plane * id * ih * iw;
+        for oz in 0..od {
+            let bd = oz * sd;
+            for oy in 0..oh {
+                let bh = oy * sh;
+                for ox in 0..ow {
+                    let bw = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    for kdd in 0..kd {
+                        let dz = ibase + (bd + kdd) * ih * iw;
+                        for kr in 0..kh {
+                            let irow = dz + (bh + kr) * iw + bw;
+                            for kc in 0..kw {
+                                let v = input[irow + kc];
+                                if v > m {
+                                    m = v;
+                                }
+                            }
+                        }
+                    }
+                    orow[(oz * oh + oy) * ow + ox] = m;
+                }
+            }
+        }
+    });
+    out
+}
+
+/// Backward of [`max_pool3d_forward_f64`]: routes each output gradient to its
+/// window's (first) argmax. Parallel over `(batch,ch)`; overlaps accumulate.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_backward_f64(
+    dout: &[f64],
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let mut din = vec![0.0f64; batch * ch * id * ih * iw];
+    din.par_chunks_mut(id * ih * iw).enumerate().for_each(|(plane, drow)| {
+        let dbase = plane * od * oh * ow;
+        for oz in 0..od {
+            let bd = oz * sd;
+            for oy in 0..oh {
+                let bh = oy * sh;
+                for ox in 0..ow {
+                    let bw = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    let mut arg = 0usize;
+                    for kdd in 0..kd {
+                        let dz = (bd + kdd) * ih * iw;
+                        for kr in 0..kh {
+                            let loc = dz + (bh + kr) * iw + bw;
+                            for kc in 0..kw {
+                                let v = input[plane * id * ih * iw + loc + kc];
+                                if v > m {
+                                    m = v;
+                                    arg = loc + kc;
+                                }
+                            }
+                        }
+                    }
+                    drow[arg] += dout[dbase + (oz * oh + oy) * ow + ox];
+                }
+            }
+        }
+    });
+    din
+}
+
 /// Fused avg-pool2d forward (f64) over a PADDED `[batch, ch, ph, pw]` input.
 /// Per output: sum over its (clamped) `kh×kw` window divided by the divisor —
 /// `count_include_pad` ? window size : in-bounds (non-pad) element count. Padded

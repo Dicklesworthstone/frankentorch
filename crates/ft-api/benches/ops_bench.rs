@@ -65,6 +65,27 @@ fn bench_bmm(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_max_pool3d(c: &mut Criterion) {
+    // max_pool3d (video/volumetric): [N,C,D,H,W]=[2,32,16,32,32], 2x2x2 stride 2.
+    let mut group = c.benchmark_group("max_pool3d");
+    let (n, ch, d, h, w) = (2usize, 32usize, 16usize, 32usize, 32usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ch, d, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)).unwrap()));
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ch, d, h, w], true).unwrap();
+            let out = s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
 fn bench_pool1d_ct1d(c: &mut Criterion) {
     // 1D sliding-window ops now routed through their fused 2D kernels (H=1).
     let mut group = c.benchmark_group("conv1d_family");
@@ -1148,6 +1169,7 @@ criterion_group!(
     bench_conv_transpose2d,
     bench_max_pool2d,
     bench_avg_pool2d,
+    bench_max_pool3d,
     bench_pool1d_ct1d,
     bench_sum,
     bench_softmax,

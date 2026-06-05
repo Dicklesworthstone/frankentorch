@@ -17242,6 +17242,45 @@ impl FrankenTorchSession {
             &[output_d, output_h, output_w],
             "max_pool3d patch count overflow",
         )?;
+
+        // Fused fast paths (f64): one windowed-max pass instead of the
+        // output_d*output_h*output_w narrow/max_dim/cat composed path.
+        if self.tensor_dtype(input)? == DType::F64 {
+            let out_shape = vec![batch_size, channels, output_d, output_h, output_w];
+            let (b_, ch_, id_, ih_, iw_) =
+                (batch_size, channels, input_d, input_h, input_w);
+            let (kd_, kh_, kw_) = (kernel_d, kernel_h, kernel_w);
+            let (od_, oh_, ow_) = (output_d, output_h, output_w);
+            let (sd_, sh_, sw_) = (stride_d, stride_h, stride_w);
+            if !self.tensor_tape.tensor_requires_grad(input)? {
+                let iv = self.tensor_values(input)?;
+                let out = ft_kernel_cpu::max_pool3d_forward_f64(
+                    &iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            return self.tensor_apply_function(
+                &[input],
+                move |ctx, ins| {
+                    let (iv, _) = ins[0];
+                    let out = ft_kernel_cpu::max_pool3d_forward_f64(
+                        iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
+                    );
+                    ctx.save_for_backward(iv.to_vec(), vec![b_, ch_, id_, ih_, iw_]);
+                    Ok((out, vec![b_, ch_, od_, oh_, ow_]))
+                },
+                move |ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let s = ctx.saved_tensors();
+                    let di = ft_kernel_cpu::max_pool3d_backward_f64(
+                        dout, &s[0], b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_,
+                        sw_,
+                    );
+                    Ok(vec![Some(di)])
+                },
+            );
+        }
+
         let mut patches = Vec::with_capacity(patch_count);
         for out_d in 0..output_d {
             let depth_start =
@@ -83224,6 +83263,36 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(shape, vec![1, 1, 1, 1]);
         assert_eq!(vals, vec![2.5]);
+    }
+
+    #[test]
+    fn functional_max_pool3d_grad_matches_finite_diff() {
+        // Fused max_pool3d grad routes each output gradient to its window argmax.
+        // Distinct input values (no ties) + kernel 2 / stride 1 (overlapping
+        // windows) make finite differences well-defined.
+        let (n, c, d, h, w, k) = (2usize, 2usize, 4usize, 4usize, 4usize, 2usize);
+        let nin = n * c * d * h * w;
+        let xv: Vec<f64> = (0..nin).map(|i| (((i * 37 + 5) % nin) as f64) * 0.1 + 0.001 * i as f64).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, c, d, h, w], true).unwrap();
+        let out = s.functional_max_pool3d(x, (k, k, k), (1, 1, 1)).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let loss_fn = |xs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, c, d, h, w], false).unwrap();
+            let o = s2.functional_max_pool3d(xi, (k, k, k), (1, 1, 1)).unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        for i in 0..nin {
+            let (mut p, mut m) = (xv.clone(), xv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            let fd = (loss_fn(&p) - loss_fn(&m)) / (2.0 * hh);
+            assert!((gx[i] - fd).abs() <= 1e-5 + 1e-4 * fd.abs(), "dx[{i}]: {} vs {fd}", gx[i]);
+        }
     }
 
     #[test]
