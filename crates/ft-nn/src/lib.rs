@@ -4,9 +4,8 @@ use std::collections::BTreeMap;
 
 use ft_api::FrankenTorchSession;
 use ft_autograd::{AutogradError, FunctionCtx, TensorNodeId};
-use ft_core::{DType, DenseTensor, DenseTensorError, Device, TensorMeta};
+use ft_core::{DType, DenseTensor, DenseTensorError, Device};
 use ft_dispatch::{DispatchError, DispatchKeyError};
-use rayon::{iter::ParallelIterator, slice::ParallelSliceMut};
 
 fn incompatible_error(reason: &'static str) -> AutogradError {
     AutogradError::Dispatch(DispatchError::Key(DispatchKeyError::IncompatibleSet {
@@ -4527,29 +4526,6 @@ impl MultiheadAttention {
         packed
     }
 
-    fn transpose_attention_keys(
-        values: &[f64],
-        batch_heads: usize,
-        seq_len: usize,
-        head_dim: usize,
-    ) -> Vec<f64> {
-        let mut transposed = vec![0.0; values.len()];
-        let src_head_stride = seq_len * head_dim;
-        let dst_head_stride = head_dim * seq_len;
-        for batch_head in 0..batch_heads {
-            let src_head =
-                &values[batch_head * src_head_stride..(batch_head + 1) * src_head_stride];
-            let dst_head =
-                &mut transposed[batch_head * dst_head_stride..(batch_head + 1) * dst_head_stride];
-            for (seq, row) in src_head.chunks_exact(head_dim).enumerate() {
-                for (dim, &value) in row.iter().enumerate() {
-                    dst_head[dim * seq_len + seq] = value;
-                }
-            }
-        }
-        transposed
-    }
-
     fn concat_attention_heads(
         values: &[f64],
         batch_size: usize,
@@ -4572,36 +4548,6 @@ impl MultiheadAttention {
             }
         }
         concat
-    }
-
-    fn pairwise_sum_f64(values: &[f64]) -> f64 {
-        const BLOCK: usize = 128;
-        if values.len() <= BLOCK {
-            return values.iter().sum();
-        }
-        let mid = values.len() / 2;
-        let (left, right) = values.split_at(mid);
-        Self::pairwise_sum_f64(left) + Self::pairwise_sum_f64(right)
-    }
-
-    fn softmax_attention_rows_in_place(scores: &mut [f64], row_len: usize) {
-        const PARALLEL_NUMEL_THRESHOLD: usize = 1 << 16;
-        let process = |row: &mut [f64]| {
-            let max_val = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-            for value in row.iter_mut() {
-                *value = (*value - max_val).exp();
-            }
-            let sum = Self::pairwise_sum_f64(row);
-            for value in row {
-                *value /= sum;
-            }
-        };
-
-        if scores.len() >= PARALLEL_NUMEL_THRESHOLD {
-            scores.par_chunks_mut(row_len).for_each(process);
-        } else {
-            scores.chunks_mut(row_len).for_each(process);
-        }
     }
 
     fn no_grad_f64_self_attention_fast_path(
@@ -4677,11 +4623,8 @@ impl MultiheadAttention {
             return Ok(None);
         };
 
-        q_heads =
+        let q_heads =
             Self::pack_attention_heads(&q_heads, seq_len, self.num_heads, self.head_dim, embed_dim);
-        for value in &mut q_heads {
-            *value *= self.scale;
-        }
         let k_heads = Self::pack_attention_heads(
             &k_values,
             seq_len,
@@ -4696,36 +4639,26 @@ impl MultiheadAttention {
             self.head_dim,
             embed_dim,
         );
-        let k_t = Self::transpose_attention_keys(&k_heads, batch_heads, seq_len, self.head_dim);
 
-        let q_meta = TensorMeta::from_shape(
-            vec![batch_heads, seq_len, self.head_dim],
-            DType::F64,
-            Device::Cpu,
+        // Flash attention: fused QK^T + stable row-softmax + scores@V in cache
+        // tiles, never materialising the [batch_heads, S, S] score matrix (the
+        // bmm path built AND softmaxed the full ~67 MB scores at S=1024). The
+        // kernel scales the scores by `self.scale` internally (equivalent to
+        // scaling Q) and applies no causal mask — matching this self-attention
+        // path's plain softmax over all keys. Result matches the bmm+softmax+bmm
+        // path to f64 round-off (softmax is reassociated; MHA parity is tolerance).
+        let head_out = ft_kernel_cpu::sdpa_forward_f64(
+            &q_heads,
+            &k_heads,
+            &v_heads,
+            batch_heads,
+            seq_len,
+            seq_len,
+            self.head_dim,
+            self.head_dim,
+            self.scale,
+            false,
         );
-        let k_t_meta = TensorMeta::from_shape(
-            vec![batch_heads, self.head_dim, seq_len],
-            DType::F64,
-            Device::Cpu,
-        );
-        let mut scores =
-            ft_kernel_cpu::bmm_tensor_contiguous_f64(&q_heads, &k_t, &q_meta, &k_t_meta)
-                .map_err(DispatchError::from)
-                .map_err(AutogradError::Dispatch)?;
-
-        let scores_meta =
-            TensorMeta::from_shape(vec![batch_heads, seq_len, seq_len], DType::F64, Device::Cpu);
-        Self::softmax_attention_rows_in_place(&mut scores, seq_len);
-
-        let v_meta = TensorMeta::from_shape(
-            vec![batch_heads, seq_len, self.head_dim],
-            DType::F64,
-            Device::Cpu,
-        );
-        let head_out =
-            ft_kernel_cpu::bmm_tensor_contiguous_f64(&scores, &v_heads, &scores_meta, &v_meta)
-                .map_err(DispatchError::from)
-                .map_err(AutogradError::Dispatch)?;
         let concat = Self::concat_attention_heads(
             &head_out,
             batch_size,

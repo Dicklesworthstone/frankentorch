@@ -296,10 +296,71 @@ fn bench_rnn_forward(c: &mut Criterion) {
     group.finish();
 }
 
+/// Same-binary A/B for the MHA no-grad attention core (the lever changed in the
+/// flash swap): the OLD `materialized` path (scale Q, transpose K, bmm scores,
+/// row softmax, bmm scores@V — building the full [bh, S, S] score matrix) vs the
+/// NEW `flash` path (ft_kernel_cpu::sdpa_forward_f64, tiled, no materialised
+/// scores). Both run in one binary so the ratio is immune to worker variance.
+fn bench_attention_core(c: &mut Criterion) {
+    use ft_core::{DType, Device, TensorMeta};
+    let mut group = c.benchmark_group("attention_core");
+    for &(bh, s, hd) in &[(8usize, 512usize, 16usize), (8, 1024, 16)] {
+        let scale = 1.0 / (hd as f64).sqrt();
+        let q: Vec<f64> = (0..bh * s * hd).map(|i| (i % 251) as f64 * 0.001 - 0.12).collect();
+        let k: Vec<f64> = (0..bh * s * hd).map(|i| (i % 241) as f64 * 0.0011 - 0.13).collect();
+        let v: Vec<f64> = (0..bh * s * hd).map(|i| (i % 233) as f64 * 0.0009 - 0.10).collect();
+        group.bench_function(&format!("materialized_{bh}x{s}x{hd}"), |b| {
+            b.iter(|| {
+                let qs: Vec<f64> = q.iter().map(|&x| x * scale).collect();
+                let mut k_t = vec![0.0f64; bh * hd * s];
+                for bhi in 0..bh {
+                    for si in 0..s {
+                        for di in 0..hd {
+                            k_t[bhi * hd * s + di * s + si] = k[bhi * s * hd + si * hd + di];
+                        }
+                    }
+                }
+                let q_meta = TensorMeta::from_shape(vec![bh, s, hd], DType::F64, Device::Cpu);
+                let kt_meta = TensorMeta::from_shape(vec![bh, hd, s], DType::F64, Device::Cpu);
+                let mut scores =
+                    ft_kernel_cpu::bmm_tensor_contiguous_f64(&qs, &k_t, &q_meta, &kt_meta).unwrap();
+                // Parallel row softmax, mirroring the old softmax_attention_rows_in_place.
+                use rayon::prelude::*;
+                scores.par_chunks_mut(s).for_each(|row| {
+                    let m = row.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+                    let mut sum = 0.0;
+                    for x in row.iter_mut() {
+                        *x = (*x - m).exp();
+                        sum += *x;
+                    }
+                    for x in row.iter_mut() {
+                        *x /= sum;
+                    }
+                });
+                let sc_meta = TensorMeta::from_shape(vec![bh, s, s], DType::F64, Device::Cpu);
+                let v_meta = TensorMeta::from_shape(vec![bh, s, hd], DType::F64, Device::Cpu);
+                black_box(
+                    ft_kernel_cpu::bmm_tensor_contiguous_f64(&scores, &v, &sc_meta, &v_meta)
+                        .unwrap(),
+                );
+            });
+        });
+        group.bench_function(&format!("flash_{bh}x{s}x{hd}"), |b| {
+            b.iter(|| {
+                black_box(ft_kernel_cpu::sdpa_forward_f64(
+                    &q, &k, &v, bh, s, s, hd, hd, scale, false,
+                ))
+            });
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_multihead_attention,
     bench_multihead_attention_nograd,
+    bench_attention_core,
     bench_lstm_forward,
     bench_gru_forward,
     bench_rnn_forward
