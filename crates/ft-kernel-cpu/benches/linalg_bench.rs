@@ -31,7 +31,9 @@ fn bench_lobpcg(c: &mut Criterion) {
         }
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
         c.bench_function(&format!("lobpcg_f64_{n}x{n}_k8"), |bch| {
-            bch.iter(|| black_box(lobpcg_contiguous_f64(black_box(&a), &meta, 8, true, 100, 1e-9).unwrap()))
+            bch.iter(|| {
+                black_box(lobpcg_contiguous_f64(black_box(&a), &meta, 8, true, 100, 1e-9).unwrap())
+            })
         });
     }
 }

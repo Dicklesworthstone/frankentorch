@@ -122,9 +122,20 @@ mod gemm {
                     // SAFETY: a is m*k; b[n0*k ..] holds bw rows of k; ct is m*bw.
                     unsafe {
                         matrixmultiply::dgemm(
-                            m, k, bw, 1.0, a.as_ptr(), k as isize, 1,
-                            b.as_ptr().add(n0 * k), 1, k as isize,
-                            0.0, ct.as_mut_ptr(), bw as isize, 1,
+                            m,
+                            k,
+                            bw,
+                            1.0,
+                            a.as_ptr(),
+                            k as isize,
+                            1,
+                            b.as_ptr().add(n0 * k),
+                            1,
+                            k as isize,
+                            0.0,
+                            ct.as_mut_ptr(),
+                            bw as isize,
+                            1,
                         );
                     }
                     (n0, ct)
@@ -152,9 +163,20 @@ mod gemm {
         // SAFETY: a is m*k, b is n*k (read as B^T via rsb=1,csb=k), c is m*n.
         unsafe {
             matrixmultiply::dgemm(
-                m, k, n, 1.0, a.as_ptr(), k as isize, 1,
-                b.as_ptr(), 1, k as isize,
-                0.0, c.as_mut_ptr(), n as isize, 1,
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                k as isize,
+                1,
+                b.as_ptr(),
+                1,
+                k as isize,
+                0.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
             );
         }
     }
@@ -307,9 +329,20 @@ mod gemm {
                     // SAFETY: a is m*k; b[n0*k ..] holds bw rows of k; ct is m*bw.
                     unsafe {
                         matrixmultiply::sgemm(
-                            m, k, bw, 1.0, a.as_ptr(), k as isize, 1,
-                            b.as_ptr().add(n0 * k), 1, k as isize,
-                            0.0, ct.as_mut_ptr(), bw as isize, 1,
+                            m,
+                            k,
+                            bw,
+                            1.0,
+                            a.as_ptr(),
+                            k as isize,
+                            1,
+                            b.as_ptr().add(n0 * k),
+                            1,
+                            k as isize,
+                            0.0,
+                            ct.as_mut_ptr(),
+                            bw as isize,
+                            1,
                         );
                     }
                     (n0, ct)
@@ -337,9 +370,20 @@ mod gemm {
         // SAFETY: a is m*k, b is n*k (read as B^T via rsb=1,csb=k), c is m*n.
         unsafe {
             matrixmultiply::sgemm(
-                m, k, n, 1.0, a.as_ptr(), k as isize, 1,
-                b.as_ptr(), 1, k as isize,
-                0.0, c.as_mut_ptr(), n as isize, 1,
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                k as isize,
+                1,
+                b.as_ptr(),
+                1,
+                k as isize,
+                0.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
             );
         }
     }
@@ -1264,7 +1308,11 @@ where
         // of SIMD lanes, so the SIMD/scalar element split is identical to the
         // serial path -> bit-for-bit identical output.
         let threads = rayon::current_num_threads().max(1);
-        let grain = numel.div_ceil(4 * threads).max(SIMD_WIDTH).div_ceil(SIMD_WIDTH) * SIMD_WIDTH;
+        let grain = numel
+            .div_ceil(4 * threads)
+            .max(SIMD_WIDTH)
+            .div_ceil(SIMD_WIDTH)
+            * SIMD_WIDTH;
         output
             .par_chunks_mut(grain)
             .zip(window.par_chunks(grain))
@@ -2337,7 +2385,11 @@ where
     // SIMD lanes -> SIMD/scalar split identical to serial -> bit-for-bit equal).
     if numel >= SIMD_UNARY_PARALLEL_THRESHOLD {
         let threads = rayon::current_num_threads().max(1);
-        let grain = numel.div_ceil(4 * threads).max(SIMD_WIDTH).div_ceil(SIMD_WIDTH) * SIMD_WIDTH;
+        let grain = numel
+            .div_ceil(4 * threads)
+            .max(SIMD_WIDTH)
+            .div_ceil(SIMD_WIDTH)
+            * SIMD_WIDTH;
         output
             .par_chunks_mut(grain)
             .zip(lhs_window.par_chunks(grain))
@@ -3365,7 +3417,14 @@ pub fn conv2d_forward_f64(
     let flat = batch * patch_count;
     let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     let mut out_flat = vec![0.0f64; flat * out_ch];
-    gemm::dgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    gemm::dgemm_bt(
+        flat,
+        patch_width,
+        out_ch,
+        &panel,
+        weight_flat,
+        &mut out_flat,
+    );
     let mut out = vec![0.0f64; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
@@ -3429,7 +3488,14 @@ pub fn conv2d_backward_f64(
     gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
     // dpanel [flat, patch_width] = dout_flat @ weight_flat.
     let mut dpanel = vec![0.0f64; flat * patch_width];
-    gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, &mut dpanel);
+    gemm::dgemm(
+        flat,
+        out_ch,
+        patch_width,
+        &dout_flat,
+        weight_flat,
+        &mut dpanel,
+    );
     let dpadded = conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     let dbias = if has_bias {
         let mut db = vec![0.0f64; out_ch];
@@ -3686,32 +3752,34 @@ pub fn max_pool3d_forward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * od * oh * ow];
-    out.par_chunks_mut(od * oh * ow).enumerate().for_each(|(plane, orow)| {
-        let ibase = plane * id * ih * iw;
-        for oz in 0..od {
-            let bd = oz * sd;
-            for oy in 0..oh {
-                let bh = oy * sh;
-                for ox in 0..ow {
-                    let bw = ox * sw;
-                    let mut m = f64::NEG_INFINITY;
-                    for kdd in 0..kd {
-                        let dz = ibase + (bd + kdd) * ih * iw;
-                        for kr in 0..kh {
-                            let irow = dz + (bh + kr) * iw + bw;
-                            for kc in 0..kw {
-                                let v = input[irow + kc];
-                                if v > m {
-                                    m = v;
+    out.par_chunks_mut(od * oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let ibase = plane * id * ih * iw;
+            for oz in 0..od {
+                let bd = oz * sd;
+                for oy in 0..oh {
+                    let bh = oy * sh;
+                    for ox in 0..ow {
+                        let bw = ox * sw;
+                        let mut m = f64::NEG_INFINITY;
+                        for kdd in 0..kd {
+                            let dz = ibase + (bd + kdd) * ih * iw;
+                            for kr in 0..kh {
+                                let irow = dz + (bh + kr) * iw + bw;
+                                for kc in 0..kw {
+                                    let v = input[irow + kc];
+                                    if v > m {
+                                        m = v;
+                                    }
                                 }
                             }
                         }
+                        orow[(oz * oh + oy) * ow + ox] = m;
                     }
-                    orow[(oz * oh + oy) * ow + ox] = m;
                 }
             }
-        }
-    });
+        });
     out
 }
 
@@ -3738,34 +3806,36 @@ pub fn max_pool3d_backward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut din = vec![0.0f64; batch * ch * id * ih * iw];
-    din.par_chunks_mut(id * ih * iw).enumerate().for_each(|(plane, drow)| {
-        let dbase = plane * od * oh * ow;
-        for oz in 0..od {
-            let bd = oz * sd;
-            for oy in 0..oh {
-                let bh = oy * sh;
-                for ox in 0..ow {
-                    let bw = ox * sw;
-                    let mut m = f64::NEG_INFINITY;
-                    let mut arg = 0usize;
-                    for kdd in 0..kd {
-                        let dz = (bd + kdd) * ih * iw;
-                        for kr in 0..kh {
-                            let loc = dz + (bh + kr) * iw + bw;
-                            for kc in 0..kw {
-                                let v = input[plane * id * ih * iw + loc + kc];
-                                if v > m {
-                                    m = v;
-                                    arg = loc + kc;
+    din.par_chunks_mut(id * ih * iw)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let dbase = plane * od * oh * ow;
+            for oz in 0..od {
+                let bd = oz * sd;
+                for oy in 0..oh {
+                    let bh = oy * sh;
+                    for ox in 0..ow {
+                        let bw = ox * sw;
+                        let mut m = f64::NEG_INFINITY;
+                        let mut arg = 0usize;
+                        for kdd in 0..kd {
+                            let dz = (bd + kdd) * ih * iw;
+                            for kr in 0..kh {
+                                let loc = dz + (bh + kr) * iw + bw;
+                                for kc in 0..kw {
+                                    let v = input[plane * id * ih * iw + loc + kc];
+                                    if v > m {
+                                        m = v;
+                                        arg = loc + kc;
+                                    }
                                 }
                             }
                         }
+                        drow[arg] += dout[dbase + (oz * oh + oy) * ow + ox];
                     }
-                    drow[arg] += dout[dbase + (oz * oh + oy) * ow + ox];
                 }
             }
-        }
-    });
+        });
     din
 }
 
@@ -3795,32 +3865,34 @@ pub fn avg_pool2d_forward_f64(
     count_include_pad: bool,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow).enumerate().for_each(|(plane, orow)| {
-        let pbase = plane * ph * pw;
-        for oy in 0..oh {
-            let rs = oy * sh;
-            let re = (rs + kh).min(ph);
-            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-            for ox in 0..ow {
-                let cs = ox * sw;
-                let ce = (cs + kw).min(pw);
-                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                let mut sum = 0.0f64;
-                for r in rs..re {
-                    let irow = pbase + r * pw;
-                    for c in cs..ce {
-                        sum += padded[irow + c];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let pbase = plane * ph * pw;
+            for oy in 0..oh {
+                let rs = oy * sh;
+                let re = (rs + kh).min(ph);
+                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+                for ox in 0..ow {
+                    let cs = ox * sw;
+                    let ce = (cs + kw).min(pw);
+                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                    let mut sum = 0.0f64;
+                    for r in rs..re {
+                        let irow = pbase + r * pw;
+                        for c in cs..ce {
+                            sum += padded[irow + c];
+                        }
                     }
+                    let div = if count_include_pad {
+                        ((re - rs) * (ce - cs)) as f64
+                    } else {
+                        (vrlen * vclen) as f64
+                    };
+                    orow[oy * ow + ox] = sum / div;
                 }
-                let div = if count_include_pad {
-                    ((re - rs) * (ce - cs)) as f64
-                } else {
-                    (vrlen * vclen) as f64
-                };
-                orow[oy * ow + ox] = sum / div;
             }
-        }
-    });
+        });
     out
 }
 
@@ -3849,31 +3921,33 @@ pub fn avg_pool2d_backward_f64(
     count_include_pad: bool,
 ) -> Vec<f64> {
     let mut dp = vec![0.0f64; batch * ch * ph * pw];
-    dp.par_chunks_mut(ph * pw).enumerate().for_each(|(plane, dprow)| {
-        let dbase = plane * oh * ow;
-        for oy in 0..oh {
-            let rs = oy * sh;
-            let re = (rs + kh).min(ph);
-            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-            for ox in 0..ow {
-                let cs = ox * sw;
-                let ce = (cs + kw).min(pw);
-                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                let div = if count_include_pad {
-                    ((re - rs) * (ce - cs)) as f64
-                } else {
-                    (vrlen * vclen) as f64
-                };
-                let g = dout[dbase + oy * ow + ox] / div;
-                for r in rs..re {
-                    let irow = r * pw;
-                    for c in cs..ce {
-                        dprow[irow + c] += g;
+    dp.par_chunks_mut(ph * pw)
+        .enumerate()
+        .for_each(|(plane, dprow)| {
+            let dbase = plane * oh * ow;
+            for oy in 0..oh {
+                let rs = oy * sh;
+                let re = (rs + kh).min(ph);
+                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+                for ox in 0..ow {
+                    let cs = ox * sw;
+                    let ce = (cs + kw).min(pw);
+                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                    let div = if count_include_pad {
+                        ((re - rs) * (ce - cs)) as f64
+                    } else {
+                        (vrlen * vclen) as f64
+                    };
+                    let g = dout[dbase + oy * ow + ox] / div;
+                    for r in rs..re {
+                        let irow = r * pw;
+                        for c in cs..ce {
+                            dprow[irow + c] += g;
+                        }
                     }
                 }
             }
-        }
-    });
+        });
     dp
 }
 
@@ -3896,26 +3970,28 @@ pub fn max_pool2d_forward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow).enumerate().for_each(|(plane, orow)| {
-        let ibase = plane * ih * iw;
-        for oy in 0..oh {
-            let base_h = oy * sh;
-            for ox in 0..ow {
-                let base_w = ox * sw;
-                let mut m = f64::NEG_INFINITY;
-                for kr in 0..kh {
-                    let irow = ibase + (base_h + kr) * iw + base_w;
-                    for kc in 0..kw {
-                        let v = input[irow + kc];
-                        if v > m {
-                            m = v;
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let ibase = plane * ih * iw;
+            for oy in 0..oh {
+                let base_h = oy * sh;
+                for ox in 0..ow {
+                    let base_w = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    for kr in 0..kh {
+                        let irow = ibase + (base_h + kr) * iw + base_w;
+                        for kc in 0..kw {
+                            let v = input[irow + kc];
+                            if v > m {
+                                m = v;
+                            }
                         }
                     }
+                    orow[oy * ow + ox] = m;
                 }
-                orow[oy * ow + ox] = m;
             }
-        }
-    });
+        });
     out
 }
 
@@ -3993,52 +4069,54 @@ pub fn conv_transpose2d_forward_f64(
     pw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * out_ch * oh * ow];
-    out.par_chunks_mut(oh * ow).enumerate().for_each(|(idx, orow)| {
-        let n = idx / out_ch;
-        let oc = idx % out_ch;
-        let b0 = bias.map_or(0.0, |b| b[oc]);
-        for oy in 0..oh {
-            for ox in 0..ow {
-                let mut acc = b0;
-                for kr in 0..kh {
-                    let y_num = oy + ph;
-                    if y_num < kr {
-                        continue;
-                    }
-                    let yd = y_num - kr;
-                    if yd % sh != 0 {
-                        continue;
-                    }
-                    let iy = yd / sh;
-                    if iy >= ih {
-                        continue;
-                    }
-                    for kc in 0..kw {
-                        let x_num = ox + pw;
-                        if x_num < kc {
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let b0 = bias.map_or(0.0, |b| b[oc]);
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = b0;
+                    for kr in 0..kh {
+                        let y_num = oy + ph;
+                        if y_num < kr {
                             continue;
                         }
-                        let xd = x_num - kc;
-                        if xd % sw != 0 {
+                        let yd = y_num - kr;
+                        if yd % sh != 0 {
                             continue;
                         }
-                        let ix = xd / sw;
-                        if ix >= iw {
+                        let iy = yd / sh;
+                        if iy >= ih {
                             continue;
                         }
-                        let mut s = 0.0f64;
-                        for ic in 0..in_ch {
-                            let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
-                            let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
-                            s += iv * wv;
+                        for kc in 0..kw {
+                            let x_num = ox + pw;
+                            if x_num < kc {
+                                continue;
+                            }
+                            let xd = x_num - kc;
+                            if xd % sw != 0 {
+                                continue;
+                            }
+                            let ix = xd / sw;
+                            if ix >= iw {
+                                continue;
+                            }
+                            let mut s = 0.0f64;
+                            for ic in 0..in_ch {
+                                let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
+                                let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                                s += iv * wv;
+                            }
+                            acc += s;
                         }
-                        acc += s;
                     }
+                    orow[oy * ow + ox] = acc;
                 }
-                orow[oy * ow + ox] = acc;
             }
-        }
-    });
+        });
     out
 }
 
@@ -4205,8 +4283,7 @@ pub fn conv3d_im2col_f64(
                     for kr in 0..kh {
                         let irow = d_off + (base_h + kr) * pw + base_w;
                         let prow_off = pkd + kr * kw;
-                        prow[prow_off..(kw + prow_off)]
-                            .copy_from_slice(&padded[irow..(kw + irow)]);
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
                     }
                 }
             }
@@ -4295,9 +4372,18 @@ pub fn conv3d_forward_f64(
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let flat = batch * patch_count;
-    let panel = conv3d_im2col_f64(padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw);
+    let panel = conv3d_im2col_f64(
+        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
     let mut out_flat = vec![0.0f64; flat * out_ch];
-    gemm::dgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    gemm::dgemm_bt(
+        flat,
+        patch_width,
+        out_ch,
+        &panel,
+        weight_flat,
+        &mut out_flat,
+    );
     let mut out = vec![0.0f64; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
@@ -4350,7 +4436,9 @@ pub fn conv3d_backward_f64(
                 *d = dout[(n * out_ch + oc) * patch_count + p];
             }
         });
-    let panel = conv3d_im2col_f64(padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw);
+    let panel = conv3d_im2col_f64(
+        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
     let mut dout_t = vec![0.0f64; out_ch * flat];
     for r in 0..flat {
         for oc in 0..out_ch {
@@ -4360,9 +4448,17 @@ pub fn conv3d_backward_f64(
     let mut dweight = vec![0.0f64; out_ch * patch_width];
     gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
     let mut dpanel = vec![0.0f64; flat * patch_width];
-    gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, &mut dpanel);
-    let dpadded =
-        conv3d_col2im_f64(&dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw);
+    gemm::dgemm(
+        flat,
+        out_ch,
+        patch_width,
+        &dout_flat,
+        weight_flat,
+        &mut dpanel,
+    );
+    let dpadded = conv3d_col2im_f64(
+        &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
     let dbias = if has_bias {
         let mut db = vec![0.0f64; out_ch];
         for (oc, dbo) in db.iter_mut().enumerate() {
@@ -4386,7 +4482,12 @@ pub fn conv3d_backward_f64(
 /// `0.5·(log(var) + (target − input)²/var [+ log(2π) if full])`. One pass,
 /// parallel — none of the ~7 full-size op-graph intermediates.
 #[must_use]
-pub fn gaussian_nll_forward_f64(input: &[f64], target: &[f64], var: &[f64], full: bool) -> Vec<f64> {
+pub fn gaussian_nll_forward_f64(
+    input: &[f64],
+    target: &[f64],
+    var: &[f64],
+    full: bool,
+) -> Vec<f64> {
     let c = if full {
         (2.0 * std::f64::consts::PI).ln()
     } else {
@@ -8398,15 +8499,31 @@ fn eigh_pythag(a: f64, b: f64) -> f64 {
 /// diagonal-h / sub-diagonal and `z` holds the accumulated reflectors (lower
 /// triangle) plus the tridiagonal diagonal on its own diagonal. The eigenvector
 /// back-transform is split out so the eigenvalues-only path can skip it.
-fn eigh_tred2_reduce(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+#[inline]
+fn lower_packed_index(row: usize, col: usize) -> usize {
+    row * (row + 1) / 2 + col
+}
+
+/// Full-vector tridiagonal reduction over packed lower storage. Arithmetic
+/// order mirrors the full-matrix EISPACK `tred2` loop; the only layout change
+/// is that the upper reflector column `z[j,i] = z[i,j] / h` is stored in
+/// `scaled_reflectors`.
+#[allow(clippy::needless_range_loop)]
+fn eigh_tred2_reduce_packed_full(
+    n: usize,
+    lower: &mut [f64],
+    scaled_reflectors: &mut [f64],
+    d: &mut [f64],
+    e: &mut [f64],
+) {
     for i in (1..n).rev() {
         let l = i - 1;
-        let row_i_start = i * n;
+        let row_i_start = lower_packed_index(i, 0);
         let mut h = 0.0;
         let mut scale = 0.0;
         if l > 0 {
-            let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
-            let row_i = &mut current_and_after[..n];
+            let (previous_rows, current_and_after) = lower.split_at_mut(row_i_start);
+            let row_i = &mut current_and_after[..=i];
             for &value in &row_i[..=l] {
                 scale += value.abs();
             }
@@ -8424,14 +8541,17 @@ fn eigh_tred2_reduce(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
                 row_i[l] = f - g;
                 f = 0.0;
                 for j in 0..=l {
-                    previous_rows[j * n + i] = row_i[j] / h;
+                    scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
                     let mut gg = 0.0;
-                    let row_j = &previous_rows[j * n..j * n + n];
+                    let row_j_start = lower_packed_index(j, 0);
+                    let row_j = &previous_rows[row_j_start..=row_j_start + j];
                     for k in 0..=j {
                         gg += row_j[k] * row_i[k];
                     }
+                    let mut lower_col_offset = lower_packed_index(j + 1, j);
                     for k in (j + 1)..=l {
-                        gg += previous_rows[k * n + j] * row_i[k];
+                        gg += previous_rows[lower_col_offset] * row_i[k];
+                        lower_col_offset += k + 1;
                     }
                     e[j] = gg / h;
                     f += e[j] * row_i[j];
@@ -8441,14 +8561,15 @@ fn eigh_tred2_reduce(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
                     f = row_i[j];
                     let gg = e[j] - hh * f;
                     e[j] = gg;
-                    let row_j = &mut previous_rows[j * n..j * n + n];
+                    let row_j_start = lower_packed_index(j, 0);
+                    let row_j = &mut previous_rows[row_j_start..=row_j_start + j];
                     for k in 0..=j {
                         row_j[k] -= f * e[k] + gg * row_i[k];
                     }
                 }
             }
         } else {
-            e[i] = z[row_i_start + l];
+            e[i] = lower[row_i_start + l];
         }
         d[i] = h;
     }
@@ -8456,10 +8577,7 @@ fn eigh_tred2_reduce(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
     e[0] = 0.0;
 }
 
-fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
-    eigh_tred2_reduce(n, z, d, e);
-    // Eigenvector back-transform: accumulate the stored reflectors into `z` so
-    // it becomes the orthonormal transform whose columns `tql2` then rotates.
+fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
     let mut reflector_col = Vec::with_capacity(n);
     let mut projections = Vec::with_capacity(n);
     for i in 0..n {
@@ -8495,9 +8613,21 @@ fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
     }
 }
 
-#[inline]
-fn lower_packed_index(row: usize, col: usize) -> usize {
-    row * (row + 1) / 2 + col
+fn eigh_tred2_packed_full(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) -> Vec<f64> {
+    let mut scaled_reflectors = vec![0.0f64; lower.len()];
+    eigh_tred2_reduce_packed_full(n, lower, &mut scaled_reflectors, d, e);
+
+    let mut z = vec![0.0f64; n * n];
+    for i in 0..n {
+        let row_start = i * n;
+        let lower_start = lower_packed_index(i, 0);
+        z[row_start..=row_start + i].copy_from_slice(&lower[lower_start..=lower_start + i]);
+        for j in 0..i {
+            z[j * n + i] = scaled_reflectors[lower_packed_index(i, j)];
+        }
+    }
+    eigh_tred2_backtransform(n, &mut z, d);
+    z
 }
 
 /// Eigenvalues-only tridiagonalization over a packed lower triangle.
@@ -8745,15 +8875,15 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     // to 100 full O(n^3) sweeps. `z` starts as the input (lower triangle used)
     // and becomes the orthonormal eigenvector matrix; `d`/`e` carry the
     // tridiagonal diagonal/sub-diagonal.
-    let mut z = vec![0.0f64; n * n];
+    let mut lower = vec![0.0f64; n * (n + 1) / 2];
     for i in 0..n {
-        for j in 0..n {
-            z[i * n + j] = data[offset + i * n + j];
-        }
+        let dst = lower_packed_index(i, 0);
+        let src = offset + i * n;
+        lower[dst..=dst + i].copy_from_slice(&data[src..=src + i]);
     }
     let mut d = vec![0.0f64; n];
     let mut e = vec![0.0f64; n];
-    eigh_tred2(n, &mut z, &mut d, &mut e);
+    let z = eigh_tred2_packed_full(n, &mut lower, &mut d, &mut e);
     let mut zt = vec![0.0f64; n * n];
     for row in 0..n {
         let row_start = row * n;
@@ -8849,11 +8979,7 @@ pub fn eig_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EigResult, 
 /// skipped: the eigenvalues are read from the quasi-triangular `h`, which does
 /// NOT depend on `q_acc`, so they are bit-for-bit identical either way. The
 /// `eigvals` path uses `want_vectors = false`.
-fn eig_impl(
-    data: &[f64],
-    meta: &TensorMeta,
-    want_vectors: bool,
-) -> Result<EigResult, KernelError> {
+fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
     if shape.len() != 2 || shape[0] != shape[1] {
@@ -9102,7 +9228,9 @@ fn eig_impl(
                         break;
                     }
                     let test1 = p_s.abs()
-                        * (h[(m - 1) * n + (m - 1)].abs() + zz.abs() + h[(m + 1) * n + (m + 1)].abs());
+                        * (h[(m - 1) * n + (m - 1)].abs()
+                            + zz.abs()
+                            + h[(m + 1) * n + (m + 1)].abs());
                     let test2 = h[m * n + (m - 1)].abs() * (q_s.abs() + r_s.abs());
                     if test2 <= eps * test1 {
                         break;
@@ -9124,7 +9252,11 @@ fn eig_impl(
                     if k != m {
                         p_s = h[k * n + (k - 1)];
                         q_s = h[(k + 1) * n + (k - 1)];
-                        r_s = if notlast { h[(k + 2) * n + (k - 1)] } else { 0.0 };
+                        r_s = if notlast {
+                            h[(k + 2) * n + (k - 1)]
+                        } else {
+                            0.0
+                        };
                         x = p_s.abs() + q_s.abs() + r_s.abs();
                         if x == 0.0 {
                             k += 1;
@@ -9329,9 +9461,7 @@ fn eig_backsub_eigenvectors(h: &mut [f64], z: &mut [f64], evals: &[f64], n: usiz
                         let mut vr = (wr(i) - p) * (wr(i) - p) + wi(i) * wi(i) - q * q;
                         let vi = (wr(i) - p) * 2.0 * q;
                         if vr == 0.0 && vi == 0.0 {
-                            vr = eps
-                                * norm
-                                * (w.abs() + q.abs() + x.abs() + y.abs() + zz_c.abs());
+                            vr = eps * norm * (w.abs() + q.abs() + x.abs() + y.abs() + zz_c.abs());
                         }
                         let (cr, ci) = eig_cdiv(
                             x * r_c - zz_c * ra + q * sa,
@@ -9342,10 +9472,8 @@ fn eig_backsub_eigenvectors(h: &mut [f64], z: &mut [f64], evals: &[f64], n: usiz
                         h[i * n + na] = cr;
                         h[i * n + en] = ci;
                         if x.abs() > zz_c.abs() + q.abs() {
-                            h[(i + 1) * n + na] =
-                                (-ra - w * h[i * n + na] + q * h[i * n + en]) / x;
-                            h[(i + 1) * n + en] =
-                                (-sa - w * h[i * n + en] - q * h[i * n + na]) / x;
+                            h[(i + 1) * n + na] = (-ra - w * h[i * n + na] + q * h[i * n + en]) / x;
+                            h[(i + 1) * n + en] = (-sa - w * h[i * n + en] - q * h[i * n + na]) / x;
                         } else {
                             let (cr2, ci2) = eig_cdiv(
                                 -r_c - y * h[i * n + na],
@@ -10212,7 +10340,8 @@ pub fn svd_lowrank_contiguous_f64(
     let l = (q + 6).min(max_rank);
 
     // Gaussian sketch Omega (n x l) via SplitMix64 + Box-Muller.
-    let mut rng = 0x243F_6A88_85A3_08D3u64 ^ ((m as u64) << 32) ^ (n as u64).wrapping_mul(2_654_435_761);
+    let mut rng =
+        0x243F_6A88_85A3_08D3u64 ^ ((m as u64) << 32) ^ (n as u64).wrapping_mul(2_654_435_761);
     let mut omega = vec![0.0f64; n * l];
     let mut idx = 0;
     while idx < omega.len() {
@@ -10414,7 +10543,8 @@ pub fn lobpcg_contiguous_f64(
     };
 
     // Initial X: random n x k, orthonormalized.
-    let mut rng = 0x853C_49E6_748F_EA9Bu64 ^ ((n as u64) << 24) ^ (k as u64).wrapping_mul(0x2545F4914F6CDD1D);
+    let mut rng =
+        0x853C_49E6_748F_EA9Bu64 ^ ((n as u64) << 24) ^ (k as u64).wrapping_mul(0x2545F4914F6CDD1D);
     let mut x = vec![0.0f64; n * k];
     let mut idx = 0;
     while idx < x.len() {
@@ -14016,7 +14146,12 @@ mod tests {
         let out = relu_tensor_contiguous_f64(&input, &meta).expect("parallel relu");
         assert_eq!(out.len(), numel);
         for (i, (&o, &x)) in out.iter().zip(input.iter()).enumerate() {
-            assert_eq!(o.to_bits(), x.max(0.0).to_bits(), "relu @{i}: {o} vs {}", x.max(0.0));
+            assert_eq!(
+                o.to_bits(),
+                x.max(0.0).to_bits(),
+                "relu @{i}: {o} vs {}",
+                x.max(0.0)
+            );
         }
         // sqrt shares the same path.
         let pos: Vec<f64> = input.iter().map(|x| x.abs() + 0.5).collect();
@@ -14031,10 +14166,16 @@ mod tests {
         // The parallel reduction splits the SAME mid tree via rayon::join, so it
         // must equal the serial pairwise sum to the bit (above the threshold).
         let numel = (1 << 19) + 123;
-        let v: Vec<f64> = (0..numel).map(|i| ((i * 17 + 3) % 251) as f64 * 0.013 - 1.5).collect();
+        let v: Vec<f64> = (0..numel)
+            .map(|i| ((i * 17 + 3) % 251) as f64 * 0.013 - 1.5)
+            .collect();
         let serial = super::pairwise_sum_f64(&v);
         let parallel = super::pairwise_sum_f64_par(&v);
-        assert_eq!(serial.to_bits(), parallel.to_bits(), "{serial} vs {parallel}");
+        assert_eq!(
+            serial.to_bits(),
+            parallel.to_bits(),
+            "{serial} vs {parallel}"
+        );
         let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
         let s = super::sum_tensor_contiguous_f64(&v, &meta).expect("sum");
         assert_eq!(s.to_bits(), serial.to_bits());
@@ -14046,8 +14187,12 @@ mod tests {
         // SIMD-grain binary path; bit-for-bit identical to scalar a+b/a*b
         // (includes a non-multiple-of-4 tail).
         let numel = (1 << 19) + 5;
-        let lhs: Vec<f64> = (0..numel).map(|i| ((i * 13 + 1) % 101) as f64 * 0.1 - 5.0).collect();
-        let rhs: Vec<f64> = (0..numel).map(|i| ((i * 7 + 3) % 89) as f64 * 0.2 - 4.0).collect();
+        let lhs: Vec<f64> = (0..numel)
+            .map(|i| ((i * 13 + 1) % 101) as f64 * 0.1 - 5.0)
+            .collect();
+        let rhs: Vec<f64> = (0..numel)
+            .map(|i| ((i * 7 + 3) % 89) as f64 * 0.2 - 4.0)
+            .collect();
         let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
         let add = add_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("parallel add");
         let mul = mul_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("parallel mul");
@@ -17646,7 +17791,10 @@ mod tests {
         // signed zeros, and prove it is bit-for-bit identical to the stable
         // comparison sort it replaces — values (to_bits) AND original indices.
         let (rows, cols) = (6usize, 512usize);
-        assert!(cols >= super::SORT_RADIX_MIN_LEN, "lane must hit radix path");
+        assert!(
+            cols >= super::SORT_RADIX_MIN_LEN,
+            "lane must hit radix path"
+        );
         let numel = rows * cols;
         let data: Vec<f64> = (0..numel)
             .map(|i| match i % 7 {
@@ -17663,8 +17811,7 @@ mod tests {
                 .expect("radix sort should succeed");
             for r in 0..rows {
                 let base = r * cols;
-                let mut lane: Vec<(usize, f64)> =
-                    (0..cols).map(|d| (d, data[base + d])).collect();
+                let mut lane: Vec<(usize, f64)> = (0..cols).map(|d| (d, data[base + d])).collect();
                 if desc {
                     lane.sort_by(|a, b| super::nan_greatest_cmp_f64(b.1, a.1));
                 } else {
@@ -17693,7 +17840,10 @@ mod tests {
         // both signed zeros must match the stable comparison sort bit-for-bit
         // (values via to_bits AND original indices) in both directions.
         let (rows, cols) = (6usize, 512usize);
-        assert!(cols >= super::SORT_RADIX_MIN_LEN, "lane must hit radix path");
+        assert!(
+            cols >= super::SORT_RADIX_MIN_LEN,
+            "lane must hit radix path"
+        );
         let numel = rows * cols;
         let data: Vec<f32> = (0..numel)
             .map(|i| match i % 7 {
@@ -17710,8 +17860,7 @@ mod tests {
                 .expect("f32 radix sort should succeed");
             for r in 0..rows {
                 let base = r * cols;
-                let mut lane: Vec<(usize, f32)> =
-                    (0..cols).map(|d| (d, data[base + d])).collect();
+                let mut lane: Vec<(usize, f32)> = (0..cols).map(|d| (d, data[base + d])).collect();
                 if desc {
                     lane.sort_by(|a, b| super::nan_greatest_cmp_f32(b.1, a.1));
                 } else {
@@ -18850,8 +18999,8 @@ mod tests {
         let mut a = vec![0.0f64; n * n];
         for i in 0..n {
             for j in 0..n {
-                a[i * n + j] = (((i * 7 + j * 3 + 1) % 11) as f64 - 5.0)
-                    + if i == j { 3.0 } else { 0.0 };
+                a[i * n + j] =
+                    (((i * 7 + j * 3 + 1) % 11) as f64 - 5.0) + if i == j { 3.0 } else { 0.0 };
             }
         }
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
@@ -19038,8 +19187,8 @@ mod tests {
             }
         }
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
-        let r =
-            super::svd_contiguous_f64(&a, &meta, false).expect("SVD must converge on a Hilbert matrix");
+        let r = super::svd_contiguous_f64(&a, &meta, false)
+            .expect("SVD must converge on a Hilbert matrix");
         let k = r.k;
         // descending, non-negative
         for w in r.s.windows(2) {
@@ -19140,7 +19289,10 @@ mod tests {
         let k = r.k;
         // smallest singular value ~ 0 (rank deficiency)
         let smin = r.s.iter().cloned().fold(f64::INFINITY, f64::min);
-        assert!(smin < 1e-9, "rank-deficient matrix should have a ~0 singular value, got {smin}");
+        assert!(
+            smin < 1e-9,
+            "rank-deficient matrix should have a ~0 singular value, got {smin}"
+        );
         // singular values non-negative and descending
         for w in r.s.windows(2) {
             assert!(w[0] >= w[1] - 1e-12, "singular values must be descending");
@@ -19693,7 +19845,11 @@ mod tests {
             for t in 0..n {
                 dot += r.q[i * n + t] * r.r[t * n + j];
             }
-            assert!((dot - a[i * n + j]).abs() < 1e-7, "(QR)[{i},{j}]={dot} vs {}", a[i * n + j]);
+            assert!(
+                (dot - a[i * n + j]).abs() < 1e-7,
+                "(QR)[{i},{j}]={dot} vs {}",
+                a[i * n + j]
+            );
         }
         // Q^T*Q == I (orthonormal columns)
         for &(c1, c2) in &[(0usize, 0usize), (10, 10), (3, 200), (255, 254)] {
@@ -19702,7 +19858,10 @@ mod tests {
                 dot += r.q[t * n + c1] * r.q[t * n + c2];
             }
             let expected = if c1 == c2 { 1.0 } else { 0.0 };
-            assert!((dot - expected).abs() < 1e-9, "Q^T Q[{c1},{c2}]={dot} vs {expected}");
+            assert!(
+                (dot - expected).abs() < 1e-9,
+                "Q^T Q[{c1},{c2}]={dot} vs {expected}"
+            );
         }
     }
 
@@ -20656,10 +20815,16 @@ mod tests {
     #[test]
     fn pairwise_sum_map_parallel_matches_serial_bit_exact() {
         let numel = (1 << 19) + 77;
-        let v: Vec<f64> = (0..numel).map(|i| ((i * 11 + 7) % 211) as f64 * 0.017 - 1.8).collect();
+        let v: Vec<f64> = (0..numel)
+            .map(|i| ((i * 11 + 7) % 211) as f64 * 0.017 - 1.8)
+            .collect();
         let serial = super::pairwise_sum_map_f64(&v, |x| x * x);
         let parallel = super::pairwise_sum_map_f64_par(&v, |x| x * x);
-        assert_eq!(serial.to_bits(), parallel.to_bits(), "{serial} vs {parallel}");
+        assert_eq!(
+            serial.to_bits(),
+            parallel.to_bits(),
+            "{serial} vs {parallel}"
+        );
         // L2 norm wires the parallel path above the threshold.
         let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
         let nrm = super::norm_tensor_contiguous_f64(&v, &meta, 2.0).expect("norm");
