@@ -2354,7 +2354,6 @@ pub fn div_tensor_broadcast_f64(
 /// transpose is never materialised — the dominant cost of the
 /// transpose-then-matmul path. Result is `[batch, out]`, bit-for-bit identical
 /// to that path.
-#[must_use]
 /// Fused scaled-dot-product attention forward (f64), the flash-attention memory
 /// pattern: process one block of `BR` query rows at a time so only that block's
 /// score tile `[BR, seq_k]` is ever materialised — NEVER the full
