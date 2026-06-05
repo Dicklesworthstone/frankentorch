@@ -2665,6 +2665,52 @@ pub fn layer_norm_forward_f64(
     out
 }
 
+#[must_use]
+pub fn layer_norm_forward_with_stats_f64(
+    x: &[f64],
+    weight: Option<&[f64]>,
+    bias: Option<&[f64]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut out = vec![0.0f64; batch * norm_size];
+    let mut means = vec![0.0f64; batch];
+    let mut rstds = vec![0.0f64; batch];
+    let inv_n = 1.0 / norm_size as f64;
+    out.par_chunks_mut(norm_size)
+        .zip(means.par_iter_mut())
+        .zip(rstds.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, ((orow, mean_slot), rstd_slot))| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mut sum = 0.0f64;
+            for &v in xrow {
+                sum += v;
+            }
+            let mean = sum * inv_n;
+            let mut vsum = 0.0f64;
+            for &v in xrow {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+            *mean_slot = mean;
+            *rstd_slot = rstd;
+            for j in 0..norm_size {
+                let mut y = (xrow[j] - mean) * rstd;
+                if let Some(w) = weight {
+                    y *= w[j];
+                }
+                if let Some(b) = bias {
+                    y += b[j];
+                }
+                orow[j] = y;
+            }
+        });
+    (out, means, rstds)
+}
+
 /// Backward of [`layer_norm_forward_f64`] with affine weight (and bias). Given
 /// `dy` (`[batch, norm_size]`), the saved input `x` and `weight`, returns
 /// `(dx, dweight, dbias)`. Recomputes `mean`/`rstd`/`xhat` per row (cheap) so the
@@ -2733,6 +2779,58 @@ pub fn layer_norm_backward_f64(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            dweight[j] += dyrow[j] * xhat;
+            dbias[j] += dyrow[j];
+        }
+    }
+    (dx, dweight, dbias)
+}
+
+/// Backward of [`layer_norm_forward_with_stats_f64`] with affine weight (and
+/// bias), reusing the forward row statistics. The affine gradient row reduction
+/// stays serial and row-major so floating-point accumulation order is unchanged.
+#[must_use]
+pub fn layer_norm_backward_with_stats_f64(
+    dy: &[f64],
+    x: &[f64],
+    weight: &[f64],
+    means: &[f64],
+    rstds: &[f64],
+    batch: usize,
+    norm_size: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let inv_n = 1.0 / norm_size as f64;
+    let mut dx = vec![0.0f64; batch * norm_size];
+    dx.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, dxrow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+            let mean = means[r];
+            let rstd = rstds[r];
+            let mut c1 = 0.0f64;
+            let mut c2 = 0.0f64;
+            for j in 0..norm_size {
+                let xhat = (xrow[j] - mean) * rstd;
+                let dxhat = dyrow[j] * weight[j];
+                c1 += dxhat;
+                c2 += dxhat * xhat;
+            }
+            for j in 0..norm_size {
+                let xhat = (xrow[j] - mean) * rstd;
+                let dxhat = dyrow[j] * weight[j];
+                dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+            }
+        });
+    let mut dweight = vec![0.0f64; norm_size];
+    let mut dbias = vec![0.0f64; norm_size];
+    for r in 0..batch {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mean = means[r];
+        let rstd = rstds[r];
         for j in 0..norm_size {
             let xhat = (xrow[j] - mean) * rstd;
             dweight[j] += dyrow[j] * xhat;
@@ -3079,9 +3177,7 @@ pub fn conv2d_im2col_f64(
                 for kr in 0..kh {
                     let irow = ch_off + (base_h + kr) * pw + base_w;
                     let prow_off = pch + kr * kw;
-                    for kc in 0..kw {
-                        prow[prow_off + kc] = padded[irow + kc];
-                    }
+                    prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
                 }
             }
         });
@@ -3554,7 +3650,7 @@ pub fn max_pool2d_backward_f64(
 /// valid `(ic,kh,kw)` contributions `input[n,ic,iy,ix]·weight[ic,oc,kh,kw]` where
 /// `iy·sh = oy+ph-kh`, `ix·sw = ox+pw-kw` (integer & in range). Weight is
 /// `[in_ch, out_ch, kh, kw]`. Parallel over `(batch, out_ch)` output planes.
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
 #[must_use]
 pub fn conv_transpose2d_forward_f64(
     input: &[f64],
@@ -3787,9 +3883,8 @@ pub fn conv3d_im2col_f64(
                     for kr in 0..kh {
                         let irow = d_off + (base_h + kr) * pw + base_w;
                         let prow_off = pkd + kr * kw;
-                        for kc in 0..kw {
-                            prow[prow_off + kc] = padded[irow + kc];
-                        }
+                        prow[prow_off..(kw + prow_off)]
+                            .copy_from_slice(&padded[irow..(kw + irow)]);
                     }
                 }
             }
@@ -6449,7 +6544,7 @@ fn sort_radix_perm(keys: &[u64], perm: &mut Vec<u32>, scratch: &mut Vec<u32>) {
         // A byte position where every element shares one bucket contributes no
         // ordering — skipping its scatter is a stability-preserving no-op and
         // skips most passes for clustered exponents.
-        if count.iter().any(|&c| c == n) {
+        if count.contains(&n) {
             continue;
         }
         let mut sum = 0usize;
@@ -7186,13 +7281,13 @@ fn winograd_filter_transform(g: &[f64]) -> [f64; 16] {
     let mut gg = [[0.0f64; 3]; 4]; // G g  (4x3)
     for j in 0..3 {
         let col = [g[j], g[3 + j], g[6 + j]];
-        for i in 0..4 {
-            gg[i][j] = grow(i, col);
+        for (i, row) in gg.iter_mut().enumerate() {
+            row[j] = grow(i, col);
         }
     }
     let mut u = [0.0f64; 16]; // (G g) G^T  (4x4)
-    for i in 0..4 {
-        let row = gg[i];
+    for (i, row) in gg.iter().enumerate() {
+        let row = *row;
         for j in 0..4 {
             u[i * 4 + j] = grow(j, row);
         }
@@ -7215,13 +7310,13 @@ fn winograd_input_transform(d: &[f64]) -> [f64; 16] {
     let mut td = [[0.0f64; 4]; 4]; // B^T d
     for j in 0..4 {
         let col = [d[j], d[4 + j], d[8 + j], d[12 + j]];
-        for i in 0..4 {
-            td[i][j] = bt(i, col);
+        for (i, row) in td.iter_mut().enumerate() {
+            row[j] = bt(i, col);
         }
     }
     let mut v = [0.0f64; 16]; // (B^T d) B
-    for i in 0..4 {
-        let row = td[i];
+    for (i, row) in td.iter().enumerate() {
+        let row = *row;
         for j in 0..4 {
             v[i * 4 + j] = bt(j, row);
         }
@@ -7242,13 +7337,13 @@ fn winograd_output_transform(m: &[f64]) -> [f64; 4] {
     let mut tm = [[0.0f64; 4]; 2]; // A^T m
     for j in 0..4 {
         let col = [m[j], m[4 + j], m[8 + j], m[12 + j]];
-        for i in 0..2 {
-            tm[i][j] = at(i, col);
+        for (i, row) in tm.iter_mut().enumerate() {
+            row[j] = at(i, col);
         }
     }
     let mut y = [0.0f64; 4]; // (A^T m) A
-    for i in 0..2 {
-        let row = tm[i];
+    for (i, row) in tm.iter().enumerate() {
+        let row = *row;
         for j in 0..2 {
             y[i * 2 + j] = at(j, row);
         }

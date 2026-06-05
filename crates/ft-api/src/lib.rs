@@ -18949,7 +18949,7 @@ impl FrankenTorchSession {
                         let (xv, _) = ins[0];
                         let (wv, _) = ins[1];
                         let (bv, _) = ins[2];
-                        let out = ft_kernel_cpu::layer_norm_forward_f64(
+                        let (out, means, rstds) = ft_kernel_cpu::layer_norm_forward_with_stats_f64(
                             xv,
                             Some(wv),
                             Some(bv),
@@ -18959,13 +18959,15 @@ impl FrankenTorchSession {
                         );
                         ctx.save_for_backward(xv.to_vec(), vec![bn, nn]);
                         ctx.save_for_backward(wv.to_vec(), vec![nn]);
+                        ctx.save_for_backward(means, vec![bn]);
+                        ctx.save_for_backward(rstds, vec![bn]);
                         Ok((out, ishape.clone()))
                     },
                     move |ctx, grad_outputs| {
                         let dy = grad_outputs[0];
                         let saved = ctx.saved_tensors();
-                        let (dx, dw, db) = ft_kernel_cpu::layer_norm_backward_f64(
-                            dy, &saved[0], &saved[1], bn, nn, eps_c,
+                        let (dx, dw, db) = ft_kernel_cpu::layer_norm_backward_with_stats_f64(
+                            dy, &saved[0], &saved[1], &saved[2], &saved[3], bn, nn,
                         );
                         Ok(vec![Some(dx), Some(dw), Some(db)])
                     },
