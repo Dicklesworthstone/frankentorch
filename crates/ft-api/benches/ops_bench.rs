@@ -65,6 +65,37 @@ fn bench_bmm(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_conv_transpose2d(c: &mut Criterion) {
+    // conv_transpose2d (GAN/segmentation upsampling): [N,C,H,W]=[2,64,16,16],
+    // weight [C_in,C_out,3,3], stride 2 -> 2x upsample. no-grad + grad.
+    let mut group = c.benchmark_group("conv_transpose2d");
+    let (n, ic, oc, h, w, k) = (2usize, 16usize, 16usize, 16usize, 16usize, 3usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ic, h, w], false).unwrap();
+        let wt = s.tensor_randn(vec![ic, oc, k, k], false).unwrap();
+        b.iter(|| {
+            black_box(
+                s.tensor_conv_transpose2d(x, wt, None, (2, 2), (1, 1), (1, 1))
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ic, h, w], true).unwrap();
+            let wt = s.tensor_randn(vec![ic, oc, k, k], true).unwrap();
+            let out = s
+                .tensor_conv_transpose2d(x, wt, None, (2, 2), (1, 1), (1, 1))
+                .unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
 fn bench_conv3d(c: &mut Criterion) {
     // conv3d (video/volumetric): [N,C,D,H,W]=[2,32,8,16,16], k=3^3 stride1 pad1.
     let mut group = c.benchmark_group("conv3d");
@@ -1036,6 +1067,7 @@ criterion_group!(
     bench_conv1d,
     bench_conv2d,
     bench_conv3d,
+    bench_conv_transpose2d,
     bench_sum,
     bench_softmax,
     bench_relu,

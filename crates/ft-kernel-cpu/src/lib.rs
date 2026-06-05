@@ -3247,6 +3247,200 @@ pub fn conv2d_backward_f64(
     (dpadded, dweight, dbias)
 }
 
+/// Fused conv_transpose2d forward (f64), computed DIRECTLY (no scatter, no
+/// per-position tensor allocs): each output element `[n,oc,oy,ox]` gathers the
+/// valid `(ic,kh,kw)` contributions `input[n,ic,iy,ix]·weight[ic,oc,kh,kw]` where
+/// `iy·sh = oy+ph-kh`, `ix·sw = ox+pw-kw` (integer & in range). Weight is
+/// `[in_ch, out_ch, kh, kw]`. Parallel over `(batch, out_ch)` output planes.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv_transpose2d_forward_f64(
+    input: &[f64],
+    weight: &[f64],
+    bias: Option<&[f64]>,
+    batch: usize,
+    in_ch: usize,
+    ih: usize,
+    iw: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; batch * out_ch * oh * ow];
+    out.par_chunks_mut(oh * ow).enumerate().for_each(|(idx, orow)| {
+        let n = idx / out_ch;
+        let oc = idx % out_ch;
+        let b0 = bias.map_or(0.0, |b| b[oc]);
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let mut acc = b0;
+                for kr in 0..kh {
+                    let y_num = oy + ph;
+                    if y_num < kr {
+                        continue;
+                    }
+                    let yd = y_num - kr;
+                    if yd % sh != 0 {
+                        continue;
+                    }
+                    let iy = yd / sh;
+                    if iy >= ih {
+                        continue;
+                    }
+                    for kc in 0..kw {
+                        let x_num = ox + pw;
+                        if x_num < kc {
+                            continue;
+                        }
+                        let xd = x_num - kc;
+                        if xd % sw != 0 {
+                            continue;
+                        }
+                        let ix = xd / sw;
+                        if ix >= iw {
+                            continue;
+                        }
+                        let mut s = 0.0f64;
+                        for ic in 0..in_ch {
+                            let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
+                            let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                            s += iv * wv;
+                        }
+                        acc += s;
+                    }
+                }
+                orow[oy * ow + ox] = acc;
+            }
+        }
+    });
+    out
+}
+
+/// Backward of [`conv_transpose2d_forward_f64`]. Returns `(dinput, dweight,
+/// dbias?)`. `dinput` parallel over `(batch, in_ch)` (gather), `dweight` parallel
+/// over the weight elements (each a deterministic reduction), `dbias = Σ dout`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv_transpose2d_backward_f64(
+    dout: &[f64],
+    input: &[f64],
+    weight: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ih: usize,
+    iw: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    // dinput[n,ic,iy,ix] = Σ_{oc,kr,kc} dout[n,oc,oy,ox]·weight[ic,oc,kr,kc],
+    // oy = iy·sh + kr - ph, ox = ix·sw + kc - pw (in range).
+    let mut dinput = vec![0.0f64; batch * in_ch * ih * iw];
+    dinput
+        .par_chunks_mut(ih * iw)
+        .enumerate()
+        .for_each(|(idx, drow)| {
+            let n = idx / in_ch;
+            let ic = idx % in_ch;
+            for iy in 0..ih {
+                for ix in 0..iw {
+                    let mut acc = 0.0f64;
+                    for kr in 0..kh {
+                        let oy_s = iy * sh + kr;
+                        if oy_s < ph {
+                            continue;
+                        }
+                        let oy = oy_s - ph;
+                        if oy >= oh {
+                            continue;
+                        }
+                        for kc in 0..kw {
+                            let ox_s = ix * sw + kc;
+                            if ox_s < pw {
+                                continue;
+                            }
+                            let ox = ox_s - pw;
+                            if ox >= ow {
+                                continue;
+                            }
+                            for oc in 0..out_ch {
+                                let dv = dout[((n * out_ch + oc) * oh + oy) * ow + ox];
+                                let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                                acc += dv * wv;
+                            }
+                        }
+                    }
+                    drow[iy * iw + ix] = acc;
+                }
+            }
+        });
+    // dweight[ic,oc,kr,kc] = Σ_{n,iy,ix} input[n,ic,iy,ix]·dout[n,oc,oy,ox].
+    let mut dweight = vec![0.0f64; in_ch * out_ch * kh * kw];
+    dweight.par_iter_mut().enumerate().for_each(|(widx, dw)| {
+        let kc = widx % kw;
+        let kr = (widx / kw) % kh;
+        let oc = (widx / (kw * kh)) % out_ch;
+        let ic = widx / (kw * kh * out_ch);
+        let mut acc = 0.0f64;
+        for n in 0..batch {
+            for iy in 0..ih {
+                let oy_s = iy * sh + kr;
+                if oy_s < ph {
+                    continue;
+                }
+                let oy = oy_s - ph;
+                if oy >= oh {
+                    continue;
+                }
+                for ix in 0..iw {
+                    let ox_s = ix * sw + kc;
+                    if ox_s < pw {
+                        continue;
+                    }
+                    let ox = ox_s - pw;
+                    if ox >= ow {
+                        continue;
+                    }
+                    let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
+                    let dv = dout[((n * out_ch + oc) * oh + oy) * ow + ox];
+                    acc += iv * dv;
+                }
+            }
+        }
+        *dw = acc;
+    });
+    let dbias = if has_bias {
+        let mut db = vec![0.0f64; out_ch];
+        for (oc, dbo) in db.iter_mut().enumerate() {
+            let mut s = 0.0f64;
+            for n in 0..batch {
+                let base = (n * out_ch + oc) * oh * ow;
+                for p in 0..oh * ow {
+                    s += dout[base + p];
+                }
+            }
+            *dbo = s;
+        }
+        Some(db)
+    } else {
+        None
+    };
+    (dinput, dweight, dbias)
+}
+
 /// 3-D im2col gather for conv3d over a PADDED `[batch, in_ch, pd, ph, pw]` input.
 /// Panel `[batch·od·oh·ow, in_ch·kd·kh·kw]`, patch-major, `(in_ch,kd,kh,kw)`-minor.
 #[allow(clippy::too_many_arguments)]

@@ -16688,6 +16688,70 @@ impl FrankenTorchSession {
             },
         )?;
 
+        // Fused fast paths (f64): a direct conv_transpose2d kernel instead of the
+        // kh*kw*ih*iw narrow/matmul/pad(full-output)/add composed loop. No-grad
+        // returns a leaf; grad routes a custom autograd op. Non-f64 falls through.
+        let ct_in_grad = self.tensor_tape.tensor_requires_grad(input)?;
+        let ct_w_grad = self.tensor_tape.tensor_requires_grad(weight)?;
+        let ct_b_grad = match bias {
+            Some(b) => self.tensor_tape.tensor_requires_grad(b)?,
+            None => false,
+        };
+        let ct_f64 = self.tensor_dtype(input)? == DType::F64
+            && self.tensor_dtype(weight)? == DType::F64
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F64))?;
+        if ct_f64 {
+            let out_shape = vec![batch_size, out_channels, output_h, output_w];
+            if !ct_in_grad && !ct_w_grad && !ct_b_grad {
+                let iv = self.tensor_values(input)?;
+                let wv = self.tensor_values(weight)?;
+                let bv = match bias {
+                    Some(b) => Some(self.tensor_values(b)?),
+                    None => None,
+                };
+                let out = ft_kernel_cpu::conv_transpose2d_forward_f64(
+                    &iv, &wv, bv.as_deref(), batch_size, in_channels, input_h, input_w, out_channels,
+                    kernel_h, kernel_w, output_h, output_w, stride_h, stride_w, padding_h, padding_w,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            let has_bias = bias.is_some();
+            let (b_, ic, ih_, iw_, oc_) = (batch_size, in_channels, input_h, input_w, out_channels);
+            let (kh_, kw_, oh_, ow_) = (kernel_h, kernel_w, output_h, output_w);
+            let (sh_, sw_, ph_, pw_) = (stride_h, stride_w, padding_h, padding_w);
+            let mut inputs = vec![input, weight];
+            if let Some(b) = bias {
+                inputs.push(b);
+            }
+            return self.tensor_apply_function(
+                &inputs,
+                move |ctx, ins| {
+                    let (iv, _) = ins[0];
+                    let (wv, _) = ins[1];
+                    let bv = if has_bias { Some(ins[2].0) } else { None };
+                    let out = ft_kernel_cpu::conv_transpose2d_forward_f64(
+                        iv, wv, bv, b_, ic, ih_, iw_, oc_, kh_, kw_, oh_, ow_, sh_, sw_, ph_, pw_,
+                    );
+                    ctx.save_for_backward(iv.to_vec(), vec![b_, ic, ih_, iw_]);
+                    ctx.save_for_backward(wv.to_vec(), vec![ic, oc_, kh_, kw_]);
+                    Ok((out, vec![b_, oc_, oh_, ow_]))
+                },
+                move |ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let s = ctx.saved_tensors();
+                    let (di, dw, db) = ft_kernel_cpu::conv_transpose2d_backward_f64(
+                        dout, &s[0], &s[1], b_, ic, ih_, iw_, oc_, kh_, kw_, oh_, ow_, sh_, sw_, ph_,
+                        pw_, has_bias,
+                    );
+                    let mut g = vec![Some(di), Some(dw)];
+                    if has_bias {
+                        g.push(Some(db.unwrap()));
+                    }
+                    Ok(g)
+                },
+            );
+        }
+
         // Compose via tensor_narrow + tensor_matmul + tensor_pad +
         // tensor_add so gradients flow back to input and weight.
         // Tracked under frankentorch-zjf6. Same scatter-and-accumulate
@@ -80351,6 +80415,64 @@ mod tests {
             s.functional_conv_transpose1d(input, weight, None, 1, 1, 0)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn conv_transpose2d_grad_matches_finite_diff() {
+        // Fused conv_transpose2d grad (custom op) must compute the true gradients,
+        // validated against central finite differences. stride 2 / padding 1 /
+        // output_padding 1 exercises the upsampling + boundary handling.
+        let (n, ic, oc, h, w, kh, kw) = (2usize, 3usize, 2usize, 3usize, 3usize, 3usize, 3usize);
+        let nin = n * ic * h * w;
+        let nwt = ic * oc * kh * kw;
+        let xv: Vec<f64> = (0..nin).map(|i| ((i % 7) as f64 - 3.0) * 0.2).collect();
+        let wv: Vec<f64> = (0..nwt).map(|i| ((i % 5) as f64 - 2.0) * 0.15).collect();
+        let bv: Vec<f64> = (0..oc).map(|c| 0.1 * c as f64 - 0.1).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, ic, h, w], true).unwrap();
+        let wt = s.tensor_variable(wv.clone(), vec![ic, oc, kh, kw], true).unwrap();
+        let bt = s.tensor_variable(bv.clone(), vec![oc], true).unwrap();
+        let out = s
+            .functional_conv_transpose2d(x, wt, Some(bt), (2, 2), (1, 1), (1, 1))
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let gw = s.tensor_grad(wt).unwrap().unwrap();
+        let gb = s.tensor_grad(bt).unwrap().unwrap();
+        let loss_fn = |xs: &[f64], ws: &[f64], bs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, ic, h, w], false).unwrap();
+            let wi = s2.tensor_variable(ws.to_vec(), vec![ic, oc, kh, kw], false).unwrap();
+            let bi = s2.tensor_variable(bs.to_vec(), vec![oc], false).unwrap();
+            let o = s2.functional_conv_transpose2d(xi, wi, Some(bi), (2, 2), (1, 1), (1, 1)).unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        let chk = |g: f64, fd: f64, what: &str, i: usize| {
+            assert!(
+                (g - fd).abs() <= 1e-5 + 1e-4 * fd.abs(),
+                "{what}[{i}]: analytic {g} vs finite-diff {fd}"
+            );
+        };
+        for i in 0..nin {
+            let (mut p, mut m) = (xv.clone(), xv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gx[i], (loss_fn(&p, &wv, &bv) - loss_fn(&m, &wv, &bv)) / (2.0 * hh), "dx", i);
+        }
+        for i in 0..nwt {
+            let (mut p, mut m) = (wv.clone(), wv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gw[i], (loss_fn(&xv, &p, &bv) - loss_fn(&xv, &m, &bv)) / (2.0 * hh), "dw", i);
+        }
+        for i in 0..oc {
+            let (mut p, mut m) = (bv.clone(), bv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gb[i], (loss_fn(&xv, &wv, &p) - loss_fn(&xv, &wv, &m)) / (2.0 * hh), "db", i);
+        }
     }
 
     #[test]
