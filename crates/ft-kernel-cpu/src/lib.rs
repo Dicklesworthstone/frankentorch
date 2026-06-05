@@ -7922,12 +7922,13 @@ fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
             let row_i_start = i * n;
             let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
             let row_i = &current_and_after[..i];
-            for j in 0..i {
-                let mut g = 0.0;
-                for k in 0..i {
-                    g += row_i[k] * previous_rows[k * n + j];
+            projections.resize(i, 0.0);
+            for k in 0..i {
+                let row_factor = row_i[k];
+                let row = &previous_rows[k * n..k * n + i];
+                for j in 0..i {
+                    projections[j] += row_factor * row[j];
                 }
-                projections.push(g);
             }
             for k in 0..i {
                 let reflector = reflector_col[k];
