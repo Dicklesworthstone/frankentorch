@@ -11121,6 +11121,70 @@ impl LSTMCell {
         Ok((hx_new, cx_new))
     }
 
+    /// Transpose of the input-hidden weight `W_ih` (constant across timesteps).
+    fn w_ih_transposed(
+        &self,
+        session: &mut FrankenTorchSession,
+    ) -> Result<TensorNodeId, AutogradError> {
+        session.tensor_transpose(self.w_ih, 0, 1)
+    }
+
+    /// Transpose of the hidden-hidden weight `W_hh` (constant across timesteps).
+    fn w_hh_transposed(
+        &self,
+        session: &mut FrankenTorchSession,
+    ) -> Result<TensorNodeId, AutogradError> {
+        session.tensor_transpose(self.w_hh, 0, 1)
+    }
+
+    /// One LSTM step given the precomputed input-gate projection `xw`
+    /// (= `input @ W_ih^T`, shape `[batch, 4*hidden]`) and the pre-transposed
+    /// recurrent weight `w_hh_t` (= `W_hh^T`).
+    ///
+    /// The non-recurrent input projection is the same matmul `forward_cell`
+    /// performs internally; pulling it out lets the sequence runner batch it
+    /// across ALL timesteps in a single GEMM and hoist the two constant weight
+    /// transposes out of the time loop. This is bit-for-bit identical to
+    /// `forward_cell` per element: the operations and floating-point add order
+    /// (`((xw + hw) + b_ih) + b_hh`) are unchanged — only `xw` arrives precomputed
+    /// and `w_hh_t` arrives pre-transposed.
+    fn forward_cell_projected(
+        &self,
+        session: &mut FrankenTorchSession,
+        xw: TensorNodeId,
+        hx: TensorNodeId,
+        cx: TensorNodeId,
+        w_hh_t: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let hw = session.tensor_matmul(hx, w_hh_t)?;
+
+        let gates_shape = {
+            let (_, meta) = session.tensor_values_meta(xw)?;
+            meta.shape().to_vec()
+        };
+        let b_ih_exp = RNNCell::expand_bias(session, self.b_ih, gates_shape.clone())?;
+        let b_hh_exp = RNNCell::expand_bias(session, self.b_hh, gates_shape)?;
+
+        let sum1 = session.tensor_add(xw, hw)?;
+        let sum2 = session.tensor_add(sum1, b_ih_exp)?;
+        let gates = session.tensor_add(sum2, b_hh_exp)?;
+
+        let chunks = session.tensor_chunk(gates, 4, 1)?;
+        let i_gate = session.tensor_sigmoid(chunks[0])?;
+        let f_gate = session.tensor_sigmoid(chunks[1])?;
+        let g_gate = session.tensor_tanh(chunks[2])?;
+        let o_gate = session.tensor_sigmoid(chunks[3])?;
+
+        let fc = session.tensor_mul(f_gate, cx)?;
+        let ig = session.tensor_mul(i_gate, g_gate)?;
+        let cx_new = session.tensor_add(fc, ig)?;
+
+        let tanh_cx = session.tensor_tanh(cx_new)?;
+        let hx_new = session.tensor_mul(o_gate, tanh_cx)?;
+
+        Ok((hx_new, cx_new))
+    }
+
     /// Get the hidden size.
     #[must_use]
     pub fn hidden_size(&self) -> usize {
@@ -11546,9 +11610,30 @@ impl LSTM {
         let mut c = c_0;
         let mut outputs = Vec::with_capacity(seq_len);
 
+        if inputs.is_empty() {
+            return Ok((outputs, h, c));
+        }
+
+        // Hoist the two constant weight transposes out of the time loop (they
+        // were recomputed every timestep inside `forward_cell`) and batch the
+        // non-recurrent input projection `X @ W_ih^T` across ALL timesteps in a
+        // single GEMM. Each timestep then only needs its recurrent matmul plus
+        // the elementwise gates. matrixmultiply reduces over the contracted
+        // dimension independently per output row, so a slice of the batched
+        // projection is bit-for-bit identical to the per-timestep matmul.
+        let w_ih_t = cell.w_ih_transposed(session)?;
+        let w_hh_t = cell.w_hh_transposed(session)?;
+        let batch_size = {
+            let (_, meta) = session.tensor_values_meta(inputs[0])?;
+            meta.shape()[0]
+        };
+        let stacked = session.tensor_cat(inputs, 0)?;
+        let xw_all = session.tensor_matmul(stacked, w_ih_t)?;
+
         if reverse {
-            for &input in inputs.iter().rev() {
-                let (h_new, c_new) = cell.forward_cell(session, input, h, c)?;
+            for t in (0..seq_len).rev() {
+                let xw = session.tensor_narrow(xw_all, 0, t * batch_size, batch_size)?;
+                let (h_new, c_new) = cell.forward_cell_projected(session, xw, h, c, w_hh_t)?;
                 outputs.push(h_new);
                 h = h_new;
                 c = c_new;
@@ -11556,8 +11641,9 @@ impl LSTM {
             // Reverse outputs so they align with the forward time ordering
             outputs.reverse();
         } else {
-            for &input in inputs {
-                let (h_new, c_new) = cell.forward_cell(session, input, h, c)?;
+            for t in 0..seq_len {
+                let xw = session.tensor_narrow(xw_all, 0, t * batch_size, batch_size)?;
+                let (h_new, c_new) = cell.forward_cell_projected(session, xw, h, c, w_hh_t)?;
                 outputs.push(h_new);
                 h = h_new;
                 c = c_new;
