@@ -252,72 +252,6 @@ fn finite_threshold_cmp(threshold: f64, sample: f64) -> std::cmp::Ordering {
     }
 }
 
-#[derive(Clone, Copy)]
-struct ThresholdSearchEntry {
-    threshold: f64,
-    index: usize,
-}
-
-fn build_eytzinger_thresholds(thresholds: &[f64]) -> Vec<ThresholdSearchEntry> {
-    fn fill(
-        thresholds: &[f64],
-        layout: &mut [ThresholdSearchEntry],
-        node: usize,
-        next_sorted: &mut usize,
-    ) {
-        if node == 0 || node > layout.len() {
-            return;
-        }
-
-        if let Some(left) = node.checked_mul(2) {
-            fill(thresholds, layout, left, next_sorted);
-        }
-        let index = *next_sorted;
-        layout[node - 1] = ThresholdSearchEntry {
-            threshold: thresholds[index],
-            index,
-        };
-        *next_sorted += 1;
-        if let Some(right) = node.checked_mul(2).and_then(|left| left.checked_add(1)) {
-            fill(thresholds, layout, right, next_sorted);
-        }
-    }
-
-    let mut layout = vec![
-        ThresholdSearchEntry {
-            threshold: 0.0,
-            index: 0,
-        };
-        thresholds.len()
-    ];
-    let mut next_sorted = 0;
-    fill(thresholds, &mut layout, 1, &mut next_sorted);
-    layout
-}
-
-fn eytzinger_threshold_index(layout: &[ThresholdSearchEntry], sample: f64) -> usize {
-    let mut node = 1usize;
-    let mut candidate = layout.len() - 1;
-
-    while node <= layout.len() {
-        let entry = layout[node - 1];
-        if sample <= entry.threshold {
-            candidate = entry.index;
-            let Some(next) = node.checked_mul(2) else {
-                break;
-            };
-            node = next;
-        } else {
-            let Some(next) = node.checked_mul(2).and_then(|left| left.checked_add(1)) else {
-                break;
-            };
-            node = next;
-        }
-    }
-
-    candidate
-}
-
 /// Yields sample indices sequentially: 0, 1, 2, ..., n-1.
 pub struct SequentialSampler {
     size: usize,
@@ -508,7 +442,6 @@ impl WeightedRandomSampler {
         }
         let mut cumulative = Vec::with_capacity(self.weights.len());
         let mut total = 0.0;
-        let mut all_weights_positive = true;
         for &w in &self.weights {
             if !w.is_finite() {
                 return Err(transform_config_error(
@@ -519,9 +452,6 @@ impl WeightedRandomSampler {
                 return Err(transform_config_error(
                     "WeightedRandomSampler: weights must be non-negative",
                 ));
-            }
-            if w == 0.0 {
-                all_weights_positive = false;
             }
             total += w;
             if !total.is_finite() {
@@ -619,21 +549,13 @@ impl WeightedRandomSampler {
 
         let mut rng = SimpleRng::new(self.seed);
         let mut result = Vec::with_capacity(self.num_samples);
-        if all_weights_positive {
-            let threshold_layout = build_eytzinger_thresholds(&cumulative);
-            for _ in 0..self.num_samples {
-                let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-                result.push(eytzinger_threshold_index(&threshold_layout, u));
-            }
-        } else {
-            for _ in 0..self.num_samples {
-                let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-                let idx = match cumulative.binary_search_by(|c| finite_threshold_cmp(*c, u)) {
-                    Ok(i) => i,
-                    Err(i) => i.min(self.weights.len() - 1),
-                };
-                result.push(idx);
-            }
+        for _ in 0..self.num_samples {
+            let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+            let idx = match cumulative.binary_search_by(|c| finite_threshold_cmp(*c, u)) {
+                Ok(i) => i,
+                Err(i) => i.min(self.weights.len() - 1),
+            };
+            result.push(idx);
         }
         Ok(result)
     }
@@ -2298,29 +2220,6 @@ mod tests {
         );
     }
 
-    fn weighted_sampler_eytzinger_golden_summary() -> String {
-        let weights: Vec<f64> = (1..=4096).map(|i| f64::from((i % 17) + 1)).collect();
-        let samples = WeightedRandomSampler::new(weights, 32)
-            .with_seed(0x5151_4096)
-            .indices()
-            .expect("large-cardinality weighted samples");
-
-        format!(
-            "weighted_sampler_eytzinger_frankentorch-ms7w\n\
-             seed=0x51514096 weights=(1..=4096).map((i % 17) + 1) samples={samples:?}\n"
-        )
-    }
-
-    #[test]
-    fn weighted_sampler_eytzinger_golden_output_matches_fixture() {
-        assert_eq!(
-            weighted_sampler_eytzinger_golden_summary(),
-            include_str!(
-                "../../../artifacts/optimization/golden_outputs/ft_data_weighted_eytzinger_frankentorch-ms7w.txt"
-            )
-        );
-    }
-
     #[test]
     fn weighted_sampler_four_threshold_helper_matches_branch_chain_edges() {
         let first = 0.25;
@@ -2352,26 +2251,6 @@ mod tests {
             let actual =
                 thresholds.binary_search_by(|threshold| finite_threshold_cmp(*threshold, sample));
             assert_eq!(actual, expected, "sample={sample}");
-        }
-    }
-
-    #[test]
-    fn weighted_sampler_eytzinger_threshold_layout_matches_binary_search() {
-        let thresholds = [0.05, 0.125, 0.25, 0.5, 0.625, 0.875, 1.0];
-        let layout = build_eytzinger_thresholds(&thresholds);
-        let samples = [0.0, 0.05, 0.125, 0.2, 0.5, 0.7, 0.999_999];
-
-        for sample in samples {
-            let expected =
-                match thresholds.binary_search_by(|threshold| threshold.total_cmp(&sample)) {
-                    Ok(index) => index,
-                    Err(index) => index.min(thresholds.len() - 1),
-                };
-            assert_eq!(
-                eytzinger_threshold_index(&layout, sample),
-                expected,
-                "sample={sample}"
-            );
         }
     }
 
