@@ -48246,7 +48246,7 @@ impl FrankenTorchSession {
         if m == 0 {
             return vec![0.0; n];
         }
-        debug_assert!(in_re.len() >= m + 1 && in_im.len() >= m + 1);
+        debug_assert!(in_re.len() > m && in_im.len() > m);
         let two_pi = 2.0 * std::f64::consts::PI;
         let mut zr = vec![0.0_f64; m];
         let mut zi = vec![0.0_f64; m];
