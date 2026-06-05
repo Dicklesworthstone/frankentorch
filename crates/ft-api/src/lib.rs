@@ -7749,6 +7749,55 @@ impl FrankenTorchSession {
         }
         let m = m1;
 
+        // Euclidean (p == 2) fast path — the dominant case AND torch's default
+        // `compute_mode` for p=2. Uses the matmul identity
+        //     d² = ‖x1‖² + ‖x2‖² − 2·x1·x2ᵀ
+        // instead of materialising the broadcasted [P, R, M] (or [B, P, R, M])
+        // difference tensor and reducing it: the cross term is one GEMM-routed
+        // matmul/bmm, the norms are two M-axis reductions, and the result is
+        // assembled with O(P·R) broadcast adds — no O(P·R·M) intermediate. The
+        // whole chain is autograd-aware (matmul/bmm/sum/clamp/sqrt all record on
+        // the tape), and for distinct points its gradient (x1−x2)/d is identical
+        // to the direct path; coincident points (d=0) are clamped to 0 before the
+        // sqrt exactly as torch's mm path does. Matches the direct sum to FFT-free
+        // f64 round-off (~1e-12), well inside the cdist tolerance contract.
+        if p == 2.0 && m > 0 && batch * p_dim * r_dim > 0 {
+            let x1_sq = self.tensor_mul(x1, x1)?;
+            let x2_sq = self.tensor_mul(x2, x2)?;
+            let (cross, x1_norm_b, x2_norm_b, out_shape) = if batched {
+                // x1 [B,P,M], x2 [B,R,M] -> cross [B,P,R].
+                let x2_t = self.tensor_transpose(x2, 1, 2)?;
+                let cross = self.tensor_bmm(x1, x2_t)?;
+                let x1_norm = self.tensor_sum_dim(x1_sq, 2)?; // [B,P]
+                let x2_norm = self.tensor_sum_dim(x2_sq, 2)?; // [B,R]
+                let x1_u = self.tensor_unsqueeze(x1_norm, 2)?; // [B,P,1]
+                let x2_u = self.tensor_unsqueeze(x2_norm, 1)?; // [B,1,R]
+                let target = vec![batch, p_dim, r_dim];
+                let x1_e = self.tensor_expand(x1_u, target.clone())?;
+                let x2_e = self.tensor_expand(x2_u, target)?;
+                (cross, x1_e, x2_e, vec![batch, p_dim, r_dim])
+            } else {
+                // x1 [P,M], x2 [R,M] -> cross [P,R].
+                let x2_t = self.tensor_transpose(x2, 0, 1)?;
+                let cross = self.tensor_matmul(x1, x2_t)?;
+                let x1_norm = self.tensor_sum_dim(x1_sq, 1)?; // [P]
+                let x2_norm = self.tensor_sum_dim(x2_sq, 1)?; // [R]
+                let x1_u = self.tensor_unsqueeze(x1_norm, 1)?; // [P,1]
+                let x2_u = self.tensor_unsqueeze(x2_norm, 0)?; // [1,R]
+                let target = vec![p_dim, r_dim];
+                let x1_e = self.tensor_expand(x1_u, target.clone())?;
+                let x2_e = self.tensor_expand(x2_u, target)?;
+                (cross, x1_e, x2_e, vec![p_dim, r_dim])
+            };
+            let norm_sum = self.tensor_add(x1_norm_b, x2_norm_b)?;
+            let two_cross = self.tensor_mul_scalar(cross, 2.0)?;
+            let d2 = self.tensor_sub(norm_sum, two_cross)?;
+            // Clamp tiny negative round-off to 0 before sqrt (torch does the same).
+            let d2_clamped = self.tensor_clamp_min(d2, 0.0)?;
+            let dist = self.tensor_sqrt(d2_clamped)?;
+            return self.tensor_reshape(dist, out_shape);
+        }
+
         // Autograd path for finite p > 0 composes through broadcasted
         // sub + abs + pow + sum_dim + pow. p == +inf uses the same
         // broadcasted difference and reduces through tensor_amax so
@@ -77605,6 +77654,73 @@ mod tests {
             .expect("cdist p=inf must propagate gradient through x2");
         assert_eq!(grad_x1, vec![0.0, -1.0]);
         assert_eq!(grad_x2, vec![0.0, 1.0]);
+    }
+
+    /// The p=2 matmul fast path (‖x1‖²+‖x2‖²−2x1·x2ᵀ) must match the direct
+    /// Euclidean distance to f64 round-off for 2-D and batched inputs, return
+    /// EXACTLY 0 at coincident points (no NaN from sqrt of clamped round-off),
+    /// and stay deterministic. Golden FNV digest pins the assembled matrix.
+    #[test]
+    fn cdist_l2_matmul_matches_direct_2d_and_batched() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        fn direct(x1: &[f64], x2: &[f64], p: usize, r: usize, m: usize) -> Vec<f64> {
+            let mut out = vec![0.0; p * r];
+            for i in 0..p {
+                for j in 0..r {
+                    let mut acc = 0.0;
+                    for k in 0..m {
+                        let d = x1[i * m + k] - x2[j * m + k];
+                        acc += d * d;
+                    }
+                    out[i * r + j] = acc.sqrt();
+                }
+            }
+            out
+        }
+
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+
+        // 2-D, including a coincident row (x1 row 0 == x2 row 0 -> distance 0).
+        let (p, r, m) = (5usize, 4usize, 3usize);
+        let x1v: Vec<f64> = (0..p * m).map(|i| ((i * 7 + 1) % 11) as f64 * 0.3 - 1.0).collect();
+        let mut x2v: Vec<f64> = (0..r * m).map(|i| ((i * 5 + 2) % 13) as f64 * 0.25 - 1.0).collect();
+        x2v[..m].copy_from_slice(&x1v[..m]); // make x2[0] == x1[0]
+        let x1 = s.tensor_variable(x1v.clone(), vec![p, m], false).unwrap();
+        let x2 = s.tensor_variable(x2v.clone(), vec![r, m], false).unwrap();
+        let out = s.tensor_cdist(x1, x2, 2.0).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![p, r]);
+        let got = s.tensor_values(out).unwrap();
+        let want = direct(&x1v, &x2v, p, r, m);
+        assert!(got[0].abs() < 1e-12, "coincident distance must be 0, got {}", got[0]);
+        for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-10, "cdist 2d @{idx}: {g} vs {w}");
+            assert!(g.is_finite(), "cdist 2d @{idx} not finite");
+            digest = (digest ^ g.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+
+        // Batched [B,P,M] x [B,R,M].
+        let (bb, pb, rb, mb) = (2usize, 4usize, 3usize, 4usize);
+        let x1b: Vec<f64> = (0..bb * pb * mb).map(|i| ((i * 3 + 1) % 7) as f64 * 0.4 - 1.0).collect();
+        let x2b: Vec<f64> = (0..bb * rb * mb).map(|i| ((i * 9 + 4) % 17) as f64 * 0.2 - 1.0).collect();
+        let x1t = s.tensor_variable(x1b.clone(), vec![bb, pb, mb], false).unwrap();
+        let x2t = s.tensor_variable(x2b.clone(), vec![bb, rb, mb], false).unwrap();
+        let outb = s.tensor_cdist(x1t, x2t, 2.0).unwrap();
+        assert_eq!(s.tensor_shape(outb).unwrap(), vec![bb, pb, rb]);
+        let gotb = s.tensor_values(outb).unwrap();
+        for b in 0..bb {
+            let want_b = direct(
+                &x1b[b * pb * mb..(b + 1) * pb * mb],
+                &x2b[b * rb * mb..(b + 1) * rb * mb],
+                pb, rb, mb,
+            );
+            for j in 0..pb * rb {
+                let g = gotb[b * pb * rb + j];
+                assert!((g - want_b[j]).abs() < 1e-10, "cdist batched b={b} @{j}: {g} vs {}", want_b[j]);
+                digest = (digest ^ g.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(digest, 5_212_595_487_214_717_763, "cdist l2 matmul golden digest");
     }
 
     // ── pdist tests ────────────────────────────────────────────────────
