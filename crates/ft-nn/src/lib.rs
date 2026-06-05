@@ -11212,6 +11212,7 @@ impl LSTMCell {
             let (_, meta) = session.tensor_values_meta(xw)?;
             meta.shape().to_vec()
         };
+        let batch = gates_shape[0];
         let b_ih_exp = RNNCell::expand_bias(session, self.b_ih, gates_shape.clone())?;
         let b_hh_exp = RNNCell::expand_bias(session, self.b_hh, gates_shape)?;
 
@@ -11219,18 +11220,77 @@ impl LSTMCell {
         let sum2 = session.tensor_add(sum1, b_ih_exp)?;
         let gates = session.tensor_add(sum2, b_hh_exp)?;
 
-        let chunks = session.tensor_chunk(gates, 4, 1)?;
-        let i_gate = session.tensor_sigmoid(chunks[0])?;
-        let f_gate = session.tensor_sigmoid(chunks[1])?;
-        let g_gate = session.tensor_tanh(chunks[2])?;
-        let o_gate = session.tensor_sigmoid(chunks[3])?;
+        // Fused gate soup: the chunk + 4 activations + cell/hidden update (~11
+        // op-graph ops over [batch, 4*hidden]/[batch, hidden]) collapse into ONE
+        // custom op over the raw gate buffer. Outputs are packed as
+        // `[2*batch, hidden]` (rows [0,batch) = h', [batch,2*batch) = c') so the
+        // dim-0 narrows below are contiguous. Bit-for-bit identical forward to the
+        // op-graph soup: ft_kernel_cpu's sigmoid is `1/(1+exp(-x))` and tanh is
+        // libm `tanh`, and the arithmetic order (`c' = f*cx + i*g`, `h' = o*tanh(c')`)
+        // is unchanged. Backward is the analytic LSTM-cell gate Jacobian.
+        let hidden = self.hidden_size;
+        let packed = session.tensor_apply_function(
+            &[gates, cx],
+            move |ctx, ins| {
+                let (gates_v, gshape) = ins[0];
+                let (cx_v, cx_shape) = ins[1];
+                let batch = gshape[0];
+                let mut out = vec![0.0f64; 2 * batch * hidden];
+                for b in 0..batch {
+                    let gbase = b * 4 * hidden;
+                    for j in 0..hidden {
+                        let i_g = 1.0 / (1.0 + (-gates_v[gbase + j]).exp());
+                        let f_g = 1.0 / (1.0 + (-gates_v[gbase + hidden + j]).exp());
+                        let g_g = gates_v[gbase + 2 * hidden + j].tanh();
+                        let o_g = 1.0 / (1.0 + (-gates_v[gbase + 3 * hidden + j]).exp());
+                        let c_new = f_g * cx_v[b * hidden + j] + i_g * g_g;
+                        let h_new = o_g * c_new.tanh();
+                        out[b * hidden + j] = h_new;
+                        out[(batch + b) * hidden + j] = c_new;
+                    }
+                }
+                ctx.save_for_backward(gates_v.to_vec(), gshape.to_vec());
+                ctx.save_for_backward(cx_v.to_vec(), cx_shape.to_vec());
+                Ok((out, vec![2 * batch, hidden]))
+            },
+            move |ctx, grad_outputs| {
+                let saved = ctx.saved_tensors();
+                let gates_v = &saved[0];
+                let cx_v = &saved[1];
+                let batch = gates_v.len() / (4 * hidden);
+                let d_packed = grad_outputs[0];
+                let mut d_gates = vec![0.0f64; batch * 4 * hidden];
+                let mut d_cx = vec![0.0f64; batch * hidden];
+                for b in 0..batch {
+                    let gbase = b * 4 * hidden;
+                    for j in 0..hidden {
+                        let i_g = 1.0 / (1.0 + (-gates_v[gbase + j]).exp());
+                        let f_g = 1.0 / (1.0 + (-gates_v[gbase + hidden + j]).exp());
+                        let g_g = gates_v[gbase + 2 * hidden + j].tanh();
+                        let o_g = 1.0 / (1.0 + (-gates_v[gbase + 3 * hidden + j]).exp());
+                        let c_prev = cx_v[b * hidden + j];
+                        let c_new = f_g * c_prev + i_g * g_g;
+                        let tc = c_new.tanh();
+                        let dh = d_packed[b * hidden + j];
+                        let dc = d_packed[(batch + b) * hidden + j];
+                        let do_g = dh * tc;
+                        let dc_total = dc + dh * o_g * (1.0 - tc * tc);
+                        let df_g = dc_total * c_prev;
+                        d_cx[b * hidden + j] = dc_total * f_g;
+                        let di_g = dc_total * g_g;
+                        let dg_g = dc_total * i_g;
+                        d_gates[gbase + j] = di_g * i_g * (1.0 - i_g);
+                        d_gates[gbase + hidden + j] = df_g * f_g * (1.0 - f_g);
+                        d_gates[gbase + 2 * hidden + j] = dg_g * (1.0 - g_g * g_g);
+                        d_gates[gbase + 3 * hidden + j] = do_g * o_g * (1.0 - o_g);
+                    }
+                }
+                Ok(vec![Some(d_gates), Some(d_cx)])
+            },
+        )?;
 
-        let fc = session.tensor_mul(f_gate, cx)?;
-        let ig = session.tensor_mul(i_gate, g_gate)?;
-        let cx_new = session.tensor_add(fc, ig)?;
-
-        let tanh_cx = session.tensor_tanh(cx_new)?;
-        let hx_new = session.tensor_mul(o_gate, tanh_cx)?;
+        let hx_new = session.tensor_narrow(packed, 0, 0, batch)?;
+        let cx_new = session.tensor_narrow(packed, 0, batch, batch)?;
 
         Ok((hx_new, cx_new))
     }
@@ -27309,6 +27369,52 @@ mod tests {
             assert!(
                 session.tensor_gradient(&report, param).is_some(),
                 "parameter gradient should exist"
+            );
+        }
+    }
+
+    #[test]
+    fn lstm_fused_gate_backward_matches_finite_diff() {
+        // Validates the analytic backward of the fused LSTM-gate custom op
+        // (forward_cell_projected) against central finite differences. seq_len=2
+        // exercises both the per-step gate Jacobian (d_gates) and the
+        // inter-timestep cell-state gradient (d_cx).
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let seq_len = 2usize;
+        let batch = 1usize;
+        let input_size = 3usize;
+        let lstm = LSTM::new(&mut session, input_size, 2, 1, false, 0.0, false).expect("lstm");
+        let base = vec![0.1, -0.2, 0.3, -0.4, 0.5, -0.6];
+
+        let x = session
+            .tensor_variable(base.clone(), vec![seq_len, batch, input_size], true)
+            .expect("x");
+        let out = lstm.forward(&mut session, x).expect("forward");
+        let loss = session.tensor_sum(out).expect("sum");
+        let report = session.tensor_backward(loss).expect("backward");
+        let x_grad = session.tensor_gradient(&report, x).expect("x grad");
+
+        let eps = 1e-6;
+        let loss_at = |session: &mut FrankenTorchSession, vals: &[f64]| -> f64 {
+            let xi = session
+                .tensor_variable(vals.to_vec(), vec![seq_len, batch, input_size], false)
+                .expect("xi");
+            let o = lstm.forward(session, xi).expect("forward");
+            let l = session.tensor_sum(o).expect("sum");
+            session.tensor_values(l).expect("loss values")[0]
+        };
+
+        for k in 0..base.len() {
+            let mut vp = base.clone();
+            vp[k] += eps;
+            let mut vm = base.clone();
+            vm[k] -= eps;
+            let numeric = (loss_at(&mut session, &vp) - loss_at(&mut session, &vm)) / (2.0 * eps);
+            assert!(
+                (numeric - x_grad[k]).abs() < 1e-5,
+                "x_grad[{k}]: analytic {} vs finite-diff {}",
+                x_grad[k],
+                numeric
             );
         }
     }
