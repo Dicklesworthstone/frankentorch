@@ -874,16 +874,7 @@ fn write_native_f16_values<W: Write>(
     values: &[Float16],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<Float16>();
-    let mut bytes = Vec::with_capacity(FT_NATIVE_HALF_VALUE_CHUNK_BYTES);
-    for chunk in values.chunks(values_per_chunk) {
-        bytes.clear();
-        for &value in chunk {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        write_native_bytes(writer, &bytes, io_path)?;
-    }
-    Ok(())
+    write_native_u16_payload_values(writer, values, io_path, Float16::to_bits)
 }
 
 fn write_native_bf16_values<W: Write>(
@@ -891,12 +882,34 @@ fn write_native_bf16_values<W: Write>(
     values: &[BFloat16],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<BFloat16>();
+    write_native_u16_payload_values(writer, values, io_path, BFloat16::to_bits)
+}
+
+fn write_native_u16_payload_values<W, T, F>(
+    writer: &mut W,
+    values: &[T],
+    io_path: &str,
+    bits_of: F,
+) -> Result<(), TensorIOError>
+where
+    W: Write,
+    T: Copy,
+    F: Fn(T) -> u16,
+{
+    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<u16>();
     let mut bytes = Vec::with_capacity(FT_NATIVE_HALF_VALUE_CHUNK_BYTES);
     for chunk in values.chunks(values_per_chunk) {
         bytes.clear();
-        for &value in chunk {
-            bytes.extend_from_slice(&value.to_le_bytes());
+        let mut lanes = chunk.chunks_exact(4);
+        for lane in &mut lanes {
+            let packed = u64::from(bits_of(lane[0]))
+                | (u64::from(bits_of(lane[1])) << 16)
+                | (u64::from(bits_of(lane[2])) << 32)
+                | (u64::from(bits_of(lane[3])) << 48);
+            bytes.extend_from_slice(&packed.to_le_bytes());
+        }
+        for &value in lanes.remainder() {
+            bytes.extend_from_slice(&bits_of(value).to_le_bytes());
         }
         write_native_bytes(writer, &bytes, io_path)?;
     }
