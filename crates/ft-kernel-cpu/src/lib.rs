@@ -3439,6 +3439,90 @@ pub fn conv2d_forward_f64(
     out
 }
 
+/// f32 mirror of [`conv2d_im2col_f64`]: parallel im2col into a
+/// `[batch·oh·ow, in_ch·kh·kw]` panel.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_im2col_f32(
+    padded: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let mut panel = vec![0.0f32; batch * patch_count * patch_width];
+    panel
+        .par_chunks_mut(patch_width)
+        .enumerate()
+        .for_each(|(row, prow)| {
+            let b = row / patch_count;
+            let pc = row % patch_count;
+            let base_h = (pc / ow) * sh;
+            let base_w = (pc % ow) * sw;
+            let batch_off = b * in_ch * ph * pw;
+            for c in 0..in_ch {
+                let ch_off = batch_off + c * ph * pw;
+                let pch = c * kh * kw;
+                for kr in 0..kh {
+                    let irow = ch_off + (base_h + kr) * pw + base_w;
+                    let prow_off = pch + kr * kw;
+                    prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                }
+            }
+        });
+    panel
+}
+
+/// f32 mirror of [`conv2d_forward_f64`]: fused im2col + `panel @ weight_flat^T`
+/// (via `sgemm_bt`, no weight transpose) written straight to NCHW, plus optional
+/// per-channel bias. Replaces the serial 6-deep im2col gather + tensor_matmul the
+/// f32 no-grad conv2d path fell through to. `weight_flat` is `[out_ch, in_ch·kh·kw]`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_forward_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+    let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    let mut out_flat = vec![0.0f32; flat * out_ch];
+    gemm::sgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    let mut out = vec![0.0f32; batch * out_ch * patch_count];
+    out.par_chunks_mut(patch_count)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let bo = bias.map_or(0.0, |bb| bb[oc]);
+            for p in 0..patch_count {
+                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+            }
+        });
+    out
+}
+
 /// Backward of [`conv2d_forward_f64`]. Returns `(dpadded, dweight_flat, dbias?)`.
 /// `dweight = dout^T @ panel`, `dpanel = dout @ weight_flat`, `dpadded =
 /// col2im(dpanel)`, `dbias = sum over (n,oh,ow)`.

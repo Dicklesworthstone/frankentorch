@@ -16396,6 +16396,41 @@ impl FrankenTorchSession {
                     false,
                 );
             }
+            // F32 no-grad: same fused kernel via sgemm_bt (conv2d_forward_f32),
+            // replacing the SERIAL 6-deep im2col gather + tensor_matmul below for
+            // f32 — the dominant ML dtype. Bit-identical to that path's GEMM.
+            if self.tensor_dtype(input)? == DType::F32
+                && self.tensor_dtype(weight)? == DType::F32
+                && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F32))?
+            {
+                let pv = self.tensor_values_f32(padded)?;
+                let wv = self.tensor_values_f32(weight)?;
+                let bv = match bias {
+                    Some(b) => Some(self.tensor_values_f32(b)?),
+                    None => None,
+                };
+                let out = ft_kernel_cpu::conv2d_forward_f32(
+                    &pv,
+                    &wv,
+                    bv.as_deref(),
+                    batch_size,
+                    in_channels,
+                    padded_h,
+                    padded_w,
+                    kernel_h,
+                    kernel_w,
+                    output_h,
+                    output_w,
+                    stride_h,
+                    stride_w,
+                    out_channels,
+                );
+                return self.tensor_variable_f32(
+                    out,
+                    vec![batch_size, out_channels, output_h, output_w],
+                    false,
+                );
+            }
             let panel_len =
                 Self::checked_mul(flat_patch_count, patch_width, "conv2d im2col size overflow")?;
             let padded_data = self.tensor_values(padded)?;
@@ -84258,6 +84293,48 @@ mod tests {
 
         assert_eq!(out_acc, 0x1c8a_815a_c09b_13df);
         assert_eq!(grad_acc, 0x0b15_7cdb_2c35_b4bd);
+    }
+
+    #[test]
+    fn functional_conv2d_f32_no_grad_fast_path_matches_composed_path() {
+        // Isomorphism proof for the fused f32 no-grad conv2d
+        // (ft_kernel_cpu::conv2d_forward_f32): it must match the composed op-graph
+        // path (im2col + matmul, forced via requires_grad=true) — same im2col panel
+        // and the same sgemm (sgemm_bt == sgemm on the materialised weight^T).
+        let input_shape = vec![2usize, 3, 5, 6];
+        let weight_shape = vec![4usize, 3, 3, 2];
+        let bias_shape = vec![4usize];
+        let input_values: Vec<f32> = (0..180)
+            .map(|idx| ((idx * 17 + 3) % 257) as f32 * 0.01 - 1.0)
+            .collect();
+        let weight_values: Vec<f32> = (0..72)
+            .map(|idx| ((idx * 19 + 11) % 131) as f32 * 0.005 - 0.3)
+            .collect();
+        let bias_values: Vec<f32> = (0..4).map(|idx| idx as f32 * 0.25 - 0.125).collect();
+
+        let mut fast = FrankenTorchSession::new(ExecutionMode::Strict);
+        let fi = fast.tensor_variable_f32(input_values.clone(), input_shape.clone(), false).unwrap();
+        let fw = fast.tensor_variable_f32(weight_values.clone(), weight_shape.clone(), false).unwrap();
+        let fb = fast.tensor_variable_f32(bias_values.clone(), bias_shape.clone(), false).unwrap();
+        let fast_out = fast.functional_conv2d(fi, fw, Some(fb), (2, 1), (1, 2)).unwrap();
+
+        let mut comp = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ci = comp.tensor_variable_f32(input_values, input_shape, true).unwrap();
+        let cw = comp.tensor_variable_f32(weight_values, weight_shape, false).unwrap();
+        let cb = comp.tensor_variable_f32(bias_values, bias_shape, false).unwrap();
+        let comp_out = comp.functional_conv2d(ci, cw, Some(cb), (2, 1), (1, 2)).unwrap();
+
+        assert_eq!(fast.tensor_shape(fast_out).unwrap(), vec![2, 4, 3, 9]);
+        assert_eq!(
+            fast.tensor_shape(fast_out).unwrap(),
+            comp.tensor_shape(comp_out).unwrap()
+        );
+        let fv = fast.tensor_values_f32(fast_out).unwrap();
+        let cv = comp.tensor_values_f32(comp_out).unwrap();
+        assert_eq!(fv.len(), cv.len());
+        for (idx, (&g, &e)) in fv.iter().zip(cv.iter()).enumerate() {
+            assert_eq!(g.to_bits(), e.to_bits(), "conv2d f32 fused/composed @{idx}: {g} vs {e}");
+        }
     }
 
     #[test]

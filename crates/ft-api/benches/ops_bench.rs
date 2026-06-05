@@ -273,6 +273,34 @@ fn bench_conv2d(c: &mut Criterion) {
             });
         });
     }
+    // F32 no-grad (the dominant ML dtype): exercises the fused conv2d_forward_f32,
+    // replacing the serial im2col gather + tensor_matmul the f32 path fell to.
+    for hw in [32, 64, 128].iter() {
+        let h = *hw;
+        let (batch, in_ch, out_ch, kh, kw) = (4usize, 64usize, 64usize, 3usize, 3usize);
+        group.bench_with_input(BenchmarkId::new("f32_hw", h), &h, |b, &h| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let iv: Vec<f32> = (0..batch * in_ch * h * h)
+                .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+                .collect();
+            let wv: Vec<f32> = (0..out_ch * in_ch * kh * kw)
+                .map(|i| (i % 97) as f32 * 0.002 - 0.1)
+                .collect();
+            let input = session
+                .tensor_variable_f32(iv, vec![batch, in_ch, h, h], false)
+                .unwrap();
+            let weight = session
+                .tensor_variable_f32(wv, vec![out_ch, in_ch, kh, kw], false)
+                .unwrap();
+            b.iter(|| {
+                black_box(
+                    session
+                        .tensor_conv2d(input, weight, None, (1, 1), (1, 1))
+                        .unwrap(),
+                )
+            });
+        });
+    }
     // Training (forward + backward): exercises the fused conv2d grad custom op.
     for hw in [32, 64].iter() {
         let h = *hw;
