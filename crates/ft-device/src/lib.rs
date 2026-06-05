@@ -13,10 +13,7 @@ impl fmt::Display for DeviceError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::Mismatch { expected, actual } => {
-                f.write_str("device mismatch: expected ")?;
-                f.write_str(device_name(*expected))?;
-                f.write_str(", got ")?;
-                f.write_str(device_name(*actual))
+                f.write_str(device_mismatch_message(*expected, *actual))
             }
         }
     }
@@ -24,10 +21,12 @@ impl fmt::Display for DeviceError {
 
 impl std::error::Error for DeviceError {}
 
-fn device_name(device: Device) -> &'static str {
-    match device {
-        Device::Cpu => "Cpu",
-        Device::Cuda => "Cuda",
+fn device_mismatch_message(expected: Device, actual: Device) -> &'static str {
+    match (expected, actual) {
+        (Device::Cpu, Device::Cpu) => "device mismatch: expected Cpu, got Cpu",
+        (Device::Cpu, Device::Cuda) => "device mismatch: expected Cpu, got Cuda",
+        (Device::Cuda, Device::Cpu) => "device mismatch: expected Cuda, got Cpu",
+        (Device::Cuda, Device::Cuda) => "device mismatch: expected Cuda, got Cuda",
     }
 }
 
@@ -305,11 +304,31 @@ mod tests {
 
     #[test]
     fn device_error_display() {
-        let err = DeviceError::Mismatch {
-            expected: Device::Cpu,
-            actual: Device::Cuda,
-        };
-        assert_eq!(format!("{err}"), "device mismatch: expected Cpu, got Cuda");
+        fn assert_mismatch_display(expected: Device, actual: Device, message: &str) {
+            let err = DeviceError::Mismatch { expected, actual };
+            assert_eq!(err.to_string(), message);
+        }
+
+        assert_mismatch_display(
+            Device::Cpu,
+            Device::Cpu,
+            "device mismatch: expected Cpu, got Cpu",
+        );
+        assert_mismatch_display(
+            Device::Cpu,
+            Device::Cuda,
+            "device mismatch: expected Cpu, got Cuda",
+        );
+        assert_mismatch_display(
+            Device::Cuda,
+            Device::Cpu,
+            "device mismatch: expected Cuda, got Cpu",
+        );
+        assert_mismatch_display(
+            Device::Cuda,
+            Device::Cuda,
+            "device mismatch: expected Cuda, got Cuda",
+        );
     }
 
     #[test]
