@@ -100519,4 +100519,66 @@ mod tests {
         let fr = s.filter_response_norm(x, 1e-6).unwrap();
         assert_eq!(s.tensor_shape(fr).unwrap(), vec![1, 2, 2, 2]);
     }
+
+    /// Elementwise binary ops now NumPy-broadcast size-1 / missing axes (the
+    /// engine inserts autograd-aware expand nodes). Verify forward values AND
+    /// that gradients reduce correctly over the broadcast axes (finite diff).
+    #[test]
+    fn elementwise_binary_ops_broadcast_forward_and_grad() {
+        use super::FrankenTorchSession;
+
+        // Forward: [2,3] op [3], [2,3] op [2,1], [2,3] op [1] (scalar).
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let at = s.tensor_variable(a.clone(), vec![2, 3], false).unwrap();
+            let bt = s.tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false).unwrap();
+            let c = s.tensor_add(at, bt).unwrap();
+            assert_eq!(s.tensor_shape(c).unwrap(), vec![2, 3]);
+            assert_eq!(s.tensor_values(c).unwrap(), vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+
+            let bt2 = s.tensor_variable(vec![100.0, 200.0], vec![2, 1], false).unwrap();
+            let d = s.tensor_mul(at, bt2).unwrap();
+            assert_eq!(s.tensor_values(d).unwrap(), vec![100.0, 200.0, 300.0, 800.0, 1000.0, 1200.0]);
+
+            let sc = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+            let e = s.tensor_div(at, sc).unwrap();
+            assert_eq!(s.tensor_values(e).unwrap(), vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0]);
+        }
+
+        // Backward: c = sum(a * b), a[2,3], b[3] -> b broadcasts over rows, so
+        // db[j] = sum_i a[i,j]; da[i,j] = b[j]. Check both against finite diff.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let at = s.tensor_variable(a.clone(), vec![2, 3], true).unwrap();
+        let bv = vec![7.0, 11.0, 13.0];
+        let bt = s.tensor_variable(bv.clone(), vec![3], true).unwrap();
+        let prod = s.tensor_mul(at, bt).unwrap();
+        let loss = s.tensor_sum(prod).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let ga = s.tensor_gradient(&report, at).unwrap();
+        let gb = s.tensor_gradient(&report, bt).unwrap();
+        // da[i,j] = b[j]
+        assert_eq!(ga, vec![7.0, 11.0, 13.0, 7.0, 11.0, 13.0]);
+        // db[j] = sum_i a[i,j] = a[0,j] + a[1,j]
+        assert_eq!(gb, vec![1.0 + 4.0, 2.0 + 5.0, 3.0 + 6.0]);
+
+        // Finite-difference cross-check on b.
+        let eval = |bv: &[f64]| -> f64 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let at = s.tensor_variable(a.clone(), vec![2, 3], false).unwrap();
+            let bt = s.tensor_variable(bv.to_vec(), vec![3], false).unwrap();
+            let p = s.tensor_mul(at, bt).unwrap();
+            let l = s.tensor_sum(p).unwrap();
+            s.tensor_values(l).unwrap()[0]
+        };
+        let eps = 1e-6;
+        for j in 0..3 {
+            let mut up = bv.clone();
+            let mut dn = bv.clone();
+            up[j] += eps;
+            dn[j] -= eps;
+            let fd = (eval(&up) - eval(&dn)) / (2.0 * eps);
+            assert!((gb[j] - fd).abs() < 1e-6, "broadcast grad b[{j}]={} vs fd {fd}", gb[j]);
+        }
+    }
 }

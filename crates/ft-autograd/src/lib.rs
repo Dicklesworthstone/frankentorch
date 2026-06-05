@@ -9721,6 +9721,51 @@ impl TensorTape {
         ))
     }
 
+    /// NumPy/torch broadcast shape of two operand shapes (right-aligned; a size-1
+    /// axis broadcasts to the other). `None` if the shapes are incompatible.
+    fn elementwise_broadcast_shape(a: &[usize], b: &[usize]) -> Option<Vec<usize>> {
+        let n = a.len().max(b.len());
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let ad = if i + a.len() < n { 1 } else { a[i + a.len() - n] };
+            let bd = if i + b.len() < n { 1 } else { b[i + b.len() - n] };
+            let d = if ad == bd {
+                ad
+            } else if ad == 1 {
+                bd
+            } else if bd == 1 {
+                ad
+            } else {
+                return None;
+            };
+            out.push(d);
+        }
+        Some(out)
+    }
+
+    /// Materialise `node` at `target` shape via autograd-aware reshape (to prepend
+    /// leading axes) + expand. The expand node's backward sums the gradient back
+    /// to the original shape, so broadcasting an elementwise operand needs no
+    /// change to the op's own backward.
+    fn broadcast_operand_to(
+        &mut self,
+        node: TensorNodeId,
+        target: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let cur = self.node(node)?.tensor.meta().shape().to_vec();
+        if cur == target {
+            return Ok(node);
+        }
+        let node = if cur.len() < target.len() {
+            let mut pre = vec![1usize; target.len() - cur.len()];
+            pre.extend_from_slice(&cur);
+            self.reshape(node, pre)?
+        } else {
+            node
+        };
+        self.expand(node, target.to_vec())
+    }
+
     fn binary(
         &mut self,
         op: BinaryOp,
@@ -9728,6 +9773,50 @@ impl TensorTape {
         rhs: TensorNodeId,
         mode: ExecutionMode,
     ) -> Result<(TensorNodeId, TensorOperationEvent), AutogradError> {
+        // NumPy-style broadcasting for elementwise binary ops: when the operand
+        // shapes differ but are broadcast-compatible, materialise each operand to
+        // the common shape (autograd-aware reshape + expand) so the matching-shape
+        // kernel and backward below apply unchanged — the inserted expand nodes
+        // reduce gradients over the broadcast axes. Previously every shape-
+        // mismatched elementwise op failed with ShapeMismatch, forcing callers to
+        // expand by hand (and many forgot: frankentorch-muan / -3pvd). Non-
+        // elementwise ops (matmul/dot/outer/bmm) and already-equal shapes are
+        // untouched, so existing behaviour is bit-identical.
+        let elementwise = matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Min
+                | BinaryOp::Max
+                | BinaryOp::Atan2
+                | BinaryOp::Fmod
+                | BinaryOp::Remainder
+        );
+        let (lhs, rhs) = if elementwise {
+            let differ = {
+                let l = self.node(lhs)?;
+                let r = self.node(rhs)?;
+                l.tensor.meta().shape() != r.tensor.meta().shape()
+            };
+            if differ {
+                let lhs_shape = self.node(lhs)?.tensor.meta().shape().to_vec();
+                let rhs_shape = self.node(rhs)?.tensor.meta().shape().to_vec();
+                if let Some(bshape) = Self::elementwise_broadcast_shape(&lhs_shape, &rhs_shape) {
+                    let lhs = self.broadcast_operand_to(lhs, &bshape)?;
+                    let rhs = self.broadcast_operand_to(rhs, &bshape)?;
+                    (lhs, rhs)
+                } else {
+                    (lhs, rhs)
+                }
+            } else {
+                (lhs, rhs)
+            }
+        } else {
+            (lhs, rhs)
+        };
+
         let (requires_grad, output_shape, output_device, outcome) = {
             let lhs_node = self.node(lhs)?;
             let rhs_node = self.node(rhs)?;
