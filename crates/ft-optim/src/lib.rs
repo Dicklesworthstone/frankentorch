@@ -126,13 +126,17 @@ fn apply_param_update(
     param: TensorNodeId,
     update: &[f64],
 ) -> Result<(), AutogradError> {
-    let param_values = session.tensor_values(param)?;
-    let new_values: Vec<f64> = param_values
-        .iter()
-        .zip(update.iter())
-        .map(|(p, u)| p - u)
-        .collect();
-    session.tensor_update_param_values(param, new_values)
+    // In-place `param -= update` via the zero-copy update API: mutate the live
+    // parameter storage directly instead of cloning it out, allocating a fresh
+    // `new_values` Vec, and cloning it back in. Bit-for-bit identical
+    // (`*p -= u` == `new = p - u`); removes one full param clone + one alloc
+    // per call. Every optimizer routed through this helper (SGD, RMSprop,
+    // Adagrad, Adadelta, Adamax, NAdam, RAdam, ...) benefits at once.
+    session.tensor_update_param_values_f64_with(param, |param_values| {
+        for (p, u) in param_values.iter_mut().zip(update.iter()) {
+            *p -= *u;
+        }
+    })
 }
 
 /// Trait for parameter optimizers.
