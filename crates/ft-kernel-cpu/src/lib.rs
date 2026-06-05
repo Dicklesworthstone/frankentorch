@@ -1178,6 +1178,13 @@ fn checked_dim_loop_sizes(
 
 const PARALLEL_THRESHOLD: usize = 8192;
 
+// The SIMD unary ops (relu/sqrt/reciprocal/...) were SERIAL while the scalar-map
+// unary path (exp/tanh/...) parallelises — so relu was ~36-59x slower than torch
+// at large N purely from single-threading. Parallelise above this gate (cheap
+// per-element work, so amortise rayon split/join only at large N, same as the
+// scalar path's threshold).
+const SIMD_UNARY_PARALLEL_THRESHOLD: usize = 1 << 19; // 524288
+
 // The generic scalar-map unary path (exp/ln/sin/gelu/erf/...) is dominated by a
 // per-element libm call (~15-20 ns), but rayon's split/join/collect overhead on
 // a many-core pool only amortises at very large N. A same-worker A/B
@@ -1231,24 +1238,39 @@ where
 
 fn simd_unary_f64<F, S>(window: &[f64], scalar_op: F, simd_op: S) -> Vec<f64>
 where
-    F: Fn(f64) -> f64,
-    S: Fn(f64x4) -> f64x4,
+    F: Fn(f64) -> f64 + Sync,
+    S: Fn(f64x4) -> f64x4 + Sync,
 {
     let numel = window.len();
-    let simd_len = numel / SIMD_WIDTH * SIMD_WIDTH;
     let mut output = vec![0.0; numel];
 
-    for (out, input) in output[..simd_len]
-        .chunks_exact_mut(SIMD_WIDTH)
-        .zip(window[..simd_len].chunks_exact(SIMD_WIDTH))
-    {
-        let a = f64x4::new([input[0], input[1], input[2], input[3]]);
-        let result = simd_op(a);
-        out.copy_from_slice(result.as_array_ref());
-    }
+    // One contiguous block: SIMD over the SIMD_WIDTH-aligned bulk, scalar tail.
+    let block = |out: &mut [f64], inp: &[f64]| {
+        let simd_len = out.len() / SIMD_WIDTH * SIMD_WIDTH;
+        for (o, i) in out[..simd_len]
+            .chunks_exact_mut(SIMD_WIDTH)
+            .zip(inp[..simd_len].chunks_exact(SIMD_WIDTH))
+        {
+            let a = f64x4::new([i[0], i[1], i[2], i[3]]);
+            o.copy_from_slice(simd_op(a).as_array_ref());
+        }
+        for (o, &v) in out[simd_len..].iter_mut().zip(&inp[simd_len..]) {
+            *o = scalar_op(v);
+        }
+    };
 
-    for (out, &value) in output[simd_len..].iter_mut().zip(&window[simd_len..]) {
-        *out = scalar_op(value);
+    if numel >= SIMD_UNARY_PARALLEL_THRESHOLD {
+        // SIMD_WIDTH-aligned grains: every grain but the last is a whole number
+        // of SIMD lanes, so the SIMD/scalar element split is identical to the
+        // serial path -> bit-for-bit identical output.
+        let threads = rayon::current_num_threads().max(1);
+        let grain = numel.div_ceil(4 * threads).max(SIMD_WIDTH).div_ceil(SIMD_WIDTH) * SIMD_WIDTH;
+        output
+            .par_chunks_mut(grain)
+            .zip(window.par_chunks(grain))
+            .for_each(|(out, inp)| block(out, inp));
+    } else {
+        block(&mut output, window);
     }
 
     output
@@ -1261,8 +1283,8 @@ fn simd_unary_f64_kernel<F, S>(
     _simd_op: S,
 ) -> Result<Vec<f64>, KernelError>
 where
-    F: Fn(f64) -> f64,
-    S: Fn(f64x4) -> f64x4,
+    F: Fn(f64) -> f64 + Sync,
+    S: Fn(f64x4) -> f64x4 + Sync,
 {
     if !meta.is_contiguous() {
         return unary_strided_f64(input, meta, scalar_op);
@@ -13387,6 +13409,29 @@ mod tests {
         let out =
             relu_tensor_contiguous_f64(&input, &meta).expect("contiguous relu should succeed");
         assert_eq!(out, vec![0.0, 1.0, 2.0, 3.0, 0.0]);
+    }
+
+    #[test]
+    fn simd_unary_parallel_path_matches_serial_bit_exact() {
+        // numel above SIMD_UNARY_PARALLEL_THRESHOLD exercises the parallel,
+        // SIMD-grain path; it must be bit-for-bit identical to the serial
+        // max(x, 0) reference (and includes a non-multiple-of-4 tail).
+        let numel = (1 << 19) + 7;
+        let input: Vec<f64> = (0..numel)
+            .map(|i| ((i * 31 + 5) % 97) as f64 * 0.1 - 4.0)
+            .collect();
+        let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
+        let out = relu_tensor_contiguous_f64(&input, &meta).expect("parallel relu");
+        assert_eq!(out.len(), numel);
+        for (i, (&o, &x)) in out.iter().zip(input.iter()).enumerate() {
+            assert_eq!(o.to_bits(), x.max(0.0).to_bits(), "relu @{i}: {o} vs {}", x.max(0.0));
+        }
+        // sqrt shares the same path.
+        let pos: Vec<f64> = input.iter().map(|x| x.abs() + 0.5).collect();
+        let so = sqrt_tensor_contiguous_f64(&pos, &meta).expect("parallel sqrt");
+        for (i, (&o, &x)) in so.iter().zip(pos.iter()).enumerate() {
+            assert_eq!(o.to_bits(), x.sqrt().to_bits(), "sqrt @{i}");
+        }
     }
 
     #[test]
