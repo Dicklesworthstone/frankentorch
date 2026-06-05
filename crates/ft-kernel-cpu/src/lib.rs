@@ -7913,10 +7913,12 @@ fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
     // Eigenvector back-transform: accumulate the stored reflectors into `z` so
     // it becomes the orthonormal transform whose columns `tql2` then rotates.
     let mut reflector_col = Vec::with_capacity(n);
+    let mut projections = Vec::with_capacity(n);
     for i in 0..n {
         if d[i] != 0.0 {
             reflector_col.clear();
             reflector_col.extend((0..i).map(|k| z[k * n + i]));
+            projections.clear();
             let row_i_start = i * n;
             let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
             let row_i = &current_and_after[..i];
@@ -7925,8 +7927,13 @@ fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
                 for k in 0..i {
                     g += row_i[k] * previous_rows[k * n + j];
                 }
-                for k in 0..i {
-                    previous_rows[k * n + j] -= g * reflector_col[k];
+                projections.push(g);
+            }
+            for k in 0..i {
+                let reflector = reflector_col[k];
+                let row = &mut previous_rows[k * n..k * n + i];
+                for j in 0..i {
+                    row[j] -= projections[j] * reflector;
                 }
             }
         }
