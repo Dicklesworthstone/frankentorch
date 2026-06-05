@@ -396,6 +396,31 @@ fn bench_smooth_l1(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_gaussian_nll(c: &mut Criterion) {
+    // Gaussian NLL (uncertainty regression), no-grad + grad f64. The op-graph
+    // builds ~7 full [n] intermediates.
+    let mut group = c.benchmark_group("gaussian_nll");
+    let n = 4096 * 2048usize;
+    group.bench_function("nograd_8m", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n], false).unwrap();
+        let t = s.tensor_randn(vec![n], false).unwrap();
+        let v = s.tensor_variable(vec![1.5; n], vec![n], false).unwrap();
+        b.iter(|| black_box(s.tensor_gaussian_nll_loss(x, t, v, "mean", false).unwrap()));
+    });
+    group.bench_function("grad_8m", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n], true).unwrap();
+            let t = s.tensor_randn(vec![n], false).unwrap();
+            let v = s.tensor_variable(vec![1.5; n], vec![n], true).unwrap();
+            let loss = s.tensor_gaussian_nll_loss(x, t, v, "mean", false).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
 fn bench_cross_entropy(c: &mut Criterion) {
     // Softmax-cross-entropy, no-grad and grad f64. [batch, classes] = [4096, 8192]
     // (LLM-vocab scale) — the op-graph materialises a 256MB log-softmax tensor.
@@ -957,6 +982,7 @@ criterion_group!(
     bench_group_norm,
     bench_batch_norm,
     bench_smooth_l1,
+    bench_gaussian_nll,
     bench_linear_forward,
     bench_interpolate_bicubic,
     bench_interpolate_trilinear,

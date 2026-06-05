@@ -3044,6 +3044,53 @@ pub fn group_norm_backward_f64(
     (dx, dweight, dbias)
 }
 
+/// Fused per-element Gaussian NLL loss:
+/// `0.5·(log(var) + (target − input)²/var [+ log(2π) if full])`. One pass,
+/// parallel — none of the ~7 full-size op-graph intermediates.
+#[must_use]
+pub fn gaussian_nll_forward_f64(input: &[f64], target: &[f64], var: &[f64], full: bool) -> Vec<f64> {
+    let c = if full {
+        (2.0 * std::f64::consts::PI).ln()
+    } else {
+        0.0
+    };
+    let mut out = vec![0.0f64; input.len()];
+    out.par_iter_mut().enumerate().for_each(|(i, o)| {
+        let d = target[i] - input[i];
+        *o = 0.5 * (var[i].ln() + d * d / var[i] + c);
+    });
+    out
+}
+
+/// Backward of [`gaussian_nll_forward_f64`] (the `full` constant drops out).
+/// With `d = target − input`: `dinput = dloss·(input−target)/var`,
+/// `dtarget = dloss·(target−input)/var`, `dvar = dloss·0.5·(1/var − d²/var²)`.
+#[must_use]
+pub fn gaussian_nll_backward_f64(
+    dloss: &[f64],
+    input: &[f64],
+    target: &[f64],
+    var: &[f64],
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let n = input.len();
+    let mut di = vec![0.0f64; n];
+    let mut dt = vec![0.0f64; n];
+    let mut dv = vec![0.0f64; n];
+    di.par_iter_mut()
+        .zip(dt.par_iter_mut())
+        .zip(dv.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, ((dii, dti), dvi))| {
+            let d = target[i] - input[i];
+            let v = var[i];
+            let dl = dloss[i];
+            *dii = dl * (-d) / v;
+            *dti = dl * d / v;
+            *dvi = dl * 0.5 * (1.0 / v - d * d / (v * v));
+        });
+    (di, dt, dv)
+}
+
 /// Fused per-element smooth-L1 (Huber-beta) loss: for `d = x − t`,
 /// `0.5·d²/beta` when `|d| < beta`, else `|d| − 0.5·beta`. One pass, parallel —
 /// none of the op-graph's ~13 full-size intermediates (incl. 4 constant `full()`

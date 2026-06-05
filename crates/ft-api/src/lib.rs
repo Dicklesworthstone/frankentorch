@@ -8946,6 +8946,56 @@ impl FrankenTorchSession {
         reduction: &str,
         full: bool,
     ) -> Result<TensorNodeId, AutogradError> {
+        // Fused fast path (f64, same-shape input/target/var): per-element Gaussian
+        // NLL in one pass, then the reduction — never the ~7 op-graph intermediates.
+        // Broadcast / non-f64 fall through.
+        let in_shape = self.tensor_shape(input)?;
+        if matches!(reduction, "none" | "mean" | "sum")
+            && self.tensor_dtype(input)? == DType::F64
+            && self.tensor_dtype(target)? == DType::F64
+            && self.tensor_dtype(var)? == DType::F64
+            && self.tensor_shape(target)? == in_shape
+            && self.tensor_shape(var)? == in_shape
+        {
+            let per = if self.tensor_tape.tensor_requires_grad(input)?
+                || self.tensor_tape.tensor_requires_grad(target)?
+                || self.tensor_tape.tensor_requires_grad(var)?
+            {
+                let fl = full;
+                self.tensor_apply_function(
+                    &[input, target, var],
+                    move |ctx, ins| {
+                        let (xv, xs) = ins[0];
+                        let (tv, _) = ins[1];
+                        let (vv, _) = ins[2];
+                        let out = ft_kernel_cpu::gaussian_nll_forward_f64(xv, tv, vv, fl);
+                        ctx.save_for_backward(xv.to_vec(), xs.to_vec());
+                        ctx.save_for_backward(tv.to_vec(), xs.to_vec());
+                        ctx.save_for_backward(vv.to_vec(), xs.to_vec());
+                        Ok((out, xs.to_vec()))
+                    },
+                    move |ctx, grad_outputs| {
+                        let dl = grad_outputs[0];
+                        let s = ctx.saved_tensors();
+                        let (di, dt, dv) =
+                            ft_kernel_cpu::gaussian_nll_backward_f64(dl, &s[0], &s[1], &s[2]);
+                        Ok(vec![Some(di), Some(dt), Some(dv)])
+                    },
+                )?
+            } else {
+                let xv = self.tensor_values(input)?;
+                let tv = self.tensor_values(target)?;
+                let vv = self.tensor_values(var)?;
+                let out = ft_kernel_cpu::gaussian_nll_forward_f64(&xv, &tv, &vv, full);
+                self.tensor_variable(out, in_shape.clone(), false)?
+            };
+            return match reduction {
+                "none" => Ok(per),
+                "mean" => self.tensor_mean(per),
+                _ => self.tensor_sum(per),
+            };
+        }
+
         let diff = self.tensor_sub(target, input)?;
         let diff_sq = self.tensor_mul(diff.clone(), diff)?;
         let scaled = self.tensor_div(diff_sq, var)?;
@@ -79417,6 +79467,74 @@ mod tests {
                 "poisson_nll grad[{i}] = {g}, expected {e}"
             );
         }
+    }
+
+    #[test]
+    fn gaussian_nll_loss_fused_matches_op_graph_and_finite_diff() {
+        // Fused Gaussian NLL must match the op-graph to tolerance (all reductions,
+        // full on/off) and its grad (dinput/dtarget/dvar) match finite differences.
+        let n = 18usize;
+        let xv: Vec<f64> = (0..n).map(|i| (i as f64 - 9.0) * 0.2).collect();
+        let tv: Vec<f64> = (0..n).map(|i| ((i % 5) as f64 - 2.0) * 0.3).collect();
+        let vv: Vec<f64> = (0..n).map(|i| 0.5 + (i % 4) as f64 * 0.3).collect(); // > 0
+        for full in [false, true] {
+            for red in ["none", "mean", "sum"] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(xv.clone(), vec![n], false).unwrap();
+                let t = s.tensor_variable(tv.clone(), vec![n], false).unwrap();
+                let v = s.tensor_variable(vv.clone(), vec![n], false).unwrap();
+                let out = s.tensor_gaussian_nll_loss(x, t, v, red, full).unwrap();
+                let fused = s.tensor_values(out).unwrap();
+                let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x2 = s2.tensor_variable(xv.clone(), vec![n], true).unwrap();
+                let t2 = s2.tensor_variable(tv.clone(), vec![n], false).unwrap();
+                let v2 = s2.tensor_variable(vv.clone(), vec![n], false).unwrap();
+                let out2 = s2.tensor_gaussian_nll_loss(x2, t2, v2, red, full).unwrap();
+                let reference = s2.tensor_values(out2).unwrap();
+                assert_eq!(fused.len(), reference.len());
+                for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                    assert!(
+                        (a - b).abs() <= 1e-12 + 1e-10 * b.abs(),
+                        "full={full} red={red} [{i}]: fused {a} vs op-graph {b}"
+                    );
+                }
+            }
+        }
+        // Grad vs finite differences (mean, full=false), all three inputs.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n], true).unwrap();
+        let t = s.tensor_variable(tv.clone(), vec![n], true).unwrap();
+        let v = s.tensor_variable(vv.clone(), vec![n], true).unwrap();
+        let out = s.tensor_gaussian_nll_loss(x, t, v, "mean", false).unwrap();
+        s.tensor_backward(out).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let gt = s.tensor_grad(t).unwrap().unwrap();
+        let gv = s.tensor_grad(v).unwrap().unwrap();
+        let loss_fn = |xs: &[f64], ts: &[f64], vs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n], false).unwrap();
+            let ti = s2.tensor_variable(ts.to_vec(), vec![n], false).unwrap();
+            let vi = s2.tensor_variable(vs.to_vec(), vec![n], false).unwrap();
+            let o = s2.tensor_gaussian_nll_loss(xi, ti, vi, "mean", false).unwrap();
+            s2.tensor_values(o).unwrap()[0]
+        };
+        let h = 1e-6;
+        let chk = |g: &[f64], pert: usize| {
+            for i in 0..n {
+                let mut up = (xv.clone(), tv.clone(), vv.clone());
+                let mut dn = (xv.clone(), tv.clone(), vv.clone());
+                match pert {
+                    0 => { up.0[i] += h; dn.0[i] -= h; }
+                    1 => { up.1[i] += h; dn.1[i] -= h; }
+                    _ => { up.2[i] += h; dn.2[i] -= h; }
+                }
+                let fd = (loss_fn(&up.0, &up.1, &up.2) - loss_fn(&dn.0, &dn.1, &dn.2)) / (2.0 * h);
+                assert!((g[i] - fd).abs() <= 1e-5 + 1e-4 * fd.abs(), "grad{pert}[{i}]: {} vs {fd}", g[i]);
+            }
+        };
+        chk(&gx, 0);
+        chk(&gt, 1);
+        chk(&gv, 2);
     }
 
     #[test]
