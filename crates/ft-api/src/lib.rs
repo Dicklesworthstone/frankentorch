@@ -78837,6 +78837,7 @@ mod tests {
             a[i * n + i] += i as f64;
         }
 
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
         for &largest in &[true, false] {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
             let input = s.tensor_variable(a.clone(), vec![n, n], false).unwrap();
@@ -78850,6 +78851,9 @@ mod tests {
 
             let eval_vals = s.tensor_values(evals).unwrap();
             let evec_vals = s.tensor_values(evecs).unwrap();
+            for &value in eval_vals.iter().chain(evec_vals.iter()) {
+                digest = (digest ^ value.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+            }
             let input_full = s.tensor_variable(a.clone(), vec![n, n], false).unwrap();
             let (full_evals, _) = s.tensor_linalg_eigh(input_full).unwrap();
             let full_vals = s.tensor_values(full_evals).unwrap();
@@ -78879,6 +78883,7 @@ mod tests {
                 }
             }
         }
+        assert_eq!(digest, 0xba28_6106_f6b3_237c);
     }
 
     #[test]
