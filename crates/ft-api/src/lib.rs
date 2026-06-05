@@ -42811,6 +42811,39 @@ impl FrankenTorchSession {
         Ok((u_node, s_node, vh_node))
     }
 
+    /// Randomized truncated SVD (Halko-Martinsson-Tropp). Returns an approximate
+    /// rank-`q` reduced SVD `(U, S, Vh)` with `U: [m, k]`, `S: [k]`, `Vh: [k, n]`
+    /// (`k = min(q, min(m,n))`) in `O(m·n·q)` — far cheaper than the full SVD when
+    /// `q << min(m, n)` (PCA / low-rank approximation). `niter` subspace power
+    /// iterations improve accuracy on slowly-decaying spectra. Equivalent to
+    /// `torch.svd_lowrank` (forward / no-grad); the randomized approximation is
+    /// non-differentiable here, so the outputs are detached.
+    pub fn tensor_svd_lowrank(
+        &mut self,
+        input: TensorNodeId,
+        q: usize,
+        niter: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        let (values, meta) = self.tensor_values_meta(input)?;
+        let result = ft_kernel_cpu::svd_lowrank_contiguous_f64(&values, &meta, q, niter)
+            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+        let (m, n, k) = (result.m, result.n, result.k);
+        let u_node = self.tensor_variable(result.u, vec![m, k], false)?;
+        let s_node = self.tensor_variable(result.s, vec![k], false)?;
+        let vh_node = self.tensor_variable(result.vh, vec![k, n], false)?;
+        Ok((u_node, s_node, vh_node))
+    }
+
+    /// Alias for [`tensor_svd_lowrank`]. Equivalent to `torch.svd_lowrank`.
+    pub fn functional_svd_lowrank(
+        &mut self,
+        input: TensorNodeId,
+        q: usize,
+        niter: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_svd_lowrank(input, q, niter)
+    }
+
     /// Alias for `tensor_linalg_svd`. Equivalent to deprecated `torch.svd`.
     ///
     /// Note: PyTorch's deprecated torch.svd returns (U, S, V) where V is
@@ -78605,6 +78638,54 @@ mod tests {
                 assert!(
                     (val - a_data[i * n + j]).abs() < 1e-10,
                     "reconstructed[{i},{j}] = {val}, expected {}",
+                    a_data[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn svd_lowrank_op_recovers_low_rank() {
+        // tensor_svd_lowrank on a rank-2 6x5 matrix (A = b·c) reconstructs A.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (m, n, r) = (6usize, 5usize, 2usize);
+        let mut b = vec![0.0f64; m * r];
+        let mut c = vec![0.0f64; r * n];
+        for i in 0..m {
+            for j in 0..r {
+                b[i * r + j] = ((i * 3 + j + 1) % 7) as f64 * 0.1 - 0.3;
+            }
+        }
+        for i in 0..r {
+            for j in 0..n {
+                c[i * n + j] = ((i * 4 + j + 2) % 5) as f64 * 0.1 - 0.2;
+            }
+        }
+        let mut a_data = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut v = 0.0;
+                for k in 0..r {
+                    v += b[i * r + k] * c[k * n + j];
+                }
+                a_data[i * n + j] = v;
+            }
+        }
+        let a = s.tensor_variable(a_data.clone(), vec![m, n], false).unwrap();
+        let (u, sv, vh) = s.tensor_svd_lowrank(a, 3, 2).unwrap();
+        let uv = s.tensor_values(u).unwrap();
+        let svv = s.tensor_values(sv).unwrap();
+        let vhv = s.tensor_values(vh).unwrap();
+        let k = svv.len();
+        for i in 0..m {
+            for j in 0..n {
+                let mut val = 0.0;
+                for l in 0..k {
+                    val += uv[i * k + l] * svv[l] * vhv[l * n + j];
+                }
+                assert!(
+                    (val - a_data[i * n + j]).abs() < 1e-7,
+                    "lowrank recon[{i},{j}] = {val}, expected {}",
                     a_data[i * n + j]
                 );
             }
