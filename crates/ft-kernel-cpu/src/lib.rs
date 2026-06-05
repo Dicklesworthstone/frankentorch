@@ -3585,7 +3585,14 @@ pub fn conv2d_forward_f32(
     let flat = batch * patch_count;
     let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     let mut out_flat = vec![0.0f32; flat * out_ch];
-    gemm::sgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    gemm::sgemm_bt(
+        flat,
+        patch_width,
+        out_ch,
+        &panel,
+        weight_flat,
+        &mut out_flat,
+    );
     let mut out = vec![0.0f32; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
