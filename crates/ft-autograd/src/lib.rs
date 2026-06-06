@@ -7550,17 +7550,36 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// Build typed storage from f64 reduction outputs, matching `dtype`.
+    /// Used by max_dim/min_dim so an f32/half input keeps its dtype (the reduced
+    /// extremum is one of the inputs, so the f64->dtype narrowing is exact).
+    #[allow(clippy::cast_possible_truncation)]
+    fn reduction_values_storage(dtype: DType, values: Vec<f64>) -> TensorStorage {
+        match dtype {
+            DType::F32 => {
+                TensorStorage::F32(Arc::new(values.into_iter().map(|v| v as f32).collect()))
+            }
+            DType::F16 => TensorStorage::F16(Arc::new(
+                values.into_iter().map(|v| Float16::from_f32(v as f32)).collect(),
+            )),
+            DType::BF16 => TensorStorage::BF16(Arc::new(
+                values.into_iter().map(|v| BFloat16::from_f32(v as f32)).collect(),
+            )),
+            _ => TensorStorage::F64(Arc::new(values)),
+        }
+    }
+
     pub fn max_dim(
         &mut self,
         input: TensorNodeId,
         dim: usize,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
         let (
-            values,
+            values_storage,
+            values_dtype,
             indices,
             input_shape,
             output_shape,
-            output_dtype,
             output_device,
             requires_grad,
         ) = {
@@ -7579,12 +7598,15 @@ impl TensorTape {
             if out_shape.is_empty() {
                 out_shape.push(1);
             }
+            // Values keep the input dtype (torch.max(f32) -> f32 values); indices
+            // stay F64. Previously both were hardcoded F64 — frankentorch-b3fg.
+            let values_storage = Self::reduction_values_storage(meta.dtype(), values);
             (
-                values,
+                values_storage,
+                meta.dtype(),
                 indices,
                 input_shape,
                 out_shape,
-                DType::F64,
                 meta.device(),
                 requires_grad,
             )
@@ -7593,9 +7615,9 @@ impl TensorTape {
         let indices_clone = indices.clone();
         let out_values = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
-                ft_core::TensorMeta::from_shape(output_shape.clone(), output_dtype, output_device),
-                values,
+            tensor: DenseTensor::from_typed_storage(
+                ft_core::TensorMeta::from_shape(output_shape.clone(), values_dtype, output_device),
+                values_storage,
             )?,
             requires_grad,
             op: TensorNodeOp::MaxDim {
@@ -7609,7 +7631,7 @@ impl TensorTape {
         let out_indices = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(
-                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                ft_core::TensorMeta::from_shape(output_shape, DType::F64, output_device),
                 indices,
             )?,
             requires_grad: false,
@@ -7625,11 +7647,11 @@ impl TensorTape {
         dim: usize,
     ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
         let (
-            values,
+            values_storage,
+            values_dtype,
             indices,
             input_shape,
             output_shape,
-            output_dtype,
             output_device,
             requires_grad,
         ) = {
@@ -7648,12 +7670,15 @@ impl TensorTape {
             if out_shape.is_empty() {
                 out_shape.push(1);
             }
+            // Values keep the input dtype (torch.min(f32) -> f32 values); indices
+            // stay F64. Previously both were hardcoded F64 — frankentorch-b3fg.
+            let values_storage = Self::reduction_values_storage(meta.dtype(), values);
             (
-                values,
+                values_storage,
+                meta.dtype(),
                 indices,
                 input_shape,
                 out_shape,
-                DType::F64,
                 meta.device(),
                 requires_grad,
             )
@@ -7662,9 +7687,9 @@ impl TensorTape {
         let indices_clone = indices.clone();
         let out_values = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_storage(
-                ft_core::TensorMeta::from_shape(output_shape.clone(), output_dtype, output_device),
-                values,
+            tensor: DenseTensor::from_typed_storage(
+                ft_core::TensorMeta::from_shape(output_shape.clone(), values_dtype, output_device),
+                values_storage,
             )?,
             requires_grad,
             op: TensorNodeOp::MinDim {
@@ -7678,7 +7703,7 @@ impl TensorTape {
         let out_indices = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_storage(
-                ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                ft_core::TensorMeta::from_shape(output_shape, DType::F64, output_device),
                 indices,
             )?,
             requires_grad: false,
