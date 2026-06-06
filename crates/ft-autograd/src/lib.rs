@@ -7766,10 +7766,28 @@ impl TensorTape {
                     .map_err(|e| AutogradError::Dispatch(e.into()))?;
                     TensorStorage::F32(Arc::new(values))
                 }
+                dt @ (DType::F16 | DType::BF16) => {
+                    // index_select is a pure gather (no arithmetic), so run it on
+                    // the half values upcast to f64 (lossless, stride-correct via
+                    // contiguous_values_as_f64) and narrow the gathered result
+                    // back to the input's half dtype. The half -> f64 -> half
+                    // round-trip is lossless because every gathered value
+                    // originated as that half dtype. frankentorch-u78p.
+                    let f64_vals = input_node.tensor.contiguous_values_as_f64()?;
+                    let f64_meta = ft_core::TensorMeta::from_shape(
+                        meta.shape().to_vec(),
+                        DType::F64,
+                        meta.device(),
+                    );
+                    let values =
+                        index_select_tensor_contiguous_f64(&f64_vals, &f64_meta, dim, indices)
+                            .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    Self::reduction_values_storage(dt, values)
+                }
                 _ => {
                     return Err(AutogradError::Dispatch(
                         DispatchKeyError::IncompatibleSet {
-                            reason: "index_select requires f32 or f64 tensors",
+                            reason: "index_select requires f32, f64, f16, or bf16 tensors",
                         }
                         .into(),
                     ));
