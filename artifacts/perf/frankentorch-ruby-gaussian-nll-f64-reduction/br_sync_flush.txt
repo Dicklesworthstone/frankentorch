@@ -1,0 +1,4 @@
+Error: Configuration error: Refusing to export stale database that would lose issues.
+Database has 922 issues, JSONL has 923 unique issues.
+Export would lose 1 issue(s): frankentorch-ib63
+Hint: Run import first, or use --force to override.
