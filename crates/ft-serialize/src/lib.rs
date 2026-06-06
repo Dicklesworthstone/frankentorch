@@ -582,6 +582,7 @@ const FT_DTYPE_TAG_F16: u8 = 2;
 const FT_DTYPE_TAG_BF16: u8 = 3;
 const FT_MIN_NATIVE_TENSOR_HEADER_BYTES: usize = 8 + 8 + 1; // key_len + ndim + dtype tag
 const FT_NATIVE_SAVE_BUFFER_BYTES: usize = 1024 * 1024;
+#[cfg(not(target_endian = "little"))]
 const FT_NATIVE_HALF_VALUE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Errors from tensor state dict save/load operations.
@@ -892,7 +893,15 @@ fn write_native_f16_values<W: Write>(
     values: &[Float16],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    write_native_u16_payload_values(writer, values, io_path, Float16::to_bits)
+    #[cfg(target_endian = "little")]
+    {
+        write_native_bytes(writer, bytemuck::cast_slice(values), io_path)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        write_native_u16_payload_values(writer, values, io_path, Float16::to_bits)
+    }
 }
 
 fn write_native_bf16_values<W: Write>(
@@ -900,9 +909,18 @@ fn write_native_bf16_values<W: Write>(
     values: &[BFloat16],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    write_native_u16_payload_values(writer, values, io_path, BFloat16::to_bits)
+    #[cfg(target_endian = "little")]
+    {
+        write_native_bytes(writer, bytemuck::cast_slice(values), io_path)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        write_native_u16_payload_values(writer, values, io_path, BFloat16::to_bits)
+    }
 }
 
+#[cfg(not(target_endian = "little"))]
 fn write_native_u16_payload_values<W, T, F>(
     writer: &mut W,
     values: &[T],

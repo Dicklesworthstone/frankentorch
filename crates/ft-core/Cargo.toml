@@ -5,7 +5,7 @@ edition = "2024"
 license-file = "../../LICENSE"
 
 [dependencies]
-half = "2.4"
+half = { version = "2.4", features = ["bytemuck"] }
 num-complex = "0.4"
 
 [dev-dependencies]

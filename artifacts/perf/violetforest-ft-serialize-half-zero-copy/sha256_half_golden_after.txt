@@ -1,0 +1,1 @@
+artifacts/optimization/golden_outputs/ft_serialize_f16_bf16_save_chunk_buffer_frankentorch-kgs4-43.txt: OK
