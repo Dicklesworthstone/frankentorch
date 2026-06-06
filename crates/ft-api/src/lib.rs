@@ -6425,6 +6425,32 @@ impl FrankenTorchSession {
             .apply_function(inputs, forward_fn, backward_fn)
     }
 
+    /// Apply a f64-only custom autograd function whose backward closure borrows
+    /// the immutable input slices from the tape instead of saving owned copies.
+    pub fn tensor_apply_function_f64_borrowed_inputs<F, B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(
+            &mut FunctionCtx,
+            &[(&[f64], &[usize])],
+        ) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
+        B: Fn(
+                &FunctionCtx,
+                &[&[f64]],
+                &[(&[f64], &[usize])],
+            ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        self.tensor_tape
+            .apply_function_f64_borrowed_inputs(inputs, forward_fn, backward_fn)
+    }
+
     /// Cross product of two 3-element vectors.
     ///
     /// Both inputs must be 1D tensors of length 3.
@@ -16686,29 +16712,42 @@ impl FrankenTorchSession {
             let has_bias = bias.is_some();
             let (b_, ic, ph, pw) = (batch_size, in_channels, padded_h, padded_w);
             let (kh, kw, oh, ow) = (kernel_h, kernel_w, output_h, output_w);
-            let (sh, sw, oc, pwidth) = (stride_h, stride_w, out_channels, patch_width);
+            let (sh, sw, oc) = (stride_h, stride_w, out_channels);
             let mut inputs = vec![padded, weight];
             if let Some(b) = bias {
                 inputs.push(b);
             }
-            return self.tensor_apply_function(
+            return self.tensor_apply_function_f64_borrowed_inputs(
                 &inputs,
-                move |ctx, ins| {
+                move |_ctx, ins| {
                     let (pv, _) = ins[0];
                     let (wv, _) = ins[1];
                     let bv = if has_bias { Some(ins[2].0) } else { None };
                     let out = ft_kernel_cpu::conv2d_forward_f64(
                         pv, wv, bv, b_, ic, ph, pw, kh, kw, oh, ow, sh, sw, oc,
                     );
-                    ctx.save_for_backward(pv.to_vec(), vec![b_, ic, ph, pw]);
-                    ctx.save_for_backward(wv.to_vec(), vec![oc, pwidth]);
                     Ok((out, vec![b_, oc, oh, ow]))
                 },
-                move |ctx, grad_outputs| {
+                move |_ctx, grad_outputs, borrowed_inputs| {
                     let dout = grad_outputs[0];
-                    let s = ctx.saved_tensors();
+                    let padded_values = borrowed_inputs[0].0;
+                    let weight_values = borrowed_inputs[1].0;
                     let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_f64(
-                        dout, &s[0], &s[1], b_, ic, ph, pw, kh, kw, oh, ow, sh, sw, oc, has_bias,
+                        dout,
+                        padded_values,
+                        weight_values,
+                        b_,
+                        ic,
+                        ph,
+                        pw,
+                        kh,
+                        kw,
+                        oh,
+                        ow,
+                        sh,
+                        sw,
+                        oc,
+                        has_bias,
                     );
                     let mut g = vec![Some(dpadded), Some(dweight)];
                     if has_bias {
@@ -85417,6 +85456,58 @@ mod tests {
             m[i] -= hh;
             chk(gb[i], (loss_fn(&xv, &wv, &p) - loss_fn(&xv, &wv, &m)) / (2.0 * hh), "db", i);
         }
+    }
+
+    #[test]
+    fn functional_conv2d_borrowed_grad_preserves_input_contract() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let input = s
+            .tensor_variable(
+                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
+                vec![1, 1, 3, 3],
+                true,
+            )
+            .unwrap();
+        let weight = s
+            .tensor_variable(vec![0.5, -1.0, 2.0, 0.25], vec![1, 1, 2, 2], true)
+            .unwrap();
+        let bias = s.tensor_variable(vec![0.75], vec![1], true).unwrap();
+
+        let out = s
+            .functional_conv2d(input, weight, Some(bias), (1, 1), (0, 0))
+            .unwrap();
+        assert_eq!(s.tensor_values(out).unwrap(), vec![8.5, 10.25, 13.75, 15.5]);
+
+        let delta = s
+            .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![1, 1, 2, 2], false)
+            .unwrap();
+        let err = s
+            .tensor_add_(weight, delta)
+            .expect_err("leaf weight mutation before backward must stay forbidden");
+        assert!(matches!(
+            err,
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
+                ft_dispatch::DispatchKeyError::IncompatibleSet { .. }
+            ))
+        ));
+
+        let loss = s.tensor_sum(out).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let input_grad = s
+            .tensor_gradient(&report, input)
+            .expect("input grad should exist");
+        let weight_grad = s
+            .tensor_gradient(&report, weight)
+            .expect("weight grad should exist");
+        let bias_grad = s
+            .tensor_gradient(&report, bias)
+            .expect("bias grad should exist");
+        assert_eq!(
+            input_grad,
+            &vec![0.5, -0.5, -1.0, 2.5, 1.75, -0.75, 2.0, 2.25, 0.25]
+        );
+        assert_eq!(weight_grad, &vec![12.0, 16.0, 24.0, 28.0]);
+        assert_eq!(bias_grad, &vec![4.0]);
     }
 
     #[test]

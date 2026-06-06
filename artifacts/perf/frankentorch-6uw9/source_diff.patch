@@ -1,0 +1,356 @@
+diff --git a/crates/ft-api/src/lib.rs b/crates/ft-api/src/lib.rs
+index 5f0ead85..5f877d03 100644
+--- a/crates/ft-api/src/lib.rs
++++ b/crates/ft-api/src/lib.rs
+@@ -6425,6 +6425,32 @@ impl FrankenTorchSession {
+             .apply_function(inputs, forward_fn, backward_fn)
+     }
+ 
++    /// Apply a f64-only custom autograd function whose backward closure borrows
++    /// the immutable input slices from the tape instead of saving owned copies.
++    pub fn tensor_apply_function_f64_borrowed_inputs<F, B>(
++        &mut self,
++        inputs: &[TensorNodeId],
++        forward_fn: F,
++        backward_fn: B,
++    ) -> Result<TensorNodeId, AutogradError>
++    where
++        F: FnOnce(
++            &mut FunctionCtx,
++            &[(&[f64], &[usize])],
++        ) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
++        B: Fn(
++                &FunctionCtx,
++                &[&[f64]],
++                &[(&[f64], &[usize])],
++            ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
++            + Send
++            + Sync
++            + 'static,
++    {
++        self.tensor_tape
++            .apply_function_f64_borrowed_inputs(inputs, forward_fn, backward_fn)
++    }
++
+     /// Cross product of two 3-element vectors.
+     ///
+     /// Both inputs must be 1D tensors of length 3.
+@@ -16686,29 +16712,42 @@ impl FrankenTorchSession {
+             let has_bias = bias.is_some();
+             let (b_, ic, ph, pw) = (batch_size, in_channels, padded_h, padded_w);
+             let (kh, kw, oh, ow) = (kernel_h, kernel_w, output_h, output_w);
+-            let (sh, sw, oc, pwidth) = (stride_h, stride_w, out_channels, patch_width);
++            let (sh, sw, oc) = (stride_h, stride_w, out_channels);
+             let mut inputs = vec![padded, weight];
+             if let Some(b) = bias {
+                 inputs.push(b);
+             }
+-            return self.tensor_apply_function(
++            return self.tensor_apply_function_f64_borrowed_inputs(
+                 &inputs,
+-                move |ctx, ins| {
++                move |_ctx, ins| {
+                     let (pv, _) = ins[0];
+                     let (wv, _) = ins[1];
+                     let bv = if has_bias { Some(ins[2].0) } else { None };
+                     let out = ft_kernel_cpu::conv2d_forward_f64(
+                         pv, wv, bv, b_, ic, ph, pw, kh, kw, oh, ow, sh, sw, oc,
+                     );
+-                    ctx.save_for_backward(pv.to_vec(), vec![b_, ic, ph, pw]);
+-                    ctx.save_for_backward(wv.to_vec(), vec![oc, pwidth]);
+                     Ok((out, vec![b_, oc, oh, ow]))
+                 },
+-                move |ctx, grad_outputs| {
++                move |_ctx, grad_outputs, borrowed_inputs| {
+                     let dout = grad_outputs[0];
+-                    let s = ctx.saved_tensors();
++                    let padded_values = borrowed_inputs[0].0;
++                    let weight_values = borrowed_inputs[1].0;
+                     let (dpadded, dweight, dbias) = ft_kernel_cpu::conv2d_backward_f64(
+-                        dout, &s[0], &s[1], b_, ic, ph, pw, kh, kw, oh, ow, sh, sw, oc, has_bias,
++                        dout,
++                        padded_values,
++                        weight_values,
++                        b_,
++                        ic,
++                        ph,
++                        pw,
++                        kh,
++                        kw,
++                        oh,
++                        ow,
++                        sh,
++                        sw,
++                        oc,
++                        has_bias,
+                     );
+                     let mut g = vec![Some(dpadded), Some(dweight)];
+                     if has_bias {
+@@ -85419,6 +85458,58 @@ mod tests {
+         }
+     }
+ 
++    #[test]
++    fn functional_conv2d_borrowed_grad_preserves_input_contract() {
++        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
++        let input = s
++            .tensor_variable(
++                vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0],
++                vec![1, 1, 3, 3],
++                true,
++            )
++            .unwrap();
++        let weight = s
++            .tensor_variable(vec![0.5, -1.0, 2.0, 0.25], vec![1, 1, 2, 2], true)
++            .unwrap();
++        let bias = s.tensor_variable(vec![0.75], vec![1], true).unwrap();
++
++        let out = s
++            .functional_conv2d(input, weight, Some(bias), (1, 1), (0, 0))
++            .unwrap();
++        assert_eq!(s.tensor_values(out).unwrap(), vec![8.5, 10.25, 13.75, 15.5]);
++
++        let delta = s
++            .tensor_variable(vec![1.0, 1.0, 1.0, 1.0], vec![1, 1, 2, 2], false)
++            .unwrap();
++        let err = s
++            .tensor_add_(weight, delta)
++            .expect_err("leaf weight mutation before backward must stay forbidden");
++        assert!(matches!(
++            err,
++            AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
++                ft_dispatch::DispatchKeyError::IncompatibleSet { .. }
++            ))
++        ));
++
++        let loss = s.tensor_sum(out).unwrap();
++        let report = s.tensor_backward(loss).unwrap();
++        let input_grad = s
++            .tensor_gradient(&report, input)
++            .expect("input grad should exist");
++        let weight_grad = s
++            .tensor_gradient(&report, weight)
++            .expect("weight grad should exist");
++        let bias_grad = s
++            .tensor_gradient(&report, bias)
++            .expect("bias grad should exist");
++        assert_eq!(
++            input_grad,
++            &vec![0.5, -0.5, -1.0, 2.5, 1.75, -0.75, 2.0, 2.25, 0.25]
++        );
++        assert_eq!(weight_grad, &vec![12.0, 16.0, 24.0, 28.0]);
++        assert_eq!(bias_grad, &vec![4.0]);
++    }
++
+     #[test]
+     fn functional_conv2d_no_grad_fast_path_matches_composed_path_bit_exact() {
+         let input_shape = vec![2, 3, 5, 6];
+diff --git a/crates/ft-autograd/src/lib.rs b/crates/ft-autograd/src/lib.rs
+index bf462abc..2947c8f2 100644
+--- a/crates/ft-autograd/src/lib.rs
++++ b/crates/ft-autograd/src/lib.rs
+@@ -1453,10 +1453,25 @@ type AutogradFunctionBackward = dyn Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Op
+     + Sync
+     + 'static;
+ 
++type AutogradFunctionBackwardWithBorrowedInputs = dyn Fn(
++        &FunctionCtx,
++        &[&[f64]],
++        &[(&[f64], &[usize])],
++    ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
++    + Send
++    + Sync
++    + 'static;
++
++#[derive(Clone)]
++enum CustomFunctionBackward {
++    Owned(Arc<AutogradFunctionBackward>),
++    BorrowedInputsF64(Arc<AutogradFunctionBackwardWithBorrowedInputs>),
++}
++
+ #[derive(Clone)]
+ struct CustomFunctionRecord {
+     ctx: FunctionCtx,
+-    backward_fn: Arc<AutogradFunctionBackward>,
++    backward: CustomFunctionBackward,
+     input_numel: Vec<usize>,
+ }
+ 
+@@ -8171,7 +8186,7 @@ impl TensorTape {
+             function_id,
+             CustomFunctionRecord {
+                 ctx,
+-                backward_fn: Arc::new(backward_fn),
++                backward: CustomFunctionBackward::Owned(Arc::new(backward_fn)),
+                 input_numel: input_numels,
+             },
+         );
+@@ -8190,6 +8205,94 @@ impl TensorTape {
+         Ok(out)
+     }
+ 
++    /// Apply a f64-only custom autograd function whose backward closure reads
++    /// immutable input slices from the tape instead of saving owned copies.
++    pub fn apply_function_f64_borrowed_inputs<F, B>(
++        &mut self,
++        inputs: &[TensorNodeId],
++        forward_fn: F,
++        backward_fn: B,
++    ) -> Result<TensorNodeId, AutogradError>
++    where
++        F: FnOnce(
++            &mut FunctionCtx,
++            &[(&[f64], &[usize])],
++        ) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
++        B: Fn(
++                &FunctionCtx,
++                &[&[f64]],
++                &[(&[f64], &[usize])],
++            ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
++            + Send
++            + Sync
++            + 'static,
++    {
++        let mut needs_input_grad = Vec::with_capacity(inputs.len());
++        let mut input_numels = Vec::with_capacity(inputs.len());
++        let mut any_requires_grad = false;
++        let mut output_device = Device::Cpu;
++
++        let (ctx, output_values, output_shape) = {
++            let mut input_refs: Vec<(&[f64], &[usize])> = Vec::with_capacity(inputs.len());
++            for &input_id in inputs {
++                let node = self.node(input_id)?;
++                let rg = node.requires_grad && self.grad_enabled;
++                needs_input_grad.push(rg);
++                if rg {
++                    any_requires_grad = true;
++                }
++                let vals = node.tensor.contiguous_values()?;
++                input_numels.push(vals.len());
++                output_device = node.tensor.meta().device();
++                input_refs.push((vals, node.tensor.meta().shape()));
++            }
++
++            let mut ctx = FunctionCtx::new(needs_input_grad);
++            let (output_values, output_shape) = forward_fn(&mut ctx, &input_refs)?;
++            (ctx, output_values, output_shape)
++        };
++
++        let inputs_owned = inputs.to_vec();
++        let out = TensorNodeId(self.nodes.len());
++
++        if !any_requires_grad || !self.grad_enabled {
++            self.nodes.push(TensorNode {
++                tensor: DenseTensor::from_storage(
++                    TensorMeta::from_shape(output_shape, DType::F64, output_device),
++                    output_values,
++                )?,
++                requires_grad: false,
++                op: TensorNodeOp::Leaf,
++            });
++            return Ok(out);
++        }
++
++        let function_id = self.next_custom_function_id;
++        self.next_custom_function_id += 1;
++
++        self.custom_functions.insert(
++            function_id,
++            CustomFunctionRecord {
++                ctx,
++                backward: CustomFunctionBackward::BorrowedInputsF64(Arc::new(backward_fn)),
++                input_numel: input_numels,
++            },
++        );
++
++        self.nodes.push(TensorNode {
++            tensor: DenseTensor::from_storage(
++                TensorMeta::from_shape(output_shape, DType::F64, output_device),
++                output_values,
++            )?,
++            requires_grad: any_requires_grad,
++            op: TensorNodeOp::CustomFunction {
++                inputs: inputs_owned,
++                function_id,
++            },
++        });
++        Ok(out)
++    }
++
+     pub fn masked_fill(
+         &mut self,
+         input: TensorNodeId,
+@@ -13228,12 +13331,29 @@ impl TensorTape {
+                     ref inputs,
+                     function_id,
+                 } => {
+-                    let record = self
+-                        .custom_functions
+-                        .get(&function_id)
+-                        .ok_or(AutogradError::UnknownTensorNode(node_id))?;
+-                    let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
+-                    let input_grads = (record.backward_fn)(&record.ctx, &grad_outputs)?;
++                    let input_grads = {
++                        let record = self
++                            .custom_functions
++                            .get(&function_id)
++                            .ok_or(AutogradError::UnknownTensorNode(node_id))?;
++                        let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
++                        match &record.backward {
++                            CustomFunctionBackward::Owned(backward_fn) => {
++                                backward_fn(&record.ctx, &grad_outputs)?
++                            }
++                            CustomFunctionBackward::BorrowedInputsF64(backward_fn) => {
++                                let mut borrowed_inputs = Vec::with_capacity(inputs.len());
++                                for &input_id in inputs {
++                                    let input_node = self.node(input_id)?;
++                                    borrowed_inputs.push((
++                                        input_node.tensor.contiguous_values()?,
++                                        input_node.tensor.meta().shape(),
++                                    ));
++                                }
++                                backward_fn(&record.ctx, &grad_outputs, &borrowed_inputs)?
++                            }
++                        }
++                    };
+ 
+                     if input_grads.len() != inputs.len() {
+                         return Err(AutogradError::TensorGradientShapeMismatch {
+@@ -22353,6 +22473,37 @@ mod tests {
+         assert_eq!(grad, &[1.0, 1.0, 1.0]);
+     }
+ 
++    #[test]
++    fn custom_function_borrowed_inputs_backward_uses_tape_values() {
++        let mut tape = TensorTape::new();
++        let x = tape.leaf(vec![1.0, -2.0, 3.5], vec![3], true).expect("x");
++
++        let y = tape
++            .apply_function_f64_borrowed_inputs(
++                &[x],
++                |_ctx, inputs| {
++                    let (vals, shape) = inputs[0];
++                    let squared = vals.iter().map(|value| value * value).collect();
++                    Ok((squared, shape.to_vec()))
++                },
++                |_ctx, grad_outputs, borrowed_inputs| {
++                    let input_values = borrowed_inputs[0].0;
++                    let grad = grad_outputs[0]
++                        .iter()
++                        .zip(input_values.iter())
++                        .map(|(grad, value)| grad * 2.0 * value)
++                        .collect();
++                    Ok(vec![Some(grad)])
++                },
++            )
++            .expect("borrowed-input square function");
++
++        assert_eq!(tape.values(y).expect("values"), vec![1.0, 4.0, 12.25]);
++        let report = tape.backward(y).expect("backward");
++        let grad = report.gradient(x).expect("gradient exists");
++        assert_eq!(grad, &[2.0, -4.0, 7.0]);
++    }
++
+     #[test]
+     fn custom_function_f32_preserves_dtype_without_grad() {
+         let mut tape = TensorTape::new();

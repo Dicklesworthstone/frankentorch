@@ -1453,10 +1453,25 @@ type AutogradFunctionBackward = dyn Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Op
     + Sync
     + 'static;
 
+type AutogradFunctionBackwardWithBorrowedInputs = dyn Fn(
+        &FunctionCtx,
+        &[&[f64]],
+        &[(&[f64], &[usize])],
+    ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+    + Send
+    + Sync
+    + 'static;
+
+#[derive(Clone)]
+enum CustomFunctionBackward {
+    Owned(Arc<AutogradFunctionBackward>),
+    BorrowedInputsF64(Arc<AutogradFunctionBackwardWithBorrowedInputs>),
+}
+
 #[derive(Clone)]
 struct CustomFunctionRecord {
     ctx: FunctionCtx,
-    backward_fn: Arc<AutogradFunctionBackward>,
+    backward: CustomFunctionBackward,
     input_numel: Vec<usize>,
 }
 
@@ -8171,7 +8186,7 @@ impl TensorTape {
             function_id,
             CustomFunctionRecord {
                 ctx,
-                backward_fn: Arc::new(backward_fn),
+                backward: CustomFunctionBackward::Owned(Arc::new(backward_fn)),
                 input_numel: input_numels,
             },
         );
@@ -8179,6 +8194,94 @@ impl TensorTape {
         self.nodes.push(TensorNode {
             tensor: Self::tensor_from_f64_values(
                 ft_core::TensorMeta::from_shape(output_shape, output_dtype, output_device),
+                output_values,
+            )?,
+            requires_grad: any_requires_grad,
+            op: TensorNodeOp::CustomFunction {
+                inputs: inputs_owned,
+                function_id,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Apply a f64-only custom autograd function whose backward closure reads
+    /// immutable input slices from the tape instead of saving owned copies.
+    pub fn apply_function_f64_borrowed_inputs<F, B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(
+            &mut FunctionCtx,
+            &[(&[f64], &[usize])],
+        ) -> Result<(Vec<f64>, Vec<usize>), AutogradError>,
+        B: Fn(
+                &FunctionCtx,
+                &[&[f64]],
+                &[(&[f64], &[usize])],
+            ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut needs_input_grad = Vec::with_capacity(inputs.len());
+        let mut input_numels = Vec::with_capacity(inputs.len());
+        let mut any_requires_grad = false;
+        let mut output_device = Device::Cpu;
+
+        let (ctx, output_values, output_shape) = {
+            let mut input_refs: Vec<(&[f64], &[usize])> = Vec::with_capacity(inputs.len());
+            for &input_id in inputs {
+                let node = self.node(input_id)?;
+                let rg = node.requires_grad && self.grad_enabled;
+                needs_input_grad.push(rg);
+                if rg {
+                    any_requires_grad = true;
+                }
+                let vals = node.tensor.contiguous_values()?;
+                input_numels.push(vals.len());
+                output_device = node.tensor.meta().device();
+                input_refs.push((vals, node.tensor.meta().shape()));
+            }
+
+            let mut ctx = FunctionCtx::new(needs_input_grad);
+            let (output_values, output_shape) = forward_fn(&mut ctx, &input_refs)?;
+            (ctx, output_values, output_shape)
+        };
+
+        let inputs_owned = inputs.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+
+        if !any_requires_grad || !self.grad_enabled {
+            self.nodes.push(TensorNode {
+                tensor: DenseTensor::from_storage(
+                    TensorMeta::from_shape(output_shape, DType::F64, output_device),
+                    output_values,
+                )?,
+                requires_grad: false,
+                op: TensorNodeOp::Leaf,
+            });
+            return Ok(out);
+        }
+
+        let function_id = self.next_custom_function_id;
+        self.next_custom_function_id += 1;
+
+        self.custom_functions.insert(
+            function_id,
+            CustomFunctionRecord {
+                ctx,
+                backward: CustomFunctionBackward::BorrowedInputsF64(Arc::new(backward_fn)),
+                input_numel: input_numels,
+            },
+        );
+
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(
+                TensorMeta::from_shape(output_shape, DType::F64, output_device),
                 output_values,
             )?,
             requires_grad: any_requires_grad,
@@ -13228,12 +13331,29 @@ impl TensorTape {
                     ref inputs,
                     function_id,
                 } => {
-                    let record = self
-                        .custom_functions
-                        .get(&function_id)
-                        .ok_or(AutogradError::UnknownTensorNode(node_id))?;
-                    let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
-                    let input_grads = (record.backward_fn)(&record.ctx, &grad_outputs)?;
+                    let input_grads = {
+                        let record = self
+                            .custom_functions
+                            .get(&function_id)
+                            .ok_or(AutogradError::UnknownTensorNode(node_id))?;
+                        let grad_outputs: Vec<&[f64]> = vec![incoming.as_slice()];
+                        match &record.backward {
+                            CustomFunctionBackward::Owned(backward_fn) => {
+                                backward_fn(&record.ctx, &grad_outputs)?
+                            }
+                            CustomFunctionBackward::BorrowedInputsF64(backward_fn) => {
+                                let mut borrowed_inputs = Vec::with_capacity(inputs.len());
+                                for &input_id in inputs {
+                                    let input_node = self.node(input_id)?;
+                                    borrowed_inputs.push((
+                                        input_node.tensor.contiguous_values()?,
+                                        input_node.tensor.meta().shape(),
+                                    ));
+                                }
+                                backward_fn(&record.ctx, &grad_outputs, &borrowed_inputs)?
+                            }
+                        }
+                    };
 
                     if input_grads.len() != inputs.len() {
                         return Err(AutogradError::TensorGradientShapeMismatch {
@@ -22351,6 +22471,37 @@ mod tests {
         let report = tape.backward(y).expect("backward");
         let grad = report.gradient(x).expect("gradient exists");
         assert_eq!(grad, &[1.0, 1.0, 1.0]);
+    }
+
+    #[test]
+    fn custom_function_borrowed_inputs_backward_uses_tape_values() {
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, -2.0, 3.5], vec![3], true).expect("x");
+
+        let y = tape
+            .apply_function_f64_borrowed_inputs(
+                &[x],
+                |_ctx, inputs| {
+                    let (vals, shape) = inputs[0];
+                    let squared = vals.iter().map(|value| value * value).collect();
+                    Ok((squared, shape.to_vec()))
+                },
+                |_ctx, grad_outputs, borrowed_inputs| {
+                    let input_values = borrowed_inputs[0].0;
+                    let grad = grad_outputs[0]
+                        .iter()
+                        .zip(input_values.iter())
+                        .map(|(grad, value)| grad * 2.0 * value)
+                        .collect();
+                    Ok(vec![Some(grad)])
+                },
+            )
+            .expect("borrowed-input square function");
+
+        assert_eq!(tape.values(y).expect("values"), vec![1.0, 4.0, 12.25]);
+        let report = tape.backward(y).expect("backward");
+        let grad = report.gradient(x).expect("gradient exists");
+        assert_eq!(grad, &[2.0, -4.0, 7.0]);
     }
 
     #[test]
