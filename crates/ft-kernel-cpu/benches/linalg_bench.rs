@@ -3,14 +3,26 @@
 //!   baseline:  rch exec -- env RAYON_NUM_THREADS=1 cargo bench -p ft-kernel-cpu --bench linalg_bench
 //!   optimized: rch exec -- cargo bench -p ft-kernel-cpu --bench linalg_bench
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
     cholesky_contiguous_f64, det_contiguous_f64, eig_contiguous_f64, eigh_contiguous_f64,
     eigvals_contiguous_f64, eigvalsh_contiguous_f64, inv_tensor_contiguous_f64,
     lobpcg_contiguous_f64, matrix_exp_contiguous_f64, qr_contiguous_f64, svd_contiguous_f64,
-    svd_lowrank_contiguous_f64, svdvals_contiguous_f64,
+    svd_lowrank_contiguous_f64, svdvals_contiguous_f64, symmetric_rank2k_lower_update_f64,
 };
+
+fn symmetric_rank2k_lower_update_scalar(n: usize, k: usize, v: &[f64], w: &[f64], a: &mut [f64]) {
+    for row in 0..n {
+        for col in 0..=row {
+            let mut update = 0.0_f64;
+            for p in 0..k {
+                update += v[row * k + p] * w[col * k + p] + w[row * k + p] * v[col * k + p];
+            }
+            a[row * n + col] -= update;
+        }
+    }
+}
 
 fn bench_lobpcg(c: &mut Criterion) {
     for &n in &[256usize, 512usize] {
@@ -204,6 +216,40 @@ fn bench_eigh(c: &mut Criterion) {
     }
 }
 
+fn bench_symmetric_rank2k_update(c: &mut Criterion) {
+    let (n, k) = (256usize, 32usize);
+    let v: Vec<f64> = (0..n * k)
+        .map(|i| ((i % 37) as f64 - 18.0) * 0.009 + (i as f64) * 1e-8)
+        .collect();
+    let w: Vec<f64> = (0..n * k)
+        .map(|i| ((i % 29) as f64 - 14.0) * 0.011 - (i as f64) * 1e-8)
+        .collect();
+    let a: Vec<f64> = (0..n * n)
+        .map(|i| ((i % 53) as f64 - 26.0) * 0.003)
+        .collect();
+
+    c.bench_function("sym_rank2k_lower_scalar_f64_256x32", |bch| {
+        bch.iter_batched(
+            || a.clone(),
+            |mut work| {
+                symmetric_rank2k_lower_update_scalar(n, k, &v, &w, &mut work);
+                black_box(work)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    c.bench_function("sym_rank2k_lower_gemm_f64_256x32", |bch| {
+        bch.iter_batched(
+            || a.clone(),
+            |mut work| {
+                symmetric_rank2k_lower_update_f64(n, k, &v, &w, &mut work).unwrap();
+                black_box(work)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+}
+
 fn bench_lu(c: &mut Criterion) {
     for &n in &[768usize, 1536usize] {
         // Diagonally dominant -> well-conditioned, no near-singular short-circuit.
@@ -253,6 +299,7 @@ criterion_group!(
     bench_lu,
     bench_cholesky,
     bench_eigh,
+    bench_symmetric_rank2k_update,
     bench_lobpcg,
     bench_eig_general,
     bench_svd,

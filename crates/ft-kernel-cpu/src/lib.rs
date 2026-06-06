@@ -8759,6 +8759,52 @@ pub struct EighResult {
     pub n: usize,
 }
 
+/// Apply the lower triangle of a symmetric rank-2k update:
+///
+/// `A := A - (V @ W^T + W @ V^T)`
+///
+/// `V` and `W` are row-major `n x k` panels and `A` is row-major `n x n`.
+/// This is the BLAS-3 trailing-update primitive needed by blocked symmetric
+/// tridiagonalization (`dsytrd`-style panels). It intentionally updates only the
+/// lower triangle because the current symmetric eigensolver consumes lower
+/// storage for tridiagonal reduction.
+pub fn symmetric_rank2k_lower_update_f64(
+    n: usize,
+    k: usize,
+    v: &[f64],
+    w: &[f64],
+    a: &mut [f64],
+) -> Result<(), KernelError> {
+    let panel_len = n * k;
+    let matrix_len = n * n;
+    if v.len() < panel_len || w.len() < panel_len || a.len() < matrix_len {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![v.len(), w.len(), a.len()],
+            rhs: vec![panel_len, panel_len, matrix_len],
+        });
+    }
+    if n == 0 || k == 0 {
+        return Ok(());
+    }
+
+    let v = &v[..panel_len];
+    let w = &w[..panel_len];
+    let a = &mut a[..matrix_len];
+    let mut vw_t = vec![0.0f64; matrix_len];
+    let mut wv_t = vec![0.0f64; matrix_len];
+    gemm::dgemm_bt(n, k, n, v, w, &mut vw_t);
+    gemm::dgemm_bt(n, k, n, w, v, &mut wv_t);
+    for row in 0..n {
+        let row_start = row * n;
+        for col in 0..=row {
+            let idx = row_start + col;
+            a[idx] -= vw_t[idx] + wv_t[idx];
+        }
+    }
+
+    Ok(())
+}
+
 /// Compute eigendecomposition of a symmetric matrix using the Jacobi eigenvalue algorithm.
 ///
 /// Returns eigenvalues sorted ascending and corresponding orthonormal eigenvectors.
@@ -15568,6 +15614,53 @@ mod tests {
                     r.to_bits(),
                     g.to_bits(),
                     "sgemm_bt diverged at {idx} for ({m},{k},{n}): ref {r} vs bt {g}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_rank2k_lower_update_matches_scalar_reference() {
+        let (n, k) = (17usize, 5usize);
+        let v: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 13) as f64 - 6.0) * 0.125 + (i as f64) * 1e-6)
+            .collect();
+        let w: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 11) as f64 - 5.0) * 0.2 - (i as f64) * 1e-6)
+            .collect();
+        let mut got: Vec<f64> = (0..n * n)
+            .map(|i| ((i % 17) as f64 - 8.0) * 0.031)
+            .collect();
+        let mut expected = got.clone();
+        for row in 0..n {
+            for col in 0..=row {
+                let mut update = 0.0;
+                for p in 0..k {
+                    update += v[row * k + p] * w[col * k + p] + w[row * k + p] * v[col * k + p];
+                }
+                expected[row * n + col] -= update;
+            }
+        }
+
+        super::symmetric_rank2k_lower_update_f64(n, k, &v, &w, &mut got).unwrap();
+        for row in 0..n {
+            for col in 0..=row {
+                let idx = row * n + col;
+                let diff = (got[idx] - expected[idx]).abs();
+                let tol = 1e-12 * expected[idx].abs().max(1.0);
+                assert!(
+                    diff <= tol,
+                    "lower update mismatch at ({row},{col}): got {}, expected {}, diff {diff}",
+                    got[idx],
+                    expected[idx]
+                );
+            }
+            for col in (row + 1)..n {
+                let idx = row * n + col;
+                assert_eq!(
+                    got[idx].to_bits(),
+                    expected[idx].to_bits(),
+                    "upper triangle changed at ({row},{col})"
                 );
             }
         }
