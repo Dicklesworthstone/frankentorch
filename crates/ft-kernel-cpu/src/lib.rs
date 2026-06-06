@@ -12021,6 +12021,143 @@ where
     Ok(simd_binary_f32(lhs_window, rhs_window, scalar_op, simd_op))
 }
 
+/// Least-squares solve `min ||A·X - B||` for an overdetermined, full-rank
+/// `A` (`m >= n`) via a reduced QR factorization: `A = Q·R`, then
+/// `R·X = Qᵀ·B` by back-substitution. This is the unique least-squares
+/// solution, identical (to tolerance) to the SVD pseudo-inverse path, but it
+/// replaces the O(n³)-but-BLAS-1 Golub–Reinsch SVD with the parallel
+/// Householder QR.
+///
+/// Returns `Ok(None)` when the QR fast path does not apply or is unsafe — `m <
+/// n` (underdetermined) or a (near-)rank-deficient `R` (a tiny diagonal) — so
+/// the caller falls back to the SVD pseudo-inverse, which yields the
+/// minimum-norm solution PyTorch returns for those cases.
+pub fn lstsq_qr_contiguous_f64(
+    a_data: &[f64],
+    a_meta: &TensorMeta,
+    b_data: &[f64],
+    b_meta: &TensorMeta,
+) -> Result<Option<Vec<f64>>, KernelError> {
+    ensure_unary_layout_and_storage(a_data, a_meta)?;
+    ensure_unary_layout_and_storage(b_data, b_meta)?;
+    let a_shape = a_meta.shape();
+    let b_shape = b_meta.shape();
+    if a_shape.len() != 2 || b_shape.len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: a_shape.to_vec(),
+            rhs: b_shape.to_vec(),
+        });
+    }
+    let m = a_shape[0];
+    let n = a_shape[1];
+    let k = b_shape[1];
+    if b_shape[0] != m {
+        return Err(KernelError::ShapeMismatch {
+            lhs: a_shape.to_vec(),
+            rhs: b_shape.to_vec(),
+        });
+    }
+    // Only the overdetermined full-rank case is handled here; everything else
+    // defers to the SVD pseudo-inverse.
+    if m == 0 || n == 0 || k == 0 || m < n {
+        return Ok(None);
+    }
+
+    // Householder QR applied SIMULTANEOUSLY to R (a copy of A) and to B, never
+    // forming the m×m Q. Forming Q (as qr_contiguous_f64 does) costs O(m²·n) and
+    // is pure waste here — least squares only needs Qᵀ·B, which the reflectors
+    // produce directly in O(m·n·k). R is reduced to upper-triangular in place;
+    // `diag` holds its diagonal (the reflection alphas).
+    let a_offset = a_meta.storage_offset();
+    let b_offset = b_meta.storage_offset();
+    let mut r = a_data[a_offset..a_offset + m * n].to_vec();
+    let mut qtb = b_data[b_offset..b_offset + m * k].to_vec();
+    let mut diag = vec![0.0_f64; n];
+
+    for j in 0..n {
+        let col_len = m - j;
+        // x = R[j..m, j]; ||x||.
+        let mut norm_sq = 0.0_f64;
+        for i in 0..col_len {
+            let val = r[(j + i) * n + j];
+            norm_sq += val * val;
+        }
+        let norm = norm_sq.sqrt();
+        if norm == 0.0 {
+            return Ok(None); // zero column -> rank-deficient, defer to SVD
+        }
+        let x0 = r[j * n + j];
+        // alpha = -sign(x0)*||x|| (the stable choice: v[0] = x0 - alpha avoids
+        // cancellation). The R diagonal becomes alpha.
+        let alpha = if x0 >= 0.0 { -norm } else { norm };
+        let mut v = vec![0.0_f64; col_len];
+        v[0] = x0 - alpha;
+        for i in 1..col_len {
+            v[i] = r[(j + i) * n + j];
+        }
+        let vnorm_sq: f64 = v.iter().map(|t| t * t).sum();
+        if vnorm_sq == 0.0 {
+            return Ok(None);
+        }
+        let inv = 2.0 / vnorm_sq;
+        // Apply H = I - inv·v·vᵀ to the trailing columns of R (j..n).
+        for c in j..n {
+            let mut dot = 0.0;
+            for i in 0..col_len {
+                dot += v[i] * r[(j + i) * n + c];
+            }
+            let f = dot * inv;
+            for i in 0..col_len {
+                r[(j + i) * n + c] -= f * v[i];
+            }
+        }
+        // Apply the same H to every column of B -> accumulates Qᵀ·B.
+        for c in 0..k {
+            let mut dot = 0.0;
+            for i in 0..col_len {
+                dot += v[i] * qtb[(j + i) * k + c];
+            }
+            let f = dot * inv;
+            for i in 0..col_len {
+                qtb[(j + i) * k + c] -= f * v[i];
+            }
+        }
+        diag[j] = alpha;
+    }
+
+    // Full-rank guard: relative to the largest |diag|. A tiny pivot means
+    // (near-)rank-deficient — defer to SVD for the minimum-norm solution and to
+    // avoid an ill-conditioned back-substitution.
+    let mut max_diag = 0.0_f64;
+    for j in 0..n {
+        max_diag = max_diag.max(diag[j].abs());
+    }
+    if max_diag == 0.0 {
+        return Ok(None);
+    }
+    let rank_tol = max_diag * f64::EPSILON * (m.max(n) as f64);
+    for j in 0..n {
+        if diag[j].abs() <= rank_tol {
+            return Ok(None);
+        }
+    }
+
+    // Back-substitute R·X = (Qᵀ·B)[0..n], R upper-triangular with `diag` on the
+    // diagonal and the strict upper part read from the reduced `r`.
+    let mut x = vec![0.0_f64; n * k];
+    for c in 0..k {
+        for i in (0..n).rev() {
+            let mut acc = qtb[i * k + c];
+            for jj in (i + 1)..n {
+                acc -= r[i * n + jj] * x[jj * k + c];
+            }
+            x[i * k + c] = acc / diag[i];
+        }
+    }
+
+    Ok(Some(x))
+}
+
 pub fn add_tensor_contiguous_f32(
     lhs: &[f32],
     rhs: &[f32],
@@ -21039,6 +21176,68 @@ mod tests {
             }
         }
         t
+    }
+
+    #[test]
+    fn lstsq_qr_recovers_overdetermined_solution_and_defers_rank_deficient() {
+        // Overdetermined, full-rank, consistent system: b = A * x_true, so the
+        // least-squares solution is exactly x_true.
+        let m = 80usize;
+        let n = 8usize;
+        let kk = 2usize;
+        let mut a = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                a[i * n + j] = (((i * 37 + j * 19) % 53) as f64 - 26.0) * 0.07
+                    + if i == j { 3.0 } else { 0.0 };
+            }
+        }
+        let mut x_true = vec![0.0f64; n * kk];
+        for idx in 0..n * kk {
+            x_true[idx] = ((idx * 13 + 5) % 17) as f64 * 0.3 - 2.0;
+        }
+        // b = A @ x_true  ([m x n] @ [n x kk])
+        let mut b = vec![0.0f64; m * kk];
+        for i in 0..m {
+            for r in 0..kk {
+                let mut acc = 0.0;
+                for j in 0..n {
+                    acc += a[i * n + j] * x_true[j * kk + r];
+                }
+                b[i * kk + r] = acc;
+            }
+        }
+        let a_meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+        let b_meta = TensorMeta::from_shape(vec![m, kk], DType::F64, Device::Cpu);
+        let x = super::lstsq_qr_contiguous_f64(&a, &a_meta, &b, &b_meta)
+            .expect("lstsq_qr should succeed")
+            .expect("full-rank overdetermined system should take the QR path");
+        let mut max_diff = 0.0f64;
+        for idx in 0..n * kk {
+            max_diff = max_diff.max((x[idx] - x_true[idx]).abs());
+        }
+        assert!(max_diff < 1e-9, "lstsq_qr solution diverges: max_diff={max_diff}");
+
+        // Rank-deficient (duplicate column) -> defer to SVD via None.
+        let mut a_rd = a.clone();
+        for i in 0..m {
+            a_rd[i * n + 1] = a_rd[i * n]; // column 1 := column 0
+        }
+        let deferred = super::lstsq_qr_contiguous_f64(&a_rd, &a_meta, &b, &b_meta)
+            .expect("lstsq_qr should not error on rank-deficient input");
+        assert!(deferred.is_none(), "rank-deficient input must defer to SVD (None)");
+
+        // Underdetermined (m < n) -> defer.
+        let a_wide_meta = TensorMeta::from_shape(vec![2usize, 3usize], DType::F64, Device::Cpu);
+        let b_wide_meta = TensorMeta::from_shape(vec![2usize, 1usize], DType::F64, Device::Cpu);
+        let a_wide = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b_wide = vec![1.0, 2.0];
+        assert!(
+            super::lstsq_qr_contiguous_f64(&a_wide, &a_wide_meta, &b_wide, &b_wide_meta)
+                .unwrap()
+                .is_none(),
+            "underdetermined must defer"
+        );
     }
 
     #[test]

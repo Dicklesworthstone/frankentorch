@@ -1446,8 +1446,36 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_lstsq(c: &mut Criterion) {
+    // Overdetermined, full-rank least squares (low RHS). Baseline = the SVD
+    // pseudo-inverse path (pinv(A) @ b); after = tensor_lstsq, which routes
+    // full-rank m>=n through QR. Same worker / same process -> clean A/B.
+    let mut group = c.benchmark_group("lstsq");
+    for &(m, n) in &[(256usize, 128usize), (512usize, 256usize)] {
+        // Baseline: SVD pseudo-inverse, the previous lstsq implementation.
+        group.bench_function(format!("pinv_svd_{m}x{n}"), |bch| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_randn(vec![m, n], false).unwrap();
+            let b = s.tensor_randn(vec![m, 1], false).unwrap();
+            bch.iter(|| {
+                let p = s.tensor_pinv(black_box(a)).unwrap();
+                black_box(s.tensor_matmul(p, black_box(b)).unwrap())
+            });
+        });
+        // After: QR fast path inside tensor_lstsq.
+        group.bench_function(format!("qr_{m}x{n}"), |bch| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_randn(vec![m, n], false).unwrap();
+            let b = s.tensor_randn(vec![m, 1], false).unwrap();
+            bch.iter(|| black_box(s.tensor_lstsq(black_box(a), black_box(b)).unwrap()));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_lstsq,
     bench_matmul,
     bench_bmm,
     bench_conv1d,
