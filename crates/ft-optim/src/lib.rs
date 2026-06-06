@@ -317,7 +317,6 @@ impl Optimizer for SGD {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -918,7 +917,6 @@ impl Optimizer for RMSprop {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -1115,7 +1113,6 @@ impl Optimizer for Adagrad {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -1270,7 +1267,6 @@ impl Optimizer for RAdam {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -4326,7 +4322,6 @@ impl Optimizer for Adadelta {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             if self.weight_decay != 0.0 {
@@ -4518,7 +4513,6 @@ impl Optimizer for NAdam {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             if self.weight_decay != 0.0 {
@@ -4692,7 +4686,6 @@ impl Optimizer for ASGD {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             if self.weight_decay != 0.0 {
@@ -4845,7 +4838,6 @@ impl Optimizer for Rprop {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
 
             let steps = self.step_sizes[i].get_or_insert_with(|| vec![self.lr; grad.len()]);
             ensure_state_len(
