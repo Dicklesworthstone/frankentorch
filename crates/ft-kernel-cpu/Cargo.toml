@@ -44,5 +44,9 @@ harness = false
 name = "topk_bench"
 harness = false
 
+[[bench]]
+name = "scan_ab"
+harness = false
+
 [lints]
 workspace = true
