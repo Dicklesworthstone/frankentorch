@@ -656,23 +656,14 @@ impl Optimizer for AdamW {
             let bias_correction1 = adam_bias_correction(self.beta1, t);
             let bias_correction2 = adam_bias_correction(self.beta2, t);
 
-            // Decoupled weight decay is equivalent to subtracting
-            // `lr * weight_decay * param` before the Adam update. Build the
-            // next state locally and only commit it after the parameter write,
-            // preserving fail-closed state behavior.
-            let mut next_m = Vec::with_capacity(grad.len());
-            let mut next_v = Vec::with_capacity(grad.len());
-
-            let m_state = self.m[i].as_deref();
-            let v_state = self.v[i].as_deref();
-            if let Some(m) = m_state {
+            if let Some(m) = self.m[i].as_deref() {
                 ensure_state_len(
                     grad.len(),
                     m.len(),
                     "adamw first-moment state length mismatch with gradient length",
                 )?;
             }
-            if let Some(v) = v_state {
+            if let Some(v) = self.v[i].as_deref() {
                 ensure_state_len(
                     grad.len(),
                     v.len(),
@@ -685,94 +676,32 @@ impl Optimizer for AdamW {
             let lr = self.lr;
             let eps = self.eps;
             let weight_decay = self.weight_decay;
+            let m_slot = &mut self.m[i];
+            let v_slot = &mut self.v[i];
             session.tensor_update_param_values_f64_with(param, |param_values| {
-                match (m_state, v_state) {
-                    (Some(m), Some(v)) => {
-                        for (((p, g), m_prev), v_prev) in param_values
-                            .iter_mut()
-                            .zip(grad.iter())
-                            .zip(m.iter())
-                            .zip(v.iter())
-                        {
-                            let m_val = beta1 * m_prev + (1.0 - beta1) * g;
-                            let v_val = beta2 * v_prev + (1.0 - beta2) * g * g;
-                            let m_hat = m_val / bias_correction1;
-                            let v_hat = v_val / bias_correction2;
-                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
-                            let decay_delta = if weight_decay == 0.0 {
-                                0.0
-                            } else {
-                                *p * lr * weight_decay
-                            };
-                            *p -= decay_delta + adam_delta;
-                            next_m.push(m_val);
-                            next_v.push(v_val);
-                        }
-                    }
-                    (Some(m), None) => {
-                        for ((p, g), m_prev) in
-                            param_values.iter_mut().zip(grad.iter()).zip(m.iter())
-                        {
-                            let m_val = beta1 * m_prev + (1.0 - beta1) * g;
-                            let v_val = (1.0 - beta2) * g * g;
-                            let m_hat = m_val / bias_correction1;
-                            let v_hat = v_val / bias_correction2;
-                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
-                            let decay_delta = if weight_decay == 0.0 {
-                                0.0
-                            } else {
-                                *p * lr * weight_decay
-                            };
-                            *p -= decay_delta + adam_delta;
-                            next_m.push(m_val);
-                            next_v.push(v_val);
-                        }
-                    }
-                    (None, Some(v)) => {
-                        for ((p, g), v_prev) in
-                            param_values.iter_mut().zip(grad.iter()).zip(v.iter())
-                        {
-                            let m_val = (1.0 - beta1) * g;
-                            let v_val = beta2 * v_prev + (1.0 - beta2) * g * g;
-                            let m_hat = m_val / bias_correction1;
-                            let v_hat = v_val / bias_correction2;
-                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
-                            let decay_delta = if weight_decay == 0.0 {
-                                0.0
-                            } else {
-                                *p * lr * weight_decay
-                            };
-                            *p -= decay_delta + adam_delta;
-                            next_m.push(m_val);
-                            next_v.push(v_val);
-                        }
-                    }
-                    (None, None) => {
-                        for (p, g) in param_values.iter_mut().zip(grad.iter()) {
-                            let m_val = (1.0 - beta1) * g;
-                            let v_val = (1.0 - beta2) * g * g;
-                            let m_hat = m_val / bias_correction1;
-                            let v_hat = v_val / bias_correction2;
-                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
-                            let decay_delta = if weight_decay == 0.0 {
-                                0.0
-                            } else {
-                                *p * lr * weight_decay
-                            };
-                            *p -= decay_delta + adam_delta;
-                            next_m.push(m_val);
-                            next_v.push(v_val);
-                        }
-                    }
+                let m = m_slot.get_or_insert_with(|| vec![0.0; grad.len()]);
+                let v = v_slot.get_or_insert_with(|| vec![0.0; grad.len()]);
+                for (((p, g), m_val), v_val) in param_values
+                    .iter_mut()
+                    .zip(grad.iter())
+                    .zip(m.iter_mut())
+                    .zip(v.iter_mut())
+                {
+                    *m_val = beta1 * *m_val + (1.0 - beta1) * *g;
+                    *v_val = beta2 * *v_val + (1.0 - beta2) * *g * *g;
+                    let m_hat = *m_val / bias_correction1;
+                    let v_hat = *v_val / bias_correction2;
+                    let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
+                    let decay_delta = if weight_decay == 0.0 {
+                        0.0
+                    } else {
+                        *p * lr * weight_decay
+                    };
+                    *p -= decay_delta + adam_delta;
                 }
             })?;
 
-            debug_assert_eq!(next_m.len(), grad.len());
-            debug_assert_eq!(next_v.len(), grad.len());
-
             self.step_counts[i] = t;
-            self.m[i] = Some(next_m);
-            self.v[i] = Some(next_v);
         }
         Ok(())
     }
