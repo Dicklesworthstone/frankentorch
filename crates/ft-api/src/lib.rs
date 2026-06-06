@@ -44177,6 +44177,36 @@ impl FrankenTorchSession {
         let m = a_shape[0];
         let n = a_shape[1];
 
+        // Fast path: overdetermined full-rank A (m >= n), no grad. Solve via QR
+        // (R·X = Qᵀ·B) instead of the SVD pseudo-inverse below — the same unique
+        // least-squares solution, ~6x faster (see lstsq_qr_contiguous_f64,
+        // frankentorch-2i5d). The kernel returns None for the (near-)rank-
+        // deficient case, which falls through to the SVD path (minimum-norm
+        // solution). B may be 1-D [m] or 2-D [m, k]; the kernel handles both.
+        // This is the torch.linalg.lstsq entry (sibling of tensor_lstsq).
+        if m >= n {
+            let nrhs = if b_shape.len() == 1 { 1 } else { b_shape[1] };
+            let (a_vals, a_meta) = self.tensor_values_meta(a)?;
+            let b_vals = self.tensor_values(b)?;
+            // The kernel takes a 2-D B; present a 1-D b as [m, 1].
+            let b_meta = ft_core::TensorMeta::from_shape(
+                vec![m, nrhs],
+                ft_core::DType::F64,
+                ft_core::Device::Cpu,
+            );
+            if let Some(x) =
+                ft_kernel_cpu::lstsq_qr_contiguous_f64(&a_vals, &a_meta, &b_vals, &b_meta)
+                    .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?
+            {
+                let out_shape = if b_shape.len() == 1 {
+                    vec![n]
+                } else {
+                    vec![n, nrhs]
+                };
+                return self.tensor_variable(x, out_shape, false);
+            }
+        }
+
         // Solve via SVD: X = V @ diag(1/sigma) @ U^T @ B (pseudoinverse approach)
         let (u, s, vt) = self.tensor_linalg_svd(a, false)?;
         let u_vals = self.tensor_values(u)?;
@@ -80315,6 +80345,45 @@ mod tests {
     }
 
     // ── lstsq / cond / matrix_rank tests ──────────────────────────────
+
+    #[test]
+    fn tensor_linalg_lstsq_qr_fast_path_matches_svd() {
+        // tensor_linalg_lstsq (torch.linalg.lstsq entry) routes full-rank
+        // overdetermined no-grad through QR; it must match the SVD solution it
+        // replaced, for both 1-D and 2-D B.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let m = 48usize;
+        let n = 6usize;
+        let mut a_vals = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                a_vals[i * n + j] =
+                    (((i * 29 + j * 13) % 37) as f64 - 18.0) * 0.05 + if i == j { 2.0 } else { 0.0 };
+            }
+        }
+        let a = s.tensor_variable(a_vals, vec![m, n], false).unwrap();
+
+        // 2-D B [m, 2]
+        let b2_vals: Vec<f64> = (0..m * 2).map(|t| ((t * 7 + 3) % 19) as f64 * 0.1 - 0.9).collect();
+        let b2 = s.tensor_variable(b2_vals, vec![m, 2], false).unwrap();
+        let x_qr = s.tensor_linalg_lstsq(a, b2).unwrap();
+        assert_eq!(s.tensor_shape(x_qr).unwrap(), vec![n, 2]);
+        // SVD reference (the path the QR fast path replaced).
+        let p = s.tensor_pinv(a).unwrap();
+        let x_ref = s.tensor_matmul(p, b2).unwrap();
+        let (vq, vr) = (s.tensor_values(x_qr).unwrap(), s.tensor_values(x_ref).unwrap());
+        let mut md = 0.0f64;
+        for (a, b) in vq.iter().zip(vr.iter()) {
+            md = md.max((a - b).abs());
+        }
+        assert!(md < 1e-8, "2-D B: QR lstsq diverges from SVD: max_diff={md}");
+
+        // 1-D B [m]
+        let b1_vals: Vec<f64> = (0..m).map(|t| ((t * 11 + 5) % 23) as f64 * 0.1 - 1.1).collect();
+        let b1 = s.tensor_variable(b1_vals, vec![m], false).unwrap();
+        let x1 = s.tensor_linalg_lstsq(a, b1).unwrap();
+        assert_eq!(s.tensor_shape(x1).unwrap(), vec![n], "1-D B returns shape [n]");
+    }
 
     #[test]
     fn lstsq_exact_solution() {

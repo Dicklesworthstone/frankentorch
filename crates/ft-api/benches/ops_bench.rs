@@ -1469,6 +1469,23 @@ fn bench_lstsq(c: &mut Criterion) {
             let b = s.tensor_randn(vec![m, 1], false).unwrap();
             bch.iter(|| black_box(s.tensor_lstsq(black_box(a), black_box(b)).unwrap()));
         });
+        // Canonical torch.linalg.lstsq entry with a 1-D b (the common fitting
+        // case): baseline SVD pinv vs the QR fast path now inside it.
+        group.bench_function(format!("linalg_pinv_svd_1d_{m}x{n}"), |bch| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_randn(vec![m, n], false).unwrap();
+            let b = s.tensor_randn(vec![m, 1], false).unwrap();
+            bch.iter(|| {
+                let p = s.tensor_pinv(black_box(a)).unwrap();
+                black_box(s.tensor_matmul(p, black_box(b)).unwrap())
+            });
+        });
+        group.bench_function(format!("linalg_qr_1d_{m}x{n}"), |bch| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let a = s.tensor_randn(vec![m, n], false).unwrap();
+            let b = s.tensor_randn(vec![m], false).unwrap();
+            bch.iter(|| black_box(s.tensor_linalg_lstsq(black_box(a), black_box(b)).unwrap()));
+        });
     }
     group.finish();
 }
