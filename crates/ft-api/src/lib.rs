@@ -33214,86 +33214,128 @@ impl FrankenTorchSession {
         let mut outputs: Vec<Vec<f64>> =
             vec![vec![0.0; batch_size * hidden_size * num_directions]; seq_len];
 
-        // Process each layer
+        // Raw no-grad forward (frankentorch-3k4v). tensor_lstm already produces
+        // non-grad leaves, so the whole sweep can run in raw f64 with ZERO per-
+        // timestep session ops / tape nodes / leaf allocations. The two matmuls
+        // are routed through ft_kernel_cpu::matmul_rhs_transposed_contiguous_f64
+        // (= x @ W^T via dgemm_bt) — the SAME kernel tensor_mm uses, so the
+        // values are bit-for-bit identical to the previous session-op path
+        // (guarded by lstm_raw_forward_golden_isomorphism). The input projection
+        // x @ W_ih^T is hoisted out of the timestep loop and batched over the
+        // whole sequence in ONE gemm (its rows are independent of h; matrixmultiply's
+        // K-accumulation is independent of the M tiling, so batching is exact);
+        // only the recurrent h @ W_hh^T stays per-step.
+        let four_h = 4 * hidden_size;
+        let kernel_err = |e: ft_kernel_cpu::KernelError| {
+            AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e))
+        };
+
         for layer in 0..num_layers {
             let (w_ih, w_hh, b_ih, b_hh) = &weights[layer];
+            let in_sz = if layer == 0 {
+                input_size
+            } else {
+                hidden_size * num_directions
+            };
 
-            // Forward direction
+            // Materialise the (small) weights/biases as contiguous f64 once.
+            let w_ih_vals = self.tensor_values(*w_ih)?; // [4h, in_sz]
+            let w_hh_vals = self.tensor_values(*w_hh)?; // [4h, hidden]
+            let b_ih_vals = match b_ih {
+                Some(b) => Some(self.tensor_values(*b)?),
+                None => None,
+            };
+            let b_hh_vals = match b_hh {
+                Some(b) => Some(self.tensor_values(*b)?),
+                None => None,
+            };
+
+            // Batched input projection over ALL timesteps: [seq*batch, in] @ W_ih^T.
+            let mut x_all = Vec::with_capacity(seq_len * batch_size * in_sz);
+            for seq_data in layer_input.iter().take(seq_len) {
+                x_all.extend_from_slice(seq_data);
+            }
+            let xw_all = ft_kernel_cpu::matmul_rhs_transposed_contiguous_f64(
+                seq_len * batch_size,
+                in_sz,
+                four_h,
+                &x_all,
+                &w_ih_vals,
+            )
+            .map_err(kernel_err)?; // [seq*batch, 4h], row (t*batch+b)
+
+            // One recurrent step: gates = ((xw_row + h @ W_hh^T) + b_ih) + b_hh,
+            // then the LSTM gate soup. Add order matches the old tensor_add chain
+            // exactly so the result is bit-identical.
+            let step = |h: &[f64], c: &[f64], xw_row: &[f64]| -> Result<(Vec<f64>, Vec<f64>), AutogradError> {
+                let hg = ft_kernel_cpu::matmul_rhs_transposed_contiguous_f64(
+                    batch_size, hidden_size, four_h, h, &w_hh_vals,
+                )
+                .map_err(kernel_err)?;
+                let mut new_h = Vec::with_capacity(batch_size * hidden_size);
+                let mut new_c = Vec::with_capacity(batch_size * hidden_size);
+                for b in 0..batch_size {
+                    let gate_base = b * four_h;
+                    for i in 0..hidden_size {
+                        let gate = |off: usize| {
+                            let mut v = xw_row[gate_base + off] + hg[gate_base + off];
+                            if let Some(bih) = &b_ih_vals {
+                                v += bih[off];
+                            }
+                            if let Some(bhh) = &b_hh_vals {
+                                v += bhh[off];
+                            }
+                            v
+                        };
+                        let i_gate = 1.0 / (1.0 + (-gate(i)).exp());
+                        let f_gate = 1.0 / (1.0 + (-gate(hidden_size + i)).exp());
+                        let g_gate = gate(2 * hidden_size + i).tanh();
+                        let o_gate = 1.0 / (1.0 + (-gate(3 * hidden_size + i)).exp());
+                        let c_idx = b * hidden_size + i;
+                        let c_val = f_gate * c[c_idx] + i_gate * g_gate;
+                        let h_val = o_gate * c_val.tanh();
+                        new_c.push(c_val);
+                        new_h.push(h_val);
+                    }
+                }
+                Ok((new_h, new_c))
+            };
+
+            let row_len = batch_size * four_h;
             let layer_base = layer * num_directions * batch_size * hidden_size;
+
+            // Forward direction.
             let mut h = h_all[layer_base..layer_base + batch_size * hidden_size].to_vec();
             let mut c = c_all[layer_base..layer_base + batch_size * hidden_size].to_vec();
-
-            let w_ih_t = self.tensor_transpose(*w_ih, 0, 1)?;
-            let w_hh_t = self.tensor_transpose(*w_hh, 0, 1)?;
-
             for t in 0..seq_len {
-                let x = self.tensor_variable(
-                    layer_input[t].clone(),
-                    vec![
-                        batch_size,
-                        if layer == 0 {
-                            input_size
-                        } else {
-                            hidden_size * num_directions
-                        },
-                    ],
-                    false,
-                )?;
-                let h_t = self.tensor_variable(h.clone(), vec![batch_size, hidden_size], false)?;
-                let c_t = self.tensor_variable(c.clone(), vec![batch_size, hidden_size], false)?;
-
-                let (new_h, new_c) = self.lstm_cell(x, (h_t, c_t), w_ih_t, w_hh_t, *b_ih, *b_hh)?;
-                h = self.tensor_values(new_h)?;
-                c = self.tensor_values(new_c)?;
-
-                for i in 0..batch_size * hidden_size {
-                    outputs[t][i] = h[i];
-                }
+                let xw_row = &xw_all[t * row_len..t * row_len + row_len];
+                let (new_h, new_c) = step(&h, &c, xw_row)?;
+                outputs[t][..batch_size * hidden_size].copy_from_slice(&new_h);
+                h = new_h;
+                c = new_c;
             }
-
-            // Update final states
             h_all[layer_base..layer_base + batch_size * hidden_size].copy_from_slice(&h);
             c_all[layer_base..layer_base + batch_size * hidden_size].copy_from_slice(&c);
 
-            // Bidirectional: backward direction
+            // Bidirectional: backward direction reuses the SAME weights and the
+            // SAME batched input projection (matching the original).
             if bidirectional {
                 let rev_base = layer_base + batch_size * hidden_size;
                 let mut h_rev = h_all[rev_base..rev_base + batch_size * hidden_size].to_vec();
                 let mut c_rev = c_all[rev_base..rev_base + batch_size * hidden_size].to_vec();
-
                 for t in (0..seq_len).rev() {
-                    let x = self.tensor_variable(
-                        layer_input[t].clone(),
-                        vec![
-                            batch_size,
-                            if layer == 0 {
-                                input_size
-                            } else {
-                                hidden_size * num_directions
-                            },
-                        ],
-                        false,
-                    )?;
-                    let h_t =
-                        self.tensor_variable(h_rev.clone(), vec![batch_size, hidden_size], false)?;
-                    let c_t =
-                        self.tensor_variable(c_rev.clone(), vec![batch_size, hidden_size], false)?;
-
-                    let (new_h, new_c) =
-                        self.lstm_cell(x, (h_t, c_t), w_ih_t, w_hh_t, *b_ih, *b_hh)?;
-                    h_rev = self.tensor_values(new_h)?;
-                    c_rev = self.tensor_values(new_c)?;
-
-                    for i in 0..batch_size * hidden_size {
-                        outputs[t][batch_size * hidden_size + i] = h_rev[i];
-                    }
+                    let xw_row = &xw_all[t * row_len..t * row_len + row_len];
+                    let (new_h, new_c) = step(&h_rev, &c_rev, xw_row)?;
+                    outputs[t][batch_size * hidden_size..]
+                        .copy_from_slice(&new_h);
+                    h_rev = new_h;
+                    c_rev = new_c;
                 }
-
                 h_all[rev_base..rev_base + batch_size * hidden_size].copy_from_slice(&h_rev);
                 c_all[rev_base..rev_base + batch_size * hidden_size].copy_from_slice(&c_rev);
             }
 
-            // Prepare input for next layer
+            // Prepare input for next layer.
             if layer < num_layers - 1 {
                 layer_input = outputs.clone();
             }
@@ -102783,6 +102825,205 @@ mod tests {
 
         assert_eq!(s.tensor_shape(output).unwrap(), vec![3, 2, 5]);
         assert_eq!(s.tensor_shape(h_n).unwrap(), vec![1, 2, 5]);
+    }
+
+    #[test]
+    #[ignore = "perf A/B; run explicitly with --ignored --nocapture"]
+    fn bench_lstm_raw_vs_session() {
+        // Same-process A/B (one rch exec => one worker => no worker-variance
+        // confound) for frankentorch-3k4v. NEW = the raw tensor_lstm forward;
+        // OLD = the previous per-timestep session-op path, replicated here by
+        // driving lstm_cell in a manual loop exactly as the old tensor_lstm did.
+        use std::time::Instant;
+        let mk = |n: usize, shift: f64| -> Vec<f64> {
+            (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+        };
+
+        // Inference is the target use case (batch=1 streaming, no_grad); medium
+        // batch is also reported. Assert on the inference config.
+        let mut inference_ratio = 0.0_f64;
+        for (seq_len, batch, input_size, hidden, iters) in [
+            (64usize, 1usize, 128usize, 128usize, 200u32),
+            (128, 1, 64, 64, 200),
+            (64, 16, 128, 128, 20),
+        ] {
+        let four_h = 4 * hidden;
+
+        let build = |s: &mut FrankenTorchSession| {
+            let input = s
+                .tensor_variable(mk(seq_len * batch * input_size, 0.0), vec![seq_len, batch, input_size], false)
+                .unwrap();
+            let w_ih = s.tensor_variable(mk(four_h * input_size, 1.0), vec![four_h, input_size], false).unwrap();
+            let w_hh = s.tensor_variable(mk(four_h * hidden, 2.0), vec![four_h, hidden], false).unwrap();
+            let b_ih = s.tensor_variable(mk(four_h, 3.0), vec![four_h], false).unwrap();
+            let b_hh = s.tensor_variable(mk(four_h, 4.0), vec![four_h], false).unwrap();
+            (input, w_ih, w_hh, b_ih, b_hh)
+        };
+
+        // NEW: raw tensor_lstm.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (input, w_ih, w_hh, b_ih, b_hh) = build(&mut s);
+        let weights = vec![(w_ih, w_hh, Some(b_ih), Some(b_hh))];
+        let t0 = Instant::now();
+        for _ in 0..iters {
+            let _ = s.tensor_lstm(input, None, &weights, false, false).unwrap();
+        }
+        let new_ns = t0.elapsed().as_nanos();
+
+        // OLD: per-timestep session-op loop (what tensor_lstm used to do).
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (input2, w_ih2, w_hh2, b_ih2, b_hh2) = build(&mut s2);
+        let input_data = s2.tensor_values(input2).unwrap();
+        let t1 = Instant::now();
+        for _ in 0..iters {
+            let w_ih_t = s2.tensor_transpose(w_ih2, 0, 1).unwrap();
+            let w_hh_t = s2.tensor_transpose(w_hh2, 0, 1).unwrap();
+            let mut h = vec![0.0; batch * hidden];
+            let mut c = vec![0.0; batch * hidden];
+            for t in 0..seq_len {
+                let mut seq_data = Vec::with_capacity(batch * input_size);
+                for b in 0..batch {
+                    for i in 0..input_size {
+                        seq_data.push(input_data[t * batch * input_size + b * input_size + i]);
+                    }
+                }
+                let x = s2.tensor_variable(seq_data, vec![batch, input_size], false).unwrap();
+                let h_t = s2.tensor_variable(h.clone(), vec![batch, hidden], false).unwrap();
+                let c_t = s2.tensor_variable(c.clone(), vec![batch, hidden], false).unwrap();
+                let (nh, nc) = s2
+                    .lstm_cell(x, (h_t, c_t), w_ih_t, w_hh_t, Some(b_ih2), Some(b_hh2))
+                    .unwrap();
+                h = s2.tensor_values(nh).unwrap();
+                c = s2.tensor_values(nc).unwrap();
+            }
+            std::hint::black_box(&h);
+        }
+        let old_ns = t1.elapsed().as_nanos();
+
+        let ratio = old_ns as f64 / new_ns as f64;
+        println!(
+            "LSTM A/B (seq={seq_len} batch={batch} in={input_size} hid={hidden}, {iters} iters): \
+             old={:.2}ms new={:.2}ms  Score={ratio:.2}x",
+            old_ns as f64 / 1e6,
+            new_ns as f64 / 1e6,
+        );
+        if batch == 1 && hidden == 128 {
+            inference_ratio = ratio;
+        }
+        }
+        // Reporting-only A/B (numbers are contention-sensitive on shared workers;
+        // run under RAYON_NUM_THREADS=1 on an idle box for a clean ratio). Sanity
+        // guard only — the bit-exactness contract is enforced by
+        // lstm_raw_forward_golden_isomorphism, not by this timing.
+        assert!(inference_ratio > 0.0, "benchmark produced no measurement");
+    }
+
+    #[test]
+    fn lstm_raw_forward_golden_isomorphism() {
+        // Golden bit-exactness guard for the raw no-grad LSTM forward
+        // (frankentorch-3k4v). Checksum folds the f64 bit-patterns of output +
+        // h_n + c_n across six configs (bias on/off, bidirectional, multi-layer,
+        // batch_first, supplied hx). The expected value is the checksum produced
+        // by the pre-rewrite session-op implementation, so any rounding drift in
+        // the raw rewrite trips this test.
+        fn fold(acc: &mut u64, v: f64) {
+            *acc = acc.rotate_left(7) ^ v.to_bits().wrapping_mul(0x9E37_79B9_7F4A_7C15);
+        }
+        fn deterministic(n: usize, scale: f64, shift: f64) -> Vec<f64> {
+            // Deterministic pseudo-values (no RNG) so the checksum is stable.
+            (0..n)
+                .map(|i| (((i as f64) * 0.123 + shift).sin()) * scale)
+                .collect()
+        }
+
+        let mut acc: u64 = 0xCBF2_9CE4_8422_2325;
+        let mut run = |s: &mut FrankenTorchSession,
+                       output: TensorNodeId,
+                       h_n: TensorNodeId,
+                       c_n: TensorNodeId,
+                       acc: &mut u64| {
+            for t in [output, h_n, c_n] {
+                for sz in s.tensor_shape(t).unwrap() {
+                    fold(acc, sz as f64);
+                }
+                for v in s.tensor_values(t).unwrap() {
+                    fold(acc, v);
+                }
+            }
+        };
+
+        // Config 1: 1-layer, no bias, seq3 batch2 in4 hid5.
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(deterministic(24, 0.5, 0.0), vec![3, 2, 4], false).unwrap();
+            let w_ih = s.tensor_variable(deterministic(80, 0.3, 1.0), vec![20, 4], false).unwrap();
+            let w_hh = s.tensor_variable(deterministic(100, 0.3, 2.0), vec![20, 5], false).unwrap();
+            let weights = vec![(w_ih, w_hh, None, None)];
+            let (o, (hn, cn)) = s.tensor_lstm(input, None, &weights, false, false).unwrap();
+            run(&mut s, o, hn, cn, &mut acc);
+        }
+        // Config 2: 1-layer WITH biases.
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(deterministic(24, 0.5, 0.5), vec![3, 2, 4], false).unwrap();
+            let w_ih = s.tensor_variable(deterministic(80, 0.3, 1.5), vec![20, 4], false).unwrap();
+            let w_hh = s.tensor_variable(deterministic(100, 0.3, 2.5), vec![20, 5], false).unwrap();
+            let b_ih = s.tensor_variable(deterministic(20, 0.2, 3.0), vec![20], false).unwrap();
+            let b_hh = s.tensor_variable(deterministic(20, 0.2, 4.0), vec![20], false).unwrap();
+            let weights = vec![(w_ih, w_hh, Some(b_ih), Some(b_hh))];
+            let (o, (hn, cn)) = s.tensor_lstm(input, None, &weights, false, false).unwrap();
+            run(&mut s, o, hn, cn, &mut acc);
+        }
+        // Config 3: bidirectional, with biases.
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(deterministic(24, 0.5, 0.7), vec![3, 2, 4], false).unwrap();
+            let w_ih = s.tensor_variable(deterministic(80, 0.3, 1.1), vec![20, 4], false).unwrap();
+            let w_hh = s.tensor_variable(deterministic(100, 0.3, 2.1), vec![20, 5], false).unwrap();
+            let b_ih = s.tensor_variable(deterministic(20, 0.2, 3.1), vec![20], false).unwrap();
+            let b_hh = s.tensor_variable(deterministic(20, 0.2, 4.1), vec![20], false).unwrap();
+            let weights = vec![(w_ih, w_hh, Some(b_ih), Some(b_hh))];
+            let (o, (hn, cn)) = s.tensor_lstm(input, None, &weights, false, true).unwrap();
+            run(&mut s, o, hn, cn, &mut acc);
+        }
+        // Config 4: 2-layer (layer1 input = hidden of layer0).
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(deterministic(24, 0.5, 0.9), vec![3, 2, 4], false).unwrap();
+            let w_ih0 = s.tensor_variable(deterministic(80, 0.3, 1.2), vec![20, 4], false).unwrap();
+            let w_hh0 = s.tensor_variable(deterministic(100, 0.3, 2.2), vec![20, 5], false).unwrap();
+            let w_ih1 = s.tensor_variable(deterministic(100, 0.3, 1.3), vec![20, 5], false).unwrap();
+            let w_hh1 = s.tensor_variable(deterministic(100, 0.3, 2.3), vec![20, 5], false).unwrap();
+            let weights = vec![(w_ih0, w_hh0, None, None), (w_ih1, w_hh1, None, None)];
+            let (o, (hn, cn)) = s.tensor_lstm(input, None, &weights, false, false).unwrap();
+            run(&mut s, o, hn, cn, &mut acc);
+        }
+        // Config 5: batch_first.
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(deterministic(24, 0.5, 1.7), vec![2, 3, 4], false).unwrap();
+            let w_ih = s.tensor_variable(deterministic(80, 0.3, 1.4), vec![20, 4], false).unwrap();
+            let w_hh = s.tensor_variable(deterministic(100, 0.3, 2.4), vec![20, 5], false).unwrap();
+            let weights = vec![(w_ih, w_hh, None, None)];
+            let (o, (hn, cn)) = s.tensor_lstm(input, None, &weights, true, false).unwrap();
+            run(&mut s, o, hn, cn, &mut acc);
+        }
+        // Config 6: supplied initial hx.
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(deterministic(24, 0.5, 2.7), vec![3, 2, 4], false).unwrap();
+            let w_ih = s.tensor_variable(deterministic(80, 0.3, 1.6), vec![20, 4], false).unwrap();
+            let w_hh = s.tensor_variable(deterministic(100, 0.3, 2.6), vec![20, 5], false).unwrap();
+            let h0 = s.tensor_variable(deterministic(10, 0.1, 5.0), vec![1, 2, 5], false).unwrap();
+            let c0 = s.tensor_variable(deterministic(10, 0.1, 6.0), vec![1, 2, 5], false).unwrap();
+            let weights = vec![(w_ih, w_hh, None, None)];
+            let (o, (hn, cn)) = s.tensor_lstm(input, Some((h0, c0)), &weights, false, false).unwrap();
+            run(&mut s, o, hn, cn, &mut acc);
+        }
+
+        // Golden checksum captured from the pre-rewrite session-op LSTM forward.
+        // The raw forward must reproduce it bit-for-bit.
+        assert_eq!(acc, 0xdd62_5bd8_61aa_b1cc_u64, "LSTM golden checksum drift");
     }
 
     #[test]
