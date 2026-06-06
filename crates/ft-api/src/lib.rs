@@ -42363,11 +42363,18 @@ impl FrankenTorchSession {
 
     /// Compute the matrix product of a sequence of matrices.
     ///
-    /// Equivalent to `torch.linalg.multi_dot(tensors)`. Multiplies
-    /// the matrices left-to-right. For optimal parenthesization of
-    /// long chains, consider dynamic programming (not implemented
-    /// here). Requires two or more tensors. First and last can be 1-D
-    /// (treated as row/column vectors); middle matrices must be 2-D.
+    /// Equivalent to `torch.linalg.multi_dot(tensors)`. Matrix multiplication
+    /// is associative, so the *order* of the pairwise products is free to
+    /// choose — and for a chain of differently-shaped matrices the order
+    /// changes the flop/intermediate cost by orders of magnitude (the classic
+    /// example: a thin dimension in the middle). This picks the optimal
+    /// parenthesization via matrix-chain dynamic programming (the same thing
+    /// `torch.linalg.multi_dot` does), instead of multiplying left-to-right.
+    ///
+    /// Requires two or more tensors. The DP applies to a chain of 2-D matrices;
+    /// if any operand is not 2-D (1-D row/column-vector ends) it falls back to
+    /// the left-to-right product. All products use the autograd-aware
+    /// `tensor_matmul`, so gradients are correct regardless of the order.
     pub fn tensor_linalg_multi_dot(
         &mut self,
         tensors: &[TensorNodeId],
@@ -42379,11 +42386,80 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let mut result = self.tensor_matmul(tensors[0], tensors[1])?;
-        for t in &tensors[2..] {
-            result = self.tensor_matmul(result, *t)?;
+        if tensors.len() == 2 {
+            return self.tensor_matmul(tensors[0], tensors[1]);
         }
-        Ok(result)
+
+        // Collect 2-D shapes; bail to left-to-right if any operand isn't a matrix.
+        let nmat = tensors.len();
+        let mut shapes = Vec::with_capacity(nmat);
+        let mut all_2d = true;
+        for &t in tensors {
+            let s = self.tensor_shape(t)?;
+            if s.len() != 2 {
+                all_2d = false;
+                break;
+            }
+            shapes.push(s);
+        }
+        if !all_2d {
+            let mut result = self.tensor_matmul(tensors[0], tensors[1])?;
+            for t in &tensors[2..] {
+                result = self.tensor_matmul(result, *t)?;
+            }
+            return Ok(result);
+        }
+
+        // Dimension chain: matrix i is p[i] x p[i+1].
+        let mut p = vec![0usize; nmat + 1];
+        p[0] = shapes[0][0];
+        for i in 0..nmat {
+            p[i + 1] = shapes[i][1];
+        }
+
+        // Matrix-chain DP. m[i][j] = min scalar-mult cost for the sub-chain
+        // i..=j; split[i][j] = the index k where that optimum parenthesizes as
+        // (i..=k)(k+1..=j). Cost is u128 to avoid overflow on large chains.
+        let mut m = vec![vec![0u128; nmat]; nmat];
+        let mut split = vec![vec![0usize; nmat]; nmat];
+        for len in 2..=nmat {
+            for i in 0..=(nmat - len) {
+                let j = i + len - 1;
+                let mut best = u128::MAX;
+                let mut best_k = i;
+                for k in i..j {
+                    let cost = m[i][k]
+                        + m[k + 1][j]
+                        + (p[i] as u128) * (p[k + 1] as u128) * (p[j + 1] as u128);
+                    if cost < best {
+                        best = cost;
+                        best_k = k;
+                    }
+                }
+                m[i][j] = best;
+                split[i][j] = best_k;
+            }
+        }
+
+        self.multi_dot_apply(tensors, &split, 0, nmat - 1)
+    }
+
+    /// Multiply the sub-chain `tensors[i..=j]` per the optimal `split` table
+    /// (recursive, autograd-aware).
+    fn multi_dot_apply(
+        &mut self,
+        tensors: &[TensorNodeId],
+        split: &[Vec<usize>],
+        i: usize,
+        j: usize,
+    ) -> Result<TensorNodeId, AutogradError> {
+        if i == j {
+            return Ok(tensors[i]);
+        }
+        let k = split[i][j];
+        let left = self.multi_dot_apply(tensors, split, i, k)?;
+        let right = self.multi_dot_apply(tensors, split, k + 1, j)?;
+        self.tensor_matmul(left, right)
     }
 
     /// Alias for `tensor_linalg_multi_dot`.
@@ -99766,6 +99842,43 @@ mod tests {
         let result = s.tensor_linalg_multi_dot(&[a, b, c]).unwrap();
         let shape = s.tensor_shape(result).unwrap();
         assert_eq!(shape, vec![2, 2]);
+    }
+
+    #[test]
+    fn multi_dot_optimal_order_matches_left_to_right() {
+        // A varying-dim chain where the optimal parenthesization differs from
+        // left-to-right: [N×k, k×N, N×k, k×N] (a thin middle dim). The product
+        // is associative, so the DP-ordered result must equal the explicit
+        // left-to-right product to floating-point tolerance.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (n, k) = (12usize, 3usize);
+        let mk = |s: &mut FrankenTorchSession, rows: usize, cols: usize, seed: usize| {
+            let data: Vec<f64> = (0..rows * cols)
+                .map(|t| (((t + seed) * 7 + 3) % 13) as f64 * 0.1 - 0.6)
+                .collect();
+            s.tensor_variable(data, vec![rows, cols], false).unwrap()
+        };
+        let a = mk(&mut s, n, k, 1);
+        let b = mk(&mut s, k, n, 2);
+        let c = mk(&mut s, n, k, 3);
+        let d = mk(&mut s, k, n, 4);
+
+        let opt = s.tensor_linalg_multi_dot(&[a, b, c, d]).unwrap();
+        assert_eq!(s.tensor_shape(opt).unwrap(), vec![n, n]);
+
+        // Explicit left-to-right reference.
+        let ab = s.tensor_matmul(a, b).unwrap();
+        let abc = s.tensor_matmul(ab, c).unwrap();
+        let abcd = s.tensor_matmul(abc, d).unwrap();
+
+        let vo = s.tensor_values(opt).unwrap();
+        let vr = s.tensor_values(abcd).unwrap();
+        assert_eq!(vo.len(), vr.len());
+        let mut md = 0.0f64;
+        for (x, y) in vo.iter().zip(vr.iter()) {
+            md = md.max((x - y).abs());
+        }
+        assert!(md < 1e-9, "optimal-order multi_dot diverges from left-to-right: max_diff={md}");
     }
 
     #[test]

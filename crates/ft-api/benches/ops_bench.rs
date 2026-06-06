@@ -1490,8 +1490,39 @@ fn bench_lstsq(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_multi_dot(c: &mut Criterion) {
+    // Low-rank chain [N×k, k×N, N×k, k×N] (thin middle dim k): left-to-right
+    // builds N×N intermediates, the optimal parenthesization keeps them small.
+    // Baseline = explicit left-to-right matmul fold; after = tensor_multi_dot
+    // (matrix-chain DP). Same worker / same process -> clean A/B.
+    let mut group = c.benchmark_group("multi_dot");
+    let (n, k) = (256usize, 8usize);
+    group.bench_function("left_to_right_256x8_chain4", |bch| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_randn(vec![n, k], false).unwrap();
+        let b = s.tensor_randn(vec![k, n], false).unwrap();
+        let cc = s.tensor_randn(vec![n, k], false).unwrap();
+        let d = s.tensor_randn(vec![k, n], false).unwrap();
+        bch.iter(|| {
+            let ab = s.tensor_matmul(black_box(a), black_box(b)).unwrap();
+            let abc = s.tensor_matmul(ab, black_box(cc)).unwrap();
+            black_box(s.tensor_matmul(abc, black_box(d)).unwrap())
+        });
+    });
+    group.bench_function("optimal_256x8_chain4", |bch| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_randn(vec![n, k], false).unwrap();
+        let b = s.tensor_randn(vec![k, n], false).unwrap();
+        let cc = s.tensor_randn(vec![n, k], false).unwrap();
+        let d = s.tensor_randn(vec![k, n], false).unwrap();
+        bch.iter(|| black_box(s.tensor_multi_dot(black_box(&[a, b, cc, d])).unwrap()));
+    });
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_multi_dot,
     bench_lstsq,
     bench_matmul,
     bench_bmm,
