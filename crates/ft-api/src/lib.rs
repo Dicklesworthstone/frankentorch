@@ -11455,8 +11455,11 @@ impl FrankenTorchSession {
     /// tensor_div + tensor_eq + tensor_where. Tracked under
     /// frankentorch-zl65.
     pub fn tensor_sinc(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
-        let shape = self.tensor_shape(input)?;
-        let pi_t = self.full(shape.clone(), std::f64::consts::PI, false)?;
+        // Constants are built with full_like(input, ..) (not full(shape, ..))
+        // so they match the input's dtype: an f32 input keeps f32 through the
+        // mul/eq/where chain (torch sinc(f32) -> f32), and tensor_eq no longer
+        // hits a dtype mismatch against an f64 zeros tensor. frankentorch-fk5l.
+        let pi_t = self.full_like(input, std::f64::consts::PI, false)?;
         let pi_x = self.tensor_mul(input, pi_t)?;
         let sin_pi_x = self.tensor_sin(pi_x)?;
 
@@ -11472,9 +11475,9 @@ impl FrankenTorchSession {
         // both safe_denom and ratio drops one tensor_mul. Saves 3
         // full() allocations + 1 tensor_mul + 1 tensor_eq + 5 graph
         // nodes per sinc call, no behavior change.
-        let zeros = self.full(shape.clone(), 0.0, false)?;
+        let zeros = self.full_like(input, 0.0, false)?;
         let zero_mask = self.tensor_eq(input, zeros)?;
-        let ones = self.full(shape, 1.0, false)?;
+        let ones = self.full_like(input, 1.0, false)?;
         let safe_denom = self.tensor_where(zero_mask, ones, pi_x)?;
         let ratio = self.tensor_div(sin_pi_x, safe_denom)?;
 
@@ -11493,13 +11496,14 @@ impl FrankenTorchSession {
         &mut self,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let shape = self.tensor_shape(input)?;
         let sin_x = self.tensor_sin(input)?;
         // Safe denominator: x where x != 0, else 1 (the masked value is discarded
-        // by the final where, so it only needs to avoid a 0/0 NaN).
-        let zeros = self.full(shape.clone(), 0.0, false)?;
+        // by the final where, so it only needs to avoid a 0/0 NaN). Constants via
+        // full_like so an f32 input keeps f32 (torch parity) and tensor_eq matches
+        // dtype. frankentorch-fk5l.
+        let zeros = self.full_like(input, 0.0, false)?;
         let zero_mask = self.tensor_eq(input, zeros)?;
-        let ones = self.full(shape, 1.0, false)?;
+        let ones = self.full_like(input, 1.0, false)?;
         let safe_denom = self.tensor_where(zero_mask, ones, input)?;
         let ratio = self.tensor_div(sin_x, safe_denom)?;
         // At x = 0 → 1.0; otherwise sin(x)/x.
@@ -46286,7 +46290,9 @@ impl FrankenTorchSession {
         let prod = self.tensor_mul(x, log_y)?;
         // Single zeros tensor shared between the eq mask and the
         // where-true branch (frankentorch-rbhb).
-        let zeros = self.full(x_shape, 0.0, false)?;
+        // full_like(x) so an f32 input keeps f32 and tensor_eq matches dtype
+        // (torch xlogy(f32) -> f32). frankentorch-fk5l.
+        let zeros = self.full_like(x, 0.0, false)?;
         let mask_x_zero = self.tensor_eq(x, zeros)?;
         // xlogy(0, y) short-circuits to 0 ONLY when y is not NaN. scipy
         // and torch both leave xlogy(0, NaN) = 0*log(NaN) = NaN, so the
@@ -51492,7 +51498,10 @@ impl FrankenTorchSession {
         let sum_x = self.tensor_sum_dim(pow_x, 1)?; // [dim_size]
         let norm = self.tensor_pow(sum_x, 1.0 / p)?; // [dim_size]
         let denom = self.tensor_clamp_min(norm, maxnorm)?; // [dim_size]
-        let max_t = self.full(vec![dim_size], maxnorm, false)?;
+        // full_like(norm) so maxnorm matches the input dtype: an f32 input keeps
+        // f32 through the scale (torch parity); full() was F64 and upcast it.
+        // frankentorch-fk5l.
+        let max_t = self.full_like(norm, maxnorm, false)?;
         let scale = self.tensor_div(max_t, denom)?; // [dim_size]
         let scale_kd = self.tensor_unsqueeze(scale, 1)?; // [dim_size, 1]
         let scale_b = self.tensor_expand(scale_kd, vec![dim_size, other_size])?;
@@ -52861,7 +52870,10 @@ impl FrankenTorchSession {
         let outer = self.tensor_matmul(centered, centered_t)?;
         #[allow(clippy::cast_precision_loss)]
         let denom_value = (m - 1) as f64;
-        let denom = self.full(vec![n, n], denom_value, false)?;
+        // full_like(outer) so the (m-1) divisor matches the input dtype and an
+        // f32 input yields an f32 covariance (torch parity); full() was F64 and
+        // promoted the f32 result to f64. frankentorch-fk5l.
+        let denom = self.full_like(outer, denom_value, false)?;
         let cov = self.tensor_div(outer, denom)?;
 
         self.runtime.ledger_mut().record(
@@ -52893,8 +52905,6 @@ impl FrankenTorchSession {
     /// via tensor_where masking.
     pub fn tensor_corrcoef(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
         let cov = self.tensor_cov(input)?;
-        let n_shape = self.tensor_shape(cov)?;
-        let n = n_shape[0];
 
         let diag = self.tensor_diagonal(cov, 0)?;
         let diag_sqrt = self.tensor_sqrt(diag)?;
@@ -52908,7 +52918,10 @@ impl FrankenTorchSession {
         // where-true branch (frankentorch-z3rb) — both ops only
         // READ their constant operand. -1 full() + -1 tape node;
         // saves an n² f64 allocation per call.
-        let zeros = self.full(vec![n, n], 0.0, false)?;
+        // full_like(denom) so the zeros constant matches the input dtype: with
+        // cov now f32-preserving, an f32 input yields an f32 corrcoef (torch
+        // parity) and tensor_eq matches dtype. frankentorch-fk5l.
+        let zeros = self.full_like(denom, 0.0, false)?;
         let mask = self.tensor_eq(denom, zeros)?;
         let out = self.tensor_where(mask, zeros, corr_unsafe)?;
 
@@ -74947,6 +74960,74 @@ mod tests {
         let bf32 = s.tensor_to_f32(b).unwrap();
         let mixed = s.tensor_add(af16, bf32).unwrap();
         assert_eq!(s.tensor_dtype(mixed).unwrap(), DType::F32, "f16+f32 -> f32");
+    }
+
+    #[test]
+    fn f32_constant_ops_preserve_dtype() {
+        // Mechanism A of frankentorch-fk5l: composed ops that build a constant
+        // via self.full(shape,val) (always F64) used to promote an f32 result to
+        // f64 (cov/corrcoef/renorm) or fail tensor_eq's matching-dtype check
+        // (xlogy/sinc/spherical_bessel_j0). With full_like(reference,val) the
+        // constant matches the input dtype, so f32 stays f32 (torch parity) and
+        // the comparisons match. f64 inputs are unaffected (full_like(f64)==full).
+        let approx = |a: &[f64], b: &[f64]| {
+            assert_eq!(a.len(), b.len(), "len {:?} vs {:?}", a, b);
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-4, "value {} vs {}", x, y);
+            }
+        };
+
+        // sinc(f32) -> f32: sinc(0)=1, sinc(0.5)=2/pi, sinc(1)=0.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable_f32(vec![0.0, 0.5, 1.0], vec![3], false).unwrap();
+        let o = s.tensor_sinc(x).unwrap();
+        assert_eq!(s.tensor_dtype(o).unwrap(), DType::F32, "sinc(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(o).unwrap(), &[1.0, 2.0 / std::f64::consts::PI, 0.0]);
+
+        // spherical_bessel_j0(f32) -> f32: j0(0)=1, j0(pi)=0.
+        let x = s.tensor_variable_f32(vec![0.0, std::f32::consts::PI], vec![2], false).unwrap();
+        let o = s.tensor_special_spherical_bessel_j0(x).unwrap();
+        assert_eq!(s.tensor_dtype(o).unwrap(), DType::F32, "bessel_j0(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(o).unwrap(), &[1.0, 0.0]);
+
+        // xlogy(f32) -> f32: 1*ln3, 2*ln4.
+        let a = s.tensor_variable_f32(vec![1.0, 2.0], vec![2], false).unwrap();
+        let b = s.tensor_variable_f32(vec![3.0, 4.0], vec![2], false).unwrap();
+        let o = s.tensor_xlogy(a, b).unwrap();
+        assert_eq!(s.tensor_dtype(o).unwrap(), DType::F32, "xlogy(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(o).unwrap(), &[3.0_f64.ln(), 2.0 * 4.0_f64.ln()]);
+
+        // xlogy zero-x branch: 0*log(0)=0 (not NaN).
+        let a = s.tensor_variable_f32(vec![0.0, 2.0], vec![2], false).unwrap();
+        let b = s.tensor_variable_f32(vec![0.0, 4.0], vec![2], false).unwrap();
+        let o = s.tensor_xlogy(a, b).unwrap();
+        approx(&s.tensor_values_lossy_f64(o).unwrap(), &[0.0, 2.0 * 4.0_f64.ln()]);
+
+        // cov(f32) -> f32 (was silently F64). Rows [1,2,3] & [4,5,6] each have
+        // variance 1 and covariance 1 -> [[1,1],[1,1]].
+        let m = s.tensor_variable_f32(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
+        let c = s.tensor_cov(m).unwrap();
+        assert_eq!(s.tensor_dtype(c).unwrap(), DType::F32, "cov(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(c).unwrap(), &[1.0, 1.0, 1.0, 1.0]);
+
+        // corrcoef(f32) -> f32 (perfectly correlated rows -> all ones).
+        let cc = s.tensor_corrcoef(m).unwrap();
+        assert_eq!(s.tensor_dtype(cc).unwrap(), DType::F32, "corrcoef(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(cc).unwrap(), &[1.0, 1.0, 1.0, 1.0]);
+
+        // renorm(f32) -> f32: row L2 norms 5 and 10, maxnorm 1 -> scale 1/5, 1/10.
+        let r = s.tensor_variable_f32(vec![3.0, 4.0, 6.0, 8.0], vec![2, 2], false).unwrap();
+        let ro = s.tensor_renorm(r, 2.0, 0, 1.0).unwrap();
+        assert_eq!(s.tensor_dtype(ro).unwrap(), DType::F32, "renorm(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(ro).unwrap(), &[0.6, 0.8, 0.6, 0.8]);
+
+        // f64 path unaffected: same ops on f64 stay f64.
+        let mf64 = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], false).unwrap();
+        let cf64 = s.tensor_cov(mf64).unwrap();
+        assert_eq!(s.tensor_dtype(cf64).unwrap(), DType::F64, "cov(f64) -> f64");
+        let xf64 = s.tensor_variable(vec![0.0, 0.5, 1.0], vec![3], false).unwrap();
+        let sf64 = s.tensor_sinc(xf64).unwrap();
+        assert_eq!(s.tensor_dtype(sf64).unwrap(), DType::F64, "sinc(f64) -> f64");
     }
 
     #[test]
