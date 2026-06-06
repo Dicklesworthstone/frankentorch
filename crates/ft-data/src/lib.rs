@@ -112,12 +112,22 @@ pub trait Dataset {
 #[derive(Clone)]
 pub struct TensorDataset {
     items: Vec<DataItem>,
+    columns: Option<Vec<TensorDatasetColumn>>,
+}
+
+#[derive(Clone)]
+struct TensorDatasetColumn {
+    name: String,
+    shape: Vec<usize>,
+    sample_numel: usize,
+    values: Vec<f64>,
 }
 
 impl TensorDataset {
     /// Create a new `TensorDataset` from a vector of data items.
     pub fn new(items: Vec<DataItem>) -> Self {
-        Self { items }
+        let columns = build_tensor_dataset_columns(&items);
+        Self { items, columns }
     }
 
     /// Create from parallel vectors of inputs and targets.
@@ -132,12 +142,13 @@ impl TensorDataset {
             targets.len(),
             "inputs and targets must have same length"
         );
-        let items = inputs
+        let items: Vec<DataItem> = inputs
             .into_iter()
             .zip(targets)
             .map(|((iv, is), (tv, ts))| DataItem::input_target(iv, is, tv, ts))
             .collect();
-        Self { items }
+        let columns = build_tensor_dataset_columns(&items);
+        Self { items, columns }
     }
 }
 
@@ -155,8 +166,46 @@ impl Dataset for TensorDataset {
         indices: &[usize],
         session: &mut FrankenTorchSession,
     ) -> Option<Result<Batch, AutogradError>> {
-        Some(collate_tensor_dataset_items(session, &self.items, indices))
+        Some(if let Some(columns) = &self.columns {
+            collate_tensor_dataset_columns(session, columns, self.items.len(), indices)
+        } else {
+            collate_tensor_dataset_items(session, &self.items, indices)
+        })
     }
+}
+
+fn build_tensor_dataset_columns(items: &[DataItem]) -> Option<Vec<TensorDatasetColumn>> {
+    let first = items.first()?;
+    let mut columns = Vec::with_capacity(first.tensors.len());
+    for (name, values, shape) in &first.tensors {
+        let sample_numel =
+            checked_shape_numel(shape, "DataLoader: sample shape volume overflow").ok()?;
+        if values.len() != sample_numel {
+            return None;
+        }
+        columns.push(TensorDatasetColumn {
+            name: name.clone(),
+            shape: shape.clone(),
+            sample_numel,
+            values: Vec::with_capacity(items.len().checked_mul(sample_numel)?),
+        });
+    }
+
+    for item in items {
+        if item.tensors.len() != columns.len() {
+            return None;
+        }
+        for ((name, values, shape), column) in item.tensors.iter().zip(columns.iter_mut()) {
+            let same_name = name.as_str().cmp(column.name.as_str()).is_eq();
+            let same_shape = shape.as_slice().cmp(column.shape.as_slice()).is_eq();
+            if !same_name || !same_shape || values.len() != column.sample_numel {
+                return None;
+            }
+            column.values.extend_from_slice(values);
+        }
+    }
+
+    Some(columns)
 }
 
 // ── Batch ────────────────────────────────────────────────────────────────
@@ -1036,6 +1085,88 @@ fn collate_tensor_dataset_items(
     })
 }
 
+fn contiguous_index_start(indices: &[usize]) -> Option<usize> {
+    let (&first, rest) = indices.split_first()?;
+    for (offset, &index) in rest.iter().enumerate() {
+        let expected = offset
+            .checked_add(1)
+            .and_then(|step| first.checked_add(step))?;
+        if index != expected {
+            return None;
+        }
+    }
+    Some(first)
+}
+
+fn collate_tensor_dataset_columns(
+    session: &mut FrankenTorchSession,
+    columns: &[TensorDatasetColumn],
+    dataset_len: usize,
+    indices: &[usize],
+) -> Result<Batch, AutogradError> {
+    if indices.is_empty() {
+        return Ok(Batch {
+            tensors: Vec::new(),
+        });
+    }
+
+    for &sample_index in indices {
+        if sample_index >= dataset_len {
+            return Err(dataloader_error(
+                "DataLoader: sampler index out of range for dataset",
+            ));
+        }
+    }
+
+    let batch_size = indices.len();
+    let contiguous_start = contiguous_index_start(indices);
+    let mut batch_tensors = Vec::with_capacity(columns.len());
+
+    for column in columns {
+        let batch_numel = checked_mul(
+            batch_size,
+            column.sample_numel,
+            "DataLoader: batch size overflow",
+        )?;
+        let batched_values = if let Some(start) = contiguous_start {
+            let start_offset = checked_mul(
+                start,
+                column.sample_numel,
+                "DataLoader: batch size overflow",
+            )?;
+            let end_offset = start_offset
+                .checked_add(batch_numel)
+                .ok_or_else(|| dataloader_error("DataLoader: batch size overflow"))?;
+            column.values[start_offset..end_offset].to_vec()
+        } else {
+            let mut values = Vec::with_capacity(batch_numel);
+            for &sample_index in indices {
+                let start_offset = checked_mul(
+                    sample_index,
+                    column.sample_numel,
+                    "DataLoader: batch size overflow",
+                )?;
+                let end_offset = start_offset
+                    .checked_add(column.sample_numel)
+                    .ok_or_else(|| dataloader_error("DataLoader: batch size overflow"))?;
+                values.extend_from_slice(&column.values[start_offset..end_offset]);
+            }
+            values
+        };
+
+        let mut batched_shape = Vec::with_capacity(1 + column.shape.len());
+        batched_shape.push(batch_size);
+        batched_shape.extend_from_slice(&column.shape);
+
+        let tensor = session.tensor_variable(batched_values, batched_shape, false)?;
+        batch_tensors.push((column.name.clone(), tensor));
+    }
+
+    Ok(Batch {
+        tensors: batch_tensors,
+    })
+}
+
 // ── Transforms ──────────────────────────────────────────────────────────
 
 /// A transform that can be applied to a `DataItem`.
@@ -1401,6 +1532,65 @@ mod tests {
         let input2 = batch2.input().unwrap();
         let vals2 = session.tensor_values(input2).unwrap();
         assert_eq!(vals2, vec![4.0, 5.0, 6.0, 7.0]);
+    }
+
+    #[test]
+    fn tensor_dataset_columnar_cache_preserves_contiguous_batch_values() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ds = make_dataset(4, 2);
+        assert!(ds.columns.is_some());
+        let mut loader = DataLoader::new(&ds, DataLoaderConfig::new(2));
+
+        let batch = loader.next_batch(&mut session).unwrap().unwrap();
+        let input = batch.input().unwrap();
+        let target = batch.target().unwrap();
+
+        assert_eq!(
+            session.tensor_values(input).unwrap(),
+            vec![0.0, 1.0, 2.0, 3.0]
+        );
+        assert_eq!(session.tensor_values(target).unwrap(), vec![0.0, 1.0]);
+        assert_eq!(session.tensor_shape(input).unwrap(), vec![2, 2]);
+        assert_eq!(session.tensor_shape(target).unwrap(), vec![2, 1]);
+    }
+
+    #[test]
+    fn tensor_dataset_columnar_cache_preserves_custom_index_order() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ds = make_dataset(4, 2);
+        assert!(ds.columns.is_some());
+        let mut loader = DataLoader::with_indices(&ds, vec![2, 0], DataLoaderConfig::new(2));
+
+        let batch = loader.next_batch(&mut session).unwrap().unwrap();
+        let input = batch.input().unwrap();
+        let target = batch.target().unwrap();
+
+        assert_eq!(
+            session.tensor_values(input).unwrap(),
+            vec![4.0, 5.0, 0.0, 1.0]
+        );
+        assert_eq!(session.tensor_values(target).unwrap(), vec![2.0, 0.0]);
+    }
+
+    #[test]
+    fn tensor_dataset_columnar_cache_falls_back_for_mismatched_shapes() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ds = TensorDataset::new(vec![
+            DataItem::single("input", vec![1.0, 2.0], vec![2]),
+            DataItem::single("input", vec![3.0, 4.0], vec![1, 2]),
+        ]);
+        assert!(ds.columns.is_none());
+        let mut loader = DataLoader::new(&ds, DataLoaderConfig::new(2));
+
+        let message = loader
+            .next_batch(&mut session)
+            .err()
+            .map(|err| err.to_string())
+            .unwrap_or_default();
+        assert!(
+            message.contains("tensor shapes differ"),
+            "unexpected error: {message}"
+        );
     }
 
     #[test]
