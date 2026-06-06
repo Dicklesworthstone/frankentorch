@@ -4792,6 +4792,105 @@ pub fn conv3d_forward_f64(
     out
 }
 
+/// f32 mirror of [`conv3d_im2col_f64`]: parallel 3-D im2col into a
+/// `[batch·od·oh·ow, in_ch·kd·kh·kw]` panel.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_im2col_f32(
+    padded: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let mut panel = vec![0.0f32; batch * patch_count * patch_width];
+    panel
+        .par_chunks_mut(patch_width)
+        .enumerate()
+        .for_each(|(row, prow)| {
+            let b = row / patch_count;
+            let pc = row % patch_count;
+            let base_d = (pc / (oh * ow)) * sd;
+            let rem = pc % (oh * ow);
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            let batch_off = b * in_ch * pd * ph * pw;
+            for c in 0..in_ch {
+                let ch_off = batch_off + c * pd * ph * pw;
+                let pch = c * kd * kh * kw;
+                for kdd in 0..kd {
+                    let d_off = ch_off + (base_d + kdd) * ph * pw;
+                    let pkd = pch + kdd * kh * kw;
+                    for kr in 0..kh {
+                        let irow = d_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pkd + kr * kw;
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
+                }
+            }
+        });
+    panel
+}
+
+/// f32 mirror of [`conv3d_forward_f64`]: fused 3-D im2col + `panel @ weight_flat^T`
+/// (via `sgemm_bt`) written straight to NCDHW, plus optional per-channel bias.
+/// Replaces the per-output narrow/cat/bmm op-graph the f32 path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_forward_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let flat = batch * patch_count;
+    let panel = conv3d_im2col_f32(
+        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
+    let mut out_flat = vec![0.0f32; flat * out_ch];
+    gemm::sgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    let mut out = vec![0.0f32; batch * out_ch * patch_count];
+    out.par_chunks_mut(patch_count)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let bo = bias.map_or(0.0, |bb| bb[oc]);
+            for p in 0..patch_count {
+                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+            }
+        });
+    out
+}
+
 /// Backward of [`conv3d_forward_f64`]. Returns `(dpadded, dweight_flat, dbias?)`.
 #[allow(clippy::too_many_arguments)]
 #[must_use]

@@ -16749,6 +16749,34 @@ impl FrankenTorchSession {
             );
         }
 
+        // F32 no-grad fused fast path (dominant ML dtype; video/3D CNNs): the same
+        // im2col + sgemm_bt kernel via conv3d_forward_f32, replacing the
+        // O(output_d*output_h*output_w) narrow/cat/bmm op-graph below.
+        if self.tensor_dtype(input)? == DType::F32
+            && self.tensor_dtype(weight)? == DType::F32
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F32))?
+            && !in_grad
+            && !w_grad
+            && !b_grad
+        {
+            let pv = self.tensor_values_f32(padded)?;
+            let wv = self.tensor_values_f32(weight)?;
+            let bv = match bias {
+                Some(b) => Some(self.tensor_values_f32(b)?),
+                None => None,
+            };
+            let out = ft_kernel_cpu::conv3d_forward_f32(
+                &pv, &wv, bv.as_deref(), batch_size, in_channels, padded_d, padded_h, padded_w,
+                kernel_d, kernel_h, kernel_w, output_d, output_h, output_w, stride_d, stride_h,
+                stride_w, out_channels,
+            );
+            return self.tensor_variable_f32(
+                out,
+                vec![batch_size, out_channels, output_d, output_h, output_w],
+                false,
+            );
+        }
+
         let mut patches = Vec::with_capacity(patch_count);
         for out_d in 0..output_d {
             let depth_start = Self::checked_mul(out_d, stride_d, "conv3d depth start overflow")?;
@@ -81639,6 +81667,47 @@ mod tests {
     }
 
     // ── conv3d and conv_transpose tests ────────────────────────────────
+
+    #[test]
+    fn conv3d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused conv3d
+        // (ft_kernel_cpu::conv3d_forward_f32) vs the f32 op-graph (narrow/cat/bmm,
+        // forced via requires_grad=true), within f32 tol. A couple stride/pad combos.
+        let (n, ic, oc, d, h, w, kd, kh, kw) = (2usize, 3, 4, 5, 6, 6, 3, 3, 3);
+        let xv: Vec<f32> = (0..n * ic * d * h * w)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.1 + (i as f32) * 0.005)
+            .collect();
+        let wv: Vec<f32> = (0..oc * ic * kd * kh * kw)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.05)
+            .collect();
+        let bv: Vec<f32> = (0..oc).map(|c| 0.05 * c as f32 - 0.1).collect();
+        for &(s_, p_) in &[(1usize, 1usize), (2, 0)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, ic, d, h, w], false).unwrap();
+            let wt = s.tensor_variable_f32(wv.clone(), vec![oc, ic, kd, kh, kw], false).unwrap();
+            let bt = s.tensor_variable_f32(bv.clone(), vec![oc], false).unwrap();
+            let out = s
+                .functional_conv3d(x, wt, Some(bt), (s_, s_, s_), (p_, p_, p_))
+                .unwrap();
+            let fused = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, ic, d, h, w], true).unwrap();
+            let wt2 = s2.tensor_variable_f32(wv.clone(), vec![oc, ic, kd, kh, kw], false).unwrap();
+            let bt2 = s2.tensor_variable_f32(bv.clone(), vec![oc], false).unwrap();
+            let out2 = s2
+                .functional_conv3d(x2, wt2, Some(bt2), (s_, s_, s_), (p_, p_, p_))
+                .unwrap();
+            let reference = s2.tensor_values_f32(out2).unwrap();
+            assert_eq!(fused.len(), reference.len());
+            for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4 + 1e-4 * b.abs(),
+                    "s={s_} p={p_} [{i}]: f32 fused {a} vs op-graph {b}"
+                );
+            }
+        }
+    }
 
     #[test]
     fn conv3d_grad_matches_finite_diff() {

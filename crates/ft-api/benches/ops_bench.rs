@@ -244,6 +244,20 @@ fn bench_conv3d(c: &mut Criterion) {
         let wt = s.tensor_randn(vec![oc, ic, k, k, k], false).unwrap();
         b.iter(|| black_box(s.tensor_conv3d(x, wt, None, (1, 1, 1), (1, 1, 1)).unwrap()));
     });
+    // F32 no-grad (dominant ML dtype): fused conv3d_forward_f32 (im2col + sgemm_bt)
+    // vs the O(od*oh*ow) narrow/cat/bmm op-graph it fell through to.
+    group.bench_function("nograd_f32", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ic * d * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let wv: Vec<f32> = (0..oc * ic * k * k * k)
+            .map(|i| (i % 97) as f32 * 0.002 - 0.1)
+            .collect();
+        let x = s.tensor_variable_f32(xv, vec![n, ic, d, h, w], false).unwrap();
+        let wt = s.tensor_variable_f32(wv, vec![oc, ic, k, k, k], false).unwrap();
+        b.iter(|| black_box(s.tensor_conv3d(x, wt, None, (1, 1, 1), (1, 1, 1)).unwrap()));
+    });
     group.bench_function("grad", |b| {
         b.iter(|| {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
