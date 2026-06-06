@@ -314,15 +314,25 @@ struct ThresholdBucketIndex {
 
 impl ThresholdBucketIndex {
     const MIN_THRESHOLDS: usize = 64;
-    const MAX_BUCKETS: usize = 4096;
+    const MAX_BUCKETS: usize = 32768;
     const MAX_BUCKET_SPAN: usize = 64;
+    const DENSE_BUCKET_FACTOR: usize = 4;
+    const DENSE_SAMPLE_FACTOR: usize = 16;
 
-    fn new(cumulative: &[f64]) -> Option<Self> {
+    fn new(cumulative: &[f64], sample_count: usize) -> Option<Self> {
         if cumulative.len() < Self::MIN_THRESHOLDS || cumulative.windows(2).any(|w| w[0] >= w[1]) {
             return None;
         }
 
-        let bucket_count = cumulative.len().min(Self::MAX_BUCKETS);
+        let bucket_count =
+            if sample_count >= cumulative.len().saturating_mul(Self::DENSE_SAMPLE_FACTOR) {
+                cumulative
+                    .len()
+                    .saturating_mul(Self::DENSE_BUCKET_FACTOR)
+                    .min(Self::MAX_BUCKETS)
+            } else {
+                cumulative.len().min(Self::MAX_BUCKETS)
+            };
         let inv_bucket_count = 1.0 / bucket_count as f64;
         let mut starts = Vec::with_capacity(bucket_count);
         let mut cursor = 0usize;
@@ -659,7 +669,7 @@ impl WeightedRandomSampler {
 
         let mut rng = SimpleRng::new(self.seed);
         let mut result = Vec::with_capacity(self.num_samples);
-        let bucket_index = ThresholdBucketIndex::new(&cumulative);
+        let bucket_index = ThresholdBucketIndex::new(&cumulative, self.num_samples);
         for _ in 0..self.num_samples {
             let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
             let idx = if let Some(index) = &bucket_index {
@@ -2484,8 +2494,8 @@ mod tests {
             cumulative.push(running / total);
         }
 
-        let bucket_index =
-            ThresholdBucketIndex::new(&cumulative).expect("positive weights should be indexed");
+        let bucket_index = ThresholdBucketIndex::new(&cumulative, 10_000)
+            .expect("positive weights should be indexed");
         let mut rng = SimpleRng::new(0x5151_4096);
         for _ in 0..10_000 {
             let sample = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
