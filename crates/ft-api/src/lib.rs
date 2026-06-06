@@ -6661,12 +6661,29 @@ impl FrankenTorchSession {
         let mut unique_vals: Vec<f64> = Vec::new();
         let mut inverse_indices: Vec<usize> = Vec::with_capacity(vals.len());
 
+        // Deduplicate by exact f64 equality (`u == v`) in O(n) via a hash map,
+        // instead of the previous O(n^2) per-element linear scan of unique_vals.
+        // The key reproduces `==` semantics exactly:
+        //  - NaN never compares equal to anything (not even itself) -> never
+        //    deduped, so each NaN element is its own unique;
+        //  - +0.0 and -0.0 compare equal -> canonicalize the key to +0.0's bits;
+        //  - every other finite value satisfies `u == v` iff identical bits, so
+        //    the raw bit pattern is an exact key.
+        // First-appearance order and inverse indices are identical to the scan.
+        let mut seen: std::collections::HashMap<u64, usize> = std::collections::HashMap::new();
         for &v in &vals {
-            let pos = unique_vals.iter().position(|&u| u == v);
-            match pos {
-                Some(idx) => inverse_indices.push(idx),
+            if v.is_nan() {
+                inverse_indices.push(unique_vals.len());
+                unique_vals.push(v);
+                continue;
+            }
+            let key = if v == 0.0 { 0.0_f64.to_bits() } else { v.to_bits() };
+            match seen.get(&key) {
+                Some(&idx) => inverse_indices.push(idx),
                 None => {
-                    inverse_indices.push(unique_vals.len());
+                    let idx = unique_vals.len();
+                    seen.insert(key, idx);
+                    inverse_indices.push(idx);
                     unique_vals.push(v);
                 }
             }

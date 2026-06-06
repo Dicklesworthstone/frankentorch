@@ -1539,8 +1539,25 @@ fn bench_einsum(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_unique(c: &mut Criterion) {
+    // tensor_unique dedup: the previous per-element linear scan of the unique
+    // set is O(n^2) when many values are distinct; the hash-map dedup is O(n).
+    // All-distinct input maximizes the unique-set size (worst case).
+    let mut group = c.benchmark_group("unique");
+    for &n in &[20_000usize] {
+        let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+        group.bench_function(format!("all_distinct_{n}"), |bch| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let t = s.tensor_1d(&data, false).unwrap();
+            bch.iter(|| black_box(s.tensor_unique(black_box(t), false, false, false).unwrap()));
+        });
+    }
+    group.finish();
+}
+
 criterion_group!(
     benches,
+    bench_unique,
     bench_einsum,
     bench_multi_dot,
     bench_lstsq,
