@@ -43987,6 +43987,14 @@ impl FrankenTorchSession {
         let m = shape[0];
         let n = shape[1];
 
+        if let Some(pinv) = {
+            let (values, meta) = self.tensor_values_meta(input)?;
+            ft_kernel_cpu::pinv_qr_contiguous_f64(&values, &meta)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?
+        } {
+            return self.tensor_variable(pinv, vec![n, m], false);
+        }
+
         // SVD: A = U @ diag(S) @ Vh
         let (u_id, s_id, vh_id) = self.tensor_linalg_svd(input, false)?;
         let s_vals = self.tensor_values(s_id)?;
@@ -79251,6 +79259,48 @@ mod tests {
                 "pinv roundtrip mismatch at {i}: got {got}, expected {exp}"
             );
         }
+    }
+
+    #[test]
+    fn pinv_qr_fast_path_handles_tall_and_wide_known_values() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tall = s
+            .tensor_variable(vec![2.0, 0.0, 0.0, 4.0, 0.0, 0.0], vec![3, 2], false)
+            .unwrap();
+        let tall_pinv = s.tensor_linalg_pinv(tall).unwrap();
+        assert_eq!(s.tensor_shape(tall_pinv).unwrap(), vec![2, 3]);
+        let tall_expected = [0.5, 0.0, 0.0, 0.0, 0.25, 0.0];
+        for (got, want) in s.tensor_values(tall_pinv).unwrap().iter().zip(tall_expected) {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "tall API pinv mismatch {got} vs {want}"
+            );
+        }
+
+        let wide = s
+            .tensor_variable(vec![2.0, 0.0, 0.0, 0.0, 4.0, 0.0], vec![2, 3], false)
+            .unwrap();
+        let wide_pinv = s.tensor_linalg_pinv(wide).unwrap();
+        assert_eq!(s.tensor_shape(wide_pinv).unwrap(), vec![3, 2]);
+        let wide_expected = [0.5, 0.0, 0.0, 0.25, 0.0, 0.0];
+        for (got, want) in s.tensor_values(wide_pinv).unwrap().iter().zip(wide_expected) {
+            assert!(
+                (got - want).abs() < 1e-12,
+                "wide API pinv mismatch {got} vs {want}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinv_qr_fast_path_defers_rank_deficient_to_svd() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let rank_deficient = s
+            .tensor_variable(vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0], vec![3, 2], false)
+            .unwrap();
+        let pinv = s.tensor_linalg_pinv(rank_deficient).unwrap();
+        assert_eq!(s.tensor_shape(pinv).unwrap(), vec![2, 3]);
+        let values = s.tensor_values(pinv).unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
     }
 
     #[test]

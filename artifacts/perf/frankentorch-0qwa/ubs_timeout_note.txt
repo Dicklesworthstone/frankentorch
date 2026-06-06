@@ -1,0 +1,7 @@
+UBS changed-surface scan command:
+
+ubs crates/ft-kernel-cpu/src/lib.rs crates/ft-api/src/lib.rs .skill-loop-progress.md artifacts/perf/frankentorch-0qwa/report.md
+
+Result:
+
+The scan was terminated after roughly three minutes without actionable findings. The partial log is retained in ubs_changed_surface.txt. Focused RCH gates passed for cargo check, pinv tests, golden sha256, git diff check, and ft-kernel-cpu clippy. ft-api clippy remains blocked by the pre-existing broad lint backlog documented in report.md.

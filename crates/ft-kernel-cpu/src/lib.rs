@@ -12129,15 +12129,15 @@ pub fn lstsq_qr_contiguous_f64(
     // (near-)rank-deficient — defer to SVD for the minimum-norm solution and to
     // avoid an ill-conditioned back-substitution.
     let mut max_diag = 0.0_f64;
-    for j in 0..n {
-        max_diag = max_diag.max(diag[j].abs());
+    for value in diag.iter().take(n) {
+        max_diag = max_diag.max(value.abs());
     }
     if max_diag == 0.0 {
         return Ok(None);
     }
     let rank_tol = max_diag * f64::EPSILON * (m.max(n) as f64);
-    for j in 0..n {
-        if diag[j].abs() <= rank_tol {
+    for value in diag.iter().take(n) {
+        if value.abs() <= rank_tol {
             return Ok(None);
         }
     }
@@ -12156,6 +12156,154 @@ pub fn lstsq_qr_contiguous_f64(
     }
 
     Ok(Some(x))
+}
+
+fn pinv_qr_full_column_rank_f64(a: &[f64], m: usize, n: usize) -> Option<Vec<f64>> {
+    if m == 0 || n == 0 || m < n {
+        return None;
+    }
+
+    let mut r = a.to_vec();
+    let mut reflectors = Vec::with_capacity(n);
+    let mut reflector_scales = Vec::with_capacity(n);
+    let mut diag = vec![0.0_f64; n];
+
+    for j in 0..n {
+        let col_len = m - j;
+        let mut norm_sq = 0.0_f64;
+        for i in 0..col_len {
+            let val = r[(j + i) * n + j];
+            norm_sq += val * val;
+        }
+        let norm = norm_sq.sqrt();
+        if norm == 0.0 {
+            return None;
+        }
+
+        let x0 = r[j * n + j];
+        let alpha = if x0 >= 0.0 { -norm } else { norm };
+        let mut v = vec![0.0_f64; col_len];
+        v[0] = x0 - alpha;
+        for i in 1..col_len {
+            v[i] = r[(j + i) * n + j];
+        }
+        let vnorm_sq: f64 = v.iter().map(|t| t * t).sum();
+        if vnorm_sq == 0.0 {
+            return None;
+        }
+        let inv = 2.0 / vnorm_sq;
+
+        for c in j..n {
+            let mut dot = 0.0;
+            for i in 0..col_len {
+                dot += v[i] * r[(j + i) * n + c];
+            }
+            let f = dot * inv;
+            for i in 0..col_len {
+                r[(j + i) * n + c] -= f * v[i];
+            }
+        }
+
+        diag[j] = alpha;
+        reflectors.push(v);
+        reflector_scales.push(inv);
+    }
+
+    let mut max_diag = 0.0_f64;
+    for value in &diag {
+        max_diag = max_diag.max(value.abs());
+    }
+    if max_diag == 0.0 {
+        return None;
+    }
+    let rank_tol = max_diag * f64::EPSILON.sqrt() * (m.max(n) as f64);
+    for value in &diag {
+        if value.abs() <= rank_tol {
+            return None;
+        }
+    }
+
+    let mut q_t_rows = vec![0.0_f64; n * m];
+    for row in 0..n {
+        q_t_rows[row * m + row] = 1.0;
+    }
+
+    for j in (0..n).rev() {
+        let v = &reflectors[j];
+        let inv = reflector_scales[j];
+        let col_len = m - j;
+        for row in 0..n {
+            let row_offset = row * m;
+            let mut dot = 0.0;
+            for i in 0..col_len {
+                dot += q_t_rows[row_offset + j + i] * v[i];
+            }
+            let f = dot * inv;
+            for i in 0..col_len {
+                q_t_rows[row_offset + j + i] -= f * v[i];
+            }
+        }
+    }
+
+    let mut pinv = vec![0.0_f64; n * m];
+    for c in 0..m {
+        for i in (0..n).rev() {
+            let mut acc = q_t_rows[i * m + c];
+            for jj in (i + 1)..n {
+                acc -= r[i * n + jj] * pinv[jj * m + c];
+            }
+            pinv[i * m + c] = acc / diag[i];
+        }
+    }
+
+    Some(pinv)
+}
+
+/// Pseudoinverse for full-rank matrices via Q-free Householder QR.
+///
+/// Returns `Ok(None)` for empty, rank-deficient, near-rank-deficient, or
+/// unsupported cases so callers can preserve the SVD pseudo-inverse fallback.
+pub fn pinv_qr_contiguous_f64(
+    a_data: &[f64],
+    a_meta: &TensorMeta,
+) -> Result<Option<Vec<f64>>, KernelError> {
+    ensure_unary_layout_and_storage(a_data, a_meta)?;
+    let shape = a_meta.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::InvalidDimension {
+            dim: shape.len(),
+            ndim: 2,
+        });
+    }
+    let m = shape[0];
+    let n = shape[1];
+    if m == 0 || n == 0 {
+        return Ok(None);
+    }
+
+    let offset = a_meta.storage_offset();
+    let values = &a_data[offset..offset + m * n];
+    if m >= n {
+        return Ok(pinv_qr_full_column_rank_f64(values, m, n));
+    }
+
+    let mut transposed = vec![0.0_f64; n * m];
+    for row in 0..m {
+        for col in 0..n {
+            transposed[col * m + row] = values[row * n + col];
+        }
+    }
+
+    let Some(transposed_pinv) = pinv_qr_full_column_rank_f64(&transposed, n, m) else {
+        return Ok(None);
+    };
+    let mut pinv = vec![0.0_f64; n * m];
+    for row in 0..m {
+        for col in 0..n {
+            pinv[col * m + row] = transposed_pinv[row * n + col];
+        }
+    }
+    Ok(Some(pinv))
 }
 
 pub fn add_tensor_contiguous_f32(
@@ -21193,8 +21341,8 @@ mod tests {
             }
         }
         let mut x_true = vec![0.0f64; n * kk];
-        for idx in 0..n * kk {
-            x_true[idx] = ((idx * 13 + 5) % 17) as f64 * 0.3 - 2.0;
+        for (idx, value) in x_true.iter_mut().enumerate() {
+            *value = ((idx * 13 + 5) % 17) as f64 * 0.3 - 2.0;
         }
         // b = A @ x_true  ([m x n] @ [n x kk])
         let mut b = vec![0.0f64; m * kk];
@@ -21238,6 +21386,46 @@ mod tests {
                 .is_none(),
             "underdetermined must defer"
         );
+    }
+
+    #[test]
+    fn pinv_qr_matches_known_full_rank_diagonal_embeddings() {
+        let tall = vec![2.0, 0.0, 0.0, 4.0, 0.0, 0.0];
+        let tall_meta = TensorMeta::from_shape(vec![3usize, 2usize], DType::F64, Device::Cpu);
+        let tall_pinv = super::pinv_qr_contiguous_f64(&tall, &tall_meta)
+            .expect("tall pinv qr should not error")
+            .expect("tall full-rank matrix should use QR");
+        assert_eq!(tall_pinv.len(), 6);
+        let tall_expected = [0.5, 0.0, 0.0, 0.0, 0.25, 0.0];
+        for (got, want) in tall_pinv.iter().zip(tall_expected) {
+            assert!((got - want).abs() < 1e-12, "tall pinv mismatch {got} vs {want}");
+        }
+
+        let wide = vec![2.0, 0.0, 0.0, 0.0, 4.0, 0.0];
+        let wide_meta = TensorMeta::from_shape(vec![2usize, 3usize], DType::F64, Device::Cpu);
+        let wide_pinv = super::pinv_qr_contiguous_f64(&wide, &wide_meta)
+            .expect("wide pinv qr should not error")
+            .expect("wide full-rank matrix should use QR");
+        assert_eq!(wide_pinv.len(), 6);
+        let wide_expected = [0.5, 0.0, 0.0, 0.25, 0.0, 0.0];
+        for (got, want) in wide_pinv.iter().zip(wide_expected) {
+            assert!((got - want).abs() < 1e-12, "wide pinv mismatch {got} vs {want}");
+        }
+    }
+
+    #[test]
+    fn pinv_qr_defers_rank_deficient_inputs() {
+        let duplicate_cols = vec![1.0, 1.0, 2.0, 2.0, 3.0, 3.0];
+        let tall_meta = TensorMeta::from_shape(vec![3usize, 2usize], DType::F64, Device::Cpu);
+        let tall = super::pinv_qr_contiguous_f64(&duplicate_cols, &tall_meta)
+            .expect("rank-deficient tall should not error");
+        assert!(tall.is_none(), "duplicate columns must defer to SVD");
+
+        let duplicate_rows = vec![1.0, 2.0, 3.0, 1.0, 2.0, 3.0];
+        let wide_meta = TensorMeta::from_shape(vec![2usize, 3usize], DType::F64, Device::Cpu);
+        let wide = super::pinv_qr_contiguous_f64(&duplicate_rows, &wide_meta)
+            .expect("rank-deficient wide should not error");
+        assert!(wide.is_none(), "duplicate rows must defer to SVD");
     }
 
     #[test]
