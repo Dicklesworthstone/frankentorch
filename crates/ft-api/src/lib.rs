@@ -74860,6 +74860,31 @@ mod tests {
     }
 
     #[test]
+    fn f16_bf16_unary_preserves_dtype() {
+        // Unary ops on half-precision inputs promote to f32 to compute, but the
+        // result must be narrowed BACK to the input dtype (torch keeps f16 -> f16);
+        // previously they returned f32 (silent upcast). See frankentorch dispatch
+        // narrow_f32_to_storage_dtype.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(vec![-1.0, 0.5, 2.0], vec![3], false)
+            .unwrap();
+
+        let xf16 = s.tensor_half(x).unwrap();
+        let r = s.tensor_relu(xf16).unwrap();
+        assert_eq!(s.tensor_dtype(r).unwrap(), DType::F16, "relu(f16) must stay f16");
+        let rv = s.tensor_values_lossy_f64(r).unwrap();
+        assert!((rv[0]).abs() < 1e-2 && (rv[1] - 0.5).abs() < 1e-2 && (rv[2] - 2.0).abs() < 1e-2);
+
+        let xbf16 = s.tensor_bfloat16(x).unwrap();
+        let e = s.tensor_exp(xbf16).unwrap();
+        assert_eq!(s.tensor_dtype(e).unwrap(), DType::BF16, "exp(bf16) must stay bf16");
+        // exp(2.0) ~ 7.389 (bf16 has ~2-3 sig digits, so loose tol).
+        let ev = s.tensor_values_lossy_f64(e).unwrap();
+        assert!((ev[2] - 7.389).abs() < 0.2, "exp(bf16) value off: {}", ev[2]);
+    }
+
+    #[test]
     fn f32_cast_roundtrip() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let a = session

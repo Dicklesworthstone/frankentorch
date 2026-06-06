@@ -4015,6 +4015,25 @@ pub fn dispatch_tensor_topk_contiguous_f64(
 
 // --- Typed dispatch wrappers (f32/f64 routing) ---
 
+/// Narrow an f32 result back to the original storage's half-precision dtype.
+///
+/// Half-precision (F16/BF16) elementwise/reduction ops promote their input to
+/// f32 to compute; the result must be narrowed BACK to the input dtype so the op
+/// preserves dtype (PyTorch keeps `f16 -> f16`) instead of upcasting to f32.
+/// For an F32 (or any non-half) `orig`, this is the identity (returns F32), so
+/// it is safe to apply on both the F32 and the F16/BF16 arms.
+fn narrow_f32_to_storage_dtype(orig: &TensorStorage, values: Vec<f32>) -> TensorStorage {
+    match orig {
+        TensorStorage::F16(_) => {
+            TensorStorage::F16(Arc::new(values.into_iter().map(Float16::from_f32).collect()))
+        }
+        TensorStorage::BF16(_) => {
+            TensorStorage::BF16(Arc::new(values.into_iter().map(BFloat16::from_f32).collect()))
+        }
+        _ => TensorStorage::F32(Arc::new(values)),
+    }
+}
+
 pub fn dispatch_tensor_unary_contiguous_typed(
     op: UnaryOp,
     mode: ExecutionMode,
@@ -4050,7 +4069,8 @@ pub fn dispatch_tensor_unary_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedUnaryOutcome {
-                storage: TensorStorage::F32(Arc::new(outcome.values)),
+                // Preserve the input's half dtype (f16 -> f16), don't upcast to f32.
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }
