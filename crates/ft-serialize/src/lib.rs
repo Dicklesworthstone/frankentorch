@@ -582,7 +582,6 @@ const FT_DTYPE_TAG_F16: u8 = 2;
 const FT_DTYPE_TAG_BF16: u8 = 3;
 const FT_MIN_NATIVE_TENSOR_HEADER_BYTES: usize = 8 + 8 + 1; // key_len + ndim + dtype tag
 const FT_NATIVE_SAVE_BUFFER_BYTES: usize = 1024 * 1024;
-const FT_NATIVE_F32_VALUE_CHUNK_BYTES: usize = 64 * 1024;
 const FT_NATIVE_HALF_VALUE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Errors from tensor state dict save/load operations.
@@ -874,21 +873,18 @@ fn write_native_f32_values<W: Write>(
     values: &[f32],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    let values_per_chunk = FT_NATIVE_F32_VALUE_CHUNK_BYTES / std::mem::size_of::<u32>();
-    let mut bytes = Vec::with_capacity(FT_NATIVE_F32_VALUE_CHUNK_BYTES);
-    for chunk in values.chunks(values_per_chunk) {
-        bytes.clear();
-        let mut lanes = chunk.chunks_exact(2);
-        for lane in &mut lanes {
-            let packed = u64::from(lane[0].to_bits()) | (u64::from(lane[1].to_bits()) << 32);
-            bytes.extend_from_slice(&packed.to_le_bytes());
-        }
-        for &value in lanes.remainder() {
-            bytes.extend_from_slice(&value.to_bits().to_le_bytes());
-        }
-        write_native_bytes(writer, &bytes, io_path)?;
+    #[cfg(target_endian = "little")]
+    {
+        write_native_bytes(writer, bytemuck::cast_slice(values), io_path)
     }
-    Ok(())
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &value in values {
+            write_native_bytes(writer, &value.to_le_bytes(), io_path)?;
+        }
+        Ok(())
+    }
 }
 
 fn write_native_f16_values<W: Write>(
