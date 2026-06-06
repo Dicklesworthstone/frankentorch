@@ -2941,6 +2941,12 @@ pub struct TensorScanDimDispatchOutcome {
     pub decision: ScanDimDispatchDecision,
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorScanDimDispatchOutcomeF32 {
+    pub values: Vec<f32>,
+    pub decision: ScanDimDispatchDecision,
+}
+
 pub fn dispatch_tensor_scan_dim_contiguous_f64(
     op: ScanOp,
     mode: ExecutionMode,
@@ -4685,38 +4691,26 @@ pub fn dispatch_tensor_scan_dim_contiguous_f32(
     meta: &TensorMeta,
     dim: usize,
     requires_grad: bool,
-) -> Result<TensorScanDimDispatchOutcome, DispatchError> {
+) -> Result<TensorScanDimDispatchOutcomeF32, DispatchError> {
     let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
     let (selected_key, backend_key, effective_key, fallback_used) =
         resolve_dispatch_keys(mode, keyset)?;
 
     let (values, kernel) = match (effective_key, op) {
         (DispatchKey::AutogradCPU, ScanOp::CumSum) => (
-            cumsum_tensor_contiguous_f32(input, meta, dim)?
-                .into_iter()
-                .map(f64::from)
-                .collect::<Vec<_>>(),
+            cumsum_tensor_contiguous_f32(input, meta, dim)?,
             "autograd_cpu::cumsum_tensor_contiguous_f32",
         ),
         (DispatchKey::CPU, ScanOp::CumSum) => (
-            cumsum_tensor_contiguous_f32(input, meta, dim)?
-                .into_iter()
-                .map(f64::from)
-                .collect::<Vec<_>>(),
+            cumsum_tensor_contiguous_f32(input, meta, dim)?,
             "cpu::cumsum_tensor_contiguous_f32",
         ),
         (DispatchKey::AutogradCPU, ScanOp::CumProd) => (
-            cumprod_tensor_contiguous_f32(input, meta, dim)?
-                .into_iter()
-                .map(f64::from)
-                .collect::<Vec<_>>(),
+            cumprod_tensor_contiguous_f32(input, meta, dim)?,
             "autograd_cpu::cumprod_tensor_contiguous_f32",
         ),
         (DispatchKey::CPU, ScanOp::CumProd) => (
-            cumprod_tensor_contiguous_f32(input, meta, dim)?
-                .into_iter()
-                .map(f64::from)
-                .collect::<Vec<_>>(),
+            cumprod_tensor_contiguous_f32(input, meta, dim)?,
             "cpu::cumprod_tensor_contiguous_f32",
         ),
         _ => {
@@ -4727,7 +4721,7 @@ pub fn dispatch_tensor_scan_dim_contiguous_f32(
         }
     };
 
-    Ok(TensorScanDimDispatchOutcome {
+    Ok(TensorScanDimDispatchOutcomeF32 {
         values,
         decision: ScanDimDispatchDecision {
             op,
@@ -5555,9 +5549,7 @@ pub fn dispatch_tensor_scan_dim_contiguous_typed(
             let outcome =
                 dispatch_tensor_scan_dim_contiguous_f32(op, mode, data, meta, dim, requires_grad)?;
             Ok(TypedScanDimOutcome {
-                storage: TensorStorage::F32(Arc::new(
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                )),
+                storage: TensorStorage::F32(Arc::new(outcome.values)),
                 decision: outcome.decision,
             })
         }
@@ -5573,9 +5565,7 @@ pub fn dispatch_tensor_scan_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedScanDimOutcome {
-                storage: TensorStorage::F32(Arc::new(
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                )),
+                storage: TensorStorage::F32(Arc::new(outcome.values)),
                 decision: outcome.decision,
             })
         }
@@ -8372,6 +8362,35 @@ mod tests {
                 reason: "complex dtypes are not supported for join dispatch"
             })
         ));
+    }
+
+    #[test]
+    fn dispatch_typed_scan_preserves_f32_storage() {
+        let storage =
+            TensorStorage::F32(std::sync::Arc::new(vec![2.0_f32, 3.0, f32::INFINITY, -1.0]));
+        let meta = TensorMeta::from_shape(vec![4], DType::F32, Device::Cpu);
+
+        let out = super::dispatch_tensor_scan_dim_contiguous_typed(
+            super::ScanOp::CumProd,
+            ExecutionMode::Strict,
+            &storage,
+            &meta,
+            0,
+            false,
+        )
+        .expect("f32 typed scan should dispatch");
+
+        assert_eq!(out.decision.kernel, "cpu::cumprod_tensor_contiguous_f32");
+        assert!(!out.decision.fallback_used);
+        match out.storage {
+            TensorStorage::F32(values) => {
+                let expected = [2.0_f32, 6.0, f32::INFINITY, f32::NEG_INFINITY];
+                for (idx, (got, want)) in values.iter().zip(expected).enumerate() {
+                    assert_eq!(got.to_bits(), want.to_bits(), "f32 cumprod @{idx}");
+                }
+            }
+            other => panic!("expected f32 scan storage, got {:?}", other.dtype()),
+        }
     }
 
     #[test]

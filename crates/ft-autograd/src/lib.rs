@@ -23792,6 +23792,24 @@ mod tests {
     }
 
     #[test]
+    fn f32_cumprod_preserves_dtype() {
+        let mut tape = TensorTape::new();
+        let a = tape
+            .leaf_f32(vec![2.0f32, 3.0, -0.0, f32::NAN], vec![4], false)
+            .unwrap();
+        let (c, event) = tape.cumprod(a, 0, ExecutionMode::Strict).unwrap();
+        assert_eq!(tape.dtype(c).unwrap(), DType::F32);
+        assert_eq!(event.decision.kernel, "cpu::cumprod_tensor_contiguous_f32");
+
+        let vals = tape.values_f32(c).unwrap();
+        let expected = [2.0f32, 6.0, -0.0];
+        for (idx, (got, want)) in vals.iter().take(3).zip(expected).enumerate() {
+            assert_eq!(got.to_bits(), want.to_bits(), "cumprod f32 @{idx}");
+        }
+        assert!(vals[3].is_nan(), "cumprod f32 NaN payload should remain NaN");
+    }
+
+    #[test]
     fn f32_expand_preserves_dtype() {
         let mut tape = TensorTape::new();
         let a = tape.leaf_f32(vec![2.0f32], vec![1], false).unwrap();

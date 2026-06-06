@@ -415,6 +415,25 @@ fn bench_cumsum(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_cumprod(c: &mut Criterion) {
+    let mut group = c.benchmark_group("cumprod");
+    let (n, d) = (8192usize, 1024usize);
+
+    group.bench_function("f64_nograd_8192x1024_dim1", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, d], false).unwrap();
+        b.iter(|| black_box(s.tensor_cumprod(x, 1).unwrap()));
+    });
+
+    group.bench_function("f32_nograd_8192x1024_dim1", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.randn_f32(vec![n, d], false).unwrap();
+        b.iter(|| black_box(s.tensor_cumprod(x, 1).unwrap()));
+    });
+
+    group.finish();
+}
+
 fn bench_norm(c: &mut Criterion) {
     let mut group = c.benchmark_group("norm");
     for size in [100000, 1000000].iter() {
@@ -1441,6 +1460,7 @@ criterion_group!(
     bench_pool1d_ct1d,
     bench_sum,
     bench_cumsum,
+    bench_cumprod,
     bench_norm,
     bench_softmax,
     bench_relu,
