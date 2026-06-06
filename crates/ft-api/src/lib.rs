@@ -8025,7 +8025,13 @@ impl FrankenTorchSession {
         // round-off. p=2 already returned via the matmul identity above.
         let needs_grad = self.tensor_tape.tensor_requires_grad(x1)?
             || self.tensor_tape.tensor_requires_grad(x2)?;
+        // The fused fast path uses the F64-only cdist_forward_f64 kernel, so gate
+        // it to F64 inputs; f32/half inputs fall through to the composed path
+        // below (dtype-preserving, genuine-f32 arithmetic = torch parity).
+        // frankentorch-fk5l.
         if !needs_grad
+            && self.tensor_dtype(x1)? == DType::F64
+            && self.tensor_dtype(x2)? == DType::F64
             && m > 0
             && batch * p_dim * r_dim > 0
             && (p == f64::INFINITY || (p.is_finite() && p > 0.0))
@@ -8096,9 +8102,11 @@ impl FrankenTorchSession {
             )));
         }
 
-        // Non-grad fallback path for p == 0, p == inf, or empty output.
-        let x1_vals = self.tensor_values(x1)?;
-        let x2_vals = self.tensor_values(x2)?;
+        // Non-grad fallback path for p == 0, p == inf, or empty output. Lossy
+        // reads so f32 inputs are accepted; the result is narrowed back to the
+        // shared input dtype below (torch cdist(f32,f32) -> f32). frankentorch-fk5l.
+        let x1_vals = self.tensor_values_lossy_f64(x1)?;
+        let x2_vals = self.tensor_values_lossy_f64(x2)?;
 
         let mut result = vec![0.0f64; batch * p_dim * r_dim];
 
@@ -8144,7 +8152,13 @@ impl FrankenTorchSession {
         } else {
             vec![p_dim, r_dim]
         };
-        self.tensor_variable(result, out_shape, false)
+        let out = self.tensor_variable(result, out_shape, false)?;
+        match (self.tensor_dtype(x1)?, self.tensor_dtype(x2)?) {
+            (dt @ (DType::F32 | DType::F16 | DType::BF16), other) if other == dt => {
+                self.tensor_tape.to_dtype(out, dt)
+            }
+            _ => Ok(out),
+        }
     }
 
     /// Compute pairwise distance between all pairs of row vectors in a 2-D tensor.
@@ -8219,7 +8233,13 @@ impl FrankenTorchSession {
         // O(out_len·M) intermediate. Same per-k order -> bit-exact. (p=2 used the
         // matmul identity above.)
         let needs_grad = self.tensor_tape.tensor_requires_grad(input)?;
+        // The fused fast path uses the F64-only pdist_forward_f64 kernel, so gate
+        // it to F64 inputs; f32/half inputs fall through to the composed path
+        // below, which is dtype-preserving (index_select/sub/abs/pow/sum_dim) and
+        // computes in genuine f32 (torch parity) rather than f64-then-narrow.
+        // frankentorch-fk5l.
         if !needs_grad
+            && self.tensor_dtype(input)? == DType::F64
             && m > 0
             && out_len > 0
             && (p == f64::INFINITY || (p.is_finite() && p > 0.0))
@@ -8271,8 +8291,10 @@ impl FrankenTorchSession {
         }
 
         // Non-grad paths for p == 0, p == inf, or empty output —
-        // fall back to the original direct computation.
-        let vals = self.tensor_values(input)?;
+        // fall back to the original direct computation. Lossy read so f32 inputs
+        // are accepted; the result is narrowed back to the input dtype below
+        // (torch pdist(f32) -> f32). frankentorch-fk5l.
+        let vals = self.tensor_values_lossy_f64(input)?;
         let mut result = Vec::with_capacity(out_len);
         for i in 0..n {
             for j in (i + 1)..n {
@@ -8302,7 +8324,11 @@ impl FrankenTorchSession {
             }
         }
 
-        self.tensor_variable(result, vec![out_len], false)
+        let out = self.tensor_variable(result, vec![out_len], false)?;
+        match self.tensor_dtype(input)? {
+            dt @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_tape.to_dtype(out, dt),
+            _ => Ok(out),
+        }
     }
 
     /// Convert class indices to one-hot encoded tensors.
@@ -11176,8 +11202,10 @@ impl FrankenTorchSession {
         // and so does Rust's f64::copysign. Dtype is preserved by
         // dispatching on the magnitude's dtype.
         let m_dtype = self.tensor_dtype(magnitude)?;
-        let m_vals = self.tensor_values(magnitude)?;
-        let s_vals = self.tensor_values(sign)?;
+        // Lossy f64 reads so f32 inputs are accepted (tensor_values is F64-only,
+        // which made the F32 output branch below dead code). frankentorch-fk5l.
+        let m_vals = self.tensor_values_lossy_f64(magnitude)?;
+        let s_vals = self.tensor_values_lossy_f64(sign)?;
         let result: Vec<f64> = m_vals
             .iter()
             .zip(s_vals.iter())
@@ -26284,7 +26312,13 @@ impl FrankenTorchSession {
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
         let (values, _argmax) = self.tensor_max_dim(input, dim)?;
-        Ok(values)
+        // max_dim currently widens half/f32 reductions to f64; narrow back so
+        // torch.amax(f32) -> f32 (the reduced max is one of the inputs, so the
+        // narrow is exact). frankentorch-fk5l (deeper max_dim fix tracked there).
+        match self.tensor_dtype(input)? {
+            dt @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_tape.to_dtype(values, dt),
+            _ => Ok(values),
+        }
     }
 
     /// Reduce along `dim` returning only the minimum values (no indices).
@@ -26297,7 +26331,12 @@ impl FrankenTorchSession {
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
         let (values, _argmin) = self.tensor_min_dim(input, dim)?;
-        Ok(values)
+        // Narrow back to the input dtype (torch.amin(f32) -> f32); see tensor_amax.
+        // frankentorch-fk5l.
+        match self.tensor_dtype(input)? {
+            dt @ (DType::F32 | DType::F16 | DType::BF16) => self.tensor_tape.to_dtype(values, dt),
+            _ => Ok(values),
+        }
     }
 
     fn validate_index_tensor_values(
@@ -35691,18 +35730,21 @@ impl FrankenTorchSession {
             );
         }
 
-        let vals = self.tensor_values(input)?;
+        // Lossy read + dtype-matched leaf so f32 inputs are accepted and the
+        // result keeps the input dtype (torch nanmedian(f32) -> f32); the old
+        // tensor_values read was F64-only and rebuilt an F64 leaf. frankentorch-fk5l.
+        let vals = self.tensor_values_lossy_f64(input)?;
         let mut non_nan: Vec<f64> = vals.into_iter().filter(|x| !x.is_nan()).collect();
 
         if non_nan.is_empty() {
-            return self.tensor_variable(vec![f64::NAN], vec![1], false);
+            return self.scalar_leaf_matching_dtype(input, f64::NAN);
         }
 
         non_nan.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
         let median_idx = (non_nan.len() - 1) / 2;
         let median_val = non_nan[median_idx];
 
-        self.tensor_variable(vec![median_val], vec![1], false)
+        self.scalar_leaf_matching_dtype(input, median_val)
     }
 
     /// NaN-aware quantile: equivalent to `torch.nanquantile(input, q)`.
@@ -44349,7 +44391,9 @@ impl FrankenTorchSession {
                 },
             )));
         }
-        let vals = self.tensor_values(input)?;
+        // Lossy read so f32 inputs are accepted (tensor_values is F64-only).
+        // frankentorch-fk5l.
+        let vals = self.tensor_values_lossy_f64(input)?;
         if k == 0 || k > vals.len() {
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Key(
                 ft_dispatch::DispatchKeyError::IncompatibleSet {
@@ -44358,28 +44402,19 @@ impl FrankenTorchSession {
             )));
         }
 
-        // Sort indices by value to find rank-k position; the routing
-        // index is non-differentiable but the value branch routes
-        // grad_value back to that single input position. Tracked
-        // under frankentorch-0juq.
+        // Sort indices by value to find the rank-k position.
         let mut indices: Vec<usize> = (0..vals.len()).collect();
         indices.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
         let idx = indices[k - 1];
-        let n = vals.len();
 
-        let value = self.tensor_apply_function(
-            &[input],
-            move |_ctx, inputs| {
-                let (vals, _shape) = inputs[0];
-                Ok((vec![vals[idx]], vec![1]))
-            },
-            move |_ctx, grad_outputs| {
-                let g = grad_outputs[0];
-                let mut grad_in = vec![0.0_f64; n];
-                grad_in[idx] = g[0];
-                Ok(vec![Some(grad_in)])
-            },
-        )?;
+        // Gather the rank-k element via index_select so the value keeps the input
+        // dtype (torch kthvalue(f32) -> f32) and stays autograd-aware:
+        // index_select's backward scatters grad_value to position `idx` and 0
+        // elsewhere — identical to the previous custom-op gradient
+        // (frankentorch-0juq), but the old path read f64-only values and built an
+        // F64 leaf. frankentorch-fk5l.
+        let idx_leaf = self.tensor_tape.leaf(vec![idx as f64], vec![1], false)?;
+        let value = self.tensor_index_select(input, 0, idx_leaf)?;
         let index = self.tensor_variable(vec![idx as f64], vec![1], false)?;
         Ok((value, index))
     }
@@ -46022,19 +46057,19 @@ impl FrankenTorchSession {
         a: TensorNodeId,
         b: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (a_vals, a_meta) = {
-            let t = self.tensor_tape.tensor(a)?;
-            (t.storage()?.to_vec(), t.meta().clone())
-        };
-        let (b_vals, b_shape) = {
-            let t = self.tensor_tape.tensor(b)?;
-            (t.storage()?.to_vec(), t.meta().shape().to_vec())
-        };
-        if a_meta.shape() != b_shape.as_slice() {
+        // Lossy f64 reads (storage().to_vec() is F64-only) so f32 inputs are
+        // accepted; the finite-check only needs the magnitudes, and the actual
+        // logaddexp math below composes through dtype-preserving primitives, so
+        // an f32 input keeps f32 (torch parity). frankentorch-fk5l.
+        let a_shape_vec = self.tensor_shape(a)?;
+        let a_vals = self.tensor_values_lossy_f64(a)?;
+        let b_shape = self.tensor_shape(b)?;
+        let b_vals = self.tensor_values_lossy_f64(b)?;
+        if a_shape_vec.as_slice() != b_shape.as_slice() {
             // Migrate to ShapeMismatch (frankentorch-c991).
             return Err(AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(
                 ft_kernel_cpu::KernelError::ShapeMismatch {
-                    lhs: a_meta.shape().to_vec(),
+                    lhs: a_shape_vec,
                     rhs: b_shape,
                 },
             )));
@@ -75028,6 +75063,96 @@ mod tests {
         let xf64 = s.tensor_variable(vec![0.0, 0.5, 1.0], vec![3], false).unwrap();
         let sf64 = s.tensor_sinc(xf64).unwrap();
         assert_eq!(s.tensor_dtype(sf64).unwrap(), DType::F64, "sinc(f64) -> f64");
+    }
+
+    #[test]
+    fn f32_value_read_ops_preserve_dtype() {
+        // Mechanism B of frankentorch-fk5l: ops whose direct/no-grad path read
+        // values via tensor_values / storage().to_vec() (F64-only) hard-errored
+        // on f32 (UnsupportedDType). Now they read via tensor_values_lossy_f64
+        // and emit the input dtype (torch parity).
+        let approx = |a: &[f64], b: &[f64]| {
+            assert_eq!(a.len(), b.len(), "len {:?} vs {:?}", a, b);
+            for (x, y) in a.iter().zip(b.iter()) {
+                assert!((x - y).abs() < 1e-4, "value {} vs {}", x, y);
+            }
+        };
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // pdist(f32) p=1 / p=inf / p=0: points [0,0],[3,4],[1,1].
+        let pts = s.tensor_variable_f32(vec![0.0, 0.0, 3.0, 4.0, 1.0, 1.0], vec![3, 2], false).unwrap();
+        let d1 = s.tensor_pdist(pts, 1.0).unwrap();
+        assert_eq!(s.tensor_dtype(d1).unwrap(), DType::F32, "pdist p=1 (f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(d1).unwrap(), &[7.0, 2.0, 5.0]);
+        let dinf = s.tensor_pdist(pts, f64::INFINITY).unwrap();
+        assert_eq!(s.tensor_dtype(dinf).unwrap(), DType::F32, "pdist p=inf (f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(dinf).unwrap(), &[4.0, 1.0, 3.0]);
+        let d0 = s.tensor_pdist(pts, 0.0).unwrap();
+        assert_eq!(s.tensor_dtype(d0).unwrap(), DType::F32, "pdist p=0 (f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(d0).unwrap(), &[2.0, 2.0, 2.0]);
+
+        // cdist(f32) p=1: x1=[[0,0],[1,1]], x2=[[0,1],[2,2]].
+        let x1 = s.tensor_variable_f32(vec![0.0, 0.0, 1.0, 1.0], vec![2, 2], false).unwrap();
+        let x2 = s.tensor_variable_f32(vec![0.0, 1.0, 2.0, 2.0], vec![2, 2], false).unwrap();
+        let cd = s.tensor_cdist(x1, x2, 1.0).unwrap();
+        assert_eq!(s.tensor_dtype(cd).unwrap(), DType::F32, "cdist p=1 (f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(cd).unwrap(), &[1.0, 4.0, 1.0, 2.0]);
+
+        // nanmedian(f32): [3,1,2] -> 2; with NaN [3,NaN,1,2] -> 2.
+        let a = s.tensor_variable_f32(vec![3.0, 1.0, 2.0], vec![3], false).unwrap();
+        let nm = s.tensor_nanmedian(a).unwrap();
+        assert_eq!(s.tensor_dtype(nm).unwrap(), DType::F32, "nanmedian(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(nm).unwrap(), &[2.0]);
+        let an = s.tensor_variable_f32(vec![3.0, f32::NAN, 1.0, 2.0], vec![4], false).unwrap();
+        let nmn = s.tensor_nanmedian(an).unwrap();
+        approx(&s.tensor_values_lossy_f64(nmn).unwrap(), &[2.0]);
+
+        // kthvalue(f32): [3,1,2], k=1 -> 1 (idx 1), k=2 -> 2 (idx 2).
+        let a = s.tensor_variable_f32(vec![3.0, 1.0, 2.0], vec![3], false).unwrap();
+        let (v1, i1) = s.tensor_kthvalue(a, 1).unwrap();
+        assert_eq!(s.tensor_dtype(v1).unwrap(), DType::F32, "kthvalue(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(v1).unwrap(), &[1.0]);
+        approx(&s.tensor_values_lossy_f64(i1).unwrap(), &[1.0]);
+        let (v2, i2) = s.tensor_kthvalue(a, 2).unwrap();
+        approx(&s.tensor_values_lossy_f64(v2).unwrap(), &[2.0]);
+        approx(&s.tensor_values_lossy_f64(i2).unwrap(), &[2.0]);
+
+        // copysign(f32): mag [3,6], sign [-1,1] -> [-3,6].
+        let mag = s.tensor_variable_f32(vec![3.0, 6.0], vec![2], false).unwrap();
+        let sgn = s.tensor_variable_f32(vec![-1.0, 1.0], vec![2], false).unwrap();
+        let cs = s.tensor_copysign(mag, sgn).unwrap();
+        assert_eq!(s.tensor_dtype(cs).unwrap(), DType::F32, "copysign(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(cs).unwrap(), &[-3.0, 6.0]);
+
+        // logaddexp(f32): [1,2],[3,4] -> log(e^1+e^3), log(e^2+e^4).
+        let la = s.tensor_variable_f32(vec![1.0, 2.0], vec![2], false).unwrap();
+        let lb = s.tensor_variable_f32(vec![3.0, 4.0], vec![2], false).unwrap();
+        let lae = s.tensor_logaddexp(la, lb).unwrap();
+        assert_eq!(s.tensor_dtype(lae).unwrap(), DType::F32, "logaddexp(f32) -> f32");
+        approx(
+            &s.tensor_values_lossy_f64(lae).unwrap(),
+            &[(1.0_f64.exp() + 3.0_f64.exp()).ln(), (2.0_f64.exp() + 4.0_f64.exp()).ln()],
+        );
+
+        // amax/amin(f32) -> f32 (were widened to f64 by max_dim/min_dim; the
+        // pdist/cdist p=inf paths route through amax).
+        let mat = s.tensor_variable_f32(vec![1.0, 4.0, 3.0, 2.0], vec![2, 2], false).unwrap();
+        let amx = s.tensor_amax(mat, 1).unwrap();
+        assert_eq!(s.tensor_dtype(amx).unwrap(), DType::F32, "amax(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(amx).unwrap(), &[4.0, 3.0]);
+        let amn = s.tensor_amin(mat, 1).unwrap();
+        assert_eq!(s.tensor_dtype(amn).unwrap(), DType::F32, "amin(f32) -> f32");
+        approx(&s.tensor_values_lossy_f64(amn).unwrap(), &[1.0, 2.0]);
+
+        // f64 no-regression: same ops on f64 stay f64 (and the f64 pdist fast
+        // path is still exercised).
+        let ptsf64 = s.tensor_variable(vec![0.0, 0.0, 3.0, 4.0, 1.0, 1.0], vec![3, 2], false).unwrap();
+        let d1f64 = s.tensor_pdist(ptsf64, 1.0).unwrap();
+        assert_eq!(s.tensor_dtype(d1f64).unwrap(), DType::F64, "pdist(f64) -> f64");
+        approx(&s.tensor_values_lossy_f64(d1f64).unwrap(), &[7.0, 2.0, 5.0]);
+        let af64 = s.tensor_variable(vec![3.0, 1.0, 2.0], vec![3], false).unwrap();
+        let (v1f64, _) = s.tensor_kthvalue(af64, 1).unwrap();
+        assert_eq!(s.tensor_dtype(v1f64).unwrap(), DType::F64, "kthvalue(f64) -> f64");
     }
 
     #[test]
