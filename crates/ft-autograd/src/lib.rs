@@ -8159,10 +8159,36 @@ impl TensorTape {
                     .map_err(|e| AutogradError::Dispatch(e.into()))?;
                     TensorStorage::F32(Arc::new(output_values))
                 }
+                dt @ (DType::F16 | DType::BF16) if !accumulate => {
+                    // index_put with accumulate=false is pure movement
+                    // (out[idx] = values, overwrite, no arithmetic), so run it on
+                    // the half values upcast to f64 (lossless) and narrow the
+                    // result back to the input's half dtype. Bit-exact: every
+                    // output element is either an original input half value or a
+                    // values half value (read via values_lossy_f64), each of which
+                    // round-trips half -> f64 -> half exactly. accumulate=true is
+                    // arithmetic and stays deferred (frankentorch-uv4l).
+                    let input_data = input_node.tensor.contiguous_values_as_f64()?;
+                    let f64_meta = ft_core::TensorMeta::from_shape(
+                        meta.shape().to_vec(),
+                        DType::F64,
+                        meta.device(),
+                    );
+                    let output_values = index_put_tensor_contiguous_f64(
+                        &input_data,
+                        &f64_meta,
+                        indices,
+                        values_data,
+                        accumulate,
+                    )
+                    .map_err(|e| AutogradError::Dispatch(e.into()))?;
+                    Self::reduction_values_storage(dt, output_values)
+                }
                 _ => {
                     return Err(AutogradError::Dispatch(
                         DispatchKeyError::IncompatibleSet {
-                            reason: "index_put requires f32 or f64 tensors",
+                            reason: "index_put requires f32 or f64 tensors \
+                                     (f16/bf16 supported only with accumulate=false)",
                         }
                         .into(),
                     ));
