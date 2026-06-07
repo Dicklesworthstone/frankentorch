@@ -6040,6 +6040,8 @@ pub fn dispatch_tensor_addmm_contiguous_typed(
     alpha: f64,
     requires_grad: bool,
 ) -> Result<TypedAddmmOutcome, DispatchError> {
+    // Keep a handle to the original storage for the half-dtype narrow below.
+    let orig_input_storage: &TensorStorage = input_storage;
     let input_storage = NonComplexTensorStorageRef::try_from(input_storage).map_err(|()| {
         DispatchKeyError::IncompatibleSet {
             reason: "complex dtypes are not supported for addmm dispatch",
@@ -6097,10 +6099,22 @@ pub fn dispatch_tensor_addmm_contiguous_typed(
             alpha,
             requires_grad,
         )?;
+        // Preserve a shared half dtype: addmm of all-f16 (or all-bf16) inputs
+        // stays f16/bf16. torch computes half addmm in f32 (acc_type) and narrows
+        // the result, so upcast -> f32 addmm -> narrow is bit-exact. Mixed/f32
+        // inputs stay f32. frankentorch-amf16.
+        let values: Vec<f32> = outcome.values.iter().map(|&v| v as f32).collect();
+        let all_half_same = matches!(
+            (input_meta.dtype(), mat1_meta.dtype(), mat2_meta.dtype()),
+            (DType::F16, DType::F16, DType::F16) | (DType::BF16, DType::BF16, DType::BF16)
+        );
+        let storage = if all_half_same {
+            narrow_f32_to_storage_dtype(orig_input_storage, values)
+        } else {
+            TensorStorage::F32(Arc::new(values))
+        };
         Ok(TypedAddmmOutcome {
-            storage: TensorStorage::F32(Arc::new(
-                outcome.values.iter().map(|&v| v as f32).collect(),
-            )),
+            storage,
             decision: outcome.decision,
         })
     }
@@ -6119,6 +6133,8 @@ pub fn dispatch_tensor_addmv_contiguous_typed(
     alpha: f64,
     requires_grad: bool,
 ) -> Result<TypedAddmvOutcome, DispatchError> {
+    // Keep a handle to the original storage for the half-dtype narrow below.
+    let orig_input_storage: &TensorStorage = input_storage;
     let input_storage = NonComplexTensorStorageRef::try_from(input_storage).map_err(|()| {
         DispatchKeyError::IncompatibleSet {
             reason: "complex dtypes are not supported for addmv dispatch",
@@ -6176,10 +6192,21 @@ pub fn dispatch_tensor_addmv_contiguous_typed(
             alpha,
             requires_grad,
         )?;
+        // Preserve a shared half dtype (see addmm). torch computes half addmv in
+        // f32 then narrows, so upcast -> f32 addmv -> narrow is bit-exact.
+        // frankentorch-amf16.
+        let values: Vec<f32> = outcome.values.iter().map(|&v| v as f32).collect();
+        let all_half_same = matches!(
+            (input_meta.dtype(), mat_meta.dtype(), vec_meta.dtype()),
+            (DType::F16, DType::F16, DType::F16) | (DType::BF16, DType::BF16, DType::BF16)
+        );
+        let storage = if all_half_same {
+            narrow_f32_to_storage_dtype(orig_input_storage, values)
+        } else {
+            TensorStorage::F32(Arc::new(values))
+        };
         Ok(TypedAddmvOutcome {
-            storage: TensorStorage::F32(Arc::new(
-                outcome.values.iter().map(|&v| v as f32).collect(),
-            )),
+            storage,
             decision: outcome.decision,
         })
     }
@@ -8470,7 +8497,7 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_typed_addmv_promotes_bf16_to_f32() {
+    fn dispatch_typed_addmv_preserves_bf16() {
         let input_storage = TensorStorage::BF16(std::sync::Arc::new(vec![
             BFloat16::from_f32(1.0),
             BFloat16::from_f32(2.0),
@@ -8503,7 +8530,10 @@ mod tests {
         )
         .expect("bf16 typed addmv should dispatch");
 
-        assert!(matches!(out.storage, TensorStorage::F32(_)));
+        // All-bf16 inputs now preserve bf16 (torch computes half addmv in f32 then
+        // narrows, so upcast->f32->narrow is bit-exact). Was previously upcast to
+        // F32. frankentorch-amf16.
+        assert!(matches!(out.storage, TensorStorage::BF16(_)));
         let values = out.storage.to_f32_vec();
         assert_eq!(values, vec![54.0, 85.0]);
     }
