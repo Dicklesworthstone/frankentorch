@@ -390,15 +390,19 @@ pub struct Adam {
     beta2: f64,
     eps: f64,
     weight_decay: f64,
+    amsgrad: bool,
     step_counts: Vec<u64>,
     m: Vec<Option<Vec<f64>>>,
     v: Vec<Option<Vec<f64>>>,
+    /// Running max of the second moment, allocated lazily only when `amsgrad`.
+    v_max: Vec<Option<Vec<f64>>>,
 }
 
 impl Adam {
     /// Create a new Adam optimizer with default hyperparameters.
     ///
-    /// Defaults: lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0
+    /// Defaults: lr=0.001, beta1=0.9, beta2=0.999, eps=1e-8, weight_decay=0.0,
+    /// amsgrad=false
     pub fn new(params: Vec<TensorNodeId>, lr: f64) -> Self {
         let n = params.len();
         Self {
@@ -408,10 +412,21 @@ impl Adam {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 0.0,
+            amsgrad: false,
             step_counts: vec![0; n],
             m: vec![None; n],
             v: vec![None; n],
+            v_max: vec![None; n],
         }
+    }
+
+    /// Enable the AMSGrad variant (default: false): use a running maximum of the
+    /// second moment in the denominator (Reddi et al. 2018). Matches
+    /// `torch.optim.Adam(amsgrad=True)`.
+    #[must_use]
+    pub fn amsgrad(mut self, amsgrad: bool) -> Self {
+        self.amsgrad = amsgrad;
+        self
     }
 
     /// Set beta coefficients for computing running averages.
@@ -517,49 +532,108 @@ impl Optimizer for Adam {
             let lr = self.lr;
             let eps = self.eps;
             let weight_decay = self.weight_decay;
-            session.tensor_update_param_values_f64_with_accumulated_gradient(
-                param,
-                |grad, param_values| {
-                    // Each parameter element's update is fully independent (no
-                    // cross-element dependency or reduction), so for large tensors
-                    // run it in parallel over elements. The per-element arithmetic
-                    // and order are unchanged, so the result is bit-for-bit
-                    // identical to the serial loop. The threshold sits above the
-                    // measured rayon break-even for sqrt-class elementwise work on
-                    // these workers. frankentorch-optpar.
-                    let body = |p: &mut f64, g: f64, m_val: &mut f64, v_val: &mut f64| {
-                        // Weight decay (L2): grad += weight_decay * param (original param).
-                        let g_eff = if weight_decay != 0.0 {
-                            g + weight_decay * *p
-                        } else {
-                            g
+            let amsgrad = self.amsgrad;
+            if amsgrad {
+                // AMSGrad path: maintain a per-element running max of the second
+                // moment and use it in the denominator. Kept separate so the
+                // (common) non-amsgrad fused loop below is byte-identical.
+                let v_max = self.v_max[i].get_or_insert_with(|| vec![0.0; grad_len]);
+                ensure_state_len(
+                    grad_len,
+                    v_max.len(),
+                    "adam max-second-moment state length mismatch with gradient length",
+                )?;
+                session.tensor_update_param_values_f64_with_accumulated_gradient(
+                    param,
+                    |grad, param_values| {
+                        let body = |p: &mut f64,
+                                    g: f64,
+                                    m_val: &mut f64,
+                                    v_val: &mut f64,
+                                    vmax_val: &mut f64| {
+                            let g_eff = if weight_decay != 0.0 {
+                                g + weight_decay * *p
+                            } else {
+                                g
+                            };
+                            *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
+                            *v_val = beta2 * *v_val + (1.0 - beta2) * g_eff * g_eff;
+                            if *vmax_val < *v_val {
+                                *vmax_val = *v_val;
+                            }
+                            let m_hat = *m_val / bias_correction1;
+                            let v_hat = *vmax_val / bias_correction2;
+                            *p -= lr * m_hat / (v_hat.sqrt() + eps);
                         };
-                        *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
-                        *v_val = beta2 * *v_val + (1.0 - beta2) * g_eff * g_eff;
-                        let m_hat = *m_val / bias_correction1;
-                        let v_hat = *v_val / bias_correction2;
-                        *p -= lr * m_hat / (v_hat.sqrt() + eps);
-                    };
-                    if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
-                        use rayon::prelude::*;
-                        param_values
-                            .par_iter_mut()
-                            .zip(grad.par_iter())
-                            .zip(m.par_iter_mut())
-                            .zip(v.par_iter_mut())
-                            .for_each(|(((p, g), m_val), v_val)| body(p, *g, m_val, v_val));
-                    } else {
-                        for (((p, g), m_val), v_val) in param_values
-                            .iter_mut()
-                            .zip(grad.iter())
-                            .zip(m.iter_mut())
-                            .zip(v.iter_mut())
-                        {
-                            body(p, *g, m_val, v_val);
+                        if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
+                            use rayon::prelude::*;
+                            param_values
+                                .par_iter_mut()
+                                .zip(grad.par_iter())
+                                .zip(m.par_iter_mut())
+                                .zip(v.par_iter_mut())
+                                .zip(v_max.par_iter_mut())
+                                .for_each(|((((p, g), m_val), v_val), vmax_val)| {
+                                    body(p, *g, m_val, v_val, vmax_val);
+                                });
+                        } else {
+                            for ((((p, g), m_val), v_val), vmax_val) in param_values
+                                .iter_mut()
+                                .zip(grad.iter())
+                                .zip(m.iter_mut())
+                                .zip(v.iter_mut())
+                                .zip(v_max.iter_mut())
+                            {
+                                body(p, *g, m_val, v_val, vmax_val);
+                            }
                         }
-                    }
-                },
-            )?;
+                    },
+                )?;
+            } else {
+                session.tensor_update_param_values_f64_with_accumulated_gradient(
+                    param,
+                    |grad, param_values| {
+                        // Each parameter element's update is fully independent (no
+                        // cross-element dependency or reduction), so for large tensors
+                        // run it in parallel over elements. The per-element arithmetic
+                        // and order are unchanged, so the result is bit-for-bit
+                        // identical to the serial loop. The threshold sits above the
+                        // measured rayon break-even for sqrt-class elementwise work on
+                        // these workers. frankentorch-optpar.
+                        let body = |p: &mut f64, g: f64, m_val: &mut f64, v_val: &mut f64| {
+                            // Weight decay (L2): grad += weight_decay * param (original param).
+                            let g_eff = if weight_decay != 0.0 {
+                                g + weight_decay * *p
+                            } else {
+                                g
+                            };
+                            *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
+                            *v_val = beta2 * *v_val + (1.0 - beta2) * g_eff * g_eff;
+                            let m_hat = *m_val / bias_correction1;
+                            let v_hat = *v_val / bias_correction2;
+                            *p -= lr * m_hat / (v_hat.sqrt() + eps);
+                        };
+                        if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
+                            use rayon::prelude::*;
+                            param_values
+                                .par_iter_mut()
+                                .zip(grad.par_iter())
+                                .zip(m.par_iter_mut())
+                                .zip(v.par_iter_mut())
+                                .for_each(|(((p, g), m_val), v_val)| body(p, *g, m_val, v_val));
+                        } else {
+                            for (((p, g), m_val), v_val) in param_values
+                                .iter_mut()
+                                .zip(grad.iter())
+                                .zip(m.iter_mut())
+                                .zip(v.iter_mut())
+                            {
+                                body(p, *g, m_val, v_val);
+                            }
+                        }
+                    },
+                )?;
+            }
         }
         Ok(())
     }
@@ -5737,6 +5811,51 @@ mod tests {
 
         let f = fails.borrow();
         assert!(f.is_empty(), "optimizer divergences ({}): {:?}", f.len(), *f);
+    }
+
+    #[test]
+    fn adam_amsgrad_matches_torch() {
+        // frankentorch-4h6y: Adam amsgrad uses a running max of the second moment.
+        // Drive with controlled gradients [10, 0, 0] (v then decreases, so amsgrad
+        // diverges from plain Adam). Golden trajectories from torch 2.12.0+cpu
+        // (probe_ams2.py).
+        let grads = [10.0, 0.0, 0.0];
+        let run = |amsgrad: bool| -> Vec<f64> {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+            // A real report is required by step() but Adam ignores it and reads the
+            // accumulated gradient, which we overwrite each step.
+            let loss = s.tensor_sum(x).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            let mut opt = Adam::new(vec![x], 0.1).amsgrad(amsgrad);
+            let mut out = Vec::new();
+            for &g in &grads {
+                s.tensor_set_accumulated_gradient(x, vec![g]).unwrap();
+                opt.step(&mut s, &report).unwrap();
+                out.push(s.tensor_values(x).unwrap()[0]);
+            }
+            out
+        };
+        let adam = run(false);
+        let ams = run(true);
+        let want_adam = [0.9000000001, 0.8329941748, 0.7811984776];
+        let want_ams = [0.9000000001, 0.8330276861, 0.7812837846];
+        for i in 0..3 {
+            assert!(
+                (adam[i] - want_adam[i]).abs() < 1e-7,
+                "adam[{i}]={} want {}",
+                adam[i],
+                want_adam[i]
+            );
+            assert!(
+                (ams[i] - want_ams[i]).abs() < 1e-7,
+                "amsgrad[{i}]={} want {}",
+                ams[i],
+                want_ams[i]
+            );
+        }
+        // amsgrad must actually diverge from plain Adam here.
+        assert!((adam[2] - ams[2]).abs() > 1e-6, "amsgrad did not change the trajectory");
     }
 
     #[test]
