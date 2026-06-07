@@ -4,6 +4,13 @@ use ft_api::FrankenTorchSession;
 use ft_autograd::{AutogradError, TensorBackwardReport, TensorNodeId};
 use ft_dispatch::{DispatchError, DispatchKeyError};
 
+/// Per-tensor element count above which an optimizer's elementwise parameter
+/// update is run in parallel (rayon). Below this, rayon's overhead dominates the
+/// (cheap, ~sqrt-class) per-element work — measured break-even on these workers is
+/// ~2.6e5 — so small parameter tensors stay serial. The parallel path is
+/// bit-for-bit identical (each element is independent). frankentorch-optpar.
+const OPTIM_PARALLEL_THRESHOLD: usize = 1 << 18; // 262144
+
 fn adam_bias_correction(beta: f64, step: u64) -> f64 {
     1.0 - beta.powf(step as f64)
 }
@@ -513,23 +520,43 @@ impl Optimizer for Adam {
             session.tensor_update_param_values_f64_with_accumulated_gradient(
                 param,
                 |grad, param_values| {
-                    for (((p, g), m_val), v_val) in param_values
-                        .iter_mut()
-                        .zip(grad.iter())
-                        .zip(m.iter_mut())
-                        .zip(v.iter_mut())
-                    {
+                    // Each parameter element's update is fully independent (no
+                    // cross-element dependency or reduction), so for large tensors
+                    // run it in parallel over elements. The per-element arithmetic
+                    // and order are unchanged, so the result is bit-for-bit
+                    // identical to the serial loop. The threshold sits above the
+                    // measured rayon break-even for sqrt-class elementwise work on
+                    // these workers. frankentorch-optpar.
+                    let body = |p: &mut f64, g: f64, m_val: &mut f64, v_val: &mut f64| {
                         // Weight decay (L2): grad += weight_decay * param (original param).
                         let g_eff = if weight_decay != 0.0 {
                             g + weight_decay * *p
                         } else {
-                            *g
+                            g
                         };
                         *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
                         *v_val = beta2 * *v_val + (1.0 - beta2) * g_eff * g_eff;
                         let m_hat = *m_val / bias_correction1;
                         let v_hat = *v_val / bias_correction2;
                         *p -= lr * m_hat / (v_hat.sqrt() + eps);
+                    };
+                    if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
+                        use rayon::prelude::*;
+                        param_values
+                            .par_iter_mut()
+                            .zip(grad.par_iter())
+                            .zip(m.par_iter_mut())
+                            .zip(v.par_iter_mut())
+                            .for_each(|(((p, g), m_val), v_val)| body(p, *g, m_val, v_val));
+                    } else {
+                        for (((p, g), m_val), v_val) in param_values
+                            .iter_mut()
+                            .zip(grad.iter())
+                            .zip(m.iter_mut())
+                            .zip(v.iter_mut())
+                        {
+                            body(p, *g, m_val, v_val);
+                        }
                     }
                 },
             )?;
@@ -6209,6 +6236,42 @@ mod tests {
                 .collect::<Vec<_>>(),
             expected_v.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+    }
+
+    #[test]
+    fn adam_parallel_path_matches_serial_exact_float_bits() {
+        // Exercise the >= OPTIM_PARALLEL_THRESHOLD parallel branch and assert it is
+        // bit-for-bit identical to the serial Adam update. frankentorch-optpar.
+        let n = super::OPTIM_PARALLEL_THRESHOLD + 7;
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let initial: Vec<f64> = (0..n).map(|i| ((i as f64) * 0.001).sin() * 2.0 - 0.3).collect();
+        let x = session
+            .tensor_variable(initial.clone(), vec![n], true)
+            .expect("variable should succeed");
+        let (lr, b1, b2, eps, wd) = (0.125, 0.8, 0.9, 1e-6, 0.01);
+        let mut optimizer = Adam::new(vec![x], lr).betas(b1, b2).eps(eps).weight_decay(wd);
+
+        let loss_sum = session.tensor_sum(x).expect("sum should succeed");
+        let report = session.tensor_backward(loss_sum).expect("backward should succeed");
+        optimizer.step(&mut session, &report).expect("step should succeed");
+
+        // Manual serial reference (grad = 1 everywhere from sum()).
+        let bc1 = 1.0 - b1.powf(1.0);
+        let bc2 = 1.0 - b2.powf(1.0);
+        let mut expected = initial;
+        for p in &mut expected {
+            let g_eff = 1.0 + wd * *p;
+            let m_val = (1.0 - b1) * g_eff;
+            let v_val = (1.0 - b2) * g_eff * g_eff;
+            let m_hat = m_val / bc1;
+            let v_hat = v_val / bc2;
+            *p -= lr * m_hat / (v_hat.sqrt() + eps);
+        }
+        let actual = session.tensor_values(x).expect("values should resolve");
+        assert_eq!(actual.len(), expected.len());
+        for (i, (a, e)) in actual.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(a.to_bits(), e.to_bits(), "param mismatch @{i}: {a} vs {e}");
+        }
     }
 
     #[test]
