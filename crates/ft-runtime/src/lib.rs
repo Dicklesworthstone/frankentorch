@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+use std::borrow::Cow;
 use std::fmt;
 
 use ft_core::ExecutionMode;
@@ -16,7 +17,7 @@ pub enum EvidenceKind {
 pub struct EvidenceEntry {
     pub ts_unix_ms: u128,
     pub kind: EvidenceKind,
-    pub summary: String,
+    pub summary: Cow<'static, str>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -44,7 +45,7 @@ impl EvidenceLedger {
     /// most recent entries (e.g. the durability search scans from the tail).
     const SOFT_CAP: usize = 1 << 15; // 32768 entries
 
-    pub fn record(&mut self, kind: EvidenceKind, summary: impl Into<String>) {
+    pub fn record(&mut self, kind: EvidenceKind, summary: impl Into<Cow<'static, str>>) {
         if self.entries.len() >= Self::SOFT_CAP {
             // Bound memory by dropping the oldest *middle* entries: keep
             // `entries[0]` (the policy-init anchor that consumers assert on) and

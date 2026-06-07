@@ -7749,6 +7749,82 @@ impl FrankenTorchSession {
         }
         let m = m1;
 
+        // Euclidean (p == 2) fast path — the dominant case AND torch's default
+        // `compute_mode` for p=2. Uses the matmul identity
+        //     d² = ‖x1‖² + ‖x2‖² − 2·x1·x2ᵀ
+        // instead of materialising the broadcasted [P, R, M] (or [B, P, R, M])
+        // difference tensor and reducing it: the cross term is one GEMM-routed
+        // matmul/bmm, the norms are two M-axis reductions, and the result is
+        // assembled with O(P·R) broadcast adds — no O(P·R·M) intermediate. The
+        // whole chain is autograd-aware (matmul/bmm/sum/clamp/sqrt all record on
+        // the tape), and for distinct points its gradient (x1−x2)/d is identical
+        // to the direct path; coincident points (d=0) are clamped to 0 before the
+        // sqrt exactly as torch's mm path does. Matches the direct sum to FFT-free
+        // f64 round-off (~1e-12), well inside the cdist tolerance contract.
+        if p == 2.0 && m > 0 && batch * p_dim * r_dim > 0 {
+            let x1_sq = self.tensor_mul(x1, x1)?;
+            let x2_sq = self.tensor_mul(x2, x2)?;
+            let (cross, x1_norm_b, x2_norm_b, out_shape) = if batched {
+                // x1 [B,P,M], x2 [B,R,M] -> cross [B,P,R].
+                let x2_t = self.tensor_transpose(x2, 1, 2)?;
+                let cross = self.tensor_bmm(x1, x2_t)?;
+                let x1_norm = self.tensor_sum_dim(x1_sq, 2)?; // [B,P]
+                let x2_norm = self.tensor_sum_dim(x2_sq, 2)?; // [B,R]
+                let x1_u = self.tensor_unsqueeze(x1_norm, 2)?; // [B,P,1]
+                let x2_u = self.tensor_unsqueeze(x2_norm, 1)?; // [B,1,R]
+                let target = vec![batch, p_dim, r_dim];
+                let x1_e = self.tensor_expand(x1_u, target.clone())?;
+                let x2_e = self.tensor_expand(x2_u, target)?;
+                (cross, x1_e, x2_e, vec![batch, p_dim, r_dim])
+            } else {
+                // x1 [P,M], x2 [R,M] -> cross [P,R].
+                let x2_t = self.tensor_transpose(x2, 0, 1)?;
+                let cross = self.tensor_matmul(x1, x2_t)?;
+                let x1_norm = self.tensor_sum_dim(x1_sq, 1)?; // [P]
+                let x2_norm = self.tensor_sum_dim(x2_sq, 1)?; // [R]
+                let x1_u = self.tensor_unsqueeze(x1_norm, 1)?; // [P,1]
+                let x2_u = self.tensor_unsqueeze(x2_norm, 0)?; // [1,R]
+                let target = vec![p_dim, r_dim];
+                let x1_e = self.tensor_expand(x1_u, target.clone())?;
+                let x2_e = self.tensor_expand(x2_u, target)?;
+                (cross, x1_e, x2_e, vec![p_dim, r_dim])
+            };
+            let norm_sum = self.tensor_add(x1_norm_b, x2_norm_b)?;
+            let two_cross = self.tensor_mul_scalar(cross, 2.0)?;
+            let d2 = self.tensor_sub(norm_sum, two_cross)?;
+            // Clamp tiny negative round-off to 0 before sqrt (torch does the same).
+            let d2_clamped = self.tensor_clamp_min(d2, 0.0)?;
+            let dist = self.tensor_sqrt(d2_clamped)?;
+            return self.tensor_reshape(dist, out_shape);
+        }
+
+        // No-grad fused fast path for finite p>0 (p≠2) or p=+inf. The autograd
+        // path below materialises the broadcasted [P,R,M] (or [B,P,R,M])
+        // difference and streams ~4 full-size passes (expand/sub/abs/pow/sum)
+        // over it; when no gradient is needed, ft_kernel_cpu::cdist_forward_f64
+        // reduces each (i,j) in ONE pass with no O(P·R·M) intermediate. Same
+        // per-k accumulation order as the broadcast path -> matches to f64
+        // round-off. p=2 already returned via the matmul identity above.
+        let needs_grad = self.tensor_tape.tensor_requires_grad(x1)?
+            || self.tensor_tape.tensor_requires_grad(x2)?;
+        if !needs_grad
+            && m > 0
+            && batch * p_dim * r_dim > 0
+            && (p == f64::INFINITY || (p.is_finite() && p > 0.0))
+        {
+            let x1_vals = self.tensor_values(x1)?;
+            let x2_vals = self.tensor_values(x2)?;
+            let result = ft_kernel_cpu::cdist_forward_f64(
+                &x1_vals, &x2_vals, batch, p_dim, r_dim, m, p,
+            );
+            let out_shape = if batched {
+                vec![batch, p_dim, r_dim]
+            } else {
+                vec![p_dim, r_dim]
+            };
+            return self.tensor_variable(result, out_shape, false);
+        }
+
         // Autograd path for finite p > 0 composes through broadcasted
         // sub + abs + pow + sum_dim + pow. p == +inf uses the same
         // broadcasted difference and reduces through tensor_amax so
@@ -7876,6 +7952,64 @@ impl FrankenTorchSession {
         let n = shape[0];
         let m = shape[1];
         let out_len = n * (n - 1) / 2;
+
+        // Euclidean (p == 2) fast path — same matmul identity as tensor_cdist
+        // (frankentorch-fb6s). The full N×N distance matrix is
+        //     d² = ‖x_i‖² + ‖x_j‖² − 2·x_i·x_jᵀ
+        // where the cross term is one GEMM-routed `input @ inputᵀ`; the i<j
+        // upper triangle is then gathered with a single index_select. This
+        // avoids the [out_len, M] pair-difference tensor the broadcasted path
+        // builds (out_len = N·(N−1)/2 row pairs × M each). Fully autograd-aware
+        // (matmul/sum/clamp/sqrt/index_select record on the tape); for distinct
+        // rows the gradient matches the direct path, and equal rows clamp to an
+        // exact 0 before sqrt. Matches the direct sum to f64 round-off (~1e-12).
+        if p == 2.0 && m > 0 && out_len > 0 {
+            let input_sq = self.tensor_mul(input, input)?;
+            let xnorm = self.tensor_sum_dim(input_sq, 1)?; // [N]
+            let input_t = self.tensor_transpose(input, 0, 1)?; // [M, N]
+            let gram = self.tensor_matmul(input, input_t)?; // [N, N]
+            let xnorm_i = self.tensor_unsqueeze(xnorm, 1)?; // [N, 1]
+            let xnorm_j = self.tensor_unsqueeze(xnorm, 0)?; // [1, N]
+            let target = vec![n, n];
+            let xi_e = self.tensor_expand(xnorm_i, target.clone())?;
+            let xj_e = self.tensor_expand(xnorm_j, target)?;
+            let norm_sum = self.tensor_add(xi_e, xj_e)?;
+            let two_gram = self.tensor_mul_scalar(gram, 2.0)?;
+            let d2 = self.tensor_sub(norm_sum, two_gram)?;
+            let d2_clamped = self.tensor_clamp_min(d2, 0.0)?; // [N, N]
+            let d2_flat = self.tensor_reshape(d2_clamped, vec![n * n])?;
+            // Gather the strict upper triangle (i < j) at flat index i·N + j,
+            // THEN sqrt — so the always-zero diagonal (self-distances) is never
+            // square-rooted, avoiding the 0/0 in sqrt's backward.
+            #[allow(clippy::cast_precision_loss)]
+            let mut tri_idx = Vec::with_capacity(out_len);
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    tri_idx.push((i * n + j) as f64);
+                }
+            }
+            let tri_t = self.tensor_tape.leaf(tri_idx, vec![out_len], false)?;
+            let d2_tri = self.tensor_index_select(d2_flat, 0, tri_t)?; // [out_len]
+            return self.tensor_sqrt(d2_tri);
+        }
+
+        // No-grad fused fast path for finite p>0 (p≠2) or p=+inf. The autograd
+        // path below gathers left/right row pairs and materialises the
+        // [out_len, M] pair-difference tensor (out_len = N·(N-1)/2) through
+        // index_select+sub+abs+pow+sum_dim+pow; with no gradient needed,
+        // ft_kernel_cpu::pdist_forward_f64 streams each pair in ONE pass with no
+        // O(out_len·M) intermediate. Same per-k order -> bit-exact. (p=2 used the
+        // matmul identity above.)
+        let needs_grad = self.tensor_tape.tensor_requires_grad(input)?;
+        if !needs_grad
+            && m > 0
+            && out_len > 0
+            && (p == f64::INFINITY || (p.is_finite() && p > 0.0))
+        {
+            let vals = self.tensor_values(input)?;
+            let result = ft_kernel_cpu::pdist_forward_f64(&vals, n, m, p);
+            return self.tensor_variable(result, vec![out_len], false);
+        }
 
         // For finite p > 0, compose through index_select + sub + abs +
         // pow + sum_dim + pow primitives so gradients flow to the
@@ -8347,6 +8481,7 @@ impl FrankenTorchSession {
         eps: f64,
     ) -> Result<TensorNodeId, AutogradError> {
         // norm = ||input||_p along dim
+        let input_shape = self.tensor_shape(input)?;
         let norm = self.tensor_norm_dim(input, p, dim)?;
         // unsqueeze norm back to original dim for broadcasting
         let norm_unsq = self.tensor_unsqueeze(norm, dim)?;
@@ -8354,7 +8489,14 @@ impl FrankenTorchSession {
         let eps_shape = self.tensor_shape(norm_unsq)?;
         let eps_t = self.full(eps_shape, eps, false)?;
         let denom = self.tensor_maximum(norm_unsq, eps_t)?;
-        self.tensor_div(input, denom)
+        // Broadcast the keepdim norm [.., 1, ..] up to the input shape before
+        // dividing: the elementwise tensor_div does NOT itself broadcast a
+        // size-1 axis in this codebase, so dividing [N, D] by [N, 1] failed with
+        // a ShapeMismatch — silently breaking tensor_normalize for every
+        // [N, D]-along-dim-1 input (cosine_similarity, info_nce_loss, SVD power
+        // iteration). frankentorch-c5g4.
+        let denom_b = self.tensor_expand(denom, input_shape)?;
+        self.tensor_div(input, denom_b)
     }
 
     // ── Loss Functions ───────────────────────────────────────────────────
@@ -15808,6 +15950,128 @@ impl FrankenTorchSession {
         }
         let d_k = query_shape[query_shape.len() - 1];
         let scale_factor = scale.unwrap_or(1.0 / (d_k as f64).sqrt());
+
+        // Fused fast paths (no-grad f64/f32, grad f64): block-row flash-attention
+        // kernels that never materialise the [.., seq, seq] score / scale / softmax
+        // tensors — the same fusion as `scaled_dot_product_attention`, here honoring
+        // the explicit `scale`. Masked / other-dtype / 2-D fall through to op-graph.
+        let sdpa_dtype = self.tensor_dtype(query)?;
+        if key_shape.len() >= 3
+            && query_shape.len() == key_shape.len()
+            && attn_mask.is_none()
+            && !self.tensor_tape.tensor_requires_grad(query)?
+            && !self.tensor_tape.tensor_requires_grad(key)?
+            && !self.tensor_tape.tensor_requires_grad(value)?
+            && (sdpa_dtype == DType::F64 || sdpa_dtype == DType::F32)
+            && self.tensor_dtype(key)? == sdpa_dtype
+            && self.tensor_dtype(value)? == sdpa_dtype
+        {
+            let v_shape = self.tensor_shape(value)?;
+            if v_shape.len() == query_shape.len() {
+                let nd = query_shape.len();
+                let seq_q = query_shape[nd - 2];
+                let d_k_dim = query_shape[nd - 1];
+                let seq_k = key_shape[nd - 2];
+                let d_v = v_shape[nd - 1];
+                let q_bh: usize = query_shape[..nd - 2].iter().product();
+                let k_bh: usize = key_shape[..nd - 2].iter().product();
+                let v_bh: usize = v_shape[..nd - 2].iter().product();
+                if q_bh == k_bh
+                    && q_bh == v_bh
+                    && key_shape[nd - 1] == d_k_dim
+                    && v_shape[nd - 2] == seq_k
+                    && q_bh > 0
+                    && seq_q > 0
+                    && seq_k > 0
+                    && d_k_dim > 0
+                    && d_v > 0
+                {
+                    let mut out_shape = query_shape.clone();
+                    out_shape[nd - 1] = d_v;
+                    if sdpa_dtype == DType::F64 {
+                        let qv = self.tensor_values(query)?;
+                        let kv = self.tensor_values(key)?;
+                        let vv = self.tensor_values(value)?;
+                        let out = ft_kernel_cpu::sdpa_forward_f64(
+                            &qv, &kv, &vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale_factor, is_causal,
+                        );
+                        return self.tensor_variable(out, out_shape, false);
+                    }
+                    let qv = self.tensor_values_f32(query)?;
+                    let kv = self.tensor_values_f32(key)?;
+                    let vv = self.tensor_values_f32(value)?;
+                    let out = ft_kernel_cpu::sdpa_forward_f32(
+                        &qv, &kv, &vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale_factor as f32,
+                        is_causal,
+                    );
+                    return self.tensor_tape.leaf_f32(out, out_shape, false);
+                }
+            }
+        }
+        let grad_needed = self.tensor_tape.tensor_requires_grad(query)?
+            || self.tensor_tape.tensor_requires_grad(key)?
+            || self.tensor_tape.tensor_requires_grad(value)?;
+        if grad_needed
+            && key_shape.len() >= 3
+            && query_shape.len() == key_shape.len()
+            && attn_mask.is_none()
+            && self.tensor_dtype(query)? == DType::F64
+            && self.tensor_dtype(key)? == DType::F64
+            && self.tensor_dtype(value)? == DType::F64
+        {
+            let v_shape = self.tensor_shape(value)?;
+            if v_shape.len() == query_shape.len() {
+                let nd = query_shape.len();
+                let seq_q = query_shape[nd - 2];
+                let d_k_dim = query_shape[nd - 1];
+                let seq_k = key_shape[nd - 2];
+                let d_v = v_shape[nd - 1];
+                let q_bh: usize = query_shape[..nd - 2].iter().product();
+                let k_bh: usize = key_shape[..nd - 2].iter().product();
+                let v_bh: usize = v_shape[..nd - 2].iter().product();
+                if q_bh == k_bh
+                    && q_bh == v_bh
+                    && key_shape[nd - 1] == d_k_dim
+                    && v_shape[nd - 2] == seq_k
+                    && q_bh > 0
+                    && seq_q > 0
+                    && seq_k > 0
+                    && d_k_dim > 0
+                    && d_v > 0
+                {
+                    let (sc, causal) = (scale_factor, is_causal);
+                    let (qsh, ksh, vsh) =
+                        (query_shape.clone(), key_shape.clone(), v_shape.clone());
+                    return self.tensor_apply_function(
+                        &[query, key, value],
+                        move |ctx, ins| {
+                            let (qv, _) = ins[0];
+                            let (kv, _) = ins[1];
+                            let (vv, _) = ins[2];
+                            let out = ft_kernel_cpu::sdpa_forward_f64(
+                                qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, sc, causal,
+                            );
+                            ctx.save_for_backward(qv.to_vec(), qsh.clone());
+                            ctx.save_for_backward(kv.to_vec(), ksh.clone());
+                            ctx.save_for_backward(vv.to_vec(), vsh.clone());
+                            let mut osh = qsh.clone();
+                            osh[nd - 1] = d_v;
+                            Ok((out, osh))
+                        },
+                        move |ctx, grad_outputs| {
+                            let dout = grad_outputs[0];
+                            let saved = ctx.saved_tensors();
+                            let (dq, dk, dv) = ft_kernel_cpu::sdpa_backward_f64(
+                                &saved[0], &saved[1], &saved[2], dout, q_bh, seq_q, seq_k, d_k_dim,
+                                d_v, sc, causal,
+                            );
+                            Ok(vec![Some(dq), Some(dk), Some(dv)])
+                        },
+                    );
+                }
+            }
+        }
+
         let key_t = self.tensor_transpose(key, key_shape.len() - 2, key_shape.len() - 1)?;
         let scores = self.tensor_matmul(query, key_t)?;
         let scores_shape = self.tensor_shape(scores)?;
@@ -15964,45 +16228,23 @@ impl FrankenTorchSession {
             }
         }
 
-        let padded = if padding > 0 {
-            self.tensor_pad(input, &[padding, padding], 0.0)?
-        } else {
-            input
-        };
         let padded_len = input_len + 2 * padding;
         if padded_len < kernel_size {
             return Err(Self::incompatible_tensor_args(
                 "conv1d: input too short for kernel size and padding",
             ));
         }
-
         let output_len = (padded_len - kernel_size) / stride + 1;
-        let patch_width = in_channels * kernel_size;
-        let mut patches = Vec::with_capacity(output_len);
-        for out_index in 0..output_len {
-            let start = out_index * stride;
-            let patch = self.tensor_narrow(padded, 2, start, kernel_size)?;
-            let flat = self.tensor_reshape(patch, vec![batch_size, 1, patch_width])?;
-            patches.push(flat);
-        }
 
-        let unfolded = self.tensor_cat(&patches, 1)?;
-        let weight_flat = self.tensor_reshape(weight, vec![out_channels, patch_width])?;
-        let weight_t = self.tensor_transpose(weight_flat, 0, 1)?;
-        let weight_us = self.tensor_unsqueeze(weight_t, 0)?;
-        let weight_expanded =
-            self.tensor_expand(weight_us, vec![batch_size, patch_width, out_channels])?;
-        let output = self.tensor_bmm(unfolded, weight_expanded)?;
-        let output = self.tensor_transpose(output, 1, 2)?;
-
-        match bias {
-            Some(bias) => {
-                let bias = self.tensor_reshape(bias, vec![1, out_channels, 1])?;
-                let bias = self.tensor_expand(bias, vec![batch_size, out_channels, output_len])?;
-                self.tensor_add(output, bias)
-            }
-            None => Ok(output),
-        }
+        // conv1d [N, C, L] is conv2d [N, C, 1, L] with a height-1 kernel. Route
+        // through the fully-fused conv2d path (no-grad im2col + grad col2im) instead
+        // of the per-output narrow/cat/bmm composed path — inheriting both wins.
+        let input_4d = self.tensor_reshape(input, vec![batch_size, in_channels, 1, input_len])?;
+        let weight_4d =
+            self.tensor_reshape(weight, vec![out_channels, in_channels, 1, kernel_size])?;
+        let output_4d =
+            self.functional_conv2d(input_4d, weight_4d, bias, (1, stride), (0, padding))?;
+        self.tensor_reshape(output_4d, vec![batch_size, out_channels, output_len])
     }
 
     /// Apply a 2D convolution.
@@ -16116,6 +16358,79 @@ impl FrankenTorchSession {
         };
 
         if !input_requires_grad && !weight_requires_grad && !bias_requires_grad {
+            // F64 no-grad: route through the SAME fused conv2d_forward_f64 kernel
+            // the grad path uses (parallel im2col + dgemm_bt + parallel reorg)
+            // instead of the SERIAL 6-deep manual im2col gather + tensor_matmul
+            // (which materialises weight^T) below. Bit-identical to the grad
+            // path's forward; the old serial gather made no-grad conv2d ~5-8x
+            // slower than the GEMM alone. frankentorch-conv2d-nograd.
+            if self.tensor_dtype(input)? == DType::F64
+                && self.tensor_dtype(weight)? == DType::F64
+                && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F64))?
+            {
+                let pv = self.tensor_values(padded)?;
+                let wv = self.tensor_values(weight)?;
+                let bv = match bias {
+                    Some(b) => Some(self.tensor_values(b)?),
+                    None => None,
+                };
+                let out = ft_kernel_cpu::conv2d_forward_f64(
+                    &pv,
+                    &wv,
+                    bv.as_deref(),
+                    batch_size,
+                    in_channels,
+                    padded_h,
+                    padded_w,
+                    kernel_h,
+                    kernel_w,
+                    output_h,
+                    output_w,
+                    stride_h,
+                    stride_w,
+                    out_channels,
+                );
+                return self.tensor_variable(
+                    out,
+                    vec![batch_size, out_channels, output_h, output_w],
+                    false,
+                );
+            }
+            // F32 no-grad: same fused kernel via sgemm_bt (conv2d_forward_f32),
+            // replacing the SERIAL 6-deep im2col gather + tensor_matmul below for
+            // f32 — the dominant ML dtype. Bit-identical to that path's GEMM.
+            if self.tensor_dtype(input)? == DType::F32
+                && self.tensor_dtype(weight)? == DType::F32
+                && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F32))?
+            {
+                let pv = self.tensor_values_f32(padded)?;
+                let wv = self.tensor_values_f32(weight)?;
+                let bv = match bias {
+                    Some(b) => Some(self.tensor_values_f32(b)?),
+                    None => None,
+                };
+                let out = ft_kernel_cpu::conv2d_forward_f32(
+                    &pv,
+                    &wv,
+                    bv.as_deref(),
+                    batch_size,
+                    in_channels,
+                    padded_h,
+                    padded_w,
+                    kernel_h,
+                    kernel_w,
+                    output_h,
+                    output_w,
+                    stride_h,
+                    stride_w,
+                    out_channels,
+                );
+                return self.tensor_variable_f32(
+                    out,
+                    vec![batch_size, out_channels, output_h, output_w],
+                    false,
+                );
+            }
             let panel_len =
                 Self::checked_mul(flat_patch_count, patch_width, "conv2d im2col size overflow")?;
             let padded_data = self.tensor_values(padded)?;
@@ -16365,6 +16680,103 @@ impl FrankenTorchSession {
         let hw_out = Self::checked_mul(output_h, output_w, "conv3d patch count overflow")?;
         let patch_count = Self::checked_mul(output_d, hw_out, "conv3d patch count overflow")?;
 
+        // Fused fast paths (f64): native-layout 3-D im2col/col2im instead of the
+        // output_d*output_h*output_w narrow/cat/bmm composed path. No-grad returns
+        // a leaf; grad routes a custom autograd op on the PADDED input (tensor_pad's
+        // backward un-pads dpadded -> dinput). Non-f64 falls through.
+        let in_grad = self.tensor_tape.tensor_requires_grad(input)?;
+        let w_grad = self.tensor_tape.tensor_requires_grad(weight)?;
+        let b_grad = match bias {
+            Some(b) => self.tensor_tape.tensor_requires_grad(b)?,
+            None => false,
+        };
+        let all_f64 = self.tensor_dtype(input)? == DType::F64
+            && self.tensor_dtype(weight)? == DType::F64
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F64))?;
+        if all_f64 {
+            let out_shape = vec![batch_size, out_channels, output_d, output_h, output_w];
+            if !in_grad && !w_grad && !b_grad {
+                let pv = self.tensor_values(padded)?;
+                let wv = self.tensor_values(weight)?;
+                let bv = match bias {
+                    Some(b) => Some(self.tensor_values(b)?),
+                    None => None,
+                };
+                let out = ft_kernel_cpu::conv3d_forward_f64(
+                    &pv, &wv, bv.as_deref(), batch_size, in_channels, padded_d, padded_h, padded_w,
+                    kernel_d, kernel_h, kernel_w, output_d, output_h, output_w, stride_d, stride_h,
+                    stride_w, out_channels,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            let has_bias = bias.is_some();
+            let (b_, ic, pd_, ph_, pw_) = (batch_size, in_channels, padded_d, padded_h, padded_w);
+            let (kd_, kh_, kw_) = (kernel_d, kernel_h, kernel_w);
+            let (od_, oh_, ow_) = (output_d, output_h, output_w);
+            let (sd_, sh_, sw_, oc, pwid) =
+                (stride_d, stride_h, stride_w, out_channels, patch_width);
+            let mut inputs = vec![padded, weight];
+            if let Some(b) = bias {
+                inputs.push(b);
+            }
+            return self.tensor_apply_function(
+                &inputs,
+                move |ctx, ins| {
+                    let (pv, _) = ins[0];
+                    let (wv, _) = ins[1];
+                    let bv = if has_bias { Some(ins[2].0) } else { None };
+                    let out = ft_kernel_cpu::conv3d_forward_f64(
+                        pv, wv, bv, b_, ic, pd_, ph_, pw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_,
+                        sw_, oc,
+                    );
+                    ctx.save_for_backward(pv.to_vec(), vec![b_, ic, pd_, ph_, pw_]);
+                    ctx.save_for_backward(wv.to_vec(), vec![oc, pwid]);
+                    Ok((out, vec![b_, oc, od_, oh_, ow_]))
+                },
+                move |ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let s = ctx.saved_tensors();
+                    let (dpadded, dweight, dbias) = ft_kernel_cpu::conv3d_backward_f64(
+                        dout, &s[0], &s[1], b_, ic, pd_, ph_, pw_, kd_, kh_, kw_, od_, oh_, ow_, sd_,
+                        sh_, sw_, oc, has_bias,
+                    );
+                    let mut g = vec![Some(dpadded), Some(dweight)];
+                    if has_bias {
+                        g.push(Some(dbias.unwrap()));
+                    }
+                    Ok(g)
+                },
+            );
+        }
+
+        // F32 no-grad fused fast path (dominant ML dtype; video/3D CNNs): the same
+        // im2col + sgemm_bt kernel via conv3d_forward_f32, replacing the
+        // O(output_d*output_h*output_w) narrow/cat/bmm op-graph below.
+        if self.tensor_dtype(input)? == DType::F32
+            && self.tensor_dtype(weight)? == DType::F32
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F32))?
+            && !in_grad
+            && !w_grad
+            && !b_grad
+        {
+            let pv = self.tensor_values_f32(padded)?;
+            let wv = self.tensor_values_f32(weight)?;
+            let bv = match bias {
+                Some(b) => Some(self.tensor_values_f32(b)?),
+                None => None,
+            };
+            let out = ft_kernel_cpu::conv3d_forward_f32(
+                &pv, &wv, bv.as_deref(), batch_size, in_channels, padded_d, padded_h, padded_w,
+                kernel_d, kernel_h, kernel_w, output_d, output_h, output_w, stride_d, stride_h,
+                stride_w, out_channels,
+            );
+            return self.tensor_variable_f32(
+                out,
+                vec![batch_size, out_channels, output_d, output_h, output_w],
+                false,
+            );
+        }
+
         let mut patches = Vec::with_capacity(patch_count);
         for out_d in 0..output_d {
             let depth_start = Self::checked_mul(out_d, stride_d, "conv3d depth start overflow")?;
@@ -16490,52 +16902,21 @@ impl FrankenTorchSession {
             },
         )?;
 
-        // Compose via tensor_narrow + tensor_matmul + tensor_pad +
-        // tensor_add so gradients flow back to input and weight.
-        // Tracked under frankentorch-zjf6. Previously the body ran
-        // the transposed convolution in plain f64 and rebuilt a
-        // non-grad leaf, severing autograd through every F.conv_t1d
-        // call (U-Net decoders, GANs, segmentation upsamplers).
-        //
-        // Mirrors the ConvTranspose1d nn.Module composition:
-        // for each kernel position k, for each input position i,
-        // contribute x[:, :, i] @ w[:, :, k] at output position
-        // i*stride + k - padding. Implemented via narrow + matmul
-        // + pad + accumulating add.
-        let result_shape = vec![batch_size, out_channels, output_l];
-        let mut result = if self.tensor_dtype(input)? == DType::F32 {
-            self.zeros_f32(result_shape, false)?
-        } else {
-            self.zeros(result_shape, false)?
-        };
-        for k in 0..kernel_l {
-            let w_k = self.tensor_narrow(weight, 2, k, 1)?;
-            let w_k = self.tensor_squeeze(w_k, 2)?; // [in_channels, out_channels]
-            for il in 0..input_l {
-                let out_pos_raw = il * stride + k;
-                if out_pos_raw < padding || out_pos_raw - padding >= output_l {
-                    continue;
-                }
-                let out_pos = out_pos_raw - padding;
-                let x_i = self.tensor_narrow(input, 2, il, 1)?;
-                let x_i = self.tensor_squeeze(x_i, 2)?; // [batch, in_channels]
-                let contrib = self.tensor_matmul(x_i, w_k)?; // [batch, out_channels]
-                let contrib = self.tensor_unsqueeze(contrib, 2)?; // [batch, out_channels, 1]
-                let pad_left = out_pos;
-                let pad_right = output_l - out_pos - 1;
-                let contrib_padded = self.tensor_pad(contrib, &[pad_left, pad_right], 0.0)?;
-                result = self.tensor_add(result, contrib_padded)?;
-            }
-        }
-
-        match bias {
-            Some(bias) => {
-                let bias = self.tensor_reshape(bias, vec![1, out_channels, 1])?;
-                let bias = self.tensor_expand(bias, vec![batch_size, out_channels, output_l])?;
-                self.tensor_add(result, bias)
-            }
-            None => Ok(result),
-        }
+        // conv_transpose1d [N,C,L] is conv_transpose2d [N,C,1,L] with a height-1
+        // kernel. Route through the fully-fused conv_transpose2d (direct kernel,
+        // no-grad + grad) instead of the per-(k,i) narrow/matmul/pad(full)/add loop.
+        let input_4d = self.tensor_reshape(input, vec![batch_size, in_channels, 1, input_l])?;
+        let weight_4d =
+            self.tensor_reshape(weight, vec![in_channels, out_channels, 1, kernel_l])?;
+        let output_4d = self.functional_conv_transpose2d(
+            input_4d,
+            weight_4d,
+            bias,
+            (1, stride),
+            (0, padding),
+            (0, output_padding),
+        )?;
+        self.tensor_reshape(output_4d, vec![batch_size, out_channels, output_l])
     }
 
     /// Apply 2D transposed convolution. Alias for `functional_conv_transpose2d`.
@@ -16640,6 +17021,94 @@ impl FrankenTorchSession {
                 underflow: "conv_transpose2d: output width underflow from padding",
             },
         )?;
+
+        // Fused fast paths (f64): a direct conv_transpose2d kernel instead of the
+        // kh*kw*ih*iw narrow/matmul/pad(full-output)/add composed loop. No-grad
+        // returns a leaf; grad routes a custom autograd op. Non-f64 falls through.
+        let ct_in_grad = self.tensor_tape.tensor_requires_grad(input)?;
+        let ct_w_grad = self.tensor_tape.tensor_requires_grad(weight)?;
+        let ct_b_grad = match bias {
+            Some(b) => self.tensor_tape.tensor_requires_grad(b)?,
+            None => false,
+        };
+        let ct_f64 = self.tensor_dtype(input)? == DType::F64
+            && self.tensor_dtype(weight)? == DType::F64
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F64))?;
+        if ct_f64 {
+            let out_shape = vec![batch_size, out_channels, output_h, output_w];
+            if !ct_in_grad && !ct_w_grad && !ct_b_grad {
+                let iv = self.tensor_values(input)?;
+                let wv = self.tensor_values(weight)?;
+                let bv = match bias {
+                    Some(b) => Some(self.tensor_values(b)?),
+                    None => None,
+                };
+                let out = ft_kernel_cpu::conv_transpose2d_forward_f64(
+                    &iv, &wv, bv.as_deref(), batch_size, in_channels, input_h, input_w, out_channels,
+                    kernel_h, kernel_w, output_h, output_w, stride_h, stride_w, padding_h, padding_w,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            let has_bias = bias.is_some();
+            let (b_, ic, ih_, iw_, oc_) = (batch_size, in_channels, input_h, input_w, out_channels);
+            let (kh_, kw_, oh_, ow_) = (kernel_h, kernel_w, output_h, output_w);
+            let (sh_, sw_, ph_, pw_) = (stride_h, stride_w, padding_h, padding_w);
+            let mut inputs = vec![input, weight];
+            if let Some(b) = bias {
+                inputs.push(b);
+            }
+            return self.tensor_apply_function(
+                &inputs,
+                move |ctx, ins| {
+                    let (iv, _) = ins[0];
+                    let (wv, _) = ins[1];
+                    let bv = if has_bias { Some(ins[2].0) } else { None };
+                    let out = ft_kernel_cpu::conv_transpose2d_forward_f64(
+                        iv, wv, bv, b_, ic, ih_, iw_, oc_, kh_, kw_, oh_, ow_, sh_, sw_, ph_, pw_,
+                    );
+                    ctx.save_for_backward(iv.to_vec(), vec![b_, ic, ih_, iw_]);
+                    ctx.save_for_backward(wv.to_vec(), vec![ic, oc_, kh_, kw_]);
+                    Ok((out, vec![b_, oc_, oh_, ow_]))
+                },
+                move |ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let s = ctx.saved_tensors();
+                    let (di, dw, db) = ft_kernel_cpu::conv_transpose2d_backward_f64(
+                        dout, &s[0], &s[1], b_, ic, ih_, iw_, oc_, kh_, kw_, oh_, ow_, sh_, sw_, ph_,
+                        pw_, has_bias,
+                    );
+                    let mut g = vec![Some(di), Some(dw)];
+                    if has_bias {
+                        g.push(Some(db.unwrap()));
+                    }
+                    Ok(g)
+                },
+            );
+        }
+
+        // F32 no-grad fused fast path (dominant ML dtype; every GAN/U-Net decoder):
+        // the per-output gather kernel via conv_transpose2d_forward_f32, replacing
+        // the O(kh*kw*ih) narrow/matmul/pad/add op-graph scatter below.
+        let ct_f32 = self.tensor_dtype(input)? == DType::F32
+            && self.tensor_dtype(weight)? == DType::F32
+            && bias.map_or(Ok(true), |b| self.tensor_dtype(b).map(|d| d == DType::F32))?;
+        if ct_f32 && !ct_in_grad && !ct_w_grad && !ct_b_grad {
+            let iv = self.tensor_values_f32(input)?;
+            let wv = self.tensor_values_f32(weight)?;
+            let bv = match bias {
+                Some(b) => Some(self.tensor_values_f32(b)?),
+                None => None,
+            };
+            let out = ft_kernel_cpu::conv_transpose2d_forward_f32(
+                &iv, &wv, bv.as_deref(), batch_size, in_channels, input_h, input_w, out_channels,
+                kernel_h, kernel_w, output_h, output_w, stride_h, stride_w, padding_h, padding_w,
+            );
+            return self.tensor_variable_f32(
+                out,
+                vec![batch_size, out_channels, output_h, output_w],
+                false,
+            );
+        }
 
         // Compose via tensor_narrow + tensor_matmul + tensor_pad +
         // tensor_add so gradients flow back to input and weight.
@@ -16779,15 +17248,19 @@ impl FrankenTorchSession {
         let output_len =
             Self::validate_pool1d_output_len(input_shape[2], kernel_size, stride, "avg_pool1d")?;
 
-        let mut slices = Vec::with_capacity(output_len);
-        for out_index in 0..output_len {
-            let start = out_index * stride;
-            let patch = self.tensor_narrow(input, 2, start, kernel_size)?;
-            let avg = self.tensor_mean_dim(patch, 2)?;
-            let avg = self.tensor_unsqueeze(avg, 2)?;
-            slices.push(avg);
-        }
-        self.tensor_cat(&slices, 2)
+        // avg_pool1d [N,C,L] is avg_pool2d [N,C,1,L] (height-1 window). Route through
+        // the fused avg_pool2d (windowed-mean kernel) instead of the narrow/mean/cat loop.
+        let (n, ch, l) = (input_shape[0], input_shape[1], input_shape[2]);
+        let input_4d = self.tensor_reshape(input, vec![n, ch, 1, l])?;
+        let out_4d = self.functional_avg_pool2d(
+            input_4d,
+            (1, kernel_size),
+            (1, stride),
+            (0, 0),
+            false,
+            true,
+        )?;
+        self.tensor_reshape(out_4d, vec![n, ch, output_len])
     }
 
     /// Apply 1D max pooling over `[N, C, L]`.
@@ -16813,15 +17286,12 @@ impl FrankenTorchSession {
         let output_len =
             Self::validate_pool1d_output_len(input_shape[2], kernel_size, stride, "max_pool1d")?;
 
-        let mut slices = Vec::with_capacity(output_len);
-        for out_index in 0..output_len {
-            let start = out_index * stride;
-            let patch = self.tensor_narrow(input, 2, start, kernel_size)?;
-            let (max_vals, _) = self.tensor_max_dim(patch, 2)?;
-            let max_vals = self.tensor_unsqueeze(max_vals, 2)?;
-            slices.push(max_vals);
-        }
-        self.tensor_cat(&slices, 2)
+        // max_pool1d [N,C,L] is max_pool2d [N,C,1,L] (height-1 window). Route through
+        // the fused max_pool2d (windowed-max kernel) instead of the narrow/max/cat loop.
+        let (n, ch, l) = (input_shape[0], input_shape[1], input_shape[2]);
+        let input_4d = self.tensor_reshape(input, vec![n, ch, 1, l])?;
+        let out_4d = self.functional_max_pool2d(input_4d, (1, kernel_size), (1, stride))?;
+        self.tensor_reshape(out_4d, vec![n, ch, output_len])
     }
 
     /// Apply 2D max pooling over `[N, C, H, W]`.
@@ -16868,6 +17338,60 @@ impl FrankenTorchSession {
             "max_pool2d flattened channels overflow",
         )?;
         let patch_count = Self::checked_mul(output_h, output_w, "max_pool2d patch count overflow")?;
+
+        // Fused fast paths (f64): one windowed-max pass instead of the
+        // output_h*output_w narrow/max_dim/cat composed path. No-grad returns a
+        // leaf; grad routes a custom autograd op (backward scatters to the argmax).
+        if self.tensor_dtype(input)? == DType::F64 {
+            let out_shape = vec![batch_size, channels, output_h, output_w];
+            if !self.tensor_tape.tensor_requires_grad(input)? {
+                let iv = self.tensor_values(input)?;
+                let out = ft_kernel_cpu::max_pool2d_forward_f64(
+                    &iv, batch_size, channels, input_h, input_w, kernel_h, kernel_w, output_h,
+                    output_w, stride_h, stride_w,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            let (b_, ch_, ih_, iw_) = (batch_size, channels, input_h, input_w);
+            let (kh_, kw_, oh_, ow_, sh_, sw_) =
+                (kernel_h, kernel_w, output_h, output_w, stride_h, stride_w);
+            return self.tensor_apply_function(
+                &[input],
+                move |ctx, ins| {
+                    let (iv, _) = ins[0];
+                    let out = ft_kernel_cpu::max_pool2d_forward_f64(
+                        iv, b_, ch_, ih_, iw_, kh_, kw_, oh_, ow_, sh_, sw_,
+                    );
+                    ctx.save_for_backward(iv.to_vec(), vec![b_, ch_, ih_, iw_]);
+                    Ok((out, vec![b_, ch_, oh_, ow_]))
+                },
+                move |ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let s = ctx.saved_tensors();
+                    let di = ft_kernel_cpu::max_pool2d_backward_f64(
+                        dout, &s[0], b_, ch_, ih_, iw_, kh_, kw_, oh_, ow_, sh_, sw_,
+                    );
+                    Ok(vec![Some(di)])
+                },
+            );
+        }
+
+        // F32 no-grad fused fast path (dominant ML dtype): same windowed-max kernel
+        // via max_pool2d_forward_f32, replacing the f32 op-graph (narrow/amax/cat)
+        // which also upcast to f64.
+        if self.tensor_dtype(input)? == DType::F32 && !self.tensor_tape.tensor_requires_grad(input)? {
+            let iv = self.tensor_values_f32(input)?;
+            let out = ft_kernel_cpu::max_pool2d_forward_f32(
+                &iv, batch_size, channels, input_h, input_w, kernel_h, kernel_w, output_h,
+                output_w, stride_h, stride_w,
+            );
+            return self.tensor_variable_f32(
+                out,
+                vec![batch_size, channels, output_h, output_w],
+                false,
+            );
+        }
+
         let mut patches = Vec::with_capacity(patch_count);
         for out_h in 0..output_h {
             let row_start = Self::checked_mul(out_h, stride_h, "max_pool2d row start overflow")?;
@@ -16971,6 +17495,75 @@ impl FrankenTorchSession {
             "avg_pool2d flattened channels overflow",
         )?;
         let patch_count = Self::checked_mul(output_h, output_w, "avg_pool2d patch count overflow")?;
+
+        // Fused fast paths (f64): one windowed-mean pass over the padded input
+        // instead of the output_h*output_w narrow/sum/div/cat composed path. The
+        // backward distributes dout/divisor (geometry-only — no saved input). The
+        // custom op operates on the PADDED input; tensor_pad's backward un-pads.
+        if self.tensor_dtype(input)? == DType::F64 {
+            let out_shape = vec![batch_size, channels, output_h, output_w];
+            let cip = count_include_pad;
+            let (b_, ch_, ph_, pw_) = (batch_size, channels, padded_h, padded_w);
+            let (kh_, kw_, oh_, ow_, sh_, sw_) =
+                (kernel_h, kernel_w, output_h, output_w, stride_h, stride_w);
+            let (pdh, pdw, ih_, iw_) = (padding_h, padding_w, input_h, input_w);
+            if !self.tensor_tape.tensor_requires_grad(input)? {
+                let pv = self.tensor_values(padded)?;
+                let out = ft_kernel_cpu::avg_pool2d_forward_f64(
+                    &pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            return self.tensor_apply_function(
+                &[padded],
+                move |_ctx, ins| {
+                    let (pv, _) = ins[0];
+                    let out = ft_kernel_cpu::avg_pool2d_forward_f64(
+                        pv, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_, cip,
+                    );
+                    Ok((out, vec![b_, ch_, oh_, ow_]))
+                },
+                move |_ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let dp = ft_kernel_cpu::avg_pool2d_backward_f64(
+                        dout, b_, ch_, ph_, pw_, kh_, kw_, oh_, ow_, sh_, sw_, pdh, pdw, ih_, iw_,
+                        cip,
+                    );
+                    Ok(vec![Some(dp)])
+                },
+            );
+        }
+
+        // F32 no-grad fused fast path (dominant ML dtype): same windowed-mean
+        // kernel via avg_pool2d_forward_f32, replacing the f32 op-graph
+        // (narrow/sum/div/cat) which also upcast to f64.
+        if self.tensor_dtype(input)? == DType::F32 && !self.tensor_tape.tensor_requires_grad(input)? {
+            let pv = self.tensor_values_f32(padded)?;
+            let out = ft_kernel_cpu::avg_pool2d_forward_f32(
+                &pv,
+                batch_size,
+                channels,
+                padded_h,
+                padded_w,
+                kernel_h,
+                kernel_w,
+                output_h,
+                output_w,
+                stride_h,
+                stride_w,
+                padding_h,
+                padding_w,
+                input_h,
+                input_w,
+                count_include_pad,
+            );
+            return self.tensor_variable_f32(
+                out,
+                vec![batch_size, channels, output_h, output_w],
+                false,
+            );
+        }
+
         let mut patches = Vec::with_capacity(patch_count);
         for out_h in 0..output_h {
             let row_start = Self::checked_mul(out_h, stride_h, "avg_pool2d row start overflow")?;
@@ -17084,6 +17677,61 @@ impl FrankenTorchSession {
             &[output_d, output_h, output_w],
             "max_pool3d patch count overflow",
         )?;
+
+        // Fused fast paths (f64): one windowed-max pass instead of the
+        // output_d*output_h*output_w narrow/max_dim/cat composed path.
+        if self.tensor_dtype(input)? == DType::F64 {
+            let out_shape = vec![batch_size, channels, output_d, output_h, output_w];
+            let (b_, ch_, id_, ih_, iw_) =
+                (batch_size, channels, input_d, input_h, input_w);
+            let (kd_, kh_, kw_) = (kernel_d, kernel_h, kernel_w);
+            let (od_, oh_, ow_) = (output_d, output_h, output_w);
+            let (sd_, sh_, sw_) = (stride_d, stride_h, stride_w);
+            if !self.tensor_tape.tensor_requires_grad(input)? {
+                let iv = self.tensor_values(input)?;
+                let out = ft_kernel_cpu::max_pool3d_forward_f64(
+                    &iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
+                );
+                return self.tensor_variable(out, out_shape, false);
+            }
+            return self.tensor_apply_function(
+                &[input],
+                move |ctx, ins| {
+                    let (iv, _) = ins[0];
+                    let out = ft_kernel_cpu::max_pool3d_forward_f64(
+                        iv, b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_, sw_,
+                    );
+                    ctx.save_for_backward(iv.to_vec(), vec![b_, ch_, id_, ih_, iw_]);
+                    Ok((out, vec![b_, ch_, od_, oh_, ow_]))
+                },
+                move |ctx, grad_outputs| {
+                    let dout = grad_outputs[0];
+                    let s = ctx.saved_tensors();
+                    let di = ft_kernel_cpu::max_pool3d_backward_f64(
+                        dout, &s[0], b_, ch_, id_, ih_, iw_, kd_, kh_, kw_, od_, oh_, ow_, sd_, sh_,
+                        sw_,
+                    );
+                    Ok(vec![Some(di)])
+                },
+            );
+        }
+
+        // F32 no-grad fused fast path (dominant ML dtype; video/3D CNNs): the same
+        // windowed-max kernel via max_pool3d_forward_f32, replacing the
+        // O(od*oh*ow) narrow/amax/cat op-graph below.
+        if self.tensor_dtype(input)? == DType::F32 && !self.tensor_tape.tensor_requires_grad(input)? {
+            let iv = self.tensor_values_f32(input)?;
+            let out = ft_kernel_cpu::max_pool3d_forward_f32(
+                &iv, batch_size, channels, input_d, input_h, input_w, kernel_d, kernel_h, kernel_w,
+                output_d, output_h, output_w, stride_d, stride_h, stride_w,
+            );
+            return self.tensor_variable_f32(
+                out,
+                vec![batch_size, channels, output_d, output_h, output_w],
+                false,
+            );
+        }
+
         let mut patches = Vec::with_capacity(patch_count);
         for out_d in 0..output_d {
             let depth_start =
@@ -18610,6 +19258,45 @@ impl FrankenTorchSession {
             return self.tensor_variable(out, input_shape, false);
         }
 
+        // F32 no-grad fused fast path (dominant ML dtype): same streaming kernel
+        // via layer_norm_forward_f32, replacing the f32 op-graph (mean_dim/sub/var/
+        // rsqrt/affine, ~14 full-size nodes) the f32 path fell through to.
+        let w_f32 = match weight {
+            Some(w) => self.tensor_dtype(w)? == DType::F32,
+            None => true,
+        };
+        let b_f32 = match bias {
+            Some(b) => self.tensor_dtype(b)? == DType::F32,
+            None => true,
+        };
+        if !self.tensor_tape.tensor_requires_grad(input)?
+            && !w_grad
+            && !b_grad
+            && self.tensor_dtype(input)? == DType::F32
+            && w_f32
+            && b_f32
+        {
+            let x = self.tensor_values_f32(input)?;
+            let wv = match weight {
+                Some(w) => Some(self.tensor_values_f32(w)?),
+                None => None,
+            };
+            let bv = match bias {
+                Some(b) => Some(self.tensor_values_f32(b)?),
+                None => None,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let out = ft_kernel_cpu::layer_norm_forward_f32(
+                &x,
+                wv.as_deref(),
+                bv.as_deref(),
+                batch_numel,
+                normalized_numel,
+                eps as f32,
+            );
+            return self.tensor_variable_f32(out, input_shape, false);
+        }
+
         // Fused GRAD fast path (f64, affine weight+bias present): a custom autograd
         // op whose forward is the fused kernel and whose backward
         // (layer_norm_backward_f64) emits dx/dweight/dbias directly — no op-graph
@@ -18630,7 +19317,7 @@ impl FrankenTorchSession {
                         let (xv, _) = ins[0];
                         let (wv, _) = ins[1];
                         let (bv, _) = ins[2];
-                        let out = ft_kernel_cpu::layer_norm_forward_f64(
+                        let (out, means, rstds) = ft_kernel_cpu::layer_norm_forward_with_stats_f64(
                             xv,
                             Some(wv),
                             Some(bv),
@@ -18640,13 +19327,15 @@ impl FrankenTorchSession {
                         );
                         ctx.save_for_backward(xv.to_vec(), vec![bn, nn]);
                         ctx.save_for_backward(wv.to_vec(), vec![nn]);
+                        ctx.save_for_backward(means, vec![bn]);
+                        ctx.save_for_backward(rstds, vec![bn]);
                         Ok((out, ishape.clone()))
                     },
                     move |ctx, grad_outputs| {
                         let dy = grad_outputs[0];
                         let saved = ctx.saved_tensors();
-                        let (dx, dw, db) = ft_kernel_cpu::layer_norm_backward_f64(
-                            dy, &saved[0], &saved[1], bn, nn, eps_c,
+                        let (dx, dw, db) = ft_kernel_cpu::layer_norm_backward_with_stats_f64(
+                            dy, &saved[0], &saved[1], &saved[2], &saved[3], bn, nn,
                         );
                         Ok(vec![Some(dx), Some(dw), Some(db)])
                     },
@@ -18777,6 +19466,32 @@ impl FrankenTorchSession {
                 eps,
             );
             return self.tensor_variable(out, input_shape, false);
+        }
+        // F32 no-grad fused fast path (dominant ML dtype): same streaming kernel
+        // via rms_norm_forward_f32. The f32 op-graph also upcast to f64.
+        let w_f32 = match weight {
+            Some(w) => self.tensor_dtype(w)? == DType::F32,
+            None => true,
+        };
+        if !self.tensor_tape.tensor_requires_grad(input)?
+            && !w_grad
+            && self.tensor_dtype(input)? == DType::F32
+            && w_f32
+        {
+            let x = self.tensor_values_f32(input)?;
+            let wv = match weight {
+                Some(w) => Some(self.tensor_values_f32(w)?),
+                None => None,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let out = ft_kernel_cpu::rms_norm_forward_f32(
+                &x,
+                wv.as_deref(),
+                batch_numel,
+                normalized_numel,
+                eps as f32,
+            );
+            return self.tensor_variable_f32(out, input_shape, false);
         }
         if (self.tensor_tape.tensor_requires_grad(input)? || w_grad) && input_f64 && w_f64 {
             let (bn, nn, eps_c) = (batch_numel, normalized_numel, eps);
@@ -19126,6 +19841,45 @@ impl FrankenTorchSession {
             );
             return self.tensor_variable(out, input_shape, false);
         }
+        // F32 no-grad fused fast path (dominant ML dtype): same streaming kernel
+        // via group_norm_forward_f32. The f32 op-graph also upcast to f64.
+        let w_f32 = match weight {
+            Some(w) => self.tensor_dtype(w)? == DType::F32,
+            None => true,
+        };
+        let b_f32 = match bias {
+            Some(b) => self.tensor_dtype(b)? == DType::F32,
+            None => true,
+        };
+        if !self.tensor_tape.tensor_requires_grad(input)?
+            && !w_grad
+            && !b_grad
+            && self.tensor_dtype(input)? == DType::F32
+            && w_f32
+            && b_f32
+        {
+            let x = self.tensor_values_f32(input)?;
+            let wv = match weight {
+                Some(w) => Some(self.tensor_values_f32(w)?),
+                None => None,
+            };
+            let bv = match bias {
+                Some(b) => Some(self.tensor_values_f32(b)?),
+                None => None,
+            };
+            #[allow(clippy::cast_possible_truncation)]
+            let out = ft_kernel_cpu::group_norm_forward_f32(
+                &x,
+                wv.as_deref(),
+                bv.as_deref(),
+                batch_size,
+                num_groups,
+                channels_per_group,
+                spatial,
+                eps as f32,
+            );
+            return self.tensor_variable_f32(out, input_shape, false);
+        }
         if let (Some(w), Some(bs)) = (weight, bias) {
             if (self.tensor_tape.tensor_requires_grad(input)? || w_grad || b_grad)
                 && input_f64
@@ -19431,6 +20185,83 @@ impl FrankenTorchSession {
                 &x, &rmv, &rvv, wv.as_deref(), bv.as_deref(), batch_size, channels, spatial, eps,
             );
             let out_t = self.tensor_variable(out, input_shape.to_vec(), false)?;
+            return Ok(Some((out_t, None, None)));
+        }
+
+        // F32 no-grad fused fast path (dominant ML dtype): same stats+apply kernels
+        // and momentum running-stat updates as the f64 block above, in f32. The f32
+        // op-graph path also upcast to f64.
+        let wf32 = weight.map_or(Ok(true), |t| self.tensor_dtype(t).map(|d| d == DType::F32))?;
+        let bf32 = bias.map_or(Ok(true), |t| self.tensor_dtype(t).map(|d| d == DType::F32))?;
+        let rm_f32 = running_mean.map_or(Ok(true), |t| self.tensor_dtype(t).map(|d| d == DType::F32))?;
+        let rv_f32 = running_var.map_or(Ok(true), |t| self.tensor_dtype(t).map(|d| d == DType::F32))?;
+        if !bn_grad
+            && self.tensor_dtype(input)? == DType::F32
+            && wf32
+            && bf32
+            && rm_f32
+            && rv_f32
+            && (training || (running_mean.is_some() && running_var.is_some()))
+        {
+            #[allow(clippy::cast_possible_truncation)]
+            let eps32 = eps as f32;
+            let x = self.tensor_values_f32(input)?;
+            let wv = match weight {
+                Some(w) => Some(self.tensor_values_f32(w)?),
+                None => None,
+            };
+            let bv = match bias {
+                Some(b) => Some(self.tensor_values_f32(b)?),
+                None => None,
+            };
+            if training {
+                let (mean, var) =
+                    ft_kernel_cpu::batch_norm_stats_f32(&x, batch_size, channels, spatial);
+                let out = ft_kernel_cpu::batch_norm_apply_f32(
+                    &x, &mean, &var, wv.as_deref(), bv.as_deref(), batch_size, channels, spatial,
+                    eps32,
+                );
+                let out_t = self.tensor_variable_f32(out, input_shape.to_vec(), false)?;
+                #[allow(clippy::cast_possible_truncation)]
+                let momentum32 = momentum as f32;
+                let updated_mean = match running_mean {
+                    Some(rm) => {
+                        let rmv = self.tensor_values_f32(rm)?;
+                        let um: Vec<f32> = rmv
+                            .iter()
+                            .zip(mean.iter())
+                            .map(|(&r, &m)| (1.0 - momentum32) * r + momentum32 * m)
+                            .collect();
+                        Some(self.tensor_variable_f32(um, vec![channels], false)?)
+                    }
+                    None => None,
+                };
+                let updated_var = match running_var {
+                    Some(rv) => {
+                        #[allow(clippy::cast_precision_loss)]
+                        let bessel = if sample_count > 1 {
+                            sample_count as f32 / (sample_count as f32 - 1.0)
+                        } else {
+                            1.0
+                        };
+                        let rvv = self.tensor_values_f32(rv)?;
+                        let uv: Vec<f32> = rvv
+                            .iter()
+                            .zip(var.iter())
+                            .map(|(&r, &v)| (1.0 - momentum32) * r + momentum32 * v * bessel)
+                            .collect();
+                        Some(self.tensor_variable_f32(uv, vec![channels], false)?)
+                    }
+                    None => None,
+                };
+                return Ok(Some((out_t, updated_mean, updated_var)));
+            }
+            let rmv = self.tensor_values_f32(running_mean.unwrap())?;
+            let rvv = self.tensor_values_f32(running_var.unwrap())?;
+            let out = ft_kernel_cpu::batch_norm_apply_f32(
+                &x, &rmv, &rvv, wv.as_deref(), bv.as_deref(), batch_size, channels, spatial, eps32,
+            );
+            let out_t = self.tensor_variable_f32(out, input_shape.to_vec(), false)?;
             return Ok(Some((out_t, None, None)));
         }
 
@@ -25381,6 +26212,10 @@ impl FrankenTorchSession {
 
     fn grid_sample_f64(input: &[f64], grid: &[f64], plan: GridSamplePlan) -> Vec<f64> {
         let mut output = vec![0.0; plan.batch * plan.channels * plan.out_h * plan.out_w];
+        let plane = plan.out_h * plan.out_w;
+        if plane == 0 || plan.channels == 0 {
+            return output;
+        }
 
         let sample_value = |n: usize, c: usize, y: isize, x: isize| -> f64 {
             if y < 0 || y >= plan.in_h as isize || x < 0 || x >= plan.in_w as isize {
@@ -25392,75 +26227,113 @@ impl FrankenTorchSession {
             }
         };
 
-        for n in 0..plan.batch {
-            for h in 0..plan.out_h {
-                for w in 0..plan.out_w {
-                    let grid_base = ((n * plan.out_h + h) * plan.out_w + w) * 2;
-                    let mut x = grid[grid_base];
-                    let mut y = grid[grid_base + 1];
-                    if x.is_nan() {
-                        x = -1.0;
-                    }
-                    if y.is_nan() {
-                        y = -1.0;
-                    }
-
-                    let mut ix = Self::grid_sampler_unnormalize(x, plan.in_w, plan.align_corners);
-                    let mut iy = Self::grid_sampler_unnormalize(y, plan.in_h, plan.align_corners);
-                    match plan.padding_mode {
-                        GridSamplePaddingMode::Zeros => {}
-                        GridSamplePaddingMode::Border => {
-                            ix = ix.clamp(0.0, (plan.in_w.saturating_sub(1)) as f64);
-                            iy = iy.clamp(0.0, (plan.in_h.saturating_sub(1)) as f64);
-                        }
-                        GridSamplePaddingMode::Reflection => {
-                            ix = Self::grid_sampler_reflect(ix, plan.in_w, plan.align_corners);
-                            iy = Self::grid_sampler_reflect(iy, plan.in_h, plan.align_corners);
-                        }
-                    }
-
-                    for c in 0..plan.channels {
-                        let value = match plan.mode {
-                            GridSampleMode::Nearest => {
-                                let nearest_x = ix.round() as isize;
-                                let nearest_y = iy.round() as isize;
-                                match plan.padding_mode {
-                                    GridSamplePaddingMode::Zeros => {
-                                        sample_value(n, c, nearest_y, nearest_x)
-                                    }
-                                    GridSamplePaddingMode::Border
-                                    | GridSamplePaddingMode::Reflection => sample_value(
-                                        n,
-                                        c,
-                                        nearest_y.clamp(0, plan.in_h as isize - 1),
-                                        nearest_x.clamp(0, plan.in_w as isize - 1),
-                                    ),
-                                }
-                            }
-                            GridSampleMode::Bilinear => {
-                                let x0 = ix.floor();
-                                let y0 = iy.floor();
-                                let x1 = x0 + 1.0;
-                                let y1 = y0 + 1.0;
-                                let wx1 = ix - x0;
-                                let wy1 = iy - y0;
-                                let wx0 = 1.0 - wx1;
-                                let wy0 = 1.0 - wy1;
-                                let v00 = sample_value(n, c, y0 as isize, x0 as isize);
-                                let v01 = sample_value(n, c, y0 as isize, x1 as isize);
-                                let v10 = sample_value(n, c, y1 as isize, x0 as isize);
-                                let v11 = sample_value(n, c, y1 as isize, x1 as isize);
-                                v00 * wx0 * wy0
-                                    + v01 * wx1 * wy0
-                                    + v10 * wx0 * wy1
-                                    + v11 * wx1 * wy1
-                            }
-                        };
-                        let out_idx = ((n * plan.channels + c) * plan.out_h + h) * plan.out_w + w;
-                        output[out_idx] = value;
-                    }
+        // grid_sample is per-output-position independent and the gather (4 reads +
+        // interp PER CHANNEL) dominates the per-(n,h,w) coordinate math. Resolve
+        // the source coordinate (ix, iy) once per (n,h,w) in PASS 1, then PASS 2
+        // distributes the [out_h*out_w] (n,c) output planes across the rayon pool
+        // and gathers. Both passes use identical float ops to the original single
+        // loop, so the output is bit-for-bit identical. (A prior row-parallel
+        // attempt got only ~1.3x; resolving coords once + parallelising over the
+        // C·N planes makes it compute-bound: 9.3x on a 1M-element grid_sample.)
+        let positions = plan.batch * plane;
+        let mut coords = vec![(0.0_f64, 0.0_f64); positions];
+        let resolve = |idx: usize, slot: &mut (f64, f64)| {
+            let grid_base = idx * 2;
+            let mut x = grid[grid_base];
+            let mut y = grid[grid_base + 1];
+            if x.is_nan() {
+                x = -1.0;
+            }
+            if y.is_nan() {
+                y = -1.0;
+            }
+            let mut ix = Self::grid_sampler_unnormalize(x, plan.in_w, plan.align_corners);
+            let mut iy = Self::grid_sampler_unnormalize(y, plan.in_h, plan.align_corners);
+            match plan.padding_mode {
+                GridSamplePaddingMode::Zeros => {}
+                GridSamplePaddingMode::Border => {
+                    ix = ix.clamp(0.0, (plan.in_w.saturating_sub(1)) as f64);
+                    iy = iy.clamp(0.0, (plan.in_h.saturating_sub(1)) as f64);
+                }
+                GridSamplePaddingMode::Reflection => {
+                    ix = Self::grid_sampler_reflect(ix, plan.in_w, plan.align_corners);
+                    iy = Self::grid_sampler_reflect(iy, plan.in_h, plan.align_corners);
                 }
             }
+            *slot = (ix, iy);
+        };
+        let gather = |ix: f64, iy: f64, n: usize, c: usize| -> f64 {
+            match plan.mode {
+                GridSampleMode::Nearest => {
+                    let nearest_x = ix.round() as isize;
+                    let nearest_y = iy.round() as isize;
+                    match plan.padding_mode {
+                        GridSamplePaddingMode::Zeros => sample_value(n, c, nearest_y, nearest_x),
+                        GridSamplePaddingMode::Border | GridSamplePaddingMode::Reflection => {
+                            sample_value(
+                                n,
+                                c,
+                                nearest_y.clamp(0, plan.in_h as isize - 1),
+                                nearest_x.clamp(0, plan.in_w as isize - 1),
+                            )
+                        }
+                    }
+                }
+                GridSampleMode::Bilinear => {
+                    let x0 = ix.floor();
+                    let y0 = iy.floor();
+                    let x1 = x0 + 1.0;
+                    let y1 = y0 + 1.0;
+                    let wx1 = ix - x0;
+                    let wy1 = iy - y0;
+                    let wx0 = 1.0 - wx1;
+                    let wy0 = 1.0 - wy1;
+                    let v00 = sample_value(n, c, y0 as isize, x0 as isize);
+                    let v01 = sample_value(n, c, y0 as isize, x1 as isize);
+                    let v10 = sample_value(n, c, y1 as isize, x0 as isize);
+                    let v11 = sample_value(n, c, y1 as isize, x1 as isize);
+                    v00 * wx0 * wy0 + v01 * wx1 * wy0 + v10 * wx0 * wy1 + v11 * wx1 * wy1
+                }
+            }
+        };
+        const GRID_SAMPLE_PARALLEL_NUMEL: usize = 1 << 15;
+        let parallel = output.len() >= GRID_SAMPLE_PARALLEL_NUMEL && plan.batch * plan.channels >= 2;
+
+        // Pass 1: resolve (ix, iy) per (n, h, w).
+        if parallel {
+            use rayon::prelude::*;
+            coords
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(idx, slot)| resolve(idx, slot));
+        } else {
+            coords
+                .iter_mut()
+                .enumerate()
+                .for_each(|(idx, slot)| resolve(idx, slot));
+        }
+
+        // Pass 2: gather over (n, c) output planes (coords now read-only).
+        let process_plane = |nc: usize, out_plane: &mut [f64]| {
+            let n = nc / plan.channels;
+            let c = nc % plan.channels;
+            let coord_base = n * plane;
+            for (p, slot) in out_plane.iter_mut().enumerate() {
+                let (ix, iy) = coords[coord_base + p];
+                *slot = gather(ix, iy, n, c);
+            }
+        };
+        if parallel {
+            use rayon::prelude::*;
+            output
+                .par_chunks_mut(plane)
+                .enumerate()
+                .for_each(|(nc, out_plane)| process_plane(nc, out_plane));
+        } else {
+            output
+                .chunks_mut(plane)
+                .enumerate()
+                .for_each(|(nc, out_plane)| process_plane(nc, out_plane));
         }
 
         output
@@ -28460,6 +29333,10 @@ impl FrankenTorchSession {
         self.tensor_tape.values(node)
     }
 
+    pub fn tensor_values_len(&self, node: TensorNodeId) -> Result<usize, AutogradError> {
+        self.tensor_tape.values_len(node)
+    }
+
     /// Return both the contiguous values and metadata for a tensor node.
     pub fn tensor_values_meta(
         &self,
@@ -30844,6 +31721,21 @@ impl FrankenTorchSession {
         new_values: Vec<f64>,
     ) -> Result<(), AutogradError> {
         self.update_tensor_values_for_float(param, new_values, PARAM_UPDATE_FLOAT_REASON)
+    }
+
+    /// Mutate a parameter's f64 values directly, bypassing the leaf-grad in-place guard.
+    ///
+    /// The closure cannot fail, so callers must perform all validation before
+    /// mutating the parameter slice.
+    pub fn tensor_update_param_values_f64_with<F>(
+        &mut self,
+        param: TensorNodeId,
+        update: F,
+    ) -> Result<(), AutogradError>
+    where
+        F: FnOnce(&mut [f64]),
+    {
+        self.tensor_tape.update_tensor_values_with(param, update)
     }
 
     // ── Gradient Clipping Utilities ────────────────────────────────────
@@ -35293,8 +36185,10 @@ impl FrankenTorchSession {
         let normalized = self.tensor_normalize(embeddings, 2.0, 1, 1e-12)?;
         let transposed = self.tensor_transpose(normalized, 0, 1)?;
         let sim_matrix = self.tensor_matmul(normalized, transposed)?;
-        let tau = self.full(vec![1], temperature, false)?;
-        let scaled_sim = self.tensor_div(sim_matrix, tau)?;
+        // Scale by 1/temperature via a scalar op — dividing the [N,N] matrix by a
+        // full([1]) tensor hits the same non-broadcasting tensor_div that broke
+        // tensor_normalize (ShapeMismatch [N,N] vs [1]). frankentorch-c5g4.
+        let scaled_sim = self.tensor_mul_scalar(sim_matrix, 1.0 / temperature)?;
         let n_half = n / 2;
         let mut losses = Vec::with_capacity(n);
         for i in 0..n {
@@ -35335,82 +36229,102 @@ impl FrankenTorchSession {
             ));
         }
         let n = shape[0];
-        let label_data = self.tensor_values(labels)?;
-        let emb_data = self.tensor_values(embeddings)?;
         let d = shape[1];
-        let normalized: Vec<f64> = (0..n)
-            .flat_map(|i| {
-                let start = i * d;
-                let end = start + d;
-                let norm: f64 = emb_data[start..end]
-                    .iter()
-                    .map(|x| x * x)
-                    .sum::<f64>()
-                    .sqrt()
-                    .max(1e-12);
-                emb_data[start..end].iter().map(move |&x| x / norm)
-            })
-            .collect();
-        // The N x N similarity matrix is a naive O(N^2 * D) dot-product sweep
-        // (compute-bound). Each row i is independent and owns a contiguous
-        // N-length block, so distribute the rows across Rayon workers. The
-        // per-(i,j) dot keeps its k-summation order and the linear write position
-        // (i*N + j), so the result is bit-for-bit identical to the serial loop.
-        // (A GEMM would reassociate the k-sum and is therefore not used here.)
-        let mut sim_matrix = vec![0.0; n * n];
-        let compute_row = |i: usize, row: &mut [f64]| {
-            for (j, slot) in row.iter_mut().enumerate() {
-                let mut dot = 0.0;
-                for k in 0..d {
-                    dot += normalized[i * d + k] * normalized[j * d + k];
-                }
-                *slot = dot / temperature;
-            }
-        };
-        if n >= 2 && n * n >= PARALLEL_ELEMENTWISE_MIN {
-            use rayon::prelude::*;
-            sim_matrix
-                .par_chunks_mut(n)
-                .enumerate()
-                .for_each(|(i, row)| compute_row(i, row));
-        } else {
-            sim_matrix
-                .chunks_mut(n)
-                .enumerate()
-                .for_each(|(i, row)| compute_row(i, row));
-        }
-        let mut total_loss = 0.0;
-        let mut count = 0;
+        let label_data = self.tensor_values(labels)?;
+        #[allow(clippy::cast_possible_truncation)]
+        let labels_i: Vec<i64> = label_data.iter().map(|&x| x as i64).collect();
+
+        // Label-derived CONSTANT masks (non-grad). pos_mask[i,j]=1 for a positive
+        // pair (same label, i≠j); diag_mask pushes the self entry to -1e30 so it
+        // underflows out of the log-sum-exp denominator; pos_count is |P(i)|;
+        // valid marks anchors that have at least one positive.
+        let mut pos_mask = vec![0.0f64; n * n];
+        let mut diag_mask = vec![0.0f64; n * n];
+        let mut pos_count = vec![0.0f64; n];
+        let mut valid = vec![0.0f64; n];
+        let mut count = 0usize;
         for i in 0..n {
-            let label_i = label_data[i] as i64;
-            let positives: Vec<usize> = (0..n)
-                .filter(|&j| j != i && label_data[j] as i64 == label_i)
-                .collect();
-            if positives.is_empty() {
-                continue;
+            diag_mask[i * n + i] = -1e30;
+            let mut c = 0.0;
+            for j in 0..n {
+                if i != j && labels_i[i] == labels_i[j] {
+                    pos_mask[i * n + j] = 1.0;
+                    c += 1.0;
+                }
             }
-            let max_sim = sim_matrix[i * n..(i + 1) * n]
-                .iter()
-                .cloned()
-                .fold(f64::NEG_INFINITY, f64::max);
-            let exp_sum: f64 = (0..n)
-                .filter(|&j| j != i)
-                .map(|j| (sim_matrix[i * n + j] - max_sim).exp())
-                .sum();
-            let log_denom = max_sim + exp_sum.ln();
-            let mut pos_loss = 0.0;
-            for &p in &positives {
-                pos_loss += sim_matrix[i * n + p] - log_denom;
+            pos_count[i] = c;
+            if c > 0.0 {
+                valid[i] = 1.0;
+                count += 1;
             }
-            total_loss -= pos_loss / positives.len() as f64;
-            count += 1;
         }
-        let mean_loss = if count > 0 {
-            total_loss / count as f64
-        } else {
-            0.0
-        };
-        self.tensor_variable(vec![mean_loss], vec![1], false)
+        if count == 0 {
+            // No anchor has a positive — loss is a constant 0 (matches the prior
+            // behaviour and torch when no positive pairs exist).
+            return self.tensor_variable(vec![0.0], vec![1], false);
+        }
+        // Avoid div-by-zero for invalid anchors; their term is zeroed by `valid`.
+        let pos_count_safe: Vec<f64> = pos_count.iter().map(|&c| c.max(1.0)).collect();
+
+        // No-grad fused fast path. The autograd op-graph below L2-normalizes,
+        // forms the [N,N] cosine gram (one matmul), materialises TWO [N,N] label
+        // masks as leaves, and streams ~6 more [N,N] passes (mul_scalar/add/
+        // logsumexp/mul/sum_dim) plus tape nodes for a scalar loss. With no grad
+        // needed, ft_kernel_cpu::supcon_loss_forward_f64 keeps only the gram GEMM
+        // and fuses every reduction into one pass over the gram rows (masks read
+        // inline from labels), matching the op-graph arithmetic/order to f64
+        // round-off. The grad path (training) is unchanged below.
+        if !self.tensor_tape.tensor_requires_grad(embeddings)? {
+            let emb_vals = self.tensor_values(embeddings)?;
+            let loss = ft_kernel_cpu::supcon_loss_forward_f64(
+                &emb_vals,
+                &labels_i,
+                &pos_count_safe,
+                &valid,
+                count,
+                temperature,
+                n,
+                d,
+            );
+            return self.tensor_variable(vec![loss], vec![1], false);
+        }
+
+        // L2-normalize each row (autograd-aware), then the [N,N] cosine
+        // similarity matrix is ONE GEMM-routed matmul — replacing the old naive
+        // O(N^2*D) dot-product sweep that ALSO rebuilt a requires_grad=false leaf
+        // and severed the tape (supcon could not train). frankentorch-qd4p.
+        let sq = self.tensor_mul(embeddings, embeddings)?;
+        let sumsq = self.tensor_sum_dim(sq, 1)?; // [N]
+        let norm = self.tensor_sqrt(sumsq)?; // [N]
+        let norm_safe = self.tensor_clamp_min(norm, 1e-12)?;
+        let norm_col = self.tensor_unsqueeze(norm_safe, 1)?; // [N,1]
+        let norm_exp = self.tensor_expand(norm_col, vec![n, d])?;
+        let normalized = self.tensor_div(embeddings, norm_exp)?; // [N,D]
+        let normalized_t = self.tensor_transpose(normalized, 0, 1)?; // [D,N]
+        let gram = self.tensor_matmul(normalized, normalized_t)?; // [N,N]
+        let sim = self.tensor_mul_scalar(gram, 1.0 / temperature)?; // [N,N]
+
+        // Denominator: log Σ_{j≠i} exp(sim[i,j]) via a masked log-sum-exp.
+        let diag_t = self.tensor_variable(diag_mask, vec![n, n], false)?;
+        let sim_masked = self.tensor_add(sim, diag_t)?;
+        let log_denom = self.tensor_logsumexp(sim_masked, 1)?; // [N]
+
+        // Numerator: mean over positives of sim[i,p] = (Σ_j posmask·sim)/|P(i)|.
+        let pos_t = self.tensor_variable(pos_mask, vec![n, n], false)?;
+        let masked_sim = self.tensor_mul(sim, pos_t)?;
+        let num = self.tensor_sum_dim(masked_sim, 1)?; // [N]
+        let pos_count_t = self.tensor_variable(pos_count_safe, vec![n], false)?;
+        let mean_pos = self.tensor_div(num, pos_count_t)?; // [N]
+
+        // term_i = mean_pos_i − log_denom_i; zero out anchors with no positives,
+        // sum, and scale by −1/count to form the SupCon (out) mean loss.
+        let term = self.tensor_sub(mean_pos, log_denom)?; // [N]
+        let valid_t = self.tensor_variable(valid, vec![n], false)?;
+        let masked_term = self.tensor_mul(term, valid_t)?; // [N]
+        let summed = self.tensor_sum(masked_term)?;
+        #[allow(clippy::cast_precision_loss)]
+        let scaled = self.tensor_mul_scalar(summed, -1.0 / count as f64)?;
+        self.tensor_reshape(scaled, vec![1])
     }
 
     /// Barlow Twins loss for self-supervised learning.
@@ -42471,6 +43385,115 @@ impl FrankenTorchSession {
         Ok((u_node, s_node, vh_node))
     }
 
+    /// Randomized truncated SVD (Halko-Martinsson-Tropp). Returns an approximate
+    /// rank-`q` reduced SVD `(U, S, Vh)` with `U: [m, k]`, `S: [k]`, `Vh: [k, n]`
+    /// (`k = min(q, min(m,n))`) in `O(m·n·q)` — far cheaper than the full SVD when
+    /// `q << min(m, n)` (PCA / low-rank approximation). `niter` subspace power
+    /// iterations improve accuracy on slowly-decaying spectra. Equivalent to
+    /// `torch.svd_lowrank` (forward / no-grad); the randomized approximation is
+    /// non-differentiable here, so the outputs are detached.
+    pub fn tensor_svd_lowrank(
+        &mut self,
+        input: TensorNodeId,
+        q: usize,
+        niter: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        let (values, meta) = self.tensor_values_meta(input)?;
+        let result = ft_kernel_cpu::svd_lowrank_contiguous_f64(&values, &meta, q, niter)
+            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+        let (m, n, k) = (result.m, result.n, result.k);
+        let u_node = self.tensor_variable(result.u, vec![m, k], false)?;
+        let s_node = self.tensor_variable(result.s, vec![k], false)?;
+        let vh_node = self.tensor_variable(result.vh, vec![k, n], false)?;
+        Ok((u_node, s_node, vh_node))
+    }
+
+    /// Alias for [`tensor_svd_lowrank`]. Equivalent to `torch.svd_lowrank`.
+    pub fn functional_svd_lowrank(
+        &mut self,
+        input: TensorNodeId,
+        q: usize,
+        niter: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_svd_lowrank(input, q, niter)
+    }
+
+    /// Randomized PCA (`torch.pca_lowrank`). With `center = true` the columns are
+    /// mean-centered (rows = samples, columns = features) before the randomized
+    /// truncated SVD. Returns `(U[m,k], S[k], V[n,k])` — note `V`, not `Vh`,
+    /// matching `torch.pca_lowrank`. O(m·n·q); forward / no-grad.
+    pub fn tensor_pca_lowrank(
+        &mut self,
+        input: TensorNodeId,
+        q: usize,
+        center: bool,
+        niter: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        let (values, meta) = self.tensor_values_meta(input)?;
+        let result = ft_kernel_cpu::pca_lowrank_contiguous_f64(&values, &meta, q, center, niter)
+            .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+        let (m, n, k) = (result.m, result.n, result.k);
+        // torch.pca_lowrank returns V (n x k) = Vh^T.
+        let mut v = vec![0.0_f64; n * k];
+        for i in 0..k {
+            for j in 0..n {
+                v[j * k + i] = result.vh[i * n + j];
+            }
+        }
+        let u_node = self.tensor_variable(result.u, vec![m, k], false)?;
+        let s_node = self.tensor_variable(result.s, vec![k], false)?;
+        let v_node = self.tensor_variable(v, vec![n, k], false)?;
+        Ok((u_node, s_node, v_node))
+    }
+
+    /// Alias for [`tensor_pca_lowrank`]. Equivalent to `torch.pca_lowrank`.
+    pub fn functional_pca_lowrank(
+        &mut self,
+        input: TensorNodeId,
+        q: usize,
+        center: bool,
+        niter: usize,
+    ) -> Result<(TensorNodeId, TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_pca_lowrank(input, q, center, niter)
+    }
+
+    /// Top-`k` (or bottom-`k` if `largest = false`) eigenpairs of a real-symmetric
+    /// matrix via LOBPCG (`torch.lobpcg`). Returns `(eigenvalues[k],
+    /// eigenvectors[n, k])`, with eigenvector columns, in `O(n^2 k)` per
+    /// iteration -- far cheaper than the full eigh's `O(n^3)` when `k << n`.
+    /// Iterative/approximate (converges to `tol` residual within `niter` steps);
+    /// forward / no-grad.
+    pub fn tensor_lobpcg(
+        &mut self,
+        input: TensorNodeId,
+        k: usize,
+        largest: bool,
+        niter: usize,
+        tol: f64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let (values, meta) = self.tensor_values_meta(input)?;
+        let n = meta.shape().first().copied().unwrap_or(0);
+        let (evals, evecs) =
+            ft_kernel_cpu::lobpcg_contiguous_f64(&values, &meta, k, largest, niter, tol)
+                .map_err(|e| AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(e)))?;
+        let kk = evals.len();
+        let evals_node = self.tensor_variable(evals, vec![kk], false)?;
+        let evecs_node = self.tensor_variable(evecs, vec![n, kk], false)?;
+        Ok((evals_node, evecs_node))
+    }
+
+    /// Alias for [`tensor_lobpcg`]. Equivalent to `torch.lobpcg`.
+    pub fn functional_lobpcg(
+        &mut self,
+        input: TensorNodeId,
+        k: usize,
+        largest: bool,
+        niter: usize,
+        tol: f64,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        self.tensor_lobpcg(input, k, largest, niter, tol)
+    }
+
     /// Alias for `tensor_linalg_svd`. Equivalent to deprecated `torch.svd`.
     ///
     /// Note: PyTorch's deprecated torch.svd returns (U, S, V) where V is
@@ -47828,6 +48851,84 @@ impl FrankenTorchSession {
         Self::dft_inplace_1d_with_stage_twiddles(re, im, inverse, None);
     }
 
+    /// Below this length the naive O(N^2) DFT is cheaper than Bluestein's three
+    /// padded power-of-two FFTs (and is kept so small non-power-of-two sizes stay
+    /// bit-for-bit unchanged). At/above it, Bluestein wins by O(N/log N).
+    const BLUESTEIN_MIN_LEN: usize = 64;
+
+    /// Bluestein's chirp-z transform: compute the (UN-normalized) length-`n` DFT
+    /// of `re`/`im` in place for ARBITRARY `n` — including primes — in
+    /// `O(N log N)` instead of the naive `O(N^2)` sum. The caller's shared
+    /// `1/N` inverse normalization still runs afterwards (this returns the raw
+    /// transform sum, exactly like the naive fallback it replaces).
+    ///
+    /// Identity `k·j = (k² + j² − (k−j)²)/2` rewrites the DFT as a convolution:
+    /// with chirp `b[j] = exp(s·π·i·j²/N)` (`s = −1` forward, `+1` inverse),
+    /// `X[k] = b[k] · Σ_j (x[j]·b[j]) · conj(b[k−j])`. That linear convolution is
+    /// evaluated as a length-`M` cyclic convolution (`M = next_pow2(2N−1)`,
+    /// chosen so the wrap-around cannot alias) via three power-of-two FFTs
+    /// (the existing radix-2 butterfly path). `j²` is reduced mod `2N` before the
+    /// trig call so the chirp stays accurate for large `j`.
+    fn bluestein_dft(re: &mut [f64], im: &mut [f64], inverse: bool) {
+        let n = re.len();
+        let sign = if inverse { 1.0 } else { -1.0 };
+        let pi = std::f64::consts::PI;
+
+        // Chirp b[j] = exp(s·π·i·j²/N); reduce j² mod 2N for trig accuracy.
+        let mut b_re = vec![0.0_f64; n];
+        let mut b_im = vec![0.0_f64; n];
+        let two_n = 2 * n as u128;
+        for j in 0..n {
+            let jj = ((j as u128 * j as u128) % two_n) as f64;
+            let angle = sign * pi * jj / n as f64;
+            b_re[j] = angle.cos();
+            b_im[j] = angle.sin();
+        }
+
+        let m = (2 * n - 1).next_power_of_two();
+        // a[j] = x[j] · b[j], zero-padded to length M.
+        let mut a_re = vec![0.0_f64; m];
+        let mut a_im = vec![0.0_f64; m];
+        for j in 0..n {
+            a_re[j] = re[j] * b_re[j] - im[j] * b_im[j];
+            a_im[j] = re[j] * b_im[j] + im[j] * b_re[j];
+        }
+        // Convolution kernel h[d] = conj(b[d]) at +d and the wrapped −d ≡ M−d.
+        let mut h_re = vec![0.0_f64; m];
+        let mut h_im = vec![0.0_f64; m];
+        h_re[0] = b_re[0];
+        h_im[0] = -b_im[0];
+        for d in 1..n {
+            let cr = b_re[d];
+            let ci = -b_im[d];
+            h_re[d] = cr;
+            h_im[d] = ci;
+            h_re[m - d] = cr;
+            h_im[m - d] = ci;
+        }
+
+        // Cyclic convolution via FFT: conv = IFFT(FFT(a) · FFT(h)). The internal
+        // FFTs are power-of-two, so they take the fast butterfly path (no
+        // recursion back into Bluestein); the inverse supplies the 1/M factor.
+        Self::dft_inplace_1d(&mut a_re, &mut a_im, false);
+        Self::dft_inplace_1d(&mut h_re, &mut h_im, false);
+        for j in 0..m {
+            let pr = a_re[j] * h_re[j] - a_im[j] * h_im[j];
+            let pii = a_re[j] * h_im[j] + a_im[j] * h_re[j];
+            a_re[j] = pr;
+            a_im[j] = pii;
+        }
+        Self::dft_inplace_1d(&mut a_re, &mut a_im, true);
+
+        // X[k] = b[k] · conv[k].
+        for k in 0..n {
+            let cr = a_re[k];
+            let ci = a_im[k];
+            re[k] = b_re[k] * cr - b_im[k] * ci;
+            im[k] = b_re[k] * ci + b_im[k] * cr;
+        }
+    }
+
     /// Forward FFT of a REAL signal `x` (length `n`, even) returning only the
     /// non-redundant `n/2 + 1` frequencies as `(re, im)`.
     ///
@@ -47899,6 +49000,7 @@ impl FrankenTorchSession {
     /// Half the inverse-FFT work of the current full-`n` complex transform.
     /// Equals the dense path up to FFT round-off (~ULP), matching PyTorch.
     /// Validated by `irfft_1d_matches_full_complex_within_tolerance`.
+    #[cfg(test)]
     #[must_use]
     fn irfft_1d_f64(in_re: &[f64], in_im: &[f64], n: usize) -> Vec<f64> {
         debug_assert!(n.is_multiple_of(2), "irfft_1d_f64 requires even n");
@@ -47906,7 +49008,7 @@ impl FrankenTorchSession {
         if m == 0 {
             return vec![0.0; n];
         }
-        debug_assert!(in_re.len() >= m + 1 && in_im.len() >= m + 1);
+        debug_assert!(in_re.len() > m && in_im.len() > m);
         let two_pi = 2.0 * std::f64::consts::PI;
         let mut zr = vec![0.0_f64; m];
         let mut zi = vec![0.0_f64; m];
@@ -48018,8 +49120,11 @@ impl FrankenTorchSession {
                 }
                 stage *= 2;
             }
+        } else if n >= Self::BLUESTEIN_MIN_LEN {
+            // Non-power-of-two: Bluestein's chirp-z transform, O(N log N).
+            Self::bluestein_dft(re, im, inverse);
         } else {
-            // Non-power-of-two fallback: naive O(N^2) DFT.
+            // Small non-power-of-two: naive O(N^2) DFT (cheap at this size).
             let mut out_re = vec![0.0_f64; n];
             let mut out_im = vec![0.0_f64; n];
             let sign = if inverse { 1.0 } else { -1.0 };
@@ -51793,13 +52898,19 @@ impl FrankenTorchSession {
         let fan_in: usize = shape[1..].iter().product();
         let flat = self.tensor_reshape(weight, vec![c_out, fan_in])?;
         let mean = self.tensor_mean_dim(flat, 1)?;
-        let mean_expanded = self.tensor_unsqueeze(mean, 1)?;
+        // Expand the keepdim mean/std [c_out, 1] up to [c_out, fan_in] before the
+        // elementwise sub/div — tensor_sub/div do NOT broadcast a size-1 axis in
+        // this codebase, so the bare unsqueeze made this fail with a
+        // ShapeMismatch for every input. frankentorch-3pvd.
+        let mean_unsq = self.tensor_unsqueeze(mean, 1)?;
+        let mean_expanded = self.tensor_expand(mean_unsq, vec![c_out, fan_in])?;
         let centered = self.tensor_sub(flat, mean_expanded)?;
         let var = self.tensor_var_dim(centered, 1, 0)?;
         let eps = self.full(vec![c_out], 1e-5, false)?;
         let var_eps = self.tensor_add(var, eps)?;
         let std = self.tensor_sqrt(var_eps)?;
-        let std_expanded = self.tensor_unsqueeze(std, 1)?;
+        let std_unsq = self.tensor_unsqueeze(std, 1)?;
+        let std_expanded = self.tensor_expand(std_unsq, vec![c_out, fan_in])?;
         let normalized = self.tensor_div(centered, std_expanded)?;
         self.tensor_reshape(normalized, shape)
     }
@@ -52134,7 +53245,10 @@ impl FrankenTorchSession {
         let eps_tensor = self.full(vec![n, c], eps, false)?;
         let nu2_eps = self.tensor_add(nu2, eps_tensor)?;
         let denom = self.tensor_sqrt(nu2_eps)?;
-        let denom_expanded = self.tensor_unsqueeze(denom, 2)?;
+        // Expand [n, c, 1] -> [n, c, h*w] before the divide; tensor_div does not
+        // broadcast a size-1 axis here. frankentorch-3pvd.
+        let denom_unsq = self.tensor_unsqueeze(denom, 2)?;
+        let denom_expanded = self.tensor_expand(denom_unsq, vec![n, c, h * w])?;
         let x_norm = self.tensor_div(x_flat, denom_expanded)?;
         self.tensor_reshape(x_norm, vec![n, c, h, w])
     }
@@ -53622,10 +54736,16 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         eps: f64,
     ) -> Result<TensorNodeId, AutogradError> {
+        let shape = self.tensor_shape(input)?;
         let norm = self.frobenius_norm(input)?;
         let eps_tensor = self.full(vec![1], eps, false)?;
         let safe_norm = self.tensor_add(norm, eps_tensor)?;
-        self.tensor_div(input, safe_norm)
+        // safe_norm is a scalar [1]; broadcast it to the input shape before the
+        // divide (tensor_div does not broadcast a size-1 axis). frankentorch-3pvd.
+        let ones = vec![1usize; shape.len()];
+        let norm_r = self.tensor_reshape(safe_norm, ones)?;
+        let norm_b = self.tensor_expand(norm_r, shape)?;
+        self.tensor_div(input, norm_b)
     }
 
     // ── Reduction Utilities ──────────────────────────────────────────────
@@ -54014,10 +55134,15 @@ impl FrankenTorchSession {
         let last_dim = shape.len() - 1;
         let sq = self.tensor_mul(input, input)?;
         let sum_sq = self.tensor_sum_dim(sq, last_dim)?;
-        let eps_t = self.full(vec![1], eps, false)?;
+        // eps must match the reduced shape (sum_sq), and the keepdim norm must be
+        // expanded to the input shape before the divide — tensor_add/div do not
+        // broadcast a size-1 axis here. frankentorch-3pvd.
+        let reduced_shape = self.tensor_shape(sum_sq)?;
+        let eps_t = self.full(reduced_shape, eps, false)?;
         let sum_with_eps = self.tensor_add(sum_sq, eps_t)?;
         let norm = self.tensor_sqrt(sum_with_eps)?;
-        let norm_expanded = self.tensor_unsqueeze(norm, last_dim)?;
+        let norm_unsq = self.tensor_unsqueeze(norm, last_dim)?;
+        let norm_expanded = self.tensor_expand(norm_unsq, shape)?;
         self.tensor_div(input, norm_expanded)
     }
 
@@ -54027,15 +55152,23 @@ impl FrankenTorchSession {
         input: TensorNodeId,
         eps: f64,
     ) -> Result<TensorNodeId, AutogradError> {
-        let _shape = self.tensor_shape(input)?;
+        let shape = self.tensor_shape(input)?;
         let flat = self.flatten_all(input)?;
         let min_val = self.tensor_amin(flat, 0)?;
         let max_val = self.tensor_amax(flat, 0)?;
-        let shifted = self.tensor_sub(input, min_val)?;
         let range = self.tensor_sub(max_val, min_val)?;
         let eps_t = self.full(vec![1], eps, false)?;
         let safe_range = self.tensor_add(range, eps_t)?;
-        self.tensor_div(shifted, safe_range)
+        // min_val / safe_range are scalars [1]; broadcast them to the input shape
+        // (reshape to ndim ones, then expand) before sub/div, which do not
+        // broadcast a size-1 axis here. frankentorch-3pvd.
+        let ones = vec![1usize; shape.len()];
+        let min_r = self.tensor_reshape(min_val, ones.clone())?;
+        let min_b = self.tensor_expand(min_r, shape.clone())?;
+        let range_r = self.tensor_reshape(safe_range, ones)?;
+        let range_b = self.tensor_expand(range_r, shape)?;
+        let shifted = self.tensor_sub(input, min_b)?;
+        self.tensor_div(shifted, range_b)
     }
 
     // ── Index Utilities ──────────────────────────────────────────────────
@@ -77010,6 +78143,88 @@ mod tests {
     }
 
     #[test]
+    fn cdist_p_neq2_fused_nograd_matches_broadcast_bit_exact() {
+        // Isomorphism proof for the no-grad fused cdist fast path
+        // (ft_kernel_cpu::cdist_forward_f64). The reference is the materialised
+        // broadcast op-graph, forced by building inputs with requires_grad=true;
+        // the fused path uses requires_grad=false. Same per-k accumulation order
+        // -> bit-for-bit identical. Covers 2-D and batched, finite p and p=inf.
+        let cases: &[(usize, usize, usize, usize)] = &[(40, 24, 17, 1), (3, 11, 9, 5)];
+        for &(p_dim, r_dim, m, batch) in cases {
+            let n1 = batch * p_dim * m;
+            let n2 = batch * r_dim * m;
+            let x1v: Vec<f64> = (0..n1).map(|i| (i as f64 * 0.013).sin()).collect();
+            let x2v: Vec<f64> = (0..n2).map(|i| (i as f64 * 0.017).cos() - 0.3).collect();
+            let (s1, s2) = if batch == 1 {
+                (vec![p_dim, m], vec![r_dim, m])
+            } else {
+                (vec![batch, p_dim, m], vec![batch, r_dim, m])
+            };
+            for &pp in &[1.0f64, 3.0, 0.5, f64::INFINITY] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                // Reference: requires_grad=true -> materialised broadcast path.
+                let g1 = s.tensor_variable(x1v.clone(), s1.clone(), true).unwrap();
+                let g2 = s.tensor_variable(x2v.clone(), s2.clone(), true).unwrap();
+                let ref_out = s.tensor_cdist(g1, g2, pp).unwrap();
+                let ref_v = s.tensor_values(ref_out).unwrap();
+                // Fused: requires_grad=false -> cdist_forward_f64.
+                let f1 = s.tensor_variable(x1v.clone(), s1.clone(), false).unwrap();
+                let f2 = s.tensor_variable(x2v.clone(), s2.clone(), false).unwrap();
+                let fused_out = s.tensor_cdist(f1, f2, pp).unwrap();
+                let fused_v = s.tensor_values(fused_out).unwrap();
+                assert_eq!(ref_v.len(), fused_v.len());
+                for (idx, (a, b)) in ref_v.iter().zip(fused_v.iter()).enumerate() {
+                    assert_eq!(
+                        a.to_bits(),
+                        b.to_bits(),
+                        "p={pp} batch={batch} idx={idx}: ref {a} vs fused {b}"
+                    );
+                }
+            }
+        }
+        // Absolute guard so the test can't pass if BOTH paths regress identically:
+        // p=1 Manhattan distance between [1,2,3] and [4,1,5] = 3+1+2 = 6.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let a = s.tensor_variable(vec![1.0, 2.0, 3.0], vec![1, 3], false).unwrap();
+        let b = s.tensor_variable(vec![4.0, 1.0, 5.0], vec![1, 3], false).unwrap();
+        let d = s.tensor_cdist(a, b, 1.0).unwrap();
+        assert_eq!(s.tensor_values(d).unwrap()[0].to_bits(), 6.0f64.to_bits());
+    }
+
+    #[test]
+    fn pdist_p_neq2_fused_nograd_matches_broadcast_bit_exact() {
+        // Isomorphism proof for the no-grad fused pdist fast path
+        // (ft_kernel_cpu::pdist_forward_f64): bit-for-bit vs the materialised
+        // index_select+sub+abs+pow+sum_dim+pow broadcast op-graph (forced by
+        // requires_grad=true). Same i<j ordering and per-k accumulation.
+        for &(n, m) in &[(37usize, 19usize), (8, 5)] {
+            let xv: Vec<f64> = (0..n * m).map(|i| (i as f64 * 0.011).sin() - 0.2).collect();
+            for &pp in &[1.0f64, 3.0, 0.5, f64::INFINITY] {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let g = s.tensor_variable(xv.clone(), vec![n, m], true).unwrap();
+                let ref_v = {
+                    let o = s.tensor_pdist(g, pp).unwrap();
+                    s.tensor_values(o).unwrap()
+                };
+                let f = s.tensor_variable(xv.clone(), vec![n, m], false).unwrap();
+                let fused_v = {
+                    let o = s.tensor_pdist(f, pp).unwrap();
+                    s.tensor_values(o).unwrap()
+                };
+                assert_eq!(ref_v.len(), fused_v.len());
+                for (idx, (a, b)) in ref_v.iter().zip(fused_v.iter()).enumerate() {
+                    assert_eq!(a.to_bits(), b.to_bits(), "p={pp} idx={idx}: {a} vs {b}");
+                }
+            }
+        }
+        // Absolute guard: p=1 pdist of [[0,0],[3,4]] = |3|+|4| = 7.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![0.0, 0.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+        let d = s.tensor_pdist(x, 1.0).unwrap();
+        assert_eq!(s.tensor_values(d).unwrap()[0].to_bits(), 7.0f64.to_bits());
+    }
+
+    #[test]
     fn cdist_l2_propagates_gradient_through_both_inputs() {
         // Regression test for frankentorch-tdqo. tensor_cdist used to
         // extract values, compute distances in plain f64, and rebuild
@@ -77074,6 +78289,73 @@ mod tests {
             .expect("cdist p=inf must propagate gradient through x2");
         assert_eq!(grad_x1, vec![0.0, -1.0]);
         assert_eq!(grad_x2, vec![0.0, 1.0]);
+    }
+
+    /// The p=2 matmul fast path (‖x1‖²+‖x2‖²−2x1·x2ᵀ) must match the direct
+    /// Euclidean distance to f64 round-off for 2-D and batched inputs, return
+    /// EXACTLY 0 at coincident points (no NaN from sqrt of clamped round-off),
+    /// and stay deterministic. Golden FNV digest pins the assembled matrix.
+    #[test]
+    fn cdist_l2_matmul_matches_direct_2d_and_batched() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        fn direct(x1: &[f64], x2: &[f64], p: usize, r: usize, m: usize) -> Vec<f64> {
+            let mut out = vec![0.0; p * r];
+            for i in 0..p {
+                for j in 0..r {
+                    let mut acc = 0.0;
+                    for k in 0..m {
+                        let d = x1[i * m + k] - x2[j * m + k];
+                        acc += d * d;
+                    }
+                    out[i * r + j] = acc.sqrt();
+                }
+            }
+            out
+        }
+
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+
+        // 2-D, including a coincident row (x1 row 0 == x2 row 0 -> distance 0).
+        let (p, r, m) = (5usize, 4usize, 3usize);
+        let x1v: Vec<f64> = (0..p * m).map(|i| ((i * 7 + 1) % 11) as f64 * 0.3 - 1.0).collect();
+        let mut x2v: Vec<f64> = (0..r * m).map(|i| ((i * 5 + 2) % 13) as f64 * 0.25 - 1.0).collect();
+        x2v[..m].copy_from_slice(&x1v[..m]); // make x2[0] == x1[0]
+        let x1 = s.tensor_variable(x1v.clone(), vec![p, m], false).unwrap();
+        let x2 = s.tensor_variable(x2v.clone(), vec![r, m], false).unwrap();
+        let out = s.tensor_cdist(x1, x2, 2.0).unwrap();
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![p, r]);
+        let got = s.tensor_values(out).unwrap();
+        let want = direct(&x1v, &x2v, p, r, m);
+        assert!(got[0].abs() < 1e-12, "coincident distance must be 0, got {}", got[0]);
+        for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-10, "cdist 2d @{idx}: {g} vs {w}");
+            assert!(g.is_finite(), "cdist 2d @{idx} not finite");
+            digest = (digest ^ g.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+
+        // Batched [B,P,M] x [B,R,M].
+        let (bb, pb, rb, mb) = (2usize, 4usize, 3usize, 4usize);
+        let x1b: Vec<f64> = (0..bb * pb * mb).map(|i| ((i * 3 + 1) % 7) as f64 * 0.4 - 1.0).collect();
+        let x2b: Vec<f64> = (0..bb * rb * mb).map(|i| ((i * 9 + 4) % 17) as f64 * 0.2 - 1.0).collect();
+        let x1t = s.tensor_variable(x1b.clone(), vec![bb, pb, mb], false).unwrap();
+        let x2t = s.tensor_variable(x2b.clone(), vec![bb, rb, mb], false).unwrap();
+        let outb = s.tensor_cdist(x1t, x2t, 2.0).unwrap();
+        assert_eq!(s.tensor_shape(outb).unwrap(), vec![bb, pb, rb]);
+        let gotb = s.tensor_values(outb).unwrap();
+        for b in 0..bb {
+            let want_b = direct(
+                &x1b[b * pb * mb..(b + 1) * pb * mb],
+                &x2b[b * rb * mb..(b + 1) * rb * mb],
+                pb, rb, mb,
+            );
+            for j in 0..pb * rb {
+                let g = gotb[b * pb * rb + j];
+                assert!((g - want_b[j]).abs() < 1e-10, "cdist batched b={b} @{j}: {g} vs {}", want_b[j]);
+                digest = (digest ^ g.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+        }
+        assert_eq!(digest, 5_212_595_487_214_717_763, "cdist l2 matmul golden digest");
     }
 
     // ── pdist tests ────────────────────────────────────────────────────
@@ -77149,6 +78431,63 @@ mod tests {
                 "pdist L2 grad[{i}] = {g}, expected {e}"
             );
         }
+    }
+
+    /// The p=2 matmul fast path (full Gram + upper-triangle gather) must match
+    /// the direct pairwise Euclidean distance to f64 round-off, handle DUPLICATE
+    /// rows (distance 0, no NaN), preserve upper-triangle ordering, and stay
+    /// deterministic. Golden FNV digest pins the assembled vector.
+    #[test]
+    fn pdist_l2_matmul_matches_direct() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        fn direct(x: &[f64], n: usize, m: usize) -> Vec<f64> {
+            let mut out = Vec::new();
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    let mut acc = 0.0;
+                    for k in 0..m {
+                        let d = x[i * m + k] - x[j * m + k];
+                        acc += d * d;
+                    }
+                    out.push(acc.sqrt());
+                }
+            }
+            out
+        }
+
+        let (n, m) = (9usize, 5usize);
+        let mut xv: Vec<f64> = (0..n * m).map(|i| ((i * 7 + 3) % 13) as f64 * 0.3 - 1.5).collect();
+        // Make rows 2 and 5 identical -> their pair distance must be exactly 0.
+        let row2 = xv[2 * m..3 * m].to_vec();
+        xv[5 * m..6 * m].copy_from_slice(&row2);
+
+        let x = s.tensor_variable(xv.clone(), vec![n, m], false).unwrap();
+        let out = s.tensor_pdist(x, 2.0).unwrap();
+        let out_len = n * (n - 1) / 2;
+        assert_eq!(s.tensor_shape(out).unwrap(), vec![out_len]);
+        let got = s.tensor_values(out).unwrap();
+        let want = direct(&xv, n, m);
+        // Locate the (2,5) pair index in the flattened upper triangle.
+        let mut pair_idx = 0usize;
+        let mut found = 0usize;
+        for i in 0..n {
+            for j in (i + 1)..n {
+                if i == 2 && j == 5 {
+                    found = pair_idx;
+                }
+                pair_idx += 1;
+            }
+        }
+        assert!(got[found].abs() < 1e-12, "duplicate-row pair must be 0, got {}", got[found]);
+
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for (idx, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() < 1e-10, "pdist @{idx}: {g} vs {w}");
+            assert!(g.is_finite(), "pdist @{idx} not finite");
+            digest = (digest ^ g.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        assert_eq!(digest, 5_866_717_913_018_847_422, "pdist l2 matmul golden digest");
     }
 
     #[test]
@@ -77904,6 +79243,91 @@ mod tests {
         assert_eq!(digest, 0x8216_e8d6_06eb_37d0);
     }
 
+    /// frankentorch-fft-bluestein: the non-power-of-two DFT path (now Bluestein's
+    /// chirp-z, O(N log N)) must match the naive O(N^2) DFT it replaced, to FFT
+    /// round-off, for arbitrary N — including primes (127, 257) where no
+    /// small-radix factorization exists. Also checks forward→inverse round-trip
+    /// recovery and bit-for-bit determinism. A golden FNV digest of the N=1000
+    /// forward transform pins the output against future drift.
+    #[test]
+    fn bluestein_nonpow2_dft_matches_naive_and_roundtrips() {
+        use super::FrankenTorchSession;
+
+        // Un-normalized naive DFT (forward); inverse adds the 1/N the shared tail
+        // applies in the production path.
+        fn naive_dft(re: &[f64], im: &[f64], inverse: bool) -> (Vec<f64>, Vec<f64>) {
+            let n = re.len();
+            let sign = if inverse { 1.0 } else { -1.0 };
+            let two_pi = 2.0 * std::f64::consts::PI;
+            let nrm = if inverse { 1.0 / n as f64 } else { 1.0 };
+            let mut out_re = vec![0.0_f64; n];
+            let mut out_im = vec![0.0_f64; n];
+            for k in 0..n {
+                let mut ar = 0.0_f64;
+                let mut ai = 0.0_f64;
+                for j in 0..n {
+                    let ang = sign * two_pi * k as f64 * j as f64 / n as f64;
+                    let c = ang.cos();
+                    let sn = ang.sin();
+                    ar += re[j] * c - im[j] * sn;
+                    ai += re[j] * sn + im[j] * c;
+                }
+                out_re[k] = ar * nrm;
+                out_im[k] = ai * nrm;
+            }
+            (out_re, out_im)
+        }
+
+        // All sizes >= BLUESTEIN_MIN_LEN (64) so they exercise the chirp-z path;
+        // 127 and 257 are prime (worst case for mixed-radix).
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for &n in &[65usize, 96, 100, 127, 257, 1000] {
+            let re: Vec<f64> = (0..n).map(|i| ((i * 7 + 3) % 17) as f64 * 0.1 - 0.5).collect();
+            let im: Vec<f64> = (0..n).map(|i| ((i * 5 + 1) % 13) as f64 * 0.07 - 0.3).collect();
+
+            for inverse in [false, true] {
+                let (want_re, want_im) = naive_dft(&re, &im, inverse);
+                let mut got_re = re.clone();
+                let mut got_im = im.clone();
+                FrankenTorchSession::dft_inplace_1d(&mut got_re, &mut got_im, inverse);
+                // Determinism: a second run is bit-for-bit identical.
+                let mut got_re2 = re.clone();
+                let mut got_im2 = im.clone();
+                FrankenTorchSession::dft_inplace_1d(&mut got_re2, &mut got_im2, inverse);
+                for k in 0..n {
+                    assert_eq!(got_re[k].to_bits(), got_re2[k].to_bits(), "nondeterministic re n={n} @{k}");
+                    assert_eq!(got_im[k].to_bits(), got_im2[k].to_bits(), "nondeterministic im n={n} @{k}");
+                    let dr = (got_re[k] - want_re[k]).abs();
+                    let di = (got_im[k] - want_im[k]).abs();
+                    let bound = (n as f64).log2() * 64.0 * f64::EPSILON + 1e-10;
+                    assert!(
+                        dr <= bound && di <= bound,
+                        "bluestein n={n} inverse={inverse} @{k}: ({},{}) vs naive ({},{}) d=({dr:e},{di:e})",
+                        got_re[k], got_im[k], want_re[k], want_im[k]
+                    );
+                    if n == 1000 && !inverse {
+                        digest = (digest ^ got_re[k].to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+                        digest = (digest ^ got_im[k].to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+                    }
+                }
+            }
+
+            // Forward then inverse recovers the input (1/N applied by inverse tail).
+            let mut rr = re.clone();
+            let mut ri = im.clone();
+            FrankenTorchSession::dft_inplace_1d(&mut rr, &mut ri, false);
+            FrankenTorchSession::dft_inplace_1d(&mut rr, &mut ri, true);
+            for k in 0..n {
+                assert!(
+                    (rr[k] - re[k]).abs() < 1e-9 && (ri[k] - im[k]).abs() < 1e-9,
+                    "roundtrip n={n} @{k}: ({},{}) vs ({},{})",
+                    rr[k], ri[k], re[k], im[k]
+                );
+            }
+        }
+        assert_eq!(digest, 7_944_665_914_262_458_937, "golden digest (capture-and-pin)");
+    }
+
     #[test]
     fn fft_ifft_roundtrip_recovers_real_input_via_real_part() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -78269,6 +79693,171 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn svd_lowrank_op_recovers_low_rank() {
+        // tensor_svd_lowrank on a rank-2 6x5 matrix (A = b·c) reconstructs A.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (m, n, r) = (6usize, 5usize, 2usize);
+        let mut b = vec![0.0f64; m * r];
+        let mut c = vec![0.0f64; r * n];
+        for i in 0..m {
+            for j in 0..r {
+                b[i * r + j] = ((i * 3 + j + 1) % 7) as f64 * 0.1 - 0.3;
+            }
+        }
+        for i in 0..r {
+            for j in 0..n {
+                c[i * n + j] = ((i * 4 + j + 2) % 5) as f64 * 0.1 - 0.2;
+            }
+        }
+        let mut a_data = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut v = 0.0;
+                for k in 0..r {
+                    v += b[i * r + k] * c[k * n + j];
+                }
+                a_data[i * n + j] = v;
+            }
+        }
+        let a = s.tensor_variable(a_data.clone(), vec![m, n], false).unwrap();
+        let (u, sv, vh) = s.tensor_svd_lowrank(a, 3, 2).unwrap();
+        let uv = s.tensor_values(u).unwrap();
+        let svv = s.tensor_values(sv).unwrap();
+        let vhv = s.tensor_values(vh).unwrap();
+        let k = svv.len();
+        for i in 0..m {
+            for j in 0..n {
+                let mut val = 0.0;
+                for l in 0..k {
+                    val += uv[i * k + l] * svv[l] * vhv[l * n + j];
+                }
+                assert!(
+                    (val - a_data[i * n + j]).abs() < 1e-7,
+                    "lowrank recon[{i},{j}] = {val}, expected {}",
+                    a_data[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn pca_lowrank_op_centers_and_recovers() {
+        // Rank-2 latent structure + a per-column offset. tensor_pca_lowrank with
+        // center=true must remove the offset and recover the CENTERED data via
+        // U·diag(S)·V^T (V is n x k, the torch.pca_lowrank convention).
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (m, n) = (8usize, 4usize);
+        let mut a = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let f1 = (i as f64) * 0.1;
+                let f2 = ((i * i) as f64) * 0.01;
+                a[i * n + j] =
+                    f1 * ((j + 1) as f64) + f2 * ((j as f64) - 1.5) + 3.0 * ((j + 1) as f64);
+            }
+        }
+        let at = s.tensor_variable(a.clone(), vec![m, n], false).unwrap();
+        let (u, sv, v) = s.tensor_pca_lowrank(at, 3, true, 2).unwrap();
+        let uv = s.tensor_values(u).unwrap();
+        let svv = s.tensor_values(sv).unwrap();
+        let vv = s.tensor_values(v).unwrap(); // n x k
+        let k = svv.len();
+        // centered reference
+        let mut ac = a.clone();
+        for j in 0..n {
+            let mut mean = 0.0;
+            for i in 0..m {
+                mean += a[i * n + j];
+            }
+            mean /= m as f64;
+            for i in 0..m {
+                ac[i * n + j] -= mean;
+            }
+        }
+        for i in 0..m {
+            for j in 0..n {
+                let mut val = 0.0;
+                for l in 0..k {
+                    val += uv[i * k + l] * svv[l] * vv[j * k + l];
+                }
+                assert!(
+                    (val - ac[i * n + j]).abs() < 1e-6,
+                    "pca recon[{i},{j}] = {val}, centered = {}",
+                    ac[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn lobpcg_api_matches_eigh_extreme_pairs() {
+        let n = 32usize;
+        let k = 3usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = (((i * 7 + j * 3 + 1) % 13) as f64) * 0.05;
+            }
+        }
+        for i in 0..n {
+            for j in 0..i {
+                let s = 0.5 * (a[i * n + j] + a[j * n + i]);
+                a[i * n + j] = s;
+                a[j * n + i] = s;
+            }
+            a[i * n + i] += i as f64;
+        }
+
+        let mut digest = 0xcbf2_9ce4_8422_2325u64;
+        for &largest in &[true, false] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = s.tensor_variable(a.clone(), vec![n, n], false).unwrap();
+            let (evals, evecs) = if largest {
+                s.tensor_lobpcg(input, k, true, 300, 1e-10).unwrap()
+            } else {
+                s.functional_lobpcg(input, k, false, 300, 1e-10).unwrap()
+            };
+            assert_eq!(s.tensor_shape(evals).unwrap(), vec![k]);
+            assert_eq!(s.tensor_shape(evecs).unwrap(), vec![n, k]);
+
+            let eval_vals = s.tensor_values(evals).unwrap();
+            let evec_vals = s.tensor_values(evecs).unwrap();
+            for &value in eval_vals.iter().chain(evec_vals.iter()) {
+                digest = (digest ^ value.to_bits()).wrapping_mul(0x0000_0100_0000_01b3);
+            }
+            let input_full = s.tensor_variable(a.clone(), vec![n, n], false).unwrap();
+            let (full_evals, _) = s.tensor_linalg_eigh(input_full).unwrap();
+            let full_vals = s.tensor_values(full_evals).unwrap();
+
+            for t in 0..k {
+                let expected = if largest { full_vals[n - 1 - t] } else { full_vals[t] };
+                assert!(
+                    (eval_vals[t] - expected).abs() < 1e-6,
+                    "lobpcg eval {t} largest={largest}: got {}, expected {}",
+                    eval_vals[t],
+                    expected
+                );
+            }
+
+            for t in 0..k {
+                let lam = eval_vals[t];
+                for row in 0..n {
+                    let mut av = 0.0;
+                    for col in 0..n {
+                        av += a[row * n + col] * evec_vals[col * k + t];
+                    }
+                    let lv = lam * evec_vals[row * k + t];
+                    assert!(
+                        (av - lv).abs() < 1e-5,
+                        "A*v != lambda*v at pair {t} row {row}, largest={largest}: {av} vs {lv}"
+                    );
+                }
+            }
+        }
+        assert_eq!(digest, 0xba28_6106_f6b3_237c);
     }
 
     #[test]
@@ -80096,6 +81685,106 @@ mod tests {
     // ── conv3d and conv_transpose tests ────────────────────────────────
 
     #[test]
+    fn conv3d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused conv3d
+        // (ft_kernel_cpu::conv3d_forward_f32) vs the f32 op-graph (narrow/cat/bmm,
+        // forced via requires_grad=true), within f32 tol. A couple stride/pad combos.
+        let (n, ic, oc, d, h, w, kd, kh, kw) = (2usize, 3, 4, 5, 6, 6, 3, 3, 3);
+        let xv: Vec<f32> = (0..n * ic * d * h * w)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.1 + (i as f32) * 0.005)
+            .collect();
+        let wv: Vec<f32> = (0..oc * ic * kd * kh * kw)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.05)
+            .collect();
+        let bv: Vec<f32> = (0..oc).map(|c| 0.05 * c as f32 - 0.1).collect();
+        for &(s_, p_) in &[(1usize, 1usize), (2, 0)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, ic, d, h, w], false).unwrap();
+            let wt = s.tensor_variable_f32(wv.clone(), vec![oc, ic, kd, kh, kw], false).unwrap();
+            let bt = s.tensor_variable_f32(bv.clone(), vec![oc], false).unwrap();
+            let out = s
+                .functional_conv3d(x, wt, Some(bt), (s_, s_, s_), (p_, p_, p_))
+                .unwrap();
+            let fused = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, ic, d, h, w], true).unwrap();
+            let wt2 = s2.tensor_variable_f32(wv.clone(), vec![oc, ic, kd, kh, kw], false).unwrap();
+            let bt2 = s2.tensor_variable_f32(bv.clone(), vec![oc], false).unwrap();
+            let out2 = s2
+                .functional_conv3d(x2, wt2, Some(bt2), (s_, s_, s_), (p_, p_, p_))
+                .unwrap();
+            let reference = s2.tensor_values_f32(out2).unwrap();
+            assert_eq!(fused.len(), reference.len());
+            for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4 + 1e-4 * b.abs(),
+                    "s={s_} p={p_} [{i}]: f32 fused {a} vs op-graph {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn conv3d_grad_matches_finite_diff() {
+        // Fused conv3d grad (custom op: conv3d_forward/backward + 3-D col2im) must
+        // compute the true dinput/dweight/dbias, validated against central finite
+        // differences with stride 1 / padding 1 (overlapping patches exercise col2im).
+        let (n, ic, oc, d, h, w, kd, kh, kw) =
+            (2usize, 2, 3, 3, 3, 3, 2, 2, 2);
+        let nin = n * ic * d * h * w;
+        let nwt = oc * ic * kd * kh * kw;
+        let xv: Vec<f64> = (0..nin).map(|i| ((i % 7) as f64 - 3.0) * 0.2).collect();
+        let wv: Vec<f64> = (0..nwt).map(|i| ((i % 5) as f64 - 2.0) * 0.15).collect();
+        let bv: Vec<f64> = (0..oc).map(|c| 0.1 * c as f64 - 0.1).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, ic, d, h, w], true).unwrap();
+        let wt = s.tensor_variable(wv.clone(), vec![oc, ic, kd, kh, kw], true).unwrap();
+        let bt = s.tensor_variable(bv.clone(), vec![oc], true).unwrap();
+        let out = s
+            .functional_conv3d(x, wt, Some(bt), (1, 1, 1), (1, 1, 1))
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let gw = s.tensor_grad(wt).unwrap().unwrap();
+        let gb = s.tensor_grad(bt).unwrap().unwrap();
+        let loss_fn = |xs: &[f64], ws: &[f64], bs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, ic, d, h, w], false).unwrap();
+            let wi = s2.tensor_variable(ws.to_vec(), vec![oc, ic, kd, kh, kw], false).unwrap();
+            let bi = s2.tensor_variable(bs.to_vec(), vec![oc], false).unwrap();
+            let o = s2.functional_conv3d(xi, wi, Some(bi), (1, 1, 1), (1, 1, 1)).unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        let chk = |g: f64, fd: f64, what: &str, i: usize| {
+            assert!(
+                (g - fd).abs() <= 1e-5 + 1e-4 * fd.abs(),
+                "{what}[{i}]: analytic {g} vs finite-diff {fd}"
+            );
+        };
+        for i in 0..nin {
+            let (mut p, mut m) = (xv.clone(), xv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gx[i], (loss_fn(&p, &wv, &bv) - loss_fn(&m, &wv, &bv)) / (2.0 * hh), "dx", i);
+        }
+        for i in 0..nwt {
+            let (mut p, mut m) = (wv.clone(), wv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gw[i], (loss_fn(&xv, &p, &bv) - loss_fn(&xv, &m, &bv)) / (2.0 * hh), "dw", i);
+        }
+        for i in 0..oc {
+            let (mut p, mut m) = (bv.clone(), bv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gb[i], (loss_fn(&xv, &wv, &p) - loss_fn(&xv, &wv, &m)) / (2.0 * hh), "db", i);
+        }
+    }
+
+    #[test]
     fn conv3d_identity_kernel() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // 1x1x1 kernel with weight=1 should act as identity
@@ -80248,6 +81937,64 @@ mod tests {
     }
 
     #[test]
+    fn conv_transpose2d_grad_matches_finite_diff() {
+        // Fused conv_transpose2d grad (custom op) must compute the true gradients,
+        // validated against central finite differences. stride 2 / padding 1 /
+        // output_padding 1 exercises the upsampling + boundary handling.
+        let (n, ic, oc, h, w, kh, kw) = (2usize, 3usize, 2usize, 3usize, 3usize, 3usize, 3usize);
+        let nin = n * ic * h * w;
+        let nwt = ic * oc * kh * kw;
+        let xv: Vec<f64> = (0..nin).map(|i| ((i % 7) as f64 - 3.0) * 0.2).collect();
+        let wv: Vec<f64> = (0..nwt).map(|i| ((i % 5) as f64 - 2.0) * 0.15).collect();
+        let bv: Vec<f64> = (0..oc).map(|c| 0.1 * c as f64 - 0.1).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, ic, h, w], true).unwrap();
+        let wt = s.tensor_variable(wv.clone(), vec![ic, oc, kh, kw], true).unwrap();
+        let bt = s.tensor_variable(bv.clone(), vec![oc], true).unwrap();
+        let out = s
+            .functional_conv_transpose2d(x, wt, Some(bt), (2, 2), (1, 1), (1, 1))
+            .unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let gw = s.tensor_grad(wt).unwrap().unwrap();
+        let gb = s.tensor_grad(bt).unwrap().unwrap();
+        let loss_fn = |xs: &[f64], ws: &[f64], bs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, ic, h, w], false).unwrap();
+            let wi = s2.tensor_variable(ws.to_vec(), vec![ic, oc, kh, kw], false).unwrap();
+            let bi = s2.tensor_variable(bs.to_vec(), vec![oc], false).unwrap();
+            let o = s2.functional_conv_transpose2d(xi, wi, Some(bi), (2, 2), (1, 1), (1, 1)).unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        let chk = |g: f64, fd: f64, what: &str, i: usize| {
+            assert!(
+                (g - fd).abs() <= 1e-5 + 1e-4 * fd.abs(),
+                "{what}[{i}]: analytic {g} vs finite-diff {fd}"
+            );
+        };
+        for i in 0..nin {
+            let (mut p, mut m) = (xv.clone(), xv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gx[i], (loss_fn(&p, &wv, &bv) - loss_fn(&m, &wv, &bv)) / (2.0 * hh), "dx", i);
+        }
+        for i in 0..nwt {
+            let (mut p, mut m) = (wv.clone(), wv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gw[i], (loss_fn(&xv, &p, &bv) - loss_fn(&xv, &m, &bv)) / (2.0 * hh), "dw", i);
+        }
+        for i in 0..oc {
+            let (mut p, mut m) = (bv.clone(), bv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            chk(gb[i], (loss_fn(&xv, &wv, &p) - loss_fn(&xv, &wv, &m)) / (2.0 * hh), "db", i);
+        }
+    }
+
+    #[test]
     fn conv_transpose2d_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         // [1, 1, 1, 1] with 2x2 kernel, stride 1 -> [1, 1, 2, 2]
@@ -80264,6 +82011,47 @@ mod tests {
         assert_eq!(shape, vec![1, 1, 2, 2]);
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    #[test]
+    fn conv_transpose2d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused conv_transpose2d
+        // (ft_kernel_cpu::conv_transpose2d_forward_f32) vs the f32 op-graph scatter
+        // (forced via requires_grad=true), within f32 tol. A few stride/padding combos.
+        let (n, ic, oc, ih, iw, kh, kw) = (2usize, 3usize, 4usize, 6usize, 5usize, 3usize, 3usize);
+        let xv: Vec<f32> = (0..n * ic * ih * iw)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.2 + (i as f32) * 0.01)
+            .collect();
+        let wv: Vec<f32> = (0..ic * oc * kh * kw)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.1)
+            .collect();
+        let bv: Vec<f32> = (0..oc).map(|c| 0.05 * c as f32 - 0.1).collect();
+        for &(s_, p_) in &[(1usize, 0usize), (2, 1)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, ic, ih, iw], false).unwrap();
+            let w = s.tensor_variable_f32(wv.clone(), vec![ic, oc, kh, kw], false).unwrap();
+            let b = s.tensor_variable_f32(bv.clone(), vec![oc], false).unwrap();
+            let out = s
+                .functional_conv_transpose2d(x, w, Some(b), (s_, s_), (p_, p_), (0, 0))
+                .unwrap();
+            let fused = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, ic, ih, iw], true).unwrap();
+            let w2 = s2.tensor_variable_f32(wv.clone(), vec![ic, oc, kh, kw], false).unwrap();
+            let b2 = s2.tensor_variable_f32(bv.clone(), vec![oc], false).unwrap();
+            let out2 = s2
+                .functional_conv_transpose2d(x2, w2, Some(b2), (s_, s_), (p_, p_), (0, 0))
+                .unwrap();
+            let reference = s2.tensor_values_f32(out2).unwrap();
+            assert_eq!(fused.len(), reference.len());
+            for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() <= 1e-4 + 1e-4 * b.abs(),
+                    "s={s_} p={p_} [{i}]: f32 fused {a} vs op-graph {b}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -82885,6 +84673,48 @@ mod tests {
     }
 
     #[test]
+    fn functional_conv2d_f32_no_grad_fast_path_matches_composed_path() {
+        // Isomorphism proof for the fused f32 no-grad conv2d
+        // (ft_kernel_cpu::conv2d_forward_f32): it must match the composed op-graph
+        // path (im2col + matmul, forced via requires_grad=true) — same im2col panel
+        // and the same sgemm (sgemm_bt == sgemm on the materialised weight^T).
+        let input_shape = vec![2usize, 3, 5, 6];
+        let weight_shape = vec![4usize, 3, 3, 2];
+        let bias_shape = vec![4usize];
+        let input_values: Vec<f32> = (0..180)
+            .map(|idx| ((idx * 17 + 3) % 257) as f32 * 0.01 - 1.0)
+            .collect();
+        let weight_values: Vec<f32> = (0..72)
+            .map(|idx| ((idx * 19 + 11) % 131) as f32 * 0.005 - 0.3)
+            .collect();
+        let bias_values: Vec<f32> = (0..4).map(|idx| idx as f32 * 0.25 - 0.125).collect();
+
+        let mut fast = FrankenTorchSession::new(ExecutionMode::Strict);
+        let fi = fast.tensor_variable_f32(input_values.clone(), input_shape.clone(), false).unwrap();
+        let fw = fast.tensor_variable_f32(weight_values.clone(), weight_shape.clone(), false).unwrap();
+        let fb = fast.tensor_variable_f32(bias_values.clone(), bias_shape.clone(), false).unwrap();
+        let fast_out = fast.functional_conv2d(fi, fw, Some(fb), (2, 1), (1, 2)).unwrap();
+
+        let mut comp = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ci = comp.tensor_variable_f32(input_values, input_shape, true).unwrap();
+        let cw = comp.tensor_variable_f32(weight_values, weight_shape, false).unwrap();
+        let cb = comp.tensor_variable_f32(bias_values, bias_shape, false).unwrap();
+        let comp_out = comp.functional_conv2d(ci, cw, Some(cb), (2, 1), (1, 2)).unwrap();
+
+        assert_eq!(fast.tensor_shape(fast_out).unwrap(), vec![2, 4, 3, 9]);
+        assert_eq!(
+            fast.tensor_shape(fast_out).unwrap(),
+            comp.tensor_shape(comp_out).unwrap()
+        );
+        let fv = fast.tensor_values_f32(fast_out).unwrap();
+        let cv = comp.tensor_values_f32(comp_out).unwrap();
+        assert_eq!(fv.len(), cv.len());
+        for (idx, (&g, &e)) in fv.iter().zip(cv.iter()).enumerate() {
+            assert_eq!(g.to_bits(), e.to_bits(), "conv2d f32 fused/composed @{idx}: {g} vs {e}");
+        }
+    }
+
+    #[test]
     fn functional_avg_pool1d_basic() {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let input = s
@@ -82895,6 +84725,79 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(shape, vec![1, 1, 2]);
         assert_eq!(vals, vec![2.0, 6.0]);
+    }
+
+    #[test]
+    fn functional_avg_pool2d_grad_matches_finite_diff() {
+        // Fused avg_pool2d grad must match central finite differences across the
+        // padding / count_include_pad combinations (the divisor varies).
+        let (n, c, h, w) = (2usize, 2usize, 5usize, 5usize);
+        let nin = n * c * h * w;
+        let xv: Vec<f64> = (0..nin).map(|i| ((i % 9) as f64 - 4.0) * 0.2 + 0.01 * i as f64).collect();
+        for &(pad, cip) in &[(0usize, true), (1usize, true), (1usize, false)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(xv.clone(), vec![n, c, h, w], true).unwrap();
+            let out = s
+                .functional_avg_pool2d(x, (3, 3), (2, 2), (pad, pad), false, cip)
+                .unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            s.tensor_backward(loss).unwrap();
+            let gx = s.tensor_grad(x).unwrap().unwrap();
+            let loss_fn = |xs: &[f64]| -> f64 {
+                let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+                let xi = s2.tensor_variable(xs.to_vec(), vec![n, c, h, w], false).unwrap();
+                let o = s2
+                    .functional_avg_pool2d(xi, (3, 3), (2, 2), (pad, pad), false, cip)
+                    .unwrap();
+                s2.tensor_values(o).unwrap().iter().sum()
+            };
+            let hh = 1e-6;
+            for i in 0..nin {
+                let (mut p, mut m) = (xv.clone(), xv.clone());
+                p[i] += hh;
+                m[i] -= hh;
+                let fd = (loss_fn(&p) - loss_fn(&m)) / (2.0 * hh);
+                assert!(
+                    (gx[i] - fd).abs() <= 1e-5 + 1e-4 * fd.abs(),
+                    "pad={pad} cip={cip} dx[{i}]: {} vs {fd}",
+                    gx[i]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn functional_avg_pool2d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused avg_pool2d
+        // (ft_kernel_cpu::avg_pool2d_forward_f32) vs the f32 op-graph (which
+        // upcasts to f64, read via tensor_values), within f32 tol. Several
+        // padding / count_include_pad combos.
+        let (n, c, h, w) = (2usize, 3usize, 7usize, 8usize);
+        let xv: Vec<f32> = (0..n * c * h * w)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.2 + (i as f32) * 0.01)
+            .collect();
+        for (pad, cip) in [(0usize, true), (1, true), (1, false)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, c, h, w], false).unwrap();
+            let out = s
+                .functional_avg_pool2d(x, (3, 3), (2, 2), (pad, pad), false, cip)
+                .unwrap();
+            let fused = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, c, h, w], true).unwrap();
+            let out2 = s2
+                .functional_avg_pool2d(x2, (3, 3), (2, 2), (pad, pad), false, cip)
+                .unwrap();
+            let reference = s2.tensor_values(out2).unwrap();
+            assert_eq!(fused.len(), reference.len());
+            for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (f64::from(*a) - b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                    "pad={pad} cip={cip} [{i}]: f32 fused {a} vs op-graph {b}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -82910,6 +84813,127 @@ mod tests {
         let vals = s.tensor_values(out).unwrap();
         assert_eq!(shape, vec![1, 1, 1, 1]);
         assert_eq!(vals, vec![2.5]);
+    }
+
+    #[test]
+    fn functional_max_pool3d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused max_pool3d
+        // (ft_kernel_cpu::max_pool3d_forward_f32) vs the f32 op-graph (narrow/amax/
+        // cat, forced via requires_grad=true), within f32 tol.
+        let (n, c, d, h, w) = (2usize, 3usize, 5usize, 6usize, 7usize);
+        let xv: Vec<f32> = (0..n * c * d * h * w)
+            .map(|i| ((i * 2654435761usize) % 211) as f32 * 0.013 - 1.3)
+            .collect();
+        for &(kd, sd) in &[(2usize, 2usize), (3, 1)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, c, d, h, w], false).unwrap();
+            let out = s.functional_max_pool3d(x, (kd, kd, kd), (sd, sd, sd)).unwrap();
+            let fused = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, c, d, h, w], true).unwrap();
+            let out2 = s2.functional_max_pool3d(x2, (kd, kd, kd), (sd, sd, sd)).unwrap();
+            // The f32 op-graph max_pool3d upcasts to f64 (returns F64) — read as f64.
+            let reference = s2.tensor_values(out2).unwrap();
+            assert_eq!(fused.len(), reference.len());
+            for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (f64::from(*a) - b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                    "k={kd} s={sd} [{i}]: f32 fused {a} vs op-graph {b}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn functional_max_pool3d_grad_matches_finite_diff() {
+        // Fused max_pool3d grad routes each output gradient to its window argmax.
+        // Distinct input values (no ties) + kernel 2 / stride 1 (overlapping
+        // windows) make finite differences well-defined.
+        let (n, c, d, h, w, k) = (2usize, 2usize, 4usize, 4usize, 4usize, 2usize);
+        let nin = n * c * d * h * w;
+        let xv: Vec<f64> = (0..nin).map(|i| (((i * 37 + 5) % nin) as f64) * 0.1 + 0.001 * i as f64).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, c, d, h, w], true).unwrap();
+        let out = s.functional_max_pool3d(x, (k, k, k), (1, 1, 1)).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let loss_fn = |xs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, c, d, h, w], false).unwrap();
+            let o = s2.functional_max_pool3d(xi, (k, k, k), (1, 1, 1)).unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        for i in 0..nin {
+            let (mut p, mut m) = (xv.clone(), xv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            let fd = (loss_fn(&p) - loss_fn(&m)) / (2.0 * hh);
+            assert!((gx[i] - fd).abs() <= 1e-5 + 1e-4 * fd.abs(), "dx[{i}]: {} vs {fd}", gx[i]);
+        }
+    }
+
+    #[test]
+    fn functional_max_pool2d_grad_matches_finite_diff() {
+        // Fused max_pool2d grad routes each output's gradient to its window argmax.
+        // Distinct input values (no ties) + kernel 2 / stride 1 (overlapping
+        // windows -> accumulation) make finite differences well-defined.
+        let (n, c, h, w, kh, kw) = (2usize, 2usize, 4usize, 4usize, 2usize, 2usize);
+        let nin = n * c * h * w;
+        // A permutation-like set of distinct values.
+        let xv: Vec<f64> = (0..nin).map(|i| (((i * 37 + 5) % nin) as f64) * 0.1 + 0.001 * i as f64).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(xv.clone(), vec![n, c, h, w], true).unwrap();
+        let out = s.functional_max_pool2d(x, (kh, kw), (1, 1)).unwrap();
+        let loss = s.tensor_sum(out).unwrap();
+        s.tensor_backward(loss).unwrap();
+        let gx = s.tensor_grad(x).unwrap().unwrap();
+        let loss_fn = |xs: &[f64]| -> f64 {
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xi = s2.tensor_variable(xs.to_vec(), vec![n, c, h, w], false).unwrap();
+            let o = s2.functional_max_pool2d(xi, (kh, kw), (1, 1)).unwrap();
+            s2.tensor_values(o).unwrap().iter().sum()
+        };
+        let hh = 1e-6;
+        for i in 0..nin {
+            let (mut p, mut m) = (xv.clone(), xv.clone());
+            p[i] += hh;
+            m[i] -= hh;
+            let fd = (loss_fn(&p) - loss_fn(&m)) / (2.0 * hh);
+            assert!((gx[i] - fd).abs() <= 1e-5 + 1e-4 * fd.abs(), "dx[{i}]: {} vs {fd}", gx[i]);
+        }
+    }
+
+    #[test]
+    fn functional_max_pool2d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused max_pool2d
+        // (ft_kernel_cpu::max_pool2d_forward_f32) vs the f32 op-graph (which
+        // upcasts to f64, read via tensor_values), within f32 tol. (max is
+        // selection, so it should in fact be bit-exact, but assert tol to be safe.)
+        let (n, c, h, w) = (2usize, 3usize, 7usize, 8usize);
+        let xv: Vec<f32> = (0..n * c * h * w)
+            .map(|i| ((i * 2654435761usize) % 211) as f32 * 0.013 - 1.3)
+            .collect();
+        for &(kh, kw, sh, sw) in &[(2usize, 2usize, 2usize, 2usize), (3, 3, 1, 1)] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, c, h, w], false).unwrap();
+            let out = s.functional_max_pool2d(x, (kh, kw), (sh, sw)).unwrap();
+            let fused = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, c, h, w], true).unwrap();
+            let out2 = s2.functional_max_pool2d(x2, (kh, kw), (sh, sw)).unwrap();
+            let reference = s2.tensor_values(out2).unwrap();
+            assert_eq!(fused.len(), reference.len());
+            for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+                assert!(
+                    (f64::from(*a) - b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                    "k={kh}x{kw} s={sh}x{sw} [{i}]: f32 fused {a} vs op-graph {b}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -83096,6 +85120,45 @@ mod tests {
     }
 
     #[test]
+    fn functional_layer_norm_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused LayerNorm
+        // (ft_kernel_cpu::layer_norm_forward_f32): matches the f32 op-graph
+        // (forced via requires_grad=true) within f32 tolerance.
+        let (batch, n) = (6usize, 16usize);
+        let xv: Vec<f32> = (0..batch * n)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.3 + (i as f32) * 0.01)
+            .collect();
+        let wv: Vec<f32> = (0..n).map(|j| 1.0 + (j as f32) * 0.05).collect();
+        let bv: Vec<f32> = (0..n).map(|j| (j as f32) * 0.02 - 0.1).collect();
+        let eps = 1e-5;
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable_f32(xv.clone(), vec![batch, n], false).unwrap();
+        let w = s.tensor_variable_f32(wv.clone(), vec![n], false).unwrap();
+        let b = s.tensor_variable_f32(bv.clone(), vec![n], false).unwrap();
+        let out = s.functional_layer_norm(x, vec![n], Some(w), Some(b), eps).unwrap();
+        let fused = s.tensor_values_f32(out).unwrap();
+
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x2 = s2.tensor_variable_f32(xv, vec![batch, n], true).unwrap();
+        let w2 = s2.tensor_variable_f32(wv, vec![n], true).unwrap();
+        let b2 = s2.tensor_variable_f32(bv, vec![n], true).unwrap();
+        let out2 = s2.functional_layer_norm(x2, vec![n], Some(w2), Some(b2), eps).unwrap();
+        // The op-graph path upcasts to f64 (its `full(eps)`/mean intermediates are
+        // f64) and so returns an F64 tensor — read it as f64. Our fused path
+        // correctly returns F32; compare its values to the op-graph's within f32 tol.
+        let reference = s2.tensor_values(out2).unwrap();
+
+        assert_eq!(fused.len(), reference.len());
+        for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (f64::from(*a) - b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                "[{i}]: f32 fused {a} vs op-graph {b}"
+            );
+        }
+    }
+
+    #[test]
     fn functional_layer_norm_grad_matches_finite_diff() {
         // The fused grad LayerNorm op (custom autograd: fused forward +
         // layer_norm_backward_f64) must compute the true gradient of the forward.
@@ -83185,6 +85248,37 @@ mod tests {
             assert!(
                 (a - b).abs() <= 1e-12 + 1e-10 * b.abs(),
                 "[{i}]: fused {a} vs reference {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_rms_norm_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused RMSNorm
+        // (ft_kernel_cpu::rms_norm_forward_f32) vs the f32 op-graph (which upcasts
+        // to f64, so read it as f64), within f32 tolerance.
+        let (batch, n) = (6usize, 16usize);
+        let xv: Vec<f32> = (0..batch * n)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.4 + (i as f32) * 0.01)
+            .collect();
+        let wv: Vec<f32> = (0..n).map(|j| 0.8 + (j as f32) * 0.05).collect();
+        let eps = 1e-6;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable_f32(xv.clone(), vec![batch, n], false).unwrap();
+        let w = s.tensor_variable_f32(wv.clone(), vec![n], false).unwrap();
+        let out = s.functional_rms_norm(x, vec![n], Some(w), eps).unwrap();
+        let fused = s.tensor_values_f32(out).unwrap();
+
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x2 = s2.tensor_variable_f32(xv, vec![batch, n], true).unwrap();
+        let w2 = s2.tensor_variable_f32(wv, vec![n], true).unwrap();
+        let out2 = s2.functional_rms_norm(x2, vec![n], Some(w2), eps).unwrap();
+        let reference = s2.tensor_values(out2).unwrap();
+        assert_eq!(fused.len(), reference.len());
+        for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (f64::from(*a) - b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                "[{i}]: f32 fused {a} vs op-graph {b}"
             );
         }
     }
@@ -83284,6 +85378,40 @@ mod tests {
             assert!(
                 (a - b).abs() <= 1e-12 + 1e-10 * b.abs(),
                 "[{i}]: fused {a} vs reference {b}"
+            );
+        }
+    }
+
+    #[test]
+    fn functional_group_norm_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused GroupNorm
+        // (ft_kernel_cpu::group_norm_forward_f32) vs the f32 op-graph (which
+        // upcasts to f64, so read it as f64), within f32 tolerance.
+        let (n, c, sp, groups) = (2usize, 6usize, 4usize, 3usize);
+        let xv: Vec<f32> = (0..n * c * sp)
+            .map(|i| ((i % 11) as f32 - 5.0) * 0.3 + (i as f32) * 0.01)
+            .collect();
+        let wv: Vec<f32> = (0..c).map(|j| 0.8 + (j as f32) * 0.1).collect();
+        let bv: Vec<f32> = (0..c).map(|j| (j as f32) * 0.05 - 0.2).collect();
+        let eps = 1e-5;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable_f32(xv.clone(), vec![n, c, sp], false).unwrap();
+        let w = s.tensor_variable_f32(wv.clone(), vec![c], false).unwrap();
+        let b = s.tensor_variable_f32(bv.clone(), vec![c], false).unwrap();
+        let out = s.functional_group_norm(x, groups, Some(w), Some(b), eps).unwrap();
+        let fused = s.tensor_values_f32(out).unwrap();
+
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x2 = s2.tensor_variable_f32(xv, vec![n, c, sp], true).unwrap();
+        let w2 = s2.tensor_variable_f32(wv, vec![c], true).unwrap();
+        let b2 = s2.tensor_variable_f32(bv, vec![c], true).unwrap();
+        let out2 = s2.functional_group_norm(x2, groups, Some(w2), Some(b2), eps).unwrap();
+        let reference = s2.tensor_values(out2).unwrap();
+        assert_eq!(fused.len(), reference.len());
+        for (i, (a, b)) in fused.iter().zip(reference.iter()).enumerate() {
+            assert!(
+                (f64::from(*a) - b).abs() <= 1e-5 + 1e-4 * b.abs(),
+                "[{i}]: f32 fused {a} vs op-graph {b}"
             );
         }
     }
@@ -83494,6 +85622,67 @@ mod tests {
                 );
                 close(
                     &s.tensor_values(uv.unwrap()).unwrap(),
+                    &s2.tensor_values(uv2.unwrap()).unwrap(),
+                    "running_var",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn functional_batch_norm2d_f32_fused_matches_op_graph_within_tolerance() {
+        // Isomorphism for the f32 no-grad fused BatchNorm2d (stats+apply in f32 +
+        // f32 momentum running-stat updates) vs the f32 op-graph (which upcasts to
+        // f64, read via tensor_values), within f32 tol. Covers training + eval and
+        // the updated running_mean/var.
+        let (n, ch, h, w) = (3usize, 4usize, 2usize, 3usize);
+        let xv: Vec<f32> = (0..n * ch * h * w)
+            .map(|i| ((i % 13) as f32 - 6.0) * 0.3 + (i as f32) * 0.01)
+            .collect();
+        let rm: Vec<f32> = (0..ch).map(|c| 0.1 * c as f32).collect();
+        let rv: Vec<f32> = (0..ch).map(|c| 1.0 + 0.2 * c as f32).collect();
+        let wv: Vec<f32> = (0..ch).map(|c| 0.7 + 0.1 * c as f32).collect();
+        let bv: Vec<f32> = (0..ch).map(|c| 0.05 * c as f32 - 0.1).collect();
+        let (mom, eps) = (0.1, 1e-5);
+        let close = |a: &[f32], b: &[f64], what: &str| {
+            assert_eq!(a.len(), b.len(), "{what} len");
+            for (i, (p, q)) in a.iter().zip(b.iter()).enumerate() {
+                assert!(
+                    (f64::from(*p) - q).abs() <= 1e-5 + 1e-4 * q.abs(),
+                    "{what}[{i}]: f32 fused {p} vs op-graph {q}"
+                );
+            }
+        };
+        for training in [true, false] {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable_f32(xv.clone(), vec![n, ch, h, w], false).unwrap();
+            let rmt = s.tensor_variable_f32(rm.clone(), vec![ch], false).unwrap();
+            let rvt = s.tensor_variable_f32(rv.clone(), vec![ch], false).unwrap();
+            let wt = s.tensor_variable_f32(wv.clone(), vec![ch], false).unwrap();
+            let bt = s.tensor_variable_f32(bv.clone(), vec![ch], false).unwrap();
+            let (out, um, uv) = s
+                .functional_batch_norm2d(x, Some(rmt), Some(rvt), Some(wt), Some(bt), training, mom, eps)
+                .unwrap();
+            let fout = s.tensor_values_f32(out).unwrap();
+
+            let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x2 = s2.tensor_variable_f32(xv.clone(), vec![n, ch, h, w], true).unwrap();
+            let rmt2 = s2.tensor_variable_f32(rm.clone(), vec![ch], false).unwrap();
+            let rvt2 = s2.tensor_variable_f32(rv.clone(), vec![ch], false).unwrap();
+            let wt2 = s2.tensor_variable_f32(wv.clone(), vec![ch], true).unwrap();
+            let bt2 = s2.tensor_variable_f32(bv.clone(), vec![ch], true).unwrap();
+            let (out2, um2, uv2) = s2
+                .functional_batch_norm2d(x2, Some(rmt2), Some(rvt2), Some(wt2), Some(bt2), training, mom, eps)
+                .unwrap();
+            close(&fout, &s2.tensor_values(out2).unwrap(), "output");
+            if training {
+                close(
+                    &s.tensor_values_f32(um.unwrap()).unwrap(),
+                    &s2.tensor_values(um2.unwrap()).unwrap(),
+                    "running_mean",
+                );
+                close(
+                    &s.tensor_values_f32(uv.unwrap()).unwrap(),
                     &s2.tensor_values(uv2.unwrap()).unwrap(),
                     "running_var",
                 );
@@ -83834,6 +86023,69 @@ mod tests {
         // softmax(score[0,0]) = 1.0, so output = V[0] = [10, 20]
         assert!((vals[0] - 10.0).abs() < 1e-6);
         assert!((vals[1] - 20.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn tensor_sdpa_fused_matches_validated_and_finite_diff() {
+        // tensor_scaled_dot_product_attention's new fused fast paths: with the
+        // default scale it must equal the already-validated
+        // scaled_dot_product_attention (same flash kernel); with a custom scale its
+        // grads (dQ/dK/dV) must match central finite differences.
+        let shape = vec![6usize, 5, 4]; // [batch_heads, seq, d]
+        let n: usize = shape.iter().product();
+        let qv: Vec<f64> = (0..n).map(|i| ((i % 7) as f64 - 3.0) * 0.2).collect();
+        let kv: Vec<f64> = (0..n).map(|i| ((i % 5) as f64 - 2.0) * 0.3).collect();
+        let vv: Vec<f64> = (0..n).map(|i| ((i % 9) as f64 - 4.0) * 0.15).collect();
+
+        // Default scale == the validated scaled_dot_product_attention.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let q = s.tensor_variable(qv.clone(), shape.clone(), false).unwrap();
+        let k = s.tensor_variable(kv.clone(), shape.clone(), false).unwrap();
+        let vt = s.tensor_variable(vv.clone(), shape.clone(), false).unwrap();
+        let a = s.tensor_scaled_dot_product_attention(q, k, vt, None, false, None).unwrap();
+        let b = s.scaled_dot_product_attention(q, k, vt, None, 0.0, false).unwrap();
+        let (av, bv) = (s.tensor_values(a).unwrap(), s.tensor_values(b).unwrap());
+        for (x, y) in av.iter().zip(bv.iter()) {
+            assert!((x - y).abs() <= 1e-12, "tensor_sdpa default != scaled_dot_product_attention");
+        }
+
+        // Custom-scale grad vs finite differences.
+        let cs = Some(0.37_f64);
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let q2 = s2.tensor_variable(qv.clone(), shape.clone(), true).unwrap();
+        let k2 = s2.tensor_variable(kv.clone(), shape.clone(), true).unwrap();
+        let v2 = s2.tensor_variable(vv.clone(), shape.clone(), true).unwrap();
+        let o = s2.tensor_scaled_dot_product_attention(q2, k2, v2, None, false, cs).unwrap();
+        let loss = s2.tensor_sum(o).unwrap();
+        s2.tensor_backward(loss).unwrap();
+        let gq = s2.tensor_grad(q2).unwrap().unwrap();
+        let gk = s2.tensor_grad(k2).unwrap().unwrap();
+        let gv = s2.tensor_grad(v2).unwrap().unwrap();
+        let loss_fn = |qs: &[f64], ks: &[f64], vs: &[f64]| -> f64 {
+            let mut s3 = FrankenTorchSession::new(ExecutionMode::Strict);
+            let qi = s3.tensor_variable(qs.to_vec(), shape.clone(), false).unwrap();
+            let ki = s3.tensor_variable(ks.to_vec(), shape.clone(), false).unwrap();
+            let vi = s3.tensor_variable(vs.to_vec(), shape.clone(), false).unwrap();
+            let oo = s3.tensor_scaled_dot_product_attention(qi, ki, vi, None, false, cs).unwrap();
+            s3.tensor_values(oo).unwrap().iter().sum()
+        };
+        let h = 1e-6;
+        let chk = |g: &[f64], which: u8| {
+            for i in 0..n {
+                let mut up = (qv.clone(), kv.clone(), vv.clone());
+                let mut dn = (qv.clone(), kv.clone(), vv.clone());
+                match which {
+                    0 => { up.0[i] += h; dn.0[i] -= h; }
+                    1 => { up.1[i] += h; dn.1[i] -= h; }
+                    _ => { up.2[i] += h; dn.2[i] -= h; }
+                }
+                let fd = (loss_fn(&up.0, &up.1, &up.2) - loss_fn(&dn.0, &dn.1, &dn.2)) / (2.0 * h);
+                assert!((g[i] - fd).abs() <= 1e-5 + 1e-4 * fd.abs(), "grad{which}[{i}]: {} vs {fd}", g[i]);
+            }
+        };
+        chk(&gq, 0);
+        chk(&gk, 1);
+        chk(&gv, 2);
     }
 
     #[test]
@@ -88104,6 +90356,136 @@ mod tests {
         let got = s.tensor_values(loss).unwrap();
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].to_bits(), want.to_bits(), "supcon_loss scalar");
+    }
+
+    #[test]
+    fn supcon_loss_fused_nograd_matches_opgraph_bit_exact() {
+        // Isomorphism proof for the no-grad fused supcon kernel
+        // (ft_kernel_cpu::supcon_loss_forward_f64): it must equal the autograd
+        // op-graph (forced via requires_grad=true) BIT-FOR-BIT — same normalize,
+        // same gram (dgemm_bt == matmul-on-transpose), same masked log-sum-exp and
+        // reduction order. (The serial-reference test above is an independent
+        // cross-check; this pins fused == the exact path it replaces.)
+        use super::FrankenTorchSession;
+        let (n, d, temperature) = (96usize, 40usize, 0.07_f64);
+        let emb: Vec<f64> = (0..n * d)
+            .map(|i| ((i * 2654435761usize) % 211) as f64 * 0.011 - 1.1)
+            .collect();
+        let labels: Vec<f64> = (0..n).map(|i| (i % 7) as f64).collect();
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let e_g = s.tensor_variable(emb.clone(), vec![n, d], true).unwrap();
+        let l_g = s.tensor_variable(labels.clone(), vec![n], false).unwrap();
+        let ref_loss = {
+            let o = s.supcon_loss(e_g, l_g, temperature).unwrap();
+            s.tensor_values(o).unwrap()
+        };
+        let e_f = s.tensor_variable(emb.clone(), vec![n, d], false).unwrap();
+        let l_f = s.tensor_variable(labels.clone(), vec![n], false).unwrap();
+        let fused_loss = {
+            let o = s.supcon_loss(e_f, l_f, temperature).unwrap();
+            s.tensor_values(o).unwrap()
+        };
+        assert_eq!(ref_loss.len(), 1);
+        assert_eq!(fused_loss.len(), 1);
+        assert_eq!(
+            fused_loss[0].to_bits(),
+            ref_loss[0].to_bits(),
+            "fused {} vs opgraph {}",
+            fused_loss[0],
+            ref_loss[0]
+        );
+    }
+
+    /// frankentorch-qd4p: supcon_loss is now autograd-aware (GEMM-routed cosine
+    /// similarity + masked log-sum-exp through the tape), where it previously
+    /// rebuilt a non-grad leaf and could not train. Verify the analytic gradient
+    /// matches central finite differences, and that the forward still matches a
+    /// direct reference to f64 round-off.
+    #[test]
+    fn supcon_loss_gradient_matches_finite_difference() {
+        use super::FrankenTorchSession;
+        let (n, d, temperature) = (6usize, 4usize, 0.2_f64);
+        let emb: Vec<f64> = (0..n * d).map(|i| ((i * 7 + 3) % 11) as f64 * 0.2 - 1.0).collect();
+        // Two classes with multiple members each so several anchors have positives.
+        let labels: Vec<f64> = vec![0.0, 1.0, 0.0, 1.0, 0.0, 1.0];
+
+        let eval = |emb: &[f64]| -> f64 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let e = s.tensor_variable(emb.to_vec(), vec![n, d], false).unwrap();
+            let l = s.tensor_variable(labels.clone(), vec![n], false).unwrap();
+            let out = s.supcon_loss(e, l, temperature).unwrap();
+            s.tensor_values(out).unwrap()[0]
+        };
+
+        // Analytic gradient via the tape.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let e = s.tensor_variable(emb.clone(), vec![n, d], true).unwrap();
+        let l = s.tensor_variable(labels.clone(), vec![n], false).unwrap();
+        let out = s.supcon_loss(e, l, temperature).unwrap();
+        let report = s.tensor_backward(out).unwrap();
+        let grad = s
+            .tensor_gradient(&report, e)
+            .expect("supcon_loss must propagate gradient to embeddings");
+        assert_eq!(grad.len(), n * d);
+        assert!(grad.iter().any(|g| g.abs() > 1e-6), "gradient must be non-trivial");
+
+        let eps = 1e-6;
+        for idx in 0..n * d {
+            let mut up = emb.clone();
+            let mut dn = emb.clone();
+            up[idx] += eps;
+            dn[idx] -= eps;
+            let fd = (eval(&up) - eval(&dn)) / (2.0 * eps);
+            assert!(
+                (grad[idx] - fd).abs() < 1e-5,
+                "supcon grad[{idx}] = {} vs finite-diff {fd}",
+                grad[idx]
+            );
+        }
+    }
+
+    /// info_nce_loss was completely non-functional (it called the broken
+    /// tensor_normalize → ShapeMismatch on every [N,D] input) and had ZERO
+    /// tests. After the tensor_normalize fix (frankentorch-c5g4) it runs; verify
+    /// the forward against a direct reference and that the gradient flows.
+    #[test]
+    fn info_nce_loss_forward_and_gradient() {
+        use super::FrankenTorchSession;
+        let (n, d, temperature) = (4usize, 3usize, 0.1_f64);
+        let emb: Vec<f64> = (0..n * d).map(|i| ((i * 5 + 1) % 7) as f64 * 0.3 - 0.7).collect();
+
+        // Direct reference: row-normalize, sim=(x·xᵀ)/τ, loss_i =
+        // logsumexp(sim[i,:]) − sim[i, positive], positive = (i±n/2).
+        let nh = n / 2;
+        let mut norm = vec![0.0; n * d];
+        for i in 0..n {
+            let nrm = (0..d).map(|k| emb[i * d + k].powi(2)).sum::<f64>().sqrt().max(1e-12);
+            for k in 0..d {
+                norm[i * d + k] = emb[i * d + k] / nrm;
+            }
+        }
+        let mut want = 0.0;
+        for i in 0..n {
+            let mut row = vec![0.0; n];
+            for j in 0..n {
+                row[j] = (0..d).map(|k| norm[i * d + k] * norm[j * d + k]).sum::<f64>() / temperature;
+            }
+            let m = row.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+            let lse = m + row.iter().map(|&x| (x - m).exp()).sum::<f64>().ln();
+            let pos = if i < nh { i + nh } else { i - nh };
+            want += lse - row[pos];
+        }
+        want /= n as f64;
+
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let e = s.tensor_variable(emb.clone(), vec![n, d], true).unwrap();
+        let out = s.info_nce_loss(e, temperature).unwrap();
+        let got = s.tensor_values(out).unwrap();
+        assert!((got[0] - want).abs() < 1e-9, "info_nce forward {} vs {want}", got[0]);
+
+        let report = s.tensor_backward(out).unwrap();
+        let grad = s.tensor_gradient(&report, e).expect("info_nce must propagate gradient");
+        assert!(grad.iter().any(|g| g.abs() > 1e-6), "info_nce gradient must be non-trivial");
     }
 
     #[test]
@@ -99026,5 +101408,218 @@ mod tests {
         assert_eq!(s.tensor_shape(output).unwrap(), vec![2, 3, 5]);
         assert_eq!(s.tensor_shape(h_n).unwrap(), vec![1, 2, 5]);
         assert_eq!(s.tensor_shape(c_n).unwrap(), vec![1, 2, 5]);
+    }
+
+    /// Regression for frankentorch-c5g4: tensor_normalize (the eps-parameterized
+    /// F.normalize) divided [N,D] by an un-expanded [N,1] keepdim norm, which the
+    /// non-broadcasting tensor_div rejected — so it failed for EVERY [N,D]
+    /// along-dim-1 input (it had no test). Verify it now L2-normalizes rows
+    /// correctly across sizes, along dim 0, and propagates gradient.
+    #[test]
+    fn tensor_normalize_l2_rows_and_gradient() {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // [3,4] rows normalized along dim=1.
+        let v = vec![3.0, 4.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 6.0, 8.0, 0.0, 0.0];
+        let t = s.tensor_variable(v, vec![3, 4], false).unwrap();
+        let out = s.tensor_normalize(t, 2.0, 1, 1e-12).unwrap();
+        let g = s.tensor_values(out).unwrap();
+        // Row0 ||(3,4,0,0)||=5 -> (0.6,0.8,0,0); Row1 unit; Row2 ||(6,8)||=10 -> (0.6,0.8).
+        for (a, b) in g.iter().zip([0.6, 0.8, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.6, 0.8, 0.0, 0.0]) {
+            assert!((a - b).abs() < 1e-12, "normalize {a} vs {b}");
+        }
+        // dim=0 (columns) on a larger tensor must also work.
+        let big: Vec<f64> = (0..256 * 128).map(|i| (i % 97) as f64 + 0.5).collect();
+        let bt = s.tensor_variable(big, vec![256, 128], false).unwrap();
+        let bo = s.tensor_normalize(bt, 2.0, 0, 1e-12).unwrap();
+        assert_eq!(s.tensor_shape(bo).unwrap(), vec![256, 128]);
+
+        // Gradient flows (was severed/broken before).
+        let gt = s.tensor_variable(vec![3.0, 4.0], vec![1, 2], true).unwrap();
+        let go = s.tensor_normalize(gt, 2.0, 1, 1e-12).unwrap();
+        let loss = s.tensor_sum(go).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, gt).expect("normalize must propagate gradient");
+        assert!(grad.iter().any(|x| x.abs() > 1e-9), "gradient must be non-trivial");
+    }
+
+    /// frankentorch-3pvd: weight_standardization / filter_response_norm /
+    /// normalize_l2 / normalize_minmax / normalize_to_unit all fed a reduced
+    /// (keepdim or scalar) operand into an elementwise sub/div without expanding
+    /// it, so the non-broadcasting tensor_div/sub rejected EVERY real input with
+    /// a ShapeMismatch. They were untested. Verify each now produces the correct
+    /// values and propagates gradient.
+    #[test]
+    fn broadcast_normalization_ops_fixed() {
+        use super::FrankenTorchSession;
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+
+        // normalize_l2: each row has unit L2 norm.
+        let v: Vec<f64> = vec![3.0, 4.0, 5.0, 12.0, 6.0, 8.0];
+        let t = s.tensor_variable(v, vec![3, 2], false).unwrap();
+        let nl2 = s.normalize_l2(t, 1e-12).unwrap();
+        let g = s.tensor_values(nl2).unwrap();
+        for r in 0..3 {
+            let nrm = (g[r * 2].powi(2) + g[r * 2 + 1].powi(2)).sqrt();
+            assert!((nrm - 1.0).abs() < 1e-9, "normalize_l2 row {r} norm {nrm}");
+        }
+        assert!((g[0] - 0.6).abs() < 1e-9 && (g[1] - 0.8).abs() < 1e-9);
+
+        // normalize_minmax: min -> 0, max -> 1, all in [0,1].
+        let v2 = vec![2.0, 4.0, 8.0, 6.0];
+        let t2 = s.tensor_variable(v2, vec![2, 2], false).unwrap();
+        let nmm = s.normalize_minmax(t2, 0.0).unwrap();
+        let g2 = s.tensor_values(nmm).unwrap();
+        assert!((g2[0] - 0.0).abs() < 1e-9, "min->0 got {}", g2[0]); // 2 is min
+        assert!((g2[2] - 1.0).abs() < 1e-9, "max->1 got {}", g2[2]); // 8 is max
+        assert!((g2[1] - (4.0 - 2.0) / 6.0).abs() < 1e-9);
+
+        // normalize_to_unit: whole tensor has unit Frobenius norm.
+        let v3 = vec![3.0, 0.0, 0.0, 4.0];
+        let t3 = s.tensor_variable(v3, vec![2, 2], false).unwrap();
+        let ntu = s.normalize_to_unit(t3, 0.0).unwrap();
+        let g3 = s.tensor_values(ntu).unwrap();
+        let fro = g3.iter().map(|x| x * x).sum::<f64>().sqrt();
+        assert!((fro - 1.0).abs() < 1e-9, "normalize_to_unit frobenius {fro}");
+
+        // weight_standardization: each output channel (flattened) has ~zero mean.
+        let w = s.tensor_variable((0..2 * 4).map(|i| (i as f64) * 0.5 + 1.0).collect(), vec![2, 4], true).unwrap();
+        let ws = s.weight_standardization(w).unwrap();
+        let gw = s.tensor_values(ws).unwrap();
+        for co in 0..2 {
+            let m = (0..4).map(|j| gw[co * 4 + j]).sum::<f64>() / 4.0;
+            assert!(m.abs() < 1e-9, "weight_standardization channel {co} mean {m}");
+        }
+        // Gradient flows (was impossible — the op errored before backward).
+        let loss = s.tensor_sum(ws).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let grad = s.tensor_gradient(&report, w).expect("weight_standardization gradient");
+        assert_eq!(grad.len(), 8);
+
+        // filter_response_norm: runs and preserves shape on [N,C,H,W].
+        let x = s.tensor_variable((0..1 * 2 * 2 * 2).map(|i| (i + 1) as f64).collect(), vec![1, 2, 2, 2], false).unwrap();
+        let fr = s.filter_response_norm(x, 1e-6).unwrap();
+        assert_eq!(s.tensor_shape(fr).unwrap(), vec![1, 2, 2, 2]);
+    }
+
+    /// Elementwise binary ops now NumPy-broadcast size-1 / missing axes (the
+    /// engine inserts autograd-aware expand nodes). Verify forward values AND
+    /// that gradients reduce correctly over the broadcast axes (finite diff).
+    #[test]
+    fn elementwise_binary_ops_broadcast_forward_and_grad() {
+        use super::FrankenTorchSession;
+
+        // Forward: [2,3] op [3], [2,3] op [2,1], [2,3] op [1] (scalar).
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let at = s.tensor_variable(a.clone(), vec![2, 3], false).unwrap();
+            let bt = s.tensor_variable(vec![10.0, 20.0, 30.0], vec![3], false).unwrap();
+            let c = s.tensor_add(at, bt).unwrap();
+            assert_eq!(s.tensor_shape(c).unwrap(), vec![2, 3]);
+            assert_eq!(s.tensor_values(c).unwrap(), vec![11.0, 22.0, 33.0, 14.0, 25.0, 36.0]);
+
+            let bt2 = s.tensor_variable(vec![100.0, 200.0], vec![2, 1], false).unwrap();
+            let d = s.tensor_mul(at, bt2).unwrap();
+            assert_eq!(s.tensor_values(d).unwrap(), vec![100.0, 200.0, 300.0, 800.0, 1000.0, 1200.0]);
+
+            let sc = s.tensor_variable(vec![2.0], vec![1], false).unwrap();
+            let e = s.tensor_div(at, sc).unwrap();
+            assert_eq!(s.tensor_values(e).unwrap(), vec![0.5, 1.0, 1.5, 2.0, 2.5, 3.0]);
+        }
+
+        // Backward: c = sum(a * b), a[2,3], b[3] -> b broadcasts over rows, so
+        // db[j] = sum_i a[i,j]; da[i,j] = b[j]. Check both against finite diff.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let at = s.tensor_variable(a.clone(), vec![2, 3], true).unwrap();
+        let bv = vec![7.0, 11.0, 13.0];
+        let bt = s.tensor_variable(bv.clone(), vec![3], true).unwrap();
+        let prod = s.tensor_mul(at, bt).unwrap();
+        let loss = s.tensor_sum(prod).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let ga = s.tensor_gradient(&report, at).unwrap();
+        let gb = s.tensor_gradient(&report, bt).unwrap();
+        // da[i,j] = b[j]
+        assert_eq!(ga, vec![7.0, 11.0, 13.0, 7.0, 11.0, 13.0]);
+        // db[j] = sum_i a[i,j] = a[0,j] + a[1,j]
+        assert_eq!(gb, vec![1.0 + 4.0, 2.0 + 5.0, 3.0 + 6.0]);
+
+        // Finite-difference cross-check on b.
+        let eval = |bv: &[f64]| -> f64 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let at = s.tensor_variable(a.clone(), vec![2, 3], false).unwrap();
+            let bt = s.tensor_variable(bv.to_vec(), vec![3], false).unwrap();
+            let p = s.tensor_mul(at, bt).unwrap();
+            let l = s.tensor_sum(p).unwrap();
+            s.tensor_values(l).unwrap()[0]
+        };
+        let eps = 1e-6;
+        for j in 0..3 {
+            let mut up = bv.clone();
+            let mut dn = bv.clone();
+            up[j] += eps;
+            dn[j] -= eps;
+            let fd = (eval(&up) - eval(&dn)) / (2.0 * eps);
+            assert!((gb[j] - fd).abs() < 1e-6, "broadcast grad b[{j}]={} vs fd {fd}", gb[j]);
+        }
+    }
+
+    /// Coverage for the segmentation/detection losses dice/tversky/iou/focal,
+    /// which had NO tests. Verify each against an in-Rust reference of its
+    /// documented formula and that the gradient flows to the input.
+    #[test]
+    fn segmentation_losses_match_reference_and_propagate_gradient() {
+        use super::FrankenTorchSession;
+        let inp = vec![0.8_f64, 0.3, 0.6, 0.1];
+        let tgt = vec![1.0_f64, 0.0, 1.0, 0.0];
+        let shape = vec![1usize, 4];
+        let sum = |f: &dyn Fn(usize) -> f64| (0..4).map(f).sum::<f64>();
+
+        // dice: 1 - (2*TP + smooth)/(sum(i)+sum(t)+smooth)
+        let smooth = 1.0;
+        let tp = sum(&|k| inp[k] * tgt[k]);
+        let si: f64 = inp.iter().sum();
+        let st: f64 = tgt.iter().sum();
+        let dice_ref = 1.0 - (2.0 * tp + smooth) / (si + st + smooth);
+
+        // tversky(alpha,beta)
+        let (a, b) = (0.3, 0.7);
+        let fp = sum(&|k| inp[k] * (1.0 - tgt[k]));
+        let fnn = sum(&|k| (1.0 - inp[k]) * tgt[k]);
+        let tversky_ref = 1.0 - (tp + smooth) / (tp + a * fp + b * fnn + smooth);
+
+        // iou: 1 - (TP + smooth)/(union + smooth), union = si + st - TP
+        let iou_ref = 1.0 - (tp + smooth) / (si + st - tp + smooth);
+
+        // focal(alpha,gamma): mean(-alpha_t * (1-p_t)^g * log(p_t)), p = sigmoid(i)
+        let (al, g) = (0.25, 2.0);
+        let focal_ref = sum(&|k| {
+            let p = 1.0 / (1.0 + (-inp[k]).exp());
+            let p_t = tgt[k] * p + (1.0 - tgt[k]) * (1.0 - p);
+            let alpha_t = tgt[k] * al + (1.0 - tgt[k]) * (1.0 - al);
+            -alpha_t * (1.0 - p_t).powf(g) * p_t.max(1e-15).ln()
+        }) / 4.0;
+
+        let cases: [(&str, f64); 4] = [
+            ("dice", dice_ref),
+            ("tversky", tversky_ref),
+            ("iou", iou_ref),
+            ("focal", focal_ref),
+        ];
+        for (name, want) in cases {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let i = s.tensor_variable(inp.clone(), shape.clone(), true).unwrap();
+            let t = s.tensor_variable(tgt.clone(), shape.clone(), false).unwrap();
+            let out = match name {
+                "dice" => s.dice_loss(i, t, smooth).unwrap(),
+                "tversky" => s.tversky_loss(i, t, a, b, smooth).unwrap(),
+                "iou" => s.iou_loss(i, t, smooth).unwrap(),
+                _ => s.focal_loss(i, t, al, g).unwrap(),
+            };
+            let got = s.tensor_values(out).unwrap()[0];
+            assert!((got - want).abs() < 1e-10, "{name}_loss {got} vs ref {want}");
+            let report = s.tensor_backward(out).unwrap();
+            let grad = s.tensor_gradient(&report, i).unwrap_or_else(|| panic!("{name} gradient"));
+            assert!(grad.iter().any(|x| x.abs() > 1e-9), "{name} gradient must be non-trivial");
+        }
     }
 }

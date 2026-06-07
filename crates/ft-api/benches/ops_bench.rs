@@ -65,6 +65,248 @@ fn bench_bmm(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_max_pool3d(c: &mut Criterion) {
+    // max_pool3d (video/volumetric): [N,C,D,H,W]=[2,32,16,32,32], 2x2x2 stride 2.
+    let mut group = c.benchmark_group("max_pool3d");
+    let (n, ch, d, h, w) = (2usize, 32usize, 16usize, 32usize, 32usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ch, d, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)).unwrap()));
+    });
+    // F32 no-grad (dominant ML dtype): fused max_pool3d_forward_f32 vs the f32
+    // op-graph (narrow/amax/cat) it fell through to.
+    group.bench_function("nograd_f32", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ch * d * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let x = s.tensor_variable_f32(xv, vec![n, ch, d, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)).unwrap()));
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ch, d, h, w], true).unwrap();
+            let out = s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_pool1d_ct1d(c: &mut Criterion) {
+    // 1D sliding-window ops now routed through their fused 2D kernels (H=1).
+    let mut group = c.benchmark_group("conv1d_family");
+    // conv_transpose1d (audio upsampling): [N,C,L]=[4,64,256], k=4 stride 2.
+    group.bench_function("conv_transpose1d_grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![4, 64, 256], true).unwrap();
+            let w = s.tensor_randn(vec![64, 64, 4], true).unwrap();
+            let out = s.tensor_conv_transpose1d(x, w, None, 2, 1, 0).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    // max/avg_pool1d: [N,C,L]=[8,64,8192], k=2 stride 2.
+    group.bench_function("max_pool1d_grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![8, 64, 8192], true).unwrap();
+            let out = s.functional_max_pool1d(x, 2, 2).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.bench_function("avg_pool1d_grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![8, 64, 8192], true).unwrap();
+            let out = s.functional_avg_pool1d(x, 2, 2).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_avg_pool2d(c: &mut Criterion) {
+    // avg_pool2d (every CNN): [N,C,H,W]=[8,64,64,64], 2x2 stride 2. no-grad + grad.
+    let mut group = c.benchmark_group("avg_pool2d");
+    let (n, ch, h, w) = (8usize, 64usize, 64usize, 64usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ch, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true).unwrap()));
+    });
+    // F32 no-grad (dominant ML dtype): fused avg_pool2d_forward_f32 vs the f32
+    // op-graph (narrow/sum/div/cat, also upcast to f64) it fell through to.
+    group.bench_function("nograd_f32", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ch * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let x = s.tensor_variable_f32(xv, vec![n, ch, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true).unwrap()));
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ch, h, w], true).unwrap();
+            let out = s.functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_max_pool2d(c: &mut Criterion) {
+    // max_pool2d (every CNN): [N,C,H,W]=[8,64,64,64], 2x2 stride 2. no-grad + grad.
+    let mut group = c.benchmark_group("max_pool2d");
+    let (n, ch, h, w) = (8usize, 64usize, 64usize, 64usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ch, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_max_pool2d(x, (2, 2), (2, 2)).unwrap()));
+    });
+    // F32 no-grad (dominant ML dtype): fused max_pool2d_forward_f32 vs the f32
+    // op-graph (narrow/amax/cat, also upcast to f64) it fell through to.
+    group.bench_function("nograd_f32", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ch * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let x = s.tensor_variable_f32(xv, vec![n, ch, h, w], false).unwrap();
+        b.iter(|| black_box(s.functional_max_pool2d(x, (2, 2), (2, 2)).unwrap()));
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ch, h, w], true).unwrap();
+            let out = s.functional_max_pool2d(x, (2, 2), (2, 2)).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_conv_transpose2d(c: &mut Criterion) {
+    // conv_transpose2d (GAN/segmentation upsampling): [N,C,H,W]=[2,64,16,16],
+    // weight [C_in,C_out,3,3], stride 2 -> 2x upsample. no-grad + grad.
+    let mut group = c.benchmark_group("conv_transpose2d");
+    let (n, ic, oc, h, w, k) = (2usize, 16usize, 16usize, 16usize, 16usize, 3usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ic, h, w], false).unwrap();
+        let wt = s.tensor_randn(vec![ic, oc, k, k], false).unwrap();
+        b.iter(|| {
+            black_box(
+                s.tensor_conv_transpose2d(x, wt, None, (2, 2), (1, 1), (1, 1))
+                    .unwrap(),
+            )
+        });
+    });
+    // F32 no-grad (dominant ML dtype): fused conv_transpose2d_forward_f32 vs the
+    // O(kh*kw*ih) op-graph scatter (narrow/matmul/pad/add) it fell through to.
+    group.bench_function("nograd_f32", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ic * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let wv: Vec<f32> = (0..ic * oc * k * k)
+            .map(|i| (i % 97) as f32 * 0.002 - 0.1)
+            .collect();
+        let x = s.tensor_variable_f32(xv, vec![n, ic, h, w], false).unwrap();
+        let wt = s.tensor_variable_f32(wv, vec![ic, oc, k, k], false).unwrap();
+        b.iter(|| {
+            black_box(
+                s.tensor_conv_transpose2d(x, wt, None, (2, 2), (1, 1), (1, 1))
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ic, h, w], true).unwrap();
+            let wt = s.tensor_randn(vec![ic, oc, k, k], true).unwrap();
+            let out = s
+                .tensor_conv_transpose2d(x, wt, None, (2, 2), (1, 1), (1, 1))
+                .unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_conv3d(c: &mut Criterion) {
+    // conv3d (video/volumetric): [N,C,D,H,W]=[2,32,8,16,16], k=3^3 stride1 pad1.
+    let mut group = c.benchmark_group("conv3d");
+    let (n, ic, oc, d, h, w, k) = (2usize, 32usize, 32usize, 8usize, 16usize, 16usize, 3usize);
+    group.bench_function("nograd", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_randn(vec![n, ic, d, h, w], false).unwrap();
+        let wt = s.tensor_randn(vec![oc, ic, k, k, k], false).unwrap();
+        b.iter(|| black_box(s.tensor_conv3d(x, wt, None, (1, 1, 1), (1, 1, 1)).unwrap()));
+    });
+    // F32 no-grad (dominant ML dtype): fused conv3d_forward_f32 (im2col + sgemm_bt)
+    // vs the O(od*oh*ow) narrow/cat/bmm op-graph it fell through to.
+    group.bench_function("nograd_f32", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ic * d * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let wv: Vec<f32> = (0..oc * ic * k * k * k)
+            .map(|i| (i % 97) as f32 * 0.002 - 0.1)
+            .collect();
+        let x = s.tensor_variable_f32(xv, vec![n, ic, d, h, w], false).unwrap();
+        let wt = s.tensor_variable_f32(wv, vec![oc, ic, k, k, k], false).unwrap();
+        b.iter(|| black_box(s.tensor_conv3d(x, wt, None, (1, 1, 1), (1, 1, 1)).unwrap()));
+    });
+    group.bench_function("grad", |b| {
+        b.iter(|| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ic, d, h, w], true).unwrap();
+            let wt = s.tensor_randn(vec![oc, ic, k, k, k], true).unwrap();
+            let out = s.tensor_conv3d(x, wt, None, (1, 1, 1), (1, 1, 1)).unwrap();
+            let loss = s.tensor_sum(out).unwrap();
+            black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_conv1d(c: &mut Criterion) {
+    // conv1d (audio/sequence): [N,C,L]=[8,64,L], k=3 stride1 pad1, no-grad + grad.
+    let mut group = c.benchmark_group("conv1d");
+    let (n, ic, oc, k) = (8usize, 64usize, 64usize, 3usize);
+    for l in [1024usize, 4096].iter() {
+        let l = *l;
+        group.bench_with_input(BenchmarkId::new("nograd_L", l), &l, |b, &l| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ic, l], false).unwrap();
+            let w = s.tensor_randn(vec![oc, ic, k], false).unwrap();
+            b.iter(|| black_box(s.tensor_conv1d(x, w, None, 1, 1).unwrap()));
+        });
+        group.bench_with_input(BenchmarkId::new("grad_L", l), &l, |b, &l| {
+            b.iter(|| {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_randn(vec![n, ic, l], true).unwrap();
+                let w = s.tensor_randn(vec![oc, ic, k], true).unwrap();
+                let out = s.tensor_conv1d(x, w, None, 1, 1).unwrap();
+                let loss = s.tensor_sum(out).unwrap();
+                black_box(s.tensor_backward(loss).unwrap())
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_conv2d(c: &mut Criterion) {
     let mut group = c.benchmark_group("conv2d");
 
@@ -84,6 +326,34 @@ fn bench_conv2d(c: &mut Criterion) {
                 .unwrap();
             let weight = session
                 .tensor_randn(vec![out_ch, in_ch, kh, kw], false)
+                .unwrap();
+            b.iter(|| {
+                black_box(
+                    session
+                        .tensor_conv2d(input, weight, None, (1, 1), (1, 1))
+                        .unwrap(),
+                )
+            });
+        });
+    }
+    // F32 no-grad (the dominant ML dtype): exercises the fused conv2d_forward_f32,
+    // replacing the serial im2col gather + tensor_matmul the f32 path fell to.
+    for hw in [32, 64, 128].iter() {
+        let h = *hw;
+        let (batch, in_ch, out_ch, kh, kw) = (4usize, 64usize, 64usize, 3usize, 3usize);
+        group.bench_with_input(BenchmarkId::new("f32_hw", h), &h, |b, &h| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let iv: Vec<f32> = (0..batch * in_ch * h * h)
+                .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+                .collect();
+            let wv: Vec<f32> = (0..out_ch * in_ch * kh * kw)
+                .map(|i| (i % 97) as f32 * 0.002 - 0.1)
+                .collect();
+            let input = session
+                .tensor_variable_f32(iv, vec![batch, in_ch, h, h], false)
+                .unwrap();
+            let weight = session
+                .tensor_variable_f32(wv, vec![out_ch, in_ch, kh, kw], false)
                 .unwrap();
             b.iter(|| {
                 black_box(
@@ -126,6 +396,20 @@ fn bench_sum(c: &mut Criterion) {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = session.tensor_randn(vec![n], false).unwrap();
             b.iter(|| black_box(session.tensor_sum(x).unwrap()));
+        });
+    }
+    group.finish();
+}
+
+fn bench_norm(c: &mut Criterion) {
+    let mut group = c.benchmark_group("norm");
+    for size in [100000, 1000000].iter() {
+        let n = *size;
+        group.throughput(Throughput::Elements(n as u64));
+        group.bench_with_input(BenchmarkId::new("l2", n), &n, |b, &n| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session.tensor_randn(vec![n], false).unwrap();
+            b.iter(|| black_box(session.tensor_norm(x, 2.0).unwrap()));
         });
     }
     group.finish();
@@ -246,6 +530,26 @@ fn bench_layer_norm(c: &mut Criterion) {
             )
         });
     });
+    // F32 no-grad (dominant ML dtype): fused layer_norm_forward_f32 vs the f32
+    // op-graph (which also upcast to f64) it fell through to.
+    group.bench_function("nograd_f32_2048x1024", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let wv: Vec<f32> = (0..hidden).map(|j| 1.0 + (j % 17) as f32 * 0.01).collect();
+        let bv: Vec<f32> = (0..hidden).map(|j| (j % 13) as f32 * 0.005 - 0.03).collect();
+        let x = session.tensor_variable_f32(xv, vec![rows, hidden], false).unwrap();
+        let w = session.tensor_variable_f32(wv, vec![hidden], false).unwrap();
+        let bias = session.tensor_variable_f32(bv, vec![hidden], false).unwrap();
+        b.iter(|| {
+            black_box(
+                session
+                    .functional_layer_norm(x, vec![hidden], Some(w), Some(bias), 1e-5)
+                    .unwrap(),
+            )
+        });
+    });
     // Forward + backward (training): exercises the fused grad LayerNorm op.
     group.bench_function("grad_2048x1024", |b| {
         b.iter(|| {
@@ -278,6 +582,38 @@ fn bench_batch_norm(c: &mut Criterion) {
                 .unwrap();
             let wt = session.tensor_randn(vec![ch], false).unwrap();
             let bias = session.tensor_randn(vec![ch], false).unwrap();
+            b.iter(|| {
+                black_box(
+                    session
+                        .functional_batch_norm2d(
+                            x, Some(rm), Some(rv), Some(wt), Some(bias), training, 0.1, 1e-5,
+                        )
+                        .unwrap(),
+                )
+            });
+        });
+    }
+    // F32 no-grad (dominant ML dtype): fused batch_norm_stats_f32 + apply_f32 vs
+    // the f32 op-graph (two permutes + ~10 nodes, also upcast to f64).
+    for (label, training) in [("train", true), ("eval", false)] {
+        group.bench_function(format!("nograd_f32_{label}_32x256x28x28"), |b| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let xv: Vec<f32> = (0..n * ch * h * w)
+                .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+                .collect();
+            let x = session.tensor_variable_f32(xv, vec![n, ch, h, w], false).unwrap();
+            let rm = session
+                .tensor_variable_f32(vec![0.0f32; ch], vec![ch], false)
+                .unwrap();
+            let rv = session
+                .tensor_variable_f32(vec![1.0f32; ch], vec![ch], false)
+                .unwrap();
+            let wt = session
+                .tensor_variable_f32((0..ch).map(|j| 0.8 + (j % 17) as f32 * 0.01).collect(), vec![ch], false)
+                .unwrap();
+            let bias = session
+                .tensor_variable_f32(vec![0.0f32; ch], vec![ch], false)
+                .unwrap();
             b.iter(|| {
                 black_box(
                     session
@@ -368,6 +704,26 @@ fn bench_group_norm(c: &mut Criterion) {
         let x = session.tensor_randn(vec![n, ch, h, w], false).unwrap();
         let wt = session.tensor_randn(vec![ch], false).unwrap();
         let bias = session.tensor_randn(vec![ch], false).unwrap();
+        b.iter(|| {
+            black_box(
+                session
+                    .functional_group_norm(x, groups, Some(wt), Some(bias), 1e-5)
+                    .unwrap(),
+            )
+        });
+    });
+    // F32 no-grad (dominant ML dtype): fused group_norm_forward_f32 vs the f32
+    // op-graph (which also upcast to f64) it fell through to.
+    group.bench_function("nograd_f32_32x256x28x28", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..n * ch * h * w)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let wv: Vec<f32> = (0..ch).map(|j| 0.8 + (j % 17) as f32 * 0.01).collect();
+        let bv: Vec<f32> = (0..ch).map(|j| (j % 13) as f32 * 0.005 - 0.03).collect();
+        let x = session.tensor_variable_f32(xv, vec![n, ch, h, w], false).unwrap();
+        let wt = session.tensor_variable_f32(wv, vec![ch], false).unwrap();
+        let bias = session.tensor_variable_f32(bv, vec![ch], false).unwrap();
         b.iter(|| {
             black_box(
                 session
@@ -472,6 +828,24 @@ fn bench_rms_norm(c: &mut Criterion) {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session.tensor_randn(vec![rows, hidden], false).unwrap();
         let w = session.tensor_randn(vec![hidden], false).unwrap();
+        b.iter(|| {
+            black_box(
+                session
+                    .functional_rms_norm(x, vec![hidden], Some(w), 1e-6)
+                    .unwrap(),
+            )
+        });
+    });
+    // F32 no-grad (dominant ML dtype): fused rms_norm_forward_f32 vs the f32
+    // op-graph (which also upcast to f64) it fell through to.
+    group.bench_function("nograd_f32_2048x1024", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|i| (i % 251) as f32 * 0.001 - 0.12)
+            .collect();
+        let wv: Vec<f32> = (0..hidden).map(|j| 0.8 + (j % 17) as f32 * 0.01).collect();
+        let x = session.tensor_variable_f32(xv, vec![rows, hidden], false).unwrap();
+        let w = session.tensor_variable_f32(wv, vec![hidden], false).unwrap();
         b.iter(|| {
             black_box(
                 session
@@ -748,6 +1122,65 @@ fn bench_supcon_loss(c: &mut Criterion) {
         let labels = session.tensor_variable(labels_v, vec![n], false).unwrap();
         b.iter(|| black_box(session.supcon_loss(black_box(emb), black_box(labels), 0.07).unwrap()));
     });
+    // Same-binary A/B baseline: the pre-fusion op-graph (L2-normalize + gram
+    // matmul + two [N,N] mask leaves + masked log-sum-exp + masked positive-mean
+    // + reduction), reproduced inline with requires_grad=false inputs so the only
+    // difference from "512x512" is the fused no-grad kernel.
+    group.bench_function("512x512_opgraph", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let emb = session.tensor_randn(vec![n, d], false).unwrap();
+        let labels_v: Vec<f64> = (0..n).map(|i| (i % 8) as f64).collect();
+        let temperature = 0.07_f64;
+        b.iter(|| {
+            let labels_i: Vec<i64> = labels_v.iter().map(|&x| x as i64).collect();
+            let mut pos_mask = vec![0.0f64; n * n];
+            let mut diag_mask = vec![0.0f64; n * n];
+            let mut pos_count = vec![0.0f64; n];
+            let mut valid = vec![0.0f64; n];
+            let mut count = 0usize;
+            for i in 0..n {
+                diag_mask[i * n + i] = -1e30;
+                let mut cc = 0.0;
+                for j in 0..n {
+                    if i != j && labels_i[i] == labels_i[j] {
+                        pos_mask[i * n + j] = 1.0;
+                        cc += 1.0;
+                    }
+                }
+                pos_count[i] = cc;
+                if cc > 0.0 {
+                    valid[i] = 1.0;
+                    count += 1;
+                }
+            }
+            let pos_count_safe: Vec<f64> = pos_count.iter().map(|&c| c.max(1.0)).collect();
+            let s = &mut session;
+            let sq = s.tensor_mul(emb, emb).unwrap();
+            let sumsq = s.tensor_sum_dim(sq, 1).unwrap();
+            let norm = s.tensor_sqrt(sumsq).unwrap();
+            let norm_safe = s.tensor_clamp_min(norm, 1e-12).unwrap();
+            let norm_col = s.tensor_unsqueeze(norm_safe, 1).unwrap();
+            let norm_exp = s.tensor_expand(norm_col, vec![n, d]).unwrap();
+            let normalized = s.tensor_div(emb, norm_exp).unwrap();
+            let normalized_t = s.tensor_transpose(normalized, 0, 1).unwrap();
+            let gram = s.tensor_matmul(normalized, normalized_t).unwrap();
+            let sim = s.tensor_mul_scalar(gram, 1.0 / temperature).unwrap();
+            let diag_t = s.tensor_variable(diag_mask, vec![n, n], false).unwrap();
+            let sim_masked = s.tensor_add(sim, diag_t).unwrap();
+            let log_denom = s.tensor_logsumexp(sim_masked, 1).unwrap();
+            let pos_t = s.tensor_variable(pos_mask, vec![n, n], false).unwrap();
+            let masked_sim = s.tensor_mul(sim, pos_t).unwrap();
+            let num = s.tensor_sum_dim(masked_sim, 1).unwrap();
+            let pos_count_t = s.tensor_variable(pos_count_safe, vec![n], false).unwrap();
+            let mean_pos = s.tensor_div(num, pos_count_t).unwrap();
+            let term = s.tensor_sub(mean_pos, log_denom).unwrap();
+            let valid_t = s.tensor_variable(valid, vec![n], false).unwrap();
+            let masked_term = s.tensor_mul(term, valid_t).unwrap();
+            let summed = s.tensor_sum(masked_term).unwrap();
+            let scaled = s.tensor_mul_scalar(summed, -1.0 / count as f64).unwrap();
+            black_box(s.tensor_reshape(scaled, vec![1]).unwrap());
+        });
+    });
     group.finish();
 }
 
@@ -984,8 +1417,16 @@ criterion_group!(
     benches,
     bench_matmul,
     bench_bmm,
+    bench_conv1d,
     bench_conv2d,
+    bench_conv3d,
+    bench_conv_transpose2d,
+    bench_max_pool2d,
+    bench_avg_pool2d,
+    bench_max_pool3d,
+    bench_pool1d_ct1d,
     bench_sum,
+    bench_norm,
     bench_softmax,
     bench_relu,
     bench_exp,

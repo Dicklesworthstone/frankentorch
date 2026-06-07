@@ -126,13 +126,17 @@ fn apply_param_update(
     param: TensorNodeId,
     update: &[f64],
 ) -> Result<(), AutogradError> {
-    let param_values = session.tensor_values(param)?;
-    let new_values: Vec<f64> = param_values
-        .iter()
-        .zip(update.iter())
-        .map(|(p, u)| p - u)
-        .collect();
-    session.tensor_update_param_values(param, new_values)
+    // In-place `param -= update` via the zero-copy update API: mutate the live
+    // parameter storage directly instead of cloning it out, allocating a fresh
+    // `new_values` Vec, and cloning it back in. Bit-for-bit identical
+    // (`*p -= u` == `new = p - u`); removes one full param clone + one alloc
+    // per call. Every optimizer routed through this helper (SGD, RMSprop,
+    // Adagrad, Adadelta, Adamax, NAdam, RAdam, ...) benefits at once.
+    session.tensor_update_param_values_f64_with(param, |param_values| {
+        for (p, u) in param_values.iter_mut().zip(update.iter()) {
+            *p -= *u;
+        }
+    })
 }
 
 /// Trait for parameter optimizers.
@@ -313,7 +317,6 @@ impl Optimizer for SGD {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -474,56 +477,59 @@ impl Optimizer for Adam {
             let t =
                 advance_param_step_count(&mut self.step_counts, i, "adam step counter overflow")?;
 
-            let param_values = session.tensor_values(param)?;
-            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
-            let mut effective_grad = grad;
+            // Single fused in-place pass: load the parameter buffer once, fold the
+            // weight-decayed gradient into the m/v moment updates and the parameter
+            // step in one traversal, then write the mutated buffer straight back.
+            // This avoids the second full param clone + the `update`/`new_values`
+            // scratch Vecs that the per-pass `apply_param_update` path allocated.
+            // Bit-for-bit identical per element to the prior multi-pass form (same
+            // ops, same order): the prior code computed `effective_grad`, then
+            // `m`, then `v`, then `update = lr*m_hat/(sqrt(v_hat)+eps)`, then
+            // `param -= update`; each element here applies exactly those steps.
+            let param_len = session.tensor_values_len(param)?;
+            ensure_grad_len_matches_param(param, param_len, grad.len())?;
 
-            // Apply weight decay
-            if self.weight_decay != 0.0 {
-                for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
-                    *g += self.weight_decay * p;
-                }
-            }
-
-            // Update biased first moment estimate: m = beta1 * m + (1 - beta1) * grad
-            let m = self.m[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
-            ensure_state_len(
-                effective_grad.len(),
-                m.len(),
-                "adam first-moment state length mismatch with gradient length",
-            )?;
-            for (m_val, g) in m.iter_mut().zip(effective_grad.iter()) {
-                *m_val = self.beta1 * *m_val + (1.0 - self.beta1) * g;
-            }
-
-            // Update biased second raw moment estimate: v = beta2 * v + (1 - beta2) * grad^2
-            let v = self.v[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
-            ensure_state_len(
-                effective_grad.len(),
-                v.len(),
-                "adam second-moment state length mismatch with gradient length",
-            )?;
-            for (v_val, g) in v.iter_mut().zip(effective_grad.iter()) {
-                *v_val = self.beta2 * *v_val + (1.0 - self.beta2) * g * g;
-            }
-
-            // Bias-corrected estimates
             let bias_correction1 = adam_bias_correction(self.beta1, t);
             let bias_correction2 = adam_bias_correction(self.beta2, t);
 
-            // Compute update: lr * m_hat / (sqrt(v_hat) + eps)
-            let update: Vec<f64> = m
-                .iter()
-                .zip(v.iter())
-                .map(|(m_val, v_val)| {
-                    let m_hat = m_val / bias_correction1;
-                    let v_hat = v_val / bias_correction2;
-                    self.lr * m_hat / (v_hat.sqrt() + self.eps)
-                })
-                .collect();
+            let m = self.m[i].get_or_insert_with(|| vec![0.0; grad.len()]);
+            ensure_state_len(
+                grad.len(),
+                m.len(),
+                "adam first-moment state length mismatch with gradient length",
+            )?;
+            let v = self.v[i].get_or_insert_with(|| vec![0.0; grad.len()]);
+            ensure_state_len(
+                grad.len(),
+                v.len(),
+                "adam second-moment state length mismatch with gradient length",
+            )?;
 
-            apply_param_update(session, param, &update)?;
+            let beta1 = self.beta1;
+            let beta2 = self.beta2;
+            let lr = self.lr;
+            let eps = self.eps;
+            let weight_decay = self.weight_decay;
+            session.tensor_update_param_values_f64_with(param, |param_values| {
+                for (((p, g), m_val), v_val) in param_values
+                    .iter_mut()
+                    .zip(grad.iter())
+                    .zip(m.iter_mut())
+                    .zip(v.iter_mut())
+                {
+                    // Weight decay (L2): grad += weight_decay * param (original param).
+                    let g_eff = if weight_decay != 0.0 {
+                        g + weight_decay * *p
+                    } else {
+                        *g
+                    };
+                    *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
+                    *v_val = beta2 * *v_val + (1.0 - beta2) * g_eff * g_eff;
+                    let m_hat = *m_val / bias_correction1;
+                    let v_hat = *v_val / bias_correction2;
+                    *p -= lr * m_hat / (v_hat.sqrt() + eps);
+                }
+            })?;
         }
         Ok(())
     }
@@ -643,9 +649,8 @@ impl Optimizer for AdamW {
                 .ok_or_else(|| optimizer_state_error("optimizer step state length mismatch"))?;
             let t = checked_next_step_count(current_step, "adamw step counter overflow")?;
 
-            let mut param_values = session.tensor_values(param)?;
-            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
+            let param_len = session.tensor_values_len(param)?;
+            ensure_grad_len_matches_param(param, param_len, grad.len())?;
 
             // Bias-corrected estimates
             let bias_correction1 = adam_bias_correction(self.beta1, t);
@@ -658,106 +663,113 @@ impl Optimizer for AdamW {
             let mut next_m = Vec::with_capacity(grad.len());
             let mut next_v = Vec::with_capacity(grad.len());
 
-            match (&self.m[i], &self.v[i]) {
-                (Some(m), Some(v)) => {
-                    ensure_state_len(
-                        grad.len(),
-                        m.len(),
-                        "adamw first-moment state length mismatch with gradient length",
-                    )?;
-                    ensure_state_len(
-                        grad.len(),
-                        v.len(),
-                        "adamw second-moment state length mismatch with gradient length",
-                    )?;
-                    for (((p, g), m_prev), v_prev) in param_values
-                        .iter_mut()
-                        .zip(grad.iter())
-                        .zip(m.iter())
-                        .zip(v.iter())
-                    {
-                        let m_val = self.beta1 * m_prev + (1.0 - self.beta1) * g;
-                        let v_val = self.beta2 * v_prev + (1.0 - self.beta2) * g * g;
-                        let m_hat = m_val / bias_correction1;
-                        let v_hat = v_val / bias_correction2;
-                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                        let decay_delta = if self.weight_decay == 0.0 {
-                            0.0
-                        } else {
-                            *p * self.lr * self.weight_decay
-                        };
-                        *p -= decay_delta + adam_delta;
-                        next_m.push(m_val);
-                        next_v.push(v_val);
-                    }
-                }
-                (Some(m), None) => {
-                    ensure_state_len(
-                        grad.len(),
-                        m.len(),
-                        "adamw first-moment state length mismatch with gradient length",
-                    )?;
-                    for ((p, g), m_prev) in param_values.iter_mut().zip(grad.iter()).zip(m.iter()) {
-                        let m_val = self.beta1 * m_prev + (1.0 - self.beta1) * g;
-                        let v_val = (1.0 - self.beta2) * g * g;
-                        let m_hat = m_val / bias_correction1;
-                        let v_hat = v_val / bias_correction2;
-                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                        let decay_delta = if self.weight_decay == 0.0 {
-                            0.0
-                        } else {
-                            *p * self.lr * self.weight_decay
-                        };
-                        *p -= decay_delta + adam_delta;
-                        next_m.push(m_val);
-                        next_v.push(v_val);
-                    }
-                }
-                (None, Some(v)) => {
-                    ensure_state_len(
-                        grad.len(),
-                        v.len(),
-                        "adamw second-moment state length mismatch with gradient length",
-                    )?;
-                    for ((p, g), v_prev) in param_values.iter_mut().zip(grad.iter()).zip(v.iter()) {
-                        let m_val = (1.0 - self.beta1) * g;
-                        let v_val = self.beta2 * v_prev + (1.0 - self.beta2) * g * g;
-                        let m_hat = m_val / bias_correction1;
-                        let v_hat = v_val / bias_correction2;
-                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                        let decay_delta = if self.weight_decay == 0.0 {
-                            0.0
-                        } else {
-                            *p * self.lr * self.weight_decay
-                        };
-                        *p -= decay_delta + adam_delta;
-                        next_m.push(m_val);
-                        next_v.push(v_val);
-                    }
-                }
-                (None, None) => {
-                    for (p, g) in param_values.iter_mut().zip(grad.iter()) {
-                        let m_val = (1.0 - self.beta1) * g;
-                        let v_val = (1.0 - self.beta2) * g * g;
-                        let m_hat = m_val / bias_correction1;
-                        let v_hat = v_val / bias_correction2;
-                        let adam_delta = self.lr * m_hat / (v_hat.sqrt() + self.eps);
-                        let decay_delta = if self.weight_decay == 0.0 {
-                            0.0
-                        } else {
-                            *p * self.lr * self.weight_decay
-                        };
-                        *p -= decay_delta + adam_delta;
-                        next_m.push(m_val);
-                        next_v.push(v_val);
-                    }
-                }
+            let m_state = self.m[i].as_deref();
+            let v_state = self.v[i].as_deref();
+            if let Some(m) = m_state {
+                ensure_state_len(
+                    grad.len(),
+                    m.len(),
+                    "adamw first-moment state length mismatch with gradient length",
+                )?;
             }
+            if let Some(v) = v_state {
+                ensure_state_len(
+                    grad.len(),
+                    v.len(),
+                    "adamw second-moment state length mismatch with gradient length",
+                )?;
+            }
+
+            let beta1 = self.beta1;
+            let beta2 = self.beta2;
+            let lr = self.lr;
+            let eps = self.eps;
+            let weight_decay = self.weight_decay;
+            session.tensor_update_param_values_f64_with(param, |param_values| {
+                match (m_state, v_state) {
+                    (Some(m), Some(v)) => {
+                        for (((p, g), m_prev), v_prev) in param_values
+                            .iter_mut()
+                            .zip(grad.iter())
+                            .zip(m.iter())
+                            .zip(v.iter())
+                        {
+                            let m_val = beta1 * m_prev + (1.0 - beta1) * g;
+                            let v_val = beta2 * v_prev + (1.0 - beta2) * g * g;
+                            let m_hat = m_val / bias_correction1;
+                            let v_hat = v_val / bias_correction2;
+                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
+                            let decay_delta = if weight_decay == 0.0 {
+                                0.0
+                            } else {
+                                *p * lr * weight_decay
+                            };
+                            *p -= decay_delta + adam_delta;
+                            next_m.push(m_val);
+                            next_v.push(v_val);
+                        }
+                    }
+                    (Some(m), None) => {
+                        for ((p, g), m_prev) in
+                            param_values.iter_mut().zip(grad.iter()).zip(m.iter())
+                        {
+                            let m_val = beta1 * m_prev + (1.0 - beta1) * g;
+                            let v_val = (1.0 - beta2) * g * g;
+                            let m_hat = m_val / bias_correction1;
+                            let v_hat = v_val / bias_correction2;
+                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
+                            let decay_delta = if weight_decay == 0.0 {
+                                0.0
+                            } else {
+                                *p * lr * weight_decay
+                            };
+                            *p -= decay_delta + adam_delta;
+                            next_m.push(m_val);
+                            next_v.push(v_val);
+                        }
+                    }
+                    (None, Some(v)) => {
+                        for ((p, g), v_prev) in
+                            param_values.iter_mut().zip(grad.iter()).zip(v.iter())
+                        {
+                            let m_val = (1.0 - beta1) * g;
+                            let v_val = beta2 * v_prev + (1.0 - beta2) * g * g;
+                            let m_hat = m_val / bias_correction1;
+                            let v_hat = v_val / bias_correction2;
+                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
+                            let decay_delta = if weight_decay == 0.0 {
+                                0.0
+                            } else {
+                                *p * lr * weight_decay
+                            };
+                            *p -= decay_delta + adam_delta;
+                            next_m.push(m_val);
+                            next_v.push(v_val);
+                        }
+                    }
+                    (None, None) => {
+                        for (p, g) in param_values.iter_mut().zip(grad.iter()) {
+                            let m_val = (1.0 - beta1) * g;
+                            let v_val = (1.0 - beta2) * g * g;
+                            let m_hat = m_val / bias_correction1;
+                            let v_hat = v_val / bias_correction2;
+                            let adam_delta = lr * m_hat / (v_hat.sqrt() + eps);
+                            let decay_delta = if weight_decay == 0.0 {
+                                0.0
+                            } else {
+                                *p * lr * weight_decay
+                            };
+                            *p -= decay_delta + adam_delta;
+                            next_m.push(m_val);
+                            next_v.push(v_val);
+                        }
+                    }
+                }
+            })?;
 
             debug_assert_eq!(next_m.len(), grad.len());
             debug_assert_eq!(next_v.len(), grad.len());
 
-            session.tensor_update_param_values(param, param_values)?;
             self.step_counts[i] = t;
             self.m[i] = Some(next_m);
             self.v[i] = Some(next_v);
@@ -905,7 +917,6 @@ impl Optimizer for RMSprop {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -1102,7 +1113,6 @@ impl Optimizer for Adagrad {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -1257,7 +1267,6 @@ impl Optimizer for RAdam {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             // Apply weight decay: grad += weight_decay * param
@@ -4313,7 +4322,6 @@ impl Optimizer for Adadelta {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             if self.weight_decay != 0.0 {
@@ -4505,7 +4513,6 @@ impl Optimizer for NAdam {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             if self.weight_decay != 0.0 {
@@ -4679,7 +4686,6 @@ impl Optimizer for ASGD {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
             let mut effective_grad = grad;
 
             if self.weight_decay != 0.0 {
@@ -4832,7 +4838,6 @@ impl Optimizer for Rprop {
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let _param_shape = session.tensor_values_meta(param)?.1.shape().to_vec();
 
             let steps = self.step_sizes[i].get_or_insert_with(|| vec![self.lr; grad.len()]);
             ensure_state_len(
@@ -6210,6 +6215,67 @@ mod tests {
             (b_val - (-2.4)).abs() < 1e-10,
             "expected b=-2.4, got {}",
             b_val
+        );
+    }
+
+    #[test]
+    fn adam_first_step_matches_exact_float_bits() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let initial = vec![1.0, -2.0, 4.0];
+        let x = session
+            .tensor_variable(initial.clone(), vec![3], true)
+            .expect("variable should succeed");
+        let mut optimizer = Adam::new(vec![x], 0.125)
+            .betas(0.8, 0.9)
+            .eps(1e-6)
+            .weight_decay(0.01);
+
+        let loss_sum = session.tensor_sum(x).expect("sum should succeed");
+        let report = session
+            .tensor_backward(loss_sum)
+            .expect("backward should succeed");
+        optimizer
+            .step(&mut session, &report)
+            .expect("step should succeed");
+
+        let mut expected = initial;
+        let mut expected_m = Vec::with_capacity(expected.len());
+        let mut expected_v = Vec::with_capacity(expected.len());
+        let bias_correction1 = 1.0 - 0.8f64.powf(1.0);
+        let bias_correction2 = 1.0 - 0.9f64.powf(1.0);
+        for p in &mut expected {
+            let g_eff = 1.0 + 0.01 * *p;
+            let m_val = 0.8 * 0.0 + (1.0 - 0.8) * g_eff;
+            let v_val = 0.9 * 0.0 + (1.0 - 0.9) * g_eff * g_eff;
+            let m_hat = m_val / bias_correction1;
+            let v_hat = v_val / bias_correction2;
+            *p -= 0.125 * m_hat / (v_hat.sqrt() + 1e-6);
+            expected_m.push(m_val);
+            expected_v.push(v_val);
+        }
+
+        let actual = session.tensor_values(x).expect("values should resolve");
+        assert_eq!(
+            actual.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            optimizer.m[0]
+                .as_deref()
+                .expect("m should be initialized")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected_m.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert_eq!(
+            optimizer.v[0]
+                .as_deref()
+                .expect("v should be initialized")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            expected_v.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
     }
 

@@ -1,0 +1,11 @@
+frankentorch-a9ry eigvalsh_golden
+n=8
+eigenvalue_bits:
+0: 0x4018781f83ba51d9
+1: 0x401c2c4bccf5b598
+2: 0x401dcdcc1fdd4c70
+3: 0x401ffe4ba7799673
+4: 0x4020457906880639
+5: 0x4021fa9838ba11d7
+6: 0x402288571a06bba8
+7: 0x4022986ca1deb92d

@@ -1,0 +1,1 @@
+artifacts/optimization/golden_outputs/ft_serialize_f32_save_bulk_pass26.txt: OK

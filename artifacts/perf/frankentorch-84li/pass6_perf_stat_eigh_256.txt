@@ -1,0 +1,4 @@
+  [2m2026-06-05T22:07:48.967292Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: bash -lc 'perf stat -e cycles,instructions,cache-misses cargo bench -p ft-kernel-cpu --bench linalg_bench -- eigh_f64_256x256 --profile-time 5'[0m
+    [2;3mat[0m rch/src/hook.rs:402 [2;3mon[0m ThreadId(1)
+
+[RCH] remote required; refusing local fallback (non-compilation command)

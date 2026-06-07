@@ -1,0 +1,25 @@
+  [2m2026-06-06T00:05:38.179379Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: cargo fmt -p ft-kernel-cpu --check[0m
+    [2;3mat[0m rch/src/hook.rs:402 [2;3mon[0m ThreadId(1)
+
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/benches/linalg_bench.rs:8:
+ use ft_kernel_cpu::{
+     cholesky_contiguous_f64, det_contiguous_f64, eig_contiguous_f64, eigh_contiguous_f64,
+     eigvals_contiguous_f64, eigvalsh_contiguous_f64, inv_tensor_contiguous_f64,
+[31m-    lobpcg_contiguous_f64, matrix_exp_contiguous_f64, qr_contiguous_f64,
+[m[31m-    svd_contiguous_f64, svd_lowrank_contiguous_f64, svdvals_contiguous_f64,
+[m[31m-    symmetric_rank2k_lower_update_f64,
+[m[32m+    lobpcg_contiguous_f64, matrix_exp_contiguous_f64, qr_contiguous_f64, svd_contiguous_f64,
+[m[32m+    svd_lowrank_contiguous_f64, svdvals_contiguous_f64, symmetric_rank2k_lower_update_f64,
+[m };
+ 
+ fn symmetric_rank2k_lower_update_scalar(n: usize, k: usize, v: &[f64], w: &[f64], a: &mut [f64]) {
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:15636:
+             for col in 0..=row {
+                 let mut update = 0.0;
+                 for p in 0..k {
+[31m-                    update += v[row * k + p] * w[col * k + p]
+[m[31m-                        + w[row * k + p] * v[col * k + p];
+[m[32m+                    update += v[row * k + p] * w[col * k + p] + w[row * k + p] * v[col * k + p];
+[m                 }
+                 expected[row * n + col] -= update;
+             }

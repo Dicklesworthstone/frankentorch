@@ -1,0 +1,1 @@
+artifacts/optimization/golden_outputs/ft_serialize_f64_save_bulk_frankentorch-kgs4-37.txt: OK

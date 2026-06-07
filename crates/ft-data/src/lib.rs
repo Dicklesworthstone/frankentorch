@@ -252,6 +252,67 @@ fn finite_threshold_cmp(threshold: f64, sample: f64) -> std::cmp::Ordering {
     }
 }
 
+fn threshold_binary_index(cumulative: &[f64], sample: f64) -> usize {
+    match cumulative.binary_search_by(|c| finite_threshold_cmp(*c, sample)) {
+        Ok(i) => i,
+        Err(i) => i.min(cumulative.len() - 1),
+    }
+}
+
+struct ThresholdBucketIndex {
+    starts: Vec<usize>,
+}
+
+impl ThresholdBucketIndex {
+    const MIN_THRESHOLDS: usize = 64;
+    const MAX_BUCKETS: usize = 4096;
+    const MAX_BUCKET_SPAN: usize = 64;
+
+    fn new(cumulative: &[f64]) -> Option<Self> {
+        if cumulative.len() < Self::MIN_THRESHOLDS || cumulative.windows(2).any(|w| w[0] >= w[1]) {
+            return None;
+        }
+
+        let bucket_count = cumulative.len().min(Self::MAX_BUCKETS);
+        let inv_bucket_count = 1.0 / bucket_count as f64;
+        let mut starts = Vec::with_capacity(bucket_count);
+        let mut cursor = 0usize;
+        for bucket in 0..bucket_count {
+            let bucket_start = bucket as f64 * inv_bucket_count;
+            while cursor < cumulative.len() && cumulative[cursor] < bucket_start {
+                cursor += 1;
+            }
+            starts.push(cursor.min(cumulative.len() - 1));
+        }
+
+        for bucket in 0..bucket_count {
+            let start = starts[bucket];
+            let end = if bucket + 1 < bucket_count {
+                starts[bucket + 1]
+            } else {
+                cumulative.len() - 1
+            };
+            if end.saturating_sub(start) + 1 > Self::MAX_BUCKET_SPAN {
+                return None;
+            }
+        }
+
+        Some(Self { starts })
+    }
+
+    fn find(&self, cumulative: &[f64], sample: f64) -> usize {
+        let mut bucket = (sample * self.starts.len() as f64) as usize;
+        if bucket >= self.starts.len() {
+            bucket = self.starts.len() - 1;
+        }
+        let mut index = self.starts[bucket];
+        while index + 1 < cumulative.len() && cumulative[index] < sample {
+            index += 1;
+        }
+        index
+    }
+}
+
 /// Yields sample indices sequentially: 0, 1, 2, ..., n-1.
 pub struct SequentialSampler {
     size: usize,
@@ -549,13 +610,13 @@ impl WeightedRandomSampler {
 
         let mut rng = SimpleRng::new(self.seed);
         let mut result = Vec::with_capacity(self.num_samples);
+        let bucket_index = ThresholdBucketIndex::new(&cumulative);
         for _ in 0..self.num_samples {
-            // Generate uniform [0, 1) using the RNG
             let u = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
-            // Binary search for the index
-            let idx = match cumulative.binary_search_by(|c| finite_threshold_cmp(*c, u)) {
-                Ok(i) => i,
-                Err(i) => i.min(self.weights.len() - 1),
+            let idx = if let Some(index) = &bucket_index {
+                index.find(&cumulative, u)
+            } else {
+                threshold_binary_index(&cumulative, u)
             };
             result.push(idx);
         }
@@ -2220,6 +2281,45 @@ mod tests {
                 "../../../artifacts/optimization/golden_outputs/ft_data_weighted_large_cardinality_frankentorch-j54u.txt"
             )
         );
+    }
+
+    #[test]
+    fn weighted_sampler_bucket_index_matches_binary_reference() {
+        let weights: Vec<f64> = (1..=4096).map(|i| f64::from((i % 17) + 1)).collect();
+        let total: f64 = weights.iter().sum();
+        let mut cumulative = Vec::with_capacity(weights.len());
+        let mut running = 0.0;
+        for weight in weights {
+            running += weight;
+            cumulative.push(running / total);
+        }
+
+        let bucket_index =
+            ThresholdBucketIndex::new(&cumulative).expect("positive weights should be indexed");
+        let mut rng = SimpleRng::new(0x5151_4096);
+        for _ in 0..10_000 {
+            let sample = (rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64;
+            assert_eq!(
+                bucket_index.find(&cumulative, sample),
+                threshold_binary_index(&cumulative, sample),
+                "sample={sample}"
+            );
+        }
+
+        for &sample in &[
+            0.0,
+            cumulative[0],
+            cumulative[17],
+            cumulative[2048],
+            cumulative[4094],
+            0.999_999,
+        ] {
+            assert_eq!(
+                bucket_index.find(&cumulative, sample),
+                threshold_binary_index(&cumulative, sample),
+                "edge sample={sample}"
+            );
+        }
     }
 
     #[test]

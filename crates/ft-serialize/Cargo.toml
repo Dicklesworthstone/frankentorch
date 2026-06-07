@@ -10,6 +10,7 @@ serde = { workspace = true }
 serde_json = { workspace = true, features = ["float_roundtrip"] }
 asupersync = { workspace = true }
 safetensors = { workspace = true }
+bytemuck = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }

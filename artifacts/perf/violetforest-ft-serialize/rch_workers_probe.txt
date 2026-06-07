@@ -1,0 +1,14 @@
+Probing 10 worker(s)...
+
+  vmi1149989 ubuntu@212.90.121.76... ✓ OK (406ms)
+  vmi1152480 ubuntu@109.205.181.92... ✓ OK (308ms)
+  vmi1153651 ubuntu@38.242.134.66... ✓ OK (537ms)
+  vmi1227854 ubuntu@109.123.245.77... ✓ OK (359ms)
+  vmi1156319 ubuntu@178.18.254.243... ✓ OK (446ms)
+  vmi1264463 ubuntu@38.242.209.154... ✓ OK (1270ms)
+  vmi1293453 ubuntu@149.102.137.103... ✓ OK (366ms)
+  vmi1167313 ubuntu@154.12.232.219... ✓ OK (281ms)
+  ts2 ubuntu@192.168.1.124... ✓ OK (215ms)
+  ts1 ubuntu@192.168.1.107... ✓ OK (91ms)
+
+10 worker(s) probed: 10 healthy.

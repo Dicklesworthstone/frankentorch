@@ -3,12 +3,108 @@
 //!   baseline:  rch exec -- env RAYON_NUM_THREADS=1 cargo bench -p ft-kernel-cpu --bench linalg_bench
 //!   optimized: rch exec -- cargo bench -p ft-kernel-cpu --bench linalg_bench
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
-    cholesky_contiguous_f64, det_contiguous_f64, eigh_contiguous_f64, inv_tensor_contiguous_f64,
-    matrix_exp_contiguous_f64, qr_contiguous_f64, svd_contiguous_f64, svdvals_contiguous_f64,
+    cholesky_contiguous_f64, det_contiguous_f64, eig_contiguous_f64, eigh_contiguous_f64,
+    eigvals_contiguous_f64, eigvalsh_contiguous_f64, inv_tensor_contiguous_f64,
+    lobpcg_contiguous_f64, matrix_exp_contiguous_f64, qr_contiguous_f64, svd_contiguous_f64,
+    svd_lowrank_contiguous_f64, svdvals_contiguous_f64, symmetric_rank2k_lower_update_f64,
 };
+
+fn symmetric_rank2k_lower_update_scalar(n: usize, k: usize, v: &[f64], w: &[f64], a: &mut [f64]) {
+    for row in 0..n {
+        for col in 0..=row {
+            let mut update = 0.0_f64;
+            for p in 0..k {
+                update += v[row * k + p] * w[col * k + p] + w[row * k + p] * v[col * k + p];
+            }
+            a[row * n + col] -= update;
+        }
+    }
+}
+
+fn bench_lobpcg(c: &mut Criterion) {
+    for &n in &[256usize, 512usize] {
+        // Symmetric, well-separated spectrum (distinct diagonal + small off-diag).
+        let mut a = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = (((i * 7 + j * 3 + 1) % 13) as f64) * 0.02;
+            }
+        }
+        for i in 0..n {
+            for j in 0..i {
+                let s = 0.5 * (a[i * n + j] + a[j * n + i]);
+                a[i * n + j] = s;
+                a[j * n + i] = s;
+            }
+            a[i * n + i] += i as f64;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        c.bench_function(&format!("lobpcg_f64_{n}x{n}_k8"), |bch| {
+            bch.iter(|| {
+                black_box(lobpcg_contiguous_f64(black_box(&a), &meta, 8, true, 100, 1e-9).unwrap())
+            })
+        });
+    }
+}
+
+fn bench_svd_lowrank(c: &mut Criterion) {
+    for &n in &[256usize, 512usize] {
+        // Low-rank-plus-tiny-noise n x n (effective rank ~16): the regime where
+        // randomized SVD (O(n^2 k)) dwarfs the full O(n^3) SVD.
+        let r = 16usize;
+        let mut b = vec![0.0_f64; n * r];
+        let mut cm = vec![0.0_f64; r * n];
+        for i in 0..n {
+            for j in 0..r {
+                b[i * r + j] = ((i * 7 + j * 3 + 1) % 23) as f64 * 0.01 - 0.11;
+            }
+        }
+        for i in 0..r {
+            for j in 0..n {
+                cm[i * n + j] = ((i * 5 + j * 2 + 4) % 19) as f64 * 0.01 - 0.09;
+            }
+        }
+        let mut a = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for k in 0..r {
+                    s += b[i * r + k] * cm[k * n + j];
+                }
+                a[i * n + j] = s + (((i + j) % 7) as f64) * 1e-6;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        c.bench_function(&format!("svd_lowrank_f64_{n}x{n}_q16"), |bch| {
+            bch.iter(|| black_box(svd_lowrank_contiguous_f64(black_box(&a), &meta, 16, 2).unwrap()))
+        });
+    }
+}
+
+fn bench_eig_general(c: &mut Criterion) {
+    for &n in &[128usize, 256usize] {
+        // Non-symmetric with WELL-SEPARATED real eigenvalues (distinct diagonal
+        // + small off-diagonal perturbation) so the shifted QR iteration
+        // converges in a few steps per eigenvalue rather than hitting max_iter.
+        let mut a = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = ((i * 41 + j * 13 + 5) % 17) as f64 * 0.01 - 0.08;
+            }
+            a[i * n + i] = (i as f64) + 1.0;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        c.bench_function(&format!("eig_f64_{n}x{n}"), |bch| {
+            bch.iter(|| black_box(eig_contiguous_f64(black_box(&a), &meta).unwrap()))
+        });
+        c.bench_function(&format!("eigvals_f64_{n}x{n}"), |bch| {
+            bch.iter(|| black_box(eigvals_contiguous_f64(black_box(&a), &meta).unwrap()))
+        });
+    }
+}
 
 fn bench_qr(c: &mut Criterion) {
     // Householder QR (Q and R). Each reflection's apply to R (per-column factor +
@@ -114,7 +210,44 @@ fn bench_eigh(c: &mut Criterion) {
         c.bench_function(&format!("eigh_f64_{n}x{n}"), |bch| {
             bch.iter(|| black_box(eigh_contiguous_f64(black_box(&a), &meta).unwrap()))
         });
+        c.bench_function(&format!("eigvalsh_f64_{n}x{n}"), |bch| {
+            bch.iter(|| black_box(eigvalsh_contiguous_f64(black_box(&a), &meta).unwrap()))
+        });
     }
+}
+
+fn bench_symmetric_rank2k_update(c: &mut Criterion) {
+    let (n, k) = (256usize, 32usize);
+    let v: Vec<f64> = (0..n * k)
+        .map(|i| ((i % 37) as f64 - 18.0) * 0.009 + (i as f64) * 1e-8)
+        .collect();
+    let w: Vec<f64> = (0..n * k)
+        .map(|i| ((i % 29) as f64 - 14.0) * 0.011 - (i as f64) * 1e-8)
+        .collect();
+    let a: Vec<f64> = (0..n * n)
+        .map(|i| ((i % 53) as f64 - 26.0) * 0.003)
+        .collect();
+
+    c.bench_function("sym_rank2k_lower_scalar_f64_256x32", |bch| {
+        bch.iter_batched(
+            || a.clone(),
+            |mut work| {
+                symmetric_rank2k_lower_update_scalar(n, k, &v, &w, &mut work);
+                black_box(work)
+            },
+            BatchSize::SmallInput,
+        );
+    });
+    c.bench_function("sym_rank2k_lower_gemm_f64_256x32", |bch| {
+        bch.iter_batched(
+            || a.clone(),
+            |mut work| {
+                symmetric_rank2k_lower_update_f64(n, k, &v, &w, &mut work).unwrap();
+                black_box(work)
+            },
+            BatchSize::SmallInput,
+        );
+    });
 }
 
 fn bench_lu(c: &mut Criterion) {
@@ -166,7 +299,11 @@ criterion_group!(
     bench_lu,
     bench_cholesky,
     bench_eigh,
+    bench_symmetric_rank2k_update,
+    bench_lobpcg,
+    bench_eig_general,
     bench_svd,
+    bench_svd_lowrank,
     bench_svdvals,
     bench_matrix_exp,
     bench_inv,

@@ -1642,6 +1642,29 @@ impl DenseTensor {
         Ok(())
     }
 
+    /// Mutate the contiguous f64 values in-place and bump the version counter.
+    pub fn update_contiguous_values_with<F>(&mut self, update: F) -> Result<(), DenseTensorError>
+    where
+        F: FnOnce(&mut [f64]),
+    {
+        if !self.meta.is_contiguous() {
+            return Err(DenseTensorError::UnsupportedLayout);
+        }
+        let start = self.meta.storage_offset();
+        let end = Self::contiguous_required_len(&self.meta)?;
+        match &mut self.storage {
+            TensorStorage::F64(v) => {
+                let buf = Arc::make_mut(v);
+                update(&mut buf[start..end]);
+            }
+            _ => {
+                return Err(DenseTensorError::UnsupportedDType(self.meta.dtype()));
+            }
+        }
+        self.version += 1;
+        Ok(())
+    }
+
     /// Update the contiguous f32 values in-place and bump the version counter.
     pub fn update_contiguous_values_f32(
         &mut self,
@@ -3288,6 +3311,26 @@ mod tests {
         assert_eq!(
             dt.storage().expect("f64 storage should be accessible"),
             &[4.0, 5.0, 6.0]
+        );
+    }
+
+    #[test]
+    fn dense_tensor_update_contiguous_values_with_mutates_in_place() {
+        let mut dt = DenseTensor::from_contiguous_values(vec![1.0, 2.0, 3.0], vec![3], Device::Cpu)
+            .expect("create dense tensor");
+        assert_eq!(dt.version(), 0);
+
+        dt.update_contiguous_values_with(|values| {
+            for value in values {
+                *value *= 2.0;
+            }
+        })
+        .expect("closure update should succeed");
+
+        assert_eq!(dt.version(), 1);
+        assert_eq!(
+            dt.storage().expect("f64 storage should be accessible"),
+            &[2.0, 4.0, 6.0]
         );
     }
 

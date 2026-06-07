@@ -122,9 +122,20 @@ mod gemm {
                     // SAFETY: a is m*k; b[n0*k ..] holds bw rows of k; ct is m*bw.
                     unsafe {
                         matrixmultiply::dgemm(
-                            m, k, bw, 1.0, a.as_ptr(), k as isize, 1,
-                            b.as_ptr().add(n0 * k), 1, k as isize,
-                            0.0, ct.as_mut_ptr(), bw as isize, 1,
+                            m,
+                            k,
+                            bw,
+                            1.0,
+                            a.as_ptr(),
+                            k as isize,
+                            1,
+                            b.as_ptr().add(n0 * k),
+                            1,
+                            k as isize,
+                            0.0,
+                            ct.as_mut_ptr(),
+                            bw as isize,
+                            1,
                         );
                     }
                     (n0, ct)
@@ -152,9 +163,20 @@ mod gemm {
         // SAFETY: a is m*k, b is n*k (read as B^T via rsb=1,csb=k), c is m*n.
         unsafe {
             matrixmultiply::dgemm(
-                m, k, n, 1.0, a.as_ptr(), k as isize, 1,
-                b.as_ptr(), 1, k as isize,
-                0.0, c.as_mut_ptr(), n as isize, 1,
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                k as isize,
+                1,
+                b.as_ptr(),
+                1,
+                k as isize,
+                0.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
             );
         }
     }
@@ -307,9 +329,20 @@ mod gemm {
                     // SAFETY: a is m*k; b[n0*k ..] holds bw rows of k; ct is m*bw.
                     unsafe {
                         matrixmultiply::sgemm(
-                            m, k, bw, 1.0, a.as_ptr(), k as isize, 1,
-                            b.as_ptr().add(n0 * k), 1, k as isize,
-                            0.0, ct.as_mut_ptr(), bw as isize, 1,
+                            m,
+                            k,
+                            bw,
+                            1.0,
+                            a.as_ptr(),
+                            k as isize,
+                            1,
+                            b.as_ptr().add(n0 * k),
+                            1,
+                            k as isize,
+                            0.0,
+                            ct.as_mut_ptr(),
+                            bw as isize,
+                            1,
                         );
                     }
                     (n0, ct)
@@ -337,9 +370,20 @@ mod gemm {
         // SAFETY: a is m*k, b is n*k (read as B^T via rsb=1,csb=k), c is m*n.
         unsafe {
             matrixmultiply::sgemm(
-                m, k, n, 1.0, a.as_ptr(), k as isize, 1,
-                b.as_ptr(), 1, k as isize,
-                0.0, c.as_mut_ptr(), n as isize, 1,
+                m,
+                k,
+                n,
+                1.0,
+                a.as_ptr(),
+                k as isize,
+                1,
+                b.as_ptr(),
+                1,
+                k as isize,
+                0.0,
+                c.as_mut_ptr(),
+                n as isize,
+                1,
             );
         }
     }
@@ -1178,6 +1222,13 @@ fn checked_dim_loop_sizes(
 
 const PARALLEL_THRESHOLD: usize = 8192;
 
+// The SIMD unary ops (relu/sqrt/reciprocal/...) were SERIAL while the scalar-map
+// unary path (exp/tanh/...) parallelises — so relu was ~36-59x slower than torch
+// at large N purely from single-threading. Parallelise above this gate (cheap
+// per-element work, so amortise rayon split/join only at large N, same as the
+// scalar path's threshold).
+const SIMD_UNARY_PARALLEL_THRESHOLD: usize = 1 << 19; // 524288
+
 // The generic scalar-map unary path (exp/ln/sin/gelu/erf/...) is dominated by a
 // per-element libm call (~15-20 ns), but rayon's split/join/collect overhead on
 // a many-core pool only amortises at very large N. A same-worker A/B
@@ -1231,24 +1282,43 @@ where
 
 fn simd_unary_f64<F, S>(window: &[f64], scalar_op: F, simd_op: S) -> Vec<f64>
 where
-    F: Fn(f64) -> f64,
-    S: Fn(f64x4) -> f64x4,
+    F: Fn(f64) -> f64 + Sync,
+    S: Fn(f64x4) -> f64x4 + Sync,
 {
     let numel = window.len();
-    let simd_len = numel / SIMD_WIDTH * SIMD_WIDTH;
     let mut output = vec![0.0; numel];
 
-    for (out, input) in output[..simd_len]
-        .chunks_exact_mut(SIMD_WIDTH)
-        .zip(window[..simd_len].chunks_exact(SIMD_WIDTH))
-    {
-        let a = f64x4::new([input[0], input[1], input[2], input[3]]);
-        let result = simd_op(a);
-        out.copy_from_slice(result.as_array_ref());
-    }
+    // One contiguous block: SIMD over the SIMD_WIDTH-aligned bulk, scalar tail.
+    let block = |out: &mut [f64], inp: &[f64]| {
+        let simd_len = out.len() / SIMD_WIDTH * SIMD_WIDTH;
+        for (o, i) in out[..simd_len]
+            .chunks_exact_mut(SIMD_WIDTH)
+            .zip(inp[..simd_len].chunks_exact(SIMD_WIDTH))
+        {
+            let a = f64x4::new([i[0], i[1], i[2], i[3]]);
+            o.copy_from_slice(simd_op(a).as_array_ref());
+        }
+        for (o, &v) in out[simd_len..].iter_mut().zip(&inp[simd_len..]) {
+            *o = scalar_op(v);
+        }
+    };
 
-    for (out, &value) in output[simd_len..].iter_mut().zip(&window[simd_len..]) {
-        *out = scalar_op(value);
+    if numel >= SIMD_UNARY_PARALLEL_THRESHOLD {
+        // SIMD_WIDTH-aligned grains: every grain but the last is a whole number
+        // of SIMD lanes, so the SIMD/scalar element split is identical to the
+        // serial path -> bit-for-bit identical output.
+        let threads = rayon::current_num_threads().max(1);
+        let grain = numel
+            .div_ceil(4 * threads)
+            .max(SIMD_WIDTH)
+            .div_ceil(SIMD_WIDTH)
+            * SIMD_WIDTH;
+        output
+            .par_chunks_mut(grain)
+            .zip(window.par_chunks(grain))
+            .for_each(|(out, inp)| block(out, inp));
+    } else {
+        block(&mut output, window);
     }
 
     output
@@ -1261,8 +1331,8 @@ fn simd_unary_f64_kernel<F, S>(
     _simd_op: S,
 ) -> Result<Vec<f64>, KernelError>
 where
-    F: Fn(f64) -> f64,
-    S: Fn(f64x4) -> f64x4,
+    F: Fn(f64) -> f64 + Sync,
+    S: Fn(f64x4) -> f64x4 + Sync,
 {
     if !meta.is_contiguous() {
         return unary_strided_f64(input, meta, scalar_op);
@@ -2068,6 +2138,42 @@ fn pairwise_sum_f64(values: &[f64]) -> f64 {
     pairwise_sum_f64(&values[..mid]) + pairwise_sum_f64(&values[mid..])
 }
 
+/// Parallel `pairwise_sum_f64` for large FULL reductions. Splits the SAME
+/// `mid = len/2` tree via `rayon::join` down to `PAR_BLOCK`, then runs the
+/// serial pairwise sum below — the associativity (`left + right` at every node)
+/// is unchanged, so the result is BIT-FOR-BIT identical to `pairwise_sum_f64`.
+/// (Not used inside the per-row softmax/norm loops, where the reduction is small
+/// and rayon would only add overhead.)
+fn pairwise_sum_f64_par(values: &[f64]) -> f64 {
+    // Small PAR_BLOCK leaf so large reductions spread across all cores; the
+    // call site gates the whole reduction on SUM_PARALLEL_THRESHOLD (below that,
+    // rayon::join overhead exceeds the gain — a 100k sum REGRESSED 2.6x while a
+    // 1M sum sped up 9.2x).
+    const PAR_BLOCK: usize = 1 << 14;
+    if values.len() <= PAR_BLOCK {
+        return pairwise_sum_f64(values);
+    }
+    let mid = values.len() / 2;
+    let (left, right) = values.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_sum_f64_par(left),
+        || pairwise_sum_f64_par(right),
+    );
+    ls + rs
+}
+
+/// `pairwise_sum_f64`, parallelised only for large FULL reductions.
+const SUM_PARALLEL_THRESHOLD: usize = 1 << 19; // 524288
+
+#[inline]
+fn pairwise_sum_f64_maybe_par(values: &[f64]) -> f64 {
+    if values.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_sum_f64_par(values)
+    } else {
+        pairwise_sum_f64(values)
+    }
+}
+
 /// Like `pairwise_sum_f64`, but applies a closure `f` to each element
 /// before adding. Used by norm helpers — `norm_l1` sums `|x|`,
 /// `norm_l2` sums `x*x`, generic `norm_lp` sums `|x|^p` — to inherit
@@ -2087,6 +2193,39 @@ where
     pairwise_sum_map_f64(&values[..mid], f) + pairwise_sum_map_f64(&values[mid..], f)
 }
 
+/// Parallel `pairwise_sum_map_f64` for large FULL reductions (e.g. an L2 norm
+/// over a whole weight tensor). Splits the SAME mid tree via rayon::join down to
+/// PAR_BLOCK, so the result is BIT-FOR-BIT identical. NOT for the per-row norm /
+/// softmax callers, where the reduction is small.
+fn pairwise_sum_map_f64_par<F>(values: &[f64], f: F) -> f64
+where
+    F: Fn(f64) -> f64 + Copy + Sync,
+{
+    const PAR_BLOCK: usize = 1 << 14;
+    if values.len() <= PAR_BLOCK {
+        return pairwise_sum_map_f64(values, f);
+    }
+    let mid = values.len() / 2;
+    let (left, right) = values.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_sum_map_f64_par(left, f),
+        || pairwise_sum_map_f64_par(right, f),
+    );
+    ls + rs
+}
+
+#[inline]
+fn pairwise_sum_map_f64_maybe_par<F>(values: &[f64], f: F) -> f64
+where
+    F: Fn(f64) -> f64 + Copy + Sync,
+{
+    if values.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_sum_map_f64_par(values, f)
+    } else {
+        pairwise_sum_map_f64(values, f)
+    }
+}
+
 pub fn sum_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f64, KernelError> {
     ensure_unary_layout_and_storage(input, meta)?;
     let numel = meta.numel();
@@ -2094,7 +2233,7 @@ pub fn sum_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f64
         return Ok(0.0);
     }
     let offset = meta.storage_offset();
-    Ok(pairwise_sum_f64(&input[offset..offset + numel]))
+    Ok(pairwise_sum_f64_maybe_par(&input[offset..offset + numel]))
 }
 
 pub fn mean_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f64, KernelError> {
@@ -2104,7 +2243,7 @@ pub fn mean_tensor_contiguous_f64(input: &[f64], meta: &TensorMeta) -> Result<f6
     if numel == 0 {
         return Ok(f64::NAN);
     }
-    let sum = pairwise_sum_f64(&input[offset..offset + numel]);
+    let sum = pairwise_sum_f64_maybe_par(&input[offset..offset + numel]);
     #[allow(clippy::cast_precision_loss)]
     let n = numel as f64;
     Ok(sum / n)
@@ -2213,30 +2352,51 @@ fn simd_binary_f64<F, S>(
     simd_op: S,
 ) -> Vec<f64>
 where
-    F: Fn(f64, f64) -> f64,
-    S: Fn(f64x4, f64x4) -> f64x4,
+    F: Fn(f64, f64) -> f64 + Sync,
+    S: Fn(f64x4, f64x4) -> f64x4 + Sync,
 {
     let numel = lhs_window.len();
-    let simd_len = numel / SIMD_WIDTH * SIMD_WIDTH;
     let mut output = vec![0.0; numel];
 
-    for ((out, lhs), rhs) in output[..simd_len]
-        .chunks_exact_mut(SIMD_WIDTH)
-        .zip(lhs_window[..simd_len].chunks_exact(SIMD_WIDTH))
-        .zip(rhs_window[..simd_len].chunks_exact(SIMD_WIDTH))
-    {
-        let a = f64x4::new([lhs[0], lhs[1], lhs[2], lhs[3]]);
-        let b = f64x4::new([rhs[0], rhs[1], rhs[2], rhs[3]]);
-        let result = simd_op(a, b);
-        out.copy_from_slice(result.as_array_ref());
-    }
+    // One contiguous block: SIMD over the SIMD_WIDTH-aligned bulk, scalar tail.
+    let block = |out: &mut [f64], lw: &[f64], rw: &[f64]| {
+        let simd_len = out.len() / SIMD_WIDTH * SIMD_WIDTH;
+        for ((o, lc), rc) in out[..simd_len]
+            .chunks_exact_mut(SIMD_WIDTH)
+            .zip(lw[..simd_len].chunks_exact(SIMD_WIDTH))
+            .zip(rw[..simd_len].chunks_exact(SIMD_WIDTH))
+        {
+            let a = f64x4::new([lc[0], lc[1], lc[2], lc[3]]);
+            let b = f64x4::new([rc[0], rc[1], rc[2], rc[3]]);
+            o.copy_from_slice(simd_op(a, b).as_array_ref());
+        }
+        for ((o, &lv), &rv) in out[simd_len..]
+            .iter_mut()
+            .zip(&lw[simd_len..])
+            .zip(&rw[simd_len..])
+        {
+            *o = scalar_op(lv, rv);
+        }
+    };
 
-    for ((out, &lhs), &rhs) in output[simd_len..]
-        .iter_mut()
-        .zip(&lhs_window[simd_len..])
-        .zip(&rhs_window[simd_len..])
-    {
-        *out = scalar_op(lhs, rhs);
+    // add/sub/mul/div were SERIAL while the scalar-map binary path parallelises,
+    // so a 1M-element add ran ~54x slower than torch. Parallelise over
+    // SIMD_WIDTH-aligned grains (every grain but the last is a whole number of
+    // SIMD lanes -> SIMD/scalar split identical to serial -> bit-for-bit equal).
+    if numel >= SIMD_UNARY_PARALLEL_THRESHOLD {
+        let threads = rayon::current_num_threads().max(1);
+        let grain = numel
+            .div_ceil(4 * threads)
+            .max(SIMD_WIDTH)
+            .div_ceil(SIMD_WIDTH)
+            * SIMD_WIDTH;
+        output
+            .par_chunks_mut(grain)
+            .zip(lhs_window.par_chunks(grain))
+            .zip(rhs_window.par_chunks(grain))
+            .for_each(|((out, lw), rw)| block(out, lw, rw));
+    } else {
+        block(&mut output, lhs_window, rhs_window);
     }
 
     output
@@ -2251,8 +2411,8 @@ fn simd_elementwise_f64<F, S>(
     _simd_op: S,
 ) -> Result<Vec<f64>, KernelError>
 where
-    F: Fn(f64, f64) -> f64,
-    S: Fn(f64x4, f64x4) -> f64x4,
+    F: Fn(f64, f64) -> f64 + Sync,
+    S: Fn(f64x4, f64x4) -> f64x4 + Sync,
 {
     ensure_meta_shape_and_dtype(lhs_meta, rhs_meta)?;
 
@@ -2354,7 +2514,6 @@ pub fn div_tensor_broadcast_f64(
 /// transpose is never materialised — the dominant cost of the
 /// transpose-then-matmul path. Result is `[batch, out]`, bit-for-bit identical
 /// to that path.
-#[must_use]
 /// Fused scaled-dot-product attention forward (f64), the flash-attention memory
 /// pattern: process one block of `BR` query rows at a time so only that block's
 /// score tile `[BR, seq_k]` is ever materialised — NEVER the full
@@ -2666,6 +2825,96 @@ pub fn layer_norm_forward_f64(
     out
 }
 
+/// f32 mirror of [`layer_norm_forward_f64`]: per-row mean/rstd normalize + affine,
+/// one streaming pass per row, parallel over rows. Replaces the f32 op-graph
+/// (mean_dim/sub/var/rsqrt/affine, ~14 full-size nodes) the f32 no-grad path fell
+/// through to.
+#[must_use]
+pub fn layer_norm_forward_f32(
+    x: &[f32],
+    weight: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * norm_size];
+    let inv_n = 1.0 / norm_size as f32;
+    out.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mut sum = 0.0f32;
+            for &v in xrow {
+                sum += v;
+            }
+            let mean = sum * inv_n;
+            let mut vsum = 0.0f32;
+            for &v in xrow {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+            for j in 0..norm_size {
+                let mut y = (xrow[j] - mean) * rstd;
+                if let Some(w) = weight {
+                    y *= w[j];
+                }
+                if let Some(b) = bias {
+                    y += b[j];
+                }
+                orow[j] = y;
+            }
+        });
+    out
+}
+
+#[must_use]
+pub fn layer_norm_forward_with_stats_f64(
+    x: &[f64],
+    weight: Option<&[f64]>,
+    bias: Option<&[f64]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let mut out = vec![0.0f64; batch * norm_size];
+    let mut means = vec![0.0f64; batch];
+    let mut rstds = vec![0.0f64; batch];
+    let inv_n = 1.0 / norm_size as f64;
+    out.par_chunks_mut(norm_size)
+        .zip(means.par_iter_mut())
+        .zip(rstds.par_iter_mut())
+        .enumerate()
+        .for_each(|(r, ((orow, mean_slot), rstd_slot))| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mut sum = 0.0f64;
+            for &v in xrow {
+                sum += v;
+            }
+            let mean = sum * inv_n;
+            let mut vsum = 0.0f64;
+            for &v in xrow {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+            *mean_slot = mean;
+            *rstd_slot = rstd;
+            for j in 0..norm_size {
+                let mut y = (xrow[j] - mean) * rstd;
+                if let Some(w) = weight {
+                    y *= w[j];
+                }
+                if let Some(b) = bias {
+                    y += b[j];
+                }
+                orow[j] = y;
+            }
+        });
+    (out, means, rstds)
+}
+
 /// Backward of [`layer_norm_forward_f64`] with affine weight (and bias). Given
 /// `dy` (`[batch, norm_size]`), the saved input `x` and `weight`, returns
 /// `(dx, dweight, dbias)`. Recomputes `mean`/`rstd`/`xhat` per row (cheap) so the
@@ -2743,6 +2992,58 @@ pub fn layer_norm_backward_f64(
     (dx, dweight, dbias)
 }
 
+/// Backward of [`layer_norm_forward_with_stats_f64`] with affine weight (and
+/// bias), reusing the forward row statistics. The affine gradient row reduction
+/// stays serial and row-major so floating-point accumulation order is unchanged.
+#[must_use]
+pub fn layer_norm_backward_with_stats_f64(
+    dy: &[f64],
+    x: &[f64],
+    weight: &[f64],
+    means: &[f64],
+    rstds: &[f64],
+    batch: usize,
+    norm_size: usize,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let inv_n = 1.0 / norm_size as f64;
+    let mut dx = vec![0.0f64; batch * norm_size];
+    dx.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, dxrow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+            let mean = means[r];
+            let rstd = rstds[r];
+            let mut c1 = 0.0f64;
+            let mut c2 = 0.0f64;
+            for j in 0..norm_size {
+                let xhat = (xrow[j] - mean) * rstd;
+                let dxhat = dyrow[j] * weight[j];
+                c1 += dxhat;
+                c2 += dxhat * xhat;
+            }
+            for j in 0..norm_size {
+                let xhat = (xrow[j] - mean) * rstd;
+                let dxhat = dyrow[j] * weight[j];
+                dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+            }
+        });
+    let mut dweight = vec![0.0f64; norm_size];
+    let mut dbias = vec![0.0f64; norm_size];
+    for r in 0..batch {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mean = means[r];
+        let rstd = rstds[r];
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            dweight[j] += dyrow[j] * xhat;
+            dbias[j] += dyrow[j];
+        }
+    }
+    (dx, dweight, dbias)
+}
+
 /// Fused RMSNorm forward (f64): per row of `[batch, norm_size]`, computes
 /// `y = x / sqrt(mean(x²) + eps) * weight` in one streaming pass (no mean
 /// subtraction — modern-LLM RMSNorm), never materialising the op-graph
@@ -2762,6 +3063,39 @@ pub fn rms_norm_forward_f64(
         .for_each(|(r, orow)| {
             let xrow = &x[r * norm_size..r * norm_size + norm_size];
             let mut ss = 0.0f64;
+            for &v in xrow {
+                ss += v * v;
+            }
+            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+            for j in 0..norm_size {
+                let mut y = xrow[j] * rstd;
+                if let Some(w) = weight {
+                    y *= w[j];
+                }
+                orow[j] = y;
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`rms_norm_forward_f64`]: per-row RMS normalize + optional
+/// weight, one streaming pass, parallel over rows. Replaces the f32 op-graph
+/// (square/mean/rsqrt/mul) the f32 no-grad path fell through to.
+#[must_use]
+pub fn rms_norm_forward_f32(
+    x: &[f32],
+    weight: Option<&[f32]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let inv_n = 1.0 / norm_size as f32;
+    let mut out = vec![0.0f32; batch * norm_size];
+    out.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mut ss = 0.0f32;
             for &v in xrow {
                 ss += v * v;
             }
@@ -2956,6 +3290,57 @@ pub fn group_norm_forward_f64(
     out
 }
 
+/// f32 mirror of [`group_norm_forward_f64`]: per-(sample,group) mean/rstd
+/// normalize + per-channel affine, one streaming pass, parallel over groups.
+/// Replaces the f32 op-graph (reshape/mean/var/expand/affine, ~15 nodes) the f32
+/// no-grad path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn group_norm_forward_f32(
+    x: &[f32],
+    weight: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    batch: usize,
+    num_groups: usize,
+    cpg: usize,
+    spatial: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let group_numel = cpg * spatial;
+    let inv_m = 1.0 / group_numel as f32;
+    let mut out = vec![0.0f32; batch * num_groups * group_numel];
+    out.par_chunks_mut(group_numel)
+        .enumerate()
+        .for_each(|(grp, orow)| {
+            let g = grp % num_groups;
+            let base = grp * group_numel;
+            let xb = &x[base..base + group_numel];
+            let mut sum = 0.0f32;
+            for &v in xb {
+                sum += v;
+            }
+            let mean = sum * inv_m;
+            let mut vsum = 0.0f32;
+            for &v in xb {
+                let d = v - mean;
+                vsum += d * d;
+            }
+            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+            for i in 0..group_numel {
+                let c = g * cpg + i / spatial;
+                let mut y = (xb[i] - mean) * rstd;
+                if let Some(w) = weight {
+                    y *= w[c];
+                }
+                if let Some(b) = bias {
+                    y += b[c];
+                }
+                orow[i] = y;
+            }
+        });
+    out
+}
+
 /// Backward of [`group_norm_forward_f64`] with per-channel affine. Returns
 /// `(dx, dweight?, dbias?)`. `dx` is parallel over groups (same normalisation
 /// Jacobian as LayerNorm, over `cpg·spatial` per group); `dweight`/`dbias` are a
@@ -3080,9 +3465,7 @@ pub fn conv2d_im2col_f64(
                 for kr in 0..kh {
                     let irow = ch_off + (base_h + kr) * pw + base_w;
                     let prow_off = pch + kr * kw;
-                    for kc in 0..kw {
-                        prow[prow_off + kc] = padded[irow + kc];
-                    }
+                    prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
                 }
             }
         });
@@ -3162,8 +3545,106 @@ pub fn conv2d_forward_f64(
     let flat = batch * patch_count;
     let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     let mut out_flat = vec![0.0f64; flat * out_ch];
-    gemm::dgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    gemm::dgemm_bt(
+        flat,
+        patch_width,
+        out_ch,
+        &panel,
+        weight_flat,
+        &mut out_flat,
+    );
     let mut out = vec![0.0f64; batch * out_ch * patch_count];
+    out.par_chunks_mut(patch_count)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let bo = bias.map_or(0.0, |bb| bb[oc]);
+            for p in 0..patch_count {
+                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`conv2d_im2col_f64`]: parallel im2col into a
+/// `[batch·oh·ow, in_ch·kh·kw]` panel.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_im2col_f32(
+    padded: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let mut panel = vec![0.0f32; batch * patch_count * patch_width];
+    panel
+        .par_chunks_mut(patch_width)
+        .enumerate()
+        .for_each(|(row, prow)| {
+            let b = row / patch_count;
+            let pc = row % patch_count;
+            let base_h = (pc / ow) * sh;
+            let base_w = (pc % ow) * sw;
+            let batch_off = b * in_ch * ph * pw;
+            for c in 0..in_ch {
+                let ch_off = batch_off + c * ph * pw;
+                let pch = c * kh * kw;
+                for kr in 0..kh {
+                    let irow = ch_off + (base_h + kr) * pw + base_w;
+                    let prow_off = pch + kr * kw;
+                    prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                }
+            }
+        });
+    panel
+}
+
+/// f32 mirror of [`conv2d_forward_f64`]: fused im2col + `panel @ weight_flat^T`
+/// (via `sgemm_bt`, no weight transpose) written straight to NCHW, plus optional
+/// per-channel bias. Replaces the serial 6-deep im2col gather + tensor_matmul the
+/// f32 no-grad conv2d path fell through to. `weight_flat` is `[out_ch, in_ch·kh·kw]`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_forward_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+    let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    let mut out_flat = vec![0.0f32; flat * out_ch];
+    gemm::sgemm_bt(
+        flat,
+        patch_width,
+        out_ch,
+        &panel,
+        weight_flat,
+        &mut out_flat,
+    );
+    let mut out = vec![0.0f32; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
         .for_each(|(idx, orow)| {
@@ -3226,8 +3707,1305 @@ pub fn conv2d_backward_f64(
     gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
     // dpanel [flat, patch_width] = dout_flat @ weight_flat.
     let mut dpanel = vec![0.0f64; flat * patch_width];
-    gemm::dgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, &mut dpanel);
+    gemm::dgemm(
+        flat,
+        out_ch,
+        patch_width,
+        &dout_flat,
+        weight_flat,
+        &mut dpanel,
+    );
     let dpadded = conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    let dbias = if has_bias {
+        let mut db = vec![0.0f64; out_ch];
+        for (oc, dbo) in db.iter_mut().enumerate() {
+            let mut s = 0.0f64;
+            for n in 0..batch {
+                let base = (n * out_ch + oc) * patch_count;
+                for p in 0..patch_count {
+                    s += dout[base + p];
+                }
+            }
+            *dbo = s;
+        }
+        Some(db)
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
+/// Fused cdist forward (f64): pairwise `p`-norm distances between rows of `x1`
+/// `[batch, p_dim, m]` and `x2` `[batch, r_dim, m]`, returning `[batch, p_dim,
+/// r_dim]`. For each output `(b, i, j)` it streams the `m` feature differences
+/// and reduces them in ONE pass — no `O(P·R·M)` broadcasted-difference tensor is
+/// ever materialised (the op-graph path builds ~4 of them). Parallel over the
+/// `batch·p_dim` output rows; the per-`k` accumulation order is identical to the
+/// serial reference, so the result matches the broadcast path to f64 round-off.
+///
+/// `p == +inf` reduces by max-abs; finite `p > 0` accumulates `Σ|Δ|^p` then takes
+/// the `1/p` power. (`p == 0` / `p == 2` are handled by their own paths.)
+#[must_use]
+pub fn cdist_forward_f64(
+    x1: &[f64],
+    x2: &[f64],
+    batch: usize,
+    p_dim: usize,
+    r_dim: usize,
+    m: usize,
+    p: f64,
+) -> Vec<f64> {
+    let mut result = vec![0.0f64; batch * p_dim * r_dim];
+    if batch * p_dim * r_dim == 0 {
+        return result;
+    }
+    let inv_p = 1.0 / p;
+    let is_inf = p == f64::INFINITY;
+    // One output row = one (b, i) pair owning a contiguous r_dim slice.
+    result
+        .par_chunks_mut(r_dim)
+        .enumerate()
+        .for_each(|(row, out)| {
+            let b = row / p_dim;
+            let i = row % p_dim;
+            let x1_base = b * p_dim * m + i * m;
+            let x2_base = b * r_dim * m;
+            for (j, slot) in out.iter_mut().enumerate() {
+                let x2_row = x2_base + j * m;
+                let mut dist = 0.0f64;
+                if is_inf {
+                    for k in 0..m {
+                        let diff = (x1[x1_base + k] - x2[x2_row + k]).abs();
+                        if diff > dist {
+                            dist = diff;
+                        }
+                    }
+                } else {
+                    for k in 0..m {
+                        let diff = (x1[x1_base + k] - x2[x2_row + k]).abs();
+                        dist += diff.powf(p);
+                    }
+                    dist = dist.powf(inv_p);
+                }
+                *slot = dist;
+            }
+        });
+    result
+}
+
+/// Fused pdist forward (f64): pairwise `p`-norm distances between every i<j pair
+/// of rows of `input` `[n, m]`, returning the flattened strict upper triangle
+/// `[n·(n-1)/2]` in `(i, then j)` order — the same layout torch's `pdist` and the
+/// op-graph (index_select+sub+abs+pow+sum_dim+pow) produce. Each pair streams its
+/// `m` feature differences in ONE pass with no `O(out_len·m)` pair-difference
+/// tensor materialised. Parallel over the `i` rows; the per-`k` accumulation order
+/// matches the op-graph, so the result is bit-identical to the broadcast path.
+///
+/// `p == +inf` reduces by max-abs; finite `p > 0` accumulates `Σ|Δ|^p` then takes
+/// the `1/p` power. (`p == 0` / `p == 2` are handled by their own paths.)
+#[must_use]
+pub fn pdist_forward_f64(input: &[f64], n: usize, m: usize, p: f64) -> Vec<f64> {
+    let out_len = n * (n - 1) / 2;
+    if out_len == 0 {
+        return Vec::new();
+    }
+    let is_inf = p == f64::INFINITY;
+    let inv_p = 1.0 / p;
+    // Row i owns the (n-1-i) outputs for j in (i+1)..n; build per-row then flatten
+    // (the concat is O(out_len), negligible vs the O(n^2·m) reduction).
+    let rows: Vec<Vec<f64>> = (0..n - 1)
+        .into_par_iter()
+        .map(|i| {
+            let i_base = i * m;
+            let mut row = Vec::with_capacity(n - 1 - i);
+            for j in (i + 1)..n {
+                let j_base = j * m;
+                let mut dist = 0.0f64;
+                if is_inf {
+                    for k in 0..m {
+                        let diff = (input[i_base + k] - input[j_base + k]).abs();
+                        if diff > dist {
+                            dist = diff;
+                        }
+                    }
+                } else {
+                    for k in 0..m {
+                        let diff = (input[i_base + k] - input[j_base + k]).abs();
+                        dist += diff.powf(p);
+                    }
+                    dist = dist.powf(inv_p);
+                }
+                row.push(dist);
+            }
+            row
+        })
+        .collect();
+    let mut result = Vec::with_capacity(out_len);
+    for row in &rows {
+        result.extend_from_slice(row);
+    }
+    result
+}
+
+/// Fused Supervised-Contrastive (SupCon) loss forward (f64), no-grad.
+///
+/// Replaces the ~16-op op-graph (L2-normalize + [N,N] cosine gram + two
+/// materialised [N,N] label-mask leaves + masked log-sum-exp + masked
+/// positive-mean + reduction) with: one L2-normalize pass, ONE gram GEMM
+/// (`gemm::dgemm_bt`, the only heavy compute, kept), and a single fused pass over
+/// the gram rows that computes the masked log-sum-exp denominator and the
+/// positive-mean numerator inline from `labels` — no [N,N] sim/mask intermediates,
+/// no tape. Each step mirrors the op-graph's exact arithmetic and reduction order
+/// (sequential per-`d` normalize sum, `tensor_logsumexp`'s max-subtract pass,
+/// sequential per-`j` masked sum, sequential per-`i` final sum), so the scalar
+/// loss matches the op-graph to f64 round-off.
+///
+/// `labels[i]` is the class of row `i`; `pos_count_safe[i] = max(|P(i)|, 1)`;
+/// `valid[i]` is 1.0 iff row `i` has >=1 positive; `count` is the number of valid
+/// anchors (caller guarantees `count > 0`). Returns the scalar SupCon loss.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn supcon_loss_forward_f64(
+    embeddings: &[f64],
+    labels: &[i64],
+    pos_count_safe: &[f64],
+    valid: &[f64],
+    count: usize,
+    temperature: f64,
+    n: usize,
+    d: usize,
+) -> f64 {
+    // 1. L2-normalize each row (sumsq sequential over d, then clamp >= 1e-12).
+    let mut normalized = vec![0.0f64; n * d];
+    normalized
+        .par_chunks_mut(d)
+        .enumerate()
+        .for_each(|(i, out)| {
+            let base = i * d;
+            let mut sumsq = 0.0f64;
+            for k in 0..d {
+                let v = embeddings[base + k];
+                sumsq += v * v;
+            }
+            let norm = sumsq.sqrt().max(1e-12);
+            for (k, slot) in out.iter_mut().enumerate() {
+                *slot = embeddings[base + k] / norm;
+            }
+        });
+
+    // 2. Cosine gram [N,N] = normalized @ normalized^T (the one heavy GEMM).
+    let mut gram = vec![0.0f64; n * n];
+    gemm::dgemm_bt(n, d, n, &normalized, &normalized, &mut gram);
+
+    // 3. Fused per-row masked log-sum-exp denominator + positive-mean numerator,
+    //    streaming the gram row once. `inv_temp` scales the cosine to logits; the
+    //    diagonal is pushed to -1e30 (matches `sim + diag_mask`) so it underflows
+    //    out of the denominator. Parallel over rows; the final sum over i is done
+    //    sequentially afterwards to preserve the op-graph's reduction order.
+    let inv_temp = 1.0 / temperature;
+    let masked_term: Vec<f64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let row = i * n;
+            // Denominator: max-subtract pass exactly like tensor_logsumexp.
+            let mut max_val = f64::NEG_INFINITY;
+            for j in 0..n {
+                let mut s = gram[row + j] * inv_temp;
+                if j == i {
+                    s -= 1e30;
+                }
+                if s > max_val {
+                    max_val = s;
+                }
+            }
+            let mut sum_exp = 0.0f64;
+            for j in 0..n {
+                let mut s = gram[row + j] * inv_temp;
+                if j == i {
+                    s -= 1e30;
+                }
+                sum_exp += (s - max_val).exp();
+            }
+            let log_denom = max_val + sum_exp.ln();
+            // Numerator: sum of sim over same-label j != i (masked-sum order j=0..n).
+            let mut num = 0.0f64;
+            for j in 0..n {
+                if i != j && labels[i] == labels[j] {
+                    num += gram[row + j] * inv_temp;
+                }
+            }
+            let mean_pos = num / pos_count_safe[i];
+            (mean_pos - log_denom) * valid[i]
+        })
+        .collect();
+
+    let mut summed = 0.0f64;
+    for &t in &masked_term {
+        summed += t;
+    }
+    #[allow(clippy::cast_precision_loss)]
+    {
+        summed * (-1.0 / count as f64)
+    }
+}
+
+/// Fused max-pool3d forward (f64): per output, the max over its `kd×kh×kw`
+/// window of `[batch, ch, id, ih, iw]`. Parallel over `(batch,ch)` volumes.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_forward_f64(
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; batch * ch * od * oh * ow];
+    out.par_chunks_mut(od * oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let ibase = plane * id * ih * iw;
+            for oz in 0..od {
+                let bd = oz * sd;
+                for oy in 0..oh {
+                    let bh = oy * sh;
+                    for ox in 0..ow {
+                        let bw = ox * sw;
+                        let mut m = f64::NEG_INFINITY;
+                        for kdd in 0..kd {
+                            let dz = ibase + (bd + kdd) * ih * iw;
+                            for kr in 0..kh {
+                                let irow = dz + (bh + kr) * iw + bw;
+                                for kc in 0..kw {
+                                    let v = input[irow + kc];
+                                    if v > m {
+                                        m = v;
+                                    }
+                                }
+                            }
+                        }
+                        orow[(oz * oh + oy) * ow + ox] = m;
+                    }
+                }
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`max_pool3d_forward_f64`]: per output, the max over its
+/// `kd×kh×kw` window, one pass parallel over `(batch,ch)` volumes. Replaces the
+/// f32 op-graph (narrow/amax/cat) the f32 no-grad path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_forward_f32(
+    input: &[f32],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * ch * od * oh * ow];
+    out.par_chunks_mut(od * oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let ibase = plane * id * ih * iw;
+            for oz in 0..od {
+                let bd = oz * sd;
+                for oy in 0..oh {
+                    let bh = oy * sh;
+                    for ox in 0..ow {
+                        let bw = ox * sw;
+                        let mut m = f32::NEG_INFINITY;
+                        for kdd in 0..kd {
+                            let dz = ibase + (bd + kdd) * ih * iw;
+                            for kr in 0..kh {
+                                let irow = dz + (bh + kr) * iw + bw;
+                                for kc in 0..kw {
+                                    let v = input[irow + kc];
+                                    if v > m {
+                                        m = v;
+                                    }
+                                }
+                            }
+                        }
+                        orow[(oz * oh + oy) * ow + ox] = m;
+                    }
+                }
+            }
+        });
+    out
+}
+
+/// Backward of [`max_pool3d_forward_f64`]: routes each output gradient to its
+/// window's (first) argmax. Parallel over `(batch,ch)`; overlaps accumulate.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_backward_f64(
+    dout: &[f64],
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let mut din = vec![0.0f64; batch * ch * id * ih * iw];
+    din.par_chunks_mut(id * ih * iw)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let dbase = plane * od * oh * ow;
+            for oz in 0..od {
+                let bd = oz * sd;
+                for oy in 0..oh {
+                    let bh = oy * sh;
+                    for ox in 0..ow {
+                        let bw = ox * sw;
+                        let mut m = f64::NEG_INFINITY;
+                        let mut arg = 0usize;
+                        for kdd in 0..kd {
+                            let dz = (bd + kdd) * ih * iw;
+                            for kr in 0..kh {
+                                let loc = dz + (bh + kr) * iw + bw;
+                                for kc in 0..kw {
+                                    let v = input[plane * id * ih * iw + loc + kc];
+                                    if v > m {
+                                        m = v;
+                                        arg = loc + kc;
+                                    }
+                                }
+                            }
+                        }
+                        drow[arg] += dout[dbase + (oz * oh + oy) * ow + ox];
+                    }
+                }
+            }
+        });
+    din
+}
+
+/// Fused avg-pool2d forward (f64) over a PADDED `[batch, ch, ph, pw]` input.
+/// Per output: sum over its (clamped) `kh×kw` window divided by the divisor —
+/// `count_include_pad` ? window size : in-bounds (non-pad) element count. Padded
+/// zeros sum to 0 so the sum is identical either way; only the divisor differs.
+/// `ceil_mode` is handled by the window clamp (`row_end = min(start+kh, ph)`).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn avg_pool2d_forward_f64(
+    padded: &[f64],
+    batch: usize,
+    ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    ih: usize,
+    iw: usize,
+    count_include_pad: bool,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; batch * ch * oh * ow];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let pbase = plane * ph * pw;
+            for oy in 0..oh {
+                let rs = oy * sh;
+                let re = (rs + kh).min(ph);
+                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+                for ox in 0..ow {
+                    let cs = ox * sw;
+                    let ce = (cs + kw).min(pw);
+                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                    let mut sum = 0.0f64;
+                    for r in rs..re {
+                        let irow = pbase + r * pw;
+                        for c in cs..ce {
+                            sum += padded[irow + c];
+                        }
+                    }
+                    let div = if count_include_pad {
+                        ((re - rs) * (ce - cs)) as f64
+                    } else {
+                        (vrlen * vclen) as f64
+                    };
+                    orow[oy * ow + ox] = sum / div;
+                }
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`avg_pool2d_forward_f64`]: one windowed-mean pass over the
+/// padded input, parallel over `(batch,ch)` planes. Replaces the f32 op-graph
+/// (narrow/sum/div/cat) the f32 no-grad path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn avg_pool2d_forward_f32(
+    padded: &[f32],
+    batch: usize,
+    ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    ih: usize,
+    iw: usize,
+    count_include_pad: bool,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * ch * oh * ow];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let pbase = plane * ph * pw;
+            for oy in 0..oh {
+                let rs = oy * sh;
+                let re = (rs + kh).min(ph);
+                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+                for ox in 0..ow {
+                    let cs = ox * sw;
+                    let ce = (cs + kw).min(pw);
+                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                    let mut sum = 0.0f32;
+                    for r in rs..re {
+                        let irow = pbase + r * pw;
+                        for c in cs..ce {
+                            sum += padded[irow + c];
+                        }
+                    }
+                    let div = if count_include_pad {
+                        ((re - rs) * (ce - cs)) as f32
+                    } else {
+                        (vrlen * vclen) as f32
+                    };
+                    orow[oy * ow + ox] = sum / div;
+                }
+            }
+        });
+    out
+}
+
+/// Backward of [`avg_pool2d_forward_f64`]: distributes each output gradient
+/// equally (`dout/divisor`) to every position in its window of `dpadded`
+/// (pad-position grads are later dropped by `tensor_pad`'s backward). Parallel
+/// over `(batch,ch)` planes; overlapping windows accumulate deterministically.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn avg_pool2d_backward_f64(
+    dout: &[f64],
+    batch: usize,
+    ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    ih: usize,
+    iw: usize,
+    count_include_pad: bool,
+) -> Vec<f64> {
+    let mut dp = vec![0.0f64; batch * ch * ph * pw];
+    dp.par_chunks_mut(ph * pw)
+        .enumerate()
+        .for_each(|(plane, dprow)| {
+            let dbase = plane * oh * ow;
+            for oy in 0..oh {
+                let rs = oy * sh;
+                let re = (rs + kh).min(ph);
+                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+                for ox in 0..ow {
+                    let cs = ox * sw;
+                    let ce = (cs + kw).min(pw);
+                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                    let div = if count_include_pad {
+                        ((re - rs) * (ce - cs)) as f64
+                    } else {
+                        (vrlen * vclen) as f64
+                    };
+                    let g = dout[dbase + oy * ow + ox] / div;
+                    for r in rs..re {
+                        let irow = r * pw;
+                        for c in cs..ce {
+                            dprow[irow + c] += g;
+                        }
+                    }
+                }
+            }
+        });
+    dp
+}
+
+/// Fused max-pool2d forward (f64): per output `[n,c,oy,ox]`, the max over its
+/// `kh×kw` window of `[batch, ch, ih, iw]`. One pass, parallel over `(batch,ch)`
+/// planes.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool2d_forward_f64(
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    ih: usize,
+    iw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; batch * ch * oh * ow];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let ibase = plane * ih * iw;
+            for oy in 0..oh {
+                let base_h = oy * sh;
+                for ox in 0..ow {
+                    let base_w = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    for kr in 0..kh {
+                        let irow = ibase + (base_h + kr) * iw + base_w;
+                        for kc in 0..kw {
+                            let v = input[irow + kc];
+                            if v > m {
+                                m = v;
+                            }
+                        }
+                    }
+                    orow[oy * ow + ox] = m;
+                }
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`max_pool2d_forward_f64`]: per output, the max over its `kh×kw`
+/// window, one pass parallel over `(batch,ch)` planes. Replaces the f32 op-graph
+/// (per-output narrow/amax/cat) the f32 no-grad path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool2d_forward_f32(
+    input: &[f32],
+    batch: usize,
+    ch: usize,
+    ih: usize,
+    iw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * ch * oh * ow];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(plane, orow)| {
+            let ibase = plane * ih * iw;
+            for oy in 0..oh {
+                let base_h = oy * sh;
+                for ox in 0..ow {
+                    let base_w = ox * sw;
+                    let mut m = f32::NEG_INFINITY;
+                    for kr in 0..kh {
+                        let irow = ibase + (base_h + kr) * iw + base_w;
+                        for kc in 0..kw {
+                            let v = input[irow + kc];
+                            if v > m {
+                                m = v;
+                            }
+                        }
+                    }
+                    orow[oy * ow + ox] = m;
+                }
+            }
+        });
+    out
+}
+
+/// Backward of [`max_pool2d_forward_f64`]: recomputes the (first) argmax of each
+/// window and routes the output gradient there. Parallel over `(batch,ch)`
+/// planes; overlapping windows accumulate deterministically within a plane.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool2d_backward_f64(
+    dout: &[f64],
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    ih: usize,
+    iw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let mut din = vec![0.0f64; batch * ch * ih * iw];
+    din.par_chunks_mut(ih * iw)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let ibase = plane * ih * iw;
+            let dbase = plane * oh * ow;
+            for oy in 0..oh {
+                let base_h = oy * sh;
+                for ox in 0..ow {
+                    let base_w = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    let mut arg = 0usize;
+                    for kr in 0..kh {
+                        let loc = (base_h + kr) * iw + base_w;
+                        for kc in 0..kw {
+                            let v = input[ibase + loc + kc];
+                            if v > m {
+                                m = v;
+                                arg = loc + kc;
+                            }
+                        }
+                    }
+                    drow[arg] += dout[dbase + oy * ow + ox];
+                }
+            }
+        });
+    din
+}
+
+/// Fused conv_transpose2d forward (f64), computed DIRECTLY (no scatter, no
+/// per-position tensor allocs): each output element `[n,oc,oy,ox]` gathers the
+/// valid `(ic,kh,kw)` contributions `input[n,ic,iy,ix]·weight[ic,oc,kh,kw]` where
+/// `iy·sh = oy+ph-kh`, `ix·sw = ox+pw-kw` (integer & in range). Weight is
+/// `[in_ch, out_ch, kh, kw]`. Parallel over `(batch, out_ch)` output planes.
+#[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
+#[must_use]
+pub fn conv_transpose2d_forward_f64(
+    input: &[f64],
+    weight: &[f64],
+    bias: Option<&[f64]>,
+    batch: usize,
+    in_ch: usize,
+    ih: usize,
+    iw: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+) -> Vec<f64> {
+    let mut out = vec![0.0f64; batch * out_ch * oh * ow];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let b0 = bias.map_or(0.0, |b| b[oc]);
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = b0;
+                    for kr in 0..kh {
+                        let y_num = oy + ph;
+                        if y_num < kr {
+                            continue;
+                        }
+                        let yd = y_num - kr;
+                        if yd % sh != 0 {
+                            continue;
+                        }
+                        let iy = yd / sh;
+                        if iy >= ih {
+                            continue;
+                        }
+                        for kc in 0..kw {
+                            let x_num = ox + pw;
+                            if x_num < kc {
+                                continue;
+                            }
+                            let xd = x_num - kc;
+                            if xd % sw != 0 {
+                                continue;
+                            }
+                            let ix = xd / sw;
+                            if ix >= iw {
+                                continue;
+                            }
+                            let mut s = 0.0f64;
+                            for ic in 0..in_ch {
+                                let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
+                                let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                                s += iv * wv;
+                            }
+                            acc += s;
+                        }
+                    }
+                    orow[oy * ow + ox] = acc;
+                }
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`conv_transpose2d_forward_f64`]: per-output gather over the
+/// transposed-conv stencil, parallel over `(batch,out_ch)` planes. Replaces the
+/// f32 op-graph scatter (`O(kh·kw·ih)` narrow/matmul/pad/add tensor ops) the f32
+/// no-grad path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv_transpose2d_forward_f32(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    ih: usize,
+    iw: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; batch * out_ch * oh * ow];
+    out.par_chunks_mut(oh * ow)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let b0 = bias.map_or(0.0, |b| b[oc]);
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let mut acc = b0;
+                    for kr in 0..kh {
+                        let y_num = oy + ph;
+                        if y_num < kr {
+                            continue;
+                        }
+                        let yd = y_num - kr;
+                        if yd % sh != 0 {
+                            continue;
+                        }
+                        let iy = yd / sh;
+                        if iy >= ih {
+                            continue;
+                        }
+                        for kc in 0..kw {
+                            let x_num = ox + pw;
+                            if x_num < kc {
+                                continue;
+                            }
+                            let xd = x_num - kc;
+                            if xd % sw != 0 {
+                                continue;
+                            }
+                            let ix = xd / sw;
+                            if ix >= iw {
+                                continue;
+                            }
+                            let mut s = 0.0f32;
+                            for ic in 0..in_ch {
+                                let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
+                                let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                                s += iv * wv;
+                            }
+                            acc += s;
+                        }
+                    }
+                    orow[oy * ow + ox] = acc;
+                }
+            }
+        });
+    out
+}
+
+/// Backward of [`conv_transpose2d_forward_f64`]. Returns `(dinput, dweight,
+/// dbias?)`. `dinput` parallel over `(batch, in_ch)` (gather), `dweight` parallel
+/// over the weight elements (each a deterministic reduction), `dbias = Σ dout`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv_transpose2d_backward_f64(
+    dout: &[f64],
+    input: &[f64],
+    weight: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ih: usize,
+    iw: usize,
+    out_ch: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    ph: usize,
+    pw: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    // dinput[n,ic,iy,ix] = Σ_{oc,kr,kc} dout[n,oc,oy,ox]·weight[ic,oc,kr,kc],
+    // oy = iy·sh + kr - ph, ox = ix·sw + kc - pw (in range).
+    let mut dinput = vec![0.0f64; batch * in_ch * ih * iw];
+    dinput
+        .par_chunks_mut(ih * iw)
+        .enumerate()
+        .for_each(|(idx, drow)| {
+            let n = idx / in_ch;
+            let ic = idx % in_ch;
+            for iy in 0..ih {
+                for ix in 0..iw {
+                    let mut acc = 0.0f64;
+                    for kr in 0..kh {
+                        let oy_s = iy * sh + kr;
+                        if oy_s < ph {
+                            continue;
+                        }
+                        let oy = oy_s - ph;
+                        if oy >= oh {
+                            continue;
+                        }
+                        for kc in 0..kw {
+                            let ox_s = ix * sw + kc;
+                            if ox_s < pw {
+                                continue;
+                            }
+                            let ox = ox_s - pw;
+                            if ox >= ow {
+                                continue;
+                            }
+                            for oc in 0..out_ch {
+                                let dv = dout[((n * out_ch + oc) * oh + oy) * ow + ox];
+                                let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                                acc += dv * wv;
+                            }
+                        }
+                    }
+                    drow[iy * iw + ix] = acc;
+                }
+            }
+        });
+    // dweight[ic,oc,kr,kc] = Σ_{n,iy,ix} input[n,ic,iy,ix]·dout[n,oc,oy,ox].
+    let mut dweight = vec![0.0f64; in_ch * out_ch * kh * kw];
+    dweight.par_iter_mut().enumerate().for_each(|(widx, dw)| {
+        let kc = widx % kw;
+        let kr = (widx / kw) % kh;
+        let oc = (widx / (kw * kh)) % out_ch;
+        let ic = widx / (kw * kh * out_ch);
+        let mut acc = 0.0f64;
+        for n in 0..batch {
+            for iy in 0..ih {
+                let oy_s = iy * sh + kr;
+                if oy_s < ph {
+                    continue;
+                }
+                let oy = oy_s - ph;
+                if oy >= oh {
+                    continue;
+                }
+                for ix in 0..iw {
+                    let ox_s = ix * sw + kc;
+                    if ox_s < pw {
+                        continue;
+                    }
+                    let ox = ox_s - pw;
+                    if ox >= ow {
+                        continue;
+                    }
+                    let iv = input[((n * in_ch + ic) * ih + iy) * iw + ix];
+                    let dv = dout[((n * out_ch + oc) * oh + oy) * ow + ox];
+                    acc += iv * dv;
+                }
+            }
+        }
+        *dw = acc;
+    });
+    let dbias = if has_bias {
+        let mut db = vec![0.0f64; out_ch];
+        for (oc, dbo) in db.iter_mut().enumerate() {
+            let mut s = 0.0f64;
+            for n in 0..batch {
+                let base = (n * out_ch + oc) * oh * ow;
+                for p in 0..oh * ow {
+                    s += dout[base + p];
+                }
+            }
+            *dbo = s;
+        }
+        Some(db)
+    } else {
+        None
+    };
+    (dinput, dweight, dbias)
+}
+
+/// 3-D im2col gather for conv3d over a PADDED `[batch, in_ch, pd, ph, pw]` input.
+/// Panel `[batch·od·oh·ow, in_ch·kd·kh·kw]`, patch-major, `(in_ch,kd,kh,kw)`-minor.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_im2col_f64(
+    padded: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let mut panel = vec![0.0f64; batch * patch_count * patch_width];
+    panel
+        .par_chunks_mut(patch_width)
+        .enumerate()
+        .for_each(|(row, prow)| {
+            let b = row / patch_count;
+            let pc = row % patch_count;
+            let base_d = (pc / (oh * ow)) * sd;
+            let rem = pc % (oh * ow);
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            let batch_off = b * in_ch * pd * ph * pw;
+            for c in 0..in_ch {
+                let ch_off = batch_off + c * pd * ph * pw;
+                let pch = c * kd * kh * kw;
+                for kdd in 0..kd {
+                    let d_off = ch_off + (base_d + kdd) * ph * pw;
+                    let pkd = pch + kdd * kh * kw;
+                    for kr in 0..kh {
+                        let irow = d_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pkd + kr * kw;
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
+                }
+            }
+        });
+    panel
+}
+
+/// 3-D col2im: transpose-scatter of [`conv3d_im2col_f64`] (overlaps summed).
+/// Parallel over batch, deterministic within each batch.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_col2im_f64(
+    dpanel: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f64> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let mut dpadded = vec![0.0f64; batch * in_ch * pd * ph * pw];
+    dpadded
+        .par_chunks_mut(in_ch * pd * ph * pw)
+        .enumerate()
+        .for_each(|(b, dpb)| {
+            for pc in 0..patch_count {
+                let base_d = (pc / (oh * ow)) * sd;
+                let rem = pc % (oh * ow);
+                let base_h = (rem / ow) * sh;
+                let base_w = (rem % ow) * sw;
+                let prow = (b * patch_count + pc) * patch_width;
+                for c in 0..in_ch {
+                    let ch_off = c * pd * ph * pw;
+                    let pch = c * kd * kh * kw;
+                    for kdd in 0..kd {
+                        let d_off = ch_off + (base_d + kdd) * ph * pw;
+                        let pkd = pch + kdd * kh * kw;
+                        for kr in 0..kh {
+                            let irow = d_off + (base_h + kr) * pw + base_w;
+                            let prow_off = prow + pkd + kr * kw;
+                            for kc in 0..kw {
+                                dpb[irow + kc] += dpanel[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    dpadded
+}
+
+/// Fused conv3d forward (f64) on a PADDED input: 3-D im2col + `panel @
+/// weight_flat^T` (dgemm_bt) straight to NCDHW, plus optional per-channel bias.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_forward_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    bias: Option<&[f64]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f64> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let flat = batch * patch_count;
+    let panel = conv3d_im2col_f64(
+        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
+    let mut out_flat = vec![0.0f64; flat * out_ch];
+    gemm::dgemm_bt(
+        flat,
+        patch_width,
+        out_ch,
+        &panel,
+        weight_flat,
+        &mut out_flat,
+    );
+    let mut out = vec![0.0f64; batch * out_ch * patch_count];
+    out.par_chunks_mut(patch_count)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let bo = bias.map_or(0.0, |bb| bb[oc]);
+            for p in 0..patch_count {
+                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`conv3d_im2col_f64`]: parallel 3-D im2col into a
+/// `[batch·od·oh·ow, in_ch·kd·kh·kw]` panel.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_im2col_f32(
+    padded: &[f32],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let mut panel = vec![0.0f32; batch * patch_count * patch_width];
+    panel
+        .par_chunks_mut(patch_width)
+        .enumerate()
+        .for_each(|(row, prow)| {
+            let b = row / patch_count;
+            let pc = row % patch_count;
+            let base_d = (pc / (oh * ow)) * sd;
+            let rem = pc % (oh * ow);
+            let base_h = (rem / ow) * sh;
+            let base_w = (rem % ow) * sw;
+            let batch_off = b * in_ch * pd * ph * pw;
+            for c in 0..in_ch {
+                let ch_off = batch_off + c * pd * ph * pw;
+                let pch = c * kd * kh * kw;
+                for kdd in 0..kd {
+                    let d_off = ch_off + (base_d + kdd) * ph * pw;
+                    let pkd = pch + kdd * kh * kw;
+                    for kr in 0..kh {
+                        let irow = d_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pkd + kr * kw;
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
+                }
+            }
+        });
+    panel
+}
+
+/// f32 mirror of [`conv3d_forward_f64`]: fused 3-D im2col + `panel @ weight_flat^T`
+/// (via `sgemm_bt`) written straight to NCDHW, plus optional per-channel bias.
+/// Replaces the per-output narrow/cat/bmm op-graph the f32 path fell through to.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_forward_f32(
+    padded: &[f32],
+    weight_flat: &[f32],
+    bias: Option<&[f32]>,
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let flat = batch * patch_count;
+    let panel = conv3d_im2col_f32(
+        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
+    let mut out_flat = vec![0.0f32; flat * out_ch];
+    gemm::sgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
+    let mut out = vec![0.0f32; batch * out_ch * patch_count];
+    out.par_chunks_mut(patch_count)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let n = idx / out_ch;
+            let oc = idx % out_ch;
+            let bo = bias.map_or(0.0, |bb| bb[oc]);
+            for p in 0..patch_count {
+                orow[p] = out_flat[(n * patch_count + p) * out_ch + oc] + bo;
+            }
+        });
+    out
+}
+
+/// Backward of [`conv3d_forward_f64`]. Returns `(dpadded, dweight_flat, dbias?)`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv3d_backward_f64(
+    dout: &[f64],
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pd: usize,
+    ph: usize,
+    pw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let patch_width = in_ch * kd * kh * kw;
+    let patch_count = od * oh * ow;
+    let flat = batch * patch_count;
+    let mut dout_flat = vec![0.0f64; flat * out_ch];
+    dout_flat
+        .par_chunks_mut(out_ch)
+        .enumerate()
+        .for_each(|(row, dr)| {
+            let n = row / patch_count;
+            let p = row % patch_count;
+            for (oc, d) in dr.iter_mut().enumerate() {
+                *d = dout[(n * out_ch + oc) * patch_count + p];
+            }
+        });
+    let panel = conv3d_im2col_f64(
+        padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
+    let mut dout_t = vec![0.0f64; out_ch * flat];
+    for r in 0..flat {
+        for oc in 0..out_ch {
+            dout_t[oc * flat + r] = dout_flat[r * out_ch + oc];
+        }
+    }
+    let mut dweight = vec![0.0f64; out_ch * patch_width];
+    gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    let mut dpanel = vec![0.0f64; flat * patch_width];
+    gemm::dgemm(
+        flat,
+        out_ch,
+        patch_width,
+        &dout_flat,
+        weight_flat,
+        &mut dpanel,
+    );
+    let dpadded = conv3d_col2im_f64(
+        &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    );
     let dbias = if has_bias {
         let mut db = vec![0.0f64; out_ch];
         for (oc, dbo) in db.iter_mut().enumerate() {
@@ -3251,7 +5029,12 @@ pub fn conv2d_backward_f64(
 /// `0.5·(log(var) + (target − input)²/var [+ log(2π) if full])`. One pass,
 /// parallel — none of the ~7 full-size op-graph intermediates.
 #[must_use]
-pub fn gaussian_nll_forward_f64(input: &[f64], target: &[f64], var: &[f64], full: bool) -> Vec<f64> {
+pub fn gaussian_nll_forward_f64(
+    input: &[f64],
+    target: &[f64],
+    var: &[f64],
+    full: bool,
+) -> Vec<f64> {
     let c = if full {
         (2.0 * std::f64::consts::PI).ln()
     } else {
@@ -3416,6 +5199,82 @@ pub fn batch_norm_apply_f64(
         shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
     }
     let mut out = vec![0.0f64; x.len()];
+    out.par_chunks_mut(spatial)
+        .enumerate()
+        .for_each(|(idx, orow)| {
+            let c = idx % channels;
+            let base = idx * spatial;
+            let (sc, sh) = (scale[c], shift[c]);
+            for s in 0..spatial {
+                orow[s] = x[base + s] * sc + sh;
+            }
+        });
+    out
+}
+
+/// f32 mirror of [`batch_norm_stats_f64`]: per-channel mean/var over the
+/// `(batch, spatial)` window, parallel over channels.
+#[must_use]
+pub fn batch_norm_stats_f32(
+    x: &[f32],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+) -> (Vec<f32>, Vec<f32>) {
+    let inv_n = 1.0 / (batch * spatial) as f32;
+    let cs = channels * spatial;
+    let mut mean = vec![0.0f32; channels];
+    let mut var = vec![0.0f32; channels];
+    mean.par_iter_mut()
+        .zip(var.par_iter_mut())
+        .enumerate()
+        .for_each(|(c, (mc, vc))| {
+            let mut sum = 0.0f32;
+            for n in 0..batch {
+                let base = n * cs + c * spatial;
+                for s in 0..spatial {
+                    sum += x[base + s];
+                }
+            }
+            let m = sum * inv_n;
+            let mut vs = 0.0f32;
+            for n in 0..batch {
+                let base = n * cs + c * spatial;
+                for s in 0..spatial {
+                    let d = x[base + s] - m;
+                    vs += d * d;
+                }
+            }
+            *mc = m;
+            *vc = vs * inv_n;
+        });
+    (mean, var)
+}
+
+/// f32 mirror of [`batch_norm_apply_f64`]: per-channel affine normalize via a
+/// precomputed scale/shift, one streaming pass parallel over `(batch·channel)` rows.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn batch_norm_apply_f32(
+    x: &[f32],
+    mean: &[f32],
+    var: &[f32],
+    weight: Option<&[f32]>,
+    bias: Option<&[f32]>,
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    eps: f32,
+) -> Vec<f32> {
+    let _ = batch;
+    let mut scale = vec![0.0f32; channels];
+    let mut shift = vec![0.0f32; channels];
+    for c in 0..channels {
+        let rstd = 1.0 / (var[c] + eps).sqrt();
+        scale[c] = rstd * weight.map_or(1.0, |w| w[c]);
+        shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
+    }
+    let mut out = vec![0.0f32; x.len()];
     out.par_chunks_mut(spatial)
         .enumerate()
         .for_each(|(idx, orow)| {
@@ -4139,12 +5998,12 @@ pub fn norm_tensor_contiguous_f64(
         // L0 "norm": count of non-zero elements
         Ok(data.iter().filter(|&&x| x != 0.0).count() as f64)
     } else if p == 1.0 {
-        Ok(pairwise_sum_map_f64(data, |x| x.abs()))
+        Ok(pairwise_sum_map_f64_maybe_par(data, |x| x.abs()))
     } else if p == 2.0 {
-        let sum_sq = pairwise_sum_map_f64(data, |x| x * x);
+        let sum_sq = pairwise_sum_map_f64_maybe_par(data, |x| x * x);
         Ok(sum_sq.sqrt())
     } else {
-        let sum_pow = pairwise_sum_map_f64(data, |x| x.abs().powf(p));
+        let sum_pow = pairwise_sum_map_f64_maybe_par(data, |x| x.abs().powf(p));
         Ok(sum_pow.powf(1.0 / p))
     }
 }
@@ -5731,7 +7590,7 @@ fn sort_radix_perm(keys: &[u64], perm: &mut Vec<u32>, scratch: &mut Vec<u32>) {
         // A byte position where every element shares one bucket contributes no
         // ordering — skipping its scatter is a stability-preserving no-op and
         // skips most passes for clustered exponents.
-        if count.iter().any(|&c| c == n) {
+        if count.contains(&n) {
             continue;
         }
         let mut sum = 0usize;
@@ -6468,13 +8327,13 @@ fn winograd_filter_transform(g: &[f64]) -> [f64; 16] {
     let mut gg = [[0.0f64; 3]; 4]; // G g  (4x3)
     for j in 0..3 {
         let col = [g[j], g[3 + j], g[6 + j]];
-        for i in 0..4 {
-            gg[i][j] = grow(i, col);
+        for (i, row) in gg.iter_mut().enumerate() {
+            row[j] = grow(i, col);
         }
     }
     let mut u = [0.0f64; 16]; // (G g) G^T  (4x4)
-    for i in 0..4 {
-        let row = gg[i];
+    for (i, row) in gg.iter().enumerate() {
+        let row = *row;
         for j in 0..4 {
             u[i * 4 + j] = grow(j, row);
         }
@@ -6497,13 +8356,13 @@ fn winograd_input_transform(d: &[f64]) -> [f64; 16] {
     let mut td = [[0.0f64; 4]; 4]; // B^T d
     for j in 0..4 {
         let col = [d[j], d[4 + j], d[8 + j], d[12 + j]];
-        for i in 0..4 {
-            td[i][j] = bt(i, col);
+        for (i, row) in td.iter_mut().enumerate() {
+            row[j] = bt(i, col);
         }
     }
     let mut v = [0.0f64; 16]; // (B^T d) B
-    for i in 0..4 {
-        let row = td[i];
+    for (i, row) in td.iter().enumerate() {
+        let row = *row;
         for j in 0..4 {
             v[i * 4 + j] = bt(j, row);
         }
@@ -6524,13 +8383,13 @@ fn winograd_output_transform(m: &[f64]) -> [f64; 4] {
     let mut tm = [[0.0f64; 4]; 2]; // A^T m
     for j in 0..4 {
         let col = [m[j], m[4 + j], m[8 + j], m[12 + j]];
-        for i in 0..2 {
-            tm[i][j] = at(i, col);
+        for (i, row) in tm.iter_mut().enumerate() {
+            row[j] = at(i, col);
         }
     }
     let mut y = [0.0f64; 4]; // (A^T m) A
-    for i in 0..2 {
-        let row = tm[i];
+    for (i, row) in tm.iter().enumerate() {
+        let row = *row;
         for j in 0..2 {
             y[i * 2 + j] = at(j, row);
         }
@@ -6650,6 +8509,227 @@ pub fn winograd_conv2d_3x3_s1_f64(
                         *slot = m[p * oc_t + oc * num_tiles + tile];
                     }
                     let y = winograd_output_transform(&mm);
+                    let obase = (b * out_ch + oc) * out_h * out_w;
+                    for i in 0..2 {
+                        let rr = r0 + i;
+                        if rr >= out_h {
+                            continue;
+                        }
+                        for j in 0..2 {
+                            let cc = c0 + j;
+                            if cc < out_w {
+                                output[obase + rr * out_w + cc] = y[i * 2 + j];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    output
+}
+
+/// Winograd F(2x2, 3x3) filter transform `U = G g G^T` (4x4), f32, `g` row-major 3x3.
+#[inline]
+fn winograd_filter_transform_f32(g: &[f32]) -> [f32; 16] {
+    let grow = |r: usize, c: [f32; 3]| -> f32 {
+        match r {
+            0 => c[0],
+            1 => 0.5 * (c[0] + c[1] + c[2]),
+            2 => 0.5 * (c[0] - c[1] + c[2]),
+            _ => c[2],
+        }
+    };
+    let mut gg = [[0.0f32; 3]; 4];
+    for j in 0..3 {
+        let col = [g[j], g[3 + j], g[6 + j]];
+        for (i, row) in gg.iter_mut().enumerate() {
+            row[j] = grow(i, col);
+        }
+    }
+    let mut u = [0.0f32; 16];
+    for (i, row) in gg.iter().enumerate() {
+        let row = *row;
+        for j in 0..4 {
+            u[i * 4 + j] = grow(j, row);
+        }
+    }
+    u
+}
+
+/// Winograd F(2,3) input transform `V = B^T d B` (4x4), f32, `d` row-major 4x4.
+#[inline]
+fn winograd_input_transform_f32(d: &[f32]) -> [f32; 16] {
+    let bt = |r: usize, c: [f32; 4]| -> f32 {
+        match r {
+            0 => c[0] - c[2],
+            1 => c[1] + c[2],
+            2 => c[2] - c[1],
+            _ => c[1] - c[3],
+        }
+    };
+    let mut td = [[0.0f32; 4]; 4];
+    for j in 0..4 {
+        let col = [d[j], d[4 + j], d[8 + j], d[12 + j]];
+        for (i, row) in td.iter_mut().enumerate() {
+            row[j] = bt(i, col);
+        }
+    }
+    let mut v = [0.0f32; 16];
+    for (i, row) in td.iter().enumerate() {
+        let row = *row;
+        for j in 0..4 {
+            v[i * 4 + j] = bt(j, row);
+        }
+    }
+    v
+}
+
+/// Winograd F(2,3) output transform `Y = A^T m A` (2x2), f32, `m` row-major 4x4.
+#[inline]
+fn winograd_output_transform_f32(m: &[f32]) -> [f32; 4] {
+    let at = |r: usize, c: [f32; 4]| -> f32 {
+        match r {
+            0 => c[0] + c[1] + c[2],
+            _ => c[1] - c[2] - c[3],
+        }
+    };
+    let mut tm = [[0.0f32; 4]; 2];
+    for j in 0..4 {
+        let col = [m[j], m[4 + j], m[8 + j], m[12 + j]];
+        for (i, row) in tm.iter_mut().enumerate() {
+            row[j] = at(i, col);
+        }
+    }
+    let mut y = [0.0f32; 4];
+    for (i, row) in tm.iter().enumerate() {
+        let row = *row;
+        for j in 0..2 {
+            y[i * 2 + j] = at(j, row);
+        }
+    }
+    y
+}
+
+/// Winograd F(2x2, 3x3) convolution for a 3x3, stride-1 conv (no dilation), f32.
+///
+/// f32 mirror of [`winograd_conv2d_3x3_s1_f64`], validated within tolerance by
+/// `winograd_conv2d_f32_matches_direct_within_tolerance`.
+///
+/// NON-WIRED FOUNDATION — MEASURED REGRESSION, kept as a reference + scaffold.
+/// `benches/winograd_bench.rs` A/B's this against an im2col + `sgemm` baseline on a
+/// 64-core worker (same binary, same worker): this materialized F(2,3) path is
+/// **1.3–2.7x SLOWER** at every representative 3x3-s1 shape (e.g. b8/ic64/oc64/hw32:
+/// 25.6 ms vs 9.4 ms). Two compounding causes, both fundamental to this formulation:
+///   1. F(2,3) splits one big-`k` GEMM (`k = in_ch*9`) into 16 small-`k` GEMMs
+///      (`k = in_ch`), collapsing arithmetic intensity — matrixmultiply's microkernel
+///      cannot amortize A/B packing over the short reduction, so the ~2.25x fewer
+///      multiplies are dwarfed by per-GEMM packing overhead.
+///   2. The serial input/output transforms scatter ~4x the output volume with poor
+///      locality (memory-bound), exactly as the f64 doc warned.
+///
+/// A real CPU win needs a genuinely FUSED transform+GEMM kernel (no materialised
+/// `v`/`m`) AND a larger tile (F(4,3)/F(6,3)) to restore GEMM `k`-depth — a large,
+/// correctness-critical build. Do NOT wire this materialized path: it regresses.
+///
+/// `input` is `[batch, in_ch, padded_h, padded_w]` (already padded), `weight` is
+/// `[out_ch, in_ch, 3, 3]`. Returns `[batch, out_ch, out_h, out_w]` with
+/// `out_h = padded_h - 2`, `out_w = padded_w - 2`. The transforms reassociate, so
+/// the result matches direct convolution to tolerance, not bit-for-bit.
+#[allow(clippy::too_many_arguments)]
+pub fn winograd_conv2d_3x3_s1_f32(
+    input: &[f32],
+    weight: &[f32],
+    batch: usize,
+    in_ch: usize,
+    out_ch: usize,
+    padded_h: usize,
+    padded_w: usize,
+) -> Vec<f32> {
+    let out_h = padded_h - 2;
+    let out_w = padded_w - 2;
+    let tiles_h = out_h.div_ceil(2);
+    let tiles_w = out_w.div_ceil(2);
+    let num_tiles = batch * tiles_h * tiles_w;
+    let oc_ic = out_ch * in_ch;
+
+    // 1. Filter transform -> u[p][oc][ic].
+    let mut u = vec![0.0f32; 16 * oc_ic];
+    for oc in 0..out_ch {
+        for ic in 0..in_ch {
+            let g = &weight[(oc * in_ch + ic) * 9..(oc * in_ch + ic) * 9 + 9];
+            let uu = winograd_filter_transform_f32(g);
+            for (p, &val) in uu.iter().enumerate() {
+                u[p * oc_ic + oc * in_ch + ic] = val;
+            }
+        }
+    }
+
+    // 2. Input transform -> v[p][ic][tile].
+    let ic_t = in_ch * num_tiles;
+    let mut v = vec![0.0f32; 16 * ic_t];
+    for b in 0..batch {
+        for th in 0..tiles_h {
+            for tw in 0..tiles_w {
+                let tile = (b * tiles_h + th) * tiles_w + tw;
+                let r0 = th * 2;
+                let c0 = tw * 2;
+                for ic in 0..in_ch {
+                    let base = (b * in_ch + ic) * padded_h * padded_w;
+                    let mut d = [0.0f32; 16];
+                    for i in 0..4 {
+                        let rr = r0 + i;
+                        if rr >= padded_h {
+                            continue;
+                        }
+                        for j in 0..4 {
+                            let cc = c0 + j;
+                            if cc < padded_w {
+                                d[i * 4 + j] = input[base + rr * padded_w + cc];
+                            }
+                        }
+                    }
+                    let vv = winograd_input_transform_f32(&d);
+                    for (p, &val) in vv.iter().enumerate() {
+                        v[p * ic_t + ic * num_tiles + tile] = val;
+                    }
+                }
+            }
+        }
+    }
+
+    // 3. 16 GEMMs: m[p] = U[p] (out_ch x in_ch) @ V[p] (in_ch x num_tiles).
+    // Each is a WIDE GEMM (num_tiles >> out_ch), so run them SERIALLY and let
+    // gemm::sgemm parallelize each across all cores (col-parallel). Fanning out
+    // over the 16 positions instead caps parallelism at 16-way and idles a
+    // many-core worker.
+    let oc_t = out_ch * num_tiles;
+    let mut m = vec![0.0f32; 16 * oc_t];
+    for (p, mp) in m.chunks_mut(oc_t).enumerate() {
+        gemm::sgemm(
+            out_ch,
+            in_ch,
+            num_tiles,
+            &u[p * oc_ic..(p + 1) * oc_ic],
+            &v[p * ic_t..(p + 1) * ic_t],
+            mp,
+        );
+    }
+
+    // 4. Output transform + scatter.
+    let mut output = vec![0.0f32; batch * out_ch * out_h * out_w];
+    for b in 0..batch {
+        for th in 0..tiles_h {
+            for tw in 0..tiles_w {
+                let tile = (b * tiles_h + th) * tiles_w + tw;
+                let r0 = th * 2;
+                let c0 = tw * 2;
+                for oc in 0..out_ch {
+                    let mut mm = [0.0f32; 16];
+                    for (p, slot) in mm.iter_mut().enumerate() {
+                        *slot = m[p * oc_t + oc * num_tiles + tile];
+                    }
+                    let y = winograd_output_transform_f32(&mm);
                     let obase = (b * out_ch + oc) * out_h * out_w;
                     for i in 0..2 {
                         let rr = r0 + i;
@@ -6958,30 +9038,12 @@ pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
         *v *= scale;
     }
 
-    // Padé [6/6] coefficients (from Higham's "The Scaling and Squaring Method")
-    let _b: [f64; 7] = [
-        1.0,
-        1.0 / 2.0,
-        1.0 / 9.0, // b2 = 1/(2*3*3) actually let me use proper coefficients
-        1.0 / 72.0,
-        1.0 / 1008.0,
-        1.0 / 30240.0,
-        1.0 / 1209600.0,
-    ];
-
-    // Actually, use the standard Padé coefficients for [6/6]:
-    // p6 = b0*I + b1*A + b2*A^2 + b3*A^3 + b4*A^4 + b5*A^5 + b6*A^6
-    // q6 = b0*I - b1*A + b2*A^2 - b3*A^3 + b4*A^4 - b5*A^5 + b6*A^6
-    // exp(A) ≈ q6^-1 * p6
-    //
-    // But the standard coefficients for Padé[p/p] of exp(x) centered at 0 are:
-    // b_k = (2p - k)! * p! / ((2p)! * k! * (p-k)!)
-    // For p=6: b_k = (12-k)! * 6! / (12! * k! * (6-k)!)
-
-    // Instead, let's use a simpler approach: Taylor series with enough terms
-    // exp(A) ≈ I + A + A^2/2! + A^3/3! + ... + A^12/12!
-    // Since we've scaled ||A|| <= 0.5, 12 terms gives machine precision
-
+    // Scaling-and-squaring with a Taylor approximant: since the scaling above
+    // guarantees ||A/2^s||_1 <= 0.5, the 13-term Taylor polynomial
+    //   exp(B) ≈ I + B + B^2/2! + ... + B^12/12!
+    // is accurate to ~machine precision; `exp(A) = (exp(A/2^s))^(2^s)` recovers it
+    // by `s` squarings. Validated by `matrix_exp_defining_properties` (diag,
+    // nilpotent, and exp(A)·exp(-A) = I).
     let mut identity = vec![0.0f64; n * n];
     for i in 0..n {
         identity[i * n + i] = 1.0;
@@ -7025,6 +9087,52 @@ pub struct EighResult {
     pub n: usize,
 }
 
+/// Apply the lower triangle of a symmetric rank-2k update:
+///
+/// `A := A - (V @ W^T + W @ V^T)`
+///
+/// `V` and `W` are row-major `n x k` panels and `A` is row-major `n x n`.
+/// This is the BLAS-3 trailing-update primitive needed by blocked symmetric
+/// tridiagonalization (`dsytrd`-style panels). It intentionally updates only the
+/// lower triangle because the current symmetric eigensolver consumes lower
+/// storage for tridiagonal reduction.
+pub fn symmetric_rank2k_lower_update_f64(
+    n: usize,
+    k: usize,
+    v: &[f64],
+    w: &[f64],
+    a: &mut [f64],
+) -> Result<(), KernelError> {
+    let panel_len = n * k;
+    let matrix_len = n * n;
+    if v.len() < panel_len || w.len() < panel_len || a.len() < matrix_len {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![v.len(), w.len(), a.len()],
+            rhs: vec![panel_len, panel_len, matrix_len],
+        });
+    }
+    if n == 0 || k == 0 {
+        return Ok(());
+    }
+
+    let v = &v[..panel_len];
+    let w = &w[..panel_len];
+    let a = &mut a[..matrix_len];
+    let mut vw_t = vec![0.0f64; matrix_len];
+    let mut wv_t = vec![0.0f64; matrix_len];
+    gemm::dgemm_bt(n, k, n, v, w, &mut vw_t);
+    gemm::dgemm_bt(n, k, n, w, v, &mut wv_t);
+    for row in 0..n {
+        let row_start = row * n;
+        for col in 0..=row {
+            let idx = row_start + col;
+            a[idx] -= vw_t[idx] + wv_t[idx];
+        }
+    }
+
+    Ok(())
+}
+
 /// Compute eigendecomposition of a symmetric matrix using the Jacobi eigenvalue algorithm.
 ///
 /// Returns eigenvalues sorted ascending and corresponding orthonormal eigenvectors.
@@ -7055,66 +9163,110 @@ fn eigh_pythag(a: f64, b: f64) -> f64 {
 /// dispatches per i). The real lever is BLOCKED tridiagonalization (LAPACK
 /// dsytrd: panel + symmetric rank-2k trailing update via gemm::dgemm), the same
 /// BLAS-3 family that won blocked-cholesky/QR — a multi-turn rewrite.
-fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+/// Householder reduction of a real-symmetric matrix to tridiagonal form
+/// (EISPACK `tred2`, first half). On return `d`/`e` carry the tridiagonal
+/// diagonal-h / sub-diagonal and `z` holds the accumulated reflectors (lower
+/// triangle) plus the tridiagonal diagonal on its own diagonal. The eigenvector
+/// back-transform is split out so the eigenvalues-only path can skip it.
+#[inline]
+fn lower_packed_index(row: usize, col: usize) -> usize {
+    row * (row + 1) / 2 + col
+}
+
+/// Full-vector tridiagonal reduction over packed lower storage. Arithmetic
+/// order mirrors the full-matrix EISPACK `tred2` loop; the only layout change
+/// is that the upper reflector column `z[j,i] = z[i,j] / h` is stored in
+/// `scaled_reflectors`.
+#[allow(clippy::needless_range_loop)]
+fn eigh_tred2_reduce_packed_full(
+    n: usize,
+    lower: &mut [f64],
+    scaled_reflectors: &mut [f64],
+    d: &mut [f64],
+    e: &mut [f64],
+) {
     for i in (1..n).rev() {
         let l = i - 1;
+        let row_i_start = lower_packed_index(i, 0);
         let mut h = 0.0;
         let mut scale = 0.0;
         if l > 0 {
-            for k in 0..=l {
-                scale += z[i * n + k].abs();
+            let (previous_rows, current_and_after) = lower.split_at_mut(row_i_start);
+            let row_i = &mut current_and_after[..=i];
+            for &value in &row_i[..=l] {
+                scale += value.abs();
             }
             if scale == 0.0 {
-                e[i] = z[i * n + l];
+                e[i] = row_i[l];
             } else {
-                for k in 0..=l {
-                    z[i * n + k] /= scale;
-                    h += z[i * n + k] * z[i * n + k];
+                for value in &mut row_i[..=l] {
+                    *value /= scale;
+                    h += *value * *value;
                 }
-                let mut f = z[i * n + l];
+                let mut f = row_i[l];
                 let g = if f >= 0.0 { -h.sqrt() } else { h.sqrt() };
                 e[i] = scale * g;
                 h -= f * g;
-                z[i * n + l] = f - g;
+                row_i[l] = f - g;
                 f = 0.0;
                 for j in 0..=l {
-                    z[j * n + i] = z[i * n + j] / h;
+                    scaled_reflectors[lower_packed_index(i, j)] = row_i[j] / h;
                     let mut gg = 0.0;
+                    let row_j_start = lower_packed_index(j, 0);
+                    let row_j = &previous_rows[row_j_start..=row_j_start + j];
                     for k in 0..=j {
-                        gg += z[j * n + k] * z[i * n + k];
+                        gg += row_j[k] * row_i[k];
                     }
+                    let mut lower_col_offset = lower_packed_index(j + 1, j);
                     for k in (j + 1)..=l {
-                        gg += z[k * n + j] * z[i * n + k];
+                        gg += previous_rows[lower_col_offset] * row_i[k];
+                        lower_col_offset += k + 1;
                     }
                     e[j] = gg / h;
-                    f += e[j] * z[i * n + j];
+                    f += e[j] * row_i[j];
                 }
                 let hh = f / (h + h);
                 for j in 0..=l {
-                    f = z[i * n + j];
+                    f = row_i[j];
                     let gg = e[j] - hh * f;
                     e[j] = gg;
+                    let row_j_start = lower_packed_index(j, 0);
+                    let row_j = &mut previous_rows[row_j_start..=row_j_start + j];
                     for k in 0..=j {
-                        z[j * n + k] -= f * e[k] + gg * z[i * n + k];
+                        row_j[k] -= f * e[k] + gg * row_i[k];
                     }
                 }
             }
         } else {
-            e[i] = z[i * n + l];
+            e[i] = lower[row_i_start + l];
         }
         d[i] = h;
     }
     d[0] = 0.0;
     e[0] = 0.0;
+}
+
+fn eigh_tred2_backtransform(n: usize, z: &mut [f64], d: &mut [f64]) {
+    let mut projections = Vec::with_capacity(n);
     for i in 0..n {
         if d[i] != 0.0 {
-            for j in 0..i {
-                let mut g = 0.0;
-                for k in 0..i {
-                    g += z[i * n + k] * z[k * n + j];
+            projections.clear();
+            let row_i_start = i * n;
+            let (previous_rows, current_and_after) = z.split_at_mut(row_i_start);
+            let row_i = &current_and_after[..i];
+            projections.resize(i, 0.0);
+            for k in 0..i {
+                let row_factor = row_i[k];
+                let row = &previous_rows[k * n..k * n + i];
+                for j in 0..i {
+                    projections[j] += row_factor * row[j];
                 }
-                for k in 0..i {
-                    z[k * n + j] -= g * z[k * n + i];
+            }
+            for k in 0..i {
+                let reflector = previous_rows[k * n + i];
+                let row = &mut previous_rows[k * n..k * n + i];
+                for j in 0..i {
+                    row[j] -= projections[j] * reflector;
                 }
             }
         }
@@ -7127,14 +9279,101 @@ fn eigh_tred2(n: usize, z: &mut [f64], d: &mut [f64], e: &mut [f64]) {
     }
 }
 
-/// QL algorithm with implicit shifts on a symmetric tridiagonal matrix.
-/// `d` (diagonal) becomes the eigenvalues, `z` (the `tred2` transform) becomes
-/// the eigenvectors as columns. EISPACK `tql2` lineage. Each eigenvalue
-/// converges in O(1) shifted QL steps, so the whole solve is O(n^3) with a far
-/// smaller constant than cyclic Jacobi. Gives up gracefully (leaving the
-/// best-so-far estimate) after a generous iteration cap, mirroring Jacobi's
-/// bounded-sweep behavior rather than erroring.
-fn eigh_tql2(n: usize, d: &mut [f64], e: &mut [f64], z: &mut [f64]) {
+fn eigh_tred2_packed_full(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) -> Vec<f64> {
+    let mut scaled_reflectors = vec![0.0f64; lower.len()];
+    eigh_tred2_reduce_packed_full(n, lower, &mut scaled_reflectors, d, e);
+
+    let mut z = vec![0.0f64; n * n];
+    for i in 0..n {
+        let row_start = i * n;
+        let lower_start = lower_packed_index(i, 0);
+        z[row_start..=row_start + i].copy_from_slice(&lower[lower_start..=lower_start + i]);
+        for j in 0..i {
+            z[j * n + i] = scaled_reflectors[lower_packed_index(i, j)];
+        }
+    }
+    eigh_tred2_backtransform(n, &mut z, d);
+    z
+}
+
+/// Eigenvalues-only tridiagonalization over a packed lower triangle.
+///
+/// This is the same Householder reduction loop as `eigh_tred2_reduce`, but the
+/// values-only path does not need the upper-triangle/reflector-column storage
+/// consumed by the full eigenvector back-transform. Keeping only the packed
+/// lower triangle halves the working set while preserving every scale, dot, and
+/// trailing-update operation in the same order over the same matrix entries.
+#[allow(clippy::needless_range_loop)]
+fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+    for i in (1..n).rev() {
+        let l = i - 1;
+        let row_i_start = lower_packed_index(i, 0);
+        let mut h = 0.0;
+        let mut scale = 0.0;
+        if l > 0 {
+            let (previous_rows, current_and_after) = lower.split_at_mut(row_i_start);
+            let row_i = &mut current_and_after[..=i];
+            for &value in &row_i[..=l] {
+                scale += value.abs();
+            }
+            if scale == 0.0 {
+                e[i] = row_i[l];
+            } else {
+                for value in &mut row_i[..=l] {
+                    *value /= scale;
+                    h += *value * *value;
+                }
+                let mut f = row_i[l];
+                let g = if f >= 0.0 { -h.sqrt() } else { h.sqrt() };
+                e[i] = scale * g;
+                h -= f * g;
+                row_i[l] = f - g;
+                f = 0.0;
+                for j in 0..=l {
+                    let mut gg = 0.0;
+                    let row_j_start = lower_packed_index(j, 0);
+                    let row_j = &previous_rows[row_j_start..=row_j_start + j];
+                    for k in 0..=j {
+                        gg += row_j[k] * row_i[k];
+                    }
+                    let mut lower_col_offset = lower_packed_index(j + 1, j);
+                    for k in (j + 1)..=l {
+                        gg += previous_rows[lower_col_offset] * row_i[k];
+                        lower_col_offset += k + 1;
+                    }
+                    e[j] = gg / h;
+                    f += e[j] * row_i[j];
+                }
+                let hh = f / (h + h);
+                for j in 0..=l {
+                    f = row_i[j];
+                    let gg = e[j] - hh * f;
+                    e[j] = gg;
+                    let row_j_start = lower_packed_index(j, 0);
+                    let row_j = &mut previous_rows[row_j_start..=row_j_start + j];
+                    for k in 0..=j {
+                        row_j[k] -= f * e[k] + gg * row_i[k];
+                    }
+                }
+            }
+        } else {
+            e[i] = lower[row_i_start + l];
+        }
+        d[i] = h;
+    }
+    d[0] = 0.0;
+    e[0] = 0.0;
+    for i in 0..n {
+        d[i] = lower[lower_packed_index(i, i)];
+    }
+}
+
+/// Implicit-shift QL iteration on a symmetric tridiagonal matrix while `zt`
+/// stores the eigenvector matrix transposed:
+/// `zt[col * n + row] == z[row * n + col]`. The rotation stream and per-entry
+/// arithmetic order match the row-major formulation; the vector updates become
+/// contiguous slices instead of strided column walks.
+fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) {
     if n == 0 {
         return;
     }
@@ -7188,12 +9427,83 @@ fn eigh_tql2(n: usize, d: &mut [f64], e: &mut [f64], z: &mut [f64]) {
                 p = s * r;
                 d[i + 1] = g + p;
                 g = c * r - b;
-                // Accumulate the rotation into the eigenvector columns.
+                let col_i = i * n;
+                let col_next = (i + 1) * n;
+                // Accumulate the rotation into the transposed eigenvector rows.
                 for k in 0..n {
-                    f = z[k * n + i + 1];
-                    z[k * n + i + 1] = s * z[k * n + i] + c * f;
-                    z[k * n + i] = c * z[k * n + i] - s * f;
+                    f = zt[col_next + k];
+                    let left = zt[col_i + k];
+                    zt[col_next + k] = s * left + c * f;
+                    zt[col_i + k] = c * left - s * f;
                 }
+            }
+            if bailed {
+                continue;
+            }
+            d[l] -= p;
+            e[l] = g;
+            e[m] = 0.0;
+        }
+    }
+}
+
+/// Eigenvalues-only QL iteration: identical implicit-shift QL sweep as
+/// `eigh_tql2`, but WITHOUT accumulating the rotations into an eigenvector
+/// matrix (the inner `O(n)` per-rotation `z` update, which is the O(n^3) bulk).
+/// The `d`/`e` updates are untouched, so the eigenvalues are bit-for-bit
+/// identical to the full path's — only the discarded eigenvectors are skipped.
+fn eigh_tql2_values_only(n: usize, d: &mut [f64], e: &mut [f64]) {
+    if n == 0 {
+        return;
+    }
+    for i in 1..n {
+        e[i - 1] = e[i];
+    }
+    e[n - 1] = 0.0;
+    for l in 0..n {
+        let mut iter = 0;
+        loop {
+            let mut m = l;
+            while m < n - 1 {
+                let dd = d[m].abs() + d[m + 1].abs();
+                if e[m].abs() <= f64::EPSILON * dd {
+                    break;
+                }
+                m += 1;
+            }
+            if m == l {
+                break;
+            }
+            if iter >= 50 {
+                break;
+            }
+            iter += 1;
+            let mut g = (d[l + 1] - d[l]) / (2.0 * e[l]);
+            let mut r = eigh_pythag(g, 1.0);
+            let sr = if g >= 0.0 { r.abs() } else { -r.abs() };
+            g = d[m] - d[l] + e[l] / (g + sr);
+            let mut s = 1.0;
+            let mut c = 1.0;
+            let mut p = 0.0;
+            let mut bailed = false;
+            for i in (l..m).rev() {
+                let f = s * e[i];
+                let b = c * e[i];
+                r = eigh_pythag(f, g);
+                e[i + 1] = r;
+                if r == 0.0 {
+                    d[i + 1] -= p;
+                    e[m] = 0.0;
+                    bailed = true;
+                    break;
+                }
+                s = f / r;
+                c = g / r;
+                g = d[i + 1] - p;
+                r = (d[i] - g) * s + 2.0 * c * b;
+                p = s * r;
+                d[i + 1] = g + p;
+                g = c * r - b;
             }
             if bailed {
                 continue;
@@ -7231,16 +9541,23 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     // to 100 full O(n^3) sweeps. `z` starts as the input (lower triangle used)
     // and becomes the orthonormal eigenvector matrix; `d`/`e` carry the
     // tridiagonal diagonal/sub-diagonal.
-    let mut z = vec![0.0f64; n * n];
+    let mut lower = vec![0.0f64; n * (n + 1) / 2];
     for i in 0..n {
-        for j in 0..n {
-            z[i * n + j] = data[offset + i * n + j];
-        }
+        let dst = lower_packed_index(i, 0);
+        let src = offset + i * n;
+        lower[dst..=dst + i].copy_from_slice(&data[src..=src + i]);
     }
     let mut d = vec![0.0f64; n];
     let mut e = vec![0.0f64; n];
-    eigh_tred2(n, &mut z, &mut d, &mut e);
-    eigh_tql2(n, &mut d, &mut e, &mut z);
+    let z = eigh_tred2_packed_full(n, &mut lower, &mut d, &mut e);
+    let mut zt = vec![0.0f64; n * n];
+    for row in 0..n {
+        let row_start = row * n;
+        for col in 0..n {
+            zt[col * n + row] = z[row_start + col];
+        }
+    }
+    eigh_tql2_transposed(n, &mut d, &mut e, &mut zt);
 
     // Sort eigenvalues ascending, permuting eigenvector columns to match.
     let mut eigen_pairs: Vec<(f64, usize)> = (0..n).map(|i| (d[i], i)).collect();
@@ -7249,8 +9566,9 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     let eigenvalues: Vec<f64> = eigen_pairs.iter().map(|(val, _)| *val).collect();
     let mut eigenvectors = vec![0.0f64; n * n];
     for (new_col, &(_, old_col)) in eigen_pairs.iter().enumerate() {
+        let old_col_start = old_col * n;
         for row in 0..n {
-            eigenvectors[row * n + new_col] = z[row * n + old_col];
+            eigenvectors[row * n + new_col] = zt[old_col_start + row];
         }
     }
 
@@ -7263,8 +9581,39 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
 
 /// Compute just the eigenvalues of a symmetric matrix (sorted ascending).
 pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
-    let result = eigh_contiguous_f64(data, meta)?;
-    Ok(result.eigenvalues)
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let n = shape[0];
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = meta.storage_offset();
+
+    // Eigenvalues-only: run the SAME Householder reduction + implicit-shift QL
+    // as `eigh_contiguous_f64`, but skip BOTH O(n^3) eigenvector accumulations
+    // (tred2's back-transform and tql2's rotation-into-z) since the vectors are
+    // discarded. The tridiagonal `d`/`e` and the QL eigenvalue iteration are
+    // untouched, so the returned eigenvalues are bit-for-bit identical to
+    // `eigh_contiguous_f64(...).eigenvalues` — proven by `eigvalsh_matches_eigh`.
+    let mut lower = vec![0.0f64; n * (n + 1) / 2];
+    for i in 0..n {
+        let dst = lower_packed_index(i, 0);
+        let src = offset + i * n;
+        lower[dst..=dst + i].copy_from_slice(&data[src..=src + i]);
+    }
+    let mut d = vec![0.0f64; n];
+    let mut e = vec![0.0f64; n];
+    eigh_tred2_values_only(n, &mut lower, &mut d, &mut e);
+    eigh_tql2_values_only(n, &mut d, &mut e);
+
+    d.sort_by(f64::total_cmp);
+    Ok(d)
 }
 
 /// Result of general (non-symmetric) eigendecomposition.
@@ -7288,6 +9637,15 @@ pub struct EigResult {
 /// The eigenvalues are returned as pairs (real, imag) interleaved.
 /// For real eigenvalues, the imaginary part is 0.
 pub fn eig_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EigResult, KernelError> {
+    eig_impl(data, meta, true)
+}
+
+/// Shared worker for general (non-symmetric) eigendecomposition. When
+/// `want_vectors` is false the O(n^3) Schur-vector accumulation (`q_acc`) is
+/// skipped: the eigenvalues are read from the quasi-triangular `h`, which does
+/// NOT depend on `q_acc`, so they are bit-for-bit identical either way. The
+/// `eigvals` path uses `want_vectors = false`.
+fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
     if shape.len() != 2 || shape[0] != shape[1] {
@@ -7373,146 +9731,267 @@ pub fn eig_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EigResult, 
             }
         }
 
-        // Accumulate Q: Q[:, (k+1):] -= 2 * (Q[:, (k+1):] @ v) @ v^T / |v|^2
-        for i in 0..n {
-            let mut dot = 0.0;
-            for j in 0..(n - k - 1) {
-                dot += q_acc[i * n + (k + 1 + j)] * v[j];
-            }
-            let scale = 2.0 * dot / v_norm_sq;
-            for j in 0..(n - k - 1) {
-                q_acc[i * n + (k + 1 + j)] -= scale * v[j];
-            }
-        }
-    }
-
-    // Step 2: QR iteration with shifts on Hessenberg matrix
-    let max_iter = 200 * n;
-    let tol = 1e-14;
-    let mut iter = 0;
-    let mut p = n;
-
-    while p > 1 && iter < max_iter {
-        // Check for convergence of subdiagonal elements
-        for i in (1..p).rev() {
-            if h[i * n + (i - 1)].abs()
-                <= tol * (h[(i - 1) * n + (i - 1)].abs() + h[i * n + i].abs())
-            {
-                h[i * n + (i - 1)] = 0.0;
-                if i == p - 1 {
-                    p -= 1;
+        // Accumulate Q: Q[:, (k+1):] -= 2 * (Q[:, (k+1):] @ v) @ v^T / |v|^2.
+        // Pure eigenvector work — skip when only eigenvalues are requested.
+        if want_vectors {
+            for i in 0..n {
+                let mut dot = 0.0;
+                for j in 0..(n - k - 1) {
+                    dot += q_acc[i * n + (k + 1 + j)] * v[j];
+                }
+                let scale = 2.0 * dot / v_norm_sq;
+                for j in 0..(n - k - 1) {
+                    q_acc[i * n + (k + 1 + j)] -= scale * v[j];
                 }
             }
         }
-        if p <= 1 {
-            break;
-        }
-
-        // Wilkinson shift
-        let a11 = h[(p - 2) * n + (p - 2)];
-        let a12 = h[(p - 2) * n + (p - 1)];
-        let a21 = h[(p - 1) * n + (p - 2)];
-        let a22 = h[(p - 1) * n + (p - 1)];
-        let trace = a11 + a22;
-        let det = a11 * a22 - a12 * a21;
-        let disc = trace * trace - 4.0 * det;
-        let shift = if disc >= 0.0 {
-            let sqrt_disc = disc.sqrt();
-            let e1 = (trace + sqrt_disc) / 2.0;
-            let e2 = (trace - sqrt_disc) / 2.0;
-            if (e1 - a22).abs() < (e2 - a22).abs() {
-                e1
-            } else {
-                e2
-            }
-        } else {
-            trace / 2.0
-        };
-
-        // Apply shift: H - shift * I
-        for i in 0..p {
-            h[i * n + i] -= shift;
-        }
-
-        // QR step on top-left p x p block using Givens rotations
-        for i in 0..(p - 1) {
-            let a = h[i * n + i];
-            let b = h[(i + 1) * n + i];
-            let r = (a * a + b * b).sqrt();
-            if r < 1e-30 {
-                continue;
-            }
-            let c = a / r;
-            let s = -b / r;
-
-            // Apply Givens rotation from left to rows i and i+1
-            for j in 0..n {
-                let t1 = h[i * n + j];
-                let t2 = h[(i + 1) * n + j];
-                h[i * n + j] = c * t1 - s * t2;
-                h[(i + 1) * n + j] = s * t1 + c * t2;
-            }
-
-            // Apply Givens rotation from right to columns i and i+1
-            for j in 0..n {
-                let t1 = h[j * n + i];
-                let t2 = h[j * n + (i + 1)];
-                h[j * n + i] = c * t1 - s * t2;
-                h[j * n + (i + 1)] = s * t1 + c * t2;
-            }
-
-            // Accumulate in Q
-            for j in 0..n {
-                let t1 = q_acc[j * n + i];
-                let t2 = q_acc[j * n + (i + 1)];
-                q_acc[j * n + i] = c * t1 - s * t2;
-                q_acc[j * n + (i + 1)] = s * t1 + c * t2;
-            }
-        }
-
-        // Undo shift
-        for i in 0..p {
-            h[i * n + i] += shift;
-        }
-
-        iter += 1;
     }
 
-    // Step 3: Extract eigenvalues from quasi-upper triangular H
-    let mut eigenvalues = vec![0.0f64; 2 * n]; // (re, im) pairs
-    let mut i = 0;
-    while i < n {
-        if i == n - 1 || h[(i + 1) * n + i].abs() < tol * (h[i * n + i].abs() + 1.0) {
-            // Real eigenvalue
-            eigenvalues[2 * i] = h[i * n + i];
-            eigenvalues[2 * i + 1] = 0.0;
-            i += 1;
-        } else {
-            // Complex conjugate pair from 2x2 block
-            let a11 = h[i * n + i];
-            let a12 = h[i * n + (i + 1)];
-            let a21 = h[(i + 1) * n + i];
-            let a22 = h[(i + 1) * n + (i + 1)];
-            let trace = a11 + a22;
-            let det = a11 * a22 - a12 * a21;
-            let disc = trace * trace - 4.0 * det;
-            let re = trace / 2.0;
-            let im = if disc < 0.0 {
-                (-disc).sqrt() / 2.0
-            } else {
-                0.0
-            };
-            eigenvalues[2 * i] = re;
-            eigenvalues[2 * i + 1] = im;
-            eigenvalues[2 * (i + 1)] = re;
-            eigenvalues[2 * (i + 1) + 1] = -im;
-            i += 2;
+    // Step 2: Francis double-shift implicit QR on the upper-Hessenberg `h`
+    // (EISPACK `hqr2` lineage), accumulating the orthogonal transforms into
+    // `q_acc` (real-Schur vectors) when requested. The IMPLICIT DOUBLE SHIFT
+    // converges trailing 2x2 blocks with COMPLEX-conjugate eigenvalues in real
+    // arithmetic — the previous single-Wilkinson-shift Givens QR could not, so
+    // it returned WRONG eigenvalues for any complex spectrum (frankentorch-09zy).
+    // Eigenvalues are written directly as interleaved (re, im) pairs.
+    let mut eigenvalues = vec![0.0f64; 2 * n];
+    {
+        // Frobenius-ish norm over the Hessenberg band for convergence tests.
+        let mut anorm = 0.0f64;
+        for i in 0..n {
+            for j in i.saturating_sub(1)..n {
+                anorm += h[i * n + j].abs();
+            }
+        }
+        let eps = f64::EPSILON;
+        let mut t = 0.0f64; // accumulated shift
+        let mut en: isize = n as isize - 1; // bottom of the active block (0-based)
+        let mut total_iter = 0usize;
+        let max_total = 60 * n + 100;
+
+        while en >= 0 {
+            let en_u = en as usize;
+            let mut its = 0usize;
+            loop {
+                // Find `l`: top of the unreduced block ending at `en`.
+                let mut l = en_u;
+                while l > 0 {
+                    let mut s = h[(l - 1) * n + (l - 1)].abs() + h[l * n + l].abs();
+                    if s == 0.0 {
+                        s = anorm;
+                    }
+                    if h[l * n + (l - 1)].abs() <= eps * s {
+                        break;
+                    }
+                    l -= 1;
+                }
+
+                let mut x = h[en_u * n + en_u];
+                if l == en_u {
+                    // One real root.
+                    h[en_u * n + en_u] = x + t;
+                    eigenvalues[2 * en_u] = x + t;
+                    eigenvalues[2 * en_u + 1] = 0.0;
+                    en -= 1;
+                    break;
+                }
+
+                let na = en_u - 1;
+                let mut y = h[na * n + na];
+                let mut w = h[en_u * n + na] * h[na * n + en_u];
+                if l == na {
+                    // Two roots (real pair or complex-conjugate pair).
+                    let pp = (y - x) / 2.0;
+                    let q = pp * pp + w;
+                    let zz = q.abs().sqrt();
+                    let xx = x + t;
+                    h[en_u * n + en_u] = xx;
+                    h[na * n + na] = y + t;
+                    if q >= 0.0 {
+                        let zz2 = if pp >= 0.0 { pp + zz } else { pp - zz };
+                        let r1 = xx + zz2;
+                        let r2 = if zz2 != 0.0 { xx - w / zz2 } else { r1 };
+                        eigenvalues[2 * na] = r1;
+                        eigenvalues[2 * na + 1] = 0.0;
+                        eigenvalues[2 * en_u] = r2;
+                        eigenvalues[2 * en_u + 1] = 0.0;
+                        if want_vectors {
+                            // Standardize the 2x2 (Givens rotation) for the Schur vectors.
+                            let xr = h[en_u * n + na];
+                            let s = xr.abs() + zz2.abs();
+                            if s != 0.0 {
+                                let mut cp = xr / s;
+                                let mut cq = zz2 / s;
+                                let r = (cp * cp + cq * cq).sqrt();
+                                cp /= r;
+                                cq /= r;
+                                for j in na..n {
+                                    let z1 = h[na * n + j];
+                                    h[na * n + j] = cq * z1 + cp * h[en_u * n + j];
+                                    h[en_u * n + j] = cq * h[en_u * n + j] - cp * z1;
+                                }
+                                for i in 0..=en_u {
+                                    let z1 = h[i * n + na];
+                                    h[i * n + na] = cq * z1 + cp * h[i * n + en_u];
+                                    h[i * n + en_u] = cq * h[i * n + en_u] - cp * z1;
+                                }
+                                for i in 0..n {
+                                    let z1 = q_acc[i * n + na];
+                                    q_acc[i * n + na] = cq * z1 + cp * q_acc[i * n + en_u];
+                                    q_acc[i * n + en_u] = cq * q_acc[i * n + en_u] - cp * z1;
+                                }
+                            }
+                        }
+                    } else {
+                        eigenvalues[2 * na] = xx + pp;
+                        eigenvalues[2 * na + 1] = zz;
+                        eigenvalues[2 * en_u] = xx + pp;
+                        eigenvalues[2 * en_u + 1] = -zz;
+                    }
+                    en -= 2;
+                    break;
+                }
+
+                if its >= 30 || total_iter >= max_total {
+                    // No convergence — record the diagonal estimate and deflate.
+                    h[en_u * n + en_u] = x + t;
+                    eigenvalues[2 * en_u] = x + t;
+                    eigenvalues[2 * en_u + 1] = 0.0;
+                    en -= 1;
+                    break;
+                }
+
+                // Form the (double) shift.
+                if its == 10 || its == 20 {
+                    // Exceptional shift to break stagnation.
+                    t += x;
+                    for i in 0..=en_u {
+                        h[i * n + i] -= x;
+                    }
+                    let s = h[en_u * n + na].abs() + h[na * n + (na - 1)].abs();
+                    x = 0.75 * s;
+                    y = x;
+                    w = -0.4375 * s * s;
+                }
+                its += 1;
+                total_iter += 1;
+
+                // Find `m`: two consecutive small sub-diagonals (start of the bulge).
+                let mut m = en_u - 2;
+                let (mut p_s, mut q_s, mut r_s);
+                loop {
+                    let zz = h[m * n + m];
+                    let r = x - zz;
+                    let s = y - zz;
+                    p_s = (r * s - w) / h[(m + 1) * n + m] + h[m * n + (m + 1)];
+                    q_s = h[(m + 1) * n + (m + 1)] - zz - r - s;
+                    r_s = h[(m + 2) * n + (m + 1)];
+                    let norm = p_s.abs() + q_s.abs() + r_s.abs();
+                    p_s /= norm;
+                    q_s /= norm;
+                    r_s /= norm;
+                    if m == l {
+                        break;
+                    }
+                    let test1 = p_s.abs()
+                        * (h[(m - 1) * n + (m - 1)].abs()
+                            + zz.abs()
+                            + h[(m + 1) * n + (m + 1)].abs());
+                    let test2 = h[m * n + (m - 1)].abs() * (q_s.abs() + r_s.abs());
+                    if test2 <= eps * test1 {
+                        break;
+                    }
+                    m -= 1;
+                }
+                // Clear the sub-sub-diagonal spike left of the bulge.
+                for i in (m + 2)..=en_u {
+                    h[i * n + (i - 2)] = 0.0;
+                    if i != m + 2 {
+                        h[i * n + (i - 3)] = 0.0;
+                    }
+                }
+
+                // Double QR (bulge-chase) step on rows [m, en].
+                let mut k = m;
+                while k <= na {
+                    let notlast = k != na;
+                    if k != m {
+                        p_s = h[k * n + (k - 1)];
+                        q_s = h[(k + 1) * n + (k - 1)];
+                        r_s = if notlast {
+                            h[(k + 2) * n + (k - 1)]
+                        } else {
+                            0.0
+                        };
+                        x = p_s.abs() + q_s.abs() + r_s.abs();
+                        if x == 0.0 {
+                            k += 1;
+                            continue;
+                        }
+                        p_s /= x;
+                        q_s /= x;
+                        r_s /= x;
+                    }
+                    let s = (p_s * p_s + q_s * q_s + r_s * r_s).sqrt().copysign(p_s);
+                    if k == m {
+                        if l != m {
+                            h[k * n + (k - 1)] = -h[k * n + (k - 1)];
+                        }
+                    } else {
+                        h[k * n + (k - 1)] = -s * x;
+                    }
+                    p_s += s;
+                    let xr = p_s / s;
+                    let yr = q_s / s;
+                    let zr = r_s / s;
+                    q_s /= p_s;
+                    r_s /= p_s;
+                    // Row modification: columns [k, n).
+                    for j in k..n {
+                        let mut p2 = h[k * n + j] + q_s * h[(k + 1) * n + j];
+                        if notlast {
+                            p2 += r_s * h[(k + 2) * n + j];
+                            h[(k + 2) * n + j] -= p2 * zr;
+                        }
+                        h[(k + 1) * n + j] -= p2 * yr;
+                        h[k * n + j] -= p2 * xr;
+                    }
+                    // Column modification: rows [0, min(en, k+3)].
+                    let jmax = (k + 3).min(en_u);
+                    for i in 0..=jmax {
+                        let mut p2 = xr * h[i * n + k] + yr * h[i * n + (k + 1)];
+                        if notlast {
+                            p2 += zr * h[i * n + (k + 2)];
+                            h[i * n + (k + 2)] -= p2 * r_s;
+                        }
+                        h[i * n + (k + 1)] -= p2 * q_s;
+                        h[i * n + k] -= p2;
+                    }
+                    if want_vectors {
+                        for i in 0..n {
+                            let mut p2 = xr * q_acc[i * n + k] + yr * q_acc[i * n + (k + 1)];
+                            if notlast {
+                                p2 += zr * q_acc[i * n + (k + 2)];
+                                q_acc[i * n + (k + 2)] -= p2 * r_s;
+                            }
+                            q_acc[i * n + (k + 1)] -= p2 * q_s;
+                            q_acc[i * n + k] -= p2;
+                        }
+                    }
+                    k += 1;
+                }
+            }
         }
     }
 
-    // Step 4: Eigenvectors - for now, return the accumulated Q
-    // (Full eigenvector computation via inverse iteration is complex)
-    // The columns of Q are approximate eigenvectors for real eigenvalues
+    // Step 3: eigenvectors. Back-substitute the eigenvectors of the
+    // quasi-triangular real-Schur form `h` in place, then transform by the
+    // accumulated Schur vectors `q_acc` to get eigenvectors of the original
+    // matrix. Complex eigenvalues yield complex eigenvectors stored as
+    // consecutive (re, im) column pairs (the `EigResult.eigenvectors` convention).
+    if want_vectors {
+        eig_backsub_eigenvectors(&mut h, &mut q_acc, &eigenvalues, n);
+    }
     Ok(EigResult {
         eigenvalues,
         eigenvectors: q_acc,
@@ -7520,9 +9999,187 @@ pub fn eig_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EigResult, 
     })
 }
 
+/// Complex division `(ar + ai·i) / (br + bi·i)` (EISPACK `cdiv`).
+fn eig_cdiv(ar: f64, ai: f64, br: f64, bi: f64) -> (f64, f64) {
+    if br.abs() >= bi.abs() {
+        let r = bi / br;
+        let d = br + bi * r;
+        ((ar + ai * r) / d, (ai - ar * r) / d)
+    } else {
+        let r = br / bi;
+        let d = br * r + bi;
+        ((ar * r + ai) / d, (ai * r - ar) / d)
+    }
+}
+
+/// Eigenvector back-substitution for a real upper-quasi-triangular Schur form
+/// `h` (EISPACK `hqr2` lineage). Computes eigenvectors of `h` into its own
+/// columns, then overwrites `z` (the accumulated Schur vectors) with the
+/// eigenvectors of the original matrix `z·(vectors of h)`. `evals` holds the
+/// interleaved (re, im) eigenvalues. Complex eigenvalue pairs are stored as a
+/// (real-part column, imag-part column) pair.
+fn eig_backsub_eigenvectors(h: &mut [f64], z: &mut [f64], evals: &[f64], n: usize) {
+    if n == 0 {
+        return;
+    }
+    let mut norm = 0.0f64;
+    for i in 0..n {
+        for j in i..n {
+            norm += h[i * n + j].abs();
+        }
+    }
+    if norm == 0.0 {
+        return;
+    }
+    let eps = f64::EPSILON;
+    let wr = |i: usize| evals[2 * i];
+    let wi = |i: usize| evals[2 * i + 1];
+
+    let mut en_i: isize = n as isize - 1;
+    while en_i >= 0 {
+        let en = en_i as usize;
+        let p = wr(en);
+        let q = wi(en);
+        if q == 0.0 {
+            // Real eigenvalue.
+            let mut m = en;
+            h[en * n + en] = 1.0;
+            if en > 0 {
+                let (mut zz_c, mut s_c) = (0.0f64, 0.0f64);
+                let mut i_i = en as isize - 1;
+                while i_i >= 0 {
+                    let i = i_i as usize;
+                    let w = h[i * n + i] - p;
+                    let mut r = 0.0;
+                    for j in m..=en {
+                        r += h[i * n + j] * h[j * n + en];
+                    }
+                    if wi(i) < 0.0 {
+                        zz_c = w;
+                        s_c = r;
+                        i_i -= 1;
+                        continue;
+                    }
+                    m = i;
+                    if wi(i) == 0.0 {
+                        let mut t = w;
+                        if t == 0.0 {
+                            t = eps * norm;
+                        }
+                        h[i * n + en] = -r / t;
+                    } else {
+                        let x = h[i * n + (i + 1)];
+                        let y = h[(i + 1) * n + i];
+                        let q2 = (wr(i) - p) * (wr(i) - p) + wi(i) * wi(i);
+                        let t = (x * s_c - zz_c * r) / q2;
+                        h[i * n + en] = t;
+                        if x.abs() > zz_c.abs() {
+                            h[(i + 1) * n + en] = (-r - w * t) / x;
+                        } else {
+                            h[(i + 1) * n + en] = (-s_c - y * t) / zz_c;
+                        }
+                    }
+                    i_i -= 1;
+                }
+            }
+            en_i -= 1;
+        } else if q < 0.0 {
+            // Complex pair: `en` is the conjugate (wi<0) root, `na = en-1` its mate.
+            let na = en - 1;
+            let mut m = na;
+            if h[en * n + na].abs() > h[na * n + en].abs() {
+                h[na * n + na] = q / h[en * n + na];
+                h[na * n + en] = -(h[en * n + en] - p) / h[en * n + na];
+            } else {
+                let (cr, ci) = eig_cdiv(0.0, -h[na * n + en], h[na * n + na] - p, q);
+                h[na * n + na] = cr;
+                h[na * n + en] = ci;
+            }
+            h[en * n + na] = 0.0;
+            h[en * n + en] = 1.0;
+            if na > 0 {
+                let (mut zz_c, mut r_c, mut s_c) = (0.0f64, 0.0f64, 0.0f64);
+                let mut i_i = na as isize - 1;
+                while i_i >= 0 {
+                    let i = i_i as usize;
+                    let w = h[i * n + i] - p;
+                    let mut ra = 0.0;
+                    let mut sa = 0.0;
+                    for j in m..=en {
+                        ra += h[i * n + j] * h[j * n + na];
+                        sa += h[i * n + j] * h[j * n + en];
+                    }
+                    if wi(i) < 0.0 {
+                        zz_c = w;
+                        r_c = ra;
+                        s_c = sa;
+                        i_i -= 1;
+                        continue;
+                    }
+                    m = i;
+                    if wi(i) == 0.0 {
+                        let (cr, ci) = eig_cdiv(-ra, -sa, w, q);
+                        h[i * n + na] = cr;
+                        h[i * n + en] = ci;
+                    } else {
+                        let x = h[i * n + (i + 1)];
+                        let y = h[(i + 1) * n + i];
+                        let mut vr = (wr(i) - p) * (wr(i) - p) + wi(i) * wi(i) - q * q;
+                        let vi = (wr(i) - p) * 2.0 * q;
+                        if vr == 0.0 && vi == 0.0 {
+                            vr = eps * norm * (w.abs() + q.abs() + x.abs() + y.abs() + zz_c.abs());
+                        }
+                        let (cr, ci) = eig_cdiv(
+                            x * r_c - zz_c * ra + q * sa,
+                            x * s_c - zz_c * sa - q * ra,
+                            vr,
+                            vi,
+                        );
+                        h[i * n + na] = cr;
+                        h[i * n + en] = ci;
+                        if x.abs() > zz_c.abs() + q.abs() {
+                            h[(i + 1) * n + na] = (-ra - w * h[i * n + na] + q * h[i * n + en]) / x;
+                            h[(i + 1) * n + en] = (-sa - w * h[i * n + en] - q * h[i * n + na]) / x;
+                        } else {
+                            let (cr2, ci2) = eig_cdiv(
+                                -r_c - y * h[i * n + na],
+                                -s_c - y * h[i * n + en],
+                                zz_c,
+                                q,
+                            );
+                            h[(i + 1) * n + na] = cr2;
+                            h[(i + 1) * n + en] = ci2;
+                        }
+                    }
+                    i_i -= 1;
+                }
+            }
+            en_i -= 2;
+        } else {
+            // q > 0: upper root of a pair, handled with its conjugate below it.
+            en_i -= 1;
+        }
+    }
+
+    // Eigenvectors of the original matrix: z[:, j] = z[:, 0..=j] · h[0..=j, j].
+    for j in (0..n).rev() {
+        for i in 0..n {
+            let mut acc = 0.0;
+            for k in 0..=j {
+                acc += z[i * n + k] * h[k * n + j];
+            }
+            z[i * n + j] = acc;
+        }
+    }
+}
+
 /// Compute just the eigenvalues of a general matrix (as complex pairs).
 pub fn eigvals_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
-    let result = eig_contiguous_f64(data, meta)?;
+    // Eigenvalues-only: skip the O(n^3) Schur-vector accumulation. The
+    // eigenvalues are read from the quasi-triangular `h`, which does not depend
+    // on `q_acc`, so they are bit-for-bit identical to
+    // `eig_contiguous_f64(...).eigenvalues`.
+    let result = eig_impl(data, meta, false)?;
     Ok(result.eigenvalues)
 }
 
@@ -8282,6 +10939,363 @@ pub fn svdvals_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64
     // Sort descending, matching svd_contiguous_f64's ordering.
     s.sort_by(|x, y| y.total_cmp(x));
     Ok(s)
+}
+
+/// One draw from a deterministic SplitMix64 stream, mapped to a uniform in (0,1).
+fn splitmix_uniform(state: &mut u64) -> f64 {
+    *state = state.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    let mut z = *state;
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    z ^= z >> 31;
+    // 53-bit mantissa -> (0, 1).
+    ((z >> 11) as f64 + 0.5) / (1u64 << 53) as f64
+}
+
+/// `out` (= ca x cb) = `A^T · B`, where `A` is `ra x ca` and `B` is `ra x cb`
+/// (both row-major). Materialises `A^T` then routes through the cache-blocked GEMM.
+fn mat_at_b(a: &[f64], ra: usize, ca: usize, b: &[f64], cb: usize, out: &mut [f64]) {
+    let mut at = vec![0.0f64; ca * ra];
+    for i in 0..ra {
+        for j in 0..ca {
+            at[j * ra + i] = a[i * ca + j];
+        }
+    }
+    gemm::dgemm(ca, ra, cb, &at, b, out);
+}
+
+/// Randomized truncated SVD (Halko-Martinsson-Tropp). Returns an approximate
+/// rank-`q` factorisation `A ≈ U·diag(s)·Vh` in `O(m·n·l)` (l = q + oversampling)
+/// instead of the full SVD's `O(m·n²)` — a large win when `q << min(m,n)`
+/// (PCA / low-rank approximation). `niter` subspace power iterations sharpen the
+/// estimate for slowly-decaying spectra. The Gaussian sketch is seeded
+/// deterministically from the shape so results are reproducible. For a matrix of
+/// exact rank ≤ q the factorisation is accurate to working precision.
+pub fn svd_lowrank_contiguous_f64(
+    data: &[f64],
+    meta: &TensorMeta,
+    q: usize,
+    niter: usize,
+) -> Result<SvdResult, KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let m = shape[0];
+    let n = shape[1];
+    if m == 0 || n == 0 {
+        return Ok(SvdResult {
+            u: Vec::new(),
+            s: Vec::new(),
+            vh: Vec::new(),
+            m,
+            n,
+            k: 0,
+        });
+    }
+    let offset = meta.storage_offset();
+    let a = data[offset..offset + m * n].to_vec();
+
+    let max_rank = m.min(n);
+    let q = q.clamp(1, max_rank);
+    // Sketch width: target rank + oversampling, capped at the smaller dimension.
+    let l = (q + 6).min(max_rank);
+
+    // Gaussian sketch Omega (n x l) via SplitMix64 + Box-Muller.
+    let mut rng =
+        0x243F_6A88_85A3_08D3u64 ^ ((m as u64) << 32) ^ (n as u64).wrapping_mul(2_654_435_761);
+    let mut omega = vec![0.0f64; n * l];
+    let mut idx = 0;
+    while idx < omega.len() {
+        let u1 = splitmix_uniform(&mut rng);
+        let u2 = splitmix_uniform(&mut rng);
+        let r = (-2.0 * u1.ln()).sqrt();
+        let ang = std::f64::consts::TAU * u2;
+        omega[idx] = r * ang.cos();
+        idx += 1;
+        if idx < omega.len() {
+            omega[idx] = r * ang.sin();
+            idx += 1;
+        }
+    }
+
+    // Y = A · Omega  (m x l).
+    let mut y = vec![0.0f64; m * l];
+    gemm::dgemm(m, n, l, &a, &omega, &mut y);
+
+    // Subspace power iterations: Y <- A·(A^T·Y).
+    for _ in 0..niter {
+        let mut z = vec![0.0f64; n * l]; // z = A^T · Y
+        mat_at_b(&a, m, n, &y, l, &mut z);
+        gemm::dgemm(m, n, l, &a, &z, &mut y); // y = A · z
+    }
+
+    // Orthonormal basis Q (m x l) of range(Y) via reduced QR.
+    let y_meta = TensorMeta::from_shape(vec![m, l], meta.dtype(), meta.device());
+    let qr = qr_contiguous_f64(&y, &y_meta, true)?;
+    let qmat = qr.q; // m x l
+    let lq = qr.n;
+
+    // B = Q^T · A  (lq x n), then its (small) full SVD.
+    let mut b = vec![0.0f64; lq * n];
+    mat_at_b(&qmat, m, lq, &a, n, &mut b);
+    let b_meta = TensorMeta::from_shape(vec![lq, n], meta.dtype(), meta.device());
+    let bsvd = svd_contiguous_f64(&b, &b_meta, false)?;
+    let kb = bsvd.k;
+
+    // U = Q · Ub  (m x kb).
+    let mut u_full = vec![0.0f64; m * kb];
+    gemm::dgemm(m, lq, kb, &qmat, &bsvd.u, &mut u_full);
+
+    // Truncate to the top-q components.
+    let out_k = q.min(kb);
+    let mut u = vec![0.0f64; m * out_k];
+    for i in 0..m {
+        for j in 0..out_k {
+            u[i * out_k + j] = u_full[i * kb + j];
+        }
+    }
+    let s = bsvd.s[..out_k].to_vec();
+    let vh = bsvd.vh[..out_k * n].to_vec();
+
+    Ok(SvdResult {
+        u,
+        s,
+        vh,
+        m,
+        n,
+        k: out_k,
+    })
+}
+
+/// Randomized PCA (`torch.pca_lowrank`). Optionally centers the columns
+/// (subtract each column's mean, treating rows as samples / columns as
+/// features), then runs the randomized truncated SVD. Returns the reduced
+/// `(U, S, Vh)`; the caller transposes `Vh` to the `V` that `torch.pca_lowrank`
+/// reports. O(m·n·q) via [`svd_lowrank_contiguous_f64`].
+pub fn pca_lowrank_contiguous_f64(
+    data: &[f64],
+    meta: &TensorMeta,
+    q: usize,
+    center: bool,
+    niter: usize,
+) -> Result<SvdResult, KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let m = shape[0];
+    let n = shape[1];
+    if m == 0 || n == 0 {
+        return Ok(SvdResult {
+            u: Vec::new(),
+            s: Vec::new(),
+            vh: Vec::new(),
+            m,
+            n,
+            k: 0,
+        });
+    }
+    let offset = meta.storage_offset();
+    let mut a = data[offset..offset + m * n].to_vec();
+    if center {
+        for j in 0..n {
+            let mut mean = 0.0;
+            for i in 0..m {
+                mean += a[i * n + j];
+            }
+            mean /= m as f64;
+            for i in 0..m {
+                a[i * n + j] -= mean;
+            }
+        }
+    }
+    let a_meta = TensorMeta::from_shape(vec![m, n], meta.dtype(), meta.device());
+    svd_lowrank_contiguous_f64(&a, &a_meta, q, niter)
+}
+
+/// Modified Gram-Schmidt over the columns of `m` (n x c, row-major). The
+/// orthonormal columns are packed into the first `rank` positions (returned);
+/// columns whose residual norm falls below the threshold are dropped (rank
+/// deficiency). Used by [`lobpcg_contiguous_f64`].
+fn mgs_orthonormalize_cols(m: &mut [f64], n: usize, c: usize) -> usize {
+    let mut rank = 0usize;
+    for j in 0..c {
+        let mut col = vec![0.0f64; n];
+        for i in 0..n {
+            col[i] = m[i * c + j];
+        }
+        for p in 0..rank {
+            let mut dot = 0.0;
+            for i in 0..n {
+                dot += col[i] * m[i * c + p];
+            }
+            for i in 0..n {
+                col[i] -= dot * m[i * c + p];
+            }
+        }
+        let norm: f64 = col.iter().map(|v| v * v).sum::<f64>().sqrt();
+        if norm > 1e-10 {
+            let inv = 1.0 / norm;
+            for i in 0..n {
+                m[i * c + rank] = col[i] * inv;
+            }
+            rank += 1;
+        }
+    }
+    rank
+}
+
+/// Top/bottom-`k` eigenpairs of a real-symmetric matrix via a block
+/// steepest-descent Rayleigh-Ritz iteration (LOBPCG family, torch.lobpcg). Each
+/// step expands the orthonormal subspace `[X | R]` (R = the X residuals,
+/// orthonormalized against X), does a SMALL `eigh` of `S^T A S`, and keeps the k
+/// extreme Ritz pairs — converging to the k largest (`largest=true`) or smallest
+/// eigenpairs in `O(n^2 k)` per iteration vs the full eigh's `O(n^3)`. Returns
+/// `(eigenvalues[k], eigenvectors[n*k]` row-major, columns = vectors`)`.
+pub fn lobpcg_contiguous_f64(
+    data: &[f64],
+    meta: &TensorMeta,
+    k: usize,
+    largest: bool,
+    niter: usize,
+    tol: f64,
+) -> Result<(Vec<f64>, Vec<f64>), KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let n = shape[0];
+    let k = k.clamp(1, n);
+    let offset = meta.storage_offset();
+    let a = data[offset..offset + n * n].to_vec();
+
+    let dev = meta.device();
+    let dty = meta.dtype();
+    // A @ M  for M: n x c  -> n x c.
+    let amul = |x: &[f64], c: usize| -> Vec<f64> {
+        let mut out = vec![0.0f64; n * c];
+        gemm::dgemm(n, n, c, &a, x, &mut out);
+        out
+    };
+    // Small dense eigh of an `s x s` symmetric matrix; selects the k extreme
+    // Ritz pairs. Returns (theta[k], coeff[s*k] row-major) where coeff column t
+    // is the eigenvector of the t-th selected Ritz value.
+    let select_ritz = |sym: &[f64], s: usize| -> Result<(Vec<f64>, Vec<f64>), KernelError> {
+        let m = TensorMeta::from_shape(vec![s, s], dty, dev);
+        let e = eigh_contiguous_f64(sym, &m)?; // eigenvalues ascending, evecs s x s cols
+        let mut theta = vec![0.0f64; k];
+        let mut coeff = vec![0.0f64; s * k];
+        for t in 0..k {
+            let idx = if largest { s - 1 - t } else { t };
+            theta[t] = e.eigenvalues[idx];
+            for i in 0..s {
+                coeff[i * k + t] = e.eigenvectors[i * s + idx];
+            }
+        }
+        Ok((theta, coeff))
+    };
+
+    // Initial X: random n x k, orthonormalized.
+    let mut rng =
+        0x853C_49E6_748F_EA9Bu64 ^ ((n as u64) << 24) ^ (k as u64).wrapping_mul(0x2545F4914F6CDD1D);
+    let mut x = vec![0.0f64; n * k];
+    let mut idx = 0;
+    while idx < x.len() {
+        let u1 = splitmix_uniform(&mut rng);
+        let u2 = splitmix_uniform(&mut rng);
+        let r = (-2.0 * u1.ln()).sqrt();
+        let ang = std::f64::consts::TAU * u2;
+        x[idx] = r * ang.cos();
+        idx += 1;
+        if idx < x.len() {
+            x[idx] = r * ang.sin();
+            idx += 1;
+        }
+    }
+    mgs_orthonormalize_cols(&mut x, n, k);
+
+    let mut ax = amul(&x, k);
+    // Initial Rayleigh-Ritz on X.
+    let mut gram = vec![0.0f64; k * k];
+    mat_at_b(&x, n, k, &ax, k, &mut gram); // X^T A X
+    let (mut theta, c0) = select_ritz(&gram, k)?;
+    {
+        let mut nx = vec![0.0f64; n * k];
+        gemm::dgemm(n, k, k, &x, &c0, &mut nx);
+        x = nx;
+        let mut nax = vec![0.0f64; n * k];
+        gemm::dgemm(n, k, k, &ax, &c0, &mut nax);
+        ax = nax;
+    }
+
+    for _ in 0..niter.max(1) {
+        // Residuals R = AX - X diag(theta).
+        let mut r = ax.clone();
+        let mut maxres = 0.0f64;
+        for i in 0..k {
+            let mut nr = 0.0;
+            for j in 0..n {
+                let v = ax[j * k + i] - theta[i] * x[j * k + i];
+                r[j * k + i] = v;
+                nr += v * v;
+            }
+            maxres = maxres.max(nr.sqrt());
+        }
+        if maxres < tol {
+            break;
+        }
+        // Orthogonalize R against X, then orthonormalize R's own columns.
+        let mut xtr = vec![0.0f64; k * k];
+        mat_at_b(&x, n, k, &r, k, &mut xtr); // X^T R  (k x k)
+        let mut xxtr = vec![0.0f64; n * k];
+        gemm::dgemm(n, k, k, &x, &xtr, &mut xxtr); // X (X^T R)
+        for v in 0..n * k {
+            r[v] -= xxtr[v];
+        }
+        let rr = mgs_orthonormalize_cols(&mut r, n, k);
+        if rr == 0 {
+            break;
+        }
+        // Subspace S = [X | R[:, :rr]]  (n x sc), orthonormal by construction.
+        let sc = k + rr;
+        let mut s = vec![0.0f64; n * sc];
+        for i in 0..n {
+            for j in 0..k {
+                s[i * sc + j] = x[i * k + j];
+            }
+            for j in 0..rr {
+                s[i * sc + (k + j)] = r[i * k + j];
+            }
+        }
+        let as_ = amul(&s, sc);
+        // M = S^T A S  (sc x sc, symmetric).
+        let mut msym = vec![0.0f64; sc * sc];
+        mat_at_b(&s, n, sc, &as_, sc, &mut msym);
+        let (theta_new, coeff) = select_ritz(&msym, sc)?; // coeff: sc x k
+        // X = S @ coeff ;  AX = AS @ coeff.
+        let mut nx = vec![0.0f64; n * k];
+        gemm::dgemm(n, sc, k, &s, &coeff, &mut nx);
+        let mut nax = vec![0.0f64; n * k];
+        gemm::dgemm(n, sc, k, &as_, &coeff, &mut nax);
+        x = nx;
+        ax = nax;
+        theta = theta_new;
+    }
+
+    Ok((theta, x))
 }
 
 /// Result of QR decomposition.
@@ -11786,6 +14800,75 @@ mod tests {
     }
 
     #[test]
+    fn simd_unary_parallel_path_matches_serial_bit_exact() {
+        // numel above SIMD_UNARY_PARALLEL_THRESHOLD exercises the parallel,
+        // SIMD-grain path; it must be bit-for-bit identical to the serial
+        // max(x, 0) reference (and includes a non-multiple-of-4 tail).
+        let numel = (1 << 19) + 7;
+        let input: Vec<f64> = (0..numel)
+            .map(|i| ((i * 31 + 5) % 97) as f64 * 0.1 - 4.0)
+            .collect();
+        let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
+        let out = relu_tensor_contiguous_f64(&input, &meta).expect("parallel relu");
+        assert_eq!(out.len(), numel);
+        for (i, (&o, &x)) in out.iter().zip(input.iter()).enumerate() {
+            assert_eq!(
+                o.to_bits(),
+                x.max(0.0).to_bits(),
+                "relu @{i}: {o} vs {}",
+                x.max(0.0)
+            );
+        }
+        // sqrt shares the same path.
+        let pos: Vec<f64> = input.iter().map(|x| x.abs() + 0.5).collect();
+        let so = sqrt_tensor_contiguous_f64(&pos, &meta).expect("parallel sqrt");
+        for (i, (&o, &x)) in so.iter().zip(pos.iter()).enumerate() {
+            assert_eq!(o.to_bits(), x.sqrt().to_bits(), "sqrt @{i}");
+        }
+    }
+
+    #[test]
+    fn pairwise_sum_parallel_matches_serial_bit_exact() {
+        // The parallel reduction splits the SAME mid tree via rayon::join, so it
+        // must equal the serial pairwise sum to the bit (above the threshold).
+        let numel = (1 << 19) + 123;
+        let v: Vec<f64> = (0..numel)
+            .map(|i| ((i * 17 + 3) % 251) as f64 * 0.013 - 1.5)
+            .collect();
+        let serial = super::pairwise_sum_f64(&v);
+        let parallel = super::pairwise_sum_f64_par(&v);
+        assert_eq!(
+            serial.to_bits(),
+            parallel.to_bits(),
+            "{serial} vs {parallel}"
+        );
+        let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
+        let s = super::sum_tensor_contiguous_f64(&v, &meta).expect("sum");
+        assert_eq!(s.to_bits(), serial.to_bits());
+    }
+
+    #[test]
+    fn simd_binary_parallel_path_matches_serial_bit_exact() {
+        // numel above SIMD_UNARY_PARALLEL_THRESHOLD exercises the parallel,
+        // SIMD-grain binary path; bit-for-bit identical to scalar a+b/a*b
+        // (includes a non-multiple-of-4 tail).
+        let numel = (1 << 19) + 5;
+        let lhs: Vec<f64> = (0..numel)
+            .map(|i| ((i * 13 + 1) % 101) as f64 * 0.1 - 5.0)
+            .collect();
+        let rhs: Vec<f64> = (0..numel)
+            .map(|i| ((i * 7 + 3) % 89) as f64 * 0.2 - 4.0)
+            .collect();
+        let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
+        let add = add_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("parallel add");
+        let mul = mul_tensor_contiguous_f64(&lhs, &rhs, &meta, &meta).expect("parallel mul");
+        for i in 0..numel {
+            assert_eq!(add[i].to_bits(), (lhs[i] + rhs[i]).to_bits(), "add @{i}");
+            assert_eq!(mul[i].to_bits(), (lhs[i] * rhs[i]).to_bits(), "mul @{i}");
+        }
+    }
+
+    #[test]
     fn sigmoid_scalar_at_zero_returns_half() {
         let input = ScalarTensor::new(0.0, DType::F64, Device::Cpu);
         let out = sigmoid_scalar(&input);
@@ -12865,6 +15948,53 @@ mod tests {
     }
 
     #[test]
+    fn symmetric_rank2k_lower_update_matches_scalar_reference() {
+        let (n, k) = (17usize, 5usize);
+        let v: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 13) as f64 - 6.0) * 0.125 + (i as f64) * 1e-6)
+            .collect();
+        let w: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 11) as f64 - 5.0) * 0.2 - (i as f64) * 1e-6)
+            .collect();
+        let mut got: Vec<f64> = (0..n * n)
+            .map(|i| ((i % 17) as f64 - 8.0) * 0.031)
+            .collect();
+        let mut expected = got.clone();
+        for row in 0..n {
+            for col in 0..=row {
+                let mut update = 0.0;
+                for p in 0..k {
+                    update += v[row * k + p] * w[col * k + p] + w[row * k + p] * v[col * k + p];
+                }
+                expected[row * n + col] -= update;
+            }
+        }
+
+        super::symmetric_rank2k_lower_update_f64(n, k, &v, &w, &mut got).unwrap();
+        for row in 0..n {
+            for col in 0..=row {
+                let idx = row * n + col;
+                let diff = (got[idx] - expected[idx]).abs();
+                let tol = 1e-12 * expected[idx].abs().max(1.0);
+                assert!(
+                    diff <= tol,
+                    "lower update mismatch at ({row},{col}): got {}, expected {}, diff {diff}",
+                    got[idx],
+                    expected[idx]
+                );
+            }
+            for col in (row + 1)..n {
+                let idx = row * n + col;
+                assert_eq!(
+                    got[idx].to_bits(),
+                    expected[idx].to_bits(),
+                    "upper triangle changed at ({row},{col})"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn exp_f64x4_matches_scalar_within_tolerance() {
         use wide::f64x4;
         // Proof obligation 1 — fast-range accuracy. Chunks fully inside
@@ -12877,7 +16007,7 @@ mod tests {
             .collect();
         // Explicit common points (0 and ±1 must be very accurate).
         xs.extend_from_slice(&[0.0, -0.0, 1.0, -1.0, 50.0, -50.0, 1e-9, -1e-9]);
-        while xs.len() % 4 != 0 {
+        while !xs.len().is_multiple_of(4) {
             xs.push(0.0);
         }
         for chunk in xs.chunks_exact(4) {
@@ -15374,7 +18504,10 @@ mod tests {
         // signed zeros, and prove it is bit-for-bit identical to the stable
         // comparison sort it replaces — values (to_bits) AND original indices.
         let (rows, cols) = (6usize, 512usize);
-        assert!(cols >= super::SORT_RADIX_MIN_LEN, "lane must hit radix path");
+        assert!(
+            cols >= super::SORT_RADIX_MIN_LEN,
+            "lane must hit radix path"
+        );
         let numel = rows * cols;
         let data: Vec<f64> = (0..numel)
             .map(|i| match i % 7 {
@@ -15391,8 +18524,7 @@ mod tests {
                 .expect("radix sort should succeed");
             for r in 0..rows {
                 let base = r * cols;
-                let mut lane: Vec<(usize, f64)> =
-                    (0..cols).map(|d| (d, data[base + d])).collect();
+                let mut lane: Vec<(usize, f64)> = (0..cols).map(|d| (d, data[base + d])).collect();
                 if desc {
                     lane.sort_by(|a, b| super::nan_greatest_cmp_f64(b.1, a.1));
                 } else {
@@ -15421,7 +18553,10 @@ mod tests {
         // both signed zeros must match the stable comparison sort bit-for-bit
         // (values via to_bits AND original indices) in both directions.
         let (rows, cols) = (6usize, 512usize);
-        assert!(cols >= super::SORT_RADIX_MIN_LEN, "lane must hit radix path");
+        assert!(
+            cols >= super::SORT_RADIX_MIN_LEN,
+            "lane must hit radix path"
+        );
         let numel = rows * cols;
         let data: Vec<f32> = (0..numel)
             .map(|i| match i % 7 {
@@ -15438,8 +18573,7 @@ mod tests {
                 .expect("f32 radix sort should succeed");
             for r in 0..rows {
                 let base = r * cols;
-                let mut lane: Vec<(usize, f32)> =
-                    (0..cols).map(|d| (d, data[base + d])).collect();
+                let mut lane: Vec<(usize, f32)> = (0..cols).map(|d| (d, data[base + d])).collect();
                 if desc {
                     lane.sort_by(|a, b| super::nan_greatest_cmp_f32(b.1, a.1));
                 } else {
@@ -15959,6 +19093,60 @@ mod tests {
     }
 
     #[test]
+    fn matrix_exp_defining_properties() {
+        // (1) expm of a diagonal matrix = diag(exp(diagonal)).
+        let meta3 = TensorMeta::from_shape(vec![3, 3], DType::F64, Device::Cpu);
+        #[rustfmt::skip]
+        let diag = vec![
+            1.0, 0.0, 0.0,
+            0.0, -1.0, 0.0,
+            0.0, 0.0, 2.0,
+        ];
+        let e = super::matrix_exp_contiguous_f64(&diag, &meta3).unwrap();
+        #[rustfmt::skip]
+        let want = vec![
+            1.0_f64.exp(), 0.0, 0.0,
+            0.0, (-1.0_f64).exp(), 0.0,
+            0.0, 0.0, 2.0_f64.exp(),
+        ];
+        assert_mat_approx_eq(&e, &want, 1e-9, "expm(diag) = diag(exp)");
+
+        // (2) expm of a nilpotent N=[[0,1],[0,0]] is exactly I + N = [[1,1],[0,1]].
+        let meta2 = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
+        let nil = vec![0.0, 1.0, 0.0, 0.0];
+        let en = super::matrix_exp_contiguous_f64(&nil, &meta2).unwrap();
+        assert_mat_approx_eq(&en, &[1.0, 1.0, 0.0, 1.0], 1e-12, "expm(nilpotent)");
+
+        // (3) expm(A)·expm(-A) = I — exercises scaling-and-squaring on a larger-norm,
+        //     non-normal matrix.
+        let n = 3;
+        #[rustfmt::skip]
+        let a = vec![
+            1.0, 2.0, 0.0,
+            0.0, 1.0, 3.0,
+            1.0, 0.0, 1.0,
+        ];
+        let neg: Vec<f64> = a.iter().map(|x| -x).collect();
+        let ea = super::matrix_exp_contiguous_f64(&a, &meta3).unwrap();
+        let ena = super::matrix_exp_contiguous_f64(&neg, &meta3).unwrap();
+        let mut prod = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0;
+                for k in 0..n {
+                    s += ea[i * n + k] * ena[k * n + j];
+                }
+                prod[i * n + j] = s;
+            }
+        }
+        let mut ident = vec![0.0f64; n * n];
+        for i in 0..n {
+            ident[i * n + i] = 1.0;
+        }
+        assert_mat_approx_eq(&prod, &ident, 1e-9, "expm(A)·expm(-A) = I");
+    }
+
+    #[test]
     fn lu_solve_simple_system() {
         // Solve A * x = b where A = [[2, 1], [5, 3]], b = [4, 7]
         // Expected: x = [5, -6]
@@ -16308,6 +19496,58 @@ mod tests {
     }
 
     #[test]
+    fn lobpcg_top_k_matches_eigh() {
+        // 48x48 symmetric with a well-separated spectrum. LOBPCG's top-4
+        // eigenvalues must match the full eigh's top-4, and each returned pair
+        // must satisfy A·v = λ·v.
+        let n = 48usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = (((i * 7 + j * 3 + 1) % 13) as f64) * 0.05;
+            }
+        }
+        for i in 0..n {
+            for j in 0..i {
+                let s = 0.5 * (a[i * n + j] + a[j * n + i]);
+                a[i * n + j] = s;
+                a[j * n + i] = s;
+            }
+            a[i * n + i] += i as f64;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let k = 4usize;
+        let (evals, evecs) = super::lobpcg_contiguous_f64(&a, &meta, k, true, 300, 1e-10).unwrap();
+        let full = super::eigh_contiguous_f64(&a, &meta).unwrap();
+        let mut full_top: Vec<f64> = (0..k).map(|t| full.eigenvalues[n - 1 - t]).collect();
+        let mut got = evals.clone();
+        got.sort_by(|x, y| y.total_cmp(x));
+        full_top.sort_by(|x, y| y.total_cmp(x));
+        for t in 0..k {
+            assert!(
+                (got[t] - full_top[t]).abs() < 1e-6,
+                "eval {t}: lobpcg {} vs eigh {}",
+                got[t],
+                full_top[t]
+            );
+        }
+        for t in 0..k {
+            let lam = evals[t];
+            for row in 0..n {
+                let mut av = 0.0;
+                for col in 0..n {
+                    av += a[row * n + col] * evecs[col * k + t];
+                }
+                let lv = lam * evecs[row * k + t];
+                assert!(
+                    (av - lv).abs() < 1e-5,
+                    "A·v != λ·v at pair {t} row {row}: {av} vs {lv}"
+                );
+            }
+        }
+    }
+
+    #[test]
     fn eigh_reconstruction_3x3() {
         let meta = TensorMeta::from_shape(vec![3, 3], DType::F64, Device::Cpu);
         #[rustfmt::skip]
@@ -16464,6 +19704,66 @@ mod tests {
     }
 
     #[test]
+    fn eig_eigenvectors_satisfy_av_lambda_v() {
+        // A general non-symmetric matrix (a mix of real and complex eigenvalues).
+        // For each returned eigenpair, the eigenvectors must satisfy A·v = λ·v —
+        // the back-substitution step, NOT just the Schur vectors.
+        let n = 5usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] =
+                    (((i * 7 + j * 3 + 1) % 11) as f64 - 5.0) + if i == j { 3.0 } else { 0.0 };
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let r = super::eig_contiguous_f64(&a, &meta).unwrap();
+        let mut saw_complex = false;
+        let mut k = 0usize;
+        while k < n {
+            let re = r.eigenvalues[2 * k];
+            let im = r.eigenvalues[2 * k + 1];
+            if im == 0.0 {
+                for row in 0..n {
+                    let mut av = 0.0;
+                    for col in 0..n {
+                        av += a[row * n + col] * r.eigenvectors[col * n + k];
+                    }
+                    let lv = re * r.eigenvectors[row * n + k];
+                    assert!(
+                        (av - lv).abs() < 1e-6,
+                        "real eig k={k}: (A v - λ v)[{row}] = {}",
+                        av - lv
+                    );
+                }
+                k += 1;
+            } else {
+                saw_complex = true;
+                // λ = re + i·im (im>0); eigenvector = col k + i·col (k+1).
+                for row in 0..n {
+                    let (mut avr, mut avi) = (0.0, 0.0);
+                    for col in 0..n {
+                        avr += a[row * n + col] * r.eigenvectors[col * n + k];
+                        avi += a[row * n + col] * r.eigenvectors[col * n + (k + 1)];
+                    }
+                    let vr = r.eigenvectors[row * n + k];
+                    let vi = r.eigenvectors[row * n + (k + 1)];
+                    assert!(
+                        (avr - (re * vr - im * vi)).abs() < 1e-6,
+                        "cplx eig k={k} re-part[{row}]"
+                    );
+                    assert!(
+                        (avi - (re * vi + im * vr)).abs() < 1e-6,
+                        "cplx eig k={k} im-part[{row}]"
+                    );
+                }
+                k += 2;
+            }
+        }
+        assert!(saw_complex, "test matrix should exercise a complex pair");
+    }
+
+    #[test]
     fn eigvals_matches_eig() {
         let meta = TensorMeta::from_shape(vec![2, 2], DType::F64, Device::Cpu);
         let a = vec![3.0, 1.0, 0.0, 2.0];
@@ -16471,6 +19771,64 @@ mod tests {
         let vals_only = super::eigvals_contiguous_f64(&a, &meta).unwrap();
         for (full_val, vals_val) in full.eigenvalues.iter().zip(&vals_only).take(4) {
             assert!((full_val - vals_val).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn eigvals_companion_complex_roots() {
+        // Companion matrix (upper-Hessenberg) of a degree-6 real polynomial with
+        // KNOWN roots including complex-conjugate pairs. This pins the correct
+        // spectrum so the Francis-QR fix can be validated.
+        // Roots: 1, 2, ±i, 1±i.
+        let factors: Vec<Vec<f64>> = vec![
+            vec![1.0, -1.0],      // x - 1
+            vec![1.0, -2.0],      // x - 2
+            vec![1.0, 0.0, 1.0],  // x^2 + 1      -> ±i
+            vec![1.0, -2.0, 2.0], // x^2 - 2x + 2 -> 1±i
+        ];
+        let mut poly = vec![1.0f64];
+        for f in &factors {
+            let mut next = vec![0.0f64; poly.len() + f.len() - 1];
+            for (i, &a) in poly.iter().enumerate() {
+                for (j, &b) in f.iter().enumerate() {
+                    next[i + j] += a * b;
+                }
+            }
+            poly = next;
+        }
+        let n = poly.len() - 1; // 6
+        // Companion: subdiagonal 1s, last column = -a_i where a_i = poly[n - i].
+        let mut c = vec![0.0f64; n * n];
+        for i in 1..n {
+            c[i * n + (i - 1)] = 1.0;
+        }
+        for i in 0..n {
+            c[i * n + (n - 1)] = -poly[n - i];
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let vals = super::eigvals_contiguous_f64(&c, &meta).unwrap();
+        let got: Vec<(f64, f64)> = (0..n).map(|k| (vals[2 * k], vals[2 * k + 1])).collect();
+        let want: Vec<(f64, f64)> = vec![
+            (1.0, 0.0),
+            (2.0, 0.0),
+            (0.0, 1.0),
+            (0.0, -1.0),
+            (1.0, 1.0),
+            (1.0, -1.0),
+        ];
+        // Eigenvalues are an unordered SET — match each expected one to a
+        // distinct computed one within tolerance (a positional sort tie-breaks
+        // unstably at the last ULP between a real root and a complex pair that
+        // share a real part).
+        let mut used = vec![false; got.len()];
+        for w in &want {
+            let hit = got.iter().enumerate().position(|(gi, g)| {
+                !used[gi] && (g.0 - w.0).abs() < 1e-6 && (g.1 - w.1).abs() < 1e-6
+            });
+            assert!(hit.is_some(), "missing eigenvalue {w:?} in {got:?}");
+            if let Some(gi) = hit {
+                used[gi] = true;
+            }
         }
     }
 
@@ -16522,6 +19880,146 @@ mod tests {
                 }
                 assert!(
                     (val - a[i * n + j]).abs() < 1e-10,
+                    "reconstructed[{i},{j}] = {val}, expected {}",
+                    a[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn svd_ill_conditioned_hilbert() {
+        // Hilbert matrix H[i][j] = 1/(i+j+1): SPD but extremely ill-conditioned.
+        // The implicit-QR SVD must NOT spuriously return SingularMatrix and must
+        // still reconstruct A = U·diag(s)·Vh (a torch-parity robustness check).
+        let n = 16usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = 1.0 / ((i + j + 1) as f64);
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let r = super::svd_contiguous_f64(&a, &meta, false)
+            .expect("SVD must converge on a Hilbert matrix");
+        let k = r.k;
+        // descending, non-negative
+        for w in r.s.windows(2) {
+            assert!(w[0] >= w[1] - 1e-12 && w[1] >= -1e-12);
+        }
+        // reconstruction (loose tol due to conditioning)
+        for i in 0..n {
+            for j in 0..n {
+                let mut val = 0.0;
+                for l in 0..k {
+                    val += r.u[i * k + l] * r.s[l] * r.vh[l * n + j];
+                }
+                assert!(
+                    (val - a[i * n + j]).abs() < 1e-9,
+                    "Hilbert recon[{i},{j}] = {val} vs {}",
+                    a[i * n + j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn svd_lowrank_recovers_exact_low_rank() {
+        // A = B·C has exact rank 3. Randomized SVD with target q>=3 must recover
+        // it to working precision, and its top-3 singular values must match the
+        // full SVD's. Validates the Halko-Martinsson-Tropp range finder + the
+        // Q^T·A small-SVD step against the exact factorization.
+        let (m, n, r) = (10usize, 7usize, 3usize);
+        let mut b = vec![0.0f64; m * r];
+        for i in 0..m {
+            for j in 0..r {
+                b[i * r + j] = ((i * 5 + j * 3 + 1) % 13) as f64 * 0.1 - 0.6;
+            }
+        }
+        let mut c = vec![0.0f64; r * n];
+        for i in 0..r {
+            for j in 0..n {
+                c[i * n + j] = ((i * 7 + j * 2 + 4) % 11) as f64 * 0.1 - 0.5;
+            }
+        }
+        let mut a = vec![0.0f64; m * n];
+        for i in 0..m {
+            for j in 0..n {
+                let mut s = 0.0;
+                for k in 0..r {
+                    s += b[i * r + k] * c[k * n + j];
+                }
+                a[i * n + j] = s;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+        let lr = super::svd_lowrank_contiguous_f64(&a, &meta, 4, 2).unwrap();
+        let k = lr.k;
+        // reconstruction U·diag(s)·Vh ≈ A
+        for i in 0..m {
+            for j in 0..n {
+                let mut val = 0.0;
+                for c2 in 0..k {
+                    val += lr.u[i * k + c2] * lr.s[c2] * lr.vh[c2 * n + j];
+                }
+                assert!(
+                    (val - a[i * n + j]).abs() < 1e-7,
+                    "lowrank recon[{i},{j}] = {val} vs {}",
+                    a[i * n + j]
+                );
+            }
+        }
+        // top-3 singular values match the full SVD's.
+        let full = super::svd_contiguous_f64(&a, &meta, false).unwrap();
+        for t in 0..r {
+            assert!(
+                (lr.s[t] - full.s[t]).abs() < 1e-7,
+                "singular value {t}: lowrank {} vs full {}",
+                lr.s[t],
+                full.s[t]
+            );
+        }
+        // descending, non-negative
+        for w in lr.s.windows(2) {
+            assert!(w[0] >= w[1] - 1e-12 && w[1] >= -1e-12);
+        }
+    }
+
+    #[test]
+    fn svd_rank_deficient_reconstructs() {
+        // Row 2 = 2·row 1 -> rank 3 (one exactly-zero singular value). SVD must
+        // still reconstruct A = U·diag(s)·Vh and produce a near-zero singular value.
+        let (m, n) = (4usize, 4usize);
+        #[rustfmt::skip]
+        let a = vec![
+            1.0, 2.0, 3.0, 4.0,
+            2.0, 4.0, 6.0, 8.0,
+            1.0, 0.0, 1.0, 0.0,
+            0.0, 1.0, 0.0, 1.0,
+        ];
+        let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+        let r = super::svd_contiguous_f64(&a, &meta, false).unwrap();
+        let k = r.k;
+        // smallest singular value ~ 0 (rank deficiency)
+        let smin = r.s.iter().cloned().fold(f64::INFINITY, f64::min);
+        assert!(
+            smin < 1e-9,
+            "rank-deficient matrix should have a ~0 singular value, got {smin}"
+        );
+        // singular values non-negative and descending
+        for w in r.s.windows(2) {
+            assert!(w[0] >= w[1] - 1e-12, "singular values must be descending");
+            assert!(w[1] >= -1e-12, "singular values must be non-negative");
+        }
+        // reconstruction U·diag(s)·Vh = A
+        for i in 0..m {
+            for j in 0..n {
+                let mut val = 0.0;
+                for l in 0..k {
+                    val += r.u[i * k + l] * r.s[l] * r.vh[l * n + j];
+                }
+                assert!(
+                    (val - a[i * n + j]).abs() < 1e-9,
                     "reconstructed[{i},{j}] = {val}, expected {}",
                     a[i * n + j]
                 );
@@ -16905,6 +20403,57 @@ mod tests {
     }
 
     #[test]
+    fn winograd_conv2d_f32_matches_direct_within_tolerance() {
+        // Isomorphism proof for the f32 Winograd F(2,3) path: matches a direct
+        // 3x3 stride-1 conv to f32 tolerance (it reassociates, not bit-exact).
+        let (batch, in_ch, out_ch) = (2usize, 3usize, 4usize);
+        let (padded_h, padded_w) = (9usize, 9usize); // out = 7x7
+        let out_h = padded_h - 2;
+        let out_w = padded_w - 2;
+        let input: Vec<f32> = (0..batch * in_ch * padded_h * padded_w)
+            .map(|i| (((i * 2654435761usize) % 211) as f32 - 105.0) * 0.013)
+            .collect();
+        let weight: Vec<f32> = (0..out_ch * in_ch * 9)
+            .map(|i| (((i * 40503usize) % 97) as f32 - 48.0) * 0.021)
+            .collect();
+
+        let got = super::winograd_conv2d_3x3_s1_f32(
+            &input, &weight, batch, in_ch, out_ch, padded_h, padded_w,
+        );
+
+        let mut want = vec![0.0f32; batch * out_ch * out_h * out_w];
+        for b in 0..batch {
+            for oc in 0..out_ch {
+                for oh in 0..out_h {
+                    for ow in 0..out_w {
+                        let mut acc = 0.0f32;
+                        for ic in 0..in_ch {
+                            let ibase = (b * in_ch + ic) * padded_h * padded_w;
+                            let wbase = (oc * in_ch + ic) * 9;
+                            for kh in 0..3 {
+                                for kw in 0..3 {
+                                    acc += input[ibase + (oh + kh) * padded_w + (ow + kw)]
+                                        * weight[wbase + kh * 3 + kw];
+                                }
+                            }
+                        }
+                        want[((b * out_ch + oc) * out_h + oh) * out_w + ow] = acc;
+                    }
+                }
+            }
+        }
+        assert_eq!(got.len(), want.len());
+        for (idx, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+            let tol = 1e-4 + 1e-4 * w.abs();
+            assert!(
+                (g - w).abs() < tol,
+                "winograd_f32[{idx}]={g} vs direct {w} (diff {:e})",
+                (g - w).abs()
+            );
+        }
+    }
+
+    #[test]
     fn cholesky_1x1() {
         let meta = TensorMeta::from_shape(vec![1, 1], DType::F64, Device::Cpu);
         let a = vec![9.0];
@@ -17009,7 +20558,11 @@ mod tests {
             for t in 0..n {
                 dot += r.q[i * n + t] * r.r[t * n + j];
             }
-            assert!((dot - a[i * n + j]).abs() < 1e-7, "(QR)[{i},{j}]={dot} vs {}", a[i * n + j]);
+            assert!(
+                (dot - a[i * n + j]).abs() < 1e-7,
+                "(QR)[{i},{j}]={dot} vs {}",
+                a[i * n + j]
+            );
         }
         // Q^T*Q == I (orthonormal columns)
         for &(c1, c2) in &[(0usize, 0usize), (10, 10), (3, 200), (255, 254)] {
@@ -17018,7 +20571,10 @@ mod tests {
                 dot += r.q[t * n + c1] * r.q[t * n + c2];
             }
             let expected = if c1 == c2 { 1.0 } else { 0.0 };
-            assert!((dot - expected).abs() < 1e-9, "Q^T Q[{c1},{c2}]={dot} vs {expected}");
+            assert!(
+                (dot - expected).abs() < 1e-9,
+                "Q^T Q[{c1},{c2}]={dot} vs {expected}"
+            );
         }
     }
 
@@ -17967,5 +21523,24 @@ mod tests {
         assert_eq!(small_neg, vec![-1.0, -2.0, -3.0]);
         let expected: Vec<f64> = (1..=16).map(|x| -(x as f64)).collect();
         assert_eq!(large_neg, expected);
+    }
+
+    #[test]
+    fn pairwise_sum_map_parallel_matches_serial_bit_exact() {
+        let numel = (1 << 19) + 77;
+        let v: Vec<f64> = (0..numel)
+            .map(|i| ((i * 11 + 7) % 211) as f64 * 0.017 - 1.8)
+            .collect();
+        let serial = super::pairwise_sum_map_f64(&v, |x| x * x);
+        let parallel = super::pairwise_sum_map_f64_par(&v, |x| x * x);
+        assert_eq!(
+            serial.to_bits(),
+            parallel.to_bits(),
+            "{serial} vs {parallel}"
+        );
+        // L2 norm wires the parallel path above the threshold.
+        let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
+        let nrm = super::norm_tensor_contiguous_f64(&v, &meta, 2.0).expect("norm");
+        assert_eq!(nrm.to_bits(), serial.sqrt().to_bits());
     }
 }

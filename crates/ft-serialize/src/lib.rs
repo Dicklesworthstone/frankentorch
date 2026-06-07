@@ -582,7 +582,6 @@ const FT_DTYPE_TAG_F16: u8 = 2;
 const FT_DTYPE_TAG_BF16: u8 = 3;
 const FT_MIN_NATIVE_TENSOR_HEADER_BYTES: usize = 8 + 8 + 1; // key_len + ndim + dtype tag
 const FT_NATIVE_SAVE_BUFFER_BYTES: usize = 1024 * 1024;
-const FT_NATIVE_F32_VALUE_CHUNK_BYTES: usize = 64 * 1024;
 const FT_NATIVE_HALF_VALUE_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Errors from tensor state dict save/load operations.
@@ -805,9 +804,7 @@ fn write_state_dict_to_writer<W: Write>(
                 let values = tensor
                     .contiguous_values()
                     .map_err(TensorIOError::TensorError)?;
-                for &v in values {
-                    write_native_bytes(writer, &v.to_le_bytes(), io_path)?;
-                }
+                write_native_f64_values(writer, values, io_path)?;
             }
             DType::F32 => {
                 let values = tensor
@@ -852,21 +849,42 @@ fn write_native_bytes<W: Write>(
     writer.write_all(bytes).map_err(|e| io_err(io_path, e))
 }
 
+fn write_native_f64_values<W: Write>(
+    writer: &mut W,
+    values: &[f64],
+    io_path: &str,
+) -> Result<(), TensorIOError> {
+    #[cfg(target_endian = "little")]
+    {
+        write_native_bytes(writer, bytemuck::cast_slice(values), io_path)
+    }
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &value in values {
+            write_native_bytes(writer, &value.to_le_bytes(), io_path)?;
+        }
+        Ok(())
+    }
+}
+
 fn write_native_f32_values<W: Write>(
     writer: &mut W,
     values: &[f32],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    let values_per_chunk = FT_NATIVE_F32_VALUE_CHUNK_BYTES / std::mem::size_of::<f32>();
-    let mut bytes = Vec::with_capacity(FT_NATIVE_F32_VALUE_CHUNK_BYTES);
-    for chunk in values.chunks(values_per_chunk) {
-        bytes.clear();
-        for &value in chunk {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        write_native_bytes(writer, &bytes, io_path)?;
+    #[cfg(target_endian = "little")]
+    {
+        write_native_bytes(writer, bytemuck::cast_slice(values), io_path)
     }
-    Ok(())
+
+    #[cfg(not(target_endian = "little"))]
+    {
+        for &value in values {
+            write_native_bytes(writer, &value.to_le_bytes(), io_path)?;
+        }
+        Ok(())
+    }
 }
 
 fn write_native_f16_values<W: Write>(
@@ -874,16 +892,7 @@ fn write_native_f16_values<W: Write>(
     values: &[Float16],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<Float16>();
-    let mut bytes = Vec::with_capacity(FT_NATIVE_HALF_VALUE_CHUNK_BYTES);
-    for chunk in values.chunks(values_per_chunk) {
-        bytes.clear();
-        for &value in chunk {
-            bytes.extend_from_slice(&value.to_le_bytes());
-        }
-        write_native_bytes(writer, &bytes, io_path)?;
-    }
-    Ok(())
+    write_native_u16_payload_values(writer, values, io_path, Float16::to_bits)
 }
 
 fn write_native_bf16_values<W: Write>(
@@ -891,12 +900,34 @@ fn write_native_bf16_values<W: Write>(
     values: &[BFloat16],
     io_path: &str,
 ) -> Result<(), TensorIOError> {
-    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<BFloat16>();
+    write_native_u16_payload_values(writer, values, io_path, BFloat16::to_bits)
+}
+
+fn write_native_u16_payload_values<W, T, F>(
+    writer: &mut W,
+    values: &[T],
+    io_path: &str,
+    bits_of: F,
+) -> Result<(), TensorIOError>
+where
+    W: Write,
+    T: Copy,
+    F: Fn(T) -> u16,
+{
+    let values_per_chunk = FT_NATIVE_HALF_VALUE_CHUNK_BYTES / std::mem::size_of::<u16>();
     let mut bytes = Vec::with_capacity(FT_NATIVE_HALF_VALUE_CHUNK_BYTES);
     for chunk in values.chunks(values_per_chunk) {
         bytes.clear();
-        for &value in chunk {
-            bytes.extend_from_slice(&value.to_le_bytes());
+        let mut lanes = chunk.chunks_exact(4);
+        for lane in &mut lanes {
+            let packed = u64::from(bits_of(lane[0]))
+                | (u64::from(bits_of(lane[1])) << 16)
+                | (u64::from(bits_of(lane[2])) << 32)
+                | (u64::from(bits_of(lane[3])) << 48);
+            bytes.extend_from_slice(&packed.to_le_bytes());
+        }
+        for &value in lanes.remainder() {
+            bytes.extend_from_slice(&bits_of(value).to_le_bytes());
         }
         write_native_bytes(writer, &bytes, io_path)?;
     }

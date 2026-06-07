@@ -25,5 +25,13 @@ harness = false
 name = "special_bench"
 harness = false
 
+[[bench]]
+name = "fft_bench"
+harness = false
+
+[[bench]]
+name = "cdist_bench"
+harness = false
+
 [lints]
 workspace = true

@@ -1,0 +1,14 @@
+bead=frankentorch-gsmd
+target=ft-api tensor_lobpcg / functional_lobpcg wrapper over ft-kernel-cpu lobpcg_contiguous_f64
+proof_test=lobpcg_api_matches_eigh_extreme_pairs
+output_digest=0xba286106f6b3237c
+fixture=n32_symmetric_well_separated_top_and_bottom_k3
+oracle=tensor_linalg_eigh_full_spectrum
+value_tolerance=1e-6
+residual_tolerance=1e-5
+kernel_baseline_worker=rch_HEAD_commit_31f0e5d9
+kernel_baseline=eigh_f64_256x256=77.96ms
+kernel_candidate=lobpcg_f64_256x256_k8=16.82ms
+p50_speedup=4.6x
+api_lever=expose_detached_no_grad_top_bottom_extreme_eigenpairs
+isomorphism=ordering_top_desc_bottom_asc_preserved,tie_breaking_none,floating_point_kernel_order_unchanged,rng_seeded_splitmix_unchanged,shape_error_paths_kernel_delegated
