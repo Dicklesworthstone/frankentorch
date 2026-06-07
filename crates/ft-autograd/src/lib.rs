@@ -7550,6 +7550,22 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// PyTorch's three-way `sign`: 0 at ±0 (NOT Rust's `f64::signum`, which
+    /// returns ±1 at ±0), ±1 for nonzero, NaN propagates. Used by the norm
+    /// backward so `d|x|/dx` at x==0 is 0 (matching torch's subgradient choice),
+    /// not ±1. frankentorch parity (see Abs backward for the same convention).
+    fn torch_sign(v: f64) -> f64 {
+        if v.is_nan() {
+            f64::NAN
+        } else if v > 0.0 {
+            1.0
+        } else if v < 0.0 {
+            -1.0
+        } else {
+            0.0
+        }
+    }
+
     /// Build typed storage from f64 reduction outputs, matching `dtype`.
     /// Used by max_dim/min_dim so an f32/half input keeps its dtype (the reduced
     /// extremum is one of the inputs, so the f64->dtype narrowing is exact).
@@ -11885,7 +11901,7 @@ impl TensorTape {
                     } else if p == 1.0 {
                         // d/dx_i = sign(x_i)
                         for i in 0..input_numel {
-                            norm_contrib[i] = grad_scalar * input_values[i].signum();
+                            norm_contrib[i] = grad_scalar * Self::torch_sign(input_values[i]);
                         }
                     } else if p.is_infinite() {
                         // Gradient flows to the element(s) achieving the extremum
@@ -11894,7 +11910,7 @@ impl TensorTape {
                         if norm_val != 0.0 {
                             for i in 0..input_numel {
                                 if input_values[i].abs() == norm_val {
-                                    norm_contrib[i] = grad_scalar * input_values[i].signum();
+                                    norm_contrib[i] = grad_scalar * Self::torch_sign(input_values[i]);
                                 }
                             }
                         }
@@ -11903,7 +11919,7 @@ impl TensorTape {
                         let norm_pow = norm_val.powf(p - 1.0);
                         for i in 0..input_numel {
                             norm_contrib[i] = grad_scalar
-                                * input_values[i].signum()
+                                * Self::torch_sign(input_values[i])
                                 * input_values[i].abs().powf(p - 1.0)
                                 / norm_pow;
                         }
@@ -11961,7 +11977,7 @@ impl TensorTape {
                                 for r in 0..reduce_size {
                                     let idx =
                                         outer * reduce_size * inner_size + r * inner_size + inner;
-                                    norm_dim_contrib[idx] = grad_val * input_values[idx].signum();
+                                    norm_dim_contrib[idx] = grad_val * Self::torch_sign(input_values[idx]);
                                 }
                             } else if p.is_infinite() {
                                 if norm_val != 0.0 {
@@ -11971,7 +11987,7 @@ impl TensorTape {
                                             + inner;
                                         if input_values[idx].abs() == norm_val {
                                             norm_dim_contrib[idx] =
-                                                grad_val * input_values[idx].signum();
+                                                grad_val * Self::torch_sign(input_values[idx]);
                                         }
                                     }
                                 }
@@ -11981,7 +11997,7 @@ impl TensorTape {
                                     let idx =
                                         outer * reduce_size * inner_size + r * inner_size + inner;
                                     norm_dim_contrib[idx] = grad_val
-                                        * input_values[idx].signum()
+                                        * Self::torch_sign(input_values[idx])
                                         * input_values[idx].abs().powf(p - 1.0)
                                         / norm_pow;
                                 }
@@ -15571,7 +15587,8 @@ impl TensorTape {
                             .tensor
                             .contiguous_values_as_f64()
                             .map_err(AutogradError::DenseTensor)?;
-                        let signs: Vec<f64> = input_values.iter().map(|v| v.signum()).collect();
+                        let signs: Vec<f64> =
+                            input_values.iter().map(|&v| Self::torch_sign(v)).collect();
                         let inc_exp = self.cg_expand(
                             incoming_id,
                             vec![incoming_val; input_numel],
@@ -15672,7 +15689,8 @@ impl TensorTape {
                             .tensor
                             .contiguous_values_as_f64()
                             .map_err(AutogradError::DenseTensor)?;
-                        let signs: Vec<f64> = input_values.iter().map(|v| v.signum()).collect();
+                        let signs: Vec<f64> =
+                            input_values.iter().map(|&v| Self::torch_sign(v)).collect();
                         let sign_leaf = self.leaf(signs, input_shape.clone(), false)?;
                         let grad_in = self.cg_mul(inc_full, sign_leaf)?;
                         self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
