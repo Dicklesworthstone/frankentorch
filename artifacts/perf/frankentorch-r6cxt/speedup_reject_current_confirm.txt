@@ -1,0 +1,8 @@
+current_lstm=0.857120x
+current_gru=1.243806x
+current_rnn=0.923976x
+current_geomean=0.994989x
+confirm_lstm=0.824624x
+confirm_gru=0.935349x
+confirm_rnn=0.679852x
+confirm_geomean=0.806395x

@@ -124,7 +124,7 @@ RCH_REQUIRE_REMOTE=1 RCH_WORKER=fmd RCH_WORKERS=fmd rch exec -- \
 
 Worker: `fmd`.
 
-| Case | Baseline | After | Speedup |
+| Case | Baseline | First after | Speedup |
 | --- | ---: | ---: | ---: |
 | `lstm_seq64_batch1_128x128` | `3.2712 ms` | `3.1111 ms` | `1.051461x` |
 | `gru_seq64_batch1_128x128` | `2.8212 ms` | `2.2303 ms` | `1.264942x` |
@@ -132,12 +132,35 @@ Worker: `fmd`.
 
 Geomean speedup: `1.089105x`.
 
-Score: `Impact 1.089 x Confidence 0.97 / Effort 0.45 = 2.35`, above the
-`>= 2.0` keep gate.
+Provisional score after this first run was above gate, but a current-tree
+re-run was required after `HEAD` advanced and the masked-SDPA compile blocker
+was repaired.
+
+Current-tree after run:
+
+| Case | Baseline | Current after | Speedup |
+| --- | ---: | ---: | ---: |
+| `lstm_seq64_batch1_128x128` | `3.2712 ms` | `3.8165 ms` | `0.857120x` |
+| `gru_seq64_batch1_128x128` | `2.8212 ms` | `2.2682 ms` | `1.243806x` |
+| `rnn_tanh_seq64_batch1_128x128` | `705.89 us` | `763.97 us` | `0.923976x` |
+
+Current geomean: `0.994989x`.
+
+Confirmation run:
+
+| Case | Baseline | Confirm after | Speedup |
+| --- | ---: | ---: | ---: |
+| `lstm_seq64_batch1_128x128` | `3.2712 ms` | `3.9669 ms` | `0.824624x` |
+| `gru_seq64_batch1_128x128` | `2.8212 ms` | `3.0162 ms` | `0.935349x` |
+| `rnn_tanh_seq64_batch1_128x128` | `705.89 us` | `1.0383 ms` | `0.679852x` |
+
+Confirmation geomean: `0.806395x`.
+
+Score: `0.0`, below the `>= 2.0` keep gate.
 
 ## Pass 6 - closeout and shifted target
 
-Verdict: KEPT.
+Verdict: REJECTED. The recurrent flat-workspace source hunk was removed.
 
 Residual gates:
 
@@ -151,8 +174,7 @@ Residual gates:
 - `ubs crates/ft-api/src/lib.rs` completed locally with broad existing ft-api
   inventory; no new unsafe code was introduced.
 
-Next shifted primitive: reprofile `recurrent_forward` after the flat workspace
-keep. GRU is no longer the dominant member by as much; the remaining target is
-the per-timestep recurrent hidden projection (`h @ W_hh^T`) and RNN output-store
-overhead, but the rejected panel-packing/scalar replay/branch split/borrowed
-storage families remain excluded.
+Next shifted primitive: reprofile `recurrent_forward` from the retained baseline
+path and attack a materially different hidden-projection primitive. Do not
+repeat packed-panel replay, scalar replay, branch splitting, padded-M panels,
+borrowed recurrent storage, or flat sequence/output workspaces.
