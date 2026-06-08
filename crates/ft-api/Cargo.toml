@@ -12,6 +12,7 @@ ft-kernel-cpu = { workspace = true }
 ft-runtime = { workspace = true }
 libm = { workspace = true }
 rayon = "1.10"
+wide = "0.7"
 
 [dev-dependencies]
 criterion = { workspace = true }
