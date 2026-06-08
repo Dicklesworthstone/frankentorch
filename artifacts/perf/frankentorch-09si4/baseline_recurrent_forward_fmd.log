@@ -1,0 +1,5 @@
+2026-06-07T23:32:57-04:00
+worker=fmd
+command=RCH_REQUIRE_REMOTE=1 RCH_WORKERS=fmd rch exec -- cargo bench -p ft-api --bench ops_bench -- recurrent_forward --warm-up-time 1 --measurement-time 5 --sample-size 20
+[RCH] local (no admissible workers: insufficient_slots=6,active_project_exclusion=1)
+[RCH] remote required; refusing local fallback (no worker assigned)
