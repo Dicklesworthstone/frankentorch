@@ -4800,6 +4800,28 @@ impl MultiheadAttention {
         key: TensorNodeId,
         value: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        self.forward_qkv_causal(session, query, key, value, false)
+    }
+
+    /// Self/cross attention over `[N, S, E]` inputs with an optional causal mask,
+    /// matching `torch.nn.MultiheadAttention(..., is_causal=True)`.
+    ///
+    /// When `is_causal` is true a lower-triangular causal mask is applied — each
+    /// query position attends only to keys at its own position or earlier, the
+    /// masking that makes autoregressive transformer decoders work. It threads
+    /// straight into the scaled-dot-product attention (the fused flash-attention
+    /// path), so future positions contribute `-inf` pre-softmax and get no
+    /// gradient. (An explicit additive `attn_mask` is a follow-up, frankentorch-
+    /// tracked, pending the masked SDPA op-graph supporting the collapsed
+    /// `[N*heads, S, d]` attention layout.)
+    pub fn forward_qkv_causal(
+        &self,
+        session: &mut FrankenTorchSession,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        is_causal: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
         let q_shape = {
             let (_, meta) = session.tensor_values_meta(query)?;
             meta.shape().to_vec()
@@ -4886,7 +4908,7 @@ impl MultiheadAttention {
             k_heads,
             v_heads,
             None,
-            false,
+            is_causal,
             Some(self.scale),
         )?;
         let head_out = session.tensor_reshape(
@@ -22588,6 +22610,90 @@ mod tests {
     }
 
     // ---- MultiheadAttention tests ----
+
+    #[test]
+    fn mha_causal_output_is_independent_of_future_positions() {
+        // In causal self-attention, output at query position i must not depend on
+        // any key/value at positions > i. So perturbing the LAST sequence token
+        // must leave the FIRST token's output unchanged.
+        let run = |last_token: [f64; 4]| -> Vec<f64> {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let mha = MultiheadAttention::new(&mut session, 4, 2).expect("mha");
+            let mut data: Vec<f64> = (0..8).map(|i| i as f64 * 0.1).collect();
+            data.extend_from_slice(&last_token); // [1,3,4]: tokens 0,1, then variable token 2
+            let x = session.tensor_variable(data, vec![1, 3, 4], false).expect("var");
+            let y = mha
+                .forward_qkv_causal(&mut session, x, x, x, true)
+                .expect("causal forward");
+            session.tensor_values(y).expect("vals")
+        };
+        let a = run([0.5, -0.3, 0.2, 0.9]);
+        let b = run([9.0, -9.0, 4.0, -2.0]);
+        // Token-0 output = first 4 values; must be identical despite token-2 change.
+        for i in 0..4 {
+            assert!(
+                (a[i] - b[i]).abs() < 1e-12,
+                "causal token-0 output changed with future token: {} vs {}",
+                a[i],
+                b[i]
+            );
+        }
+        // Sanity: token-2 output DOES change (it attends to the perturbed token).
+        assert!(
+            (8..12).any(|i| (a[i] - b[i]).abs() > 1e-6),
+            "token-2 output should depend on token-2 input"
+        );
+    }
+
+    #[test]
+    fn mha_causal_differs_from_unmasked_and_last_token_matches() {
+        // For a length-3 sequence: the LAST query token attends to all 3 keys in
+        // both causal and full attention, so its output is identical; the FIRST
+        // token differs (causal sees only key 0, full sees all keys).
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mha = MultiheadAttention::new(&mut session, 4, 2).expect("mha");
+        let data: Vec<f64> = (0..12).map(|i| (i as f64 - 6.0) * 0.1).collect();
+        let x = session.tensor_variable(data, vec![1, 3, 4], false).expect("var");
+
+        let causal = mha
+            .forward_qkv_causal(&mut session, x, x, x, true)
+            .expect("causal");
+        let full = mha.forward_qkv(&mut session, x, x, x).expect("unmasked");
+        let cv = session.tensor_values(causal).expect("cv");
+        let fv = session.tensor_values(full).expect("fv");
+
+        // Last token (indices 8..12) identical: attends to all 3 keys in both.
+        for i in 8..12 {
+            assert!(
+                (cv[i] - fv[i]).abs() < 1e-12,
+                "last token should match between causal and full: {} vs {}",
+                cv[i],
+                fv[i]
+            );
+        }
+        // First token differs (causal sees only key 0, full sees all keys).
+        assert!(
+            (0..4).any(|i| (cv[i] - fv[i]).abs() > 1e-6),
+            "causal and full attention should differ on the first token"
+        );
+    }
+
+    #[test]
+    fn mha_causal_is_differentiable() {
+        // Causal self-attention must still be differentiable through SDPA.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mha = MultiheadAttention::new(&mut session, 4, 2).expect("mha");
+        let data: Vec<f64> = (1..=12).map(|i| i as f64 * 0.1).collect();
+        let x = session.tensor_variable(data, vec![1, 3, 4], true).expect("var");
+        let y = mha
+            .forward_qkv_causal(&mut session, x, x, x, true)
+            .expect("causal");
+        let loss = session.tensor_sum(y).expect("sum");
+        session.tensor_backward(loss).expect("backward");
+        let gx = session.tensor_grad(x).expect("grad").expect("some");
+        assert_eq!(gx.len(), 12);
+        assert!(gx.iter().any(|&g| g != 0.0), "input grads should be nonzero");
+    }
 
     #[test]
     fn mha_forward_self_attention() {
