@@ -2,28 +2,22 @@ command=rch exec -- cargo bench -p ft-api --bench ops_bench -- knn_search/8192x5
 worker=vmi1153651
 target=knn_search/8192x512_k8
 
-baseline_time_ms_low=11.070
-baseline_time_ms_median=11.360
-baseline_time_ms_high=11.730
-baseline_thrpt_melem_s_low=357.56
-baseline_thrpt_melem_s_median=369.22
-baseline_thrpt_melem_s_high=378.88
+baseline_time_ms_low=14.814
+baseline_time_ms_median=17.337
+baseline_time_ms_high=20.527
+baseline_thrpt_melem_s_low=204.33
+baseline_thrpt_melem_s_median=241.93
+baseline_thrpt_melem_s_high=283.12
 
-after_time_ms_low=9.0338
-after_time_ms_median=9.4908
-after_time_ms_high=10.077
-after_thrpt_melem_s_low=416.21
-after_thrpt_melem_s_median=441.94
-after_thrpt_melem_s_high=464.29
+after_time_ms_low=8.4860
+after_time_ms_median=8.9280
+after_time_ms_high=9.6186
+after_thrpt_melem_s_low=436.06
+after_thrpt_melem_s_median=469.79
+after_thrpt_melem_s_high=494.26
 
-confirmation_after_time_ms_low=8.4860
-confirmation_after_time_ms_median=8.9280
-confirmation_after_time_ms_high=9.6186
-confirmation_after_thrpt_melem_s_low=436.06
-confirmation_after_thrpt_melem_s_median=469.79
-confirmation_after_thrpt_melem_s_high=494.26
 confirmation_worker=vmi1153651
 
-median_speedup=1.196949x
-score=2.58
+median_speedup=1.9410x
+score=2.22
 verdict=KEEP

@@ -1,4 +1,4 @@
-baseline_median_ms=11.3600
-after_median_ms=9.4908
-speedup=1.196949x
-score=2.58
+baseline_median_ms=17.3370
+after_median_ms=8.9280
+speedup=1.9410x
+score=2.22

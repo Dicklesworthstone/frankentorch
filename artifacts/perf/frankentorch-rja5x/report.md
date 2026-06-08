@@ -25,15 +25,18 @@ Same worker: `vmi1153651`
 
 | Run | Median | Interval |
 | --- | ---: | --- |
-| Baseline | 11.360 ms | [11.070 ms, 11.730 ms] |
-| SIMD panel | 9.4908 ms | [9.0338 ms, 10.077 ms] |
-| SIMD panel confirmation | 8.9280 ms | [8.4860 ms, 9.6186 ms] |
+| Baseline, clean `475a5782` worktree | 17.337 ms | [14.814 ms, 20.527 ms] |
+| SIMD panel | 8.9280 ms | [8.4860 ms, 9.6186 ms] |
 
-Speedup: `1.196949x`
+Speedup: `1.9410x`
 
-Score: `Impact 1.196949 x Confidence 0.97 / Effort 0.45 = 2.58`
+Score: `Impact 1.9410 x Confidence 0.80 / Effort 0.70 = 2.22`
 
-Verdict: `KEEP` (`Score >= 2.0`, same-worker intervals do not overlap).
+Verdict: `KEEP` (`Score >= 2.0`, same-worker medians and intervals favor the candidate).
+
+The retained raw logs used for the gate are `baseline_head_475a5782_retry1.log` and
+`after_simd_retry1.log`. Earlier zero-byte or incomplete admission-pressure attempts
+are intentionally excluded from the score.
 
 ## Isomorphism Proof
 
@@ -46,13 +49,13 @@ Verdict: `KEEP` (`Score >= 2.0`, same-worker intervals do not overlap).
 
 ## Verification
 
-- `cargo test -p ft-api knn_search -- --nocapture`: passed 3/3 after `rch` failed open locally due worker admission pressure.
+- `cargo test -p ft-api knn_search -- --nocapture`: passed 3/3 on `vmi1167313`.
 - `cargo check -p ft-api --all-targets`: passed remotely on `vmi1153651`.
 - `sha256sum -c artifacts/optimization/golden_checksums.txt`: passed.
 - `git diff --check`: passed.
 - `cargo fmt -p ft-api -- --check`: blocked by broad pre-existing `ft-api` formatting drift outside this KNN hunk; the KNN-specific formatter complaint was manually fixed.
-- `cargo clippy -p ft-api --all-targets -- -D warnings`: blocked by broad pre-existing `ft-api` lint debt unrelated to this KNN hunk.
-- `ubs crates/ft-api/src/lib.rs crates/ft-api/Cargo.toml Cargo.lock`: scanner timed out after several minutes on the large `ft-api` file and was terminated; no UBS finding was emitted before timeout.
+- `cargo clippy -p ft-api --all-targets -- -D warnings`: failed on broad pre-existing `ft-api` lint debt unrelated to this KNN hunk; no logged diagnostic references `wide::f64x4`, `knn_coords_are_finite`, or the distance-panel lane replay.
+- `ubs crates/ft-api/src/lib.rs crates/ft-api/Cargo.toml Cargo.lock`: timed out after 300 seconds on the large `ft-api` file after entering the Rust scan; no UBS finding was emitted before timeout.
 
 ## Next Shifted Target
 
