@@ -4312,6 +4312,7 @@ pub struct Adamax {
     beta2: f64,
     eps: f64,
     weight_decay: f64,
+    maximize: bool,
     step_counts: Vec<u64>,
     m: Vec<Option<Vec<f64>>>,
     u: Vec<Option<Vec<f64>>>,
@@ -4330,6 +4331,7 @@ impl Adamax {
             beta2: 0.999,
             eps: 1e-8,
             weight_decay: 0.0,
+            maximize: false,
             step_counts: vec![0; n],
             m: vec![None; n],
             u: vec![None; n],
@@ -4352,6 +4354,14 @@ impl Adamax {
     #[must_use]
     pub fn weight_decay(mut self, weight_decay: f64) -> Self {
         self.weight_decay = weight_decay;
+        self
+    }
+
+    /// Maximize the objective instead of minimizing it (default: false).
+    /// Mirrors `torch.optim.Adamax(maximize=...)`: negates the gradient first.
+    #[must_use]
+    pub fn maximize(mut self, maximize: bool) -> Self {
+        self.maximize = maximize;
         self
     }
 
@@ -4406,6 +4416,13 @@ impl Optimizer for Adamax {
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
             let mut effective_grad = grad;
+
+            // maximize: negate the gradient first (before weight decay), torch parity.
+            if self.maximize {
+                for g in effective_grad.iter_mut() {
+                    *g = -*g;
+                }
+            }
 
             if self.weight_decay != 0.0 {
                 for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
@@ -4469,6 +4486,7 @@ pub struct Adadelta {
     rho: f64,
     eps: f64,
     weight_decay: f64,
+    maximize: bool,
     square_avg: Vec<Option<Vec<f64>>>,
     acc_delta: Vec<Option<Vec<f64>>>,
 }
@@ -4485,6 +4503,7 @@ impl Adadelta {
             rho: 0.9,
             eps: 1e-6,
             weight_decay: 0.0,
+            maximize: false,
             square_avg: vec![None; n],
             acc_delta: vec![None; n],
         }
@@ -4505,6 +4524,14 @@ impl Adadelta {
     #[must_use]
     pub fn weight_decay(mut self, weight_decay: f64) -> Self {
         self.weight_decay = weight_decay;
+        self
+    }
+
+    /// Maximize the objective instead of minimizing it (default: false).
+    /// Mirrors `torch.optim.Adadelta(maximize=...)`: negates the gradient first.
+    #[must_use]
+    pub fn maximize(mut self, maximize: bool) -> Self {
+        self.maximize = maximize;
         self
     }
 
@@ -4554,6 +4581,13 @@ impl Optimizer for Adadelta {
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
             let mut effective_grad = grad;
+
+            // maximize: negate the gradient first (before weight decay), torch parity.
+            if self.maximize {
+                for g in effective_grad.iter_mut() {
+                    *g = -*g;
+                }
+            }
 
             if self.weight_decay != 0.0 {
                 for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
@@ -4831,6 +4865,7 @@ pub struct ASGD {
     alpha: f64,
     t0: f64,
     weight_decay: f64,
+    maximize: bool,
     step_count: u64,
     ax: Vec<Option<Vec<f64>>>,
     eta: f64,
@@ -4850,11 +4885,20 @@ impl ASGD {
             alpha: 0.75,
             t0: 1e6,
             weight_decay: 0.0,
+            maximize: false,
             step_count: 0,
             ax: vec![None; n],
             eta: lr,
             mu: 1.0,
         }
+    }
+
+    /// Maximize the objective instead of minimizing it (default: false).
+    /// Mirrors `torch.optim.ASGD(maximize=...)`: negates the gradient first.
+    #[must_use]
+    pub fn maximize(mut self, maximize: bool) -> Self {
+        self.maximize = maximize;
+        self
     }
 
     #[must_use]
@@ -4935,6 +4979,13 @@ impl Optimizer for ASGD {
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
             let mut effective_grad = grad;
 
+            // maximize: negate the gradient first (before weight decay), torch parity.
+            if self.maximize {
+                for g in effective_grad.iter_mut() {
+                    *g = -*g;
+                }
+            }
+
             if self.weight_decay != 0.0 {
                 for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
                     *g += self.weight_decay * p;
@@ -5008,6 +5059,7 @@ pub struct Rprop {
     eta_plus: f64,
     step_min: f64,
     step_max: f64,
+    maximize: bool,
     step_sizes: Vec<Option<Vec<f64>>>,
     prev_grad: Vec<Option<Vec<f64>>>,
 }
@@ -5025,9 +5077,19 @@ impl Rprop {
             eta_plus: 1.2,
             step_min: 1e-6,
             step_max: 50.0,
+            maximize: false,
             step_sizes: vec![None; n],
             prev_grad: vec![None; n],
         }
+    }
+
+    /// Maximize the objective instead of minimizing it (default: false).
+    /// Mirrors `torch.optim.Rprop(maximize=...)`: negates the gradient first, so
+    /// the sign-based step logic ascends the objective.
+    #[must_use]
+    pub fn maximize(mut self, maximize: bool) -> Self {
+        self.maximize = maximize;
+        self
     }
 
     /// Set the multiplicative decrease/increase factors (default: 0.5, 1.2).
@@ -5089,10 +5151,17 @@ impl Optimizer for Rprop {
         self.validate_hyperparams()?;
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match load_param_gradient(session, param)? {
+            let mut grad = match load_param_gradient(session, param)? {
                 Some(g) => g,
                 None => continue,
             };
+
+            // maximize: negate the gradient so the sign-based step ascends.
+            if self.maximize {
+                for g in grad.iter_mut() {
+                    *g = -*g;
+                }
+            }
 
             let param_values = session.tensor_values(param)?;
             ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
@@ -6085,6 +6154,26 @@ mod tests {
             [1.105645178605, 2.105645178869],
             [1.187393263063, 2.18577315422],
             [1.265440564321, 2.261539028167],
+        ]);
+        trial!("adamax_maximize", |x| Adamax::new(vec![x], 0.1).maximize(true), [
+            [1.0999999995, 2.09999999975],
+            [1.195693778989, 2.197744360425],
+            [1.288144042869, 2.293578014413],
+        ]);
+        trial!("adadelta_maximize", |x| Adadelta::new(vec![x], 1.0).maximize(true), [
+            [1.003162273707, 2.003162276672],
+            [1.006411545748, 2.006409130971],
+            [1.009723954281, 2.009715747525],
+        ]);
+        trial!("asgd_maximize", |x| ASGD::new(vec![x], 0.1).maximize(true), [
+            [1.19999000298, 2.39998000596],
+            [1.439974201337, 2.879948402673],
+            [1.727950311998, 3.455900623996],
+        ]);
+        trial!("rprop_maximize", |x| Rprop::new(vec![x], 0.1).maximize(true), [
+            [1.1, 2.1],
+            [1.22, 2.22],
+            [1.364, 2.364],
         ]);
 
         let f = fails.borrow();
