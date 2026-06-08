@@ -41,7 +41,7 @@ allocation-counter = "0.8.1"
 libm = "0.2.15"
 bytemuck = "1.25.0"
 
-asupersync = { version = "0.3.1", default-features = false, features = ["test-internals"] }
+asupersync = { version = "0.3.4", default-features = false, features = ["test-internals"] }
 ftui = { version = "0.2.0", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 
