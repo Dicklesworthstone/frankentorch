@@ -1643,6 +1643,31 @@ fn bench_lstsq(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_triangular_solve(c: &mut Criterion) {
+    // torch.linalg.solve_triangular with a large RHS panel (the triangular-inverse
+    // workload) — the column-parallel substitution target. Same process/worker.
+    let mut group = c.benchmark_group("triangular_solve");
+    for &n in &[512usize, 1024usize] {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        // Lower-triangular, well-conditioned (diagonally dominant).
+        let mut a_vals = vec![0.0_f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                a_vals[i * n + j] = ((i * 31 + j * 17) % 97) as f64 * 0.013 - 0.5;
+            }
+            a_vals[i * n + i] = n as f64;
+        }
+        let a = s.tensor_variable(a_vals, vec![n, n], false).unwrap();
+        let b = s.tensor_randn(vec![n, n], false).unwrap();
+        group.bench_function(format!("nrhs_{n}x{n}"), |bch| {
+            bch.iter(|| {
+                black_box(s.tensor_triangular_solve(black_box(a), black_box(b), false).unwrap())
+            });
+        });
+    }
+    group.finish();
+}
+
 fn bench_multi_dot(c: &mut Criterion) {
     // Low-rank chain [N×k, k×N, N×k, k×N] (thin middle dim k): left-to-right
     // builds N×N intermediates, the optimal parenthesization keeps them small.
@@ -1713,6 +1738,7 @@ criterion_group!(
     bench_unique,
     bench_einsum,
     bench_multi_dot,
+    bench_triangular_solve,
     bench_lstsq,
     bench_matmul,
     bench_bmm,
