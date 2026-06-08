@@ -84,6 +84,21 @@ Fallback trigger fired:
   as borrowed recurrent tensor storage or flat sequence/output layout to reduce
   data movement around the unchanged GEMM calls.
 
+## Packed-RHS implementation feasibility addendum
+
+A verifier pass confirmed the rejection:
+
+- `matrixmultiply` publicly reexports only `dgemm` / `sgemm`;
+- `GemmKernel::pack_nr`, `packing::pack` / `pack_avx2`, and `gemm_packed`
+  are private or `pub(crate)`;
+- exact packed-B replay would need the same runtime-selected microkernel,
+  pack layout, masked edge path, and MXCSR restoration wrapper;
+- copying/vendor-patching that internal unsafe layer is outside this bead's
+  one-lever safe-Rust budget.
+
+Verdict: close the packed-RHS sub-primitive as rejected and move to a non-panel
+data-movement primitive around unchanged public `dgemm_bt` calls.
+
 ## Pass 4-6 - borrowed recurrent tensor storage rejection
 
 The next exactness-preserving candidate was to borrow immutable contiguous f64
