@@ -10642,8 +10642,16 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
                     let zr = r_s / s;
                     q_s /= p_s;
                     r_s /= p_s;
-                    // Row modification: columns [k, n).
-                    for j in k..n {
+                    // Row modification. For eigenvectors (real-Schur form) the
+                    // whole row [k, n) must be transformed. For eigenvalues only,
+                    // columns (en, n) belong to already-deflated trailing blocks
+                    // that never feed back into the active block's recurrence nor
+                    // the diagonal the eigenvalues are read from, so restricting to
+                    // [k, en] is BIT-EXACT for the eigenvalues and skips the
+                    // growing trailing band as the matrix deflates (hqr range, not
+                    // hqr2). frankentorch-eig-eigvals-rowrange.
+                    let row_end = if want_vectors { n } else { en_u + 1 };
+                    for j in k..row_end {
                         let mut p2 = h[k * n + j] + q_s * h[(k + 1) * n + j];
                         if notlast {
                             p2 += r_s * h[(k + 2) * n + j];
