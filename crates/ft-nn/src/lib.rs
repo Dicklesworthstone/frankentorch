@@ -1919,7 +1919,32 @@ impl Module for Tanh {
 }
 
 /// GELU activation module.
-pub struct GELU;
+///
+/// `GELU::new()` / `GELU::default()` is the exact erf form
+/// (`torch.nn.GELU(approximate='none')`, the default); `GELU::tanh()` selects the
+/// GPT-2 / BERT tanh approximation (`torch.nn.GELU(approximate='tanh')`).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct GELU {
+    approximate_tanh: bool,
+}
+
+impl GELU {
+    /// Exact (erf) GELU — `torch.nn.GELU(approximate='none')`.
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            approximate_tanh: false,
+        }
+    }
+
+    /// Tanh-approximation GELU — `torch.nn.GELU(approximate='tanh')`.
+    #[must_use]
+    pub fn tanh() -> Self {
+        Self {
+            approximate_tanh: true,
+        }
+    }
+}
 
 impl Module for GELU {
     fn forward(
@@ -1927,7 +1952,11 @@ impl Module for GELU {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        session.tensor_gelu(input)
+        if self.approximate_tanh {
+            session.tensor_gelu_tanh(input)
+        } else {
+            session.tensor_gelu(input)
+        }
     }
 
     fn parameters(&self) -> Vec<TensorNodeId> {
@@ -21046,7 +21075,7 @@ mod tests {
         assert!(ReLU6.parameters().is_empty());
         assert!(Sigmoid.parameters().is_empty());
         assert!(Tanh.parameters().is_empty());
-        assert!(GELU.parameters().is_empty());
+        assert!(GELU::new().parameters().is_empty());
         assert!(SiLU.parameters().is_empty());
     }
 
@@ -21222,7 +21251,7 @@ mod tests {
             .tensor_variable(vec![0.0, 1.0], vec![2], false)
             .expect("variable should succeed");
 
-        let gelu = GELU;
+        let gelu = GELU::new();
         let y = gelu
             .forward(&mut session, x)
             .expect("gelu forward should succeed");
@@ -21234,6 +21263,40 @@ mod tests {
             "gelu(1) should be ~0.8412, got {}",
             values[1]
         );
+    }
+
+    #[test]
+    fn gelu_tanh_module_matches_torch_and_differs_from_exact() {
+        // GELU::tanh() must produce torch's approximate='tanh' values, distinct
+        // from the exact erf form. Goldens from torch 2.12.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data = vec![-1.0, 0.5, 1.0, 2.0];
+
+        let x = session.tensor_variable(data.clone(), vec![4], false).unwrap();
+        let yt = GELU::tanh().forward(&mut session, x).unwrap();
+        let tanh_vals = session.tensor_values(yt).unwrap();
+        let want = [
+            -0.15880800939172324,
+            0.34571400982514394,
+            0.8411919906082768,
+            1.954597694087775,
+        ];
+        for (i, (g, w)) in tanh_vals.iter().zip(want.iter()).enumerate() {
+            assert!((g - w).abs() <= 1e-9, "tanh-gelu[{i}]: {g} vs torch {w}");
+        }
+
+        // The exact (default) form must differ from the tanh approximation.
+        let x2 = session.tensor_variable(data, vec![4], false).unwrap();
+        let ye = GELU::new().forward(&mut session, x2).unwrap();
+        let exact_vals = session.tensor_values(ye).unwrap();
+        assert!(
+            (exact_vals[0] - tanh_vals[0]).abs() > 1e-6,
+            "GELU::new() must differ from GELU::tanh()"
+        );
+        // Default is the exact form.
+        let x3 = session.tensor_variable(vec![-1.0], vec![1], false).unwrap();
+        let yd = GELU::default().forward(&mut session, x3).unwrap();
+        assert_eq!(session.tensor_values(yd).unwrap()[0], exact_vals[0]);
     }
 
     #[test]
