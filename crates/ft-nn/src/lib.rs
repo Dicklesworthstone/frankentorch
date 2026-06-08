@@ -4800,26 +4800,39 @@ impl MultiheadAttention {
         key: TensorNodeId,
         value: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
-        self.forward_qkv_causal(session, query, key, value, false)
+        self.forward_qkv_masked(session, query, key, value, None, false)
     }
 
-    /// Self/cross attention over `[N, S, E]` inputs with an optional causal mask,
-    /// matching `torch.nn.MultiheadAttention(..., is_causal=True)`.
-    ///
-    /// When `is_causal` is true a lower-triangular causal mask is applied — each
-    /// query position attends only to keys at its own position or earlier, the
-    /// masking that makes autoregressive transformer decoders work. It threads
-    /// straight into the scaled-dot-product attention (the fused flash-attention
-    /// path), so future positions contribute `-inf` pre-softmax and get no
-    /// gradient. (An explicit additive `attn_mask` is a follow-up, frankentorch-
-    /// tracked, pending the masked SDPA op-graph supporting the collapsed
-    /// `[N*heads, S, d]` attention layout.)
+    /// Self/cross attention with an optional causal mask, matching
+    /// `torch.nn.MultiheadAttention(..., is_causal=True)`. Convenience wrapper
+    /// over [`Self::forward_qkv_masked`] with no explicit `attn_mask`.
     pub fn forward_qkv_causal(
         &self,
         session: &mut FrankenTorchSession,
         query: TensorNodeId,
         key: TensorNodeId,
         value: TensorNodeId,
+        is_causal: bool,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.forward_qkv_masked(session, query, key, value, None, is_causal)
+    }
+
+    /// Self/cross attention over `[N, S, E]` inputs with masking, matching the
+    /// masked forms of `torch.nn.MultiheadAttention`.
+    ///
+    /// `attn_mask` is an ADDITIVE float mask broadcastable to the
+    /// `[N*num_heads, S_q, S_k]` attention scores — e.g. shape `[S_q, S_k]` (like
+    /// torch's `[L, S]`, broadcast over batch·heads) or `[N*num_heads, S_q, S_k]`.
+    /// `is_causal` applies a lower-triangular causal mask (autoregressive
+    /// decoders). Both thread into the scaled-dot-product attention, so masked
+    /// positions contribute `-inf` pre-softmax and receive no gradient.
+    pub fn forward_qkv_masked(
+        &self,
+        session: &mut FrankenTorchSession,
+        query: TensorNodeId,
+        key: TensorNodeId,
+        value: TensorNodeId,
+        attn_mask: Option<TensorNodeId>,
         is_causal: bool,
     ) -> Result<TensorNodeId, AutogradError> {
         let q_shape = {
@@ -4907,7 +4920,7 @@ impl MultiheadAttention {
             q_heads,
             k_heads,
             v_heads,
-            None,
+            attn_mask,
             is_causal,
             Some(self.scale),
         )?;
@@ -22676,6 +22689,34 @@ mod tests {
             (0..4).any(|i| (cv[i] - fv[i]).abs() > 1e-6),
             "causal and full attention should differ on the first token"
         );
+    }
+
+    #[test]
+    fn mha_explicit_causal_mask_matches_is_causal() {
+        // With the masked SDPA op-graph fixed (m4ur4), an additive upper-triangular
+        // -inf attn_mask [S,S] must match is_causal=true.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mha = MultiheadAttention::new(&mut session, 4, 2).expect("mha");
+        let data: Vec<f64> = (0..12).map(|i| (i as f64 - 6.0) * 0.1).collect();
+        let x = session.tensor_variable(data, vec![1, 3, 4], false).expect("var");
+
+        let causal = mha
+            .forward_qkv_causal(&mut session, x, x, x, true)
+            .expect("is_causal");
+        let ninf = f64::NEG_INFINITY;
+        let mask_vals = vec![0.0, ninf, ninf, 0.0, 0.0, ninf, 0.0, 0.0, 0.0];
+        let mask = session.tensor_variable(mask_vals, vec![3, 3], false).expect("mask");
+        let masked = mha
+            .forward_qkv_masked(&mut session, x, x, x, Some(mask), false)
+            .expect("explicit mask");
+        let cv = session.tensor_values(causal).expect("cv");
+        let mv = session.tensor_values(masked).expect("mv");
+        for (c, m) in cv.iter().zip(mv.iter()) {
+            assert!(
+                (c - m).abs() < 1e-9,
+                "explicit causal mask != is_causal: {c} vs {m}"
+            );
+        }
     }
 
     #[test]
