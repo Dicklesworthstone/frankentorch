@@ -6445,6 +6445,8 @@ pub struct Conv2d {
     padding_h: usize,
     padding_w: usize,
     groups: usize,
+    dilation_h: usize,
+    dilation_w: usize,
 }
 
 impl Conv2d {
@@ -6519,6 +6521,8 @@ impl Conv2d {
             padding_h: ph,
             padding_w: pw,
             groups: 1,
+            dilation_h: 1,
+            dilation_w: 1,
         })
     }
 
@@ -6610,7 +6614,19 @@ impl Conv2d {
             padding_h: ph,
             padding_w: pw,
             groups,
+            dilation_h: 1,
+            dilation_w: 1,
         })
+    }
+
+    /// Set the dilation (à-trous spacing) of the kernel, matching
+    /// `torch.nn.Conv2d(..., dilation=(dH, dW))` (default `(1, 1)`). Composes with
+    /// `groups`.
+    #[must_use]
+    pub fn dilation(mut self, dilation: (usize, usize)) -> Self {
+        self.dilation_h = dilation.0;
+        self.dilation_w = dilation.1;
+        self
     }
 
     /// Access the weight parameter.
@@ -6650,6 +6666,20 @@ impl Module for Conv2d {
                     reason: "Conv2d input channels do not match in_channels",
                 },
             )));
+        }
+
+        // Dilation routes through the dilated functional (zero-stuffed kernel),
+        // which threads groups through too — so dilation and groups compose.
+        if self.dilation_h > 1 || self.dilation_w > 1 {
+            return session.functional_conv2d_dilated(
+                input,
+                self.weight,
+                self.bias,
+                (self.stride_h, self.stride_w),
+                (self.padding_h, self.padding_w),
+                (self.dilation_h, self.dilation_w),
+                self.groups,
+            );
         }
 
         // Grouped convolution routes through the fused functional (independent
@@ -22684,6 +22714,38 @@ mod tests {
         // out_channels=5 not divisible by groups=2.
         assert!(
             Conv2d::new_grouped(&mut session, 4, 5, (2, 2), (1, 1), (0, 0), false, 2).is_err()
+        );
+    }
+
+    #[test]
+    fn conv2d_dilation_module_shape_and_matches_functional() {
+        // dilation=2 with a 3x3 kernel on 7x7 -> effective kernel 5x5 ->
+        // output (7-5)/1+1 = 3. The module forward must equal the dilated
+        // functional applied to its own weight.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let conv = Conv2d::new(&mut session, 2, 3, (3, 3), (1, 1), (0, 0), true)
+            .expect("conv2d")
+            .dilation((2, 2));
+        let x = session
+            .tensor_variable((0..98).map(|i| i as f64 * 0.01).collect(), vec![1, 2, 7, 7], false)
+            .expect("variable");
+        let via_module = conv.forward(&mut session, x).expect("module forward");
+        assert_eq!(session.tensor_shape(via_module).expect("shape"), vec![1, 3, 3, 3]);
+        let via_fn = session
+            .functional_conv2d_dilated(
+                x,
+                conv.weight(),
+                conv.bias(),
+                (1, 1),
+                (0, 0),
+                (2, 2),
+                1,
+            )
+            .expect("functional dilated");
+        assert_eq!(
+            session.tensor_values(via_module).expect("m"),
+            session.tensor_values(via_fn).expect("f"),
+            "dilated module must match functional_conv2d_dilated"
         );
     }
 
