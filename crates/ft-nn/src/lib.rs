@@ -6686,6 +6686,7 @@ pub struct MaxPool2d {
     stride_w: usize,
     padding_h: usize,
     padding_w: usize,
+    ceil_mode: bool,
 }
 
 impl MaxPool2d {
@@ -6703,6 +6704,7 @@ impl MaxPool2d {
             stride_w: if sw == 0 { kw } else { sw },
             padding_h: 0,
             padding_w: 0,
+            ceil_mode: false,
         }
     }
 
@@ -6713,6 +6715,15 @@ impl MaxPool2d {
     pub fn padding(mut self, padding: (usize, usize)) -> Self {
         self.padding_h = padding.0;
         self.padding_w = padding.1;
+        self
+    }
+
+    /// Use ceil instead of floor for the output-size computation (default
+    /// `false`), matching `torch.nn.MaxPool2d(ceil_mode=...)`. The trailing
+    /// partial windows pool over their in-bounds cells only.
+    #[must_use]
+    pub fn ceil_mode(mut self, ceil_mode: bool) -> Self {
+        self.ceil_mode = ceil_mode;
         self
     }
 }
@@ -6736,6 +6747,19 @@ impl Module for MaxPool2d {
                     reason: "MaxPool2d expects 4D input [N, C, H, W]",
                 },
             )));
+        }
+
+        // ceil_mode needs torch's ceil output sizing plus partial-window handling
+        // off the bottom/right edge; route those through the fused functional
+        // (bit-exact -inf hang-off). The floor path keeps the composed patch loop.
+        if self.ceil_mode {
+            return session.functional_max_pool2d_full(
+                input,
+                (self.kernel_h, self.kernel_w),
+                (self.stride_h, self.stride_w),
+                (self.padding_h, self.padding_w),
+                true,
+            );
         }
 
         let batch_size = input_shape[0];
@@ -22627,6 +22651,25 @@ mod tests {
             .tensor_variable(data, vec![1, 1, 5, 5], false)
             .expect("variable");
         let pool = MaxPool2d::new((3, 3), (2, 2)).padding((1, 1));
+        let y = pool.forward(&mut session, x).expect("forward");
+        let (vals, meta) = session.tensor_values_meta(y).expect("values");
+        assert_eq!(meta.shape(), &[1, 1, 3, 3]);
+        let want = [7.0, 9.0, 10.0, 17.0, 19.0, 20.0, 22.0, 24.0, 25.0];
+        for (g, w) in vals.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-12, "got {vals:?} want {want:?}");
+        }
+    }
+
+    #[test]
+    fn maxpool2d_ceil_mode_matches_torch() {
+        // torch nn.MaxPool2d(2, stride=2, ceil_mode=True) on arange(1..=25)[1,1,5,5]
+        //   -> [3,3] = [7,9,10,17,19,20,22,24,25] (extra row/col vs floor [2,2]).
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let data: Vec<f64> = (1..=25).map(|v| v as f64).collect();
+        let x = session
+            .tensor_variable(data, vec![1, 1, 5, 5], false)
+            .expect("variable");
+        let pool = MaxPool2d::new((2, 2), (2, 2)).ceil_mode(true);
         let y = pool.forward(&mut session, x).expect("forward");
         let (vals, meta) = session.tensor_values_meta(y).expect("values");
         assert_eq!(meta.shape(), &[1, 1, 3, 3]);
