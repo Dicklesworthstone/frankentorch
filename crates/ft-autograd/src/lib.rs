@@ -14030,6 +14030,43 @@ impl TensorTape {
                         rule: "d(max/min_dim(x))/dx=mask*broadcast(grad) (cg)",
                     });
                 }
+                TensorNodeOp::Addmm {
+                    input,
+                    mat1,
+                    mat2,
+                    beta,
+                    alpha,
+                } => {
+                    // addmm = beta*input + alpha*(mat1 @ mat2):
+                    //   d/d(input) = beta*grad (summed to input's shape if broadcast)
+                    //   d/d(mat1)  = alpha*(grad @ mat2^T)
+                    //   d/d(mat2)  = alpha*(mat1^T @ grad)
+                    // Built from differentiable cg matmul/transpose/scalar helpers so a
+                    // further backward is well-defined.
+                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let grad_input = self.cg_mul_scalar(incoming_id, beta)?;
+                    let grad_input = self.cg_sum_to_shape(grad_input, &input_shape)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_input)?;
+
+                    let mat2_t = self.cg_transpose_2d(mat2)?;
+                    let grad_mat1 = self.cg_matmul_2d(incoming_id, mat2_t)?;
+                    let grad_mat1 = self.cg_mul_scalar(grad_mat1, alpha)?;
+                    self.cg_accumulate(mat1, &mut grad_nodes, grad_mat1)?;
+
+                    let mat1_t = self.cg_transpose_2d(mat1)?;
+                    let grad_mat2 = self.cg_matmul_2d(mat1_t, incoming_id)?;
+                    let grad_mat2 = self.cg_mul_scalar(grad_mat2, alpha)?;
+                    self.cg_accumulate(mat2, &mut grad_nodes, grad_mat2)?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    Self::complete_dependency(&mut pending, mat1, &mut queue)?;
+                    Self::complete_dependency(&mut pending, mat2, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(addmm)/d:input=beta*grad,mat1=a*grad@mat2^T,mat2=a*mat1^T@grad (cg)",
+                    });
+                }
                 TensorNodeOp::Div { lhs, rhs } => {
                     // d(a/b)/da = grad/b, d(a/b)/db = -a*grad/b^2
                     let grad_lhs = self.cg_div(incoming_id, rhs)?;
@@ -16485,6 +16522,64 @@ impl TensorTape {
             op: TensorNodeOp::Bmm { lhs, rhs },
         });
         Ok(out)
+    }
+
+    /// Helper: 2-D transpose for create_graph backward, recording a `Transpose` op
+    /// (dim0=0, dim1=1) so a further backward differentiates it via the first-order
+    /// transpose rule (which is its own adjoint). Produces contiguous transposed
+    /// values for downstream matmuls.
+    fn cg_transpose_2d(&mut self, input: TensorNodeId) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, data, shape, dtype, device) = {
+            let node = self.node(input)?;
+            (
+                node.requires_grad,
+                node.tensor.contiguous_values_as_f64()?,
+                node.tensor.meta().shape().to_vec(),
+                node.tensor.meta().dtype(),
+                node.tensor.meta().device(),
+            )
+        };
+        let r = shape[0];
+        let c = shape[1];
+        let mut result = vec![0.0; r * c];
+        for i in 0..r {
+            for j in 0..c {
+                result[j * r + i] = data[i * c + j];
+            }
+        }
+        let meta = ft_core::TensorMeta::from_shape(vec![c, r], dtype, device);
+        let out = TensorNodeId(self.nodes.len());
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_storage(meta, result)?,
+            requires_grad,
+            op: TensorNodeOp::Transpose {
+                input,
+                dim0: 0,
+                dim1: 1,
+            },
+        });
+        Ok(out)
+    }
+
+    /// Helper: 2-D matmul for create_graph backward, bridged through the rank-3
+    /// `cg_bmm` (reshape [m,k]->[1,m,k], [k,n]->[1,k,n], bmm, reshape [1,m,n]->[m,n]).
+    /// Records Reshape/Bmm ops, all differentiable for a further backward.
+    fn cg_matmul_2d(
+        &mut self,
+        lhs: TensorNodeId,
+        rhs: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let (lshape, rshape) = (
+            self.node(lhs)?.tensor.meta().shape().to_vec(),
+            self.node(rhs)?.tensor.meta().shape().to_vec(),
+        );
+        let m = lshape[0];
+        let k = lshape[1];
+        let n = rshape[1];
+        let l3 = self.cg_reshape(lhs, vec![1, m, k])?;
+        let r3 = self.cg_reshape(rhs, vec![1, k, n])?;
+        let out3 = self.cg_bmm(l3, r3)?;
+        self.cg_reshape(out3, vec![m, n])
     }
 
     /// Helper: reshape (same element order, same numel) for create_graph backward,
@@ -23888,6 +23983,44 @@ mod tests {
                 .zip(expected2.iter())
                 .all(|(g, e)| (g - e).abs() < 1e-10),
             "f''(x) should be {expected2:?}, got {grad2_x:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_addmm() {
+        // out = mat1 @ mat2 (beta=0): mat1=[[1,2]], mat2=[[3],[4]] -> out=[[11]].
+        // f=sum(out^2): grad_mat1 = 2*out*mat2^T = 22*[3,4] = [66,88]. Second backward
+        // of grad_mat1 (= 2(ac+bd)[c,d]) summed over its outputs gives [2c^2+2cd,
+        // 2dc+2d^2] = [42,56]. Exercises create_graph for Addmm (matmul+transpose chain).
+        let mut tape = TensorTape::new();
+        let input = tape.leaf(vec![0.0], vec![1, 1], false).expect("input");
+        let mat1 = tape.leaf(vec![1.0, 2.0], vec![1, 2], true).expect("mat1");
+        let mat2 = tape.leaf(vec![3.0, 4.0], vec![2, 1], true).expect("mat2");
+        let (out, _) = tape
+            .addmm(input, mat1, mat2, 0.0, 1.0, ExecutionMode::Strict)
+            .expect("addmm");
+        let (z, _) = tape.mul(out, out, ExecutionMode::Strict).expect("out^2");
+        let (loss, _) = tape.sum(z, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward (create_graph) must support Addmm");
+        let grad_mat1 = report1.gradient(mat1).expect("mat1 gradient");
+        assert!(
+            (grad_mat1[0] - 66.0).abs() < 1e-9 && (grad_mat1[1] - 88.0).abs() < 1e-9,
+            "grad_mat1 should be [66,88], got {grad_mat1:?}"
+        );
+        let dm1_node = report1.gradient_node(mat1).expect("gradient node for mat1");
+        let report2 = tape.backward(dm1_node).expect("second backward");
+        let grad2 = report2.gradient(mat1).expect("mat1 second gradient");
+        assert!(
+            (grad2[0] - 42.0).abs() < 1e-9 && (grad2[1] - 56.0).abs() < 1e-9,
+            "f''(mat1) should be [42,56], got {grad2:?}"
         );
     }
 
