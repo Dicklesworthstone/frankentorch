@@ -178,6 +178,63 @@ fn qr_backward_r_grad_matches_finite_diff_nonsymmetric() {
     });
 }
 
+// ── Symmetric-domain linalg (eigvalsh / eigh / cholesky) ───────────────────
+// These ops require a symmetric (and for cholesky, PD) input, so perturbing a
+// single entry breaks the domain. Instead build the symmetric input A = P + P^T
+// from a FREE parameter P (cholesky adds c*I for positive-definiteness): FD over P
+// is unconstrained and validates the op's adjoint composed with the already-audited
+// add + transpose backwards — convention-agnostic w.r.t. how the op symmetrizes its
+// own gradient.
+
+#[test]
+fn eigvalsh_backward_grad_matches_finite_diff() {
+    // A = P + P^T (symmetric, well-separated eigenvalues -> smooth eigvalsh).
+    let p = vec![2.0, 0.5, 0.1, 0.3, 3.0, 0.2, 0.1, 0.4, 4.0];
+    fd_check(&p, &[3, 3], |s, pn| {
+        let pt = s.tensor_transpose(pn, 0, 1).unwrap();
+        let a = s.tensor_add(pn, pt).unwrap();
+        let ev = s.tensor_eigvalsh(a).unwrap();
+        let z = s.tensor_mul(ev, ev).unwrap();
+        s.tensor_sum(z).unwrap()
+    });
+}
+
+#[test]
+fn eigh_eigenvalue_backward_grad_matches_finite_diff() {
+    // Same symmetric construction; loss over eigenVALUES only (eigenvectors carry a
+    // sign/gauge ambiguity that makes their gradient ill-defined for FD).
+    let p = vec![2.0, 0.5, 0.1, 0.3, 3.0, 0.2, 0.1, 0.4, 4.0];
+    fd_check(&p, &[3, 3], |s, pn| {
+        let pt = s.tensor_transpose(pn, 0, 1).unwrap();
+        let a = s.tensor_add(pn, pt).unwrap();
+        let (vals, _vecs) = s.tensor_eigh(a).unwrap();
+        let z = s.tensor_mul(vals, vals).unwrap();
+        s.tensor_sum(z).unwrap()
+    });
+}
+
+#[test]
+fn cholesky_backward_grad_matches_finite_diff() {
+    // A = P + P^T + 5*I -> symmetric positive-definite (diagonally dominant); FD over
+    // the free P validates the cholesky adjoint (the tricky lower-triangular Phi op).
+    let p = vec![0.5, 0.2, 0.1, 0.3, 0.4, 0.15, 0.1, 0.25, 0.6];
+    fd_check(&p, &[3, 3], |s, pn| {
+        let pt = s.tensor_transpose(pn, 0, 1).unwrap();
+        let sym = s.tensor_add(pn, pt).unwrap();
+        let cid = s
+            .tensor_variable(
+                vec![5.0, 0.0, 0.0, 0.0, 5.0, 0.0, 0.0, 0.0, 5.0],
+                vec![3, 3],
+                false,
+            )
+            .unwrap();
+        let a = s.tensor_add(sym, cid).unwrap();
+        let l = s.tensor_cholesky(a, false).unwrap();
+        let z = s.tensor_mul(l, l).unwrap();
+        s.tensor_sum(z).unwrap()
+    });
+}
+
 // ── Fused backward kernels ─────────────────────────────────────────────────
 // These (SDPA, conv2d, layer_norm) are the highest remaining addmm-class bug risk:
 // fused custom-op backwards full of matmuls/transposes/reductions, on general
