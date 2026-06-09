@@ -10842,11 +10842,6 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
                             }
                             row[k + 1] -= p2 * q_s;
                             row[k] -= p2;
-                        };
-                        if n >= 64 {
-                            q_acc.par_chunks_mut(n).for_each(update_q_row);
-                        } else {
-                            q_acc.chunks_mut(n).for_each(update_q_row);
                         }
                     }
                     k += 1;
