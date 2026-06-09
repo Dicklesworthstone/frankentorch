@@ -14110,6 +14110,24 @@ impl TensorTape {
                         rule: "d(addmv)/d:input=beta*grad,mat=a*outer(grad,vec),vec=a*mat^T@grad (cg)",
                     });
                 }
+                TensorNodeOp::ProdDim {
+                    input,
+                    dim,
+                    input_shape,
+                } => {
+                    // d(prod_dim(x))/dx_i = grad_y * prod_{j!=i} x_j. Built division-free
+                    // (zero-correct) as broadcast(grad_y) * prod_excluding_self(x).
+                    let prod_excl = self.cg_prod_excluding_self(input, dim, &input_shape)?;
+                    let broadcast = self.cg_broadcast_along_dim(incoming_id, dim, &input_shape)?;
+                    let grad_input = self.cg_mul(broadcast, prod_excl)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_input)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(prod_dim(x))/dx_i=grad*prod_excl_i (cg)",
+                    });
+                }
                 TensorNodeOp::Div { lhs, rhs } => {
                     // d(a/b)/da = grad/b, d(a/b)/db = -a*grad/b^2
                     let grad_lhs = self.cg_div(incoming_id, rhs)?;
@@ -16623,6 +16641,47 @@ impl TensorTape {
         let r3 = self.cg_reshape(rhs, vec![1, k, n])?;
         let out3 = self.cg_bmm(l3, r3)?;
         self.cg_reshape(out3, vec![m, n])
+    }
+
+    /// Helper: per-element product-excluding-self along `dim`, i.e. for each position
+    /// the product of all the OTHER elements in its reduction slice. Built as
+    /// `prefix_excl * suffix_excl` from exclusive cumulative products (inclusive
+    /// cumprod, dropped by one and 1-padded on the appropriate side), so it is
+    /// division-free and exactly correct for any number of zeros (the textbook
+    /// formula `prod/x_i` would divide by zero). The recorded CumProd/Flip/Narrow/Pad
+    /// nodes all have a first-order backward, so a further backward is well-defined.
+    /// This is the differentiable core of ProdDim's gradient.
+    fn cg_prod_excluding_self(
+        &mut self,
+        x: TensorNodeId,
+        dim: usize,
+        input_shape: &[usize],
+    ) -> Result<TensorNodeId, AutogradError> {
+        let ndim = input_shape.len();
+        let n = input_shape[dim];
+        if n == 1 {
+            // prod over a singleton dim: each element's "product of others" is 1.
+            let numel = Self::checked_shape_numel(input_shape, "prod_excl numel overflow")?;
+            return self.leaf(vec![1.0; numel], input_shape.to_vec(), false);
+        }
+        let pair = ndim - 1 - dim;
+        // prefix_excl[i] = product of x[<i]: inclusive cumprod, drop the last, pad a
+        // leading 1.0 along `dim`.
+        let (prefix_incl, _) = self.cumprod(x, dim, ExecutionMode::Strict)?;
+        let prefix_drop = self.narrow(prefix_incl, dim, 0, n - 1)?;
+        let mut pad_front = vec![0usize; 2 * (ndim - dim)];
+        pad_front[2 * pair] = 1;
+        let prefix_excl = self.pad(prefix_drop, &pad_front, 1.0)?;
+        // suffix_excl[i] = product of x[>i]: reverse, inclusive cumprod, reverse, drop
+        // the first, pad a trailing 1.0 along `dim`.
+        let x_rev = self.cg_flip(x, vec![dim])?;
+        let (suffix_rev_incl, _) = self.cumprod(x_rev, dim, ExecutionMode::Strict)?;
+        let suffix_incl = self.cg_flip(suffix_rev_incl, vec![dim])?;
+        let suffix_drop = self.narrow(suffix_incl, dim, 1, n - 1)?;
+        let mut pad_back = vec![0usize; 2 * (ndim - dim)];
+        pad_back[2 * pair + 1] = 1;
+        let suffix_excl = self.pad(suffix_drop, &pad_back, 1.0)?;
+        self.cg_mul(prefix_excl, suffix_excl)
     }
 
     /// Helper: reshape (same element order, same numel) for create_graph backward,
@@ -24105,6 +24164,82 @@ mod tests {
         assert!(
             (grad2[0] - 48.0).abs() < 1e-9 && (grad2[1] - 68.0).abs() < 1e-9,
             "f''(vec) should be [48,68], got {grad2:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_prod_dim() {
+        // x=[[2,3,4],[1,5,2]], y=prod_dim(x,1)=[24,10]. f=sum(y): grad_x_i =
+        // prod_{j!=i} x_j -> [[12,8,6],[10,2,5]]. Second backward (sum over outputs of
+        // d(grad_x_i)/dx_j = sum_{i!=j} prod_{k!=i,j} x_k) gives [[7,6,5],[7,3,6]].
+        // Exercises create_graph for ProdDim (division-free prod-excluding-self).
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![2.0, 3.0, 4.0, 1.0, 5.0, 2.0], vec![2, 3], true)
+            .expect("x");
+        let (y, _) = tape
+            .prod_dim(x, 1, ExecutionMode::Strict)
+            .expect("prod_dim");
+        let (loss, _) = tape.sum(y, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward (create_graph) must support ProdDim");
+        let grad_x = report1.gradient(x).expect("x gradient");
+        let expected = [12.0, 8.0, 6.0, 10.0, 2.0, 5.0];
+        assert!(
+            grad_x
+                .iter()
+                .zip(expected.iter())
+                .all(|(g, e)| (g - e).abs() < 1e-9),
+            "grad_x should be {expected:?}, got {grad_x:?}"
+        );
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let grad2 = report2.gradient(x).expect("x second gradient");
+        let expected2 = [7.0, 6.0, 5.0, 7.0, 3.0, 6.0];
+        assert!(
+            grad2
+                .iter()
+                .zip(expected2.iter())
+                .all(|(g, e)| (g - e).abs() < 1e-9),
+            "f''(x) should be {expected2:?}, got {grad2:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_prod_dim_with_zero() {
+        // Zero-handling: x=[2,0,4], prod=0, grad_x_i = prod_{j!=i} = [0,8,0] (only the
+        // zero position gets a nonzero gradient). Division-free form must produce this
+        // without NaN/inf. f=sum(y) with single output.
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![2.0, 0.0, 4.0], vec![1, 3], true).expect("x");
+        let (y, _) = tape
+            .prod_dim(x, 1, ExecutionMode::Strict)
+            .expect("prod_dim");
+        let (loss, _) = tape.sum(y, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward (create_graph) must support ProdDim with zeros");
+        let grad_x = report1.gradient(x).expect("x gradient");
+        let expected = [0.0, 8.0, 0.0];
+        assert!(
+            grad_x
+                .iter()
+                .zip(expected.iter())
+                .all(|(g, e)| (g - e).abs() < 1e-9),
+            "grad_x should be {expected:?} (no NaN/inf), got {grad_x:?}"
         );
     }
 
