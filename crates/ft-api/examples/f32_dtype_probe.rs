@@ -138,5 +138,42 @@ fn main() {
     bin!("special_gammainc", p4(), p4(), |s: &mut FrankenTorchSession, x, y| s.tensor_special_gammainc(x, y));
     bin!("special_gammaincc", p4(), p4(), |s: &mut FrankenTorchSession, x, y| s.tensor_special_gammaincc(x, y));
 
+    // batch 4: matrix / distance ops (2D f32 inputs -> torch keeps f32)
+    macro_rules! mat {
+        ($name:literal, $build:expr) => {{
+            match $build(&mut s) {
+                Ok(r) => match s.tensor_dtype(r) {
+                    Ok(DType::F32) => {}
+                    Ok(d) => { println!("{:<28} UPCAST -> {:?}", $name, d); bugs += 1; }
+                    Err(e) => println!("{:<28} dtype-err {e:?}", $name),
+                },
+                Err(e) => { println!("{:<28} ERR {e:?}", $name); bugs += 1; }
+            }
+        }};
+    }
+    // SPD 3x3 for the square-matrix ops.
+    let spd = |s: &mut FrankenTorchSession| {
+        s.tensor_variable_f32(vec![4.0, 1.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0, 2.0], vec![3, 3], false).unwrap()
+    };
+    mat!("pinv", |s: &mut FrankenTorchSession| { let m = spd(s); s.tensor_pinv(m) });
+    mat!("matrix_power", |s: &mut FrankenTorchSession| { let m = spd(s); s.tensor_matrix_power(m, 3) });
+    mat!("matrix_exp", |s: &mut FrankenTorchSession| { let m = spd(s); s.tensor_matrix_exp(m) });
+    mat!("logdet", |s: &mut FrankenTorchSession| { let m = spd(s); s.tensor_logdet(m) });
+    mat!("trace", |s: &mut FrankenTorchSession| { let m = spd(s); s.tensor_trace(m) });
+    mat!("cholesky_solve", |s: &mut FrankenTorchSession| {
+        let b = s.tensor_variable_f32(vec![1.0, 2.0, 3.0], vec![3, 1], false).unwrap();
+        let l = s.tensor_variable_f32(vec![2.0, 0.0, 0.0, 0.5, 1.6, 0.0, 0.0, 0.6, 1.3], vec![3, 3], false).unwrap();
+        s.tensor_cholesky_solve(b, l, false)
+    });
+    mat!("cdist", |s: &mut FrankenTorchSession| {
+        let x1 = s.tensor_variable_f32(vec![0.0, 0.0, 1.0, 1.0], vec![2, 2], false).unwrap();
+        let x2 = s.tensor_variable_f32(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        s.tensor_cdist(x1, x2, 2.0)
+    });
+    mat!("pdist", |s: &mut FrankenTorchSession| {
+        let x = s.tensor_variable_f32(vec![0.0, 0.0, 1.0, 1.0, 2.0, 0.0], vec![3, 2], false).unwrap();
+        s.tensor_pdist(x, 2.0)
+    });
+
     println!("\nf32 UPCAST/ERR bugs: {bugs}");
 }
