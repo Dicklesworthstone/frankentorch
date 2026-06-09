@@ -33,6 +33,12 @@ print("logaddexp|" + fmt(torch.logaddexp(a, b)))
 print("fmax|" + fmt(torch.fmax(a, b)))
 print("ldexp|" + fmt(torch.ldexp(a, b)))
 
+fa = torch.tensor([1.0, -1.0, 0.0, INF, -INF, INF, -INF, INF, -INF, NAN, 1.0, INF, 5.0, -5.0,
+                   7.0, -7.0, 0.3, 2.5, -0.0, 6.5, -6.5])
+fb = torch.tensor([0.0, 0.0, 0.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 1.0, NAN, INF, INF, INF,
+                   2.0, 2.0, 0.1, 0.5, 3.0, 2.0, 2.0])
+print("floor_divide_edge|" + fmt(torch.floor_divide(fa, fb)))
+
 xx = torch.tensor([0.0, 0.0, 2.0, 3.0, 0.5, 1.0])
 yy = torch.tensor([0.0, -1.0, 0.0, 2.0, 4.0, -3.0])
 print("xlogy|" + fmt(torch.xlogy(xx, yy)))

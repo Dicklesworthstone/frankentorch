@@ -58,6 +58,27 @@ fn main() {
     bin!("fmax", tensor_fmax, av, bv);
     bin!("ldexp", tensor_ldexp, av, bv);
 
+    // floor_divide: comprehensive sign/zero/inf/nan edge set (frankentorch-bh6bh).
+    // torch uses aten div_floor_floating, NOT floor(a/b): ±inf dividend -> NaN,
+    // -5/+inf -> -1, but inf/0 -> inf (b==0 short-circuit).
+    let fa = s.tensor_variable(
+        vec![
+            1.0, -1.0, 0.0, INF, -INF, INF, -INF, INF, -INF, NAN, 1.0, INF, 5.0, -5.0, 7.0, -7.0,
+            0.3, 2.5, -0.0, 6.5, -6.5,
+        ],
+        vec![21],
+        false,
+    ).unwrap();
+    let fb = s.tensor_variable(
+        vec![
+            0.0, 0.0, 0.0, 1.0, 1.0, -1.0, -1.0, 0.0, 0.0, 1.0, NAN, INF, INF, INF, 2.0, 2.0, 0.1,
+            0.5, 3.0, 2.0, 2.0,
+        ],
+        vec![21],
+        false,
+    ).unwrap();
+    bin!("floor_divide_edge", tensor_floor_divide, fa, fb);
+
     // xlogy: x*log(y), with the x==0 short-circuit (0*log(0)=0, 0*log(-1)=0).
     let xx = s.tensor_variable(vec![0.0, 0.0, 2.0, 3.0, 0.5, 1.0], vec![6], false).unwrap();
     let yy = s.tensor_variable(vec![0.0, -1.0, 0.0, 2.0, 4.0, -3.0], vec![6], false).unwrap();
