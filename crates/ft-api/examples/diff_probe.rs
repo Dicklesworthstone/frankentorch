@@ -194,4 +194,90 @@ fn main() {
     unl!("exp2", tensor_exp2);
     unl!("log2", tensor_log2);
     unl!("log10", tensor_log10);
+
+    // ── batch 5: reductions over inf/nan + comparison NaN semantics ──────
+    let mk = |s: &mut FrankenTorchSession, v: Vec<f64>| {
+        let n = v.len();
+        s.tensor_variable(v, vec![n], false).unwrap()
+    };
+    macro_rules! pr {
+        ($name:literal, $id:expr) => {{
+            let id = $id;
+            println!("{}|{}", $name, fmt(&val(&mut s, id)));
+        }};
+    }
+    let t = mk(&mut s, vec![2.0, 0.0, INF]);
+    pr!("prod_0inf", s.tensor_prod(t).unwrap());
+    let t = mk(&mut s, vec![INF, -INF]);
+    pr!("sum_infninf", s.tensor_sum(t).unwrap());
+    let t = mk(&mut s, vec![1.0, NAN, 2.0]);
+    pr!("nansum", s.tensor_nansum(t).unwrap());
+    let t = mk(&mut s, vec![NAN, NAN]);
+    pr!("nansum_allnan", s.tensor_nansum(t).unwrap());
+    let t = mk(&mut s, vec![1.0, NAN, 3.0]);
+    pr!("nanmean", s.tensor_nanmean(t).unwrap());
+    let t = mk(&mut s, vec![NAN, NAN]);
+    pr!("nanmean_allnan", s.tensor_nanmean(t).unwrap());
+    let t = mk(&mut s, vec![5.0]);
+    pr!("var_n1_c1", s.tensor_var(t, 1).unwrap());
+    let t = mk(&mut s, vec![5.0]);
+    pr!("var_n1_c0", s.tensor_var(t, 0).unwrap());
+    let t = mk(&mut s, vec![5.0]);
+    pr!("std_n1_c1", s.tensor_std(t, 1).unwrap());
+    let t = mk(&mut s, vec![1.0, NAN, 3.0]);
+    pr!("amax_nan", s.tensor_amax(t, 0).unwrap());
+    let t = mk(&mut s, vec![1.0, NAN, 3.0]);
+    pr!("amin_nan", s.tensor_amin(t, 0).unwrap());
+    let t = mk(&mut s, vec![1.0, 0.0, INF, 2.0]);
+    pr!("cumprod_0inf", s.tensor_cumprod(t, 0).unwrap());
+    let t = mk(&mut s, vec![1.0, INF, -INF, 1.0]);
+    pr!("cumsum_infninf", s.tensor_cumsum(t, 0).unwrap());
+    let t = mk(&mut s, vec![-INF, -INF]);
+    pr!("logsumexp_ninf", s.tensor_logsumexp(t, 0).unwrap());
+    let t = mk(&mut s, vec![INF, 1.0]);
+    pr!("logsumexp_inf", s.tensor_logsumexp(t, 0).unwrap());
+    let t = mk(&mut s, vec![INF, 1.0, 2.0]);
+    pr!("norm2_inf", s.tensor_norm(t, 2.0).unwrap());
+    let a = mk(&mut s, vec![NAN, 1.0, INF, -INF]);
+    let b = mk(&mut s, vec![NAN, 1.0, INF, -INF]);
+    pr!("isclose_eqnanF", s.tensor_isclose(a, b, 1e-5, 1e-8, false).unwrap());
+    let a = mk(&mut s, vec![NAN, 1.0, INF, -INF]);
+    let b = mk(&mut s, vec![NAN, 1.0, INF, -INF]);
+    pr!("isclose_eqnanT", s.tensor_isclose(a, b, 1e-5, 1e-8, true).unwrap());
+
+    // ── batch 6: special-function ACCURACY (Cephes vs torch, tight tol) ──
+    // Positive in-domain points; flagging only gaps >> 1 ULP (real accuracy
+    // bugs, like the digamma B10-truncation found earlier). i0/i1/i0e/i1e/erfcx/
+    // ndtr/ndtri all match torch to ~1e-16.
+    // CAUTION — bessel_j0/j1/y0 INTENTIONALLY diverge ~1e-8 from torch and that
+    // is CORRECT: ft routes them through libm (f64-accurate, mpmath-verified to
+    // ~16 digits), while torch.special.bessel_j0 is only ~7-8 digits (it promotes
+    // single-precision Cephes polynomials). Do NOT "fix" j0/j1/y0 toward torch.
+    // bessel_k0 is the reverse: ft's table-free series is ~1.5e-8 worst (x≈9) vs
+    // torch's ~1-ULP Cephes (frankentorch-4ixyt). libm has no k0/k1.
+    macro_rules! sp {
+        ($name:literal, $m:ident) => {{
+            let t = s
+                .tensor_variable(vec![0.5, 1.0, 2.0, 3.0, 5.0, 8.0], vec![6], false)
+                .unwrap();
+            let r = s.$m(t).unwrap();
+            println!("{}|{}", $name, fmt(&val(&mut s, r)));
+        }};
+    }
+    sp!("i0", tensor_i0);
+    sp!("i1", tensor_i1);
+    sp!("i0e", tensor_i0e);
+    sp!("i1e", tensor_i1e);
+    sp!("bessel_j0", tensor_special_bessel_j0);
+    sp!("bessel_j1", tensor_special_bessel_j1);
+    sp!("bessel_y0", tensor_special_bessel_y0);
+    sp!("bessel_k0", tensor_special_modified_bessel_k0);
+    sp!("erfcx", tensor_erfcx);
+    // ndtr over a centered range; ndtri over (0,1).
+    let t = s.tensor_variable(vec![-3.0, -1.0, 0.0, 1.0, 2.0, 3.0], vec![6], false).unwrap();
+    let r = s.tensor_ndtr(t).unwrap();
+    println!("ndtr|{}", fmt(&val(&mut s, r)));
+    let t = s.tensor_variable(vec![0.01, 0.1, 0.25, 0.5, 0.9, 0.99], vec![6], false).unwrap();
+    let r = s.tensor_ndtri(t).unwrap();
+    println!("ndtri|{}", fmt(&val(&mut s, r)));
 }
