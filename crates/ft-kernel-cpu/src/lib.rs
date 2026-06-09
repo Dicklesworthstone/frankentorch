@@ -10539,7 +10539,10 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
         let m_sub = n - k - 1;
         let par = n >= 64;
 
-        // Left multiply: H[(k+1):, :] -= 2 * v @ (v^T @ H[(k+1):, :]) / |v|^2.
+        // Left multiply. For eigvals-only, columns before k are outside the
+        // active Hessenberg band and are never read by the QR phase; skipping
+        // them preserves the exact scalar arithmetic for every live slot. Full
+        // eig keeps the legacy full-column update so the vector path is unchanged.
         // Precompute per-column scale = 2*(v^T H)[j]/|v|^2 from the UNMODIFIED H in
         // the same i-order as the scalar dot (bit-exact), then row-parallel update:
         // row (k+1+i) only needs scale[j] and v[i].
@@ -10548,8 +10551,10 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
         // the serial O(n^2)-per-step companion to the already row-parallel update,
         // i.e. the remaining Amdahl tail of the Hessenberg phase — parallelizes
         // BIT-EXACTLY: each slot keeps the scalar path's i-order dot (l9xod).
-        let mut left_scale = vec![0.0f64; n];
-        let col_scale = |(j, slot): (usize, &mut f64)| {
+        let left_start = if want_vectors { 0 } else { k };
+        let mut left_scale = vec![0.0f64; n - left_start];
+        let col_scale = |(j_rel, slot): (usize, &mut f64)| {
+            let j = left_start + j_rel;
             let mut dot = 0.0;
             for i in 0..m_sub {
                 dot += v[i] * h[(k + 1 + i) * n + j];
@@ -10565,8 +10570,8 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
             let rows = &mut h[(k + 1) * n..];
             let upd = |(i, row): (usize, &mut [f64])| {
                 let vi = v[i];
-                for (j, cell) in row.iter_mut().enumerate() {
-                    *cell -= left_scale[j] * vi;
+                for j in left_start..n {
+                    row[j] -= left_scale[j - left_start] * vi;
                 }
             };
             if par {
