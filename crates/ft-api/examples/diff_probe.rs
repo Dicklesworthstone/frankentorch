@@ -96,4 +96,45 @@ fn main() {
     println!("nan_to_num|{}", fmt(&val(&mut s, r)));
     let r = s.tensor_heaviside(av, bv).unwrap();
     println!("heaviside|{}", fmt(&val(&mut s, r)));
+
+    // ── batch 2: NaN-propagation + domain edges ──────────────────────────
+    // maximum/minimum PROPAGATE NaN (unlike fmax/fmin which ignore it).
+    let ma = s.tensor_variable(vec![NAN, 1.0, NAN, -INF, INF, 3.0], vec![6], false).unwrap();
+    let mb = s.tensor_variable(vec![1.0, NAN, NAN, 5.0, 5.0, -3.0], vec![6], false).unwrap();
+    bin!("maximum", tensor_maximum, ma, mb);
+    bin!("minimum", tensor_minimum, ma, mb);
+
+    // atan2(y, x): quadrant/edge behavior.
+    let ya = s.tensor_variable(vec![0.0, -0.0, 1.0, -1.0, INF, INF, 0.0, NAN], vec![8], false).unwrap();
+    let xa = s.tensor_variable(vec![1.0, 1.0, 0.0, 0.0, INF, -INF, -1.0, 1.0], vec![8], false).unwrap();
+    bin!("atan2", tensor_atan2, ya, xa);
+
+    // clamp(x, 0, 1) incl NaN input; and clamp(x, 1, 0) (min>max).
+    let cl = s.tensor_variable(vec![-1.0, 0.5, 2.0, NAN, INF, -INF], vec![6], false).unwrap();
+    let r = s.tensor_clamp(cl, 0.0, 1.0).unwrap();
+    println!("clamp01|{}", fmt(&val(&mut s, r)));
+    let r = s.tensor_clamp(cl, 1.0, 0.0).unwrap();
+    println!("clamp_minmax|{}", fmt(&val(&mut s, r)));
+
+    // Unary domain edges.
+    macro_rules! un {
+        ($name:literal, $m:ident, $vec:expr) => {{
+            let t = s.tensor_variable($vec, vec![6], false).unwrap();
+            let r = s.$m(t).unwrap();
+            println!("{}|{}", $name, fmt(&val(&mut s, r)));
+        }};
+    }
+    un!("asin", tensor_asin, vec![2.0, -2.0, 1.0, -1.0, 0.0, NAN]);
+    un!("acos", tensor_acos, vec![2.0, -2.0, 1.0, -1.0, 0.0, NAN]);
+    un!("log", tensor_log, vec![-1.0, 0.0, 1.0, INF, -INF, NAN]);
+    un!("sqrt", tensor_sqrt, vec![-1.0, 0.0, 4.0, INF, -INF, NAN]);
+    un!("rsqrt", tensor_rsqrt, vec![0.0, 4.0, -1.0, INF, -0.0, NAN]);
+    un!("log1p", tensor_log1p, vec![-2.0, -1.0, 0.0, INF, -0.5, NAN]);
+    un!("expm1", tensor_expm1, vec![-INF, 0.0, INF, -1.0, 1.0, NAN]);
+    un!("lgamma", tensor_lgamma, vec![0.0, -1.0, -2.0, 0.5, INF, -INF]);
+    un!("digamma", tensor_digamma, vec![0.0, -1.0, -2.0, 0.5, 1.0, INF]);
+    un!("erfinv", tensor_erfinv, vec![1.0, -1.0, 2.0, -2.0, 0.0, NAN]);
+    let t = s.tensor_variable(vec![0.0, 1.0, 0.5, -0.1, 1.1, NAN], vec![6], false).unwrap();
+    let r = s.tensor_logit(t, None).unwrap();
+    println!("logit|{}", fmt(&val(&mut s, r)));
 }
