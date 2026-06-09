@@ -137,4 +137,61 @@ fn main() {
     let t = s.tensor_variable(vec![0.0, 1.0, 0.5, -0.1, 1.1, NAN], vec![6], false).unwrap();
     let r = s.tensor_logit(t, None).unwrap();
     println!("logit|{}", fmt(&val(&mut s, r)));
+
+    // ── batch 3: activation extremes (overflow / inf / nan) ──────────────
+    // x covering -inf, large negative, 0, large positive (overflow region),
+    // +inf, nan — where naive exp/log compositions blow up vs torch.
+    macro_rules! un8 {
+        ($name:literal, $m:ident) => {{
+            let t = s
+                .tensor_variable(vec![-INF, -100.0, -1.0, 0.0, 1.0, 50.0, 100.0, INF, NAN], vec![9], false)
+                .unwrap();
+            let r = s.$m(t).unwrap();
+            println!("{}|{}", $name, fmt(&val(&mut s, r)));
+        }};
+    }
+    un8!("softplus", tensor_softplus);
+    un8!("sigmoid", tensor_sigmoid);
+    un8!("tanh", tensor_tanh);
+    un8!("gelu", tensor_gelu);
+    un8!("silu", tensor_silu);
+    un8!("mish", tensor_mish);
+    un8!("softsign", tensor_softsign);
+    un8!("erf", tensor_erf);
+    un8!("erfc", tensor_erfc);
+    un8!("reciprocal", tensor_reciprocal);
+
+    // ── batch 4: rounding (banker's) + exp/log at extremes / halfway ─────
+    macro_rules! unr {
+        ($name:literal, $m:ident) => {{
+            let t = s
+                .tensor_variable(
+                    vec![-INF, INF, NAN, -0.0, 2.5, 3.5, -2.5, 0.5, -0.5, 1e20],
+                    vec![10],
+                    false,
+                )
+                .unwrap();
+            let r = s.$m(t).unwrap();
+            println!("{}|{}", $name, fmt(&val(&mut s, r)));
+        }};
+    }
+    unr!("round", tensor_round);
+    unr!("trunc", tensor_trunc);
+    unr!("frac", tensor_frac);
+    unr!("ceil", tensor_ceil);
+    unr!("floor", tensor_floor);
+    unr!("sign", tensor_sign);
+    macro_rules! unl {
+        ($name:literal, $m:ident) => {{
+            let t = s
+                .tensor_variable(vec![-INF, -1.0, 0.0, -0.0, 1.0, 2.0, 8.0, 710.0, INF, NAN], vec![10], false)
+                .unwrap();
+            let r = s.$m(t).unwrap();
+            println!("{}|{}", $name, fmt(&val(&mut s, r)));
+        }};
+    }
+    unl!("exp", tensor_exp);
+    unl!("exp2", tensor_exp2);
+    unl!("log2", tensor_log2);
+    unl!("log10", tensor_log10);
 }

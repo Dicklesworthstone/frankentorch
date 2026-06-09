@@ -72,3 +72,31 @@ print("lgamma|" + fmt(torch.lgamma(torch.tensor([0.0, -1.0, -2.0, 0.5, INF, -INF
 print("digamma|" + fmt(torch.digamma(torch.tensor([0.0, -1.0, -2.0, 0.5, 1.0, INF]))))
 print("erfinv|" + fmt(torch.erfinv(torch.tensor([1.0, -1.0, 2.0, -2.0, 0.0, NAN]))))
 print("logit|" + fmt(torch.logit(torch.tensor([0.0, 1.0, 0.5, -0.1, 1.1, NAN]))))
+
+# ── batch 3: activation extremes ──
+import torch.nn.functional as F
+b3 = torch.tensor([-INF, -100.0, -1.0, 0.0, 1.0, 50.0, 100.0, INF, NAN])
+print("softplus|" + fmt(F.softplus(b3)))
+print("sigmoid|" + fmt(torch.sigmoid(b3)))
+print("tanh|" + fmt(torch.tanh(b3)))
+print("gelu|" + fmt(F.gelu(b3)))
+print("silu|" + fmt(F.silu(b3)))
+print("mish|" + fmt(F.mish(b3)))
+print("softsign|" + fmt(F.softsign(b3)))
+print("erf|" + fmt(torch.erf(b3)))
+print("erfc|" + fmt(torch.erfc(b3)))
+print("reciprocal|" + fmt(torch.reciprocal(b3)))
+
+# ── batch 4: rounding + exp/log at extremes ──
+b4 = torch.tensor([-INF, INF, NAN, -0.0, 2.5, 3.5, -2.5, 0.5, -0.5, 1e20])
+print("round|" + fmt(torch.round(b4)))
+print("trunc|" + fmt(torch.trunc(b4)))
+print("frac|" + fmt(torch.frac(b4)))
+print("ceil|" + fmt(torch.ceil(b4)))
+print("floor|" + fmt(torch.floor(b4)))
+print("sign|" + fmt(torch.sign(b4)))
+b4l = torch.tensor([-INF, -1.0, 0.0, -0.0, 1.0, 2.0, 8.0, 710.0, INF, NAN])
+print("exp|" + fmt(torch.exp(b4l)))
+print("exp2|" + fmt(torch.exp2(b4l)))
+print("log2|" + fmt(torch.log2(b4l)))
+print("log10|" + fmt(torch.log10(b4l)))

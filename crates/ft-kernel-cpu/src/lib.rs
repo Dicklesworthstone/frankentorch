@@ -714,14 +714,15 @@ pub fn expm1_scalar(input: &ScalarTensor) -> ScalarTensor {
 /// sign-bit semantics), which is observably different — fix it once
 /// here so every dispatch backend sees the same semantics.
 fn torch_sign_f64(value: f64) -> f64 {
-    if value.is_nan() {
-        f64::NAN
-    } else if value == 0.0 {
-        0.0
-    } else if value > 0.0 {
+    // torch.sign = (0 < x) - (x < 0): NaN and ±0 fall through both comparisons
+    // to 0.0. torch.sign(NaN) == 0.0 (NOT NaN — verified torch 2.12, f64+f32);
+    // the prior NaN→NaN branch diverged. frankentorch-z6bl1.
+    if value > 0.0 {
         1.0
-    } else {
+    } else if value < 0.0 {
         -1.0
+    } else {
+        0.0
     }
 }
 
@@ -13488,14 +13489,13 @@ fn round_ties_even_f32(value: f32) -> f32 {
 
 /// F32 companion to `torch_sign_f64` — see that function for rationale.
 fn torch_sign_f32(value: f32) -> f32 {
-    if value.is_nan() {
-        f32::NAN
-    } else if value == 0.0 {
-        0.0
-    } else if value > 0.0 {
+    // torch.sign(NaN) == 0.0; NaN and ±0 fall through to 0.0. frankentorch-z6bl1.
+    if value > 0.0 {
         1.0
-    } else {
+    } else if value < 0.0 {
         -1.0
+    } else {
+        0.0
     }
 }
 
@@ -20082,9 +20082,11 @@ mod tests {
     }
 
     #[test]
-    fn sign_scalar_propagates_nan() {
+    fn sign_scalar_nan_is_zero() {
+        // torch.sign(NaN) == 0.0 (NOT NaN): (0<x)-(x<0) is 0 for NaN.
+        // Verified torch 2.12. frankentorch-z6bl1.
         let nan = ScalarTensor::new(f64::NAN, DType::F64, Device::Cpu);
-        assert!(sign_scalar(&nan).value().is_nan());
+        assert_eq!(sign_scalar(&nan).value(), 0.0);
     }
 
     #[test]
@@ -20098,11 +20100,12 @@ mod tests {
     }
 
     #[test]
-    fn sign_tensor_contiguous_propagates_nan() {
+    fn sign_tensor_contiguous_nan_is_zero() {
+        // torch.sign(NaN) == 0.0, not NaN (verified torch 2.12). frankentorch-z6bl1.
         let meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
         let input = vec![f64::NAN, 1.0, -1.0];
         let out = sign_tensor_contiguous_f64(&input, &meta).expect("sign should succeed");
-        assert!(out[0].is_nan());
+        assert_eq!(out[0], 0.0);
         assert_eq!(out[1], 1.0);
         assert_eq!(out[2], -1.0);
     }
