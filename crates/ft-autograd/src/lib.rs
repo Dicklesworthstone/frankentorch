@@ -13963,6 +13963,73 @@ impl TensorTape {
                         rule: "d(repeat(x))/dx=fold_sum_over_tiles (cg)",
                     });
                 }
+                TensorNodeOp::MaxDim {
+                    input,
+                    dim,
+                    input_shape,
+                    indices,
+                }
+                | TensorNodeOp::MinDim {
+                    input,
+                    dim,
+                    input_shape,
+                    indices,
+                } => {
+                    // grad_x = mask ⊙ broadcast(grad_y along dim), where mask is 1 at
+                    // the selected (arg-max/arg-min) position per slice and 0 elsewhere.
+                    // The mask is a constant leaf (argmax carries no gradient — torch
+                    // semantics), and the broadcast (reshape+expand) is differentiable,
+                    // so a second backward gathers grad_x at the selected positions
+                    // (sum over dim of mask*upstream) — the exact adjoint.
+                    let (outer_size, inner_size, input_numel) = Self::checked_dim_loop_sizes(
+                        &input_shape,
+                        dim,
+                        "max/min create_graph shape volume overflow",
+                    )?;
+                    let reduce_size = input_shape[dim];
+                    let mut mask = vec![0.0; input_numel];
+                    for outer in 0..outer_size {
+                        for inner in 0..inner_size {
+                            let out_idx = outer * inner_size + inner;
+                            let selected_f = indices[out_idx];
+                            if !selected_f.is_finite()
+                                || selected_f < 0.0
+                                || selected_f.fract().abs() > f64::EPSILON
+                                || selected_f > usize::MAX as f64
+                            {
+                                return Err(AutogradError::Dispatch(
+                                    DispatchKeyError::IncompatibleSet {
+                                        reason: "max/min create_graph received invalid index value",
+                                    }
+                                    .into(),
+                                ));
+                            }
+                            let selected_r = selected_f as usize;
+                            if selected_r >= reduce_size {
+                                return Err(AutogradError::Dispatch(
+                                    DispatchKeyError::IncompatibleSet {
+                                        reason:
+                                            "max/min create_graph received out-of-bounds index value",
+                                    }
+                                    .into(),
+                                ));
+                            }
+                            mask[outer * reduce_size * inner_size
+                                + selected_r * inner_size
+                                + inner] = 1.0;
+                        }
+                    }
+                    let broadcast = self.cg_broadcast_along_dim(incoming_id, dim, &input_shape)?;
+                    let mask_node = self.leaf(mask, input_shape.clone(), false)?;
+                    let grad_input = self.cg_mul(broadcast, mask_node)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_input)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(max/min_dim(x))/dx=mask*broadcast(grad) (cg)",
+                    });
+                }
                 TensorNodeOp::Div { lhs, rhs } => {
                     // d(a/b)/da = grad/b, d(a/b)/db = -a*grad/b^2
                     let grad_lhs = self.cg_div(incoming_id, rhs)?;
@@ -23778,6 +23845,49 @@ mod tests {
         assert!(
             grad2_x.iter().all(|&g| (g - 6.0).abs() < 1e-10),
             "f''(x) should be [6,6], got {grad2_x:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_max_dim() {
+        // x=[[1,5,3],[4,2,6]], y=max_dim(x,1)=[5,6] (argmax cols 1,2). f=sum(y^2):
+        // grad scatters 2y to argmax -> grad_x=[[0,10,0],[0,0,12]]; since grad at the
+        // argmax = 2*x[argmax], the second derivative is 2 at those positions, 0 else.
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+            .expect("x");
+        let (y, _idx) = tape.max_dim(x, 1).expect("max_dim");
+        let (z, _) = tape.mul(y, y, ExecutionMode::Strict).expect("y*y");
+        let (loss, _) = tape.sum(z, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward (create_graph) must support MaxDim");
+        let grad_x = report1.gradient(x).expect("x gradient");
+        let expected = [0.0, 10.0, 0.0, 0.0, 0.0, 12.0];
+        assert!(
+            grad_x
+                .iter()
+                .zip(expected.iter())
+                .all(|(g, e)| (g - e).abs() < 1e-10),
+            "grad_x should be {expected:?}, got {grad_x:?}"
+        );
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let grad2_x = report2.gradient(x).expect("x second gradient");
+        let expected2 = [0.0, 2.0, 0.0, 0.0, 0.0, 2.0];
+        assert!(
+            grad2_x
+                .iter()
+                .zip(expected2.iter())
+                .all(|(g, e)| (g - e).abs() < 1e-10),
+            "f''(x) should be {expected2:?}, got {grad2_x:?}"
         );
     }
 
