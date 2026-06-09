@@ -13552,14 +13552,19 @@ impl TensorTape {
                     }
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &input_contrib)?;
 
-                    // d/d(mat1): alpha * grad_out @ mat2^T => [m,n] @ [n,k] = [m,k]
+                    // d/d(mat1): alpha * grad_out @ mat2^T => [m,n] @ [n,k] = [m,k].
+                    // grad_mat1[row,col] = Σ_j grad_out[row,j] * mat2[col,j]; mat2 is
+                    // row-major [k,n], so mat2[col,j] = mat2_vals[col*n + j]. (The prior
+                    // `mat2_vals[col + inner*n]` indexed mat2[inner,col] = the WRONG
+                    // transpose, giving grad_out @ mat2 — only correct for symmetric
+                    // mat2. Caught by the create_graph vs regular-backward cross-check.)
                     let mat1_numel = Self::checked_mul_usize(m, k, "addmm mat1 grad overflow")?;
                     let mut mat1_contrib = vec![0.0; mat1_numel];
                     for row in 0..m {
                         for col in 0..k {
                             let mut acc = 0.0;
                             for inner in 0..n {
-                                acc += incoming[row * n + inner] * mat2_vals[col + inner * n];
+                                acc += incoming[row * n + inner] * mat2_vals[col * n + inner];
                             }
                             mat1_contrib[row * k + col] = alpha * acc;
                         }
@@ -24802,6 +24807,161 @@ mod tests {
             res.is_err(),
             "custom function without a create_graph backward should error under create_graph"
         );
+    }
+
+    #[test]
+    fn addmm_backward_mat1_grad_uses_mat2_transpose() {
+        // Regression for a transpose bug in the REGULAR addmm grad_mat1 (it computed
+        // grad_out @ mat2 instead of grad_out @ mat2^T — wrong for any non-symmetric
+        // mat2). out = mat1@mat2, mat1=[[1,2]], mat2=[[3,4],[5,6]] -> out=[[13,16]];
+        // loss=sum(out^2). grad_mat1 = grad_out @ mat2^T = [26,32]@[[3,5],[4,6]] =
+        // [206,322] (finite-difference verified: d(loss)/d(mat1[0,0])=206).
+        let mut tape = TensorTape::new();
+        let input = tape.leaf(vec![0.0, 0.0], vec![1, 2], false).expect("input");
+        let mat1 = tape.leaf(vec![1.0, 2.0], vec![1, 2], true).expect("mat1");
+        let mat2 = tape
+            .leaf(vec![3.0, 4.0, 5.0, 6.0], vec![2, 2], false)
+            .expect("mat2");
+        let (out, _) = tape
+            .addmm(input, mat1, mat2, 0.0, 1.0, ExecutionMode::Strict)
+            .expect("addmm");
+        let (z, _) = tape.mul(out, out, ExecutionMode::Strict).expect("out^2");
+        let (loss, _) = tape.sum(z, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(loss).expect("backward");
+        let g = report.gradient(mat1).expect("mat1 grad");
+        assert!(
+            (g[0] - 206.0).abs() < 1e-9 && (g[1] - 322.0).abs() < 1e-9,
+            "regular addmm grad_mat1 should be [206,322] (grad_out @ mat2^T), got {g:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_first_order_matches_regular_backward() {
+        // Independent-oracle cross-validation: the create_graph backward path is
+        // implemented SEPARATELY from the regular backward. For every supported op,
+        // their first-order gradients of the same loss must agree. This catches a bug
+        // class the per-op analytic tests can miss (a consistent mental error shared
+        // between an analytic expectation and the create_graph impl) by comparing
+        // against the independently-implemented, battle-tested regular backward.
+        fn check<F>(name: &str, builder: F)
+        where
+            F: Fn(&mut TensorTape) -> (TensorNodeId, TensorNodeId),
+        {
+            let mut t1 = TensorTape::new();
+            let (root1, x1) = builder(&mut t1);
+            let r1 = t1.backward(root1).expect("regular backward");
+            let g_regular = r1.gradient(x1).expect("regular grad").to_vec();
+
+            let mut t2 = TensorTape::new();
+            let (root2, x2) = builder(&mut t2);
+            let r2 = t2
+                .backward_with_options(
+                    root2,
+                    BackwardOptions {
+                        create_graph: true,
+                        ..BackwardOptions::strict_default()
+                    },
+                )
+                .expect("create_graph backward");
+            let g_cg = r2.gradient(x2).expect("cg grad").to_vec();
+
+            assert_eq!(g_regular.len(), g_cg.len(), "{name}: grad length mismatch");
+            for (i, (a, b)) in g_regular.iter().zip(g_cg.iter()).enumerate() {
+                assert!(
+                    (a - b).abs() < 1e-9,
+                    "{name}: create_graph grad[{i}]={b} != regular grad[{i}]={a}"
+                );
+            }
+        }
+
+        let sq = |t: &mut TensorTape, y: TensorNodeId| -> TensorNodeId {
+            // nonlinear loss so the gradient is x-dependent: sum(y*y)
+            let (z, _) = t.mul(y, y, ExecutionMode::Strict).expect("y*y");
+            t.sum(z, ExecutionMode::Strict).expect("sum").0
+        };
+
+        check("flip", |t| {
+            let x = t.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![4], true).unwrap();
+            let y = t.flip(x, vec![0]).unwrap();
+            (sq(t, y), x)
+        });
+        check("roll", |t| {
+            let x = t.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![4], true).unwrap();
+            let y = t.roll(x, 1, 0).unwrap();
+            (sq(t, y), x)
+        });
+        check("repeat", |t| {
+            let x = t.leaf(vec![1.0, 2.0], vec![2], true).unwrap();
+            let y = t.repeat(x, vec![3]).unwrap();
+            (sq(t, y), x)
+        });
+        check("pad", |t| {
+            let x = t.leaf(vec![1.0, 2.0], vec![2], true).unwrap();
+            let y = t.pad(x, &[1, 1], 0.0).unwrap();
+            (sq(t, y), x)
+        });
+        check("split", |t| {
+            let x = t.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![4], true).unwrap();
+            let y = t.split(x, &[2, 2], 0).unwrap()[1];
+            (sq(t, y), x)
+        });
+        check("max_dim", |t| {
+            let x = t
+                .leaf(vec![1.0, 5.0, 3.0, 4.0, 2.0, 6.0], vec![2, 3], true)
+                .unwrap();
+            let (y, _) = t.max_dim(x, 1).unwrap();
+            (sq(t, y), x)
+        });
+        check("prod_dim", |t| {
+            let x = t
+                .leaf(vec![2.0, 3.0, 4.0, 1.0, 5.0, 2.0], vec![2, 3], true)
+                .unwrap();
+            let (y, _) = t.prod_dim(x, 1, ExecutionMode::Strict).unwrap();
+            (sq(t, y), x)
+        });
+        check("cumprod", |t| {
+            let x = t.leaf(vec![2.0, 3.0, 4.0], vec![3], true).unwrap();
+            let (y, _) = t.cumprod(x, 0, ExecutionMode::Strict).unwrap();
+            (sq(t, y), x)
+        });
+        check("addmm", |t| {
+            let input = t.leaf(vec![0.0, 0.0], vec![1, 2], false).unwrap();
+            let mat1 = t.leaf(vec![1.0, 2.0], vec![1, 2], true).unwrap();
+            let mat2 = t.leaf(vec![3.0, 4.0, 5.0, 6.0], vec![2, 2], false).unwrap();
+            let (y, _) = t
+                .addmm(input, mat1, mat2, 0.0, 1.0, ExecutionMode::Strict)
+                .unwrap();
+            (sq(t, y), mat1)
+        });
+        check("addmv", |t| {
+            let input = t.leaf(vec![0.0, 0.0], vec![2], false).unwrap();
+            let mat = t.leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], false).unwrap();
+            let v = t.leaf(vec![5.0, 6.0], vec![2], true).unwrap();
+            let (y, _) = t
+                .addmv(input, mat, v, 0.0, 1.0, ExecutionMode::Strict)
+                .unwrap();
+            (sq(t, y), v)
+        });
+        check("index_put", |t| {
+            let input = t.leaf(vec![10.0, 20.0, 30.0, 40.0], vec![4], true).unwrap();
+            let values = t.leaf(vec![2.0, 7.0], vec![2], false).unwrap();
+            let y = t
+                .index_put(input, values, &[vec![1.0, 3.0]], &[2.0, 7.0], false)
+                .unwrap();
+            (sq(t, y), input)
+        });
+        check("cast", |t| {
+            let x = t.leaf(vec![2.0, 3.0], vec![2], true).unwrap();
+            let xf = t.to_f32(x).unwrap();
+            let xb = t.to_f64(xf).unwrap();
+            (sq(t, xb), x)
+        });
+        check("lerp", |t| {
+            let s = t.leaf(vec![1.0, 2.0], vec![2], true).unwrap();
+            let e = t.leaf(vec![3.0, 4.0], vec![2], false).unwrap();
+            let (y, _) = t.lerp(s, e, 0.25, ExecutionMode::Strict).unwrap();
+            (sq(t, y), s)
+        });
     }
 
     #[test]
