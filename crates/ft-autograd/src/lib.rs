@@ -13931,6 +13931,38 @@ impl TensorTape {
                         rule: "d(pad(x))/dx=unpad(grad) (cg)",
                     });
                 }
+                TensorNodeOp::Repeat {
+                    input,
+                    original_shape,
+                    repeats,
+                } => {
+                    // grad = fold (sum over tiles). repeat tiles output[c]=in[c % s_d],
+                    // so reshape the output [s0*r0, s1*r1, ...] to interleaved
+                    // [r0, s0, r1, s1, ...] (contiguous-equivalent), sum each tile
+                    // (even) axis high-position-first so earlier axes don't shift, then
+                    // reshape to the input shape. Reshape and SumDim both have a
+                    // first-order backward, so a further backward is well-defined.
+                    let repeat_shape = Self::normalize_repeat_shape(&original_shape, &repeats)?;
+                    let ndim = repeats.len();
+                    let mut interleaved = Vec::with_capacity(2 * ndim);
+                    for d in 0..ndim {
+                        interleaved.push(repeats[d]);
+                        interleaved.push(repeat_shape[d]);
+                    }
+                    let mut grad = self.reshape(incoming_id, interleaved)?;
+                    for d in (0..ndim).rev() {
+                        let (summed, _) = self.sum_dim(grad, 2 * d, ExecutionMode::Strict)?;
+                        grad = summed;
+                    }
+                    let grad = self.reshape(grad, original_shape.clone())?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad)?;
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(repeat(x))/dx=fold_sum_over_tiles (cg)",
+                    });
+                }
                 TensorNodeOp::Div { lhs, rhs } => {
                     // d(a/b)/da = grad/b, d(a/b)/db = -a*grad/b^2
                     let grad_lhs = self.cg_div(incoming_id, rhs)?;
@@ -23713,6 +23745,39 @@ mod tests {
         assert!(
             grad2_x.iter().all(|&g| (g - 2.0).abs() < 1e-10),
             "f''(x) should be [2,2], got {grad2_x:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_repeat() {
+        // repeat([1,2],3)=[1,2,1,2,1,2]. f=sum(y^2): each input element appears in 3
+        // tiles, so grad_x=[3*2*x0, 3*2*x1]=[6,12] and 2nd derivative [6,6].
+        // Exercises create_graph for Repeat (recorded as reshape + sum-over-tiles).
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(vec![1.0, 2.0], vec![2], true).expect("x");
+        let y = tape.repeat(x, vec![3]).expect("repeat");
+        let (z, _) = tape.mul(y, y, ExecutionMode::Strict).expect("y*y");
+        let (loss, _) = tape.sum(z, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward (create_graph) must support Repeat");
+        let grad_x = report1.gradient(x).expect("x gradient");
+        assert!(
+            (grad_x[0] - 6.0).abs() < 1e-10 && (grad_x[1] - 12.0).abs() < 1e-10,
+            "grad_x should be [6,12], got {grad_x:?}"
+        );
+        let dx_node = report1.gradient_node(x).expect("gradient node for x");
+        let report2 = tape.backward(dx_node).expect("second backward");
+        let grad2_x = report2.gradient(x).expect("x second gradient");
+        assert!(
+            grad2_x.iter().all(|&g| (g - 6.0).abs() < 1e-10),
+            "f''(x) should be [6,6], got {grad2_x:?}"
         );
     }
 
