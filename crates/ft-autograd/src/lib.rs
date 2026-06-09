@@ -24809,6 +24809,135 @@ mod tests {
         );
     }
 
+    /// Finite-difference gradient check: validates a backward gradient against
+    /// numerical central differences. The gold-standard oracle — independent of any
+    /// analytic expectation, it catches transpose/index bugs (like the addmm
+    /// grad_mat1 bug) that symmetric/square test inputs mask. `build_loss` takes the
+    /// tape and the (grad-tracked) input node and returns a scalar loss node.
+    fn fd_grad_check<F>(input: Vec<f64>, shape: Vec<usize>, build_loss: F)
+    where
+        F: Fn(&mut TensorTape, TensorNodeId) -> TensorNodeId,
+    {
+        let eps = 1e-6;
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(input.clone(), shape.clone(), true).expect("leaf");
+        let loss = build_loss(&mut tape, x);
+        let report = tape.backward(loss).expect("backward");
+        let analytic = report.gradient(x).expect("grad").to_vec();
+        assert_eq!(analytic.len(), input.len(), "grad length mismatch");
+
+        let eval = |vals: &[f64]| -> f64 {
+            let mut t = TensorTape::new();
+            let xn = t.leaf(vals.to_vec(), shape.clone(), false).expect("leaf");
+            let l = build_loss(&mut t, xn);
+            t.values(l).expect("loss value")[0]
+        };
+        for i in 0..input.len() {
+            let mut up = input.clone();
+            up[i] += eps;
+            let mut dn = input.clone();
+            dn[i] -= eps;
+            let fd = (eval(&up) - eval(&dn)) / (2.0 * eps);
+            assert!(
+                (analytic[i] - fd).abs() < 1e-4,
+                "grad[{i}]: analytic {} != finite-diff {}",
+                analytic[i],
+                fd
+            );
+        }
+    }
+
+    #[test]
+    fn matmul_backward_grads_match_finite_diff_nonsquare() {
+        // A[2,3] @ B[3,2] — non-square, non-symmetric. FD-check grad w.r.t. both.
+        let a = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let b = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let b1 = b.clone();
+        fd_grad_check(a.clone(), vec![2, 3], move |t, x| {
+            let bn = t.leaf(b1.clone(), vec![3, 2], false).unwrap();
+            let (out, _) = t.matmul(x, bn, ExecutionMode::Strict).unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+        let a1 = a.clone();
+        fd_grad_check(b.clone(), vec![3, 2], move |t, x| {
+            let an = t.leaf(a1.clone(), vec![2, 3], false).unwrap();
+            let (out, _) = t.matmul(an, x, ExecutionMode::Strict).unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+    }
+
+    #[test]
+    fn bmm_backward_grads_match_finite_diff_nonsquare() {
+        // batch=2: A[2,2,3] @ B[2,3,2] — non-square per batch, non-symmetric.
+        let a: Vec<f64> = (1..=12).map(|v| v as f64).collect();
+        let b: Vec<f64> = (13..=24).map(|v| v as f64 * 0.5).collect();
+        let b1 = b.clone();
+        fd_grad_check(a.clone(), vec![2, 2, 3], move |t, x| {
+            let bn = t.leaf(b1.clone(), vec![2, 3, 2], false).unwrap();
+            let (out, _) = t.bmm(x, bn, ExecutionMode::Strict).unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+        let a1 = a.clone();
+        fd_grad_check(b.clone(), vec![2, 3, 2], move |t, x| {
+            let an = t.leaf(a1.clone(), vec![2, 2, 3], false).unwrap();
+            let (out, _) = t.bmm(an, x, ExecutionMode::Strict).unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+    }
+
+    #[test]
+    fn outer_backward_grads_match_finite_diff() {
+        // a[3] (x) b[4] — non-square outer product, non-symmetric.
+        let a = vec![1.0, 2.0, 3.0];
+        let b = vec![4.0, 5.0, 6.0, 7.0];
+        let b1 = b.clone();
+        fd_grad_check(a.clone(), vec![3], move |t, x| {
+            let bn = t.leaf(b1.clone(), vec![4], false).unwrap();
+            let (out, _) = t.outer(x, bn, ExecutionMode::Strict).unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+        let a1 = a.clone();
+        fd_grad_check(b.clone(), vec![4], move |t, x| {
+            let an = t.leaf(a1.clone(), vec![3], false).unwrap();
+            let (out, _) = t.outer(an, x, ExecutionMode::Strict).unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+    }
+
+    #[test]
+    fn addmm_backward_grads_match_finite_diff_nonsquare() {
+        // FD re-validation of the addmm grad_mat1 fix on non-square, non-symmetric
+        // mat1[2,3] @ mat2[3,2] (the case class that exposed the transpose bug).
+        let m1 = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let m2 = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+        let m2a = m2.clone();
+        fd_grad_check(m1.clone(), vec![2, 3], move |t, x| {
+            let input = t.leaf(vec![0.0; 4], vec![2, 2], false).unwrap();
+            let mat2 = t.leaf(m2a.clone(), vec![3, 2], false).unwrap();
+            let (out, _) = t
+                .addmm(input, x, mat2, 0.0, 1.0, ExecutionMode::Strict)
+                .unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+        let m1a = m1.clone();
+        fd_grad_check(m2.clone(), vec![3, 2], move |t, x| {
+            let input = t.leaf(vec![0.0; 4], vec![2, 2], false).unwrap();
+            let mat1 = t.leaf(m1a.clone(), vec![2, 3], false).unwrap();
+            let (out, _) = t
+                .addmm(input, mat1, x, 0.0, 1.0, ExecutionMode::Strict)
+                .unwrap();
+            let (z, _) = t.mul(out, out, ExecutionMode::Strict).unwrap();
+            t.sum(z, ExecutionMode::Strict).unwrap().0
+        });
+    }
+
     #[test]
     fn addmm_backward_mat1_grad_uses_mat2_transpose() {
         // Regression for a transpose bug in the REGULAR addmm grad_mat1 (it computed
