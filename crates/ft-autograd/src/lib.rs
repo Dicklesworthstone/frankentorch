@@ -14067,6 +14067,49 @@ impl TensorTape {
                         rule: "d(addmm)/d:input=beta*grad,mat1=a*grad@mat2^T,mat2=a*mat1^T@grad (cg)",
                     });
                 }
+                TensorNodeOp::Addmv {
+                    input,
+                    mat,
+                    vec: vec_id,
+                    beta,
+                    alpha,
+                } => {
+                    // addmv = beta*input + alpha*(mat[m,k] @ vec[k]):
+                    //   d/input = beta*grad (summed to input shape)
+                    //   d/mat   = alpha*outer(grad[m], vec[k]) = alpha*(grad[m,1] @ vec[1,k])
+                    //   d/vec   = alpha*(mat^T @ grad) = alpha*(mat^T[k,m] @ grad[m,1])
+                    // Reuses the cg matmul/transpose/scalar helpers; all recorded ops
+                    // have first-order backward, so a further backward is well-defined.
+                    let input_shape = self.nodes[input.0].tensor.meta().shape().to_vec();
+                    let mat_shape = self.nodes[mat.0].tensor.meta().shape().to_vec();
+                    let m = mat_shape[0];
+                    let k = mat_shape[1];
+
+                    let grad_input = self.cg_mul_scalar(incoming_id, beta)?;
+                    let grad_input = self.cg_sum_to_shape(grad_input, &input_shape)?;
+                    self.cg_accumulate(input, &mut grad_nodes, grad_input)?;
+
+                    let grad_col = self.cg_reshape(incoming_id, vec![m, 1])?;
+                    let vec_row = self.cg_reshape(vec_id, vec![1, k])?;
+                    let grad_mat = self.cg_matmul_2d(grad_col, vec_row)?;
+                    let grad_mat = self.cg_mul_scalar(grad_mat, alpha)?;
+                    self.cg_accumulate(mat, &mut grad_nodes, grad_mat)?;
+
+                    let mat_t = self.cg_transpose_2d(mat)?;
+                    let grad_vec = self.cg_matmul_2d(mat_t, grad_col)?;
+                    let grad_vec = self.cg_reshape(grad_vec, vec![k])?;
+                    let grad_vec = self.cg_mul_scalar(grad_vec, alpha)?;
+                    self.cg_accumulate(vec_id, &mut grad_nodes, grad_vec)?;
+
+                    Self::complete_dependency(&mut pending, input, &mut queue)?;
+                    Self::complete_dependency(&mut pending, mat, &mut queue)?;
+                    Self::complete_dependency(&mut pending, vec_id, &mut queue)?;
+                    steps.push(TensorBackwardStep {
+                        node: node_id,
+                        incoming_grad_len: self.nodes[incoming_id.0].tensor.meta().numel(),
+                        rule: "d(addmv)/d:input=beta*grad,mat=a*outer(grad,vec),vec=a*mat^T@grad (cg)",
+                    });
+                }
                 TensorNodeOp::Div { lhs, rhs } => {
                     // d(a/b)/da = grad/b, d(a/b)/db = -a*grad/b^2
                     let grad_lhs = self.cg_div(incoming_id, rhs)?;
@@ -24021,6 +24064,47 @@ mod tests {
         assert!(
             (grad2[0] - 42.0).abs() < 1e-9 && (grad2[1] - 56.0).abs() < 1e-9,
             "f''(mat1) should be [42,56], got {grad2:?}"
+        );
+    }
+
+    #[test]
+    fn create_graph_second_derivative_addmv() {
+        // out = mat @ vec (beta=0): mat=[[1,2],[3,4]], vec=[5,6] -> out=[17,39].
+        // f=sum(out^2): grad_vec = 2*mat^T@mat@vec = mat^T@(2*out) = [268,380]. Second
+        // backward of grad_vec (linear in vec with Jacobian 2*mat^T@mat=[[20,28],[28,40]])
+        // summed over outputs gives the column sums [48,68]. Exercises create_graph for
+        // Addmv (outer + mat^T@grad chain).
+        let mut tape = TensorTape::new();
+        let input = tape.leaf(vec![0.0, 0.0], vec![2], false).expect("input");
+        let mat = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
+            .expect("mat");
+        let v = tape.leaf(vec![5.0, 6.0], vec![2], true).expect("vec");
+        let (out, _) = tape
+            .addmv(input, mat, v, 0.0, 1.0, ExecutionMode::Strict)
+            .expect("addmv");
+        let (z, _) = tape.mul(out, out, ExecutionMode::Strict).expect("out^2");
+        let (loss, _) = tape.sum(z, ExecutionMode::Strict).expect("sum");
+        let report1 = tape
+            .backward_with_options(
+                loss,
+                BackwardOptions {
+                    create_graph: true,
+                    ..BackwardOptions::strict_default()
+                },
+            )
+            .expect("first backward (create_graph) must support Addmv");
+        let grad_vec = report1.gradient(v).expect("vec gradient");
+        assert!(
+            (grad_vec[0] - 268.0).abs() < 1e-9 && (grad_vec[1] - 380.0).abs() < 1e-9,
+            "grad_vec should be [268,380], got {grad_vec:?}"
+        );
+        let dv_node = report1.gradient_node(v).expect("gradient node for vec");
+        let report2 = tape.backward(dv_node).expect("second backward");
+        let grad2 = report2.gradient(v).expect("vec second gradient");
+        assert!(
+            (grad2[0] - 48.0).abs() < 1e-9 && (grad2[1] - 68.0).abs() < 1e-9,
+            "f''(vec) should be [48,68], got {grad2:?}"
         );
     }
 
