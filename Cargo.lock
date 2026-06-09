@@ -747,6 +747,7 @@ dependencies = [
 name = "ft-autograd"
 version = "0.1.0"
 dependencies = [
+ "criterion",
  "ft-core",
  "ft-dispatch",
  "ft-kernel-cpu",

@@ -1,0 +1,1 @@
+Superseded: first candidate benchmark attempt piped stdout only while RCH emitted diagnostics/results on stderr. See `.skill-loop-progress.md` Pass 4 for the recorded rejected scalar-tred2 evidence and same-worker numbers.

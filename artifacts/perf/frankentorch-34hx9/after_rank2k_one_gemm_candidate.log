@@ -1,0 +1,1 @@
+Superseded: first rank-2k after benchmark piped stdout only while RCH emitted diagnostics/results on stderr. See `after_rank2k_one_gemm_candidate_final.log`.

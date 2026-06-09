@@ -1,0 +1,1 @@
+Superseded: first rank-2k focused test artifact piped stdout only while RCH emitted diagnostics/results on stderr. See `test_ft_kernel_cpu_rank2k_one_gemm_final.log`.

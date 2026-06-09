@@ -1,0 +1,377 @@
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/benches/linalg_bench.rs:6:
+ use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+ use ft_core::{DType, Device, TensorMeta};
+ use ft_kernel_cpu::{
+-    cholesky_contiguous_f64, cholesky_solve_contiguous_f64, det_contiguous_f64,
+-    eig_contiguous_f64, eigh_contiguous_f64,
+-    eigvals_contiguous_f64, eigvalsh_contiguous_f64, inv_tensor_contiguous_f64,
+-    lobpcg_contiguous_f64, lu_factor_contiguous_f64, lu_solve_contiguous_f64,
+-    lu_solve_mixed_refine_contiguous_f64, matrix_exp_contiguous_f64, qr_contiguous_f64,
+-    svd_contiguous_f64, svd_lowrank_contiguous_f64, svdvals_contiguous_f64,
++    cholesky_contiguous_f64, cholesky_solve_contiguous_f64, det_contiguous_f64, eig_contiguous_f64,
++    eigh_contiguous_f64, eigvals_contiguous_f64, eigvalsh_contiguous_f64,
++    inv_tensor_contiguous_f64, lobpcg_contiguous_f64, lu_factor_contiguous_f64,
++    lu_solve_contiguous_f64, lu_solve_mixed_refine_contiguous_f64, matrix_exp_contiguous_f64,
++    qr_contiguous_f64, svd_contiguous_f64, svd_lowrank_contiguous_f64, svdvals_contiguous_f64,
+     symmetric_rank2k_lower_update_f64,
+ };
+
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/benches/linalg_bench.rs:391:
+         c.bench_function(&format!("cholesky_solve_f64_{n}x{n}_nrhs"), |bch| {
+             bch.iter(|| {
+                 black_box(
+-                    cholesky_solve_contiguous_f64(&factor, black_box(&id), &id_meta, false).unwrap(),
++                    cholesky_solve_contiguous_f64(&factor, black_box(&id), &id_meta, false)
++                        .unwrap(),
+                 )
+             })
+         });
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:475:
+         csc: isize,
+     ) {
+         unsafe {
+-            matrixmultiply::dgemm(
+-                m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc,
+-            );
++            matrixmultiply::dgemm(m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc);
+         }
+         set_mxcsr_default();
+     }
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:505:
+         csc: isize,
+     ) {
+         unsafe {
+-            matrixmultiply::sgemm(
+-                m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc,
+-            );
++            matrixmultiply::sgemm(m, k, n, alpha, a, rsa, csa, b, rsb, csb, beta, c, rsc, csc);
+         }
+         set_mxcsr_default();
+     }
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:5225:
+         padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+     );
+     let mut out_flat = vec![0.0f32; flat * out_ch];
+-    gemm::sgemm_bt(flat, patch_width, out_ch, &panel, weight_flat, &mut out_flat);
++    gemm::sgemm_bt(
++        flat,
++        patch_width,
++        out_ch,
++        &panel,
++        weight_flat,
++        &mut out_flat,
++    );
+     let mut out = vec![0.0f32; batch * out_ch * patch_count];
+     out.par_chunks_mut(patch_count)
+         .enumerate()
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:8679:
+     // and order (forward k ascending, back k descending). Transpose to RHS-outer
+     // so each column is contiguous, solve in parallel, transpose back. The
+     // transposes are O(n*num_rhs) vs the O(n^2*num_rhs) solve. frankentorch-l9xod-inv.
+-    let par_gate =
+-        num_rhs >= 8 && (n as u128) * (n as u128) * (num_rhs as u128) >= (1u128 << 26);
++    let par_gate = num_rhs >= 8 && (n as u128) * (n as u128) * (num_rhs as u128) >= (1u128 << 26);
+     if par_gate {
+         let lu = &factor.lu;
+         let mut xt = vec![0.0f64; num_rhs * n];
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:9781:
+     // frankentorch-otbok). Bit-exact: each column reproduces the serial sweep's
+     // per-element arithmetic and order. Transpose to RHS-outer, solve in parallel,
+     // transpose back. frankentorch-chsolve-colpar.
+-    let par_gate =
+-        num_rhs >= 8 && (n as u128) * (n as u128) * (num_rhs as u128) >= (1u128 << 29);
++    let par_gate = num_rhs >= 8 && (n as u128) * (n as u128) * (num_rhs as u128) >= (1u128 << 29);
+     if par_gate {
+         let mut xt = vec![0.0f64; num_rhs * n];
+         for i in 0..n {
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16303:
+         // gating on SUM_PARALLEL_THRESHOLD rather than using a different reduction
+         // order). Guard that invariant across sizes that straddle PAR_BLOCK and the
+         // threshold, including non-power-of-two lengths (uneven splits).
+-        for &n in &[1usize, 127, 16384, 16385, 32768, 100_000, 524_289, 1_000_003] {
+-            let data: Vec<f64> = (0..n).map(|i| ((i * 31 + 7) % 1009) as f64 * 0.013 - 6.5).collect();
++        for &n in &[
++            1usize, 127, 16384, 16385, 32768, 100_000, 524_289, 1_000_003,
++        ] {
++            let data: Vec<f64> = (0..n)
++                .map(|i| ((i * 31 + 7) % 1009) as f64 * 0.013 - 6.5)
++                .collect();
+             assert_eq!(
+                 super::pairwise_sum_f64(&data).to_bits(),
+                 super::pairwise_sum_f64_par(&data).to_bits(),
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16324:
+     fn sum_parallel_crossover_probe() {
+         use std::time::Instant;
+         let cores = rayon::current_num_threads().max(2);
+-        let p1 = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+-        let pn = rayon::ThreadPoolBuilder::new().num_threads(cores).build().unwrap();
++        let p1 = rayon::ThreadPoolBuilder::new()
++            .num_threads(1)
++            .build()
++            .unwrap();
++        let pn = rayon::ThreadPoolBuilder::new()
++            .num_threads(cores)
++            .build()
++            .unwrap();
+         println!("cores={cores}");
+         for &n in &[16384usize, 32768, 65536, 131072, 262144, 524288, 1_048_576] {
+             let data: Vec<f64> = (0..n).map(|i| ((i % 97) as f64) * 0.01 - 0.5).collect();
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16368:
+         // NOT the cross-test pollution source (it stays default through a GEMM +
+         // transcendental sweep); the guard keeps it that way.
+         super::set_mxcsr_default();
+-        assert_eq!(super::read_mxcsr(), 0x1f80, "MXCSR not at default after reset");
++        assert_eq!(
++            super::read_mxcsr(),
++            0x1f80,
++            "MXCSR not at default after reset"
++        );
+
+         // Only the CONTROL bits matter for determinism: FTZ (bit 15), DAZ
+         // (bit 6) and the rounding mode (bits 13-14). The low 6 bits are sticky
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16423:
+         let bias: Vec<f64> = (0..out_ch).map(|i| (i as f64) * 0.05 - 0.1).collect();
+
+         let got = super::conv2d_forward_f64(
+-            &padded, &weight, Some(&bias), batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
++            &padded,
++            &weight,
++            Some(&bias),
++            batch,
++            in_ch,
++            ph,
++            pw,
++            kh,
++            kw,
++            oh,
++            ow,
++            sh,
++            sw,
++            out_ch,
+         );
+
+         let patch_count = oh * ow;
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16430:
+         let flat = batch * patch_count;
+         let patch_width = in_ch * kh * kw;
+-        let panel =
+-            super::conv2d_im2col_f64(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
++        let panel = super::conv2d_im2col_f64(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+         let mut out_flat = vec![0.0f64; flat * out_ch];
+         super::gemm::dgemm_bt(flat, patch_width, out_ch, &panel, &weight, &mut out_flat);
+         let mut want = vec![0.0f64; batch * out_ch * patch_count];
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16445:
+         }
+         assert_eq!(got.len(), want.len());
+         for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+-            assert_eq!(g.to_bits(), w.to_bits(), "1x1 conv mismatch @{i}: {g} vs {w}");
++            assert_eq!(
++                g.to_bits(),
++                w.to_bits(),
++                "1x1 conv mismatch @{i}: {g} vs {w}"
++            );
+         }
+
+         // f32 mirror: same bit-exact check against im2col_f32 + sgemm_bt.
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16453:
+         let weight32: Vec<f32> = weight.iter().map(|&v| v as f32).collect();
+         let bias32: Vec<f32> = bias.iter().map(|&v| v as f32).collect();
+         let got32 = super::conv2d_forward_f32(
+-            &padded32, &weight32, Some(&bias32), batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw,
++            &padded32,
++            &weight32,
++            Some(&bias32),
++            batch,
++            in_ch,
++            ph,
++            pw,
++            kh,
++            kw,
++            oh,
++            ow,
++            sh,
++            sw,
+             out_ch,
+         );
+         let panel32 =
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16460:
+             super::conv2d_im2col_f32(&padded32, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+         let mut out_flat32 = vec![0.0f32; flat * out_ch];
+-        super::gemm::sgemm_bt(flat, patch_width, out_ch, &panel32, &weight32, &mut out_flat32);
++        super::gemm::sgemm_bt(
++            flat,
++            patch_width,
++            out_ch,
++            &panel32,
++            &weight32,
++            &mut out_flat32,
++        );
+         let mut want32 = vec![0.0f32; batch * out_ch * patch_count];
+         for n in 0..batch {
+             for oc in 0..out_ch {
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16471:
+             }
+         }
+         for (i, (g, w)) in got32.iter().zip(want32.iter()).enumerate() {
+-            assert_eq!(g.to_bits(), w.to_bits(), "1x1 conv f32 mismatch @{i}: {g} vs {w}");
++            assert_eq!(
++                g.to_bits(),
++                w.to_bits(),
++                "1x1 conv f32 mismatch @{i}: {g} vs {w}"
++            );
+         }
+     }
+
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16483:
+         let (kh, kw, sh, sw) = (1usize, 1usize, 1usize, 1usize);
+         let (oh, ow) = (ph, pw);
+         let n_in = batch * in_ch * ph * pw;
+-        let padded: Vec<f64> = (0..n_in).map(|i| ((i as f64 * 0.013).sin()) * 0.5).collect();
+-        let weight: Vec<f64> = (0..out_ch * in_ch).map(|i| ((i as f64 * 0.017).cos()) * 0.3).collect();
++        let padded: Vec<f64> = (0..n_in)
++            .map(|i| ((i as f64 * 0.013).sin()) * 0.5)
++            .collect();
++        let weight: Vec<f64> = (0..out_ch * in_ch)
++            .map(|i| ((i as f64 * 0.017).cos()) * 0.3)
++            .collect();
+         let bias: Vec<f64> = (0..out_ch).map(|i| (i as f64) * 0.001).collect();
+         let iters = 60u32;
+
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:16492:
+         let t0 = Instant::now();
+         for _ in 0..iters {
+             let o = super::conv2d_forward_f64(
+-                &padded, &weight, Some(&bias), batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw, out_ch,
++                &padded,
++                &weight,
++                Some(&bias),
++                batch,
++                in_ch,
++                ph,
++                pw,
++                kh,
++                kw,
++                oh,
++                ow,
++                sh,
++                sw,
++                out_ch,
+             );
+             std::hint::black_box(&o);
+         }
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:20520:
+             }
+             assert_eq!(got.len(), want.len());
+             for (i, (&g, &w)) in got.iter().zip(want.iter()).enumerate() {
+-                assert_eq!(g.to_bits(), w.to_bits(), "shape={shape:?} dim={dim} idx={i}");
++                assert_eq!(
++                    g.to_bits(),
++                    w.to_bits(),
++                    "shape={shape:?} dim={dim} idx={i}"
++                );
+             }
+
+             // f32 path too.
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:20540:
+                 }
+             }
+             for (i, (&g, &w)) in got32.iter().zip(want32.iter()).enumerate() {
+-                assert_eq!(g.to_bits(), w.to_bits(), "f32 shape={shape:?} dim={dim} idx={i}");
++                assert_eq!(
++                    g.to_bits(),
++                    w.to_bits(),
++                    "f32 shape={shape:?} dim={dim} idx={i}"
++                );
+             }
+         }
+     }
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:22053:
+             a[i * n + i] = (i as f64) + 1.0;
+         }
+         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+-        let one_thread = rayon::ThreadPoolBuilder::new().num_threads(1).build().unwrap();
+-        let four_threads = rayon::ThreadPoolBuilder::new().num_threads(4).build().unwrap();
++        let one_thread = rayon::ThreadPoolBuilder::new()
++            .num_threads(1)
++            .build()
++            .unwrap();
++        let four_threads = rayon::ThreadPoolBuilder::new()
++            .num_threads(4)
++            .build()
++            .unwrap();
+
+         let serial = one_thread.install(|| super::eig_contiguous_f64(&a, &meta).unwrap());
+         let parallel = four_threads.install(|| super::eig_contiguous_f64(&a, &meta).unwrap());
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:22061:
+         assert_eq!(serial.n, parallel.n);
+-        for (i, (&s, &p)) in serial.eigenvalues.iter().zip(&parallel.eigenvalues).enumerate() {
++        for (i, (&s, &p)) in serial
++            .eigenvalues
++            .iter()
++            .zip(&parallel.eigenvalues)
++            .enumerate()
++        {
+             assert_eq!(
+                 s.to_bits(),
+                 p.to_bits(),
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:22066:
+                 "eigenvalue bit mismatch at interleaved slot {i}: {s} vs {p}"
+             );
+         }
+-        for (i, (&s, &p)) in serial.eigenvectors.iter().zip(&parallel.eigenvectors).enumerate() {
++        for (i, (&s, &p)) in serial
++            .eigenvectors
++            .iter()
++            .zip(&parallel.eigenvectors)
++            .enumerate()
++        {
+             assert_eq!(
+                 s.to_bits(),
+                 p.to_bits(),
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:23011:
+         for idx in 0..n * kk {
+             max_diff = max_diff.max((x[idx] - x_true[idx]).abs());
+         }
+-        assert!(max_diff < 1e-9, "lstsq_qr solution diverges: max_diff={max_diff}");
++        assert!(
++            max_diff < 1e-9,
++            "lstsq_qr solution diverges: max_diff={max_diff}"
++        );
+
+         // Rank-deficient (duplicate column) -> defer to SVD via None.
+         let mut a_rd = a.clone();
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:23020:
+         }
+         let deferred = super::lstsq_qr_contiguous_f64(&a_rd, &a_meta, &b, &b_meta)
+             .expect("lstsq_qr should not error on rank-deficient input");
+-        assert!(deferred.is_none(), "rank-deficient input must defer to SVD (None)");
++        assert!(
++            deferred.is_none(),
++            "rank-deficient input must defer to SVD (None)"
++        );
+
+         // Underdetermined (m < n) -> defer.
+         let a_wide_meta = TensorMeta::from_shape(vec![2usize, 3usize], DType::F64, Device::Cpu);
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:23045:
+         assert_eq!(tall_pinv.len(), 6);
+         let tall_expected = [0.5, 0.0, 0.0, 0.0, 0.25, 0.0];
+         for (got, want) in tall_pinv.iter().zip(tall_expected) {
+-            assert!((got - want).abs() < 1e-12, "tall pinv mismatch {got} vs {want}");
++            assert!(
++                (got - want).abs() < 1e-12,
++                "tall pinv mismatch {got} vs {want}"
++            );
+         }
+
+         let wide = vec![2.0, 0.0, 0.0, 0.0, 4.0, 0.0];
+Diff in /data/projects/.scratch/frankentorch-34hx9-boldfalcon-20260609T2100/crates/ft-kernel-cpu/src/lib.rs:23056:
+         assert_eq!(wide_pinv.len(), 6);
+         let wide_expected = [0.5, 0.0, 0.0, 0.25, 0.0, 0.0];
+         for (got, want) in wide_pinv.iter().zip(wide_expected) {
+-            assert!((got - want).abs() < 1e-12, "wide pinv mismatch {got} vs {want}");
++            assert!(
++                (got - want).abs() < 1e-12,
++                "wide pinv mismatch {got} vs {want}"
++            );
+         }
+     }

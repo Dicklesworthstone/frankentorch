@@ -10028,14 +10028,25 @@ pub fn symmetric_rank2k_lower_update_f64(
     let w = &w[..panel_len];
     let a = &mut a[..matrix_len];
     let mut vw_t = vec![0.0f64; matrix_len];
-    let mut wv_t = vec![0.0f64; matrix_len];
     gemm::dgemm_bt(n, k, n, v, w, &mut vw_t);
-    gemm::dgemm_bt(n, k, n, w, v, &mut wv_t);
-    for row in 0..n {
-        let row_start = row * n;
-        for col in 0..=row {
-            let idx = row_start + col;
-            a[idx] -= vw_t[idx] + wv_t[idx];
+
+    if v.iter().chain(w.iter()).all(|x| x.is_finite()) {
+        for row in 0..n {
+            let row_start = row * n;
+            for col in 0..=row {
+                let idx = row_start + col;
+                a[idx] -= vw_t[idx] + vw_t[col * n + row];
+            }
+        }
+    } else {
+        let mut wv_t = vec![0.0f64; matrix_len];
+        gemm::dgemm_bt(n, k, n, w, v, &mut wv_t);
+        for row in 0..n {
+            let row_start = row * n;
+            for col in 0..=row {
+                let idx = row_start + col;
+                a[idx] -= vw_t[idx] + wv_t[idx];
+            }
         }
     }
 
@@ -18040,6 +18051,82 @@ mod tests {
                     "upper triangle changed at ({row},{col})"
                 );
             }
+        }
+    }
+
+    fn symmetric_rank2k_two_gemm_reference(
+        n: usize,
+        k: usize,
+        v: &[f64],
+        w: &[f64],
+        a: &mut [f64],
+    ) {
+        let mut vw_t = vec![0.0f64; n * n];
+        let mut wv_t = vec![0.0f64; n * n];
+        crate::gemm::dgemm_bt(n, k, n, v, w, &mut vw_t);
+        crate::gemm::dgemm_bt(n, k, n, w, v, &mut wv_t);
+        for row in 0..n {
+            let row_start = row * n;
+            for col in 0..=row {
+                let idx = row_start + col;
+                a[idx] -= vw_t[idx] + wv_t[idx];
+            }
+        }
+    }
+
+    #[test]
+    fn symmetric_rank2k_lower_update_finite_matches_two_gemm_bits() {
+        let (n, k) = (33usize, 7usize);
+        let v: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 31) as f64 - 15.0) * 0.017 + (i as f64) * 1e-9)
+            .collect();
+        let w: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 23) as f64 - 11.0) * 0.019 - (i as f64) * 1e-9)
+            .collect();
+        let base: Vec<f64> = (0..n * n)
+            .map(|i| ((i % 41) as f64 - 20.0) * 0.005)
+            .collect();
+        let mut got = base.clone();
+        let mut expected = base;
+
+        super::symmetric_rank2k_lower_update_f64(n, k, &v, &w, &mut got).unwrap();
+        symmetric_rank2k_two_gemm_reference(n, k, &v, &w, &mut expected);
+
+        for (idx, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "finite one-GEMM rank2k path diverged at {idx}: got {g}, expected {e}"
+            );
+        }
+    }
+
+    #[test]
+    fn symmetric_rank2k_lower_update_nonfinite_matches_two_gemm_bits() {
+        let (n, k) = (9usize, 4usize);
+        let mut v: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 17) as f64 - 8.0) * 0.031)
+            .collect();
+        let mut w: Vec<f64> = (0..n * k)
+            .map(|i| ((i % 19) as f64 - 9.0) * 0.027)
+            .collect();
+        v[3] = f64::NAN;
+        w[11] = f64::INFINITY;
+        let base: Vec<f64> = (0..n * n)
+            .map(|i| ((i % 13) as f64 - 6.0) * 0.007)
+            .collect();
+        let mut got = base.clone();
+        let mut expected = base;
+
+        super::symmetric_rank2k_lower_update_f64(n, k, &v, &w, &mut got).unwrap();
+        symmetric_rank2k_two_gemm_reference(n, k, &v, &w, &mut expected);
+
+        for (idx, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                e.to_bits(),
+                "non-finite fallback rank2k path diverged at {idx}: got {g:?}, expected {e:?}"
+            );
         }
     }
 
