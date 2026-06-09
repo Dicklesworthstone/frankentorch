@@ -10522,13 +10522,23 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
         // Precompute per-column scale = 2*(v^T H)[j]/|v|^2 from the UNMODIFIED H in
         // the same i-order as the scalar dot (bit-exact), then row-parallel update:
         // row (k+1+i) only needs scale[j] and v[i].
+        // Each column j's dot v^T H[(k+1):, j] is independent and reads the
+        // UNMODIFIED `h` (mutated only by the row update below), so this sweep —
+        // the serial O(n^2)-per-step companion to the already row-parallel update,
+        // i.e. the remaining Amdahl tail of the Hessenberg phase — parallelizes
+        // BIT-EXACTLY: each slot keeps the scalar path's i-order dot (l9xod).
         let mut left_scale = vec![0.0f64; n];
-        for (j, slot) in left_scale.iter_mut().enumerate() {
+        let col_scale = |(j, slot): (usize, &mut f64)| {
             let mut dot = 0.0;
             for i in 0..m_sub {
                 dot += v[i] * h[(k + 1 + i) * n + j];
             }
             *slot = 2.0 * dot / v_norm_sq;
+        };
+        if par {
+            left_scale.par_iter_mut().enumerate().for_each(col_scale);
+        } else {
+            left_scale.iter_mut().enumerate().for_each(col_scale);
         }
         {
             let rows = &mut h[(k + 1) * n..];
