@@ -1,0 +1,2 @@
+[RCH] local (no admissible workers: critical_pressure=1,insufficient_slots=1)
+[RCH] remote required; refusing local fallback (no worker assigned)
