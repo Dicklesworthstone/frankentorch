@@ -16,11 +16,11 @@ Pass12 private split on `vmi1227854` showed the staged residual is not QL:
 
 | Stage | Time |
 | --- | ---: |
-| `stage1_values` | 6785.09 us/iter |
-| `lower_pack` | 5.31 us/iter |
-| `packed_tred2` | 6527.02 us/iter |
-| `values_ql` | 270.85 us/iter |
-| `two_stage_total` | 9458.28 us/iter |
+| `stage1_values` | 3705.73 us/iter |
+| `lower_pack` | 5.25 us/iter |
+| `packed_tred2` | 6950.99 us/iter |
+| `values_ql` | 254.41 us/iter |
+| `two_stage_total` | 10594.52 us/iter |
 
 That made the packed TRED2 memory layout a profile-backed target.
 
@@ -54,9 +54,10 @@ the public path.
 
 ## Gates
 
-- `cargo check -j 1 -p ft-kernel-cpu`: passed on `vmi1227854`.
-- `cargo clippy -j 1 -p ft-kernel-cpu -- -D warnings`: passed on `vmi1227854`.
+- `cargo check -j 1 -p ft-kernel-cpu --all-targets`: passed on `vmi1227854`.
+- `cargo clippy -j 1 -p ft-kernel-cpu --all-targets -- -D warnings`: passed on `vmi1227854`.
 - `cargo fmt -p ft-kernel-cpu --check`: passed locally after RCH refused fmt as non-compilation.
+- `git diff --check`: passed.
 - `ubs crates/ft-kernel-cpu/src/lib.rs`: 0 critical issues; broad pre-existing warning inventory remains.
 
 ## Score
