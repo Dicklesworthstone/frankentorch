@@ -10530,16 +10530,10 @@ pub fn eigvalsh_two_stage_f64(a: &[f64], n: usize, b: usize) -> Result<Vec<f64>,
     }
     let bw = b.clamp(1, n.saturating_sub(1).max(1));
     // Values-only stage-1: BLAS-3 blocked panel reduction (no Q accumulation).
-    let band = symmetric_to_banded_values_f64(a, n, bw)?;
-    let mut lower = vec![0.0f64; n * (n + 1) / 2];
-    for i in 0..n {
-        let dst = lower_packed_index(i, 0);
-        let src = i * n;
-        lower[dst..=dst + i].copy_from_slice(&band[src..=src + i]);
-    }
+    let mut band = symmetric_to_banded_values_f64(a, n, bw)?;
     let mut d = vec![0.0f64; n];
     let mut e = vec![0.0f64; n];
-    eigh_tred2_values_only(n, &mut lower, &mut d, &mut e);
+    eigh_tred2_values_only_full_lower(n, &mut band, &mut d, &mut e);
     eigh_tql2_values_only(n, &mut d, &mut e);
     d.sort_by(f64::total_cmp);
     Ok(d)
@@ -10777,6 +10771,75 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
     e[0] = 0.0;
     for i in 0..n {
         d[i] = lower[lower_packed_index(i, i)];
+    }
+}
+
+/// Eigenvalues-only tridiagonalization over the lower triangle of a row-major
+/// full matrix. This mirrors `eigh_tred2_values_only` exactly, but the staged
+/// two-stage path already owns a full row-major band from stage 1; staying in
+/// that layout avoids the packed conversion and replaces triangular-index
+/// column walks with fixed-stride row-major loads.
+#[allow(clippy::needless_range_loop)]
+fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f64]) {
+    debug_assert!(lower.len() >= n * n);
+    for i in (1..n).rev() {
+        let l = i - 1;
+        let row_i_start = i * n;
+        let mut h = 0.0;
+        let mut scale = 0.0;
+        if l > 0 {
+            let (previous_rows, current_and_after) = lower.split_at_mut(row_i_start);
+            let row_i = &mut current_and_after[..n];
+            for &value in &row_i[..=l] {
+                scale += value.abs();
+            }
+            if scale == 0.0 {
+                e[i] = row_i[l];
+            } else {
+                for value in &mut row_i[..=l] {
+                    *value /= scale;
+                    h += *value * *value;
+                }
+                let mut f = row_i[l];
+                let g = if f >= 0.0 { -h.sqrt() } else { h.sqrt() };
+                e[i] = scale * g;
+                h -= f * g;
+                row_i[l] = f - g;
+                f = 0.0;
+                for j in 0..=l {
+                    let mut gg = 0.0;
+                    let row_j_start = j * n;
+                    let row_j = &previous_rows[row_j_start..=row_j_start + j];
+                    for k in 0..=j {
+                        gg += row_j[k] * row_i[k];
+                    }
+                    for k in (j + 1)..=l {
+                        gg += previous_rows[k * n + j] * row_i[k];
+                    }
+                    e[j] = gg / h;
+                    f += e[j] * row_i[j];
+                }
+                let hh = f / (h + h);
+                for j in 0..=l {
+                    f = row_i[j];
+                    let gg = e[j] - hh * f;
+                    e[j] = gg;
+                    let row_j_start = j * n;
+                    let row_j = &mut previous_rows[row_j_start..=row_j_start + j];
+                    for k in 0..=j {
+                        row_j[k] -= f * e[k] + gg * row_i[k];
+                    }
+                }
+            }
+        } else {
+            e[i] = lower[row_i_start + l];
+        }
+        d[i] = h;
+    }
+    d[0] = 0.0;
+    e[0] = 0.0;
+    for i in 0..n {
+        d[i] = lower[i * n + i];
     }
 }
 
@@ -18847,6 +18910,49 @@ mod tests {
                 assert!(
                     (lr - lb).abs() <= etol,
                     "n={n} b={b}: eigenvalue[{idx}] ref={lr} blocked={lb} (tol {etol})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn eigh_tred2_values_only_full_lower_matches_packed_bit_exact() {
+        for &n in &[3usize, 8, 16, 32, 48] {
+            let mut full = vec![0.0f64; n * n];
+            let mut packed = vec![0.0f64; n * (n + 1) / 2];
+            for row in 0..n {
+                let packed_start = super::lower_packed_index(row, 0);
+                for col in 0..=row {
+                    let value = ((row * 19 + col * 7 + 11) % 37) as f64 * 0.125 - 2.0
+                        + (row as f64) * 0.013
+                        - (col as f64) * 0.009;
+                    full[row * n + col] = value;
+                    packed[packed_start + col] = value;
+                }
+            }
+
+            let mut packed_d = vec![0.0f64; n];
+            let mut packed_e = vec![0.0f64; n];
+            super::eigh_tred2_values_only(n, &mut packed, &mut packed_d, &mut packed_e);
+
+            let mut full_d = vec![0.0f64; n];
+            let mut full_e = vec![0.0f64; n];
+            super::eigh_tred2_values_only_full_lower(n, &mut full, &mut full_d, &mut full_e);
+
+            let bits = |values: &[f64]| {
+                values
+                    .iter()
+                    .map(|value| value.to_bits())
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(bits(&full_d), bits(&packed_d), "n={n}: d drifted");
+            assert_eq!(bits(&full_e), bits(&packed_e), "n={n}: e drifted");
+            for row in 0..n {
+                let packed_start = super::lower_packed_index(row, 0);
+                assert_eq!(
+                    bits(&full[row * n..=row * n + row]),
+                    bits(&packed[packed_start..=packed_start + row]),
+                    "n={n}: lower row {row} drifted"
                 );
             }
         }

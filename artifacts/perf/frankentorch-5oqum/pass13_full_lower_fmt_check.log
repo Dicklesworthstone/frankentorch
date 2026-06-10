@@ -1,0 +1,1 @@
+cargo fmt -p ft-kernel-cpu --check exit=0
