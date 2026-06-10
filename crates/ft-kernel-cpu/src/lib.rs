@@ -11586,6 +11586,16 @@ pub fn eig_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EigResult, 
 /// skipped: the eigenvalues are read from the quasi-triangular `h`, which does
 /// NOT depend on `q_acc`, so they are bit-for-bit identical either way. The
 /// `eigvals` path uses `want_vectors = false`.
+/// One deferred Schur-vector (q_acc) operation from the Francis QR run: a 3-column
+/// bulge reflector or a 2-column 2x2-standardization Givens. Both are pure sinks
+/// (the bulge chase reads/writes only `h`), so the COMPLETE ordered stream is
+/// collected and replayed onto q_acc in one row-parallel pass. frankentorch-9y5bi.
+#[derive(Clone, Copy)]
+enum EigQaccOp {
+    Bulge(usize, f64, f64, f64, f64, f64, bool),
+    Givens(usize, f64, f64),
+}
+
 fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
@@ -11765,13 +11775,12 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
         // par_chunks_mut — dropping the rayon dispatch count from O(n^2) to O(n).
         // Bit-exact vs the serial per-k update: each row replays the identical
         // rotation sequence in k-order, and rows never interact (l9xod).
-        let mut sweep_rot: Vec<(usize, f64, f64, f64, f64, f64, bool)> = Vec::new();
-        // The deferred record-replay q_acc update (parallel over rows, one dispatch
-        // per sweep) wins only for large n where the O(n^3) Schur-vector work
-        // dominates: measured ~2x at n=512 (eig 1.50s -> 0.76s). At n<=256 the
-        // inline per-k serial update is FASTER (the replay structure regressed it
-        // ~1.5x), so it is used below this size — zero regression by construction.
-        let use_qacc_replay = n >= 512;
+        // WHOLE-stream deferral: collect EVERY q_acc operation (bulge reflectors +
+        // 2x2-standardization Givens) across the entire Francis QR, then replay onto
+        // q_acc in ONE row-parallel pass below. One rayon dispatch instead of
+        // O(sweeps), so it wins even at n=256 where the old per-sweep replay
+        // regressed (hence was gated to n>=512). frankentorch-9y5bi.
+        let mut sweep_rot: Vec<EigQaccOp> = Vec::new();
         let mut total_iter = 0usize;
         let max_total = 60 * n + 100;
 
@@ -11841,11 +11850,9 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
                                     h[i * n + na] = cq * z1 + cp * h[i * n + en_u];
                                     h[i * n + en_u] = cq * h[i * n + en_u] - cp * z1;
                                 }
-                                for i in 0..n {
-                                    let z1 = q_acc[i * n + na];
-                                    q_acc[i * n + na] = cq * z1 + cp * q_acc[i * n + en_u];
-                                    q_acc[i * n + en_u] = cq * q_acc[i * n + en_u] - cp * z1;
-                                }
+                                // Defer the q_acc 2x2 Givens into the ordered stream
+                                // (columns na, en_u==na+1), replayed below in order.
+                                sweep_rot.push(EigQaccOp::Givens(na, cq, cp));
                             }
                         }
                     } else {
@@ -11982,42 +11989,34 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
                         h[i * n + k] -= p2;
                     }
                     if want_vectors {
-                        if use_qacc_replay {
-                            // Large n: defer this rotation; the whole sweep is
-                            // replayed onto q_acc in parallel after the bulge chase.
-                            sweep_rot.push((k, xr, yr, zr, q_s, r_s, notlast));
-                        } else {
-                            // Small n: inline per-k serial update (faster than the
-                            // deferred replay here; a per-k rayon dispatch was the
-                            // old ~10x pessimization, now avoided).
-                            for row in q_acc.chunks_mut(n) {
-                                let mut p2 = xr * row[k] + yr * row[k + 1];
-                                if notlast {
-                                    p2 += zr * row[k + 2];
-                                    row[k + 2] -= p2 * r_s;
-                                }
-                                row[k + 1] -= p2 * q_s;
-                                row[k] -= p2;
-                            }
-                        }
+                        // Defer EVERY rotation across the WHOLE Francis-QR run; the
+                        // q_acc Schur vectors are a pure sink (the bulge chase reads
+                        // /writes only `h`), so the complete ordered rotation stream
+                        // is replayed onto q_acc in ONE parallel pass after the chase.
+                        // Whole-stream (not per-sweep) deferral drops the rayon
+                        // dispatch count from O(sweeps) to 1, so it WINS even at the
+                        // n=256 sizes where the per-sweep variant regressed. Bit-exact
+                        // vs the inline per-k update (same rotations, same per-row
+                        // k-order). frankentorch-9y5bi (SVD whole-stream lesson).
+                        sweep_rot.push(EigQaccOp::Bulge(k, xr, yr, zr, q_s, r_s, notlast));
                     }
                     k += 1;
                 }
-                // Apply this sweep's recorded Givens rotations to the Schur
-                // vectors in ONE pass. Each row of q_acc is independent and
-                // replays the rotations in the same k-order as the serial per-k
-                // update, so the result is bit-identical; the single per-sweep
-                // dispatch (vs per-k) makes the parallelism a net win. Gated on
-                // actual work (rows x rotations) so small sweeps stay serial.
-                if use_qacc_replay && !sweep_rot.is_empty() {
-                    // Per-sweep work gate (only reached when n>=512, so parallelism
-                    // already pays): parallelize sweeps whose rows*rotations clears
-                    // the dispatch cost; the tiny tail sweeps replay serially.
-                    const EIG_QACC_PAR_WORK: u64 = 1 << 14;
-                    let work = (n as u64) * (sweep_rot.len() as u64);
-                    let rots: &[(usize, f64, f64, f64, f64, f64, bool)] = &sweep_rot;
-                    let apply = |row: &mut [f64]| {
-                        for &(kk, xr, yr, zr, q_s, r_s, notlast) in rots {
+                // (rotations accumulated into `sweep_rot`; replayed once below.)
+            }
+        }
+        // Replay the COMPLETE ordered rotation stream onto q_acc in ONE pass —
+        // each row independently applies every rotation in k-order, bit-identical
+        // to the inline per-k update but parallel over rows with a single rayon
+        // dispatch (vs O(sweeps)). frankentorch-9y5bi.
+        if want_vectors && !sweep_rot.is_empty() {
+            const EIG_QACC_PAR_WORK: u64 = 1 << 14;
+            let work = (n as u64) * (sweep_rot.len() as u64);
+            let rots: &[EigQaccOp] = &sweep_rot;
+            let apply = |row: &mut [f64]| {
+                for op in rots {
+                    match *op {
+                        EigQaccOp::Bulge(kk, xr, yr, zr, q_s, r_s, notlast) => {
                             let mut p2 = xr * row[kk] + yr * row[kk + 1];
                             if notlast {
                                 p2 += zr * row[kk + 2];
@@ -12026,14 +12025,18 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
                             row[kk + 1] -= p2 * q_s;
                             row[kk] -= p2;
                         }
-                    };
-                    if work >= EIG_QACC_PAR_WORK {
-                        q_acc.par_chunks_mut(n).for_each(apply);
-                    } else {
-                        q_acc.chunks_mut(n).for_each(apply);
+                        EigQaccOp::Givens(col, cq, cp) => {
+                            let z1 = row[col];
+                            row[col] = cq * z1 + cp * row[col + 1];
+                            row[col + 1] = cq * row[col + 1] - cp * z1;
+                        }
                     }
-                    sweep_rot.clear();
                 }
+            };
+            if work >= EIG_QACC_PAR_WORK {
+                q_acc.par_chunks_mut(n).for_each(apply);
+            } else {
+                q_acc.chunks_mut(n).for_each(apply);
             }
         }
     }
@@ -12215,14 +12218,30 @@ fn eig_backsub_eigenvectors(h: &mut [f64], z: &mut [f64], evals: &[f64], n: usiz
         }
     }
 
-    // Eigenvectors of the original matrix: z[:, j] = z[:, 0..=j] · h[0..=j, j].
-    for j in (0..n).rev() {
-        for i in 0..n {
-            let mut acc = 0.0;
-            for k in 0..=j {
-                acc += z[i * n + k] * h[k * n + j];
+    // Eigenvectors of the original matrix: Z := Z · U where U is the upper triangle
+    // of `h` (Z[:, j] = Z[:, 0..=j] · h[0..=j, j]). Large n routes this O(n^3/2)
+    // triangular matmul through the cache-blocked parallel gemm::dgemm (BLAS-3);
+    // small n keeps the byte-identical serial sweep. The GEMM reassociates the
+    // k-sum, so the eigenvectors match the serial path only to TOLERANCE (they are
+    // non-unique up to scale anyway). frankentorch-9y5bi.
+    if n >= 128 {
+        let mut u = vec![0.0f64; n * n];
+        for k in 0..n {
+            let row = k * n;
+            u[row + k..row + n].copy_from_slice(&h[row + k..row + n]);
+        }
+        let mut znew = vec![0.0f64; n * n];
+        gemm::dgemm(n, n, n, z, &u, &mut znew);
+        z.copy_from_slice(&znew);
+    } else {
+        for j in (0..n).rev() {
+            for i in 0..n {
+                let mut acc = 0.0;
+                for k in 0..=j {
+                    acc += z[i * n + k] * h[k * n + j];
+                }
+                z[i * n + j] = acc;
             }
-            z[i * n + j] = acc;
         }
     }
 }
@@ -23902,6 +23921,50 @@ mod tests {
         assert!((im1.abs() - 1.0).abs() < 1e-8, "imag part should be ±1");
         // Conjugate pair: im0 = -im1
         assert!((im0 + im1).abs() < 1e-8, "should be conjugate pair");
+    }
+
+    #[test]
+    fn eig_large_real_av_eq_lambda_v_blocked_paths() {
+        // n=160 > 128 exercises the BLOCKED Hessenberg, the whole-stream Schur-vector
+        // deferral, AND the GEMM z·h back-transform together. Diagonally dominant ->
+        // well-separated REAL eigenvalues (real eigenvectors), so for each returned
+        // eigenpair A·v = λ·v must hold to tolerance. frankentorch-9y5bi.
+        let n = 160usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = (((i * 41 + j * 13 + 5) % 17) as f64) * 0.01 - 0.08;
+            }
+            a[i * n + i] = (i as f64) + 1.0;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let r = super::eig_contiguous_f64(&a, &meta).expect("eig");
+        // For real eigenvalues (imag==0), the eigenvector column is real; check A·v=λv.
+        for col in [0usize, 1, 40, 80, 159] {
+            let lambda_re = r.eigenvalues[2 * col];
+            if r.eigenvalues[2 * col + 1].abs() > 1e-9 {
+                continue; // skip any complex pair
+            }
+            // v = column `col` of eigenvectors (row-major n×n, columns are vectors).
+            let mut vnorm = 0.0;
+            for i in 0..n {
+                vnorm += r.eigenvectors[i * n + col] * r.eigenvectors[i * n + col];
+            }
+            if vnorm < 1e-12 {
+                continue;
+            }
+            for &irow in &[0usize, 37, 159] {
+                let mut av = 0.0;
+                for k in 0..n {
+                    av += a[irow * n + k] * r.eigenvectors[k * n + col];
+                }
+                let lv = lambda_re * r.eigenvectors[irow * n + col];
+                assert!(
+                    (av - lv).abs() < 1e-6 * (vnorm.sqrt() + 1.0),
+                    "A·v != λ·v at col={col} row={irow}: {av} vs {lv}"
+                );
+            }
+        }
     }
 
     #[test]
