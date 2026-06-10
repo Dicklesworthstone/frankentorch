@@ -10505,10 +10505,10 @@ pub fn banded_to_tridiagonal_f64(band: &[f64], n: usize, b: usize) -> (Vec<f64>,
 }
 
 /// Eigenvalues of a real-symmetric matrix via the full two-stage path:
-/// stage-1 dense->banded ([`symmetric_to_banded_f64`]) at half-bandwidth `b`,
-/// stage-2 banded->tridiagonal bulge chase ([`banded_to_tridiagonal_f64`]),
-/// then the shared implicit-shift QL ([`eigh_tql2_values_only`]). Eigenvalues
-/// are returned sorted ascending.
+/// stage-1 dense->banded ([`symmetric_to_banded_values_f64`]) at half-bandwidth
+/// `b`, then a values-only packed Householder tridiagonalization and the shared
+/// implicit-shift QL ([`eigh_tql2_values_only`]). Eigenvalues are returned
+/// sorted ascending.
 ///
 /// This is the **end-to-end correctness vehicle** for the two-stage swing
 /// (frankentorch-5oqum): it must agree with the live [`eigvalsh_contiguous_f64`]
@@ -10530,7 +10530,15 @@ pub fn eigvalsh_two_stage_f64(a: &[f64], n: usize, b: usize) -> Result<Vec<f64>,
     let bw = b.clamp(1, n.saturating_sub(1).max(1));
     // Values-only stage-1: BLAS-3 blocked panel reduction (no Q accumulation).
     let band = symmetric_to_banded_values_f64(a, n, bw)?;
-    let (mut d, mut e) = banded_to_tridiagonal_f64(&band, n, bw);
+    let mut lower = vec![0.0f64; n * (n + 1) / 2];
+    for i in 0..n {
+        let dst = lower_packed_index(i, 0);
+        let src = i * n;
+        lower[dst..=dst + i].copy_from_slice(&band[src..=src + i]);
+    }
+    let mut d = vec![0.0f64; n];
+    let mut e = vec![0.0f64; n];
+    eigh_tred2_values_only(n, &mut lower, &mut d, &mut e);
     eigh_tql2_values_only(n, &mut d, &mut e);
     d.sort_by(f64::total_cmp);
     Ok(d)
