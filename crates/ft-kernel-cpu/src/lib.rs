@@ -10228,9 +10228,10 @@ pub fn symmetric_to_banded_values_f64(
         return Ok(symmetric_to_banded_f64(a, n, b)?.0);
     }
 
+    let panel_width = b.min(16);
     let mut s = 0usize;
     while s < ncols {
-        let w = b.min(ncols - s); // panel width (<= b)
+        let w = panel_width.min(ncols - s); // panel width (<= b)
         let r0 = s + b; // first row of the active region R = [r0, n)
         if r0 >= n {
             break;
