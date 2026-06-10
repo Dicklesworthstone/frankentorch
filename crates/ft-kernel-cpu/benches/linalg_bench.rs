@@ -6,13 +6,13 @@
 use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
-    banded_to_tridiagonal_f64, cholesky_contiguous_f64, cholesky_solve_contiguous_f64,
-    det_contiguous_f64, eig_contiguous_f64, eigh_contiguous_f64, eigvals_contiguous_f64,
-    eigvalsh_contiguous_f64, eigvalsh_two_stage_f64, inv_tensor_contiguous_f64,
-    lobpcg_contiguous_f64, lu_factor_contiguous_f64, lu_solve_contiguous_f64,
-    lu_solve_mixed_refine_contiguous_f64, matrix_exp_contiguous_f64, qr_contiguous_f64,
-    svd_contiguous_f64, svd_lowrank_contiguous_f64, svdvals_contiguous_f64,
-    symmetric_rank2k_lower_update_f64, symmetric_to_banded_f64,
+    banded_to_tridiagonal_f64, cholesky_contiguous_f32, cholesky_contiguous_f64,
+    cholesky_solve_contiguous_f64, det_contiguous_f64, eig_contiguous_f64, eigh_contiguous_f64,
+    eigvals_contiguous_f64, eigvalsh_contiguous_f64, eigvalsh_two_stage_f64,
+    inv_tensor_contiguous_f64, lobpcg_contiguous_f64, lu_factor_contiguous_f64,
+    lu_solve_contiguous_f64, lu_solve_mixed_refine_contiguous_f64, matrix_exp_contiguous_f32,
+    matrix_exp_contiguous_f64, qr_contiguous_f64, svd_contiguous_f64, svd_lowrank_contiguous_f64,
+    svdvals_contiguous_f64, symmetric_rank2k_lower_update_f64, symmetric_to_banded_f64,
 };
 
 fn symmetric_rank2k_lower_update_scalar(n: usize, k: usize, v: &[f64], w: &[f64], a: &mut [f64]) {
@@ -198,6 +198,13 @@ fn bench_matrix_exp(c: &mut Criterion) {
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
         c.bench_function(&format!("matrix_exp_f64_{n}x{n}"), |bch| {
             bch.iter(|| black_box(matrix_exp_contiguous_f64(black_box(&a), &meta).unwrap()))
+        });
+        // Native f32 path (frankentorch-b3o90): all square n^3 GEMMs, so f32 gets
+        // the full ~2-3x sgemm speedup vs the current f32->f64 upcast.
+        let a32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+        let meta32 = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+        c.bench_function(&format!("matrix_exp_f32_{n}x{n}"), |bch| {
+            bch.iter(|| black_box(matrix_exp_contiguous_f32(black_box(&a32), &meta32).unwrap()))
         });
     }
 }
@@ -388,6 +395,16 @@ fn bench_cholesky(c: &mut Criterion) {
         let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
         c.bench_function(&format!("cholesky_f64_{n}x{n}"), |bch| {
             bch.iter(|| black_box(cholesky_contiguous_f64(black_box(&a), &meta, false).unwrap()))
+        });
+        // Native f32 path (frankentorch-b3o90): same SPD matrix in f32. torch f32
+        // cholesky uses f32 LAPACK, so this is the parity-correct dtype and ~2x
+        // faster than the current f32->f64 upcast (which runs the f64 kernel).
+        let a32: Vec<f32> = a.iter().map(|&v| v as f32).collect();
+        let meta32 = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+        c.bench_function(&format!("cholesky_f32_{n}x{n}"), |bch| {
+            bch.iter(|| {
+                black_box(cholesky_contiguous_f32(black_box(&a32), &meta32, false).unwrap())
+            })
         });
     }
 }

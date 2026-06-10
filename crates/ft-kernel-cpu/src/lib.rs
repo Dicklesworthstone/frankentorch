@@ -9731,6 +9731,124 @@ pub fn cholesky_contiguous_f64(
     }
 }
 
+/// Native f32 blocked Cholesky — same right-looking LAPACK-`potrf` algorithm as
+/// [`cholesky_contiguous_f64`] but computed entirely in `f32` (trailing rank-NB
+/// update via `gemm::sgemm`). torch's f32 Cholesky uses f32 LAPACK (`spotrf`), so
+/// computing in f32 both HALVES the FLOPs/bandwidth (≈2x vs the f64-upcast path)
+/// AND matches torch's f32 precision instead of exceeding it. Returns the n×n
+/// lower (or upper, if `upper`) factor row-major. Validated by reconstruction
+/// (L·L^T ≈ A) at f32 tolerance, not bit-for-bit (the blocked GEMM reassociates,
+/// exactly like the f64 path). frankentorch-b3o90.
+pub fn cholesky_contiguous_f32(
+    data: &[f32],
+    meta: &TensorMeta,
+    upper: bool,
+) -> Result<Vec<f32>, KernelError> {
+    ensure_unary_layout_and_storage_f32(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let n = shape[0];
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let offset = meta.storage_offset();
+    const NB: usize = 64;
+    let mut l = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            l[i * n + j] = data[offset + i * n + j];
+        }
+    }
+
+    let mut jb = 0;
+    while jb < n {
+        let je = (jb + NB).min(n);
+        let nb = je - jb;
+
+        // 1. Factor the diagonal block l[jb:je, jb:je] (lower) in place.
+        for jj in jb..je {
+            let mut s = l[jj * n + jj];
+            for p in jb..jj {
+                s -= l[jj * n + p] * l[jj * n + p];
+            }
+            if s <= 0.0 {
+                return Err(KernelError::NotPositiveDefinite);
+            }
+            let d = s.sqrt();
+            l[jj * n + jj] = d;
+            for ii in (jj + 1)..je {
+                let mut t = l[ii * n + jj];
+                for p in jb..jj {
+                    t -= l[ii * n + p] * l[jj * n + p];
+                }
+                l[ii * n + jj] = t / d;
+            }
+        }
+
+        let m = n - je;
+        if m == 0 {
+            break;
+        }
+
+        // 2. TRSM: L21 = A21 · L11^{-T}, panel l[je:n, jb:je] in place.
+        let (head, tail) = l.split_at_mut(je * n);
+        let trsm_body = |row: &mut [f32]| {
+            for c in 0..nb {
+                let mut t = row[jb + c];
+                for p in 0..c {
+                    t -= row[jb + p] * head[(jb + c) * n + (jb + p)];
+                }
+                row[jb + c] = t / head[(jb + c) * n + (jb + c)];
+            }
+        };
+        if m >= 64 {
+            tail.par_chunks_mut(n).for_each(trsm_body);
+        } else {
+            tail.chunks_mut(n).for_each(trsm_body);
+        }
+
+        // 3. Trailing update A22 -= L21 · L21^T via the blocked/parallel f32 GEMM.
+        let mut l21 = vec![0.0f32; m * nb];
+        let mut l21t = vec![0.0f32; nb * m];
+        for i in 0..m {
+            for c in 0..nb {
+                let v = l[(je + i) * n + (jb + c)];
+                l21[i * nb + c] = v;
+                l21t[c * m + i] = v;
+            }
+        }
+        let mut prod = vec![0.0f32; m * m];
+        gemm::sgemm(m, nb, m, &l21, &l21t, &mut prod);
+        for i in 0..m {
+            let row_base = (je + i) * n + je;
+            let p_base = i * m;
+            for j in 0..=i {
+                l[row_base + j] -= prod[p_base + j];
+            }
+        }
+
+        jb = je;
+    }
+
+    if upper {
+        let mut u = vec![0.0f32; n * n];
+        for i in 0..n {
+            for j in i..n {
+                u[i * n + j] = l[j * n + i];
+            }
+        }
+        Ok(u)
+    } else {
+        Ok(l)
+    }
+}
+
 /// Solve A @ X = B given Cholesky factor L where A = L @ L^T.
 ///
 /// Performs two triangular solves: L @ Y = B, then L^T @ X = Y.
@@ -9980,6 +10098,80 @@ pub fn matrix_exp_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<
     // Square s times: result = result^(2^s)
     for _ in 0..s {
         gemm::dgemm(n, n, n, &result, &result, &mut temp);
+        result.copy_from_slice(&temp);
+    }
+
+    Ok(result)
+}
+
+/// Native f32 matrix exponential — same scaling-and-squaring Taylor scheme as
+/// [`matrix_exp_contiguous_f64`] but in `f32` (every matmul via `gemm::sgemm`).
+/// The cost is dominated by ~`13 + s` SQUARE `n×n×n` GEMMs, where f32 is ~2-3x
+/// faster than f64 (8-wide vs 4-wide SIMD + half the bytes), so this is ~2-3x
+/// vs the current f32->f64-upcast path AND matches torch's f32 dtype. The 13-term
+/// Taylor on `||A/2^s||_1 <= 0.5` stays accurate to ~f32 precision. Validated by
+/// the defining properties (exp(A)·exp(-A) = I) to f32 tolerance. b3o90.
+pub fn matrix_exp_contiguous_f32(data: &[f32], meta: &TensorMeta) -> Result<Vec<f32>, KernelError> {
+    ensure_unary_layout_and_storage_f32(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let n = shape[0];
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+
+    let offset = meta.storage_offset();
+    let mut a = vec![0.0f32; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            a[i * n + j] = data[offset + i * n + j];
+        }
+    }
+
+    let mut norm = 0.0f32;
+    for j in 0..n {
+        let mut col_sum = 0.0f32;
+        for i in 0..n {
+            col_sum += a[i * n + j].abs();
+        }
+        norm = norm.max(col_sum);
+    }
+
+    let s = if norm > 0.5 {
+        (norm / 0.5).log2().ceil() as u32
+    } else {
+        0
+    };
+
+    let scale = 0.5f32.powi(s as i32);
+    for v in &mut a {
+        *v *= scale;
+    }
+
+    let mut identity = vec![0.0f32; n * n];
+    for i in 0..n {
+        identity[i * n + i] = 1.0;
+    }
+
+    let num_terms = 13;
+    let mut result = identity.clone();
+    let mut temp = vec![0.0f32; n * n];
+
+    for k in (1..num_terms).rev() {
+        gemm::sgemm(n, n, n, &result, &a, &mut temp);
+        let inv_k = 1.0f32 / k as f32;
+        for i in 0..n * n {
+            result[i] = temp[i] * inv_k + identity[i];
+        }
+    }
+
+    for _ in 0..s {
+        gemm::sgemm(n, n, n, &result, &result, &mut temp);
         result.copy_from_slice(&temp);
     }
 
@@ -22409,6 +22601,52 @@ mod tests {
     }
 
     #[test]
+    fn matrix_exp_f32_defining_properties() {
+        // Native f32 matrix_exp (b3o90): same proof obligations as the f64 path
+        // at f32 tolerance. (1) diagonal, (2) nilpotent exact, (3) expm(A)expm(-A)=I.
+        let meta3 = TensorMeta::from_shape(vec![3, 3], DType::F32, Device::Cpu);
+        let diag = vec![1.0f32, 0.0, 0.0, 0.0, -1.0, 0.0, 0.0, 0.0, 2.0];
+        let e = super::matrix_exp_contiguous_f32(&diag, &meta3).unwrap();
+        let want = vec![
+            1.0f32.exp(),
+            0.0,
+            0.0,
+            0.0,
+            (-1.0f32).exp(),
+            0.0,
+            0.0,
+            0.0,
+            2.0f32.exp(),
+        ];
+        for (g, w) in e.iter().zip(&want) {
+            assert!((g - w).abs() < 1e-4, "expm(diag): {g} vs {w}");
+        }
+
+        let meta2 = TensorMeta::from_shape(vec![2, 2], DType::F32, Device::Cpu);
+        let nil = vec![0.0f32, 1.0, 0.0, 0.0];
+        let en = super::matrix_exp_contiguous_f32(&nil, &meta2).unwrap();
+        for (g, w) in en.iter().zip(&[1.0f32, 1.0, 0.0, 1.0]) {
+            assert!((g - w).abs() < 1e-5, "expm(nilpotent): {g} vs {w}");
+        }
+
+        let n = 3;
+        let a = vec![1.0f32, 2.0, 0.0, 0.0, 1.0, 3.0, 1.0, 0.0, 1.0];
+        let neg: Vec<f32> = a.iter().map(|x| -x).collect();
+        let ea = super::matrix_exp_contiguous_f32(&a, &meta3).unwrap();
+        let ena = super::matrix_exp_contiguous_f32(&neg, &meta3).unwrap();
+        for i in 0..n {
+            for j in 0..n {
+                let mut s = 0.0f32;
+                for k in 0..n {
+                    s += ea[i * n + k] * ena[k * n + j];
+                }
+                let want = if i == j { 1.0 } else { 0.0 };
+                assert!((s - want).abs() < 1e-3, "expm(A)expm(-A)[{i},{j}]={s}");
+            }
+        }
+    }
+
+    #[test]
     fn lu_solve_simple_system() {
         // Solve A * x = b where A = [[2, 1], [5, 3]], b = [4, 7]
         // Expected: x = [5, -6]
@@ -23832,6 +24070,49 @@ mod tests {
             assert!(
                 (dot - a[i * n + j]).abs() < 1e-7,
                 "(L·L^T)[{i},{j}]={dot} expected {}",
+                a[i * n + j]
+            );
+        }
+    }
+
+    #[test]
+    fn cholesky_f32_blocked_reconstructs_and_lower_triangular() {
+        // Native f32 blocked Cholesky (frankentorch-b3o90): n=384 > NB exercises
+        // the panel/TRSM/SYRK path. Proof obligations: lower-triangular and
+        // L·L^T ≈ A at f32 tolerance (the f32 SYRK reassociates, like the f64).
+        let n = 384usize;
+        let mut a = vec![0.0f32; n * n];
+        for i in 0..n {
+            for j in 0..i {
+                let v = (((i * 131 + j * 17) % 19) as f32 - 9.0) * 0.01;
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+            a[i * n + i] = n as f32;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+        let l = super::cholesky_contiguous_f32(&a, &meta, false).expect("cholesky f32");
+        assert_eq!(l.len(), n * n);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                assert_eq!(
+                    l[i * n + j],
+                    0.0,
+                    "factor not lower-triangular at ({i},{j})"
+                );
+            }
+        }
+        // Reconstruction on a sample. f32 SPD with diagonal n gives entries ~O(n);
+        // tolerance scales with sqrt(n)*eps_f32*magnitude.
+        for &(i, j) in &[(0usize, 0usize), (5, 2), (300, 299), (383, 0), (200, 200)] {
+            let mut dot = 0.0f32;
+            for k in 0..=j.min(i) {
+                dot += l[i * n + k] * l[j * n + k];
+            }
+            let tol = 1e-3 * (a[i * n + j].abs() + 1.0);
+            assert!(
+                (dot - a[i * n + j]).abs() < tol,
+                "(L·L^T)[{i},{j}]={dot} expected {} (tol {tol})",
                 a[i * n + j]
             );
         }
