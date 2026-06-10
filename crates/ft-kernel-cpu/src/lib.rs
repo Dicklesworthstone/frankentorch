@@ -13826,13 +13826,17 @@ pub struct QrResult {
 /// Q. frankentorch-ct2yy.
 fn qr_householder_panel_blocked(
     r_mat: &mut [f64],
-    q_mat: &mut [f64],
     m: usize,
     n: usize,
     k: usize,
-) {
+    qcols: usize,
+) -> Vec<f64> {
     const NB: usize = 32;
     let tiny = f64::EPSILON * 1e6;
+    // Forward pass reduces R and stores each panel's (V, T); Q is then built
+    // (m×qcols) by a reverse dorgqr — so REDUCED tall matrices (qcols=k<m) cost
+    // O(m·k²) instead of building the full m×m Q (O(m²·k)). frankentorch-ct2yy.
+    let mut panels: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
     let mut p = 0;
     while p < k {
         let pe = (p + NB).min(k);
@@ -13954,19 +13958,36 @@ fn qr_householder_panel_blocked(
             }
         }
 
-        // --- Accumulate Q := Q · (I - V T Vᵀ) = Q - ((Q V) T) Vᵀ.
-        let mut qv = vec![0.0f64; m * nb];
-        gemm::dgemm(m, m, nb, q_mat, &vmat, &mut qv); // Q V
-        let mut qvt = vec![0.0f64; m * nb];
-        gemm::dgemm(m, nb, nb, &qv, &tmat, &mut qvt); // (Q V) T
-        let mut qupd = vec![0.0f64; m * m];
-        gemm::dgemm_bt(m, nb, m, &qvt, &vmat, &mut qupd); // ((Q V) T) Vᵀ
-        for x in 0..m * m {
-            q_mat[x] -= qupd[x];
-        }
-
+        panels.push((nb, vmat, tmat));
         p = pe;
     }
+
+    // --- Reverse dorgqr: Q (m×qcols) = H_0 H_1 ... H_{k-1} · I[:, :qcols].
+    // Start X = I[:, :qcols]; apply blocks innermost-first (reverse panel order),
+    // each Q_block · X = X - V (T (Vᵀ X)).
+    let mut x = vec![0.0f64; m * qcols];
+    for i in 0..m.min(qcols) {
+        x[i * qcols + i] = 1.0;
+    }
+    for (nb, vmat, tmat) in panels.iter().rev() {
+        let nb = *nb;
+        let mut vt = vec![0.0f64; nb * m];
+        for row in 0..m {
+            for c in 0..nb {
+                vt[c * m + row] = vmat[row * nb + c];
+            }
+        }
+        let mut w1 = vec![0.0f64; nb * qcols];
+        gemm::dgemm(nb, m, qcols, &vt, &x, &mut w1); // Vᵀ X
+        let mut w2 = vec![0.0f64; nb * qcols];
+        gemm::dgemm(nb, nb, qcols, tmat, &w1, &mut w2); // T (Vᵀ X)
+        let mut upd = vec![0.0f64; m * qcols];
+        gemm::dgemm(m, nb, qcols, vmat, &w2, &mut upd); // V (...)
+        for t in 0..m * qcols {
+            x[t] -= upd[t];
+        }
+    }
+    x
 }
 
 pub fn qr_contiguous_f64(
@@ -14001,43 +14022,35 @@ pub fn qr_contiguous_f64(
     // Copy A into working matrix R (m x n, row-major)
     let mut r_mat = data[offset..offset + m * n].to_vec();
 
-    // Build Q as product of Householder reflections, starting as identity (m x m)
-    let mut q_mat = vec![0.0; m * m];
-    for i in 0..m {
-        q_mat[i * m + i] = 1.0;
-    }
-
     // Blocked compact-WY path (BLAS-3) for sizes where the GEMM trailing update
     // beats the per-reflector BLAS-2 sweep; small matrices stay on the scalar
-    // sweep (no panel/GEMM overhead). frankentorch-ct2yy.
+    // sweep (no panel/GEMM overhead). The reverse dorgqr builds Q directly at the
+    // output width (m×k for reduced, m×m for full), so reduced tall QR skips the
+    // full m×m Q. frankentorch-ct2yy.
     if m >= 128 && k >= 16 {
-        qr_householder_panel_blocked(&mut r_mat, &mut q_mat, m, n, k);
+        let qcols = if reduced { k } else { m };
+        let q = qr_householder_panel_blocked(&mut r_mat, m, n, k, qcols);
         for i in 0..m {
             for jj in 0..i.min(n) {
                 r_mat[i * n + jj] = 0.0;
             }
         }
         if reduced {
-            let mut q_reduced = vec![0.0; m * k];
-            for i in 0..m {
-                for j in 0..k {
-                    q_reduced[i * k + j] = q_mat[i * m + j];
-                }
-            }
             let r_reduced = r_mat[..k * n].to_vec();
             return Ok(QrResult {
-                q: q_reduced,
+                q,
                 r: r_reduced,
                 m: k,
                 n,
             });
         }
-        return Ok(QrResult {
-            q: q_mat,
-            r: r_mat,
-            m,
-            n,
-        });
+        return Ok(QrResult { q, r: r_mat, m, n });
+    }
+
+    // Build Q as product of Householder reflections, starting as identity (m x m)
+    let mut q_mat = vec![0.0; m * m];
+    for i in 0..m {
+        q_mat[i * m + i] = 1.0;
     }
 
     for j in 0..k {

@@ -127,6 +127,24 @@ fn bench_qr(c: &mut Criterion) {
             bch.iter(|| black_box(qr_contiguous_f64(black_box(&a), &meta, true).unwrap()))
         });
     }
+    // Tall reduced QR (m >> n) — QR's dominant use case (least squares). The
+    // reverse-dorgqr blocked path builds Q at m×k instead of the full m×m, so the
+    // Q accumulation is O(m·k²) not O(m²·k). frankentorch-ct2yy.
+    for &(m, ncol) in &[(2048usize, 128usize), (4096usize, 128usize)] {
+        let mut a = vec![0.0f64; m * ncol];
+        for i in 0..m {
+            for j in 0..ncol {
+                a[i * ncol + j] = (((i * 53 + j * 31) % 97) as f64 - 48.0) * 0.1;
+            }
+        }
+        for j in 0..ncol {
+            a[j * ncol + j] += m as f64;
+        }
+        let meta = TensorMeta::from_shape(vec![m, ncol], DType::F64, Device::Cpu);
+        c.bench_function(&format!("qr_f64_tall_{m}x{ncol}"), |bch| {
+            bch.iter(|| black_box(qr_contiguous_f64(black_box(&a), &meta, true).unwrap()))
+        });
+    }
 }
 
 fn bench_inv(c: &mut Criterion) {
