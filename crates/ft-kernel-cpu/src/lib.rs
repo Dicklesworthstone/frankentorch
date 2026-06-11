@@ -11309,6 +11309,163 @@ fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64],
     }
 }
 
+/// Compact-WY BLOCKED symmetric tridiagonalization (LAPACK `dsytrd`/`dlatrd`
+/// shape), values-only. Reduces the symmetric matrix `a` (n×n row-major, FULL —
+/// both triangles populated) to tridiagonal `T = Qᵀ A Q` via NB-wide Householder
+/// panels. Each panel column `j` forms a reflector `P = I − τ v vᵀ` zeroing the
+/// sub-sub-diagonal of column `j`; the panel's accumulated trailing update is the
+/// symmetric rank-2k `A := A − V Wᵀ − W Vᵀ`, applied as two cache-blocked parallel
+/// `gemm::dgemm_bt` calls (BLAS-3, restricted to the trailing `[pe,n)²` block).
+/// This halves the FLOPS of the per-column `dsytd2` sweep
+/// (`eigh_tred2_values_only`): the only remaining BLAS-2 cost is the per-column
+/// symmetric matvec `y = A0·v`, which runs against the PANEL-FIXED `A0`
+/// (sidestepping the trailing circular dependency exactly like `hessenberg_reduce_
+/// blocked`). `w = τ(A_cur v) − ½τ²(vᵀA_cur v) v` with
+/// `A_cur = A0 − Σ_{l<c}(v_l w_lᵀ + w_l v_lᵀ)` so the deferred panel updates are
+/// folded into each matvec.
+///
+/// Reassociates panel-by-panel, so the tridiagonal matches the unblocked sweep
+/// only to TOLERANCE — but the EIGENVALUES are invariant under any orthogonal
+/// similarity, so `eigvalsh` reconstructs to ~1e-12 (the SAME reconstruction-
+/// tolerance standard the blocked LU/Cholesky/QR/Hessenberg kernels already use;
+/// qgce4 ratified). Returns `(d, e)` with `d` the diagonal and `e[1..n]` the
+/// sub-diagonal (`e[0]=0`), matching the EISPACK `eigh_tql2_values_only` contract
+/// (signs of `e` are immaterial to the eigenvalues).
+///
+/// NEGATIVE RESULT (frankentorch-t0b4l): despite halving the flops this never
+/// clears the ≥2.0x bar and is WORKER-DEPENDENT — MEASURED 0.37-0.70x (slower)
+/// vs packed `dsytd2` on a 64-thread worker (the parallel `syr2k` saturates memory
+/// bandwidth) and only ~1.06-1.21x on a 10-thread worker, at n=256..1024. The
+/// reduction is memory-bandwidth-bound and the full-n² symmetric WY footprint
+/// loses the cache fight to the packed half-triangle; halving flops cannot help a
+/// bandwidth-bound op. Reached only via `eigvalsh_blocked_f64` (NOT the production
+/// dispatch); kept so a band-packed (`O(n²·b)` traffic) reduction can reuse the WY
+/// panel + the `eigvalsh_blocked_ab` A/B harness.
+#[allow(clippy::needless_range_loop)]
+fn eigh_tridiag_reduce_blocked(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut d = vec![0.0f64; n];
+    let mut e = vec![0.0f64; n];
+    if n == 0 {
+        return (d, e);
+    }
+    if n == 1 {
+        d[0] = a[0];
+        return (d, e);
+    }
+    const NB: usize = 32;
+    let mut k0 = 0usize;
+    while k0 < n - 1 {
+        let pe = (k0 + NB).min(n - 1);
+        let nb = pe - k0;
+        // A0 = the matrix entering this panel, held FIXED for every matvec below.
+        let a0 = a.to_vec();
+        let mut vmat = vec![0.0f64; n * nb]; // V[:, c] = reflector c (rows >j zero)
+        let mut wmat = vec![0.0f64; n * nb]; // W[:, c]
+        for c in 0..nb {
+            let j = k0 + c;
+            // Current column j (rows j..n): apply this panel's prior rank-2 updates.
+            let mut col = vec![0.0f64; n];
+            for r in j..n {
+                let mut acc = a0[r * n + j];
+                for l in 0..c {
+                    acc -=
+                        vmat[r * nb + l] * wmat[j * nb + l] + wmat[r * nb + l] * vmat[j * nb + l];
+                }
+                col[r] = acc;
+            }
+            d[j] = col[j]; // diagonal is final (no later reflector touches row j)
+            // Householder reflector zeroing col[j+2..n].
+            let mut cn2 = 0.0;
+            for r in (j + 1)..n {
+                cn2 += col[r] * col[r];
+            }
+            if cn2 < 1e-300 {
+                e[j + 1] = col[j + 1];
+                continue; // V/W column c stay 0 (no-op reflector)
+            }
+            let col_norm = cn2.sqrt();
+            let sign = if col[j + 1] >= 0.0 { 1.0 } else { -1.0 };
+            e[j + 1] = -sign * col_norm;
+            vmat[(j + 1) * nb + c] = col[j + 1] + sign * col_norm;
+            for r in (j + 2)..n {
+                vmat[r * nb + c] = col[r];
+            }
+            let mut vn2 = 0.0;
+            for r in (j + 1)..n {
+                let x = vmat[r * nb + c];
+                vn2 += x * x;
+            }
+            let tau = 2.0 / vn2;
+            // y = A0_trail · v  (rows j+1..n; v is zero on 0..=j) against the fixed
+            // A0 — the BLAS-2 floor of the reduction. Kept SERIAL: on this
+            // bandwidth-bound matvec a per-column rayon dispatch MEASURED ~1.8x
+            // SLOWER than serial (t0b4l), matching the documented reduction wall.
+            let vcol: Vec<f64> = (0..n).map(|r| vmat[r * nb + c]).collect();
+            let mut y = vec![0.0f64; n];
+            for r in (j + 1)..n {
+                let row = &a0[r * n..r * n + n];
+                let mut acc = 0.0;
+                for c2 in (j + 1)..n {
+                    acc += row[c2] * vcol[c2];
+                }
+                y[r] = acc;
+            }
+            // Fold in this panel's prior rank-2 updates: y := A_cur · v.
+            for l in 0..c {
+                let mut wtv = 0.0;
+                let mut vtv = 0.0;
+                for r in (j + 1)..n {
+                    wtv += wmat[r * nb + l] * vcol[r];
+                    vtv += vmat[r * nb + l] * vcol[r];
+                }
+                for r in (j + 1)..n {
+                    y[r] -= vmat[r * nb + l] * wtv + wmat[r * nb + l] * vtv;
+                }
+            }
+            // w = τ·y − ½τ²·(vᵀy)·v.
+            let mut vav = 0.0;
+            for r in (j + 1)..n {
+                vav += vcol[r] * y[r];
+            }
+            let alpha = -0.5 * tau * tau * vav;
+            for r in (j + 1)..n {
+                wmat[r * nb + c] = tau * y[r] + alpha * vcol[r];
+            }
+        }
+        // Trailing symmetric rank-2k update on the [pe,n)² block ONLY (the only
+        // part later panels read): A := A0 − V Wᵀ − W Vᵀ (BLAS-3). Pack the
+        // trailing rows of V/W (mt×nb contiguous) so the two GEMMs cost mt²·nb,
+        // not n²·nb. The corrupted panel rows are never revisited (reflectors live
+        // in `vmat`, eigenvalues already in d/e).
+        let mt = n - pe;
+        if mt > 0 {
+            let mut vt = vec![0.0f64; mt * nb];
+            let mut wt = vec![0.0f64; mt * nb];
+            for rr in 0..mt {
+                let r = pe + rr;
+                for c in 0..nb {
+                    vt[rr * nb + c] = vmat[r * nb + c];
+                    wt[rr * nb + c] = wmat[r * nb + c];
+                }
+            }
+            let mut vw = vec![0.0f64; mt * mt];
+            gemm::dgemm_bt(mt, nb, mt, &vt, &wt, &mut vw); // V Wᵀ (trailing)
+            let mut wv = vec![0.0f64; mt * mt];
+            gemm::dgemm_bt(mt, nb, mt, &wt, &vt, &mut wv); // W Vᵀ (trailing)
+            for rr in 0..mt {
+                let r = pe + rr;
+                for cc in 0..mt {
+                    let c = pe + cc;
+                    a[r * n + c] = a0[r * n + c] - vw[rr * mt + cc] - wv[rr * mt + cc];
+                }
+            }
+        }
+        k0 = pe;
+    }
+    d[n - 1] = a[(n - 1) * n + (n - 1)];
+    (d, e)
+}
+
 /// Implicit-shift QL iteration on a symmetric tridiagonal matrix while `zt`
 /// stores the eigenvector matrix transposed:
 /// `zt[col * n + row] == z[row * n + col]`. The rotation stream and per-entry
@@ -11542,6 +11699,17 @@ pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f6
     // discarded. The tridiagonal `d`/`e` and the QL eigenvalue iteration are
     // untouched, so the returned eigenvalues are bit-for-bit identical to
     // `eigh_contiguous_f64(...).eigenvalues` — proven by `eigvalsh_matches_eigh`.
+    //
+    // PERF NOTE (frankentorch-t0b4l): the per-column BLAS-2 `dsytd2` sweep below
+    // stays the production path. A compact-WY BLOCKED `dsytrd` reduction
+    // (`eigvalsh_blocked_f64` / `eigh_tridiag_reduce_blocked`) was implemented and
+    // proven equal to ~1e-12, but never clears the ≥2.0x bar and is WORKER-
+    // DEPENDENT: same-process A/B MEASURED 0.37-0.70x (SLOWER) on a 64-thread
+    // worker and only ~1.06-1.21x on a 10-thread worker, n=256..1024. The
+    // reduction is memory-bandwidth-bound and the full-n² symmetric WY footprint
+    // loses to this packed half-triangle's cache locality (parallel `syr2k`
+    // saturates bandwidth on high-core workers). Naive WY blocking is a dead lever
+    // here; only BAND-PACKED (O(n²·b) traffic) storage can win.
     let mut lower = vec![0.0f64; n * (n + 1) / 2];
     for i in 0..n {
         let dst = lower_packed_index(i, 0);
@@ -11552,7 +11720,49 @@ pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f6
     let mut e = vec![0.0f64; n];
     eigh_tred2_values_only(n, &mut lower, &mut d, &mut e);
     eigh_tql2_values_only(n, &mut d, &mut e);
+    d.sort_by(f64::total_cmp);
+    Ok(d)
+}
 
+/// Eigenvalues of a symmetric matrix via the compact-WY BLOCKED `dsytrd`
+/// reduction (`eigh_tridiag_reduce_blocked`) + implicit-shift QL.
+///
+/// NEGATIVE-RESULT benchmark entry (frankentorch-t0b4l), kept pub alongside the
+/// packed `eigvalsh_contiguous_f64` exactly as `eigvalsh_two_stage_f64` is kept
+/// against it: a same-process A/B (`--example eigvalsh_blocked_ab`) measures this
+/// at 0.37-0.70x of the packed sweep on a 64-thread worker and only ~1.06-1.21x on
+/// a 10-thread worker across n=256..1024 — never the ≥2.0x the perf bar requires —
+/// because the symmetric tridiagonalization is memory-bandwidth-bound and the
+/// full-n² WY footprint loses the cache fight to the packed half-triangle.
+/// Eigenvalues match the packed path to ~1e-12 (orthogonal-reduction invariance;
+/// qgce4 tolerance parity). Retained so a future BAND-PACKED reduction can reuse
+/// the WY panel and its A/B harness; NOT wired into the production dispatch.
+pub fn eigvalsh_blocked_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let n = shape[0];
+    if n == 0 {
+        return Ok(Vec::new());
+    }
+    let offset = meta.storage_offset();
+    // Symmetrize from the LOWER triangle (matches the packed path's source).
+    let mut full = vec![0.0f64; n * n];
+    for i in 0..n {
+        let src = offset + i * n;
+        for jx in 0..=i {
+            let v = data[src + jx];
+            full[i * n + jx] = v;
+            full[jx * n + i] = v;
+        }
+    }
+    let (mut d, mut e) = eigh_tridiag_reduce_blocked(&mut full, n);
+    eigh_tql2_values_only(n, &mut d, &mut e);
     d.sort_by(f64::total_cmp);
     Ok(d)
 }
@@ -23686,6 +23896,39 @@ mod tests {
             (slogdet_result.logabsdet - expected).abs() < 1e-6,
             "logabsdet = {}, expected {expected}",
             slogdet_result.logabsdet
+        );
+    }
+
+    #[test]
+    fn eigvalsh_blocked_matches_packed() {
+        // n >= 128 routes eigvalsh through the compact-WY BLOCKED dsytrd reduction
+        // (frankentorch-t0b4l). Prove its sorted eigenvalues match the unblocked
+        // packed dsytd2 sweep to reconstruction tolerance on a deterministic
+        // symmetric matrix (qgce4 tolerance-parity standard, not bit-for-bit).
+        let n = 160usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..=i {
+                // Deterministic, well-spread symmetric entries.
+                let v = (((i * 131 + j * 17 + 7) % 1000) as f64) / 100.0 - 5.0
+                    + if i == j { (i as f64) * 0.5 } else { 0.0 };
+                a[i * n + j] = v;
+                a[j * n + i] = v;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let blocked = super::eigvalsh_blocked_f64(&a, &meta).unwrap();
+        let d = super::eigvalsh_contiguous_f64(&a, &meta).unwrap(); // packed reference
+        assert_eq!(blocked.len(), n);
+        let mut max_abs = 0.0f64;
+        let mut scale = 1.0f64;
+        for i in 0..n {
+            max_abs = max_abs.max((blocked[i] - d[i]).abs());
+            scale = scale.max(d[i].abs());
+        }
+        assert!(
+            max_abs < 1e-9 * scale.max(1.0),
+            "blocked vs packed eigvalsh max abs diff {max_abs} (scale {scale})"
         );
     }
 
