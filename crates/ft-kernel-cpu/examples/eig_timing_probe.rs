@@ -12,7 +12,7 @@
 //! multishift-QR + AED rewrite of the Francis QR (qglh3 → npxbw).
 
 use ft_core::{DType, Device, TensorMeta};
-use ft_kernel_cpu::{eig_contiguous_f64, eigvals_contiguous_f64};
+use ft_kernel_cpu::{eig_contiguous_f64, eig_francis_profile_f64, eigvals_contiguous_f64};
 use std::time::Instant;
 fn build(n: usize) -> Vec<f64> {
     let mut a = vec![0.0f64; n * n];
@@ -56,9 +56,41 @@ fn main() {
             },
             it,
         );
+        let profile = eig_francis_profile_f64(&a, &m, false).unwrap().profile;
+        let first_shift = profile.shift_samples.first();
         println!(
             "n={n:<5} eigvals={ev:8.2}ms  eig={eg:8.2}ms  (vec_machinery={:.2}ms)",
             eg - ev
         );
+        if let Some(sample) = first_shift {
+            println!(
+                "profile n={n:<5} sweeps={} defl1={} defl2={} fallback={} exceptional={} max_width={} samples={} truncated={} first_shift=[{}..{} x={:.3e} y={:.3e} w={:.3e} exceptional={}]",
+                profile.total_sweeps,
+                profile.one_by_one_deflations,
+                profile.two_by_two_deflations,
+                profile.fallback_deflations,
+                profile.exceptional_shifts,
+                profile.max_active_window_width,
+                profile.shift_samples.len(),
+                profile.shift_samples_truncated,
+                sample.active_first,
+                sample.active_last,
+                sample.x,
+                sample.y,
+                sample.w,
+                sample.exceptional
+            );
+        } else {
+            println!(
+                "profile n={n:<5} sweeps={} defl1={} defl2={} fallback={} exceptional={} max_width={} samples=0 truncated={}",
+                profile.total_sweeps,
+                profile.one_by_one_deflations,
+                profile.two_by_two_deflations,
+                profile.fallback_deflations,
+                profile.exceptional_shifts,
+                profile.max_active_window_width,
+                profile.shift_samples_truncated
+            );
+        }
     }
 }

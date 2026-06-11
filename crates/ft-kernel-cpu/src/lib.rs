@@ -11492,8 +11492,8 @@ fn eigh_tred2_reduce_packed_full(
                         gg += row_j[k] * row_i[k];
                     }
                     let mut lower_col_offset = lower_packed_index(j + 1, j);
-                    for k in (j + 1)..=l {
-                        gg += previous_rows[lower_col_offset] * row_i[k];
+                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                        gg += previous_rows[lower_col_offset] * row_i_k;
                         lower_col_offset += k + 1;
                     }
                     e[j] = gg / h;
@@ -11611,8 +11611,8 @@ fn eigh_tred2_values_only(n: usize, lower: &mut [f64], d: &mut [f64], e: &mut [f
                         gg += row_j[k] * row_i[k];
                     }
                     let mut lower_col_offset = lower_packed_index(j + 1, j);
-                    for k in (j + 1)..=l {
-                        gg += previous_rows[lower_col_offset] * row_i[k];
+                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                        gg += previous_rows[lower_col_offset] * row_i_k;
                         lower_col_offset += k + 1;
                     }
                     e[j] = gg / h;
@@ -11681,8 +11681,8 @@ fn eigh_tred2_values_only_full_lower(n: usize, lower: &mut [f64], d: &mut [f64],
                     for k in 0..=j {
                         gg += row_j[k] * row_i[k];
                     }
-                    for k in (j + 1)..=l {
-                        gg += previous_rows[k * n + j] * row_i[k];
+                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                        gg += previous_rows[k * n + j] * row_i_k;
                     }
                     e[j] = gg / h;
                     f += e[j] * row_i[j];
@@ -12055,8 +12055,8 @@ fn eigh_tred2_reduce_packed_full_f32(
                         gg += row_j[k] * row_i[k];
                     }
                     let mut lower_col_offset = lower_packed_index(j + 1, j);
-                    for k in (j + 1)..=l {
-                        gg += previous_rows[lower_col_offset] * row_i[k];
+                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                        gg += previous_rows[lower_col_offset] * row_i_k;
                         lower_col_offset += k + 1;
                     }
                     e[j] = gg / h;
@@ -12423,8 +12423,8 @@ fn eigh_tred2_values_only_f32(n: usize, lower: &mut [f32], d: &mut [f32], e: &mu
                         gg += row_j[k] * row_i[k];
                     }
                     let mut lower_col_offset = lower_packed_index(j + 1, j);
-                    for k in (j + 1)..=l {
-                        gg += previous_rows[lower_col_offset] * row_i[k];
+                    for (k, &row_i_k) in row_i.iter().enumerate().take(l + 1).skip(j + 1) {
+                        gg += previous_rows[lower_col_offset] * row_i_k;
                         lower_col_offset += k + 1;
                     }
                     e[j] = gg / h;
@@ -12635,6 +12635,174 @@ enum EigQaccOp {
     Givens(usize, f64, f64),
 }
 
+const EIG_FRANCIS_SHIFT_SAMPLE_LIMIT: usize = 4096;
+
+/// One bounded diagnostic sample of the current Francis double-shift source.
+#[doc(hidden)]
+#[derive(Debug, Clone, Copy)]
+pub struct EigFrancisShiftSample {
+    /// Top of the active unreduced Hessenberg window.
+    pub active_first: usize,
+    /// Bottom of the active unreduced Hessenberg window.
+    pub active_last: usize,
+    /// Iteration counter inside the current active window before incrementing.
+    pub iteration_in_window: usize,
+    /// EISPACK-style accumulated shift `t` after any exceptional shift update.
+    pub accumulated_shift: f64,
+    /// First scalar in the current double-shift source.
+    pub x: f64,
+    /// Second scalar in the current double-shift source.
+    pub y: f64,
+    /// Product term in the current double-shift source.
+    pub w: f64,
+    /// Whether this sample came from the exceptional-shift fallback.
+    pub exceptional: bool,
+}
+
+trait FrancisTraceSink {
+    const ENABLED: bool;
+
+    fn reset(&mut self, _n: usize) {}
+    fn observe_active_window(&mut self, _active_first: usize, _active_last: usize) {}
+    fn record_one_by_one_deflation(&mut self) {}
+    fn record_two_by_two_deflation(&mut self) {}
+    fn record_fallback_non_convergence(&mut self, _max_total_exhausted: bool) {}
+    fn record_sweep(&mut self) {}
+    fn record_shift(&mut self, _sample: EigFrancisShiftSample) {}
+    fn record_selected_m(&mut self, _m: usize) {}
+}
+
+struct FrancisTraceDisabled;
+
+impl FrancisTraceSink for FrancisTraceDisabled {
+    const ENABLED: bool = false;
+}
+
+/// Hidden profile counters for the current scalar Francis QR implementation.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct EigFrancisProfile {
+    /// Matrix dimension.
+    pub n: usize,
+    /// Number of implicit double-shift sweeps attempted.
+    pub total_sweeps: usize,
+    /// Number of 1x1 real-root deflations.
+    pub one_by_one_deflations: usize,
+    /// Number of 2x2 real/complex-pair deflations.
+    pub two_by_two_deflations: usize,
+    /// Number of max-iteration fallback deflations.
+    pub fallback_deflations: usize,
+    /// Number of fallbacks caused by exhausting the global max iteration budget.
+    pub max_total_exhaustions: usize,
+    /// Number of exceptional shifts used to break stagnation.
+    pub exceptional_shifts: usize,
+    /// Widest active unreduced Hessenberg window observed.
+    pub max_active_window_width: usize,
+    /// Bounded prefix of active window observations.
+    pub active_windows: Vec<(usize, usize)>,
+    /// Bounded prefix of shift-source samples.
+    pub shift_samples: Vec<EigFrancisShiftSample>,
+    /// Bounded prefix of selected bulge-start rows.
+    pub selected_m: Vec<usize>,
+    /// True when any bounded profile vector omitted additional samples.
+    pub shift_samples_truncated: bool,
+    sample_limit: usize,
+}
+
+impl EigFrancisProfile {
+    fn new(n: usize) -> Self {
+        Self {
+            n,
+            total_sweeps: 0,
+            one_by_one_deflations: 0,
+            two_by_two_deflations: 0,
+            fallback_deflations: 0,
+            max_total_exhaustions: 0,
+            exceptional_shifts: 0,
+            max_active_window_width: 0,
+            active_windows: Vec::new(),
+            shift_samples: Vec::new(),
+            selected_m: Vec::new(),
+            shift_samples_truncated: false,
+            sample_limit: EIG_FRANCIS_SHIFT_SAMPLE_LIMIT,
+        }
+    }
+
+    /// Count scalar eigenvalue slots accounted for by all deflation modes.
+    pub fn deflated_eigenvalue_count(&self) -> usize {
+        self.one_by_one_deflations + 2 * self.two_by_two_deflations + self.fallback_deflations
+    }
+
+    fn push_bounded<T>(items: &mut Vec<T>, item: T, sample_limit: usize) -> bool {
+        if items.len() < sample_limit {
+            items.push(item);
+            false
+        } else {
+            true
+        }
+    }
+}
+
+impl FrancisTraceSink for EigFrancisProfile {
+    const ENABLED: bool = true;
+
+    fn reset(&mut self, n: usize) {
+        *self = Self::new(n);
+    }
+
+    fn observe_active_window(&mut self, active_first: usize, active_last: usize) {
+        let width = active_last + 1 - active_first;
+        self.max_active_window_width = self.max_active_window_width.max(width);
+        self.shift_samples_truncated |= Self::push_bounded(
+            &mut self.active_windows,
+            (active_first, active_last),
+            self.sample_limit,
+        );
+    }
+
+    fn record_one_by_one_deflation(&mut self) {
+        self.one_by_one_deflations += 1;
+    }
+
+    fn record_two_by_two_deflation(&mut self) {
+        self.two_by_two_deflations += 1;
+    }
+
+    fn record_fallback_non_convergence(&mut self, max_total_exhausted: bool) {
+        self.fallback_deflations += 1;
+        if max_total_exhausted {
+            self.max_total_exhaustions += 1;
+        }
+    }
+
+    fn record_sweep(&mut self) {
+        self.total_sweeps += 1;
+    }
+
+    fn record_shift(&mut self, sample: EigFrancisShiftSample) {
+        if sample.exceptional {
+            self.exceptional_shifts += 1;
+        }
+        self.shift_samples_truncated |=
+            Self::push_bounded(&mut self.shift_samples, sample, self.sample_limit);
+    }
+
+    fn record_selected_m(&mut self, m: usize) {
+        self.shift_samples_truncated |=
+            Self::push_bounded(&mut self.selected_m, m, self.sample_limit);
+    }
+}
+
+/// Hidden result bundle for the Francis QR diagnostic path.
+#[doc(hidden)]
+#[derive(Debug, Clone)]
+pub struct EigFrancisProfileResult {
+    /// Eig/eigvals result produced by the diagnostic path.
+    pub result: EigResult,
+    /// Profile counters and bounded shift-source samples.
+    pub profile: EigFrancisProfile,
+}
+
 fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
@@ -12812,6 +12980,20 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
 /// multishift + AED rewrite (frankentorch-fql10) can recursively factor a
 /// Hessenberg sub-window for aggressive early deflation. frankentorch-j4fgz.
 fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: bool) -> Vec<f64> {
+    let mut trace = FrancisTraceDisabled;
+    eig_francis_schur_traced(h, q_acc, n, want_vectors, &mut trace)
+}
+
+fn eig_francis_schur_traced<T: FrancisTraceSink>(
+    h: &mut [f64],
+    q_acc: &mut [f64],
+    n: usize,
+    want_vectors: bool,
+    trace: &mut T,
+) -> Vec<f64> {
+    if T::ENABLED {
+        trace.reset(n);
+    }
     let mut eigenvalues = vec![0.0f64; 2 * n];
     {
         // Frobenius-ish norm over the Hessenberg band for convergence tests.
@@ -12855,6 +13037,9 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
                     }
                     l -= 1;
                 }
+                if T::ENABLED {
+                    trace.observe_active_window(l, en_u);
+                }
 
                 let mut x = h[en_u * n + en_u];
                 if l == en_u {
@@ -12862,6 +13047,9 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
                     h[en_u * n + en_u] = x + t;
                     eigenvalues[2 * en_u] = x + t;
                     eigenvalues[2 * en_u + 1] = 0.0;
+                    if T::ENABLED {
+                        trace.record_one_by_one_deflation();
+                    }
                     en -= 1;
                     break;
                 }
@@ -12916,20 +13104,29 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
                         eigenvalues[2 * en_u] = xx + pp;
                         eigenvalues[2 * en_u + 1] = -zz;
                     }
+                    if T::ENABLED {
+                        trace.record_two_by_two_deflation();
+                    }
                     en -= 2;
                     break;
                 }
 
                 if its >= 30 || total_iter >= max_total {
                     // No convergence — record the diagonal estimate and deflate.
+                    let max_total_exhausted = total_iter >= max_total;
                     h[en_u * n + en_u] = x + t;
                     eigenvalues[2 * en_u] = x + t;
                     eigenvalues[2 * en_u + 1] = 0.0;
+                    if T::ENABLED {
+                        trace.record_fallback_non_convergence(max_total_exhausted);
+                    }
                     en -= 1;
                     break;
                 }
 
                 // Form the (double) shift.
+                let iteration_in_window = its;
+                let mut exceptional_shift = false;
                 if its == 10 || its == 20 {
                     // Exceptional shift to break stagnation.
                     t += x;
@@ -12940,9 +13137,23 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
                     x = 0.75 * s;
                     y = x;
                     w = -0.4375 * s * s;
+                    exceptional_shift = true;
                 }
                 its += 1;
                 total_iter += 1;
+                if T::ENABLED {
+                    trace.record_sweep();
+                    trace.record_shift(EigFrancisShiftSample {
+                        active_first: l,
+                        active_last: en_u,
+                        iteration_in_window,
+                        accumulated_shift: t,
+                        x,
+                        y,
+                        w,
+                        exceptional: exceptional_shift,
+                    });
+                }
 
                 // Find `m`: two consecutive small sub-diagonals (start of the bulge).
                 let mut m = en_u - 2;
@@ -12970,6 +13181,9 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
                         break;
                     }
                     m -= 1;
+                }
+                if T::ENABLED {
+                    trace.record_selected_m(m);
                 }
                 // Clear the sub-sub-diagonal spike left of the bulge.
                 for i in (m + 2)..=en_u {
@@ -13286,6 +13500,145 @@ fn eig_backsub_eigenvectors(h: &mut [f64], z: &mut [f64], evals: &[f64], n: usiz
             }
         }
     }
+}
+
+#[doc(hidden)]
+pub fn eig_francis_profile_f64(
+    data: &[f64],
+    meta: &TensorMeta,
+    want_vectors: bool,
+) -> Result<EigFrancisProfileResult, KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 || shape[0] != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![2],
+        });
+    }
+    let n = shape[0];
+
+    let offset = meta.storage_offset();
+    let mut h = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            h[i * n + j] = data[offset + i * n + j];
+        }
+    }
+
+    let mut q_acc = vec![0.0f64; n * n];
+    for i in 0..n {
+        q_acc[i * n + i] = 1.0;
+    }
+
+    if n >= 128 {
+        hessenberg_reduce_blocked(&mut h, &mut q_acc, n, want_vectors);
+    } else {
+        for k in 0..(n.saturating_sub(2)) {
+            let mut col_norm_sq = 0.0;
+            for i in (k + 1)..n {
+                col_norm_sq += h[i * n + k] * h[i * n + k];
+            }
+            if col_norm_sq < 1e-30 {
+                continue;
+            }
+            let col_norm = col_norm_sq.sqrt();
+            let sign = if h[(k + 1) * n + k] >= 0.0 { 1.0 } else { -1.0 };
+            let v0 = h[(k + 1) * n + k] + sign * col_norm;
+            let mut v = vec![0.0f64; n - k - 1];
+            v[0] = v0;
+            for i in 1..(n - k - 1) {
+                v[i] = h[(k + 2 + i - 1) * n + k];
+            }
+            let v_norm_sq: f64 = v.iter().map(|x| x * x).sum();
+            if v_norm_sq < 1e-30 {
+                continue;
+            }
+
+            let m_sub = n - k - 1;
+            let par = n >= 64;
+            let left_start = if want_vectors { 0 } else { k };
+            let mut left_scale = vec![0.0f64; n - left_start];
+            let col_scale = |(j_rel, slot): (usize, &mut f64)| {
+                let j = left_start + j_rel;
+                let mut dot = 0.0;
+                for i in 0..m_sub {
+                    dot += v[i] * h[(k + 1 + i) * n + j];
+                }
+                *slot = 2.0 * dot / v_norm_sq;
+            };
+            if par {
+                left_scale.par_iter_mut().enumerate().for_each(col_scale);
+            } else {
+                left_scale.iter_mut().enumerate().for_each(col_scale);
+            }
+            {
+                let rows = &mut h[(k + 1) * n..];
+                let upd = |(i, row): (usize, &mut [f64])| {
+                    let vi = v[i];
+                    for j in left_start..n {
+                        row[j] -= left_scale[j - left_start] * vi;
+                    }
+                };
+                if par {
+                    rows.par_chunks_mut(n).enumerate().for_each(upd);
+                } else {
+                    rows.chunks_mut(n).enumerate().for_each(upd);
+                }
+            }
+
+            {
+                let upd = |row: &mut [f64]| {
+                    let mut dot = 0.0;
+                    for j in 0..m_sub {
+                        dot += row[k + 1 + j] * v[j];
+                    }
+                    let scale = 2.0 * dot / v_norm_sq;
+                    for j in 0..m_sub {
+                        row[k + 1 + j] -= scale * v[j];
+                    }
+                };
+                if par {
+                    h.par_chunks_mut(n).for_each(upd);
+                } else {
+                    h.chunks_mut(n).for_each(upd);
+                }
+            }
+
+            if want_vectors {
+                let upd = |row: &mut [f64]| {
+                    let mut dot = 0.0;
+                    for j in 0..m_sub {
+                        dot += row[k + 1 + j] * v[j];
+                    }
+                    let scale = 2.0 * dot / v_norm_sq;
+                    for j in 0..m_sub {
+                        row[k + 1 + j] -= scale * v[j];
+                    }
+                };
+                if par {
+                    q_acc.par_chunks_mut(n).for_each(upd);
+                } else {
+                    q_acc.chunks_mut(n).for_each(upd);
+                }
+            }
+        }
+    }
+
+    let mut profile = EigFrancisProfile::new(n);
+    let eigenvalues = eig_francis_schur_traced(&mut h, &mut q_acc, n, want_vectors, &mut profile);
+    if want_vectors {
+        eig_backsub_eigenvectors(&mut h, &mut q_acc, &eigenvalues, n);
+    }
+
+    Ok(EigFrancisProfileResult {
+        result: EigResult {
+            eigenvalues,
+            eigenvectors: q_acc,
+            n,
+        },
+        profile,
+    })
 }
 
 /// Compute just the eigenvalues of a general matrix (as complex pairs).
@@ -25096,8 +25449,8 @@ mod tests {
         let meta = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
         let r = super::eigh_contiguous_f32(&a, &meta).expect("eigh_f32");
         let want = [2.64587f32, 3.99457, 5.43426, 9.9253];
-        for i in 0..n {
-            assert!((r.eigenvalues[i] - want[i]).abs() < 1e-3, "λ[{i}]");
+        for (i, &expected) in want.iter().enumerate() {
+            assert!((r.eigenvalues[i] - expected).abs() < 1e-3, "λ[{i}]");
         }
         // V·diag(λ)·Vᵀ == A  (V columns are eigenvectors: V[r*n+c]).
         for i in 0..n {
@@ -25976,6 +26329,78 @@ mod tests {
         let vals_only = super::eigvals_contiguous_f64(&a, &meta).unwrap();
         for (full_val, vals_val) in full.eigenvalues.iter().zip(&vals_only).take(4) {
             assert!((full_val - vals_val).abs() < 1e-12);
+        }
+    }
+
+    #[test]
+    fn eig_francis_profile_matches_eigvals_bit_exact() {
+        let n = 64usize;
+        let mut a = vec![0.0f64; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = ((i * 41 + j * 13 + 5) % 17) as f64 * 0.01 - 0.08;
+            }
+            a[i * n + i] = (i as f64) + 1.0;
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let production = super::eigvals_contiguous_f64(&a, &meta).unwrap();
+        let diagnostic = super::eig_francis_profile_f64(&a, &meta, false).unwrap();
+        assert_eq!(diagnostic.result.n, n);
+        assert_eq!(diagnostic.profile.n, n);
+        assert!(diagnostic.profile.total_sweeps > 0);
+        assert!(diagnostic.profile.max_active_window_width > 0);
+        assert!(!diagnostic.profile.active_windows.is_empty());
+        assert!(!diagnostic.profile.shift_samples.is_empty());
+        assert!(!diagnostic.profile.selected_m.is_empty());
+        assert!(!diagnostic.profile.shift_samples_truncated);
+        assert_eq!(diagnostic.profile.deflated_eigenvalue_count(), n);
+        assert!(diagnostic.profile.max_total_exhaustions <= diagnostic.profile.fallback_deflations);
+        assert_eq!(
+            diagnostic.profile.exceptional_shifts,
+            diagnostic
+                .profile
+                .shift_samples
+                .iter()
+                .filter(|packet| packet.exceptional)
+                .count()
+        );
+        assert_eq!(
+            diagnostic.profile.shift_samples.len(),
+            diagnostic.profile.selected_m.len(),
+            "each recorded shift packet must have the selected bulge start m"
+        );
+        assert!(
+            diagnostic
+                .profile
+                .shift_samples
+                .iter()
+                .all(|packet| packet.active_first <= packet.active_last
+                    && packet.active_last < n
+                    && packet.accumulated_shift.is_finite()
+                    && packet.x.is_finite()
+                    && packet.y.is_finite()
+                    && packet.w.is_finite())
+        );
+        assert!(
+            diagnostic
+                .profile
+                .shift_samples
+                .iter()
+                .filter(|packet| packet.exceptional)
+                .all(|packet| packet.iteration_in_window == 10 || packet.iteration_in_window == 20),
+            "exceptional shifts must preserve the existing its == 10 || its == 20 cadence"
+        );
+        assert_eq!(production.len(), diagnostic.result.eigenvalues.len());
+        for (i, (&prod, &profiled)) in production
+            .iter()
+            .zip(&diagnostic.result.eigenvalues)
+            .enumerate()
+        {
+            assert_eq!(
+                prod.to_bits(),
+                profiled.to_bits(),
+                "profiled eigvals mismatch at interleaved slot {i}: {prod} vs {profiled}"
+            );
         }
     }
 
