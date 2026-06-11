@@ -3710,16 +3710,47 @@ pub fn conv2d_forward_f64(
         return out;
     }
 
-    let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    // Streaming/fused im2col-GEMM: the full im2col panel (`flat·patch_width`) is the
+    // DOMINANT cost (~65% of the conv) because it writes the whole replicated panel
+    // to DRAM only for the GEMM to re-read it. Instead materialize the panel one
+    // ROW-TILE at a time into a small reused buffer that stays in cache, GEMM that
+    // tile, and never round-trip the panel through DRAM. Each tile is `TILE`
+    // consecutive output positions (mostly within one output row, so their input
+    // patches overlap and stay cache-hot). Per-tile FLOP = TILE·patch_width·out_ch
+    // sits below the GEMM parallel gate, so `dgemm_bt` runs serial inside each tile
+    // and the OUTER `par_chunks_mut` over tiles provides the parallelism. Each
+    // output element keeps the identical matrixmultiply micro-kernel K-order
+    // (independent of the M tiling), so the result is BIT-FOR-BIT identical to the
+    // full-panel path. frankentorch-conv2d-stream.
+    const TILE: usize = 192;
     let mut out_flat = vec![0.0f64; flat * out_ch];
-    gemm::dgemm_bt(
-        flat,
-        patch_width,
-        out_ch,
-        &panel,
-        weight_flat,
-        &mut out_flat,
-    );
+    out_flat
+        .par_chunks_mut(TILE * out_ch)
+        .enumerate()
+        .for_each(|(ti, oflat_tile)| {
+            let m0 = ti * TILE;
+            let rows = oflat_tile.len() / out_ch;
+            let mut ptile = vec![0.0f64; rows * patch_width];
+            for r in 0..rows {
+                let row = m0 + r;
+                let b = row / patch_count;
+                let pc = row % patch_count;
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let batch_off = b * in_ch * ph * pw;
+                let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                for c in 0..in_ch {
+                    let ch_off = batch_off + c * ph * pw;
+                    let pch = c * kh * kw;
+                    for kr in 0..kh {
+                        let irow = ch_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pch + kr * kw;
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
+                }
+            }
+            gemm::dgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
+        });
     let mut out = vec![0.0f64; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
@@ -3833,16 +3864,39 @@ pub fn conv2d_forward_f32(
         return out;
     }
 
-    let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    // Streaming/fused im2col-GEMM — see conv2d_forward_f64 for the rationale and the
+    // bit-exactness argument (per-element K-order is independent of the M tiling).
+    // Avoids writing the whole replicated panel to DRAM (~65% of the conv cost).
+    // frankentorch-conv2d-stream.
+    const TILE: usize = 192;
     let mut out_flat = vec![0.0f32; flat * out_ch];
-    gemm::sgemm_bt(
-        flat,
-        patch_width,
-        out_ch,
-        &panel,
-        weight_flat,
-        &mut out_flat,
-    );
+    out_flat
+        .par_chunks_mut(TILE * out_ch)
+        .enumerate()
+        .for_each(|(ti, oflat_tile)| {
+            let m0 = ti * TILE;
+            let rows = oflat_tile.len() / out_ch;
+            let mut ptile = vec![0.0f32; rows * patch_width];
+            for r in 0..rows {
+                let row = m0 + r;
+                let b = row / patch_count;
+                let pc = row % patch_count;
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let batch_off = b * in_ch * ph * pw;
+                let prow = &mut ptile[r * patch_width..(r + 1) * patch_width];
+                for c in 0..in_ch {
+                    let ch_off = batch_off + c * ph * pw;
+                    let pch = c * kh * kw;
+                    for kr in 0..kh {
+                        let irow = ch_off + (base_h + kr) * pw + base_w;
+                        let prow_off = pch + kr * kw;
+                        prow[prow_off..(kw + prow_off)].copy_from_slice(&padded[irow..(kw + irow)]);
+                    }
+                }
+            }
+            gemm::sgemm_bt(rows, patch_width, out_ch, &ptile, weight_flat, oflat_tile);
+        });
     let mut out = vec![0.0f32; batch * out_ch * patch_count];
     out.par_chunks_mut(patch_count)
         .enumerate()
