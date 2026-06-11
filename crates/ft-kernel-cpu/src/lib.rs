@@ -11960,13 +11960,29 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
         }
     }
 
-    // Step 2: Francis double-shift implicit QR on the upper-Hessenberg `h`
-    // (EISPACK `hqr2` lineage), accumulating the orthogonal transforms into
-    // `q_acc` (real-Schur vectors) when requested. The IMPLICIT DOUBLE SHIFT
-    // converges trailing 2x2 blocks with COMPLEX-conjugate eigenvalues in real
-    // arithmetic — the previous single-Wilkinson-shift Givens QR could not, so
-    // it returned WRONG eigenvalues for any complex spectrum (frankentorch-09zy).
-    // Eigenvalues are written directly as interleaved (re, im) pairs.
+    // Step 2: Francis double-shift implicit QR (extracted to `eig_francis_schur`
+    // so the multishift + AED rewrite can recursively Schur-factor sub-windows).
+    let eigenvalues = eig_francis_schur(&mut h, &mut q_acc, n, want_vectors);
+    if want_vectors {
+        eig_backsub_eigenvectors(&mut h, &mut q_acc, &eigenvalues, n);
+    }
+    Ok(EigResult {
+        eigenvalues,
+        eigenvectors: q_acc,
+        n,
+    })
+}
+
+/// Francis double-shift implicit QR (EISPACK `hqr2` lineage) on the upper-
+/// Hessenberg `h`, accumulating the orthogonal transforms into `q_acc` (real-
+/// Schur vectors) when `want_vectors`. The IMPLICIT DOUBLE SHIFT converges
+/// trailing 2x2 blocks with COMPLEX-conjugate eigenvalues in real arithmetic
+/// (a single-Wilkinson-shift Givens QR could not — frankentorch-09zy). Returns
+/// the eigenvalues as interleaved (re, im) pairs (length `2*n`). Extracted
+/// verbatim from `eig_impl` (BIT-EXACT, golden-anchored) so the small-bulge
+/// multishift + AED rewrite (frankentorch-fql10) can recursively factor a
+/// Hessenberg sub-window for aggressive early deflation. frankentorch-j4fgz.
+fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: bool) -> Vec<f64> {
     let mut eigenvalues = vec![0.0f64; 2 * n];
     {
         // Frobenius-ish norm over the Hessenberg band for convergence tests.
@@ -12250,20 +12266,7 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
             }
         }
     }
-
-    // Step 3: eigenvectors. Back-substitute the eigenvectors of the
-    // quasi-triangular real-Schur form `h` in place, then transform by the
-    // accumulated Schur vectors `q_acc` to get eigenvectors of the original
-    // matrix. Complex eigenvalues yield complex eigenvectors stored as
-    // consecutive (re, im) column pairs (the `EigResult.eigenvectors` convention).
-    if want_vectors {
-        eig_backsub_eigenvectors(&mut h, &mut q_acc, &eigenvalues, n);
-    }
-    Ok(EigResult {
-        eigenvalues,
-        eigenvectors: q_acc,
-        n,
-    })
+    eigenvalues
 }
 
 /// Complex division `(ar + ai·i) / (br + bi·i)` (EISPACK `cdiv`).
