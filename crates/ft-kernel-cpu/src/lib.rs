@@ -5014,6 +5014,35 @@ pub fn conv_transpose2d_backward_f64(
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
     // dinput[n,ic,iy,ix] = Σ_{oc,kr,kc} dout[n,oc,oy,ox]·weight[ic,oc,kr,kc],
     // oy = iy·sh + kr - ph, ox = ix·sw + kc - pw (in range).
+    // dinput's innermost `Σ_oc dout·weight` strides BOTH operands over out_ch
+    // (dout by oh·ow, weight by kh·kw) — a cache miss per oc step at large Cout.
+    // Transpose `dout` to channels-last `[N,oh,ow,Cout]` and `weight` to
+    // `[Cin,kh,kw,Cout]` ONCE so each `Σ_oc` reads two CONTIGUOUS Cout-vectors; the
+    // sum stays SEQUENTIAL over oc, so dinput is BIT-FOR-BIT identical (the
+    // channels-last forward analog, frankentorch-ctp-cl).
+    let mut dout_cl = vec![0.0f64; batch * oh * ow * out_ch];
+    dout_cl
+        .par_chunks_mut(oh * ow * out_ch)
+        .enumerate()
+        .for_each(|(n, dst)| {
+            for oc in 0..out_ch {
+                let src_base = (n * out_ch + oc) * oh * ow;
+                for s in 0..oh * ow {
+                    dst[s * out_ch + oc] = dout[src_base + s];
+                }
+            }
+        });
+    let mut weight_cl = vec![0.0f64; in_ch * kh * kw * out_ch];
+    for ic in 0..in_ch {
+        for oc in 0..out_ch {
+            for kr in 0..kh {
+                for kc in 0..kw {
+                    weight_cl[((ic * kh + kr) * kw + kc) * out_ch + oc] =
+                        weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
+                }
+            }
+        }
+    }
     let mut dinput = vec![0.0f64; batch * in_ch * ih * iw];
     dinput
         .par_chunks_mut(ih * iw)
@@ -5021,6 +5050,8 @@ pub fn conv_transpose2d_backward_f64(
         .for_each(|(idx, drow)| {
             let n = idx / in_ch;
             let ic = idx % in_ch;
+            let nbase = n * oh * ow * out_ch;
+            let wbase = ic * kh * kw * out_ch;
             for iy in 0..ih {
                 for ix in 0..iw {
                     let mut acc = 0.0f64;
@@ -5042,10 +5073,10 @@ pub fn conv_transpose2d_backward_f64(
                             if ox >= ow {
                                 continue;
                             }
+                            let dvec = &dout_cl[nbase + (oy * ow + ox) * out_ch..][..out_ch];
+                            let wvec = &weight_cl[wbase + (kr * kw + kc) * out_ch..][..out_ch];
                             for oc in 0..out_ch {
-                                let dv = dout[((n * out_ch + oc) * oh + oy) * ow + ox];
-                                let wv = weight[(((ic * out_ch + oc) * kh + kr) * kw) + kc];
-                                acc += dv * wv;
+                                acc += dvec[oc] * wvec[oc];
                             }
                         }
                     }
