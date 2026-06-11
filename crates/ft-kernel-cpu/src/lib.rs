@@ -12027,6 +12027,16 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
                     l -= 1;
                 }
 
+                if !want_vectors
+                    && its != 0
+                    && its.is_multiple_of(4)
+                    && let Some(next_en) =
+                        eig_try_aed_deflate_suffix(h, &mut eigenvalues, n, l, en_u, anorm)
+                {
+                    en = next_en;
+                    break;
+                }
+
                 let mut x = h[en_u * n + en_u];
                 if l == en_u {
                     // One real root.
@@ -12267,6 +12277,59 @@ fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: b
         }
     }
     eigenvalues
+}
+
+fn eig_try_aed_deflate_suffix(
+    h: &mut [f64],
+    eigenvalues: &mut [f64],
+    n: usize,
+    l: usize,
+    en_u: usize,
+    anorm: f64,
+) -> Option<isize> {
+    const AED_WIN: usize = 16;
+    if en_u + 1 < 4 * AED_WIN || en_u + 1 - l <= AED_WIN {
+        return None;
+    }
+    let kw = en_u + 1 - AED_WIN;
+    if kw <= l {
+        return None;
+    }
+    let beta = h[kw * n + (kw - 1)].abs();
+    let scale = anorm.max(h[(kw - 1) * n + (kw - 1)].abs() + h[kw * n + kw].abs());
+    if beta > scale * 1e-8 {
+        return None;
+    }
+
+    let mut win = vec![0.0f64; AED_WIN * AED_WIN];
+    for i in 0..AED_WIN {
+        for j in 0..AED_WIN {
+            win[i * AED_WIN + j] = h[(kw + i) * n + (kw + j)];
+        }
+    }
+    let mut z = vec![0.0f64; AED_WIN * AED_WIN];
+    for i in 0..AED_WIN {
+        z[i * AED_WIN + i] = 1.0;
+    }
+    let vals = eig_francis_schur(&mut win, &mut z, AED_WIN, true);
+
+    let mut max_spike = 0.0f64;
+    for &z0j in z.iter().take(AED_WIN) {
+        max_spike = max_spike.max(beta * z0j.abs());
+    }
+    if max_spike > scale * 1e-10 {
+        return None;
+    }
+
+    for i in 0..AED_WIN {
+        for j in 0..AED_WIN {
+            h[(kw + i) * n + (kw + j)] = win[i * AED_WIN + j];
+        }
+        eigenvalues[2 * (kw + i)] = vals[2 * i];
+        eigenvalues[2 * (kw + i) + 1] = vals[2 * i + 1];
+    }
+    h[kw * n + (kw - 1)] = 0.0;
+    Some(kw as isize - 1)
 }
 
 /// Complex division `(ar + ai·i) / (br + bi·i)` (EISPACK `cdiv`).
