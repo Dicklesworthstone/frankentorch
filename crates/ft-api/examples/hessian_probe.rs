@@ -10,10 +10,16 @@ use ft_core::ExecutionMode;
 fn main() {
     let x0 = vec![0.5f64, 1.0, 1.5, 2.0];
 
+    let unit = vec![0.1f64, 0.3, 0.5, 0.7];
+    let genv = vec![-1.0f64, 0.5, 1.0, 2.0];
+
     macro_rules! probe {
-        ($name:literal, $m:ident) => {{
+        ($name:literal, $m:ident) => {
+            probe!($name, $m, x0)
+        };
+        ($name:literal, $m:ident, $inp:expr) => {{
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = s.tensor_variable(x0.clone(), vec![4], true).unwrap();
+            let x = s.tensor_variable($inp.clone(), vec![4], true).unwrap();
             match s.$m(x) {
                 Ok(y) => match s.tensor_sum(y) {
                     Ok(out) => match s.tensor_functional_hessian(out, x) {
@@ -52,4 +58,24 @@ fn main() {
     probe!("tan", tensor_tan);
     probe!("elu", tensor_elu);
     probe!("mish", tensor_mish);
+    // --- extended batch (frankentorch double-backward vein) ---
+    probe!("log2", tensor_log2);
+    probe!("log10", tensor_log10);
+    probe!("exp2", tensor_exp2);
+    probe!("rsqrt", tensor_rsqrt);
+    probe!("acosh", tensor_acosh);
+    probe!("lgamma", tensor_lgamma);
+    probe!("digamma", tensor_digamma);
+    probe!("asin", tensor_asin, unit);
+    probe!("acos", tensor_acos, unit);
+    probe!("atanh", tensor_atanh, unit);
+    probe!("erfinv", tensor_erfinv, unit);
+    probe!("gelu_tanh", tensor_gelu_tanh, genv);
+    probe!("softsign", tensor_softsign, genv);
+    probe!("tanhshrink", tensor_tanhshrink, genv);
+    probe!("selu", tensor_selu, genv);
+    probe!("logsigmoid", tensor_logsigmoid, genv);
+    let neg = vec![-2.0f64, -1.0, -0.5, -0.1];
+    probe!("elu_neg", tensor_elu, neg);
+    probe!("selu_neg", tensor_selu, neg);
 }
