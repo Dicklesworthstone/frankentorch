@@ -31,9 +31,9 @@ One instrumentation lever only:
 
 ## Stage split
 
-The final probe ran through `rch exec` local fallback because RCH refused remote
-assignment (`critical_pressure=1`, `insufficient_slots=1`). Treat these numbers
-as routing evidence, not same-worker keep/reject proof.
+The initial probe ran through `rch exec` local fallback because RCH refused remote
+assignment (`critical_pressure=1`, `insufficient_slots=1`). It showed the same
+shape as the later remote split and is retained as routing evidence only.
 
 | Shape | Total | Copy/zero | Panel + T | Trailing R | Reverse Q | Unaccounted |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
@@ -42,16 +42,24 @@ as routing evidence, not same-worker keep/reject proof.
 
 Both rows were `blocked=true` and `matches_production=true`.
 
+Remote follow-up ran through RCH on `ovh-a`:
+
+| Shape | Total | Copy/zero | Panel + T | Trailing R | Reverse Q | Unaccounted |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| 512x512 | 51.643 ms | 1.781% | 45.911% | 18.597% | 33.470% | 0.241% |
+| 2048x128 | 29.917 ms | 0.960% | 68.787% | 11.349% | 19.356% | 0.000% |
+
+Both remote rows were `blocked=true` and `matches_production=true`.
+Remote log sha256:
+`1199847aa2129cf793337cbc0c54ff488485ec3506650f3a21a24ec77d62a290`.
+
 ## Pass 4 gate
 
-Local fallback evidence supports the pass-2 diagnosis: panel factorization plus
-T build is the dominant stage, especially on the tall row.
-
-Pass 4 is not fully authorized by the pass-2 trigger yet because pass 2 required
-same-worker remote split evidence before implementing recursive/block-recursive
-panel QR. The next action is to rerun `qr_stage_split` under remote RCH,
-preferably on `vmi1227854`; if panel plus T remains at or above 35% on either
-primary row, recursive/block-recursive panel QR clears the trigger.
+Remote evidence supports the pass-2 diagnosis: panel factorization plus T build
+is the dominant stage, especially on the tall row. Pass 4 is authorized to try
+exactly one recursive/block-recursive panel lever, with same-worker rebench on
+`ovh-a` or a clearly documented new same-worker pair if the fleet scheduler
+cannot return `ovh-a`.
 
 ## Gates
 
@@ -61,3 +69,4 @@ primary row, recursive/block-recursive panel QR clears the trigger.
 - `rch exec -v -- cargo test -p ft-kernel-cpu --lib qr_blocked_tall_reconstructs_and_orthonormal`: pass via local fallback.
 - `rch exec -v -- cargo clippy -p ft-kernel-cpu --lib --tests --benches --example qr_stage_split -- -D warnings`: pass via local fallback.
 - `ubs crates/ft-kernel-cpu/src/lib.rs crates/ft-kernel-cpu/examples/qr_stage_split.rs`: exit 0; no critical findings, broad existing warnings recorded.
+- `RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 rch exec -v -- cargo run -p ft-kernel-cpu --release --example qr_stage_split`: pass on remote worker `ovh-a`; profile helper matched production bit-for-bit for both rows.

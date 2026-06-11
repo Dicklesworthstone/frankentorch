@@ -1,0 +1,6 @@
+[RCH] local (no admissible workers: critical_pressure=1,insufficient_slots=1)
+threads=64
+qr_f64_512x512_reduced digest=0x6b1efd3f929359cc bit_equal=true
+qr_f64_512x512_reduced avg_total_ms=57.678 copy_zeroing=0.406ms/0.7% panel_t=25.819ms/44.8% trailing_r=11.091ms/19.2% reverse_q=20.351ms/35.3% unaccounted=0.011ms/0.0%
+qr_f64_2048x128_reduced digest=0xaea3b5647bb0dff4 bit_equal=true
+qr_f64_2048x128_reduced avg_total_ms=30.140 copy_zeroing=0.241ms/0.8% panel_t=21.023ms/69.8% trailing_r=3.252ms/10.8% reverse_q=5.622ms/18.7% unaccounted=0.003ms/0.0%

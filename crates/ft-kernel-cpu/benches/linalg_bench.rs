@@ -12,8 +12,9 @@ use ft_kernel_cpu::{
     eigvalsh_two_stage_f64, inv_tensor_contiguous_f64, lobpcg_contiguous_f64,
     lu_factor_contiguous_f64, lu_solve_contiguous_f32, lu_solve_contiguous_f64,
     lu_solve_mixed_refine_contiguous_f64, matrix_exp_contiguous_f32, matrix_exp_contiguous_f64,
-    qr_contiguous_f64, svd_contiguous_f64, svd_lowrank_contiguous_f64, svdvals_contiguous_f64,
-    symmetric_rank2k_lower_update_f64, symmetric_to_banded_f64,
+    qr_contiguous_f64, qr_contiguous_f64_stage_profile, svd_contiguous_f64,
+    svd_lowrank_contiguous_f64, svdvals_contiguous_f64, symmetric_rank2k_lower_update_f64,
+    symmetric_to_banded_f64,
 };
 
 fn symmetric_rank2k_lower_update_scalar(n: usize, k: usize, v: &[f64], w: &[f64], a: &mut [f64]) {
@@ -126,6 +127,13 @@ fn bench_qr(c: &mut Criterion) {
         c.bench_function(&format!("qr_f64_{n}x{n}"), |bch| {
             bch.iter(|| black_box(qr_contiguous_f64(black_box(&a), &meta, true).unwrap()))
         });
+        if n == 512 {
+            c.bench_function(&format!("qr_f64_{n}x{n}_stage_profile"), |bch| {
+                bch.iter(|| {
+                    black_box(qr_contiguous_f64_stage_profile(black_box(&a), &meta, true).unwrap())
+                })
+            });
+        }
     }
     // Tall reduced QR (m >> n) — QR's dominant use case (least squares). The
     // reverse-dorgqr blocked path builds Q at m×k instead of the full m×m, so the
@@ -144,6 +152,13 @@ fn bench_qr(c: &mut Criterion) {
         c.bench_function(&format!("qr_f64_tall_{m}x{ncol}"), |bch| {
             bch.iter(|| black_box(qr_contiguous_f64(black_box(&a), &meta, true).unwrap()))
         });
+        if m == 2048 && ncol == 128 {
+            c.bench_function(&format!("qr_f64_tall_{m}x{ncol}_stage_profile"), |bch| {
+                bch.iter(|| {
+                    black_box(qr_contiguous_f64_stage_profile(black_box(&a), &meta, true).unwrap())
+                })
+            });
+        }
     }
 }
 

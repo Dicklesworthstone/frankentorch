@@ -1,0 +1,27 @@
+[RCH] local (no admissible workers: critical_pressure=1,insufficient_slots=1)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 15.26s
+     Running benches/linalg_bench.rs (/data/tmp/cargo-target/release/deps/linalg_bench-aa9fc2ba4861f31f)
+Gnuplot not found, using plotters backend
+Benchmarking qr_f64_512x512_stage_profile
+Benchmarking qr_f64_512x512_stage_profile: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 5.3s, or reduce sample count to 90.
+Benchmarking qr_f64_512x512_stage_profile: Collecting 100 samples in estimated 5.3093 s (100 iterations)
+Benchmarking qr_f64_512x512_stage_profile: Analyzing
+qr_f64_512x512_stage_profile
+                        time:   [53.536 ms 54.180 ms 54.884 ms]
+Found 22 outliers among 100 measurements (22.00%)
+  4 (4.00%) high mild
+  18 (18.00%) high severe
+
+Benchmarking qr_f64_tall_2048x128_stage_profile
+Benchmarking qr_f64_tall_2048x128_stage_profile: Warming up for 3.0000 s
+Benchmarking qr_f64_tall_2048x128_stage_profile: Collecting 100 samples in estimated 5.4143 s (200 iterations)
+Benchmarking qr_f64_tall_2048x128_stage_profile: Analyzing
+qr_f64_tall_2048x128_stage_profile
+                        time:   [26.550 ms 26.903 ms 27.314 ms]
+Found 13 outliers among 100 measurements (13.00%)
+  1 (1.00%) high mild
+  12 (12.00%) high severe
+
