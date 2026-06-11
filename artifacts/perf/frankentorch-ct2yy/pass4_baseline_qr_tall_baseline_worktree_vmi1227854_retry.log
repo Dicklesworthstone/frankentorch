@@ -1,0 +1,509 @@
+  [2m2026-06-11T14:32:13.998138Z[0m [34mDEBUG[0m [1;34mrch::verbose[0m[34m: [34mverbose output enabled, [1;34mmode[0m[34m: Plain, [1;34mformat[0m[34m: json[0m
+    [2;3mat[0m rch/src/main.rs:1722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998276Z[0m [34mDEBUG[0m [1;34mrch::hook::config_cache[0m[34m: [34mconfig.cache.hit, [1;34mpath[0m[34m: /home/ubuntu/.cache/rch/config.cache.json, [1;34mbytes[0m[34m: 2961[0m
+    [2;3mat[0m rch/src/config.rs:196 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998327Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: received_input=/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998334Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_absolute_input=/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998339Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_root_resolved=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998343Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_input_resolved=/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998348Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_within_root=/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260 root=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:13.998933Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (3 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:14.320087Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankentorch-ct2yy-baseline-b994c260 (hash: bd2d7c7f78ecb192)[0m
+    [2;3mat[0m rch/src/hook.rs:5994 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:14.320137Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6016 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:33.320294Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook.rs:6046 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:33.320385Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:33.320394Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:33.320403Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:33.320437Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260 -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:33.320445Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:36.324364Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 3003ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:36.324479Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:36.324488Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:36.324495Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:36.324527Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-api -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-api on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:36.324534Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:38.166284Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1841ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:38.166393Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:38.166401Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:38.166408Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:38.166453Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-autograd -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-autograd on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:38.166460Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:40.031509Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1865ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:40.031648Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:40.031660Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:40.031669Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:40.031740Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-conformance -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-conformance on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:40.031767Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:41.905737Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1873ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:41.905858Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:41.905865Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:41.905871Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:41.905897Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-core -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-core on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:41.905903Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:43.739515Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1833ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:43.739629Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:43.739637Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:43.739645Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:43.739677Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-data -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-data on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:43.739683Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:45.610429Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1870ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:45.610520Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:45.610526Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:45.610533Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:45.610560Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-device -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-device on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:45.610565Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:47.393800Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1783ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:47.393919Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:47.393931Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:47.393943Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:47.394008Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-dispatch on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:47.394021Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:49.279340Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1885ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:49.279506Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:49.279520Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:49.279532Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:49.279610Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-kernel-cpu on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:49.279623Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:51.102934Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1823ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:51.103044Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:51.103052Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:51.103059Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:51.103089Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-nn -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-nn on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:51.103095Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:52.933974Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1830ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:52.934091Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:52.934099Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:52.934106Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:52.934138Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-optim -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-optim on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:52.934145Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:54.812354Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1878ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:54.812475Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:54.812483Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:54.812491Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:54.812521Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-runtime -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-runtime on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:54.812528Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:56.676743Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1864ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:56.676856Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.core.*' to '.core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:56.676864Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern '.git/objects/' to '.git/'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:56.676871Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mRewriting legacy broad exclude pattern 'core.*' to 'core.[0-9]*'[0m
+    [2;3mat[0m rch/src/transfer.rs:769 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:56.676913Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-serialize -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-serialize on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:56.676920Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mEffective exclude patterns: ["*.rlib", "*.rmeta", ".beads/", ".bun/", ".rch-target-*/", ".rch-target*/", ".cargo-target-*/", ".cargo-target-rusticmill/", ".cargo-target/", ".core.[0-9]*", ".git/", ".next/", ".npm/", ".nuxt/", ".nyc_output/", ".parcel-cache/", ".pnpm-store/", ".turbo/", "build/", "core.[0-9]*", "coverage/", "dist/", "legacy_python_mcp_agent_mail_code/mcp_agent_mail/.venv/", "node_modules/", "perf.data", "perf.data.old", "perf_hsmm.data", "perf_hsmm.data.old", "process_triage/", "sample_sqlite_db_files/", "target-*/", "target/", "target_*/", "tests/artifacts/", "baselines/hyperfine/", ".rch-target/", ".rch-tmp/", ".franken_whisper/tools/ffmpeg/"][0m
+    [2;3mat[0m rch/src/transfer.rs:1441 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:58.533807Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1856ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:58.533868Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 2160 files, 4945918 bytes in 25204ms[0m
+    [2;3mat[0m rch/src/hook.rs:6209 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:58.533894Z[0m [34mDEBUG[0m [1;34mrch_common::ssh[0m[34m: [34mConnecting to root@109.123.245.77 via SSH...[0m
+    [2;3mat[0m rch-common/src/ssh.rs:183 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:59.488902Z[0m [34mDEBUG[0m [1;34mrch_common::ssh[0m[34m: [34mConnected to vmi1227854 (109.123.245.77)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:212 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:59.488940Z[0m [34mDEBUG[0m [1;34mrch_common::ssh[0m[34m: [34mExecuting on vmi1227854: nohup sh -c 'cd "/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260" 2>/dev/null || exit 0; for d in .rch-target-*-job-* .rch-target-*-pid-*; do [ -d "$d" ] || continue; [ "$d" = ".rch-target-vmi1227854-job-29879662679166288-1781188353320285816-0" ] && continue; if find "$d" -mmin -720 -print -quit 2>/dev/null | grep -q .; then continue; fi; rm -rf -- "$d" 2>/dev/null; done' >/dev/null 2>&1 &[0m
+    [2;3mat[0m rch-common/src/ssh.rs:343 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:59.849000Z[0m [34mDEBUG[0m [1;34mrch_common::ssh[0m[34m: [34mCommand completed on vmi1227854 (exit=0, duration=360ms)[0m
+    [2;3mat[0m rch-common/src/ssh.rs:418 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:59.849034Z[0m [34mDEBUG[0m [1;34mrch_common::ssh[0m[34m: [34mDisconnecting from vmi1227854[0m
+    [2;3mat[0m rch-common/src/ssh.rs:330 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:32:59.857258Z[0m [34mDEBUG[0m [1;34mrch_common::ssh[0m[34m: [34mDisconnected from vmi1227854[0m
+    [2;3mat[0m rch-common/src/ssh.rs:333 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:33:02.661251Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo bench -j 1 -p ft-kernel-cpu --bench linalg_bench -- qr_f64_tall_2048x128 --warm-up-time 1 --measurement-time 5 --sample-size 20[0m
+    [2;3mat[0m rch/src/hook.rs:6252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:33:02.661301Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/.rch-target-vmi1227854-job-29879662679166288-1781188353320285816-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:33:02.661314Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mForwarding env vars: ["CARGO_TARGET_DIR"][0m
+    [2;3mat[0m rch/src/transfer.rs:966 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:33:02.661320Z[0m [34mDEBUG[0m [1;34mrch::transfer[0m[34m: [34mExternal timeout protection disabled by config[0m
+    [2;3mat[0m rch/src/transfer.rs:1084 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded anes v0.1.6
+  Downloaded autocfg v1.5.0
+  Downloaded cast v0.3.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded ciborium-ll v0.2.2
+  Downloaded clap_lex v1.1.0
+  Downloaded anstyle v1.0.14
+  Downloaded bit-vec v0.8.0
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded clap v4.6.1
+  Downloaded criterion v0.5.1
+  Downloaded aho-corasick v1.1.4
+  Downloaded cfg-if v1.0.4
+  Downloaded ciborium-io v0.2.2
+  Downloaded console v0.16.3
+  Downloaded bitflags v2.11.1
+  Downloaded bytemuck v1.25.0
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded either v1.15.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded regex v1.12.3
+  Downloaded quote v1.0.45
+  Downloaded half v2.7.1
+  Downloaded fnv v1.0.7
+  Downloaded rand_chacha v0.9.0
+  Downloaded errno v0.3.14
+  Downloaded num-complex v0.4.6
+  Downloaded rusty-fork v0.3.1
+  Downloaded unicode-ident v1.0.24
+  Downloaded plotters-backend v0.3.7
+  Downloaded quick-error v1.2.3
+  Downloaded plotters-svg v0.3.7
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded oorandom v11.1.5
+  Downloaded walkdir v2.5.0
+  Downloaded itoa v1.0.18
+  Downloaded is-terminal v0.4.17
+  Downloaded rand_core v0.9.5
+  Downloaded rand_xorshift v0.4.0
+  Downloaded serde_core v1.0.228
+  Downloaded safe_arch v0.7.4
+  Downloaded wait-timeout v0.2.1
+  Downloaded num-traits v0.2.19
+  Downloaded rawpointer v0.2.1
+  Downloaded getrandom v0.3.4
+  Downloaded serde_derive v1.0.228
+  Downloaded similar v2.7.0
+  Downloaded fastrand v2.4.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded clap_builder v4.6.0
+  Downloaded rand v0.9.4
+  Downloaded rayon-core v1.13.0
+  Downloaded wide v0.7.33
+  Downloaded insta v1.47.2
+  Downloaded matrixmultiply v0.3.10
+  Downloaded tinytemplate v1.2.1
+  Downloaded serde_json v1.0.149
+  Downloaded rayon v1.12.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded proptest v1.11.0
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+  Downloaded ciborium v0.2.2
+  Downloaded tempfile v3.27.0
+  Downloaded itertools v0.10.5
+  Downloaded once_cell v1.21.4
+  Downloaded unarray v0.1.4
+  Downloaded libm v0.2.16
+  Downloaded same-file v1.0.6
+  Downloaded memchr v2.8.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded zmij v1.0.21
+  Downloaded serde v1.0.228
+  Downloaded plotters v0.3.7
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded criterion-plot v0.5.0
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling libc v0.2.185
+   Compiling cfg-if v1.0.4
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling zerocopy-derive v0.8.48
+   Compiling getrandom v0.3.4
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling zmij v1.0.21
+   Compiling once_cell v1.21.4
+   Compiling serde v1.0.228
+   Compiling rayon-core v1.13.0
+   Compiling bitflags v2.11.1
+   Compiling either v1.15.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling rand_core v0.9.5
+   Compiling serde_derive v1.0.228
+   Compiling fastrand v2.4.1
+   Compiling serde_json v1.0.149
+   Compiling regex-syntax v0.8.10
+   Compiling tempfile v3.27.0
+   Compiling matrixmultiply v0.3.10
+   Compiling itoa v1.0.18
+   Compiling clap_lex v1.1.0
+   Compiling plotters-backend v0.3.7
+   Compiling anstyle v1.0.14
+   Compiling libm v0.2.16
+   Compiling memchr v2.8.0
+   Compiling ciborium-io v0.2.2
+   Compiling ciborium-ll v0.2.2
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling rayon v1.12.0
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling same-file v1.0.6
+   Compiling rawpointer v0.2.1
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling rand_chacha v0.9.0
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-core)
+   Compiling regex v1.12.3
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling tinytemplate v1.2.1
+   Compiling ciborium v0.2.2
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling is-terminal v0.4.17
+   Compiling console v0.16.3
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling similar v2.7.0
+   Compiling unarray v0.1.4
+   Compiling proptest v1.11.0
+   Compiling insta v1.47.2
+   Compiling criterion v0.5.1
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/crates/ft-kernel-cpu)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 3m 12s
+     Running benches/linalg_bench.rs (.rch-target-vmi1227854-job-29879662679166288-1781188353320285816-0/release/deps/linalg_bench-aa9fc2ba4861f31f)
+Gnuplot not found, using plotters backend
+Benchmarking qr_f64_tall_2048x128
+Benchmarking qr_f64_tall_2048x128: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 5.0s. You may wish to increase target time to 8.1s, enable flat sampling, or reduce sample count to 10.
+Benchmarking qr_f64_tall_2048x128: Collecting 20 samples in estimated 8.1429 s (210 iterations)
+Benchmarking qr_f64_tall_2048x128: Analyzing
+qr_f64_tall_2048x128    time:   [37.045 ms 37.809 ms 38.647 ms]
+
+Benchmarking qr_f64_tall_2048x128_stage_profile
+Benchmarking qr_f64_tall_2048x128_stage_profile: Warming up for 1.0000 s
+
+Warning: Unable to complete 20 samples in 5.0s. You may wish to increase target time to 7.7s, enable flat sampling, or reduce sample count to 10.
+Benchmarking qr_f64_tall_2048x128_stage_profile: Collecting 20 samples in estimated 7.7323 s (210 iterations)
+Benchmarking qr_f64_tall_2048x128_stage_profile: Analyzing
+qr_f64_tall_2048x128_stage_profile
+                        time:   [37.408 ms 38.092 ms 39.042 ms]
+Found 1 outliers among 20 measurements (5.00%)
+  1 (5.00%) high mild
+
+  [2m2026-06-11T14:37:09.098769Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 246437ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:09.099083Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:6425 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:09.099103Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2106 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.126637Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2027ms (1 files, 1180 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2145 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.126678Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1 files, 1180 bytes in 2027ms[0m
+    [2;3mat[0m rch/src/hook.rs:6458 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.126812Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/.scratch/frankentorch-ct2yy-baseline-b994c260/.rch-target-vmi1227854-job-29879662679166288-1781188353320285816-0 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2106 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:13.113067Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1986ms (212 files, 3516 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2145 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:13.113102Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 212 files, 3516 bytes in 1986ms[0m
+    [2;3mat[0m rch/src/hook.rs:6582 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (299.1s)

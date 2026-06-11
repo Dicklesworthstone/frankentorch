@@ -24,16 +24,17 @@ Worker: `vmi1227854`.
 | Row | Baseline | Candidate | Speedup |
 | --- | ---: | ---: | ---: |
 | `qr_f64_512x512` | `67.182 ms` | `45.689 ms` | `1.47x` |
-| `qr_f64_tall_2048x128` | `46.387 ms` | `24.812 ms` | `1.87x` |
+| `qr_f64_tall_2048x128` | `37.809 ms` | `25.196 ms` | `1.50x` |
 
 Artifacts:
 
 - Baseline square: `pass4_baseline_qr_512_vmi1227854_retry.log`
 - Candidate square: `pass4_candidate_qr_512_any_remote.log`
-- Tall baseline: pass-1 same-worker remote row recorded in `.skill-loop-progress.md`
-- Candidate tall: `pass4_candidate_qr_tall_any_remote.log`
+- Tall baseline: `pass4_baseline_qr_tall_baseline_worktree_vmi1227854_retry.log`
+- Candidate tall: `pass4_candidate_qr_tall_vmi1227854_retry.log`
+- Supporting candidate tall rerun: `pass4_candidate_qr_tall_any_remote.log`
 
-Score: `(Impact 4 * Confidence 4) / Effort 3 = 5.33`; keep.
+Score: `(Impact 4 * Confidence 5) / Effort 3 = 6.67`; keep.
 
 ## Isomorphism Proof
 
@@ -47,26 +48,21 @@ Score: `(Impact 4 * Confidence 4) / Effort 3 = 5.33`; keep.
   - `512x512`: `532fcee14166c954`
   - `2048x128`: `22f5a5fdf69e511f`
 
-Golden/proof bundle SHA-256:
-
-```text
-1b0d08fbe6fe2a1c605b945962c9c5e08931a3666b206451e8f9573b788f1070  artifacts/perf/frankentorch-ct2yy/pass4_candidate_qr_512_any_remote.log
-3d20234d4a477722c9482a250a4cb77d39642c81d19c90452a63f101a4fa8b83  artifacts/perf/frankentorch-ct2yy/pass4_candidate_qr_tall_any_remote.log
-e3cf7a281d52f066d08e59e1621f7a1013edd2a27578f7b911f0dabda9595225  artifacts/perf/frankentorch-ct2yy/pass4_qr_stage_split_after.log
-8320afb2b1c41cc4c6dc6fbdaa2ed4953e318d19b181919609c72dd7ec731191  artifacts/perf/frankentorch-ct2yy/pass4_test_qr_filter.log
-9174a8b519d196a1f0149fe60849243e37516d3626111f180f1242649818466a  artifacts/perf/frankentorch-ct2yy/pass4_clippy_ft_kernel_cpu_lib_allow_preexisting_range_loop.log
-```
+Golden/proof bundle SHA-256: see
+`artifacts/perf/frankentorch-ct2yy/pass4_proof_bundle.sha256`.
 
 ## Gates
 
 - `rch exec -- cargo test -p ft-kernel-cpu --lib qr_ -- --nocapture`: pass, 16 tests.
 - `rch exec -- cargo check -p ft-kernel-cpu --lib --tests --benches --example qr_stage_split`: pass.
 - `rch exec -- cargo clippy -p ft-kernel-cpu --lib -- -A clippy::needless_range_loop -D warnings`: pass.
+- `rch exec -- cargo clippy -p ft-kernel-cpu --lib --tests --benches --example qr_stage_split -- -D warnings`: fails on pre-existing `needless_range_loop` diagnostics; the detached parent worktree fails on the same library lint sites.
 - `cargo fmt -p ft-kernel-cpu --check`: pass.
 - `git diff --check -- crates/ft-kernel-cpu/src/lib.rs`: pass.
 - `ubs crates/ft-kernel-cpu/src/lib.rs`: 0 critical issues; pre-existing broad warnings remain in the large file.
 
-Standard `cargo clippy -p ft-kernel-cpu --all-targets -- -D warnings` is still blocked by unrelated pre-existing `needless_range_loop` diagnostics outside this QR hunk.
+Standard all-target clippy with `-D warnings` is still blocked by unrelated
+pre-existing `needless_range_loop` diagnostics outside this QR hunk.
 
 ## Next Profile Target
 
