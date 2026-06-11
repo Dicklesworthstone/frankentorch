@@ -53,6 +53,7 @@ Remote golden attempts were refused by RCH:
 
 Deterministic proof anchor captured through `rch exec` local fallback:
 
+
 ```text
 n=64  eigvals_digest=0xbc0583d464b1a211 eig_digest=0xbc0583d464b1a211
 n=128 eigvals_digest=0x763c4b15d92c4b89 eig_digest=0x763c4b15d92c4b89
