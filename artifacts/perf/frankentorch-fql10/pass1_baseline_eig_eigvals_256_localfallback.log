@@ -1,0 +1,105 @@
+created_at=2026-06-11T00:24:20-04:00
+git_head=446652100c5165304eab22ca42fa5c681e0babef
+command=rch exec -- cargo bench -j 1 -p ft-kernel-cpu --bench linalg_bench -- '^(eigvals_f64_256x256|eig_f64_256x256)$' --sample-size 10 --warm-up-time 1 --measurement-time 3
+[RCH] local (no admissible workers: critical_pressure=1,active_project_exclusion=1)
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling syn v2.0.117
+   Compiling libc v0.2.185
+   Compiling cfg-if v1.0.4
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling zerocopy-derive v0.8.48
+   Compiling getrandom v0.3.4
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling bitflags v2.11.1
+   Compiling serde v1.0.228
+   Compiling linux-raw-sys v0.12.1
+   Compiling rayon-core v1.13.0
+   Compiling once_cell v1.21.4
+   Compiling either v1.15.0
+   Compiling zmij v1.0.21
+   Compiling crossbeam-deque v0.8.6
+   Compiling rand_core v0.9.5
+   Compiling serde_derive v1.0.228
+   Compiling regex-syntax v0.8.10
+   Compiling serde_json v1.0.149
+   Compiling fastrand v2.4.1
+   Compiling tempfile v3.27.0
+   Compiling matrixmultiply v0.3.10
+   Compiling libm v0.2.16
+   Compiling ciborium-io v0.2.2
+   Compiling memchr v2.8.0
+   Compiling anstyle v1.0.14
+   Compiling clap_lex v1.1.0
+   Compiling itoa v1.0.18
+   Compiling plotters-backend v0.3.7
+   Compiling plotters-svg v0.3.7
+   Compiling clap_builder v4.6.0
+   Compiling ciborium-ll v0.2.2
+   Compiling rayon v1.12.0
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling rawpointer v0.2.1
+   Compiling same-file v1.0.6
+   Compiling quick-error v1.2.3
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling rusty-fork v0.3.1
+   Compiling walkdir v2.5.0
+   Compiling bit-set v0.8.0
+   Compiling rand_chacha v0.9.0
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling regex v1.12.3
+   Compiling ciborium v0.2.2
+   Compiling clap v4.6.1
+   Compiling tinytemplate v1.2.1
+   Compiling plotters v0.3.7
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling is-terminal v0.4.17
+   Compiling console v0.16.3
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling unarray v0.1.4
+   Compiling similar v2.7.0
+   Compiling insta v1.47.2
+   Compiling proptest v1.11.0
+   Compiling criterion v0.5.1
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 2m 26s
+     Running benches/linalg_bench.rs (/data/tmp/cargo-target/release/deps/linalg_bench-aa9fc2ba4861f31f)
+Gnuplot not found, using plotters backend
+Benchmarking eig_f64_256x256
+Benchmarking eig_f64_256x256: Warming up for 1.0000 s
+Benchmarking eig_f64_256x256: Collecting 10 samples in estimated 4.6782 s (110 iterations)
+Benchmarking eig_f64_256x256: Analyzing
+eig_f64_256x256         time:   [42.391 ms 43.219 ms 43.875 ms]
+                        change: [-48.194% -42.260% -36.060%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+Benchmarking eigvals_f64_256x256
+Benchmarking eigvals_f64_256x256: Warming up for 1.0000 s
+Benchmarking eigvals_f64_256x256: Collecting 10 samples in estimated 4.4927 s (165 iterations)
+Benchmarking eigvals_f64_256x256: Analyzing
+eigvals_f64_256x256     time:   [27.081 ms 27.472 ms 27.835 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) low mild
+

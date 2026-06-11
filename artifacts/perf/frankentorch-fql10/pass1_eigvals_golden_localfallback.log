@@ -1,0 +1,7 @@
+created_at=2026-06-11T00:27:52-04:00
+git_head=446652100c5165304eab22ca42fa5c681e0babef
+command=rch exec -- cargo run -p ft-kernel-cpu --release --example eigvals_golden
+[RCH] local (no admissible workers: critical_pressure=1,active_project_exclusion=1)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `release` profile [optimized] target(s) in 0.35s
+     Running `/data/tmp/cargo-target/release/examples/eigvals_golden`

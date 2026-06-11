@@ -1,0 +1,21 @@
+command=rch exec -- cargo bench -j 1 -p ft-kernel-cpu --bench linalg_bench -- '^(qr_f64_512x512|qr_f64_tall_2048x128)$' --sample-size 10 --warm-up-time 1 --measurement-time 3
+[RCH] local (no admissible workers: critical_pressure=1,insufficient_slots=1)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.08s
+     Running benches/linalg_bench.rs (/data/tmp/cargo-target/release/deps/linalg_bench-aa9fc2ba4861f31f)
+Gnuplot not found, using plotters backend
+Benchmarking qr_f64_512x512
+Benchmarking qr_f64_512x512: Warming up for 1.0000 s
+Benchmarking qr_f64_512x512: Collecting 10 samples in estimated 5.8593 s (110 iterations)
+Benchmarking qr_f64_512x512: Analyzing
+qr_f64_512x512          time:   [53.778 ms 54.462 ms 55.012 ms]
+                        change: [-18.263% -16.688% -14.864%] (p = 0.00 < 0.05)
+                        Performance has improved.
+
+Benchmarking qr_f64_tall_2048x128
+Benchmarking qr_f64_tall_2048x128: Warming up for 1.0000 s
+Benchmarking qr_f64_tall_2048x128: Collecting 10 samples in estimated 3.1793 s (110 iterations)
+Benchmarking qr_f64_tall_2048x128: Analyzing
+qr_f64_tall_2048x128    time:   [28.818 ms 29.168 ms 29.767 ms]
+                        change: [-35.802% -31.978% -28.279%] (p = 0.00 < 0.05)
+                        Performance has improved.
+

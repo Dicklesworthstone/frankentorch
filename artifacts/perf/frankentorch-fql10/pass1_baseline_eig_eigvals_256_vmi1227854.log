@@ -1,0 +1,5 @@
+created_at=2026-06-11T00:21:12-04:00
+git_head=446652100c5165304eab22ca42fa5c681e0babef
+command=RCH_REQUIRE_REMOTE=1 RCH_WORKER=vmi1227854 rch exec -- cargo bench -j 1 -p ft-kernel-cpu --bench linalg_bench -- '^(eigvals_f64_256x256|eig_f64_256x256)$' --sample-size 10 --warm-up-time 1 --measurement-time 3
+[RCH] local (no admissible workers: critical_pressure=1,active_project_exclusion=1)
+[RCH] remote required; refusing local fallback (no worker assigned)
