@@ -1,0 +1,55 @@
+  [2m2026-06-11T14:27:24.064878Z[0m [34mDEBUG[0m [1;34mrch::verbose[0m[34m: [34mverbose output enabled, [1;34mmode[0m[34m: Plain, [1;34mformat[0m[34m: json[0m
+    [2;3mat[0m rch/src/main.rs:1722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:27:24.064987Z[0m [34mDEBUG[0m [1;34mrch::hook::config_cache[0m[34m: [34mconfig.cache.hit, [1;34mpath[0m[34m: /home/ubuntu/.cache/rch/config.cache.json, [1;34mbytes[0m[34m: 2928[0m
+    [2;3mat[0m rch/src/config.rs:196 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:27:24.065026Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: received_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:27:24.065032Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_absolute_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:27:24.065035Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_root_resolved=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:27:24.065039Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_input_resolved=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:27:24.065043Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_within_root=/data/projects/frankentorch root=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+[RCH] local (no admissible workers: critical_pressure=1,active_project_exclusion=1)
+    Blocking waiting for file lock on build directory
+   Compiling once_cell v1.21.4
+   Compiling libm v0.2.16
+   Compiling rawpointer v0.2.1
+   Compiling similar v2.7.0
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+   Compiling itertools v0.10.5
+   Compiling clap_builder v4.6.0
+   Compiling is-terminal v0.4.17
+   Compiling console v0.16.3
+   Compiling bytemuck_derive v1.10.2
+   Compiling tempfile v3.27.0
+   Compiling rusty-fork v0.3.1
+   Compiling insta v1.47.2
+   Compiling bytemuck v1.25.0
+   Compiling num-complex v0.4.6
+   Compiling plotters v0.3.7
+   Compiling proptest v1.11.0
+   Compiling half v2.7.1
+   Compiling safe_arch v0.7.4
+   Compiling wide v0.7.33
+   Compiling ciborium-ll v0.2.2
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling criterion-plot v0.5.0
+   Compiling ciborium v0.2.2
+   Compiling clap v4.6.1
+   Compiling criterion v0.5.1
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `release` profile [optimized] target(s) in 28.91s
+     Running `/data/tmp/cargo-target/release/examples/qr_stage_split`
+qr_stage_split shape=512x512 rows=512 cols=512 reduced=true samples=7 blocked=true matches_production=true digest_fnv64=532fcee14166c954 total_ns=41828675 copy_zeroing_ns=988293 copy_zeroing_pct=2.363 panel_and_t_ns=11304727 panel_and_t_pct=27.026 trailing_r_ns=9403087 trailing_r_pct=22.480 reverse_q_ns=19780866 reverse_q_pct=47.290 unaccounted_ns=351702 unaccounted_pct=0.841
+qr_stage_split shape=2048x128 rows=2048 cols=128 reduced=true samples=7 blocked=true matches_production=true digest_fnv64=22f5a5fdf69e511f total_ns=20817349 copy_zeroing_ns=244223 copy_zeroing_pct=1.173 panel_and_t_ns=11999123 panel_and_t_pct=57.640 trailing_r_ns=3047665 trailing_r_pct=14.640 reverse_q_ns=5550315 reverse_q_pct=26.662 unaccounted_ns=0 unaccounted_pct=0.000

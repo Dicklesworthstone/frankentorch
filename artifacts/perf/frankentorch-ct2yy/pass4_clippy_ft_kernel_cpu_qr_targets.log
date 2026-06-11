@@ -1,0 +1,68 @@
+  [2m2026-06-11T14:26:59.720881Z[0m [34mDEBUG[0m [1;34mrch::verbose[0m[34m: [34mverbose output enabled, [1;34mmode[0m[34m: Plain, [1;34mformat[0m[34m: json[0m
+    [2;3mat[0m rch/src/main.rs:1722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:59.721007Z[0m [34mDEBUG[0m [1;34mrch::hook::config_cache[0m[34m: [34mconfig.cache.hit, [1;34mpath[0m[34m: /home/ubuntu/.cache/rch/config.cache.json, [1;34mbytes[0m[34m: 2928[0m
+    [2;3mat[0m rch/src/config.rs:196 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:59.721050Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: received_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:59.721056Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_absolute_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:59.721060Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_root_resolved=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:59.721064Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_input_resolved=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:59.721067Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_within_root=/data/projects/frankentorch root=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+[RCH] local (no admissible workers: critical_pressure=1,active_project_exclusion=1)
+    Checking ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+error: the loop variable `k` is used to index `row_i`
+     --> crates/ft-kernel-cpu/src/lib.rs:12058:30
+      |
+12058 |                     for k in (j + 1)..=l {
+      |                              ^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_range_loop
+      = note: `-D clippy::needless-range-loop` implied by `-D warnings`
+      = help: to override `-D warnings` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+      |
+12058 -                     for k in (j + 1)..=l {
+12058 +                     for (k, <item>) in row_i.iter().enumerate().take(l + 1).skip((j + 1)) {
+      |
+
+error: the loop variable `k` is used to index `row_i`
+     --> crates/ft-kernel-cpu/src/lib.rs:12426:30
+      |
+12426 |                     for k in (j + 1)..=l {
+      |                              ^^^^^^^^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+      |
+12426 -                     for k in (j + 1)..=l {
+12426 +                     for (k, <item>) in row_i.iter().enumerate().take(l + 1).skip((j + 1)) {
+      |
+
+error: could not compile `ft-kernel-cpu` (lib) due to 2 previous errors
+warning: build failed, waiting for other jobs to finish...
+error: the loop variable `i` is used to index `want`
+     --> crates/ft-kernel-cpu/src/lib.rs:25099:18
+      |
+25099 |         for i in 0..n {
+      |                  ^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_range_loop
+help: consider using an iterator and enumerate()
+      |
+25099 -         for i in 0..n {
+25099 +         for (i, <item>) in want.iter().enumerate().take(n) {
+      |
+
+error: could not compile `ft-kernel-cpu` (lib test) due to 3 previous errors

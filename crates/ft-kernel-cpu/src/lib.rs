@@ -15133,6 +15133,268 @@ fn qr_profile_record_ns(slot: &mut u128, start: Option<std::time::Instant>) {
     }
 }
 
+fn qr_build_compact_wy_t_f64(
+    vmat: &[f64],
+    tau: &[f64],
+    m: usize,
+    nb: usize,
+    col_start: usize,
+    col_end: usize,
+) -> Vec<f64> {
+    let width = col_end - col_start;
+    let mut tmat = vec![0.0f64; width * width];
+    for c in 0..width {
+        let src_c = col_start + c;
+        if tau[src_c] == 0.0 {
+            continue;
+        }
+        tmat[c * width + c] = tau[src_c];
+        for i in 0..c {
+            let src_i = col_start + i;
+            let mut dot = 0.0;
+            for row in 0..m {
+                dot += vmat[row * nb + src_i] * vmat[row * nb + src_c];
+            }
+            tmat[i * width + c] = -tau[src_c] * dot;
+        }
+        let mut newcol = vec![0.0f64; c];
+        for i in 0..c {
+            let mut s = 0.0;
+            for l in i..c {
+                s += tmat[i * width + l] * tmat[l * width + c];
+            }
+            newcol[i] = s;
+        }
+        for i in 0..c {
+            tmat[i * width + c] = newcol[i];
+        }
+    }
+    tmat
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qr_apply_panel_block_reflector_f64(
+    r_mat: &mut [f64],
+    m: usize,
+    n: usize,
+    panel_start: usize,
+    nb: usize,
+    vmat: &[f64],
+    tau: &[f64],
+    block_start: usize,
+    block_end: usize,
+    target_start: usize,
+    target_end: usize,
+) {
+    let block_width = block_end - block_start;
+    let target_width = target_end - target_start;
+    if block_width == 0
+        || target_width == 0
+        || !tau[block_start..block_end]
+            .iter()
+            .any(|&value| value != 0.0)
+    {
+        return;
+    }
+
+    let first_row = panel_start + block_start;
+    let active_rows = m - first_row;
+    let tmat = qr_build_compact_wy_t_f64(vmat, tau, m, nb, block_start, block_end);
+    let mut vblock = vec![0.0f64; active_rows * block_width];
+    let mut vt = vec![0.0f64; block_width * active_rows];
+    for local_row in 0..active_rows {
+        let row = first_row + local_row;
+        for c in 0..block_width {
+            let value = vmat[row * nb + block_start + c];
+            vblock[local_row * block_width + c] = value;
+            vt[c * active_rows + local_row] = value;
+        }
+    }
+
+    let target_col = panel_start + target_start;
+    let mut panel_cols = vec![0.0f64; active_rows * target_width];
+    for local_row in 0..active_rows {
+        let row = first_row + local_row;
+        let src = row * n + target_col;
+        let dst = local_row * target_width;
+        panel_cols[dst..dst + target_width].copy_from_slice(&r_mat[src..src + target_width]);
+    }
+
+    let mut work = vec![0.0f64; block_width * target_width];
+    gemm::dgemm(
+        block_width,
+        active_rows,
+        target_width,
+        &vt,
+        &panel_cols,
+        &mut work,
+    );
+    let mut tt = vec![0.0f64; block_width * block_width];
+    for i in 0..block_width {
+        for j in 0..block_width {
+            tt[i * block_width + j] = tmat[j * block_width + i];
+        }
+    }
+    let mut reflected = vec![0.0f64; block_width * target_width];
+    gemm::dgemm(
+        block_width,
+        block_width,
+        target_width,
+        &tt,
+        &work,
+        &mut reflected,
+    );
+    let mut update = vec![0.0f64; active_rows * target_width];
+    gemm::dgemm(
+        active_rows,
+        block_width,
+        target_width,
+        &vblock,
+        &reflected,
+        &mut update,
+    );
+    for local_row in 0..active_rows {
+        let row = first_row + local_row;
+        let dst = row * n + target_col;
+        let src = local_row * target_width;
+        for c in 0..target_width {
+            r_mat[dst + c] -= update[src + c];
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qr_factor_panel_leaf_f64(
+    r_mat: &mut [f64],
+    m: usize,
+    n: usize,
+    panel_start: usize,
+    leaf_start: usize,
+    leaf_end: usize,
+    nb: usize,
+    vmat: &mut [f64],
+    tau: &mut [f64],
+    tiny: f64,
+) {
+    for c in leaf_start..leaf_end {
+        let j = panel_start + c;
+        let col_len = m - j;
+        let mut nrm2 = 0.0;
+        for t in 0..col_len {
+            let x = r_mat[(j + t) * n + j];
+            nrm2 += x * x;
+        }
+        let norm_v = nrm2.sqrt();
+        if norm_v < tiny {
+            continue;
+        }
+        let v0 = r_mat[j * n + j];
+        let sign = if v0 >= 0.0 { 1.0 } else { -1.0 };
+        vmat[j * nb + c] = v0 + sign * norm_v;
+        for t in 1..col_len {
+            vmat[(j + t) * nb + c] = r_mat[(j + t) * n + j];
+        }
+        let mut nv2 = 0.0;
+        for t in 0..col_len {
+            let x = vmat[(j + t) * nb + c];
+            nv2 += x * x;
+        }
+        if nv2 < tiny {
+            for t in 0..col_len {
+                vmat[(j + t) * nb + c] = 0.0;
+            }
+            continue;
+        }
+        let tau_c = 2.0 / nv2;
+        tau[c] = tau_c;
+        // Reflected column j: diagonal = -sign*norm, below-diagonal = 0.
+        r_mat[j * n + j] = -sign * norm_v;
+        for t in 1..col_len {
+            r_mat[(j + t) * n + j] = 0.0;
+        }
+        for col in (j + 1)..(panel_start + leaf_end) {
+            let mut dot = 0.0;
+            for t in 0..col_len {
+                dot += vmat[(j + t) * nb + c] * r_mat[(j + t) * n + col];
+            }
+            let factor = tau_c * dot;
+            for t in 0..col_len {
+                r_mat[(j + t) * n + col] -= factor * vmat[(j + t) * nb + c];
+            }
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn qr_factor_panel_recursive_f64(
+    r_mat: &mut [f64],
+    m: usize,
+    n: usize,
+    panel_start: usize,
+    range_start: usize,
+    range_end: usize,
+    nb: usize,
+    vmat: &mut [f64],
+    tau: &mut [f64],
+    tiny: f64,
+) {
+    const LEAF: usize = 8;
+    if range_end - range_start <= LEAF {
+        qr_factor_panel_leaf_f64(
+            r_mat,
+            m,
+            n,
+            panel_start,
+            range_start,
+            range_end,
+            nb,
+            vmat,
+            tau,
+            tiny,
+        );
+        return;
+    }
+
+    let mid = range_start + (range_end - range_start) / 2;
+    qr_factor_panel_recursive_f64(
+        r_mat,
+        m,
+        n,
+        panel_start,
+        range_start,
+        mid,
+        nb,
+        vmat,
+        tau,
+        tiny,
+    );
+    qr_apply_panel_block_reflector_f64(
+        r_mat,
+        m,
+        n,
+        panel_start,
+        nb,
+        vmat,
+        tau,
+        range_start,
+        mid,
+        mid,
+        range_end,
+    );
+    qr_factor_panel_recursive_f64(
+        r_mat,
+        m,
+        n,
+        panel_start,
+        mid,
+        range_end,
+        nb,
+        vmat,
+        tau,
+        tiny,
+    );
+}
+
 fn qr_householder_panel_blocked_profiled(
     r_mat: &mut [f64],
     m: usize,
@@ -15158,81 +15420,11 @@ fn qr_householder_panel_blocked_profiled(
         let panel_start = qr_profile_stage_start(profile_enabled);
         let mut vmat = vec![0.0f64; m * nb];
         let mut tau = vec![0.0f64; nb];
-        for c in 0..nb {
-            let j = p + c;
-            let col_len = m - j;
-            let mut nrm2 = 0.0;
-            for t in 0..col_len {
-                let x = r_mat[(j + t) * n + j];
-                nrm2 += x * x;
-            }
-            let norm_v = nrm2.sqrt();
-            if norm_v < tiny {
-                continue;
-            }
-            let v0 = r_mat[j * n + j];
-            let sign = if v0 >= 0.0 { 1.0 } else { -1.0 };
-            vmat[j * nb + c] = v0 + sign * norm_v;
-            for t in 1..col_len {
-                vmat[(j + t) * nb + c] = r_mat[(j + t) * n + j];
-            }
-            let mut nv2 = 0.0;
-            for t in 0..col_len {
-                let x = vmat[(j + t) * nb + c];
-                nv2 += x * x;
-            }
-            if nv2 < tiny {
-                for t in 0..col_len {
-                    vmat[(j + t) * nb + c] = 0.0;
-                }
-                continue;
-            }
-            let tau_c = 2.0 / nv2;
-            tau[c] = tau_c;
-            // Reflected column j: diagonal = -sign*norm, below-diagonal = 0.
-            r_mat[j * n + j] = -sign * norm_v;
-            for t in 1..col_len {
-                r_mat[(j + t) * n + j] = 0.0;
-            }
-            for col in (j + 1)..pe {
-                let mut dot = 0.0;
-                for t in 0..col_len {
-                    dot += vmat[(j + t) * nb + c] * r_mat[(j + t) * n + col];
-                }
-                let factor = tau_c * dot;
-                for t in 0..col_len {
-                    r_mat[(j + t) * n + col] -= factor * vmat[(j + t) * nb + c];
-                }
-            }
-        }
+        qr_factor_panel_recursive_f64(r_mat, m, n, p, 0, nb, nb, &mut vmat, &mut tau, tiny);
 
         // --- Compact-WY T (nb×nb upper triangular, LAPACK dlarft forward) so that
         //     H_p H_{p+1} ... H_{pe-1} = I - V T Vᵀ.
-        let mut tmat = vec![0.0f64; nb * nb];
-        for c in 0..nb {
-            if tau[c] == 0.0 {
-                continue;
-            }
-            tmat[c * nb + c] = tau[c];
-            for i in 0..c {
-                let mut dot = 0.0;
-                for row in 0..m {
-                    dot += vmat[row * nb + i] * vmat[row * nb + c];
-                }
-                tmat[i * nb + c] = -tau[c] * dot;
-            }
-            let mut newcol = vec![0.0f64; c];
-            for i in 0..c {
-                let mut s = 0.0;
-                for l in i..c {
-                    s += tmat[i * nb + l] * tmat[l * nb + c];
-                }
-                newcol[i] = s;
-            }
-            for i in 0..c {
-                tmat[i * nb + c] = newcol[i];
-            }
-        }
+        let tmat = qr_build_compact_wy_t_f64(&vmat, &tau, m, nb, 0, nb);
         if let Some(timings) = timings.as_mut() {
             qr_profile_record_ns(&mut timings.panel_and_t_ns, panel_start);
         }

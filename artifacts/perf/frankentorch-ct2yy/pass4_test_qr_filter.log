@@ -1,0 +1,73 @@
+  [2m2026-06-11T14:26:07.489074Z[0m [34mDEBUG[0m [1;34mrch::verbose[0m[34m: [34mverbose output enabled, [1;34mmode[0m[34m: Plain, [1;34mformat[0m[34m: json[0m
+    [2;3mat[0m rch/src/main.rs:1722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:07.489266Z[0m [34mDEBUG[0m [1;34mrch::hook::config_cache[0m[34m: [34mconfig.cache.hit, [1;34mpath[0m[34m: /home/ubuntu/.cache/rch/config.cache.json, [1;34mbytes[0m[34m: 2928[0m
+    [2;3mat[0m rch/src/config.rs:196 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:07.489332Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: received_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:07.489340Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_absolute_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:07.489346Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_root_resolved=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:07.489353Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_input_resolved=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:26:07.489358Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_within_root=/data/projects/frankentorch root=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+[RCH] local (no admissible workers: critical_pressure=1,active_project_exclusion=1)
+    Blocking waiting for file lock on build directory
+   Compiling getrandom v0.3.4
+   Compiling rustix v1.1.4
+   Compiling bitflags v2.11.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling regex-syntax v0.8.10
+   Compiling fastrand v2.4.1
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling quick-error v1.2.3
+   Compiling similar v2.7.0
+   Compiling unarray v0.1.4
+   Compiling wait-timeout v0.2.1
+   Compiling console v0.16.3
+   Compiling ppv-lite86 v0.2.21
+   Compiling bit-set v0.8.0
+   Compiling rand_core v0.9.5
+   Compiling rand_chacha v0.9.0
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling regex-automata v0.4.14
+   Compiling tempfile v3.27.0
+   Compiling rusty-fork v0.3.1
+   Compiling insta v1.47.2
+   Compiling proptest v1.11.0
+   Compiling regex v1.12.3
+   Compiling criterion v0.5.1
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 27.25s
+     Running unittests src/lib.rs (/data/tmp/cargo-target/debug/deps/ft_kernel_cpu-d26c108ecd1e4673)
+
+running 16 tests
+test tests::pinv_qr_defers_rank_deficient_inputs ... ok
+test tests::pinv_qr_matches_known_full_rank_diagonal_embeddings ... ok
+test tests::qr_1x1 ... ok
+test tests::qr_empty_matrix ... ok
+test tests::lstsq_qr_recovers_overdetermined_solution_and_defers_rank_deficient ... ok
+test tests::qr_known_3x3_reduced ... ok
+test tests::qr_identity_3x3_complete ... ok
+test tests::qr_r_is_upper_triangular ... ok
+test tests::qr_rejects_1d_tensor ... ok
+test tests::qr_tall_matrix_4x2_complete ... ok
+test tests::qr_tall_matrix_4x2_reduced ... ok
+test tests::qr_wide_matrix_2x4_reduced ... ok
+test tests::prop_qr_reconstruction_square_matrix ... ok
+test tests::qr_blocked_tall_reconstructs_and_orthonormal ... ok
+test tests::qr_f32_native_reconstructs_and_orthonormal ... ok
+test tests::qr_parallel_apply_reconstructs_and_orthonormal ... ok
+
+test result: ok. 16 passed; 0 failed; 0 ignored; 0 measured; 429 filtered out; finished in 0.19s
+

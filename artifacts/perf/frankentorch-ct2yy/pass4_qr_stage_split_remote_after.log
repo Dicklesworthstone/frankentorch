@@ -1,0 +1,23 @@
+  [2m2026-06-11T14:37:11.729069Z[0m [34mDEBUG[0m [1;34mrch::verbose[0m[34m: [34mverbose output enabled, [1;34mmode[0m[34m: Plain, [1;34mformat[0m[34m: json[0m
+    [2;3mat[0m rch/src/main.rs:1722 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.729217Z[0m [34mDEBUG[0m [1;34mrch::hook::config_cache[0m[34m: [34mconfig.cache.hit, [1;34mpath[0m[34m: /home/ubuntu/.cache/rch/config.cache.json, [1;34mbytes[0m[34m: 2928[0m
+    [2;3mat[0m rch/src/config.rs:196 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.729267Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: received_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.729274Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_absolute_input=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.729278Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_root_resolved=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.729283Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: canonical_input_resolved=/data/projects/frankentorch[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-11T14:37:11.729288Z[0m [34mDEBUG[0m [1;34mrch::hook[0m[34m: [34m[RCH] project identity normalization: verified_within_root=/data/projects/frankentorch root=/data/projects[0m
+    [2;3mat[0m rch/src/hook.rs:2875 [2;3mon[0m ThreadId(1)
+
+[RCH] local (no admissible workers: critical_pressure=1,insufficient_slots=1)
+[RCH] remote required; refusing local fallback (no worker assigned)

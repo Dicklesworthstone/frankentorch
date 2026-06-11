@@ -1,0 +1,22 @@
+[RCH] local (no admissible workers: critical_pressure=1,insufficient_slots=1)
+    Blocking waiting for file lock on build directory
+    Checking cfg-if v1.0.4
+    Checking rawpointer v0.2.1
+    Checking either v1.15.0
+   Compiling num-traits v0.2.19
+    Checking crossbeam-utils v0.8.21
+    Checking libm v0.2.16
+    Checking bytemuck v1.25.0
+    Checking zerocopy v0.8.48
+    Checking matrixmultiply v0.3.10
+    Checking safe_arch v0.7.4
+    Checking crossbeam-epoch v0.9.18
+    Checking wide v0.7.33
+    Checking crossbeam-deque v0.8.6
+    Checking rayon-core v1.13.0
+    Checking num-complex v0.4.6
+    Checking rayon v1.12.0
+    Checking half v2.7.1
+    Checking ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 18.95s
