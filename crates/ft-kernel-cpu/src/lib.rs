@@ -8520,6 +8520,22 @@ struct LuFactorF32 {
     n: usize,
 }
 
+/// Native f32 LU factorization result (the f32 companion to [`LuFactorResult`]).
+/// Carries the direct row permutation (`pivots`, consumed by
+/// `lu_solve_contiguous_f32`) and the LAPACK getrf-style `ipiv` (for torch
+/// `lu_factor` parity). frankentorch-b3o90.
+#[derive(Debug, Clone)]
+pub struct LuFactorResultF32 {
+    /// Packed LU matrix in row-major order (n x n), f32.
+    pub lu: Vec<f32>,
+    /// Direct row permutation: `pivots[i]` is the original row now at position `i`.
+    pub pivots: Vec<usize>,
+    /// LAPACK getrf-style pivot sequence (0-indexed).
+    pub ipiv: Vec<usize>,
+    /// Matrix dimension (n x n).
+    pub n: usize,
+}
+
 /// Result of full LU decomposition: P, L, U as separate matrices.
 #[derive(Debug, Clone)]
 pub struct LuResult {
@@ -8693,6 +8709,151 @@ pub fn lu_factor_contiguous_f64(
     }
 
     Ok(LuFactorResult {
+        lu,
+        pivots,
+        ipiv,
+        n,
+    })
+}
+
+/// Native f32 LU factorization with partial pivoting — the f32 companion to
+/// [`lu_factor_contiguous_f64`]. Same blocked right-looking getrf scheme (panel
+/// factor + `gemm::sgemm` trailing update), computed entirely in f32 so the
+/// public f32 solve/inverse path avoids the f32->f64->f32 round trip and matches
+/// torch's f32 dtype. The blocked trailing GEMM reassociates vs an unblocked
+/// sweep (tolerance parity, same as the f64 kernel). frankentorch-b3o90.
+pub fn lu_factor_contiguous_f32(
+    data: &[f32],
+    meta: &TensorMeta,
+) -> Result<LuFactorResultF32, KernelError> {
+    ensure_unary_layout_and_storage_f32(data, meta)?;
+    let shape = meta.shape();
+    if shape.len() != 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![shape.len()],
+        });
+    }
+    let n = shape[0];
+    if n != shape[1] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![n],
+            rhs: vec![shape[1]],
+        });
+    }
+    if n == 0 {
+        return Ok(LuFactorResultF32 {
+            lu: Vec::new(),
+            pivots: Vec::new(),
+            ipiv: Vec::new(),
+            n: 0,
+        });
+    }
+
+    let offset = meta.storage_offset();
+    let mut lu: Vec<f32> = data[offset..offset + n * n].to_vec();
+    let mut pivots: Vec<usize> = (0..n).collect();
+    let mut ipiv: Vec<usize> = (0..n).collect();
+
+    const NB: usize = 64;
+    const LU_PAR_MIN_ROWS: usize = 64;
+    let singular_tol = f32::EPSILON * 1e3;
+
+    let mut k0 = 0;
+    while k0 < n {
+        let pe = (k0 + NB).min(n);
+
+        // --- 1. Factor the column panel [k0, pe) ---
+        for k in k0..pe {
+            let mut max_val = lu[k * n + k].abs();
+            let mut max_row = k;
+            for i in (k + 1)..n {
+                let val = lu[i * n + k].abs();
+                if val > max_val {
+                    max_val = val;
+                    max_row = i;
+                }
+            }
+            ipiv[k] = max_row;
+            if max_row != k {
+                pivots.swap(k, max_row);
+                for j in 0..n {
+                    lu.swap(k * n + j, max_row * n + j);
+                }
+            }
+            let diag = lu[k * n + k];
+            if diag.abs() < singular_tol {
+                for i in (k + 1)..n {
+                    lu[i * n + k] = 0.0;
+                }
+                continue;
+            }
+            let rows_below = n - k - 1;
+            if rows_below >= LU_PAR_MIN_ROWS && rayon::current_num_threads() > 1 {
+                let (head, tail) = lu.split_at_mut((k + 1) * n);
+                let pivot_row = &head[k * n..(k + 1) * n];
+                tail.par_chunks_mut(n).for_each(|row_i| {
+                    let m = row_i[k] / diag;
+                    row_i[k] = m;
+                    for j in (k + 1)..pe {
+                        row_i[j] -= m * pivot_row[j];
+                    }
+                });
+            } else {
+                for i in (k + 1)..n {
+                    let m = lu[i * n + k] / diag;
+                    lu[i * n + k] = m;
+                    for j in (k + 1)..pe {
+                        lu[i * n + j] -= m * lu[k * n + j];
+                    }
+                }
+            }
+        }
+
+        let kb = pe - k0;
+        let tcols = n - pe;
+        if tcols == 0 {
+            break;
+        }
+
+        // --- 2. Triangular solve U12 = L11^{-1} * A12 ---
+        for i in k0..pe {
+            for t in k0..i {
+                let lit = lu[i * n + t];
+                if lit != 0.0 {
+                    for j in pe..n {
+                        lu[i * n + j] -= lit * lu[t * n + j];
+                    }
+                }
+            }
+        }
+
+        // --- 3. GEMM trailing update A22 -= L21 * U12 ---
+        let trows = n - pe;
+        let mut l21 = vec![0.0f32; trows * kb];
+        for ii in 0..trows {
+            let src = (pe + ii) * n + k0;
+            l21[ii * kb..ii * kb + kb].copy_from_slice(&lu[src..src + kb]);
+        }
+        let mut u12 = vec![0.0f32; kb * tcols];
+        for ii in 0..kb {
+            let src = (k0 + ii) * n + pe;
+            u12[ii * tcols..ii * tcols + tcols].copy_from_slice(&lu[src..src + tcols]);
+        }
+        let mut prod = vec![0.0f32; trows * tcols];
+        gemm::sgemm(trows, kb, tcols, &l21, &u12, &mut prod);
+        for ii in 0..trows {
+            let dst = (pe + ii) * n + pe;
+            let prow = &prod[ii * tcols..ii * tcols + tcols];
+            for jj in 0..tcols {
+                lu[dst + jj] -= prow[jj];
+            }
+        }
+
+        k0 = pe;
+    }
+
+    Ok(LuFactorResultF32 {
         lu,
         pivots,
         ipiv,
@@ -23986,6 +24147,64 @@ mod tests {
             }
         }
         assert_mat_approx_eq(&ax, &b, 1e-10, "A * x should equal b");
+    }
+
+    #[test]
+    fn lu_factor_f32_native_solves_and_reconstructs() {
+        // Native f32 LU (frankentorch-b3o90): factor a 64x64+ matrix (exercises the
+        // blocked sgemm trailing update), confirm P·L·U == A within f32 tolerance
+        // and that lu_solve_contiguous_f32 recovers x for A·x=b.
+        let n = 96usize;
+        let meta_a = TensorMeta::from_shape(vec![n, n], DType::F32, Device::Cpu);
+        // Deterministic, diagonally-dominant (well-conditioned) f32 matrix.
+        let mut a = vec![0.0f32; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                a[i * n + j] = (((i * 31 + j * 17) % 13) as f32) * 0.1 - 0.6;
+            }
+            a[i * n + i] += n as f32;
+        }
+        let f = super::lu_factor_contiguous_f32(&a, &meta_a).expect("lu_factor_f32");
+        assert_eq!(f.n, n);
+
+        // Reconstruct P·A == L·U from the packed factor and direct permutation.
+        // (P·A)[i] = A[pivots[i]]; L unit-lower, U upper, both from `lu`.
+        let mut recon = vec![0.0f32; n * n];
+        for i in 0..n {
+            for j in 0..n {
+                let mut acc = 0.0f32;
+                for k in 0..=i.min(j) {
+                    let l_ik = if k == i { 1.0 } else { f.lu[i * n + k] };
+                    let u_kj = f.lu[k * n + j];
+                    acc += l_ik * u_kj;
+                }
+                recon[i * n + j] = acc;
+            }
+        }
+        for i in 0..n {
+            let orig = f.pivots[i] * n;
+            for j in 0..n {
+                let diff = (recon[i * n + j] - a[orig + j]).abs();
+                assert!(diff < 5e-3, "P·A != L·U at ({i},{j}): {diff}");
+            }
+        }
+
+        // Solve A·x = b and verify the residual.
+        let b: Vec<f32> = (0..n).map(|i| (i % 7) as f32 + 1.0).collect();
+        let meta_b = TensorMeta::from_shape(vec![n], DType::F32, Device::Cpu);
+        let x = super::lu_solve_contiguous_f32(&f.lu, &f.pivots, n, &b, &meta_b).expect("lu_solve");
+        for i in 0..n {
+            let mut ax = 0.0f32;
+            for j in 0..n {
+                ax += a[i * n + j] * x[j];
+            }
+            assert!(
+                (ax - b[i]).abs() < 5e-3,
+                "A·x != b at {i}: {} vs {}",
+                ax,
+                b[i]
+            );
+        }
     }
 
     #[test]
