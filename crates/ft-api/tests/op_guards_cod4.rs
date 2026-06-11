@@ -128,39 +128,45 @@ fn istft_requires_grad_window_fails_loud() {
 }
 
 #[test]
-fn complex_requires_grad_parts_fail_loud() {
+fn complex_requires_grad_parts_are_differentiable() {
+    // frankentorch-ng1hw: tensor_complex is now differentiable. The complex
+    // output's interleaved gradient de-interleaves back into the real/imag inputs.
     let mut session = strict_session();
-    let real_grad = session.tensor_variable(vec![1.0], vec![1], true).unwrap();
-    let imag_no_grad = session.tensor_variable(vec![2.0], vec![1], false).unwrap();
-
-    assert_fails_loud(
-        session.tensor_complex(real_grad, imag_no_grad),
-        "complex requires_grad real",
-    );
-
-    let real_no_grad = session.tensor_variable(vec![1.0], vec![1], false).unwrap();
-    let imag_grad = session.tensor_variable(vec![2.0], vec![1], true).unwrap();
-    assert_fails_loud(
-        session.tensor_complex(real_no_grad, imag_grad),
-        "complex requires_grad imag",
-    );
+    let real = session
+        .tensor_variable(vec![1.0, 2.0], vec![2], true)
+        .unwrap();
+    let imag = session
+        .tensor_variable(vec![3.0, 4.0], vec![2], true)
+        .unwrap();
+    let z = session.tensor_complex(real, imag).unwrap();
+    assert_eq!(session.tensor_dtype(z).unwrap(), DType::Complex128);
+    // loss = sum(imag(z)) -> grad real = 0, grad imag = 1.
+    let im = session.tensor_imag(z).unwrap();
+    let out = session.tensor_sum(im).unwrap();
+    let rep = session.tensor_backward(out).unwrap();
+    assert_eq!(session.tensor_gradient(&rep, real).unwrap(), &[0.0, 0.0]);
+    assert_eq!(session.tensor_gradient(&rep, imag).unwrap(), &[1.0, 1.0]);
 }
 
 #[test]
-fn view_as_complex_requires_grad_input_fails_loud() {
+fn view_as_complex_requires_grad_input_is_differentiable() {
+    // frankentorch-ng1hw: view_as_complex is a differentiable layout bridge.
     let mut session = strict_session();
     let input = session
         .tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![2, 2], true)
         .unwrap();
-
-    assert_fails_loud(
-        session.tensor_view_as_complex(input),
-        "view_as_complex requires_grad input",
-    );
+    let z = session.tensor_view_as_complex(input).unwrap();
+    assert_eq!(session.tensor_dtype(z).unwrap(), DType::Complex128);
+    let back = session.tensor_view_as_real(z).unwrap();
+    let out = session.tensor_sum(back).unwrap();
+    let rep = session.tensor_backward(out).unwrap();
+    assert_eq!(session.tensor_gradient(&rep, input).unwrap(), &[1.0, 1.0, 1.0, 1.0]);
 }
 
 #[test]
-fn view_as_real_requires_grad_complex_input_fails_loud() {
+fn view_as_real_requires_grad_complex_input_is_differentiable() {
+    // frankentorch-ng1hw: view_as_real is a differentiable layout bridge; the
+    // gradient is copied through unchanged (interleaved [re,im] layout).
     let mut session = strict_session();
     let tensor = DenseTensor::from_typed_storage(
         TensorMeta::from_shape(vec![2], DType::Complex128, Device::Cpu),
@@ -171,11 +177,11 @@ fn view_as_real_requires_grad_complex_input_fails_loud() {
     )
     .unwrap();
     let input = session.tensor_variable_from_storage(tensor, true);
-
-    assert_fails_loud(
-        session.tensor_view_as_real(input),
-        "view_as_real requires_grad complex input",
-    );
+    let real_view = session.tensor_view_as_real(input).unwrap();
+    let out = session.tensor_sum(real_view).unwrap();
+    let rep = session.tensor_backward(out).unwrap();
+    // d sum(view_as_real(z))/dz = ones over both re/im lanes (2 complex -> 4 reals).
+    assert_eq!(session.tensor_gradient(&rep, input).unwrap(), &[1.0, 1.0, 1.0, 1.0]);
 }
 
 #[test]

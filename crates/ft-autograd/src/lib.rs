@@ -8413,6 +8413,80 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// Record a complex<->real "bridge" autograd node whose forward output tensor is
+    /// built directly by the caller (so it can be complex-dtype, which the f64-valued
+    /// [`apply_function`] cannot produce) and whose backward maps the output gradient
+    /// buffer to per-input gradient buffers.
+    ///
+    /// Complex nodes carry their gradient as an interleaved real buffer of length
+    /// `2*numel` (torch `view_as_real` convention); [`backward_with_options`] sizes the
+    /// per-node buffers accordingly, so `backward_fn` receives the output node's full
+    /// (possibly 2*numel) gradient slice and must return one gradient per input matching
+    /// that input's own buffer length (`2*numel` for a complex input, `numel` for real).
+    ///
+    /// The node is recorded as a [`TensorNodeOp::CustomFunction`], so reachability,
+    /// dependency counting, and backward dispatch handle it with no new op variants.
+    /// frankentorch-ng1hw.
+    pub fn apply_complex_bridge<B>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        output: DenseTensor,
+        backward_fn: B,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        B: Fn(&FunctionCtx, &[&[f64]]) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut needs_input_grad = Vec::with_capacity(inputs.len());
+        let mut input_numels = Vec::with_capacity(inputs.len());
+        let mut any_requires_grad = false;
+        for &id in inputs {
+            let node = self.node(id)?;
+            let rg = node.requires_grad && self.grad_enabled;
+            needs_input_grad.push(rg);
+            if rg {
+                any_requires_grad = true;
+            }
+            input_numels.push(node.tensor.meta().numel());
+        }
+
+        let out = TensorNodeId(self.nodes.len());
+
+        // No input needs grad (or grad disabled): produce a plain Leaf, matching the
+        // non-grad fast path of the bridge ops (and apply_function's behavior).
+        if !any_requires_grad || !self.grad_enabled {
+            self.nodes.push(TensorNode {
+                tensor: output,
+                requires_grad: false,
+                op: TensorNodeOp::Leaf,
+            });
+            return Ok(out);
+        }
+
+        let function_id = self.next_custom_function_id;
+        self.next_custom_function_id += 1;
+        self.custom_functions.insert(
+            function_id,
+            CustomFunctionRecord {
+                ctx: FunctionCtx::new(needs_input_grad),
+                backward: CustomFunctionBackward::Owned(Arc::new(backward_fn)),
+                input_numel: input_numels,
+                create_graph_backward: None,
+            },
+        );
+        self.nodes.push(TensorNode {
+            tensor: output,
+            requires_grad: true,
+            op: TensorNodeOp::CustomFunction {
+                inputs: inputs.to_vec(),
+                function_id,
+            },
+        });
+        Ok(out)
+    }
+
     /// Like [`apply_function`], but also registers a tape-building create_graph
     /// backward so the custom function supports double-backward. The first-order
     /// `backward_fn` (raw `Vec<f64>`) drives ordinary backward; the
@@ -10385,7 +10459,13 @@ impl TensorTape {
             .enumerate()
             .map(|(idx, node)| {
                 if reachable[idx] {
-                    vec![0.0; node.tensor.meta().numel()]
+                    // Complex nodes carry their gradient as an interleaved real
+                    // buffer of length 2*numel (torch view_as_real convention), so a
+                    // complex tensor's grad has somewhere to store both re/im parts.
+                    // Real nodes are unchanged (multiplier 1). frankentorch-ng1hw.
+                    let meta = node.tensor.meta();
+                    let mult = if meta.dtype().is_complex() { 2 } else { 1 };
+                    vec![0.0; meta.numel() * mult]
                 } else {
                     Vec::new()
                 }
