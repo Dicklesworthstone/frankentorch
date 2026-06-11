@@ -3969,6 +3969,11 @@ pub fn cdist_forward_f64(
     }
     let inv_p = 1.0 / p;
     let is_inf = p == f64::INFINITY;
+    // p == 1 (Manhattan) is `Σ|Δ|` with NO per-element `powf(1.0)` and NO final
+    // `powf(1.0)`. Since `pow(x, 1.0) == x` exactly (glibc/IEEE), eliding both is
+    // BIT-EXACT vs the general `powf` path but skips one libm `pow` call per
+    // element — the dominant cost on the p=1 path. frankentorch-cdist-p1.
+    let is_one = p == 1.0;
     // One output row = one (b, i) pair owning a contiguous r_dim slice.
     result
         .par_chunks_mut(r_dim)
@@ -3987,6 +3992,10 @@ pub fn cdist_forward_f64(
                         if diff > dist {
                             dist = diff;
                         }
+                    }
+                } else if is_one {
+                    for k in 0..m {
+                        dist += (x1[x1_base + k] - x2[x2_row + k]).abs();
                     }
                 } else {
                     for k in 0..m {
@@ -4019,6 +4028,10 @@ pub fn pdist_forward_f64(input: &[f64], n: usize, m: usize, p: f64) -> Vec<f64> 
     }
     let is_inf = p == f64::INFINITY;
     let inv_p = 1.0 / p;
+    // p == 1 (Manhattan): `Σ|Δ|` with NO per-element `powf(1.0)` and NO final
+    // `powf(1.0)` — bit-exact (`pow(x, 1.0) == x`), one fewer libm `pow` per
+    // element. frankentorch-cdist-p1.
+    let is_one = p == 1.0;
     // Row i owns the (n-1-i) outputs for j in (i+1)..n; build per-row then flatten
     // (the concat is O(out_len), negligible vs the O(n^2·m) reduction).
     let rows: Vec<Vec<f64>> = (0..n - 1)
@@ -4035,6 +4048,10 @@ pub fn pdist_forward_f64(input: &[f64], n: usize, m: usize, p: f64) -> Vec<f64> 
                         if diff > dist {
                             dist = diff;
                         }
+                    }
+                } else if is_one {
+                    for k in 0..m {
+                        dist += (input[i_base + k] - input[j_base + k]).abs();
                     }
                 } else {
                     for k in 0..m {
