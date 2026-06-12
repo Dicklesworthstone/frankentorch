@@ -20,7 +20,7 @@ fn t<F: FnMut()>(mut f: F, it: usize) -> f64 {
     }
     s.elapsed().as_secs_f64() * 1e3 / it as f64
 }
-#[allow(clippy::too_many_arguments)]
+#[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
 fn old(
     input: &[f64],
     weight: &[f64],
