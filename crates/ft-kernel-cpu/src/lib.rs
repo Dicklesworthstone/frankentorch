@@ -258,12 +258,17 @@ mod gemm {
     // Shared M×N tile grid: ~sqrt(threads) blocks per axis (minimises B+A traffic
     // for square shapes), clamped to the GEMM block-size floors. Returns the block
     // extents and the list of (i0,j0) tile origins — disjoint rectangles tiling C.
-    fn tile_blocks(m: usize, n: usize) -> (usize, usize, Vec<(usize, usize)>) {
+    fn tile_shape(m: usize, n: usize) -> (usize, usize) {
         let threads = rayon::current_num_threads().max(1);
         let p = (threads as f64).sqrt().floor().max(1.0) as usize; // M-blocks
         let q = threads.div_ceil(p); // N-blocks
         let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
         let nb = n.div_ceil(q).max(MIN_BLOCK_COLS);
+        (mb, nb)
+    }
+
+    fn tile_blocks(m: usize, n: usize) -> (usize, usize, Vec<(usize, usize)>) {
+        let (mb, nb) = tile_shape(m, n);
         let mut tiles: Vec<(usize, usize)> = Vec::new();
         let mut i0 = 0;
         while i0 < m {
@@ -278,35 +283,44 @@ mod gemm {
     }
 
     fn dgemm_2d_parallel(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
-        let (mb, nb, tiles) = tile_blocks(m, n);
+        let (mb, nb) = tile_shape(m, n);
         let cp = TilePtr(c.as_mut_ptr());
-        tiles.into_par_iter().for_each(|(i0, j0)| {
+        (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
             let cp = &cp;
-            let bi = (i0 + mb).min(m) - i0;
+            let j0 = j_blk * nb;
             let bj = (j0 + nb).min(n) - j0;
-            // SAFETY: A rows [i0,i0+bi) = a[i0*k..] (rsa=k,csa=1); B cols [j0,j0+bj)
-            // = b.add(j0) (rsb=n,csb=1); both in bounds. Output is the DISJOINT tile
-            // C[i0:i1, j0:j1] written via cp.0.add(i0*n+j0) with rsc=n,csc=1 — last
-            // element (i0+bi-1)*n+j0+bj-1 <= m*n-1. K is not tiled → bit-for-bit equal
-            // to the single dgemm_block call.
-            unsafe {
-                dgemm_mm(
-                    bi,
-                    k,
-                    bj,
-                    1.0,
-                    a.as_ptr().add(i0 * k),
-                    k as isize,
-                    1,
-                    b.as_ptr().add(j0),
-                    n as isize,
-                    1,
-                    0.0,
-                    cp.0.add(i0 * n + j0),
-                    n as isize,
-                    1,
-                );
+            let mut b_panel = vec![0.0_f64; k * bj];
+            for kk in 0..k {
+                let src = &b[kk * n + j0..kk * n + j0 + bj];
+                let dst = &mut b_panel[kk * bj..(kk + 1) * bj];
+                dst.copy_from_slice(src);
             }
+            (0..m.div_ceil(mb)).into_par_iter().for_each(|i_blk| {
+                let i0 = i_blk * mb;
+                let bi = (i0 + mb).min(m) - i0;
+                // SAFETY: A rows [i0,i0+bi) = a[i0*k..] (rsa=k,csa=1). The packed
+                // B panel is the same logical B[:,j0:j0+bj] values in row-major
+                // [k,bj] order, copied before the tile calls. Output is the DISJOINT
+                // tile C[i0:i1, j0:j1] written via cp.0.add(i0*n+j0). K is not tiled.
+                unsafe {
+                    dgemm_mm(
+                        bi,
+                        k,
+                        bj,
+                        1.0,
+                        a.as_ptr().add(i0 * k),
+                        k as isize,
+                        1,
+                        b_panel.as_ptr(),
+                        bj as isize,
+                        1,
+                        0.0,
+                        cp.0.add(i0 * n + j0),
+                        n as isize,
+                        1,
+                    );
+                }
+            });
         });
     }
 
