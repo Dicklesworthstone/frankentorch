@@ -12900,15 +12900,20 @@ impl FrancisShadowAudit {
                 }
                 block_start = block_end;
             }
-            for i in 0..=step.jmax {
-                let mut p2 =
-                    step.xr * scratch[i * n + step.k] + step.yr * scratch[i * n + (step.k + 1)];
-                if step.notlast {
-                    p2 += step.zr * scratch[i * n + (step.k + 2)];
-                    scratch[i * n + (step.k + 2)] -= p2 * step.r_s;
+            let mut col_block_start = 0;
+            while col_block_start <= step.jmax {
+                let col_block_end = (col_block_start + TILE).min(step.jmax + 1);
+                for i in col_block_start..col_block_end {
+                    let mut p2 =
+                        step.xr * scratch[i * n + step.k] + step.yr * scratch[i * n + (step.k + 1)];
+                    if step.notlast {
+                        p2 += step.zr * scratch[i * n + (step.k + 2)];
+                        scratch[i * n + (step.k + 2)] -= p2 * step.r_s;
+                    }
+                    scratch[i * n + (step.k + 1)] -= p2 * step.q_s;
+                    scratch[i * n + step.k] -= p2;
                 }
-                scratch[i * n + (step.k + 1)] -= p2 * step.q_s;
-                scratch[i * n + step.k] -= p2;
+                col_block_start = col_block_end;
             }
         }
         scratch
