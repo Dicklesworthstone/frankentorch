@@ -259,3 +259,29 @@
    Compiling wide v0.7.33
    Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
    Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 18s
+     Running unittests src/lib.rs (.rch-target-vmi1227854-job-29884606035526702-1781320402185728221-0/debug/deps/ft_kernel_cpu-d26c108ecd1e4673)
+
+running 3 tests
+test tests::eig_francis_shadow_profile_matches_full_eig_vectors_bit_exact ... ok
+test tests::eig_francis_shadow_profile_matches_values_path_bit_exact ... ok
+test tests::eig_francis_shadow_profile_matches_scalar_streams_bit_exact ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 446 filtered out; finished in 0.07s
+
+  [2m2026-06-13T03:15:16.521742Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 79774ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-13T03:15:16.522134Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:6425 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-13T03:15:16.522182Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankentorch on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2106 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-13T03:15:18.416114Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1893ms (5 files, 1809 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2145 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-13T03:15:18.416147Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 5 files, 1809 bytes in 1893ms[0m
+    [2;3mat[0m rch/src/hook.rs:6458 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (118.2s)
