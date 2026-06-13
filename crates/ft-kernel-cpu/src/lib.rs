@@ -14058,19 +14058,9 @@ pub fn eig_francis_shadow_profile_f64(
 
     let mut shadow_audit = FrancisShadowAudit::new(n);
     let shadow_eigenvalues = if want_vectors {
-        eig_francis_schur_traced::<true, _>(
-            &mut shadow_h,
-            &mut shadow_q_acc,
-            n,
-            &mut shadow_audit,
-        )
+        eig_francis_schur_traced::<true, _>(&mut shadow_h, &mut shadow_q_acc, n, &mut shadow_audit)
     } else {
-        eig_francis_schur_traced::<false, _>(
-            &mut shadow_h,
-            &mut shadow_q_acc,
-            n,
-            &mut shadow_audit,
-        )
+        eig_francis_schur_traced::<false, _>(&mut shadow_h, &mut shadow_q_acc, n, &mut shadow_audit)
     };
     let shadow_profile = shadow_audit.profile.clone();
     let shadow_schur = shadow_h.clone();
