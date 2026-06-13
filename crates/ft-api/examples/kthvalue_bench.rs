@@ -7,7 +7,7 @@ fn t<F: FnMut()>(mut f: F) -> f64 {
         f();
     }
     let mut b = f64::MAX;
-    for _ in 0..5 {
+    for _ in 0..6 {
         let s = Instant::now();
         for _ in 0..3 {
             f();
@@ -16,34 +16,36 @@ fn t<F: FnMut()>(mut f: F) -> f64 {
     }
     b
 }
-// Old quantile(linear, q=0.5): full sort of indices, then pick lo/hi, lerp.
-fn old_quantile_mid(vals: &[f64]) -> f64 {
-    let n = vals.len();
-    let mut idx: Vec<usize> = (0..n).collect();
-    idx.sort_by(|&a, &b| vals[a].total_cmp(&vals[b]));
-    let fidx = 0.5 * (n - 1) as f64;
-    let lo = fidx.floor() as usize;
-    let hi = fidx.ceil() as usize;
-    let frac = fidx - lo as f64;
-    let l = vals[idx[lo]];
-    let h = vals[idx[hi]];
-    l + frac * (h - l)
-}
 fn main() {
-    let n = 1_000_000usize;
+    let (rows, cols) = (256usize, 4096usize);
+    let n = rows * cols;
     let data: Vec<f64> = (0..n)
         .map(|i| ((i * 2654435761usize) % 1_000_003) as f64)
         .collect();
+    let lo = 2047usize;
+    let hi = 2048usize;
+    let frac = 0.5;
+    // OLD op logic via public API: parallel kernel sort along dim, narrow, lerp.
     let old = t(|| {
-        black_box(old_quantile_mid(black_box(&data)));
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let tt = s
+            .tensor_variable(data.clone(), vec![rows, cols], false)
+            .unwrap();
+        let (sorted, _) = s.tensor_sort(tt, 1, false).unwrap();
+        let lo_v = s.tensor_narrow(sorted, 1, lo, 1).unwrap();
+        let hi_v = s.tensor_narrow(sorted, 1, hi, 1).unwrap();
+        black_box(s.tensor_lerp(lo_v, hi_v, frac).unwrap());
     });
+    // NEW op.
     let new = t(|| {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tt = s.tensor_variable(data.clone(), vec![n], false).unwrap();
-        black_box(s.tensor_quantile(tt, 0.5).unwrap());
+        let tt = s
+            .tensor_variable(data.clone(), vec![rows, cols], false)
+            .unwrap();
+        black_box(s.tensor_quantile_dim(tt, 0.5, 1, false, "linear").unwrap());
     });
     println!(
-        "quantile(0.5) n={n}: old(full-sort) {old:.3}ms | new(2x quickselect, incl session) {new:.3}ms | {:.2}x",
+        "quantile_dim [{rows},{cols}]: old(parallel-sort+narrow) {old:.3}ms | new(quickselect) {new:.3}ms | {:.2}x",
         old / new
     );
 }
