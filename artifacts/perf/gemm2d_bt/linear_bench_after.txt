@@ -1,0 +1,4 @@
+threads = 10
+linear x[512,1024] @ W[1024,1024]^T: 5.477 ms  196 GFLOP/s
+linear x[1024,1024] @ W[1024,1024]^T: 9.107 ms  236 GFLOP/s
+linear x[2048,512] @ W[2048,512]^T: 21.123 ms  203 GFLOP/s
