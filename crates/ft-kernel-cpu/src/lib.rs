@@ -13218,14 +13218,17 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
 /// Hessenberg sub-window for aggressive early deflation. frankentorch-j4fgz.
 fn eig_francis_schur(h: &mut [f64], q_acc: &mut [f64], n: usize, want_vectors: bool) -> Vec<f64> {
     let mut trace = FrancisTraceDisabled;
-    eig_francis_schur_traced(h, q_acc, n, want_vectors, &mut trace)
+    if want_vectors {
+        eig_francis_schur_traced::<true, _>(h, q_acc, n, &mut trace)
+    } else {
+        eig_francis_schur_traced::<false, _>(h, q_acc, n, &mut trace)
+    }
 }
 
-fn eig_francis_schur_traced<T: FrancisTraceSink>(
+fn eig_francis_schur_traced<const WANT_VECTORS: bool, T: FrancisTraceSink>(
     h: &mut [f64],
     q_acc: &mut [f64],
     n: usize,
-    want_vectors: bool,
     trace: &mut T,
 ) -> Vec<f64> {
     if T::ENABLED {
@@ -13310,7 +13313,7 @@ fn eig_francis_schur_traced<T: FrancisTraceSink>(
                         eigenvalues[2 * na + 1] = 0.0;
                         eigenvalues[2 * en_u] = r2;
                         eigenvalues[2 * en_u + 1] = 0.0;
-                        if want_vectors {
+                        if WANT_VECTORS {
                             // Standardize the 2x2 (Givens rotation) for the Schur vectors.
                             let xr = h[en_u * n + na];
                             let s = xr.abs() + zz2.abs();
@@ -13430,7 +13433,7 @@ fn eig_francis_schur_traced<T: FrancisTraceSink>(
                     }
                 }
                 if T::ENABLED {
-                    trace.record_shadow_sweep_start(h, n, m, en_u, want_vectors);
+                    trace.record_shadow_sweep_start(h, n, m, en_u, WANT_VECTORS);
                 }
 
                 // Double QR (bulge-chase) step on rows [m, en].
@@ -13476,7 +13479,7 @@ fn eig_francis_schur_traced<T: FrancisTraceSink>(
                     // [k, en] is BIT-EXACT for the eigenvalues and skips the
                     // growing trailing band as the matrix deflates (hqr range, not
                     // hqr2). frankentorch-eig-eigvals-rowrange.
-                    let row_end = if want_vectors { n } else { en_u + 1 };
+                    let row_end = if WANT_VECTORS { n } else { en_u + 1 };
                     if T::ENABLED {
                         let subdiag_col = if k == m {
                             if l != m { Some(k - 1) } else { None }
@@ -13518,7 +13521,7 @@ fn eig_francis_schur_traced<T: FrancisTraceSink>(
                         h[i * n + (k + 1)] -= p2 * q_s;
                         h[i * n + k] -= p2;
                     }
-                    if want_vectors {
+                    if WANT_VECTORS {
                         // Defer EVERY rotation across the WHOLE Francis-QR run; the
                         // q_acc Schur vectors are a pure sink (the bulge chase reads
                         // /writes only `h`), so the complete ordered rotation stream
@@ -13542,7 +13545,7 @@ fn eig_francis_schur_traced<T: FrancisTraceSink>(
         // each row independently applies every rotation in k-order, bit-identical
         // to the inline per-k update but parallel over rows with a single rayon
         // dispatch (vs O(sweeps)). frankentorch-9y5bi.
-        if want_vectors && !sweep_rot.is_empty() {
+        if WANT_VECTORS && !sweep_rot.is_empty() {
             const EIG_QACC_PAR_WORK: u64 = 1 << 14;
             let work = (n as u64) * (sweep_rot.len() as u64);
             let rots: &[EigQaccOp] = &sweep_rot;
@@ -13887,7 +13890,11 @@ pub fn eig_francis_profile_f64(
     }
 
     let mut profile = EigFrancisProfile::new(n);
-    let eigenvalues = eig_francis_schur_traced(&mut h, &mut q_acc, n, want_vectors, &mut profile);
+    let eigenvalues = if want_vectors {
+        eig_francis_schur_traced::<true, _>(&mut h, &mut q_acc, n, &mut profile)
+    } else {
+        eig_francis_schur_traced::<false, _>(&mut h, &mut q_acc, n, &mut profile)
+    };
     if want_vectors {
         eig_backsub_eigenvectors(&mut h, &mut q_acc, &eigenvalues, n);
     }
@@ -14031,24 +14038,40 @@ pub fn eig_francis_shadow_profile_f64(
     let mut shadow_q_acc = q_acc;
 
     let mut scalar_profile = EigFrancisProfile::new(n);
-    let scalar_eigenvalues = eig_francis_schur_traced(
-        &mut scalar_h,
-        &mut scalar_q_acc,
-        n,
-        want_vectors,
-        &mut scalar_profile,
-    );
+    let scalar_eigenvalues = if want_vectors {
+        eig_francis_schur_traced::<true, _>(
+            &mut scalar_h,
+            &mut scalar_q_acc,
+            n,
+            &mut scalar_profile,
+        )
+    } else {
+        eig_francis_schur_traced::<false, _>(
+            &mut scalar_h,
+            &mut scalar_q_acc,
+            n,
+            &mut scalar_profile,
+        )
+    };
     let scalar_schur = scalar_h.clone();
     let scalar_q_schur = scalar_q_acc.clone();
 
     let mut shadow_audit = FrancisShadowAudit::new(n);
-    let shadow_eigenvalues = eig_francis_schur_traced(
-        &mut shadow_h,
-        &mut shadow_q_acc,
-        n,
-        want_vectors,
-        &mut shadow_audit,
-    );
+    let shadow_eigenvalues = if want_vectors {
+        eig_francis_schur_traced::<true, _>(
+            &mut shadow_h,
+            &mut shadow_q_acc,
+            n,
+            &mut shadow_audit,
+        )
+    } else {
+        eig_francis_schur_traced::<false, _>(
+            &mut shadow_h,
+            &mut shadow_q_acc,
+            n,
+            &mut shadow_audit,
+        )
+    };
     let shadow_profile = shadow_audit.profile.clone();
     let shadow_schur = shadow_h.clone();
     let shadow_q_schur = shadow_q_acc.clone();
