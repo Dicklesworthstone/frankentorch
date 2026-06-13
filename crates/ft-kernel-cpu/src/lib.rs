@@ -13396,12 +13396,23 @@ fn eigh_tridiag_reduce_blocked(a: &mut [f64], n: usize) -> (Vec<f64>, Vec<f64>) 
     (d, e)
 }
 
-/// Implicit-shift QL iteration on a symmetric tridiagonal matrix while `zt`
-/// stores the eigenvector matrix transposed:
-/// `zt[col * n + row] == z[row * n + col]`. The rotation stream and per-entry
-/// arithmetic order match the row-major formulation; the vector updates become
-/// contiguous slices instead of strided column walks.
-fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) {
+/// Eigenvalues-only QL iteration: identical implicit-shift QL sweep as
+/// `eigh_tql2`, but WITHOUT accumulating the rotations into an eigenvector
+/// matrix (the inner `O(n)` per-rotation `z` update, which is the O(n^3) bulk).
+/// The `d`/`e` updates are untouched, so the eigenvalues are bit-for-bit
+/// identical to the full path's — only the discarded eigenvectors are skipped.
+/// Implicit-shift QL eigenvector iteration with DEFERRED whole-stream replay.
+///
+/// Operates on the NON-transposed eigenvector matrix `z` (row-major n×n): each QL
+/// rotation mixes the two adjacent eigenvalue-index COLUMNS `(i, i+1)`, so within a
+/// row they are contiguous in memory. The d/e recurrence + convergence decisions
+/// read only `d`/`e` (never `z`), so we log the COMPLETE ordered rotation stream
+/// `(i, c, s)` first, then replay it across the `z` rows in a SINGLE parallel pass
+/// — one fork/join for the whole O(n³) accumulation instead of one per rotation
+/// (which regressed: memory-bound, O(n²) fork/joins). Each row replays the entire
+/// log in order, so every entry is BIT-FOR-BIT identical to the inline sweep.
+/// frankentorch-kgs4.73.
+fn eigh_tql2_z_deferred(n: usize, d: &mut [f64], e: &mut [f64], z: &mut [f64]) {
     if n == 0 {
         return;
     }
@@ -13409,10 +13420,10 @@ fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) 
         e[i - 1] = e[i];
     }
     e[n - 1] = 0.0;
+    let mut ops: Vec<(usize, f64, f64)> = Vec::new();
     for l in 0..n {
         let mut iter = 0;
         loop {
-            // Locate a negligible sub-diagonal element to split off.
             let mut m = l;
             while m < n - 1 {
                 let dd = d[m].abs() + d[m + 1].abs();
@@ -13428,7 +13439,6 @@ fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) 
                 break;
             }
             iter += 1;
-            // Form the Wilkinson shift.
             let mut g = (d[l + 1] - d[l]) / (2.0 * e[l]);
             let mut r = eigh_pythag(g, 1.0);
             let sr = if g >= 0.0 { r.abs() } else { -r.abs() };
@@ -13438,7 +13448,7 @@ fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) 
             let mut p = 0.0;
             let mut bailed = false;
             for i in (l..m).rev() {
-                let mut f = s * e[i];
+                let f = s * e[i];
                 let b = c * e[i];
                 r = eigh_pythag(f, g);
                 e[i + 1] = r;
@@ -13455,15 +13465,8 @@ fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) 
                 p = s * r;
                 d[i + 1] = g + p;
                 g = c * r - b;
-                let col_i = i * n;
-                let col_next = (i + 1) * n;
-                // Accumulate the rotation into the transposed eigenvector rows.
-                for k in 0..n {
-                    f = zt[col_next + k];
-                    let left = zt[col_i + k];
-                    zt[col_next + k] = s * left + c * f;
-                    zt[col_i + k] = c * left - s * f;
-                }
+                // Defer the rotation of z columns (i, i+1) to the parallel replay.
+                ops.push((i, c, s));
             }
             if bailed {
                 continue;
@@ -13473,13 +13476,22 @@ fn eigh_tql2_transposed(n: usize, d: &mut [f64], e: &mut [f64], zt: &mut [f64]) 
             e[m] = 0.0;
         }
     }
+    // Replay: each row of z independently applies the whole ordered rotation stream
+    // to its adjacent column pairs (i, i+1). Bit-identical to the inline form
+    // because the recurrence above never read z.
+    if !ops.is_empty() {
+        let ops = &ops;
+        z.par_chunks_mut(n).for_each(|row| {
+            for &(i, c, s) in ops {
+                let a = row[i];
+                let bb = row[i + 1];
+                row[i + 1] = s * a + c * bb;
+                row[i] = c * a - s * bb;
+            }
+        });
+    }
 }
 
-/// Eigenvalues-only QL iteration: identical implicit-shift QL sweep as
-/// `eigh_tql2`, but WITHOUT accumulating the rotations into an eigenvector
-/// matrix (the inner `O(n)` per-rotation `z` update, which is the O(n^3) bulk).
-/// The `d`/`e` updates are untouched, so the eigenvalues are bit-for-bit
-/// identical to the full path's — only the discarded eigenvectors are skipped.
 fn eigh_tql2_values_only(n: usize, d: &mut [f64], e: &mut [f64]) {
     if n == 0 {
         return;
@@ -13827,15 +13839,11 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     }
     let mut d = vec![0.0f64; n];
     let mut e = vec![0.0f64; n];
-    let z = eigh_tred2_packed_full(n, &mut lower, &mut d, &mut e);
-    let mut zt = vec![0.0f64; n * n];
-    for row in 0..n {
-        let row_start = row * n;
-        for col in 0..n {
-            zt[col * n + row] = z[row_start + col];
-        }
-    }
-    eigh_tql2_transposed(n, &mut d, &mut e, &mut zt);
+    let mut z = eigh_tred2_packed_full(n, &mut lower, &mut d, &mut e);
+    // QL eigenvector iteration on the NON-transposed Z via deferred whole-stream
+    // replay (rotation mixes adjacent columns i,i+1 → contiguous, row-parallel).
+    // frankentorch-kgs4.73.
+    eigh_tql2_z_deferred(n, &mut d, &mut e, &mut z);
 
     // Sort eigenvalues ascending, permuting eigenvector columns to match.
     let mut eigen_pairs: Vec<(f64, usize)> = (0..n).map(|i| (d[i], i)).collect();
@@ -13844,9 +13852,8 @@ pub fn eigh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<EighResult
     let eigenvalues: Vec<f64> = eigen_pairs.iter().map(|(val, _)| *val).collect();
     let mut eigenvectors = vec![0.0f64; n * n];
     for (new_col, &(_, old_col)) in eigen_pairs.iter().enumerate() {
-        let old_col_start = old_col * n;
         for row in 0..n {
-            eigenvectors[row * n + new_col] = zt[old_col_start + row];
+            eigenvectors[row * n + new_col] = z[row * n + old_col];
         }
     }
 
@@ -28727,6 +28734,49 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn eigh_tql2_deferred_parallel_reconstructs_n288() {
+        // n=288 drives many QL sweeps, exercising the deferred whole-stream
+        // eigenvector replay (kgs4.73, par_chunks over Z rows). Verifies V·diag(λ)·Vᵀ
+        // reconstructs A and the eigenvectors are orthonormal.
+        let n = 288usize;
+        let mut a = vec![0.0f64; n * n];
+        for r in 0..n {
+            for c in 0..=r {
+                let v = (((r * 131 + c * 17 + 7) % 1000) as f64) * 0.001 - 0.5;
+                a[r * n + c] = v;
+                a[c * n + r] = v;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![n, n], DType::F64, Device::Cpu);
+        let res = super::eigh_contiguous_f64(&a, &meta).unwrap();
+        let mut max_recon = 0.0f64;
+        for i in 0..n {
+            for j in 0..n {
+                let mut val = 0.0;
+                for k in 0..n {
+                    val += res.eigenvectors[i * n + k]
+                        * res.eigenvalues[k]
+                        * res.eigenvectors[j * n + k];
+                }
+                max_recon = max_recon.max((val - a[i * n + j]).abs());
+            }
+        }
+        assert!(max_recon < 1e-9, "eigh reconstruction error {max_recon:e}");
+        let mut max_orth = 0.0f64;
+        for c1 in 0..n {
+            for c2 in c1..n {
+                let mut dot = 0.0;
+                for row in 0..n {
+                    dot += res.eigenvectors[row * n + c1] * res.eigenvectors[row * n + c2];
+                }
+                let expected = if c1 == c2 { 1.0 } else { 0.0 };
+                max_orth = max_orth.max((dot - expected).abs());
+            }
+        }
+        assert!(max_orth < 1e-9, "eigh orthonormality error {max_orth:e}");
     }
 
     // ---- eig tests (general eigendecomposition) ----
