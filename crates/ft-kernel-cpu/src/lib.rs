@@ -11630,6 +11630,104 @@ pub fn cholesky_solve_contiguous_f64(
     Ok(x)
 }
 
+/// BLAS-3 blocked triangular solve A·X = B for the large multi-RHS regime. `a` is
+/// a row-major n×n triangular matrix (lower if `!upper`, upper if `upper`), `b` and
+/// the return are row-major n×num_rhs. Blocks the single substitution into row
+/// panels: a scalar diagonal-block solve, then the trailing update fused into the
+/// solution via gemm::dgemm_sub_into (alpha=-1, beta=1), so each A panel is read
+/// ONCE and reused across ALL RHS columns instead of being re-streamed per column.
+/// NO singularity guard — divides by the diagonal directly, matching
+/// torch.linalg.solve_triangular (inf/nan on a zero diagonal). The per-panel sums
+/// reassociate vs the scalar sweep (within the dense-solve tolerance policy).
+/// frankentorch-kgs4.68.
+pub fn triangular_solve_blocked_contiguous_f64(
+    a: &[f64],
+    n: usize,
+    b: &[f64],
+    num_rhs: usize,
+    upper: bool,
+) -> Vec<f64> {
+    let mut x = b.to_vec();
+    if n == 0 || num_rhs == 0 {
+        return x;
+    }
+    const NB: usize = 64;
+    let mut panel = vec![0.0f64; n * NB];
+    let mut ypanel = vec![0.0f64; NB * num_rhs];
+
+    if !upper {
+        // Lower A, forward substitution, blocked top-to-bottom.
+        let mut k0 = 0;
+        while k0 < n {
+            let pe = (k0 + NB).min(n);
+            let nb = pe - k0;
+            for i in k0..pe {
+                let xi = i * num_rhs;
+                let row = i * n;
+                for kk in k0..i {
+                    let a_ik = a[row + kk];
+                    let xk = kk * num_rhs;
+                    for r in 0..num_rhs {
+                        x[xi + r] -= a_ik * x[xk + r];
+                    }
+                }
+                let diag = a[row + i];
+                for r in 0..num_rhs {
+                    x[xi + r] /= diag;
+                }
+            }
+            let m = n - pe;
+            if m > 0 {
+                let ap = &mut panel[..m * nb];
+                for ii in 0..m {
+                    let src = (pe + ii) * n + k0;
+                    ap[ii * nb..ii * nb + nb].copy_from_slice(&a[src..src + nb]);
+                }
+                let yp = &mut ypanel[..nb * num_rhs];
+                yp.copy_from_slice(&x[k0 * num_rhs..pe * num_rhs]);
+                gemm::dgemm_sub_into(m, nb, num_rhs, ap, yp, &mut x, pe * num_rhs, num_rhs);
+            }
+            k0 = pe;
+        }
+    } else {
+        // Upper A, back substitution, blocked bottom-to-top.
+        let mut peb = n;
+        while peb > 0 {
+            let k0 = peb.saturating_sub(NB);
+            let nb = peb - k0;
+            for i in (k0..peb).rev() {
+                let xi = i * num_rhs;
+                let row = i * n;
+                for kk in (i + 1)..peb {
+                    let a_ik = a[row + kk];
+                    let xk = kk * num_rhs;
+                    for r in 0..num_rhs {
+                        x[xi + r] -= a_ik * x[xk + r];
+                    }
+                }
+                let diag = a[row + i];
+                for r in 0..num_rhs {
+                    x[xi + r] /= diag;
+                }
+            }
+            if k0 > 0 {
+                let m = k0;
+                let ap = &mut panel[..m * nb];
+                for row_a in 0..m {
+                    // A[row_a, k0:peb] is the upper-right block, directly contiguous.
+                    let src = row_a * n + k0;
+                    ap[row_a * nb..row_a * nb + nb].copy_from_slice(&a[src..src + nb]);
+                }
+                let yp = &mut ypanel[..nb * num_rhs];
+                yp.copy_from_slice(&x[k0 * num_rhs..peb * num_rhs]);
+                gemm::dgemm_sub_into(m, nb, num_rhs, ap, yp, &mut x, 0, num_rhs);
+            }
+            peb = k0;
+        }
+    }
+    x
+}
+
 /// Native f32 Cholesky solve — two triangular solves (`L Y = B`, `L^T X = Y`)
 /// computed in `f32`. `factor` is the n×n lower (or upper, if `upper`) factor
 /// row-major (e.g. from [`cholesky_contiguous_f32`]); `b_data` is `[n]` or
@@ -29850,6 +29948,71 @@ mod tests {
             max_off < 1e-3,
             "A @ A^-1 deviates from I by {max_off:e} (f32 blocked cholesky_solve path)"
         );
+    }
+
+    #[test]
+    fn triangular_solve_blocked_matches_serial_n256() {
+        // Blocked BLAS-3 triangular solve (kgs4.68) must match a per-column serial
+        // substitution to working precision, for both lower and upper A.
+        let n = 256usize;
+        let nrhs = 96usize;
+        for &upper in &[false, true] {
+            let mut a = vec![0.0f64; n * n];
+            for r in 0..n {
+                for c in 0..n {
+                    a[r * n + c] = (((r * 131 + c * 17 + 7) % 1000) as f64) * 0.001 - 0.5;
+                }
+                a[r * n + r] += n as f64;
+            }
+            for r in 0..n {
+                for c in 0..n {
+                    if (upper && c < r) || (!upper && c > r) {
+                        a[r * n + c] = 0.0;
+                    }
+                }
+            }
+            let mut b = vec![0.0f64; n * nrhs];
+            for (i, v) in b.iter_mut().enumerate() {
+                *v = ((i % 97) as f64) * 0.01 - 0.4;
+            }
+            // Serial per-column reference.
+            let mut serial = b.clone();
+            for col in 0..nrhs {
+                let mut c: Vec<f64> = (0..n).map(|i| serial[i * nrhs + col]).collect();
+                if upper {
+                    for i in (0..n).rev() {
+                        let d = a[i * n + i];
+                        let mut s = c[i];
+                        for j in (i + 1)..n {
+                            s -= a[i * n + j] * c[j];
+                        }
+                        c[i] = s / d;
+                    }
+                } else {
+                    for i in 0..n {
+                        let d = a[i * n + i];
+                        let mut s = c[i];
+                        for j in 0..i {
+                            s -= a[i * n + j] * c[j];
+                        }
+                        c[i] = s / d;
+                    }
+                }
+                for i in 0..n {
+                    serial[i * nrhs + col] = c[i];
+                }
+            }
+            let blk = super::triangular_solve_blocked_contiguous_f64(&a, n, &b, nrhs, upper);
+            let maxdiff = serial
+                .iter()
+                .zip(&blk)
+                .map(|(x, y)| (x - y).abs())
+                .fold(0.0f64, f64::max);
+            assert!(
+                maxdiff < 1e-9,
+                "blocked triangular solve (upper={upper}) differs from serial by {maxdiff:e}"
+            );
+        }
     }
 
     // ---- QR Decomposition tests (bd-2drq.4) ----
