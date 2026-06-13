@@ -7,6 +7,7 @@ fn main() {
     let d: Vec<f64> = (0..n*n).map(|i| ((i*2654435761usize)%10007) as f64 * 0.001).collect();
     let m = TensorMeta::from_shape(vec![n,n], DType::F64, Device::Cpu);
     println!("argmax_d1 {:.3} ms", t(|| { let _=ft_kernel_cpu::argmax_dim_tensor_contiguous_f64(&d,&m,1).unwrap(); }));
-    println!("argmax_d0 {:.3} ms", t(|| { let _=ft_kernel_cpu::argmax_dim_tensor_contiguous_f64(&d,&m,0).unwrap(); }));
     println!("max_d1    {:.3} ms", t(|| { let _=ft_kernel_cpu::max_dim_tensor_contiguous_f64(&d,&m,1).unwrap(); }));
+    println!("max_d0    {:.3} ms", t(|| { let _=ft_kernel_cpu::max_dim_tensor_contiguous_f64(&d,&m,0).unwrap(); }));
+    println!("min_d1    {:.3} ms", t(|| { let _=ft_kernel_cpu::min_dim_tensor_contiguous_f64(&d,&m,1).unwrap(); }));
 }

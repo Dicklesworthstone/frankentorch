@@ -7376,21 +7376,37 @@ pub fn max_dim_tensor_contiguous_f64(
     let mut indices = vec![0.0; out_numel];
     let data = &input[offset..];
 
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let out_idx = outer * inner_size + inner;
-            for r in 0..reduce_size {
-                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                let val = data[idx];
-                if val.is_nan() {
-                    values[out_idx] = f64::NAN;
-                    indices[out_idx] = r as f64;
-                    break;
-                } else if val > values[out_idx] {
-                    values[out_idx] = val;
-                    indices[out_idx] = r as f64;
-                }
+    // Each output lane (outer,inner) reduces an independent strided column; the
+    // per-lane scan (first strict-max wins, NaN short-circuits to its index) is
+    // unchanged by scheduling, so per-lane parallelism is BIT-FOR-BIT equal to the
+    // serial double loop. frankentorch-kgs4.51.
+    let lane = |out_idx: usize, v: &mut f64, ix: &mut f64| {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for r in 0..reduce_size {
+            let val = data[base + r * inner_size];
+            if val.is_nan() {
+                *v = f64::NAN;
+                *ix = r as f64;
+                break;
+            } else if val > *v {
+                *v = val;
+                *ix = r as f64;
             }
+        }
+    };
+    if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        values
+            .par_iter_mut()
+            .zip(indices.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, ix))| lane(i, v, ix));
+    } else {
+        for (i, (v, ix)) in values.iter_mut().zip(indices.iter_mut()).enumerate() {
+            lane(i, v, ix);
         }
     }
 
@@ -7427,21 +7443,34 @@ pub fn min_dim_tensor_contiguous_f64(
     let mut indices = vec![0.0; out_numel];
     let data = &input[offset..];
 
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let out_idx = outer * inner_size + inner;
-            for r in 0..reduce_size {
-                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                let val = data[idx];
-                if val.is_nan() {
-                    values[out_idx] = f64::NAN;
-                    indices[out_idx] = r as f64;
-                    break;
-                } else if val < values[out_idx] {
-                    values[out_idx] = val;
-                    indices[out_idx] = r as f64;
-                }
+    // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.51.
+    let lane = |out_idx: usize, v: &mut f64, ix: &mut f64| {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for r in 0..reduce_size {
+            let val = data[base + r * inner_size];
+            if val.is_nan() {
+                *v = f64::NAN;
+                *ix = r as f64;
+                break;
+            } else if val < *v {
+                *v = val;
+                *ix = r as f64;
             }
+        }
+    };
+    if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        values
+            .par_iter_mut()
+            .zip(indices.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, ix))| lane(i, v, ix));
+    } else {
+        for (i, (v, ix)) in values.iter_mut().zip(indices.iter_mut()).enumerate() {
+            lane(i, v, ix);
         }
     }
 
@@ -18906,21 +18935,34 @@ pub fn max_dim_tensor_contiguous_f32(
     let mut values = vec![f32::NEG_INFINITY; out_numel];
     let mut indices = vec![0.0f32; out_numel];
     let data = &input[offset..];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let out_idx = outer * inner_size + inner;
-            for r in 0..reduce_size {
-                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                let val = data[idx];
-                if val.is_nan() {
-                    values[out_idx] = f32::NAN;
-                    indices[out_idx] = r as f32;
-                    break;
-                } else if val > values[out_idx] {
-                    values[out_idx] = val;
-                    indices[out_idx] = r as f32;
-                }
+    // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.51.
+    let lane = |out_idx: usize, v: &mut f32, ix: &mut f32| {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for r in 0..reduce_size {
+            let val = data[base + r * inner_size];
+            if val.is_nan() {
+                *v = f32::NAN;
+                *ix = r as f32;
+                break;
+            } else if val > *v {
+                *v = val;
+                *ix = r as f32;
             }
+        }
+    };
+    if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        values
+            .par_iter_mut()
+            .zip(indices.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, ix))| lane(i, v, ix));
+    } else {
+        for (i, (v, ix)) in values.iter_mut().zip(indices.iter_mut()).enumerate() {
+            lane(i, v, ix);
         }
     }
     Ok((values, indices))
@@ -18950,21 +18992,34 @@ pub fn min_dim_tensor_contiguous_f32(
     let mut values = vec![f32::INFINITY; out_numel];
     let mut indices = vec![0.0f32; out_numel];
     let data = &input[offset..];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let out_idx = outer * inner_size + inner;
-            for r in 0..reduce_size {
-                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                let val = data[idx];
-                if val.is_nan() {
-                    values[out_idx] = f32::NAN;
-                    indices[out_idx] = r as f32;
-                    break;
-                } else if val < values[out_idx] {
-                    values[out_idx] = val;
-                    indices[out_idx] = r as f32;
-                }
+    // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.51.
+    let lane = |out_idx: usize, v: &mut f32, ix: &mut f32| {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for r in 0..reduce_size {
+            let val = data[base + r * inner_size];
+            if val.is_nan() {
+                *v = f32::NAN;
+                *ix = r as f32;
+                break;
+            } else if val < *v {
+                *v = val;
+                *ix = r as f32;
             }
+        }
+    };
+    if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        values
+            .par_iter_mut()
+            .zip(indices.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, ix))| lane(i, v, ix));
+    } else {
+        for (i, (v, ix)) in values.iter_mut().zip(indices.iter_mut()).enumerate() {
+            lane(i, v, ix);
         }
     }
     Ok((values, indices))
@@ -20609,6 +20664,62 @@ mod tests {
         let par_min = super::argmin_dim_tensor_contiguous_f64(&data, &meta, 1).unwrap();
         assert_eq!(par_max, serial_arg(false), "argmax parallel != serial");
         assert_eq!(par_min, serial_arg(true), "argmin parallel != serial");
+    }
+
+    // The parallel dim-max/min (value+index) (frankentorch-kgs4.51) must match the
+    // serial reference bit-for-bit incl. ties (first-occurrence), NaN-wins, and a
+    // real -inf/+inf column. Input is large enough to trigger the parallel path.
+    #[test]
+    fn parallel_max_min_dim_matches_serial_with_ties_and_nan() {
+        use ft_core::{DType, Device, TensorMeta};
+        let (outer, red, inner) = (50usize, 48usize, 6usize); // numel 14400 >= 8192
+        let n = outer * red * inner;
+        let mut data = vec![0.0f64; n];
+        for (i, d) in data.iter_mut().enumerate() {
+            *d = ((i * 2654435761usize) % 11) as f64;
+        }
+        data[7 * red * inner + 20 * inner + 3] = f64::NAN; // NaN in one lane
+        for r in 0..red {
+            data[2 * red * inner + r * inner + 1] = f64::NEG_INFINITY; // an all -inf lane
+        }
+        let meta = TensorMeta::from_shape(vec![outer, red, inner], DType::F64, Device::Cpu);
+
+        let serial = |minimize: bool| -> (Vec<f64>, Vec<f64>) {
+            let init = if minimize {
+                f64::INFINITY
+            } else {
+                f64::NEG_INFINITY
+            };
+            let mut vals = vec![init; outer * inner];
+            let mut idx = vec![0.0f64; outer * inner];
+            for o in 0..outer {
+                for ii in 0..inner {
+                    let oi = o * inner + ii;
+                    for r in 0..red {
+                        let v = data[o * red * inner + r * inner + ii];
+                        if v.is_nan() {
+                            vals[oi] = f64::NAN;
+                            idx[oi] = r as f64;
+                            break;
+                        } else if (minimize && v < vals[oi]) || (!minimize && v > vals[oi]) {
+                            vals[oi] = v;
+                            idx[oi] = r as f64;
+                        }
+                    }
+                }
+            }
+            (vals, idx)
+        };
+        let (mv, mi) = super::max_dim_tensor_contiguous_f64(&data, &meta, 1).unwrap();
+        let (nv, ni) = super::min_dim_tensor_contiguous_f64(&data, &meta, 1).unwrap();
+        let (smv, smi) = serial(false);
+        let (snv, sni) = serial(true);
+        // NaN-aware bit comparison for values; exact for indices.
+        let bits = |a: &[f64]| a.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+        assert_eq!(bits(&mv), bits(&smv), "max values");
+        assert_eq!(mi, smi, "max indices");
+        assert_eq!(bits(&nv), bits(&snv), "min values");
+        assert_eq!(ni, sni, "min indices");
     }
 
     #[test]

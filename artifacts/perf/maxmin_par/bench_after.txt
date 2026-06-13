@@ -1,0 +1,5 @@
+threads=10
+argmax_d1 1.130 ms
+max_d1    0.891 ms
+max_d0    4.305 ms
+min_d1    0.697 ms
