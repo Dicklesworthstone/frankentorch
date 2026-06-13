@@ -1,0 +1,5 @@
+threads=10
+sum_d1  0.259 ms
+sum_d0  3.118 ms
+mean_d1 0.202 ms
+prod_d1 0.430 ms

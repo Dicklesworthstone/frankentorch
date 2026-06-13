@@ -2678,34 +2678,51 @@ pub fn sum_dim_tensor_contiguous_f64(
     // Push-based output skips the m*n zero-init memset
     // (frankentorch-ao30). Both branches below proceed in
     // row-major output order so push is correct.
-    let mut output = Vec::with_capacity(out_numel);
     let data = &input[offset..];
+    // Each output lane pairwise-sums an independent column; the per-lane reduction
+    // order is unchanged, so parallelizing over lanes is BIT-FOR-BIT equal to the
+    // serial loop (collect preserves the outer*inner_size+inner index order).
+    // frankentorch-kgs4.52.
+    let parallel = out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1;
 
     // Inner_size == 1 means we are reducing the last (most-contiguous)
     // dim, which is the most common shape: e.g. [B, D].sum(dim=-1).
     // The strided slice for each outer is pure contiguous, so we can
     // pairwise-sum directly with zero scratch allocation.
     if inner_size == 1 {
-        for outer in 0..outer_size {
+        let lane = |outer: usize| {
             let start = outer * reduce_size;
-            let end = start + reduce_size;
-            output.push(pairwise_sum_f64(&data[start..end]));
-        }
+            pairwise_sum_f64(&data[start..start + reduce_size])
+        };
+        let output: Vec<f64> = if parallel {
+            (0..outer_size).into_par_iter().map(lane).collect()
+        } else {
+            (0..outer_size).map(lane).collect()
+        };
         return Ok(output);
     }
 
-    // General strided case: gather each (outer, inner) slice into a
-    // reusable scratch buffer, then pairwise-sum. One allocation per
-    // call, not per cell. Same precision pattern as `var_dim_*`.
-    let mut scratch = vec![0.0_f64; reduce_size];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            for r in 0..reduce_size {
-                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
-            }
-            output.push(pairwise_sum_f64(&scratch));
+    // General strided case: gather each (outer, inner) slice into a reusable scratch
+    // buffer, then pairwise-sum. `map_init` gives one scratch per worker thread.
+    let lane = |scratch: &mut Vec<f64>, out_idx: usize| -> f64 {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for (r, s) in scratch.iter_mut().enumerate() {
+            *s = data[base + r * inner_size];
         }
-    }
+        pairwise_sum_f64(scratch)
+    };
+    let output: Vec<f64> = if parallel {
+        (0..out_numel)
+            .into_par_iter()
+            .map_init(|| vec![0.0_f64; reduce_size], |scratch, i| lane(scratch, i))
+            .collect()
+    } else {
+        let mut scratch = vec![0.0_f64; reduce_size];
+        (0..out_numel).map(|i| lane(&mut scratch, i)).collect()
+    };
 
     Ok(output)
 }
@@ -6799,21 +6816,30 @@ pub fn prod_dim_tensor_contiguous_f64(
         return Ok(vec![1.0; out_numel]);
     }
     let offset = meta.storage_offset();
-    // Push-based output skips the 1.0-init pass; row-major
-    // (outer, inner) order matches output index
-    // outer * inner_size + inner (frankentorch-suw1).
-    let mut output = Vec::with_capacity(out_numel);
     let data = &input[offset..];
 
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let mut prod = 1.0;
-            for r in 0..reduce_size {
-                prod *= data[outer * reduce_size * inner_size + r * inner_size + inner];
-            }
-            output.push(prod);
+    // Each output lane is an independent sequential product of a strided column;
+    // the per-lane left-to-right multiply order is unchanged by scheduling, so
+    // per-lane parallelism is BIT-FOR-BIT equal to the serial double loop (and the
+    // collect preserves the original outer*inner_size+inner index order).
+    // frankentorch-kgs4.52.
+    let lane = |out_idx: usize| -> f64 {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        let mut prod = 1.0;
+        for r in 0..reduce_size {
+            prod *= data[base + r * inner_size];
         }
-    }
+        prod
+    };
+    let output: Vec<f64> = if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        (0..out_numel).into_par_iter().map(lane).collect()
+    } else {
+        (0..out_numel).map(lane).collect()
+    };
 
     Ok(output)
 }
@@ -18160,31 +18186,43 @@ pub fn sum_dim_tensor_contiguous_f32(
         return Ok(vec![0.0f32; out_numel]);
     }
     let offset = meta.storage_offset();
-    // Push-based output mirrors the f64 fix (frankentorch-bv1n).
-    let mut output = Vec::with_capacity(out_numel);
     let data = &input[offset..];
+    // F32 mirror of the parallel f64 sum_dim (frankentorch-kgs4.52): per-lane
+    // parallelism, bit-exact vs the serial pairwise loop.
+    let parallel = out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1;
 
-    // F32 mirror of the f64 sum_dim fast/general split. F32 has only
-    // a 24-bit mantissa so the precision improvement from pairwise
-    // vs sequential is even more pronounced here.
     if inner_size == 1 {
-        for outer in 0..outer_size {
+        let lane = |outer: usize| {
             let start = outer * reduce_size;
-            let end = start + reduce_size;
-            output.push(pairwise_sum_f32(&data[start..end]));
-        }
+            pairwise_sum_f32(&data[start..start + reduce_size])
+        };
+        let output: Vec<f32> = if parallel {
+            (0..outer_size).into_par_iter().map(lane).collect()
+        } else {
+            (0..outer_size).map(lane).collect()
+        };
         return Ok(output);
     }
 
-    let mut scratch = vec![0.0f32; reduce_size];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            for r in 0..reduce_size {
-                scratch[r] = data[outer * reduce_size * inner_size + r * inner_size + inner];
-            }
-            output.push(pairwise_sum_f32(&scratch));
+    let lane = |scratch: &mut Vec<f32>, out_idx: usize| -> f32 {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for (r, s) in scratch.iter_mut().enumerate() {
+            *s = data[base + r * inner_size];
         }
-    }
+        pairwise_sum_f32(scratch)
+    };
+    let output: Vec<f32> = if parallel {
+        (0..out_numel)
+            .into_par_iter()
+            .map_init(|| vec![0.0f32; reduce_size], |scratch, i| lane(scratch, i))
+            .collect()
+    } else {
+        let mut scratch = vec![0.0f32; reduce_size];
+        (0..out_numel).map(|i| lane(&mut scratch, i)).collect()
+    };
     Ok(output)
 }
 
@@ -18446,18 +18484,25 @@ pub fn prod_dim_tensor_contiguous_f32(
         return Ok(vec![1.0f32; out_numel]);
     }
     let offset = meta.storage_offset();
-    // Push-based output mirrors the f64 fix (frankentorch-bv1n).
-    let mut output = Vec::with_capacity(out_numel);
     let data = &input[offset..];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let mut prod = 1.0f32;
-            for r in 0..reduce_size {
-                prod *= data[outer * reduce_size * inner_size + r * inner_size + inner];
-            }
-            output.push(prod);
+    // Per-lane parallel; bit-exact vs the serial sequential product. frankentorch-kgs4.52.
+    let lane = |out_idx: usize| -> f32 {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        let mut prod = 1.0f32;
+        for r in 0..reduce_size {
+            prod *= data[base + r * inner_size];
         }
-    }
+        prod
+    };
+    let output: Vec<f32> = if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        (0..out_numel).into_par_iter().map(lane).collect()
+    } else {
+        (0..out_numel).map(lane).collect()
+    };
     Ok(output)
 }
 
@@ -20664,6 +20709,63 @@ mod tests {
         let par_min = super::argmin_dim_tensor_contiguous_f64(&data, &meta, 1).unwrap();
         assert_eq!(par_max, serial_arg(false), "argmax parallel != serial");
         assert_eq!(par_min, serial_arg(true), "argmin parallel != serial");
+    }
+
+    // The parallel arithmetic dim-reductions (frankentorch-kgs4.52) must match the
+    // serial reference bit-for-bit: sum keeps per-lane pairwise order, prod keeps
+    // per-lane sequential order. Covers dim=1 (inner_size=1) and dim=0 (strided),
+    // on an input large enough to trigger the parallel path.
+    #[test]
+    fn parallel_sum_prod_dim_matches_serial() {
+        use ft_core::{DType, Device, TensorMeta};
+        let (a, b) = (96usize, 112usize); // numel 10752 >= 8192
+        let data: Vec<f64> = (0..a * b)
+            .map(|i| (((i * 2654435761usize) % 9973) as f64 - 4096.0) * 1e-3)
+            .collect();
+        let meta = TensorMeta::from_shape(vec![a, b], DType::F64, Device::Cpu);
+
+        // Serial references using the EXACT per-lane order of the kernels.
+        let serial_sum = |dim: usize| -> Vec<f64> {
+            let (red, outer, inner) = if dim == 1 { (b, a, 1) } else { (a, 1, b) };
+            let mut out = Vec::new();
+            let mut scratch = vec![0.0; red];
+            for oi in 0..outer * inner {
+                let o = oi / inner;
+                let ii = oi % inner;
+                for (r, s) in scratch.iter_mut().enumerate() {
+                    *s = data[o * red * inner + r * inner + ii];
+                }
+                out.push(super::pairwise_sum_f64(&scratch));
+            }
+            out
+        };
+        let serial_prod = |dim: usize| -> Vec<f64> {
+            let (red, outer, inner) = if dim == 1 { (b, a, 1) } else { (a, 1, b) };
+            let mut out = Vec::new();
+            for oi in 0..outer * inner {
+                let o = oi / inner;
+                let ii = oi % inner;
+                let mut p = 1.0;
+                for r in 0..red {
+                    p *= data[o * red * inner + r * inner + ii];
+                }
+                out.push(p);
+            }
+            out
+        };
+        for dim in [1usize, 0] {
+            let bits = |v: &[f64]| v.iter().map(|x| x.to_bits()).collect::<Vec<_>>();
+            assert_eq!(
+                bits(&super::sum_dim_tensor_contiguous_f64(&data, &meta, dim).unwrap()),
+                bits(&serial_sum(dim)),
+                "sum_dim parallel != serial dim={dim}"
+            );
+            assert_eq!(
+                bits(&super::prod_dim_tensor_contiguous_f64(&data, &meta, dim).unwrap()),
+                bits(&serial_prod(dim)),
+                "prod_dim parallel != serial dim={dim}"
+            );
+        }
     }
 
     // The parallel dim-max/min (value+index) (frankentorch-kgs4.51) must match the
