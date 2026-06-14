@@ -22154,7 +22154,14 @@ pub fn complex_abs_contiguous(
     if !meta.is_contiguous() {
         return Err(KernelError::UnsupportedLayout { side: "input" });
     }
-    Ok(input.iter().map(|z| z.norm()).collect())
+    // |a+bi| = hypot(a, b) — compute-bound (sqrt), so parallelize like the other
+    // transcendental elementwise ops. Pure per-element map → bit-identical to
+    // serial. frankentorch-kgs4.91.
+    if input.len() >= PARALLEL_THRESHOLD {
+        Ok(input.par_iter().map(|z| z.norm()).collect())
+    } else {
+        Ok(input.iter().map(|z| z.norm()).collect())
+    }
 }
 
 /// Phase angle of each complex element: angle(a+bi) = atan2(b, a).
@@ -22165,7 +22172,13 @@ pub fn complex_angle_contiguous(
     if !meta.is_contiguous() {
         return Err(KernelError::UnsupportedLayout { side: "input" });
     }
-    Ok(input.iter().map(|z| z.arg()).collect())
+    // angle = atan2(b, a) — the most compute-bound complex op (~atan2/element).
+    // Pure per-element map → bit-identical to serial. frankentorch-kgs4.91.
+    if input.len() >= PARALLEL_THRESHOLD {
+        Ok(input.par_iter().map(|z| z.arg()).collect())
+    } else {
+        Ok(input.iter().map(|z| z.arg()).collect())
+    }
 }
 
 /// Element-wise complex addition.
@@ -22209,6 +22222,9 @@ pub fn complex_mul_contiguous(
             rhs: rhs_meta.shape().to_vec(),
         });
     }
+    // NB: complex mul/div stay serial — measured memory-bandwidth-bound
+    // (~0.5-1ns/elem), so a rayon split regressed them (kgs4.91 A/B). Only the
+    // genuinely compute-bound abs(sqrt)/angle(atan2) are parallelized.
     Ok(lhs.iter().zip(rhs.iter()).map(|(a, b)| a * b).collect())
 }
 
@@ -22231,6 +22247,8 @@ pub fn complex_div_contiguous(
             rhs: rhs_meta.shape().to_vec(),
         });
     }
+    // Serial: bandwidth-bound like complex mul (kgs4.91 A/B showed a parallel
+    // regression); the per-element division work doesn't cover rayon dispatch.
     Ok(lhs.iter().zip(rhs.iter()).map(|(a, b)| a / b).collect())
 }
 
