@@ -2393,26 +2393,57 @@ pub fn reduce_sum_for_broadcast(
         return Ok(Vec::new());
     }
 
-    let original_strides =
-        broadcast_strides(original_shape, expanded_shape, "broadcast strides overflow")?;
-    let mut reduced = vec![0.0; original_numel];
-    let mut coords = vec![0usize; ndim];
+    // The serial sweep adds expanded_grad[e] (row-major e) into reduced[orig(e)].
+    // Equivalently, reduced[o] = Σ of the grads whose expanded index maps to `o`,
+    // summed in increasing expanded-flat-index order. Computing each output
+    // independently in that exact order lets us parallelize over outputs WITHOUT
+    // changing the floating-point accumulation order — bit-identical to the serial
+    // scatter-add. The per-output index decode (not the single read) dominates, so
+    // it is compute-bound. frankentorch-kgs4.95.
+    let expanded_strides = ft_core::contiguous_strides(expanded_shape);
+    let original_cstrides = ft_core::contiguous_strides(original_shape);
+    // Dims that were broadcast (original size 1, expanded > 1): the contributors to
+    // each output range over the cartesian product of these, in row-major order.
+    let bcast_dims: Vec<usize> = (0..ndim)
+        .filter(|&d| original_shape[d] == 1 && expanded_shape[d] > 1)
+        .collect();
+    let bcast_sizes: Vec<usize> = bcast_dims.iter().map(|&d| expanded_shape[d]).collect();
+    let num_contrib: usize = bcast_sizes.iter().product();
 
-    for grad in expanded_grad {
-        let mut original_idx = 0usize;
+    let reduce_one = |o: usize| -> f64 {
+        // Base expanded-flat index from the (fixed) non-broadcast coordinates.
+        let mut rem = o;
+        let mut base = 0usize;
         for d in 0..ndim {
-            original_idx += coords[d] * original_strides[d];
+            let oc = rem / original_cstrides[d];
+            rem %= original_cstrides[d];
+            base += oc * expanded_strides[d];
         }
-        reduced[original_idx] += *grad;
-
-        for d in (0..ndim).rev() {
-            coords[d] += 1;
-            if coords[d] < expanded_shape[d] {
-                break;
+        // Sum contributors in increasing expanded-flat order (row-major over the
+        // broadcast dims, last broadcast dim varying fastest) — matches the serial
+        // sweep's visitation order for this output exactly.
+        let mut acc = 0.0_f64;
+        for count in 0..num_contrib {
+            let mut c = count;
+            let mut offset = 0usize;
+            for k in (0..bcast_dims.len()).rev() {
+                let coord = c % bcast_sizes[k];
+                c /= bcast_sizes[k];
+                offset += coord * expanded_strides[bcast_dims[k]];
             }
-            coords[d] = 0;
+            acc += expanded_grad[base + offset];
         }
-    }
+        acc
+    };
+
+    let reduced: Vec<f64> = if expanded_numel >= PARALLEL_THRESHOLD {
+        (0..original_numel)
+            .into_par_iter()
+            .map(reduce_one)
+            .collect()
+    } else {
+        (0..original_numel).map(reduce_one).collect()
+    };
 
     Ok(reduced)
 }
@@ -22025,27 +22056,47 @@ pub fn reduce_sum_for_broadcast_f32(
     if original_numel == 0 {
         return Ok(Vec::new());
     }
-    let original_strides = broadcast_strides(
-        original_shape,
-        expanded_shape,
-        "broadcast_f32 strides overflow",
-    )?;
-    let mut reduced = vec![0.0f32; original_numel];
-    let mut coords = vec![0usize; ndim];
-    for grad in expanded_grad {
-        let mut original_idx = 0usize;
+    // Parallel-over-outputs, contributors summed in increasing expanded-flat order =
+    // the serial sweep's per-output order → bit-identical. See the f64 twin for the
+    // full rationale. frankentorch-kgs4.95.
+    let expanded_strides = ft_core::contiguous_strides(expanded_shape);
+    let original_cstrides = ft_core::contiguous_strides(original_shape);
+    let bcast_dims: Vec<usize> = (0..ndim)
+        .filter(|&d| original_shape[d] == 1 && expanded_shape[d] > 1)
+        .collect();
+    let bcast_sizes: Vec<usize> = bcast_dims.iter().map(|&d| expanded_shape[d]).collect();
+    let num_contrib: usize = bcast_sizes.iter().product();
+
+    let reduce_one = |o: usize| -> f32 {
+        let mut rem = o;
+        let mut base = 0usize;
         for d in 0..ndim {
-            original_idx += coords[d] * original_strides[d];
+            let oc = rem / original_cstrides[d];
+            rem %= original_cstrides[d];
+            base += oc * expanded_strides[d];
         }
-        reduced[original_idx] += *grad;
-        for d in (0..ndim).rev() {
-            coords[d] += 1;
-            if coords[d] < expanded_shape[d] {
-                break;
+        let mut acc = 0.0_f32;
+        for count in 0..num_contrib {
+            let mut c = count;
+            let mut offset = 0usize;
+            for k in (0..bcast_dims.len()).rev() {
+                let coord = c % bcast_sizes[k];
+                c /= bcast_sizes[k];
+                offset += coord * expanded_strides[bcast_dims[k]];
             }
-            coords[d] = 0;
+            acc += expanded_grad[base + offset];
         }
-    }
+        acc
+    };
+
+    let reduced: Vec<f32> = if expanded_numel >= PARALLEL_THRESHOLD {
+        (0..original_numel)
+            .into_par_iter()
+            .map(reduce_one)
+            .collect()
+    } else {
+        (0..original_numel).map(reduce_one).collect()
+    };
     Ok(reduced)
 }
 
@@ -26855,6 +26906,111 @@ mod tests {
         let err = super::reduce_sum_for_broadcast(&[1.0, 2.0, 3.0], &[2, 2], &[1, 2])
             .expect_err("gradient shape mismatch should fail");
         assert!(matches!(err, super::KernelError::ShapeMismatch { .. }));
+    }
+
+    #[test]
+    fn reduce_sum_for_broadcast_parallel_matches_serial_scatter_bit_exact() {
+        // Reference = the original serial row-major scatter-add. The production fn
+        // takes its parallel-over-outputs path once expanded_numel >= the threshold;
+        // the sizes below cross it. Results must be BIT-FOR-BIT identical (kgs4.95).
+        fn serial_ref(grad: &[f64], expanded: &[usize], original: &[usize]) -> Vec<f64> {
+            let ndim = expanded.len();
+            let ostrides =
+                super::broadcast_strides(original, expanded, "ref").expect("ref strides");
+            let onumel: usize = original.iter().product();
+            let mut reduced = vec![0.0_f64; onumel];
+            let mut coords = vec![0usize; ndim];
+            for g in grad {
+                let mut idx = 0usize;
+                for d in 0..ndim {
+                    idx += coords[d] * ostrides[d];
+                }
+                reduced[idx] += *g;
+                for d in (0..ndim).rev() {
+                    coords[d] += 1;
+                    if coords[d] < expanded[d] {
+                        break;
+                    }
+                    coords[d] = 0;
+                }
+            }
+            reduced
+        }
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[256, 64], &[1, 64]),       // reduce leading dim
+            (&[64, 256], &[64, 1]),       // reduce trailing dim
+            (&[16, 32, 24], &[1, 32, 1]), // reduce both ends
+            (&[100, 100], &[1, 1]),       // reduce to scalar
+            (&[8, 8, 8, 32], &[8, 1, 8, 1]),
+            (&[4096, 5], &[1, 5]),
+        ];
+        for (expanded, original) in cases {
+            let numel: usize = expanded.iter().product();
+            // deterministic pseudo-random grads with a wide dynamic range so any
+            // accumulation-order difference would surface in the low bits.
+            let grad: Vec<f64> = (0..numel)
+                .map(|i| {
+                    let x = ((i.wrapping_mul(2654435761)) % 7919) as f64;
+                    (x - 3959.0) * 1.000_000_000_173
+                })
+                .collect();
+            let got = super::reduce_sum_for_broadcast(&grad, expanded, original).expect("reduce");
+            let want = serial_ref(&grad, expanded, original);
+            assert_eq!(got.len(), want.len(), "shape {expanded:?}->{original:?}");
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(
+                    g.to_bits(),
+                    w.to_bits(),
+                    "bit mismatch at {i} for {expanded:?}->{original:?}: {g} vs {w}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn reduce_sum_for_broadcast_f32_parallel_matches_serial_scatter_bit_exact() {
+        fn serial_ref(grad: &[f32], expanded: &[usize], original: &[usize]) -> Vec<f32> {
+            let ndim = expanded.len();
+            let ostrides =
+                super::broadcast_strides(original, expanded, "ref").expect("ref strides");
+            let onumel: usize = original.iter().product();
+            let mut reduced = vec![0.0_f32; onumel];
+            let mut coords = vec![0usize; ndim];
+            for g in grad {
+                let mut idx = 0usize;
+                for d in 0..ndim {
+                    idx += coords[d] * ostrides[d];
+                }
+                reduced[idx] += *g;
+                for d in (0..ndim).rev() {
+                    coords[d] += 1;
+                    if coords[d] < expanded[d] {
+                        break;
+                    }
+                    coords[d] = 0;
+                }
+            }
+            reduced
+        }
+        let cases: &[(&[usize], &[usize])] = &[
+            (&[256, 64], &[1, 64]),
+            (&[64, 256], &[64, 1]),
+            (&[16, 32, 24], &[1, 32, 1]),
+            (&[100, 100], &[1, 1]),
+            (&[8, 8, 8, 32], &[8, 1, 8, 1]),
+        ];
+        for (expanded, original) in cases {
+            let numel: usize = expanded.iter().product();
+            let grad: Vec<f32> = (0..numel)
+                .map(|i| (((i.wrapping_mul(2654435761)) % 7919) as f32 - 3959.0) * 1.000_03)
+                .collect();
+            let got =
+                super::reduce_sum_for_broadcast_f32(&grad, expanded, original).expect("reduce");
+            let want = serial_ref(&grad, expanded, original);
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert_eq!(g.to_bits(), w.to_bits(), "f32 bit mismatch at {i}");
+            }
+        }
     }
 
     // ── index_select tests ─────────────────────────────────────────────
