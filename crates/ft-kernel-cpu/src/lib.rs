@@ -8775,6 +8775,42 @@ pub fn scatter_add_tensor_contiguous_f64(
     let idx_offset = index_meta.storage_offset();
     let index_data = &index[idx_offset..];
 
+    // Each output element `outer·dim_size·inner_size + s·inner_size + inner` belongs
+    // to exactly one (outer, inner) column (row s), so distinct (outer, inner) pairs
+    // touch DISJOINT outputs — the only accumulation collisions are across the scatter
+    // index `r` within one column. Parallelize over the (outer, inner) columns: each
+    // builds its own length-`dim_size` accumulator, scattering `r` in increasing order
+    // (identical to the serial sweep's per-column order → bit-exact), then the strided
+    // columns are written back disjointly. frankentorch-kgs4.97.
+    let total_cols = outer_size * inner_size;
+    if src_numel >= PARALLEL_THRESHOLD && total_cols >= 2 {
+        let cols = (0..total_cols)
+            .into_par_iter()
+            .map(|oi| -> Result<Vec<f64>, KernelError> {
+                let outer = oi / inner_size;
+                let inner = oi % inner_size;
+                let mut col = vec![0.0_f64; dim_size];
+                for (s, slot) in col.iter_mut().enumerate() {
+                    *slot = output[outer * dim_size * inner_size + s * inner_size + inner];
+                }
+                for r in 0..idx_dim_size {
+                    let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
+                    let selected = normalize_strict_index_value(index_data[idx_pos], dim_size)?;
+                    col[selected] += src[idx_pos];
+                }
+                Ok(col)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (oi, col) in cols.iter().enumerate() {
+            let outer = oi / inner_size;
+            let inner = oi % inner_size;
+            for (s, &v) in col.iter().enumerate() {
+                output[outer * dim_size * inner_size + s * inner_size + inner] = v;
+            }
+        }
+        return Ok(output);
+    }
+
     for outer in 0..outer_size {
         for r in 0..idx_dim_size {
             for inner in 0..inner_size {
@@ -21335,6 +21371,37 @@ pub fn scatter_add_tensor_contiguous_f32(
     let mut output = input[offset..offset + numel].to_vec();
     let idx_offset = index_meta.storage_offset();
     let index_data = &index[idx_offset..];
+    // Distinct (outer, inner) columns touch disjoint outputs; parallelize over them,
+    // each scattering `r` in increasing order into a local accumulator (bit-exact),
+    // then write the strided columns back. See the f64 twin. frankentorch-kgs4.97.
+    let total_cols = outer_size * inner_size;
+    if src_numel >= PARALLEL_THRESHOLD && total_cols >= 2 {
+        let cols = (0..total_cols)
+            .into_par_iter()
+            .map(|oi| -> Result<Vec<f32>, KernelError> {
+                let outer = oi / inner_size;
+                let inner = oi % inner_size;
+                let mut col = vec![0.0_f32; dim_size];
+                for (s, slot) in col.iter_mut().enumerate() {
+                    *slot = output[outer * dim_size * inner_size + s * inner_size + inner];
+                }
+                for r in 0..idx_dim_size {
+                    let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
+                    let selected = normalize_strict_index_value(index_data[idx_pos], dim_size)?;
+                    col[selected] += src[idx_pos];
+                }
+                Ok(col)
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        for (oi, col) in cols.iter().enumerate() {
+            let outer = oi / inner_size;
+            let inner = oi % inner_size;
+            for (s, &v) in col.iter().enumerate() {
+                output[outer * dim_size * inner_size + s * inner_size + inner] = v;
+            }
+        }
+        return Ok(output);
+    }
     for outer in 0..outer_size {
         for r in 0..idx_dim_size {
             for inner in 0..inner_size {
@@ -27010,6 +27077,114 @@ mod tests {
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
                 assert_eq!(g.to_bits(), w.to_bits(), "f32 bit mismatch at {i}");
             }
+        }
+    }
+
+    #[test]
+    fn scatter_add_parallel_matches_serial_with_collisions_bit_exact() {
+        // Original serial sweep as the reference. The case below crosses the
+        // parallel threshold (src_numel >= PARALLEL_THRESHOLD, total_cols = m >= 2),
+        // and has heavy index COLLISIONS (200 rows -> 50 outputs) so any change in
+        // accumulation order would surface in the low bits. (kgs4.97)
+        fn serial(
+            input: &[f64],
+            shape: &[usize],
+            dim: usize,
+            index: &[f64],
+            idx_shape: &[usize],
+            src: &[f64],
+        ) -> Vec<f64> {
+            let dim_size = shape[dim];
+            let idx_dim_size = idx_shape[dim];
+            let inner_size: usize = idx_shape[dim + 1..].iter().product();
+            let outer_size: usize = idx_shape[..dim].iter().product();
+            let numel: usize = shape.iter().product();
+            let mut output = input[..numel].to_vec();
+            for outer in 0..outer_size {
+                for r in 0..idx_dim_size {
+                    for inner in 0..inner_size {
+                        let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
+                        let selected = index[idx_pos] as usize;
+                        let dst = outer * dim_size * inner_size + selected * inner_size + inner;
+                        output[dst] += src[idx_pos];
+                    }
+                }
+            }
+            output
+        }
+        let (num_emb, m, n) = (50usize, 256usize, 200usize); // embedding-backward shape
+        let out_shape = [num_emb, m];
+        let idx_shape = [n, m];
+        let input: Vec<f64> = (0..num_emb * m).map(|i| (i % 97) as f64 * 0.1).collect();
+        let src: Vec<f64> = (0..n * m)
+            .map(|i| ((i * 31) % 101) as f64 * 0.01 - 0.5)
+            .collect();
+        let index: Vec<f64> = (0..n * m)
+            .map(|i| (i.wrapping_mul(2654435761) % num_emb) as f64)
+            .collect();
+        assert!(n * m >= super::PARALLEL_THRESHOLD, "must hit parallel path");
+        let meta = TensorMeta::from_shape(out_shape.to_vec(), DType::F64, Device::Cpu);
+        let idx_meta = TensorMeta::from_shape(idx_shape.to_vec(), DType::F64, Device::Cpu);
+        let got =
+            super::scatter_add_tensor_contiguous_f64(&input, &meta, 0, &index, &idx_meta, &src)
+                .expect("scatter_add");
+        let want = serial(&input, &out_shape, 0, &index, &idx_shape, &src);
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(g.to_bits(), w.to_bits(), "scatter_add bit mismatch at {i}");
+        }
+    }
+
+    #[test]
+    fn scatter_add_f32_parallel_matches_serial_with_collisions_bit_exact() {
+        fn serial(
+            input: &[f32],
+            shape: &[usize],
+            dim: usize,
+            index: &[f64],
+            idx_shape: &[usize],
+            src: &[f32],
+        ) -> Vec<f32> {
+            let dim_size = shape[dim];
+            let idx_dim_size = idx_shape[dim];
+            let inner_size: usize = idx_shape[dim + 1..].iter().product();
+            let outer_size: usize = idx_shape[..dim].iter().product();
+            let numel: usize = shape.iter().product();
+            let mut output = input[..numel].to_vec();
+            for outer in 0..outer_size {
+                for r in 0..idx_dim_size {
+                    for inner in 0..inner_size {
+                        let idx_pos = outer * idx_dim_size * inner_size + r * inner_size + inner;
+                        let selected = index[idx_pos] as usize;
+                        let dst = outer * dim_size * inner_size + selected * inner_size + inner;
+                        output[dst] += src[idx_pos];
+                    }
+                }
+            }
+            output
+        }
+        let (num_emb, m, n) = (50usize, 256usize, 200usize);
+        let out_shape = [num_emb, m];
+        let idx_shape = [n, m];
+        let input: Vec<f32> = (0..num_emb * m).map(|i| (i % 97) as f32 * 0.1).collect();
+        let src: Vec<f32> = (0..n * m)
+            .map(|i| ((i * 31) % 101) as f32 * 0.01 - 0.5)
+            .collect();
+        let index: Vec<f64> = (0..n * m)
+            .map(|i| (i.wrapping_mul(2654435761) % num_emb) as f64)
+            .collect();
+        assert!(n * m >= super::PARALLEL_THRESHOLD);
+        let meta = TensorMeta::from_shape(out_shape.to_vec(), DType::F32, Device::Cpu);
+        let idx_meta = TensorMeta::from_shape(idx_shape.to_vec(), DType::F64, Device::Cpu);
+        let got =
+            super::scatter_add_tensor_contiguous_f32(&input, &meta, 0, &index, &idx_meta, &src)
+                .expect("scatter_add_f32");
+        let want = serial(&input, &out_shape, 0, &index, &idx_shape, &src);
+        for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "scatter_add_f32 bit mismatch at {i}"
+            );
         }
     }
 
