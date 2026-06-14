@@ -9257,41 +9257,57 @@ pub fn cumprod_backward_tensor_contiguous_f64(
     let out_data = &output[offset..];
     let go_data = &grad_output[offset..];
 
-    for outer in 0..outer_size {
+    // Each (outer,inner) lane's gradient is computed purely from values within that
+    // lane (reads are absolute; writes target only this lane's slice), so the outer
+    // blocks are independent and fan out over Rayon bit-for-bit identically to the
+    // serial scan. The zero-input branch is O(dim^2), so this is compute-heavy and
+    // benefits strongly. Mirrors the forward cumprod lane parallelization.
+    let lane = dim_size * inner_size;
+    let compute_lane = |base: usize, out_chunk: &mut [f64]| {
         for inner in 0..inner_size {
             // Compute reverse cumsum of (grad_output * output)
             let mut acc = 0.0;
             for d in (0..dim_size).rev() {
-                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                let idx = base + d * inner_size + inner;
                 acc += go_data[idx] * out_data[idx];
                 let inp = in_data[idx];
                 if inp.abs() > f64::EPSILON {
-                    grad_input[idx] = acc / inp;
+                    out_chunk[d * inner_size + inner] = acc / inp;
                 } else {
                     // When input is zero, compute gradient by direct summation
                     // to avoid division by zero
                     let mut sum = 0.0;
                     for j in d..dim_size {
-                        let j_idx = outer * dim_size * inner_size + j * inner_size + inner;
+                        let j_idx = base + j * inner_size + inner;
                         // Product of all elements except position d, from d to j
                         let mut prod = 1.0;
                         for k in d..=j {
                             if k != d {
-                                let k_idx = outer * dim_size * inner_size + k * inner_size + inner;
+                                let k_idx = base + k * inner_size + inner;
                                 prod *= in_data[k_idx];
                             }
                         }
                         // Also include the prefix product (elements before d)
                         if d > 0 {
-                            let prev_idx =
-                                outer * dim_size * inner_size + (d - 1) * inner_size + inner;
+                            let prev_idx = base + (d - 1) * inner_size + inner;
                             prod *= out_data[prev_idx];
                         }
                         sum += go_data[j_idx] * prod;
                     }
-                    grad_input[idx] = sum;
+                    out_chunk[d * inner_size + inner] = sum;
                 }
             }
+        }
+    };
+    if numel >= PARALLEL_THRESHOLD && outer_size >= 2 {
+        grad_input
+            .par_chunks_mut(lane)
+            .enumerate()
+            .for_each(|(outer, out_chunk)| compute_lane(outer * lane, out_chunk));
+    } else {
+        for outer in 0..outer_size {
+            let base = outer * lane;
+            compute_lane(base, &mut grad_input[base..base + lane]);
         }
     }
 
@@ -21833,36 +21849,49 @@ pub fn cumprod_backward_tensor_contiguous_f32(
     let in_data = &input[offset..];
     let out_data = &output[offset..];
     let go_data = &grad_output[offset..];
-    for outer in 0..outer_size {
+    // Independent (outer,inner) lanes -> Rayon; reads absolute, writes lane-local =
+    // bit-exact. Mirrors the f64 path.
+    let lane = dim_size * inner_size;
+    let compute_lane = |base: usize, out_chunk: &mut [f32]| {
         for inner in 0..inner_size {
             let mut acc = 0.0f32;
             for d in (0..dim_size).rev() {
-                let idx = outer * dim_size * inner_size + d * inner_size + inner;
+                let idx = base + d * inner_size + inner;
                 acc += go_data[idx] * out_data[idx];
                 let inp = in_data[idx];
                 if inp.abs() > f32::EPSILON {
-                    grad_input[idx] = acc / inp;
+                    out_chunk[d * inner_size + inner] = acc / inp;
                 } else {
                     let mut sum = 0.0f32;
                     for j in d..dim_size {
-                        let j_idx = outer * dim_size * inner_size + j * inner_size + inner;
+                        let j_idx = base + j * inner_size + inner;
                         let mut prod = 1.0f32;
                         for kk in d..=j {
                             if kk != d {
-                                let k_idx = outer * dim_size * inner_size + kk * inner_size + inner;
+                                let k_idx = base + kk * inner_size + inner;
                                 prod *= in_data[k_idx];
                             }
                         }
                         if d > 0 {
-                            let prev_idx =
-                                outer * dim_size * inner_size + (d - 1) * inner_size + inner;
+                            let prev_idx = base + (d - 1) * inner_size + inner;
                             prod *= out_data[prev_idx];
                         }
                         sum += go_data[j_idx] * prod;
                     }
-                    grad_input[idx] = sum;
+                    out_chunk[d * inner_size + inner] = sum;
                 }
             }
+        }
+    };
+    if numel >= PARALLEL_THRESHOLD && outer_size >= 2 {
+        grad_input
+            .par_chunks_mut(lane)
+            .enumerate()
+            .for_each(|(outer, out_chunk)| compute_lane(outer * lane, out_chunk));
+    } else {
+        for outer in 0..outer_size {
+            let base = outer * lane;
+            compute_lane(base, &mut grad_input[base..base + lane]);
         }
     }
     Ok(grad_input)
