@@ -18186,7 +18186,7 @@ impl TensorTape {
         })
     }
 
-    fn repeat_slice<T: Clone>(
+    fn repeat_slice<T: Clone + Send + Sync>(
         values: &[T],
         repeat_shape: &[usize],
         repeats: &[usize],
@@ -18211,18 +18211,28 @@ impl TensorTape {
         let output_strides = ft_core::contiguous_strides(output_shape);
         let src_strides = ft_core::contiguous_strides(repeat_shape);
         let ndim = repeats.len();
-        let mut result = vec![values[0].clone(); output_numel];
-        for (flat, slot) in result.iter_mut().enumerate() {
+        // Each output element independently unravels its flat index and maps each dim
+        // back through the periodic `% repeat_shape[d]` to a source index — the per-dim
+        // div/mod index math (not the single clone) dominates, so this gather is
+        // compute-bound and parallelizes cleanly. Indexed map preserves order →
+        // bit-identical to the serial fill. frankentorch-kgs4.103.
+        let eval = |flat: usize| -> T {
             let mut remaining = flat;
             let mut src_flat = 0;
             for d in 0..ndim {
                 let coord = remaining / output_strides[d];
                 remaining %= output_strides[d];
-                let src_coord = coord % repeat_shape[d];
-                src_flat += src_coord * src_strides[d];
+                src_flat += (coord % repeat_shape[d]) * src_strides[d];
             }
-            *slot = values[src_flat].clone();
-        }
+            values[src_flat].clone()
+        };
+        const REPEAT_PAR_MIN: usize = 1 << 13; // 8192
+        let result: Vec<T> = if output_numel >= REPEAT_PAR_MIN {
+            use rayon::prelude::*;
+            (0..output_numel).into_par_iter().map(eval).collect()
+        } else {
+            (0..output_numel).map(eval).collect()
+        };
         Ok(result)
     }
 

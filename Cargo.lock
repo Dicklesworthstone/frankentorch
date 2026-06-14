@@ -754,6 +754,7 @@ dependencies = [
  "insta",
  "libm",
  "proptest",
+ "rayon",
 ]
 
 [[package]]
