@@ -14303,6 +14303,62 @@ pub fn lu_solve_backward_f64(
     (packed, grad_b)
 }
 
+/// Reverse-mode VJP of the matrix inverse `Y = A⁻¹` from the output cotangent
+/// `grad_y`:  grad_A = −Yᵀ·grad_Y·Yᵀ. Routes the two matmuls through the parallel
+/// cache-blocked GEMM (BLAS-3) instead of scalar O(n³) loops. TOLERANCE (gradients
+/// are tolerance-parity, finite-difference validated). frankentorch-kgs4.81.
+pub fn inv_backward_f64(y: &[f64], grad_y: &[f64], n: usize) -> Vec<f64> {
+    let mut yt = vec![0.0f64; n * n];
+    for k in 0..n {
+        for i in 0..n {
+            yt[i * n + k] = y[k * n + i];
+        }
+    }
+    let mut tmp = vec![0.0f64; n * n];
+    gemm::dgemm(n, n, n, &yt, grad_y, &mut tmp); // Yᵀ·grad_Y
+    let mut grad_a = vec![0.0f64; n * n];
+    gemm::dgemm_bt(n, n, n, &tmp, y, &mut grad_a); // tmp·Yᵀ
+    for v in grad_a.iter_mut() {
+        *v = -*v;
+    }
+    grad_a
+}
+
+/// VJP of `cholesky_solve` wrt the factor: grad_L = −sym(grad_B·Xᵀ)·L (lower) or
+/// −L·sym(grad_B·Xᵀ) (upper), where `grad_b` is the already-solved RHS cotangent
+/// (n×nrhs), `x` the saved solution (n×nrhs), `l` the n×n factor. Routes the matmuls
+/// through the parallel cache-blocked GEMM (BLAS-3). TOLERANCE (gradients).
+/// frankentorch-kgs4.81.
+pub fn cholesky_solve_backward_grad_l_f64(
+    l: &[f64],
+    grad_b: &[f64],
+    x: &[f64],
+    n: usize,
+    nrhs: usize,
+    upper: bool,
+) -> Vec<f64> {
+    // m = grad_B · Xᵀ, then common = m + mᵀ.
+    let mut m = vec![0.0f64; n * n];
+    gemm::dgemm_bt(n, nrhs, n, grad_b, x, &mut m);
+    let mut common = vec![0.0f64; n * n];
+    for i in 0..n {
+        for k in 0..n {
+            common[i * n + k] = m[i * n + k] + m[k * n + i];
+        }
+    }
+    // grad_L = −(common·L) [lower] | −(L·common) [upper].
+    let mut grad_l = vec![0.0f64; n * n];
+    if upper {
+        gemm::dgemm(n, n, n, l, &common, &mut grad_l);
+    } else {
+        gemm::dgemm(n, n, n, &common, l, &mut grad_l);
+    }
+    for v in grad_l.iter_mut() {
+        *v = -*v;
+    }
+    grad_l
+}
+
 /// Compute just the eigenvalues of a symmetric matrix (sorted ascending).
 pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
