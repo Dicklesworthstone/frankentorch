@@ -9158,13 +9158,37 @@ pub fn cumprod_tensor_contiguous_f64(
     let mut output = vec![0.0; numel];
     let data = &input[offset..];
 
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let mut acc = 1.0;
-            for d in 0..dim_size {
-                let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                acc *= data[idx];
-                output[idx] = acc;
+    // The `outer` blocks are independent and own contiguous `dim_size*inner_size`
+    // output slices, so fan them out over Rayon. Each lane's multiplicative
+    // accumulation order is unchanged, so the result is bit-for-bit identical to
+    // the serial scan. Mirrors `cumsum_tensor_contiguous_f64`; the parallel win
+    // was confirmed by an anchored single-process A/B (cumsum 2.2x anchor,
+    // cumprod 2.9x) resolving the earlier separate-exec worker-variance confound.
+    let lane = dim_size * inner_size;
+    if numel >= PARALLEL_THRESHOLD && outer_size >= 2 {
+        output
+            .par_chunks_mut(lane)
+            .enumerate()
+            .for_each(|(outer, out_chunk)| {
+                let base = outer * lane;
+                for inner in 0..inner_size {
+                    let mut acc = 1.0;
+                    for d in 0..dim_size {
+                        let idx = d * inner_size + inner;
+                        acc *= data[base + idx];
+                        out_chunk[idx] = acc;
+                    }
+                }
+            });
+    } else {
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let mut acc = 1.0;
+                for d in 0..dim_size {
+                    let idx = outer * lane + d * inner_size + inner;
+                    acc *= data[idx];
+                    output[idx] = acc;
+                }
             }
         }
     }
@@ -21707,13 +21731,33 @@ pub fn cumprod_tensor_contiguous_f32(
     let offset = meta.storage_offset();
     let mut output = vec![0.0f32; numel];
     let data = &input[offset..];
-    for outer in 0..outer_size {
-        for inner in 0..inner_size {
-            let mut acc = 1.0f32;
-            for d in 0..dim_size {
-                let idx = outer * dim_size * inner_size + d * inner_size + inner;
-                acc *= data[idx];
-                output[idx] = acc;
+    // Independent `outer` lanes -> Rayon; per-lane order unchanged = bit-exact.
+    // Mirrors the f64 path (anchored A/B confirmed the parallel win).
+    let lane = dim_size * inner_size;
+    if numel >= PARALLEL_THRESHOLD && outer_size >= 2 {
+        output
+            .par_chunks_mut(lane)
+            .enumerate()
+            .for_each(|(outer, out_chunk)| {
+                let base = outer * lane;
+                for inner in 0..inner_size {
+                    let mut acc = 1.0f32;
+                    for d in 0..dim_size {
+                        let idx = d * inner_size + inner;
+                        acc *= data[base + idx];
+                        out_chunk[idx] = acc;
+                    }
+                }
+            });
+    } else {
+        for outer in 0..outer_size {
+            for inner in 0..inner_size {
+                let mut acc = 1.0f32;
+                for d in 0..dim_size {
+                    let idx = outer * lane + d * inner_size + inner;
+                    acc *= data[idx];
+                    output[idx] = acc;
+                }
             }
         }
     }
