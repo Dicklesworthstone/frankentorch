@@ -14062,6 +14062,64 @@ pub fn qr_backward_tall_f64(
     grad_a
 }
 
+/// Reverse-mode VJP of the lower Cholesky factorization `L = chol(A)` from the
+/// factor cotangent `grad_l` (n×n):
+///   Φ = ½·diag + tril(Lᵀ·grad_L, −1) ; grad_A = sym(L⁻ᵀ·(Φ·L⁻¹)).
+/// Routes the three matmuls (Lᵀ·grad_L, Φ·L⁻¹, L⁻ᵀ·t) through the parallel
+/// cache-blocked GEMM (BLAS-3); the small L⁻¹ forward-substitution stays scalar.
+/// TOLERANCE (gradients are tolerance-parity, finite-difference validated).
+/// frankentorch-kgs4.78.
+pub fn cholesky_backward_lower_f64(l: &[f64], grad_l: &[f64], n: usize) -> Vec<f64> {
+    // Φ = lower-triangular part of Lᵀ·grad_L, diagonal halved.
+    let mut lt = vec![0.0f64; n * n];
+    for k in 0..n {
+        for i in 0..n {
+            lt[i * n + k] = l[k * n + i];
+        }
+    }
+    let mut ltgl = vec![0.0f64; n * n];
+    gemm::dgemm(n, n, n, &lt, grad_l, &mut ltgl);
+    let mut phi = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..=i {
+            phi[i * n + j] = if i == j {
+                0.5 * ltgl[i * n + j]
+            } else {
+                ltgl[i * n + j]
+            };
+        }
+    }
+    // L⁻¹ (lower-triangular) via forward substitution: solve L·Linv = I.
+    let mut linv = vec![0.0f64; n * n];
+    for c in 0..n {
+        for i in c..n {
+            let mut s = if i == c { 1.0 } else { 0.0 };
+            for j in c..i {
+                s -= l[i * n + j] * linv[j * n + c];
+            }
+            linv[i * n + c] = s / l[i * n + i];
+        }
+    }
+    // t = Φ·Linv, a_bar = Linvᵀ·t, then symmetrize.
+    let mut t = vec![0.0f64; n * n];
+    gemm::dgemm(n, n, n, &phi, &linv, &mut t);
+    let mut linvt = vec![0.0f64; n * n];
+    for k in 0..n {
+        for i in 0..n {
+            linvt[i * n + k] = linv[k * n + i];
+        }
+    }
+    let mut a_bar = vec![0.0f64; n * n];
+    gemm::dgemm(n, n, n, &linvt, &t, &mut a_bar);
+    let mut grad_a = vec![0.0f64; n * n];
+    for i in 0..n {
+        for j in 0..n {
+            grad_a[i * n + j] = 0.5 * (a_bar[i * n + j] + a_bar[j * n + i]);
+        }
+    }
+    grad_a
+}
+
 /// Compute just the eigenvalues of a symmetric matrix (sorted ascending).
 pub fn eigvalsh_contiguous_f64(data: &[f64], meta: &TensorMeta) -> Result<Vec<f64>, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
