@@ -11040,11 +11040,11 @@ impl TensorTape {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
 
-                    let sin_contrib = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(grad, x)| grad * x.cos())
-                        .collect::<Vec<_>>();
+                    let sin_contrib = Self::tensor_backward_zip_map(
+                        &incoming,
+                        &input_values,
+                        |grad, x| grad * x.cos(),
+                    );
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sin_contrib)?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -11059,11 +11059,11 @@ impl TensorTape {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
 
-                    let cos_contrib = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(grad, x)| grad * (-x.sin()))
-                        .collect::<Vec<_>>();
+                    let cos_contrib = Self::tensor_backward_zip_map(
+                        &incoming,
+                        &input_values,
+                        |grad, x| grad * (-x.sin()),
+                    );
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &cos_contrib)?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -11210,11 +11210,11 @@ impl TensorTape {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
                     // d/dx asin(x) = 1/sqrt(1-x^2)
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| g / (1.0 - x * x).sqrt())
-                        .collect();
+                    let contrib = Self::tensor_backward_zip_map(
+                        &incoming,
+                        &input_values,
+                        |g, x| g / (1.0 - x * x).sqrt(),
+                    );
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -11227,11 +11227,11 @@ impl TensorTape {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
                     // d/dx acos(x) = -1/sqrt(1-x^2)
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| -g / (1.0 - x * x).sqrt())
-                        .collect();
+                    let contrib = Self::tensor_backward_zip_map(
+                        &incoming,
+                        &input_values,
+                        |g, x| -g / (1.0 - x * x).sqrt(),
+                    );
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -11261,11 +11261,11 @@ impl TensorTape {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
                     // d/dx sinh(x) = cosh(x)
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| g * x.cosh())
-                        .collect();
+                    let contrib = Self::tensor_backward_zip_map(
+                        &incoming,
+                        &input_values,
+                        |g, x| g * x.cosh(),
+                    );
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -11278,11 +11278,11 @@ impl TensorTape {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
                     // d/dx cosh(x) = sinh(x)
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| g * x.sinh())
-                        .collect();
+                    let contrib = Self::tensor_backward_zip_map(
+                        &incoming,
+                        &input_values,
+                        |g, x| g * x.sinh(),
+                    );
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
