@@ -331,29 +331,13 @@ impl Optimizer for SGD {
     ) -> Result<(), AutogradError> {
         self.validate_hyperparams()?;
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match load_param_gradient(session, param)? {
-                Some(g) => g,
+            let grad_len = match session.tensor_accumulated_gradient_len(param)? {
+                Some(len) => len,
                 None => continue,
             };
 
-            let param_values = session.tensor_values(param)?;
-            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let mut effective_grad = grad;
-
-            // maximize: ascend the objective by negating the gradient first
-            // (before weight decay), matching torch.
-            if self.maximize {
-                for g in effective_grad.iter_mut() {
-                    *g = -*g;
-                }
-            }
-
-            // Apply weight decay: grad += weight_decay * param
-            if self.weight_decay != 0.0 {
-                for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
-                    *g += self.weight_decay * p;
-                }
-            }
+            let param_len = session.tensor_values_len(param)?;
+            ensure_grad_len_matches_param(param, param_len, grad_len)?;
 
             if self.momentum != 0.0 {
                 // Update velocity. PyTorch seeds the momentum buffer with
@@ -361,39 +345,61 @@ impl Optimizer for SGD {
                 // from the second step onward applies
                 // `buf = momentum * buf + (1 - dampening) * grad`.
                 let is_first_step = self.velocity[i].is_none();
-                let vel = self.velocity[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
+                let vel = self.velocity[i].get_or_insert_with(|| vec![0.0; grad_len]);
                 ensure_state_len(
-                    effective_grad.len(),
+                    grad_len,
                     vel.len(),
                     "sgd optimizer state length mismatch with gradient length",
                 )?;
-                if is_first_step {
-                    for (v, g) in vel.iter_mut().zip(effective_grad.iter()) {
-                        *v = *g;
-                    }
-                } else {
-                    for (v, g) in vel.iter_mut().zip(effective_grad.iter()) {
-                        *v = self.momentum * *v + (1.0 - self.dampening) * g;
-                    }
-                }
 
-                if self.nesterov {
-                    // Nesterov: param -= lr * (grad + momentum * velocity)
-                    let update: Vec<f64> = effective_grad
-                        .iter()
-                        .zip(vel.iter())
-                        .map(|(g, v)| self.lr * (g + self.momentum * v))
-                        .collect();
-                    apply_param_update(session, param, &update)?;
-                } else {
-                    // Standard momentum: param -= lr * velocity
-                    let update: Vec<f64> = vel.iter().map(|v| self.lr * v).collect();
-                    apply_param_update(session, param, &update)?;
-                }
+                let lr = self.lr;
+                let momentum = self.momentum;
+                let dampening = self.dampening;
+                let weight_decay = self.weight_decay;
+                let maximize = self.maximize;
+                let nesterov = self.nesterov;
+                session.tensor_update_param_values_f64_with_accumulated_gradient(
+                    param,
+                    |grad, param_values| {
+                        for ((p, &g), v) in
+                            param_values.iter_mut().zip(grad.iter()).zip(vel.iter_mut())
+                        {
+                            let original = *p;
+                            let mut effective_grad = if maximize { -g } else { g };
+                            if weight_decay != 0.0 {
+                                effective_grad += weight_decay * original;
+                            }
+                            if is_first_step {
+                                *v = effective_grad;
+                            } else {
+                                *v = momentum * *v + (1.0 - dampening) * effective_grad;
+                            }
+                            let update = if nesterov {
+                                lr * (effective_grad + momentum * *v)
+                            } else {
+                                lr * *v
+                            };
+                            *p -= update;
+                        }
+                    },
+                )?;
             } else {
-                // Vanilla SGD: param -= lr * grad
-                let update: Vec<f64> = effective_grad.iter().map(|g| self.lr * g).collect();
-                apply_param_update(session, param, &update)?;
+                let lr = self.lr;
+                let weight_decay = self.weight_decay;
+                let maximize = self.maximize;
+                session.tensor_update_param_values_f64_with_accumulated_gradient(
+                    param,
+                    |grad, param_values| {
+                        for (p, &g) in param_values.iter_mut().zip(grad.iter()) {
+                            let original = *p;
+                            let mut effective_grad = if maximize { -g } else { g };
+                            if weight_decay != 0.0 {
+                                effective_grad += weight_decay * original;
+                            }
+                            *p -= lr * effective_grad;
+                        }
+                    },
+                )?;
             }
         }
         Ok(())

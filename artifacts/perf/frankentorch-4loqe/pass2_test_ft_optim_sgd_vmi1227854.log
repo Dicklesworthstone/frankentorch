@@ -1,0 +1,285 @@
+  [2m2026-06-15T22:43:47.487462Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (2 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:47.805706Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankentorch-ivorydeer-clean-20260615T214904Z (hash: b58f860600e5d1c4)[0m
+    [2;3mat[0m rch/src/hook.rs:5994 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:47.805748Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6016 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:49.417242Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook.rs:6046 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:49.417323Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:51.786283Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2368ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:51.786355Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-api -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-api on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:53.832352Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2045ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:53.832434Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-autograd -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-autograd on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:55.964282Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2131ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:55.964378Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-conformance -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-conformance on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:57.882733Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1918ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:57.882814Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-core -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-core on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:59.818177Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1935ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:43:59.818260Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-data -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-data on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:01.875788Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2057ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:01.875892Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-device -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-device on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:03.732824Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1856ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:03.732907Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-dispatch on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:05.723435Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1990ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:05.723529Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-kernel-cpu on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:07.606219Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1882ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:07.606312Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-nn -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-nn on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:09.503025Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1896ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:09.503101Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-optim -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-optim on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:11.424893Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1921ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:11.424999Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-runtime -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-runtime on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:13.273633Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1848ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:13.273725Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-serialize -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-serialize on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:15.131035Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1857ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:15.131088Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 3006 files, 130423 bytes in 25704ms[0m
+    [2;3mat[0m rch/src/hook.rs:6209 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:21.197175Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo test -j 1 -p ft-optim sgd -- --nocapture[0m
+    [2;3mat[0m rch/src/hook.rs:6252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:44:21.197236Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/.rch-target-vmi1227854-job-29884606035533976-1781563429417235309-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded clap_lex v1.1.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded cfg-if v1.0.4
+  Downloaded itoa v1.0.18
+  Downloaded ciborium-io v0.2.2
+  Downloaded ciborium-ll v0.2.2
+  Downloaded plotters-backend v0.3.7
+  Downloaded plotters-svg v0.3.7
+  Downloaded same-file v1.0.6
+  Downloaded cast v0.3.0
+  Downloaded is-terminal v0.4.17
+  Downloaded rawpointer v0.2.1
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded criterion-plot v0.5.0
+  Downloaded anes v0.1.6
+  Downloaded anstyle v1.0.14
+  Downloaded num-complex v0.4.6
+  Downloaded either v1.15.0
+  Downloaded walkdir v2.5.0
+  Downloaded autocfg v1.5.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded oorandom v11.1.5
+  Downloaded tinytemplate v1.2.1
+  Downloaded quote v1.0.45
+  Downloaded ciborium v0.2.2
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded once_cell v1.21.4
+  Downloaded zmij v1.0.21
+  Downloaded half v2.7.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded unicode-ident v1.0.24
+  Downloaded criterion v0.5.1
+  Downloaded bytemuck v1.25.0
+  Downloaded serde_core v1.0.228
+  Downloaded matrixmultiply v0.3.10
+  Downloaded clap v4.6.1
+  Downloaded safe_arch v0.7.4
+  Downloaded serde_derive v1.0.228
+  Downloaded num-traits v0.2.19
+  Downloaded rayon-core v1.13.0
+  Downloaded memchr v2.8.0
+  Downloaded serde v1.0.228
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded wide v0.7.33
+  Downloaded itertools v0.10.5
+  Downloaded plotters v0.3.7
+  Downloaded regex v1.12.3
+  Downloaded serde_json v1.0.149
+  Downloaded clap_builder v4.6.0
+  Downloaded libm v0.2.16
+  Downloaded rayon v1.12.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling autocfg v1.5.0
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling zerocopy-derive v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling half v2.7.1
+   Compiling crossbeam-epoch v0.9.18
+   Compiling either v1.15.0
+   Compiling rayon-core v1.13.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling num-complex v0.4.6
+   Compiling matrixmultiply v0.3.10
+   Compiling libm v0.2.16
+   Compiling serde_core v1.0.228
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-core)
+   Compiling rayon v1.12.0
+   Compiling safe_arch v0.7.4
+   Compiling rawpointer v0.2.1
+   Compiling wide v0.7.33
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-kernel-cpu)
+   Compiling serde_derive v1.0.228
+   Compiling libc v0.2.185
+   Compiling serde_json v1.0.149
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-dispatch)
+   Compiling anstyle v1.0.14
+   Compiling plotters-backend v0.3.7
+   Compiling regex-syntax v0.8.10
+   Compiling clap_lex v1.1.0
+   Compiling ciborium-io v0.2.2
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling ciborium-ll v0.2.2
+   Compiling clap_builder v4.6.0
+   Compiling regex-automata v0.4.14
+   Compiling plotters-svg v0.3.7
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-autograd)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-runtime)
+   Compiling itertools v0.10.5
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling criterion-plot v0.5.0
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-api)
+   Compiling is-terminal v0.4.17
+   Compiling plotters v0.3.7
+   Compiling regex v1.12.3
+   Compiling clap v4.6.1
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling anes v0.1.6
+   Compiling once_cell v1.21.4
+   Compiling oorandom v11.1.5
+   Compiling criterion v0.5.1
+   Compiling ft-nn v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-nn)
+warning: variable does not need to be mutable
+    --> crates/ft-nn/src/lib.rs:4776:18
+     |
+4776 |         let Some(mut q_heads) = Self::no_grad_f64_projection_values(
+     |                  ----^^^^^^^
+     |                  |
+     |                  help: remove this `mut`
+     |
+     = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ft-nn` (lib) generated 1 warning (run `cargo fix --lib -p ft-nn` to apply 1 suggestion)
+   Compiling ft-optim v0.1.0 (/data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z/crates/ft-optim)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 01s
+     Running unittests src/lib.rs (.rch-target-vmi1227854-job-29884606035533976-1781563429417235309-0/debug/deps/ft_optim-c49c3354de770a4c)
+
+running 29 tests
+test tests::asgd_averaged_parameters ... ok
+test tests::sgd_accumulates_gradients_across_backwards ... ok
+test tests::asgd_basic_step_reduces_loss ... ok
+test tests::radam_uses_sgd_in_early_steps ... ok
+test tests::asgd_invalid_lr_fails ... ok
+test tests::sgd_dampening_matches_torch_buffer_recurrence ... ok
+test tests::sgd_dampening_does_not_affect_first_step ... ok
+test tests::sgd_basic_step_reduces_loss ... ok
+test tests::sgd_microbatch_accumulation_matches_single_batch_step ... ok
+test tests::sgd_momentum_second_step_uses_accumulated_velocity ... ok
+test tests::sgd_nesterov_momentum_differs_from_standard ... ok
+test tests::sgd_nesterov_requires_positive_momentum ... ok
+test tests::sgd_nesterov_rejects_nonzero_dampening ... ok
+test tests::asgd_convergence ... ok
+test tests::sgd_rejects_negative_dampening ... ok
+test tests::sgd_rejects_mismatched_velocity_state_length ... ok
+test tests::sgd_rejects_negative_learning_rate ... ok
+test tests::sgd_with_momentum_accumulates_velocity ... ok
+test tests::sgd_skips_params_without_gradients ... ok
+test tests::sgd_weight_decay_applies_l2_penalty ... ok
+test tests::sgd_step_reads_persistent_gradients_not_report_payload ... ok
+test tests::e2e_sequential_relu_network_trains_with_sgd ... ok
+test tests::sgd_set_momentum_updates_value ... ok
+test tests::sgd_multiple_steps_converge_toward_minimum ... ok
+test tests::sgd_optimizes_multiple_parameters ... ok
+test tests::e2e_sgd_trains_linear_to_reduce_mse_loss ... ok
+test tests::step_lr_with_sgd_integration ... ok
+test tests::e2e_sgd_momentum_trains_faster_than_vanilla ... ok
+test tests::sgd_zero_grad_clears_persistent_gradients ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 183 filtered out; finished in 0.01s
+
+  [2m2026-06-15T22:46:24.894702Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 123697ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:46:24.895034Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:6425 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:46:24.895055Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/.scratch/frankentorch-ivorydeer-clean-20260615T214904Z on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2106 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:46:26.929389Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2034ms (1 files, 1180 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2145 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T22:46:26.929434Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1 files, 1180 bytes in 2034ms[0m
+    [2;3mat[0m rch/src/hook.rs:6458 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (159.4s)
