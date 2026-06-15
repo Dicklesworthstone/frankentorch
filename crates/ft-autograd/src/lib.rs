@@ -22276,7 +22276,8 @@ mod tests {
             };
             let tsp = sp.tanh();
             let sig = 1.0 / (1.0 + (-x_value).exp());
-            let expected = 1.0 + tsp + x_value * sig * (1.0 - tsp * tsp);
+            let mish_grad = tsp + x_value * sig * (1.0 - tsp * tsp);
+            let expected = 1.0 + mish_grad;
             assert_eq!(
                 grad.to_bits(),
                 expected.to_bits(),

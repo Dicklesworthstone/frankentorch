@@ -1,0 +1,107 @@
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:11040:
+                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+
+[31m-                    let sin_contrib = Self::tensor_backward_zip_map(
+[m[31m-                        &incoming,
+[m[31m-                        &input_values,
+[m[31m-                        |grad, x| grad * x.cos(),
+[m[31m-                    );
+[m[32m+                    let sin_contrib =
+[m[32m+                        Self::tensor_backward_zip_map(&incoming, &input_values, |grad, x| {
+[m[32m+                            grad * x.cos()
+[m[32m+                        });
+[m                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sin_contrib)?;
+
+                     Self::complete_dependency(&mut pending, input, &mut queue)?;
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:11059:
+                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+
+[31m-                    let cos_contrib = Self::tensor_backward_zip_map(
+[m[31m-                        &incoming,
+[m[31m-                        &input_values,
+[m[31m-                        |grad, x| grad * (-x.sin()),
+[m[31m-                    );
+[m[32m+                    let cos_contrib =
+[m[32m+                        Self::tensor_backward_zip_map(&incoming, &input_values, |grad, x| {
+[m[32m+                            grad * (-x.sin())
+[m[32m+                        });
+[m                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &cos_contrib)?;
+
+                     Self::complete_dependency(&mut pending, input, &mut queue)?;
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:11210:
+                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+                     // d/dx asin(x) = 1/sqrt(1-x^2)
+[31m-                    let contrib = Self::tensor_backward_zip_map(
+[m[31m-                        &incoming,
+[m[31m-                        &input_values,
+[m[31m-                        |g, x| g / (1.0 - x * x).sqrt(),
+[m[31m-                    );
+[m[32m+                    let contrib =
+[m[32m+                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+[m[32m+                            g / (1.0 - x * x).sqrt()
+[m[32m+                        });
+[m                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                     Self::complete_dependency(&mut pending, input, &mut queue)?;
+                     steps.push(TensorBackwardStep {
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:11227:
+                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+                     // d/dx acos(x) = -1/sqrt(1-x^2)
+[31m-                    let contrib = Self::tensor_backward_zip_map(
+[m[31m-                        &incoming,
+[m[31m-                        &input_values,
+[m[31m-                        |g, x| -g / (1.0 - x * x).sqrt(),
+[m[31m-                    );
+[m[32m+                    let contrib =
+[m[32m+                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+[m[32m+                            -g / (1.0 - x * x).sqrt()
+[m[32m+                        });
+[m                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                     Self::complete_dependency(&mut pending, input, &mut queue)?;
+                     steps.push(TensorBackwardStep {
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:11261:
+                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+                     // d/dx sinh(x) = cosh(x)
+[31m-                    let contrib = Self::tensor_backward_zip_map(
+[m[31m-                        &incoming,
+[m[31m-                        &input_values,
+[m[31m-                        |g, x| g * x.cosh(),
+[m[31m-                    );
+[m[32m+                    let contrib =
+[m[32m+                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+[m[32m+                            g * x.cosh()
+[m[32m+                        });
+[m                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                     Self::complete_dependency(&mut pending, input, &mut queue)?;
+                     steps.push(TensorBackwardStep {
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:11278:
+                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
+                     // d/dx cosh(x) = sinh(x)
+[31m-                    let contrib = Self::tensor_backward_zip_map(
+[m[31m-                        &incoming,
+[m[31m-                        &input_values,
+[m[31m-                        |g, x| g * x.sinh(),
+[m[31m-                    );
+[m[32m+                    let contrib =
+[m[32m+                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+[m[32m+                            g * x.sinh()
+[m[32m+                        });
+[m                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                     Self::complete_dependency(&mut pending, input, &mut queue)?;
+                     steps.push(TensorBackwardStep {
+Diff in /data/projects/frankentorch/crates/ft-autograd/src/lib.rs:12582:
+                             .for_each(|(outer, block)| compute(outer, block));
+                     } else {
+                         for outer in 0..outer_size {
+[31m-                            let block =
+[m[31m-                                &mut logsoftmax_contrib[outer * lane_stride..(outer + 1) * lane_stride];
+[m[32m+                            let block = &mut logsoftmax_contrib
+[m[32m+                                [outer * lane_stride..(outer + 1) * lane_stride];
+[m                             compute(outer, block);
+                         }
+                     }
