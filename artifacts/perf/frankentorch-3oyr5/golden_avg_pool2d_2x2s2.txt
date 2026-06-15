@@ -1,0 +1,4 @@
+frankentorch-3oyr5 avg_pool2d 2x2 stride2 f64 direct-path golden
+fixture: batch=2 ch=3 ih=5 iw=7, f64 and f32 deterministic inputs
+digest_fn: FNV-1a64 over f64 direct-path output bits then f32 generic-control output bits
+digest: 0x7af37c5e805fbec5
