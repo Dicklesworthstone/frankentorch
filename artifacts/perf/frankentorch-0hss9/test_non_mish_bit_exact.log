@@ -1,0 +1,352 @@
+  [2m2026-06-15T05:46:00.018200Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ovh-a at ubuntu@51.222.245.56 (0 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:00.341279Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankentorch-next-20260615T045108Z (hash: eccedb14f1dfd6c2)[0m
+    [2;3mat[0m rch/src/hook.rs:5994 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:00.341337Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6016 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:01.074203Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ovh-a...[0m
+    [2;3mat[0m rch/src/hook.rs:6046 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:01.074279Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z -> /data/projects/.scratch/frankentorch-next-20260615T045108Z on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:01.678189Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 603ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:01.678264Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-api -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-api on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:02.144035Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 465ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:02.144120Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:02.599824Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 455ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:02.599909Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-conformance -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-conformance on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:03.090819Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 490ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:03.090905Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:03.546738Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 455ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:03.546814Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-data -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-data on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:04.035870Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 489ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:04.035991Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-device -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-device on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:04.493802Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 457ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:04.493873Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:04.981471Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 487ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:04.981555Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:05.508913Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 527ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:05.509018Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-nn -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-nn on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:05.998591Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 489ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:05.998680Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-optim -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-optim on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:06.482540Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 483ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:06.482625Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-runtime -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-runtime on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:06.976498Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 493ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:06.976582Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-serialize -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-serialize on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:07.437632Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 461ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:07.437683Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 2898 files, 131343 bytes in 6354ms[0m
+    [2;3mat[0m rch/src/hook.rs:6209 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:09.654784Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo test -j 1 -p ft-autograd tensor_non_mish_activation_backward_matches_serial_formula_bit_exact -- --nocapture[0m
+    [2;3mat[0m rch/src/hook.rs:6252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:46:09.654829Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/.rch-target-ovh-a-job-29884606035532672-1781502361074194462-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded ciborium-io v0.2.2
+  Downloaded clap_lex v1.1.0
+  Downloaded cfg-if v1.0.4
+  Downloaded cast v0.3.0
+  Downloaded ciborium-ll v0.2.2
+  Downloaded anes v0.1.6
+  Downloaded anstyle v1.0.14
+  Downloaded autocfg v1.5.0
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded bit-vec v0.8.0
+  Downloaded ciborium v0.2.2
+  Downloaded either v1.15.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded bitflags v2.11.1
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded bytemuck v1.25.0
+  Downloaded criterion-plot v0.5.0
+  Downloaded clap v4.6.1
+  Downloaded console v0.16.3
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded same-file v1.0.6
+  Downloaded plotters-svg v0.3.7
+  Downloaded plotters-backend v0.3.7
+  Downloaded unarray v0.1.4
+  Downloaded itoa v1.0.18
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded rawpointer v0.2.1
+  Downloaded wait-timeout v0.2.1
+  Downloaded fnv v1.0.7
+  Downloaded walkdir v2.5.0
+  Downloaded rand_chacha v0.9.0
+  Downloaded tinytemplate v1.2.1
+  Downloaded quote v1.0.45
+  Downloaded rand_xorshift v0.4.0
+  Downloaded quick-error v1.2.3
+  Downloaded rand_core v0.9.5
+  Downloaded rusty-fork v0.3.1
+  Downloaded is-terminal v0.4.17
+  Downloaded errno v0.3.14
+  Downloaded fastrand v2.4.1
+  Downloaded oorandom v11.1.5
+  Downloaded num-complex v0.4.6
+  Downloaded zmij v1.0.21
+  Downloaded once_cell v1.21.4
+  Downloaded similar v2.7.0
+  Downloaded tempfile v3.27.0
+  Downloaded serde_core v1.0.228
+  Downloaded criterion v0.5.1
+  Downloaded getrandom v0.3.4
+  Downloaded half v2.7.1
+  Downloaded num-traits v0.2.19
+  Downloaded proc-macro2 v1.0.106
+  Downloaded rayon-core v1.13.0
+  Downloaded unicode-ident v1.0.24
+  Downloaded safe_arch v0.7.4
+  Downloaded serde v1.0.228
+  Downloaded serde_derive v1.0.228
+  Downloaded memchr v2.8.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded matrixmultiply v0.3.10
+  Downloaded aho-corasick v1.1.4
+  Downloaded rand v0.9.4
+  Downloaded clap_builder v4.6.0
+  Downloaded wide v0.7.33
+  Downloaded insta v1.47.2
+  Downloaded itertools v0.10.5
+  Downloaded plotters v0.3.7
+  Downloaded libm v0.2.16
+  Downloaded rayon v1.12.0
+  Downloaded serde_json v1.0.149
+  Downloaded regex v1.12.3
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.185
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling getrandom v0.3.4
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling either v1.15.0
+   Compiling rustix v1.1.4
+   Compiling rayon-core v1.13.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling zmij v1.0.21
+   Compiling bitflags v2.11.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling once_cell v1.21.4
+   Compiling serde v1.0.228
+   Compiling rand_core v0.9.5
+   Compiling matrixmultiply v0.3.10
+   Compiling serde_derive v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling libm v0.2.16
+   Compiling regex-syntax v0.8.10
+   Compiling fastrand v2.4.1
+   Compiling tempfile v3.27.0
+   Compiling rayon v1.12.0
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling clap_lex v1.1.0
+   Compiling rawpointer v0.2.1
+   Compiling plotters-backend v0.3.7
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling ciborium-io v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling clap_builder v4.6.0
+   Compiling ciborium-ll v0.2.2
+   Compiling plotters-svg v0.3.7
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core)
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling quick-error v1.2.3
+   Compiling rusty-fork v0.3.1
+   Compiling walkdir v2.5.0
+   Compiling criterion-plot v0.5.0
+   Compiling bit-set v0.8.0
+   Compiling rand_chacha v0.9.0
+   Compiling regex v1.12.3
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu)
+   Compiling plotters v0.3.7
+   Compiling tinytemplate v1.2.1
+   Compiling ciborium v0.2.2
+   Compiling clap v4.6.1
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling console v0.16.3
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling anes v0.1.6
+   Compiling similar v2.7.0
+   Compiling unarray v0.1.4
+   Compiling proptest v1.11.0
+   Compiling insta v1.47.2
+   Compiling criterion v0.5.1
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd)
+error[E0282]: type annotations needed
+     --> crates/ft-autograd/src/lib.rs:11296:53
+      |
+11296 |                         let phi = inv_sqrt_two_pi * (-0.5 * x * x).exp();
+      |                                                     ^^^^^^^^^^^^^^ cannot infer type
+
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+     --> crates/ft-autograd/src/lib.rs:11293:21
+      |
+11293 |                       Self::accumulate_tensor_gradient_with(input, &mut grads[input.0], |index| {
+      |  _____________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^_____________________________-
+11294 | |                         let g = incoming[index];
+11295 | |                         let x = input_values[index];
+11296 | |                         let phi = inv_sqrt_two_pi * (-0.5 * x * x).exp();
+11297 | |                         g * (0.5 * (1.0 + libm::erf(x * inv_sqrt_two)) + x * phi)
+11298 | |                     })?;
+      | |_____________________- argument #3 of type `usize` is missing
+      |
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18816:8
+      |
+18816 |     fn accumulate_tensor_gradient_with<F: FnMut(usize) -> f64>(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18819 |         contribution_len: usize,
+      |         -----------------------
+help: provide the argument
+      |
+11293 |                     Self::accumulate_tensor_gradient_with(input, &mut grads[input.0], /* usize */, |index| {
+      |                                                                                       ++++++++++++
+
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+     --> crates/ft-autograd/src/lib.rs:11309:21
+      |
+11309 |                       Self::accumulate_tensor_gradient_with(input, &mut grads[input.0], |index| {
+      |  _____________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^_____________________________-
+11310 | |                         let g = incoming[index];
+11311 | |                         let x = input_values[index];
+11312 | |                         let s = 1.0 / (1.0 + (-x).exp());
+11313 | |                         g * s * (1.0 + x * (1.0 - s))
+11314 | |                     })?;
+      | |_____________________- argument #3 of type `usize` is missing
+      |
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18816:8
+      |
+18816 |     fn accumulate_tensor_gradient_with<F: FnMut(usize) -> f64>(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18819 |         contribution_len: usize,
+      |         -----------------------
+help: provide the argument
+      |
+11309 |                     Self::accumulate_tensor_gradient_with(input, &mut grads[input.0], /* usize */, |index| {
+      |                                                                                       ++++++++++++
+
+error[E0061]: this function takes 4 arguments but 3 arguments were supplied
+     --> crates/ft-autograd/src/lib.rs:11464:21
+      |
+11464 |                       Self::accumulate_tensor_gradient_with(input, &mut grads[input.0], |index| {
+      |  _____________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^_____________________________-
+11465 | |                         let x = input_values[index];
+11466 | |                         let grad = if x > 20.0 {
+11467 | |                             1.0
+...     |
+11471 | |                         incoming[index] * grad
+11472 | |                     })?;
+      | |_____________________- argument #3 of type `usize` is missing
+      |
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18816:8
+      |
+18816 |     fn accumulate_tensor_gradient_with<F: FnMut(usize) -> f64>(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+18819 |         contribution_len: usize,
+      |         -----------------------
+help: provide the argument
+      |
+11464 |                     Self::accumulate_tensor_gradient_with(input, &mut grads[input.0], /* usize */, |index| {
+      |                                                                                       ++++++++++++
+
+Some errors have detailed explanations: E0061, E0282.
+For more information about an error, try `rustc --explain E0061`.
+error: could not compile `ft-autograd` (lib test) due to 4 previous errors
+  [2m2026-06-15T05:47:09.832816Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=101 in 60177ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+[RCH] remote ovh-a failed (exit 101)

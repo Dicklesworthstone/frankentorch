@@ -11290,14 +11290,11 @@ impl TensorTape {
                     let inv_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
                     let inv_sqrt_two_pi =
                         std::f64::consts::FRAC_1_SQRT_2 * std::f64::consts::FRAC_2_SQRT_PI * 0.5;
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, &x)| {
+                    let contrib =
+                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
                             let phi = inv_sqrt_two_pi * (-0.5 * x * x).exp();
                             g * (0.5 * (1.0 + libm::erf(x * inv_sqrt_two)) + x * phi)
-                        })
-                        .collect();
+                        });
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -22196,6 +22193,37 @@ mod tests {
                 grad.to_bits(),
                 expected.to_bits(),
                 "mish backward bit mismatch at index {index}: x={x_value}"
+            );
+        }
+    }
+
+    #[test]
+    fn tensor_gelu_large_backward_matches_serial_formula_bit_exact() {
+        let size = (1 << 15) + 257;
+        let values: Vec<f64> = (0..size)
+            .map(|i| match i % 2049 {
+                0 => 25.0,
+                1 => -25.0,
+                _ => -6.0 + ((i % 2048) as f64) * (12.0 / 2047.0),
+            })
+            .collect();
+
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(values.clone(), vec![size], true).expect("leaf");
+        let (y, _) = tape.gelu(x, ExecutionMode::Strict).expect("gelu");
+        let report = tape.backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+
+        for (index, (&x_value, &grad)) in values.iter().zip(grads.iter()).enumerate() {
+            let inv_sqrt_two = std::f64::consts::FRAC_1_SQRT_2;
+            let inv_sqrt_two_pi =
+                std::f64::consts::FRAC_1_SQRT_2 * std::f64::consts::FRAC_2_SQRT_PI * 0.5;
+            let phi = inv_sqrt_two_pi * (-0.5 * x_value * x_value).exp();
+            let expected = 0.5 * (1.0 + libm::erf(x_value * inv_sqrt_two)) + x_value * phi;
+            assert_eq!(
+                grad.to_bits(),
+                expected.to_bits(),
+                "gelu backward bit mismatch at index {index}: x={x_value}"
             );
         }
     }

@@ -1,0 +1,758 @@
+  [2m2026-06-15T06:11:43.057133Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ovh-a at ubuntu@51.222.245.56 (5 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:43.378839Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankentorch-next-20260615T045108Z (hash: eccedb14f1dfd6c2)[0m
+    [2;3mat[0m rch/src/hook.rs:5994 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:43.378918Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6016 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:44.340505Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ovh-a...[0m
+    [2;3mat[0m rch/src/hook.rs:6046 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:44.340572Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z -> /data/projects/.scratch/frankentorch-next-20260615T045108Z on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:44.940253Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 599ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:44.940326Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-api -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-api on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:45.476850Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 536ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:45.476969Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:46.046252Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 569ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:46.046343Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-conformance -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-conformance on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:46.548594Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 502ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:46.548724Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:47.030980Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 482ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:47.031053Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-data -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-data on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:47.492831Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 461ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:47.492982Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-device -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-device on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:48.004803Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 511ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:48.004892Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:48.490240Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 485ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:48.490339Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:48.966793Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 476ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:48.966877Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-nn -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-nn on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:49.469388Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 502ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:49.469677Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-optim -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-optim on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:49.966504Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 496ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:49.966622Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-runtime -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-runtime on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:50.464890Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 498ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:50.464973Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-serialize -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-serialize on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:50.980441Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 515ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:50.980491Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 2907 files, 125675 bytes in 6632ms[0m
+    [2;3mat[0m rch/src/hook.rs:6209 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:53.061471Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo test -j 1 -p ft-autograd[0m
+    [2;3mat[0m rch/src/hook.rs:6252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:11:53.061516Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/.rch-target-ovh-a-job-29884606035532766-1781503904340498537-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded anes v0.1.6
+  Downloaded anstyle v1.0.14
+  Downloaded bitflags v2.11.1
+  Downloaded bytemuck v1.25.0
+  Downloaded autocfg v1.5.0
+  Downloaded bit-vec v0.8.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded getrandom v0.3.4
+  Downloaded num-complex v0.4.6
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded insta v1.47.2
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded fnv v1.0.7
+  Downloaded fastrand v2.4.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded rayon-core v1.13.0
+  Downloaded rand v0.9.4
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded quick-error v1.2.3
+  Downloaded plotters-svg v0.3.7
+  Downloaded rand_xorshift v0.4.0
+  Downloaded oorandom v11.1.5
+  Downloaded cfg-if v1.0.4
+  Downloaded tempfile v3.27.0
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded ciborium-ll v0.2.2
+  Downloaded wait-timeout v0.2.1
+  Downloaded clap_lex v1.1.0
+  Downloaded is-terminal v0.4.17
+  Downloaded ciborium-io v0.2.2
+  Downloaded unarray v0.1.4
+  Downloaded rawpointer v0.2.1
+  Downloaded itoa v1.0.18
+  Downloaded same-file v1.0.6
+  Downloaded plotters-backend v0.3.7
+  Downloaded errno v0.3.14
+  Downloaded cast v0.3.0
+  Downloaded criterion-plot v0.5.0
+  Downloaded matrixmultiply v0.3.10
+  Downloaded quote v1.0.45
+  Downloaded rand_chacha v0.9.0
+  Downloaded rand_core v0.9.5
+  Downloaded rusty-fork v0.3.1
+  Downloaded zmij v1.0.21
+  Downloaded ciborium v0.2.2
+  Downloaded clap v4.6.1
+  Downloaded serde_core v1.0.228
+  Downloaded either v1.15.0
+  Downloaded walkdir v2.5.0
+  Downloaded tinytemplate v1.2.1
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded safe_arch v0.7.4
+  Downloaded unicode-ident v1.0.24
+  Downloaded console v0.16.3
+  Downloaded similar v2.7.0
+  Downloaded serde_derive v1.0.228
+  Downloaded num-traits v0.2.19
+  Downloaded half v2.7.1
+  Downloaded plotters v0.3.7
+  Downloaded once_cell v1.21.4
+  Downloaded wide v0.7.33
+  Downloaded memchr v2.8.0
+  Downloaded serde v1.0.228
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded libm v0.2.16
+  Downloaded criterion v0.5.1
+  Downloaded itertools v0.10.5
+  Downloaded rayon v1.12.0
+  Downloaded serde_json v1.0.149
+  Downloaded regex v1.12.3
+  Downloaded clap_builder v4.6.0
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded libc v0.2.185
+  Downloaded regex-automata v0.4.14
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.185
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling getrandom v0.3.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling serde_core v1.0.228
+   Compiling either v1.15.0
+   Compiling rayon-core v1.13.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling rustix v1.1.4
+   Compiling matrixmultiply v0.3.10
+   Compiling libm v0.2.16
+   Compiling linux-raw-sys v0.12.1
+   Compiling zmij v1.0.21
+   Compiling once_cell v1.21.4
+   Compiling serde v1.0.228
+   Compiling bitflags v2.11.1
+   Compiling rayon v1.12.0
+   Compiling rand_core v0.9.5
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling serde_derive v1.0.228
+   Compiling fastrand v2.4.1
+   Compiling rawpointer v0.2.1
+   Compiling serde_json v1.0.149
+   Compiling regex-syntax v0.8.10
+   Compiling tempfile v3.27.0
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core)
+   Compiling itoa v1.0.18
+   Compiling anstyle v1.0.14
+   Compiling plotters-backend v0.3.7
+   Compiling ciborium-io v0.2.2
+   Compiling memchr v2.8.0
+   Compiling clap_lex v1.1.0
+   Compiling clap_builder v4.6.0
+   Compiling ciborium-ll v0.2.2
+   Compiling plotters-svg v0.3.7
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu)
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling cast v0.3.0
+   Compiling bit-vec v0.8.0
+   Compiling same-file v1.0.6
+   Compiling fnv v1.0.7
+   Compiling rusty-fork v0.3.1
+   Compiling walkdir v2.5.0
+   Compiling bit-set v0.8.0
+   Compiling criterion-plot v0.5.0
+   Compiling rand_chacha v0.9.0
+   Compiling regex v1.12.3
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch)
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling clap v4.6.1
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling is-terminal v0.4.17
+   Compiling console v0.16.3
+   Compiling anes v0.1.6
+   Compiling unarray v0.1.4
+   Compiling similar v2.7.0
+   Compiling oorandom v11.1.5
+   Compiling criterion v0.5.1
+   Compiling insta v1.47.2
+   Compiling proptest v1.11.0
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 11s
+     Running unittests src/lib.rs (.rch-target-ovh-a-job-29884606035532766-1781503904340498537-0/debug/deps/ft_autograd-439033e7d0dccc63)
+
+running 466 tests
+test tests::backward_options_for_mode_hardened_matches_default ... ok
+test tests::add_backward_matches_expected_gradient ... ok
+test tests::backward_options_for_mode_strict_matches_default ... ok
+test tests::backward_rejects_root_without_requires_grad ... ok
+test tests::bf16_shape_ops_preserve_dtype ... ok
+test tests::backward_rejects_unknown_root_node_id ... ok
+test tests::borrowed_accumulated_gradient_update_preserves_gradient_storage ... ok
+test tests::complex_expand_preserves_dtype_and_imaginary_values ... ok
+test tests::complex_pad_preserves_dtype_and_imaginary_values ... ok
+test tests::clamp_backward_nan_input_gradient_is_zero ... ok
+test tests::complex_flip_repeat_roll_preserve_imaginary_values ... ok
+test tests::composite_graph_gradient_is_deterministic ... ok
+test tests::complex_permutation_shape_ops_preserve_imaginary_values ... ok
+test tests::complex_shape_ops_preserve_dtype_and_imaginary_values ... ok
+test tests::create_graph_abs_gradient_is_zero_at_zero ... ok
+test tests::create_graph_cat_gradients ... ok
+test tests::create_graph_atan2_gradients ... ok
+test tests::create_graph_asin_second_derivative ... ok
+test tests::create_graph_acos_second_derivative ... ok
+test tests::create_graph_default_false_does_not_record_gradient_ops ... ok
+test tests::create_graph_custom_function_without_hook_errors ... ok
+test tests::create_graph_custom_function_double_backward ... ok
+test tests::create_graph_cumsum_second_derivative_routes_through_scan ... ok
+test tests::create_graph_elu_gradients ... ok
+test tests::create_graph_dot_second_derivative ... ok
+test tests::create_graph_cat_second_derivative ... ok
+test tests::addmm_backward_mat1_grad_uses_mat2_transpose ... ok
+test tests::create_graph_expand_size_one_dim_preserves_original_gradient_shape ... ok
+test tests::create_graph_bmm_gradients ... ok
+test tests::create_graph_cumprod_with_zero_errors_cleanly ... ok
+test tests::create_graph_bmm_second_derivative_cross_term ... ok
+test tests::create_graph_expand_prepended_dim_sums_gradients_per_input_element ... ok
+test tests::create_graph_elu_second_derivative ... ok
+test tests::addmm_backward_grads_match_finite_diff_nonsquare ... ok
+test tests::create_graph_gelu_first_derivative ... ok
+test tests::create_graph_fmod_gradients ... ok
+test tests::create_graph_gather_second_derivative ... ok
+test tests::create_graph_gradient_penalty_style ... ok
+test tests::create_graph_hardswish_gradients ... ok
+test tests::create_graph_hardswish_second_derivative ... ok
+test tests::bmm_backward_grads_match_finite_diff_nonsquare ... ok
+test tests::create_graph_hardsigmoid_gradients ... ok
+test tests::create_graph_frac_passthrough_gradient ... ok
+test tests::create_graph_leaky_relu_gradients ... ok
+test tests::create_graph_index_select_second_derivative ... ok
+test tests::create_graph_log_softmax_gradients ... ok
+test tests::create_graph_hardtanh_gradients ... ok
+test tests::create_graph_multi_element_tensor ... ok
+test tests::create_graph_norm1_gradients ... ok
+test tests::create_graph_log_softmax_second_derivative_matches_fd ... ok
+test tests::create_graph_mish_gradients ... ok
+test tests::create_graph_physics_double_backward ... ok
+test tests::create_graph_norm2_second_derivative_matches_hessian ... ok
+test tests::create_graph_records_gradient_ops_in_tape ... ok
+test tests::create_graph_min_max_gradients ... ok
+test tests::create_graph_mish_second_derivative_matches_fd ... ok
+test tests::create_graph_rounding_ops_zero_gradient ... ok
+test tests::create_graph_norm_dim1_gradients ... ok
+test tests::create_graph_scalar_output_second_derivative ... ok
+test tests::create_graph_scatter_add_gradients ... ok
+test tests::create_graph_scatter_gradients ... ok
+test tests::create_graph_remainder_gradients ... ok
+test tests::create_graph_rsqrt_second_derivative ... ok
+test tests::create_graph_first_order_matches_regular_backward ... ok
+test tests::create_graph_second_derivative_addmv ... ok
+test tests::create_graph_matmul_gradient_matches_plain_backward ... ok
+test tests::create_graph_second_derivative_cumprod ... ok
+test tests::create_graph_second_derivative_addmm ... ok
+test tests::create_graph_outer_second_derivative ... ok
+test tests::create_graph_mean_double_backward_keeps_one_over_n ... ok
+test tests::create_graph_narrow_gradients ... ok
+test tests::create_graph_second_derivative_cast ... ok
+test tests::create_graph_second_derivative_expm1 ... ok
+test tests::create_graph_norm_dim2_second_derivative_per_slice_hessian ... ok
+test tests::create_graph_second_derivative_atan ... ok
+test tests::create_graph_second_derivative_flip ... ok
+test tests::create_graph_second_derivative_index_put ... ok
+test tests::create_graph_second_derivative_erf_erfc ... ok
+test tests::create_graph_rsqrt_gradients ... ok
+test tests::create_graph_second_derivative_index_put_accumulate ... ok
+test tests::create_graph_second_derivative_exp ... ok
+test tests::create_graph_second_derivative_lerp ... ok
+test tests::create_graph_second_derivative_pad ... ok
+test tests::create_graph_second_derivative_matches_finite_differences ... ok
+test tests::create_graph_second_derivative_sin ... ok
+test tests::create_graph_second_derivative_repeat ... ok
+test tests::create_graph_second_derivative_prod_dim_with_zero ... ok
+test tests::create_graph_second_derivative_roll ... ok
+test tests::create_graph_second_derivative_prod_dim ... ok
+test tests::create_graph_second_derivative_sinh_cosh ... ok
+test tests::create_graph_second_derivative_split ... ok
+test tests::create_graph_softmax_gradients ... ok
+test tests::create_graph_softplus_gradients ... ok
+test tests::create_graph_second_derivative_log2_log10 ... ok
+test tests::create_graph_silu_second_derivative ... ok
+test tests::create_graph_stack_gradients ... ok
+test tests::create_graph_softmax_second_derivative_matches_fd ... ok
+test tests::create_graph_second_derivative_tan ... ok
+test tests::create_graph_sort_second_derivative_routes_through_permutation ... ok
+test tests::create_graph_std_dim_second_derivative_matches_fd ... ok
+test tests::create_graph_softplus_second_derivative ... ok
+test tests::create_graph_transpose_carries_gradient ... ok
+test tests::create_graph_topk_second_derivative_routes_through_selection ... ok
+test tests::create_graph_trace_second_derivative_routes_through_diagonal ... ok
+test tests::create_graph_where_gradients ... ok
+test tests::create_graph_second_derivative_x_cubed ... ok
+test tests::create_graph_stack_second_derivative ... ok
+test tests::create_graph_var_dim_second_derivative_matches_fd ... ok
+test tests::custom_function_backward_matches_finite_difference ... ok
+test tests::create_graph_second_derivative_max_dim ... ok
+test tests::create_graph_sum_dim_and_clamp ... ok
+test tests::custom_function_borrowed_inputs_backward_uses_tape_values ... ok
+test tests::custom_function_grad_fn_label ... ok
+test tests::create_graph_shape_ops_second_derivative ... ok
+test tests::create_graph_where_second_derivative_routes_through_gate ... ok
+test tests::custom_function_identity_forward ... ok
+test tests::custom_function_multi_input ... ok
+test tests::custom_function_composed_with_standard_ops ... ok
+test tests::custom_function_identity_backward ... ok
+test tests::custom_function_f32_preserves_dtype_and_backward ... ok
+test tests::custom_function_no_saved_tensors ... ok
+test tests::custom_function_save_for_backward ... ok
+test tests::default_backward_consumes_scalar_graph ... ok
+test tests::custom_function_needs_input_grad ... ok
+test tests::custom_function_straight_through_estimator ... ok
+test tests::custom_function_double_forward_backward ... ok
+test tests::create_graph_second_derivative_log1p ... ok
+test tests::dependency_snapshot_preserves_initial_pending_counts ... ok
+test tests::custom_function_none_gradient_for_input ... ok
+test tests::default_backward_consumes_tensor_graph ... ok
+test tests::custom_function_save_for_backward_with_negatives ... ok
+test tests::f32_backward_pow_sum ... ok
+test tests::dependency_underflow_is_fail_closed ... ok
+test tests::dependency_scheduler_waits_for_all_children ... ok
+test tests::f32_backward_through_cast ... ok
+test tests::div_backward_matches_expected_gradient ... ok
+test tests::custom_function_respects_disabled_grad_tracking ... ok
+test tests::f32_backward_through_unary ... ok
+test tests::f32_backward_mul_sum_chain ... ok
+test tests::f32_cumprod_preserves_dtype ... ok
+test tests::f32_cumsum_preserves_dtype ... ok
+test tests::custom_function_f32_preserves_dtype_without_grad ... ok
+test tests::f32_expand_preserves_dtype ... ok
+test tests::f32_binary_add_preserves_dtype ... ok
+test tests::f32_leaf_and_values_roundtrip ... ok
+test tests::f32_flip_repeat_roll_preserve_dtype ... ok
+test tests::f32_mean_preserves_dtype ... ok
+test tests::f32_binary_mul_preserves_dtype ... ok
+test tests::f32_mixed_binary_promotes_to_f64 ... ok
+test tests::f32_pad_preserves_dtype ... ok
+test tests::f32_cast_noop_same_dtype ... ok
+test tests::f32_cast_roundtrip ... ok
+test tests::f32_permutation_shape_ops_preserve_dtype ... ok
+test tests::f32_pow_preserves_dtype ... ok
+test tests::f32_clamp_preserves_dtype ... ok
+test tests::f32_reduction_output_is_f32_storage ... ok
+test tests::f32_shape_ops_preserve_dtype ... ok
+test tests::f32_softmax_numerical_stability ... ok
+test tests::f32_softmax_preserves_dtype ... ok
+test tests::f32_storage_is_actually_f32 ... ok
+test tests::f32_sum_preserves_dtype ... ok
+test tests::f32_unary_abs_preserves_dtype ... ok
+test tests::f32_unary_neg_preserves_dtype ... ok
+test tests::f32_vs_f64_precision_comparison ... ok
+test tests::flip_rejects_duplicate_dims_like_torch ... ok
+test tests::gan_style_shared_graph_two_backward_passes ... ok
+test tests::half_pad_preserves_dtype ... ok
+test tests::half_repeat_preserves_dtype ... ok
+test tests::half_shape_ops_preserve_dtype ... ok
+test tests::hardened_mode_reentrant_depth_overflow_fallbacks ... ok
+test tests::metamorphic_shape_ops_preserve_bf16_dtype_and_storage ... ok
+test tests::mul_backward_matches_expected_gradient ... ok
+test tests::metamorphic_shape_ops_preserve_complex128_dtype_and_storage ... ok
+test tests::metamorphic_shape_ops_preserve_complex64_dtype_and_storage ... ok
+test tests::graph_consumption_reduces_memory_footprint ... ok
+test tests::metamorphic_shape_ops_preserve_f16_dtype_and_storage ... ok
+test tests::gather_index_select_backward_grads_match_finite_diff ... ok
+test tests::matmul_backward_grads_match_finite_diff_nonsquare ... ok
+test tests::retain_graph_allows_second_scalar_backward ... ok
+test tests::retain_graph_allows_second_tensor_backward ... ok
+test tests::roll_extreme_shift_does_not_overflow_forward_or_backward ... ok
+test tests::permute_backward_grad_matches_finite_diff_3cycle ... ok
+test tests::roll_inverse_metamorphic_preserves_values_and_gradients ... ok
+test tests::scalar_acos_backward ... ok
+test tests::scalar_acos_forward ... ok
+test tests::scalar_asin_acos_sum_is_pi_over_2 ... ok
+test tests::scalar_asin_backward ... ok
+test tests::scalar_asin_forward ... ok
+test tests::scalar_asin_forward_zero ... ok
+test tests::scalar_atan_backward ... ok
+test tests::scalar_atan_forward ... ok
+test tests::scalar_atan_forward_zero ... ok
+test tests::outer_backward_grads_match_finite_diff ... ok
+test tests::scalar_ceil_backward_zero_grad ... ok
+test tests::scalar_ceil_forward ... ok
+test tests::scalar_ceil_negative ... ok
+test tests::scalar_cos_backward ... ok
+test tests::scalar_cos_forward ... ok
+test tests::scalar_cosh_backward ... ok
+test tests::scalar_cosh_forward ... ok
+test tests::scalar_cosh_forward_zero ... ok
+test tests::scalar_cosh_squared_minus_sinh_squared_is_one ... ok
+test tests::scalar_elu_backward_at_zero_is_one ... ok
+test tests::scalar_elu_backward_negative ... ok
+test tests::scalar_elu_backward_positive ... ok
+test tests::scalar_elu_forward_negative ... ok
+test tests::scalar_elu_forward_positive ... ok
+test tests::scalar_expm1_backward ... ok
+test tests::scalar_expm1_forward ... ok
+test tests::scalar_floor_backward_zero_grad ... ok
+test tests::scalar_floor_forward ... ok
+test tests::scalar_floor_negative ... ok
+test tests::scalar_frac_backward ... ok
+test tests::scalar_frac_forward_negative ... ok
+test tests::scalar_gelu_backward ... ok
+test tests::scalar_gelu_forward ... ok
+test tests::scalar_gelu_forward_negative ... ok
+test tests::scalar_gelu_forward_zero ... ok
+test tests::scalar_hardtanh_backward_at_saturation_boundaries_is_zero ... ok
+test tests::scalar_leaky_relu_backward_at_zero_uses_slope ... ok
+test tests::scalar_leaky_relu_backward_negative ... ok
+test tests::scalar_leaky_relu_backward_positive ... ok
+test tests::scalar_leaky_relu_forward_negative ... ok
+test tests::scalar_leaky_relu_forward_positive ... ok
+test tests::scalar_log10_backward ... ok
+test tests::scalar_log10_forward ... ok
+test tests::scalar_log1p_backward ... ok
+test tests::scalar_log1p_expm1_roundtrip ... ok
+test tests::scalar_log1p_forward ... ok
+test tests::scalar_log2_backward ... ok
+test tests::scalar_log2_forward ... ok
+test tests::scalar_round_backward_zero_grad ... ok
+test tests::scalar_round_forward ... ok
+test tests::scalar_round_forward_down ... ok
+test tests::scalar_round_forward_ties_to_even_negative ... ok
+test tests::scalar_frac_forward ... ok
+test tests::scalar_round_forward_ties_to_even_odd_floor ... ok
+test tests::scalar_sign_backward ... ok
+test tests::scalar_sign_forward_negative ... ok
+test tests::scalar_sign_forward_positive ... ok
+test tests::scalar_sign_forward_zero ... ok
+test tests::scalar_silu_backward ... ok
+test tests::scalar_silu_forward ... ok
+test tests::scalar_silu_forward_zero ... ok
+test tests::scalar_sin_backward ... ok
+test tests::scalar_sin_cos_identity ... ok
+test tests::scalar_sin_forward ... ok
+test tests::scalar_sin_zero ... ok
+test tests::scalar_sinh_backward ... ok
+test tests::scalar_sinh_forward ... ok
+test tests::scalar_sinh_forward_zero ... ok
+test tests::scalar_softplus_backward_above_threshold_is_exactly_one ... ok
+test tests::scalar_tan_backward ... ok
+test tests::scalar_tan_forward ... ok
+test tests::scalar_trunc_backward ... ok
+test tests::scalar_trunc_forward_negative ... ok
+test tests::scalar_trunc_frac_identity ... ok
+test tests::scalar_trunc_forward ... ok
+test tests::second_backward_on_consumed_scalar_graph_returns_error ... ok
+test tests::second_backward_on_consumed_tensor_graph_returns_error ... ok
+test tests::strict_mode_reentrant_depth_overflow_fails ... ok
+test tests::sub_backward_matches_expected_gradient ... ok
+test tests::tape_grad_enabled_default_is_true ... ok
+test tests::tape_leaf_respects_grad_disabled ... ok
+test tests::tape_ops_respect_grad_disabled ... ok
+test tests::tape_set_grad_enabled ... ok
+test tests::tensor_accessor_rejects_unknown_node_id ... ok
+test tests::tensor_accumulate_gradient_mismatch_is_fail_closed ... ok
+test tests::tensor_acos_backward ... ok
+test tests::tensor_acos_forward ... ok
+test tests::tensor_add_forward_backward_matches_expected_gradients ... ok
+test tests::tensor_add_with_offset_view_input_returns_fresh_contiguous_output ... ok
+test tests::tensor_argmax_not_requires_grad ... ok
+test tests::tensor_argmax_returns_correct_indices ... ok
+test tests::tensor_argmin_returns_correct_indices ... ok
+test tests::tensor_asin_backward ... ok
+test tests::tensor_asin_forward ... ok
+test tests::tensor_atan_backward ... ok
+test tests::tensor_atan_forward ... ok
+test tests::tensor_backward_bmm_rejects_incoming_gradient_len_mismatch ... ok
+test tests::tensor_backward_div_rejects_non_contiguous_operand_layout ... ok
+test tests::tensor_backward_dot_rejects_incoming_gradient_len_mismatch ... ok
+test tests::tensor_backward_index_select_rejects_huge_index_value ... ok
+test tests::tensor_backward_mul_rejects_non_contiguous_operand_layout ... ok
+test tests::tensor_backward_rejects_root_without_requires_grad ... ok
+test tests::prop_scheduler_telemetry_is_self_consistent ... ok
+test tests::tensor_backward_sort_rejects_incoming_gradient_len_mismatch ... ok
+test tests::tensor_backward_sort_rejects_out_of_bounds_scatter_index ... ok
+test tests::tensor_backward_topk_rejects_malformed_indices_len ... ok
+test tests::tensor_cat_backward ... ok
+test tests::prop_scheduler_replay_is_deterministic ... ok
+test tests::tensor_cat_three_inputs ... ok
+test tests::tensor_ceil_backward_zero_grad ... ok
+test tests::prop_tensor_add_gradient_is_ones ... ok
+test tests::tensor_ceil_forward ... ok
+test tests::tensor_cos_backward ... ok
+test tests::tensor_cosh_backward ... ok
+test tests::tensor_cosh_forward ... ok
+test tests::tensor_dependency_complete_underflow_is_fail_closed ... ok
+test tests::tensor_dependency_compute_underflow_is_fail_closed ... ok
+test tests::tensor_dependency_snapshot_preserves_initial_pending_counts ... ok
+test tests::tensor_detach_in_place_on_leaf_is_noop ... ok
+test tests::tensor_detach_in_place_turns_non_leaf_into_leaf ... ok
+test tests::tensor_dispatch_supports_non_contiguous_input ... ok
+test tests::tensor_double_transpose_is_identity ... ok
+test tests::tensor_elu_backward ... ok
+test tests::tensor_elu_backward_zero_and_nan_match_torch ... ok
+test tests::tensor_cat_dim1_forward ... ok
+test tests::tensor_cos_forward ... ok
+test tests::tensor_elu_forward ... ok
+test tests::tensor_ensure_len_mismatch_is_fail_closed ... ok
+test tests::tensor_expm1_backward ... ok
+test tests::reductions_backward_grads_match_finite_diff_middle_dim ... ok
+test tests::tensor_floor_forward ... ok
+test tests::tensor_frac_forward ... ok
+test tests::tensor_frac_backward ... ok
+test tests::tensor_gelu_forward ... ok
+test tests::tensor_gelu_backward ... ok
+test tests::tensor_cat_dim0_forward ... ok
+test tests::tensor_expm1_forward ... ok
+test tests::tensor_floor_backward_zero_grad ... ok
+test tests::prop_strict_reentrant_overflow_is_fail_closed ... ok
+test tests::tensor_hardtanh_backward_boundaries_and_nan_match_torch ... ok
+test tests::tensor_index_put_non_accumulate_duplicate_values_are_last_write_wins ... ok
+test tests::tensor_leaky_relu_backward ... ok
+test tests::tensor_leaky_relu_forward ... ok
+test tests::tensor_log1p_backward ... ok
+test tests::tensor_log1p_forward ... ok
+test tests::tensor_log2_backward ... ok
+test tests::tensor_log2_forward ... ok
+test tests::tensor_log_softmax_backward_grad_sum_is_zero ... ok
+test tests::tensor_log_softmax_equals_log_of_softmax ... ok
+test tests::tensor_log_softmax_forward_consistent ... ok
+test tests::tensor_matmul_backward_all_ones_golden_output_is_stable ... ok
+test tests::tensor_matmul_forward_backward_matches_expected_gradients ... ok
+test tests::tensor_index_put_scalar_broadcast_duplicate_grad_counts_distinct_outputs ... ok
+test tests::tensor_max_dim_along_dim0 ... ok
+test tests::tensor_leaky_relu_backward_at_zero_and_nan_use_slope ... ok
+test tests::tensor_max_dim_backward_along_dim0 ... ok
+test tests::tensor_max_dim_returns_values_and_indices ... ok
+test tests::tensor_max_dim_backward_scatters_gradient ... ok
+test tests::tensor_meta_rejects_unknown_node_id ... ok
+test tests::tensor_min_dim_returns_values_and_indices ... ok
+test tests::tensor_min_dim_backward_scatters_gradient ... ok
+test tests::tensor_mul_scalar_matches_full_scale_tensor_forward_backward ... ok
+test tests::tensor_mul_scalar_preserves_f32_dtype ... ok
+test tests::tensor_permute_3d_reorders_data ... ok
+test tests::tensor_permute_backward_preserves_element_gradients ... ok
+test tests::tensor_permute_backward_propagates_gradient ... ok
+test tests::tensor_permute_duplicate_dim_fails ... ok
+test tests::tensor_permute_identity_no_change ... ok
+test tests::tensor_permute_invalid_dim_fails ... ok
+test tests::tensor_permute_wrong_ndim_fails ... ok
+test tests::tensor_prod_dim_backward ... ok
+test tests::tensor_prod_dim_backward_with_zero ... ok
+test tests::tensor_prod_dim_forward_dim0 ... ok
+test tests::tensor_prod_dim_forward_dim1 ... ok
+test tests::tensor_register_hook_chains_in_registration_order ... ok
+test tests::tensor_register_hook_error_propagates ... ok
+test tests::prop_shared_parent_waits_for_all_children ... ok
+test tests::tensor_register_hook_none_is_observation_only ... ok
+test tests::tensor_register_hook_modifies_gradient ... ok
+test tests::tensor_register_hook_rejects_shape_mismatch ... ok
+test tests::tensor_remove_hook_disables_callback ... ok
+test tests::tensor_requires_grad_and_grad_fn_introspection ... ok
+test tests::prop_tensor_mul_gradient_is_cross ... ok
+test tests::prop_tensor_relu_gradient_matches_indicator ... ok
+test tests::tensor_requires_grad_toggle_on_leaf_roundtrip ... ok
+test tests::tensor_requires_grad_toggle_rejects_non_leaf ... ok
+test tests::tensor_reshape_1d_to_2d ... ok
+test tests::tensor_reshape_2d_to_1d ... ok
+test tests::tensor_reshape_mismatched_numel_fails ... ok
+test tests::tensor_reshape_preserves_data_3d ... ok
+test tests::tensor_reshape_backward ... ok
+test tests::tensor_reshape_then_squeeze_roundtrip ... ok
+test tests::tensor_round_backward_zero_grad ... ok
+test tests::tensor_round_forward ... ok
+test tests::root_does_not_require_grad_diagnostic_snapshot ... ok
+test tests::reentrant_depth_exceeded_diagnostic_snapshot ... ok
+test tests::tensor_root_does_not_require_grad_diagnostic_snapshot ... ok
+test tests::graph_consumed_diagnostic_snapshot ... ok
+test tests::tensor_gradient_shape_mismatch_diagnostic_snapshot ... ok
+test tests::tensor_requires_grad_non_leaf_diagnostic_snapshot ... ok
+test tests::tensor_graph_consumed_diagnostic_snapshot ... ok
+test tests::tensor_matmul_shape_mismatch_diagnostic_snapshot ... ok
+test tests::scheduler_property_log_golden_snapshot ... ok
+test tests::tensor_requires_grad_non_floating_diagnostic_snapshot ... ok
+test tests::tensor_scheduler_telemetry_locked_by_golden ... ok
+test tests::tensor_sign_backward ... ok
+test tests::tensor_silu_backward ... ok
+test tests::tensor_silu_forward ... ok
+test tests::tensor_sin_forward ... ok
+test tests::tensor_sin_backward ... ok
+test tests::tensor_sinh_forward ... ok
+test tests::tensor_sinh_backward ... ok
+test tests::tensor_softmax_backward_dim0 ... ok
+test tests::tensor_softmax_forward_preserves_order ... ok
+test tests::tensor_softmax_forward_sums_to_one ... ok
+test tests::tensor_softmax_backward_grad_sum_is_zero ... ok
+test tests::tensor_squeeze_invalid_dim_fails ... ok
+test tests::tensor_squeeze_middle_dim ... ok
+test tests::tensor_squeeze_backward ... ok
+test tests::tensor_squeeze_removes_dim_of_size_1 ... ok
+test tests::tensor_squeeze_noop_when_dim_not_1 ... ok
+test tests::tensor_softplus_backward_above_threshold_is_exactly_one ... ok
+test tests::tensor_stack_dim0_forward ... ok
+test tests::tensor_stack_dim1_forward ... ok
+test tests::tensor_stack_backward ... ok
+test tests::tensor_tan_forward ... ok
+test tests::tensor_std_dim_backward ... ok
+test tests::tensor_tape_grad_enabled_default_is_true ... ok
+test tests::tensor_tan_backward ... ok
+test tests::tensor_std_dim_forward_dim0 ... ok
+test tests::tensor_transpose_2d_swaps_shape_and_data ... ok
+test tests::tensor_transpose_3d ... ok
+test tests::tensor_tape_leaf_respects_grad_disabled ... ok
+test tests::tensor_transpose_backward_propagates_gradient ... ok
+test tests::tensor_transpose_identity_same_dim ... ok
+test tests::tensor_transpose_backward_preserves_element_gradients ... ok
+test tests::tensor_trunc_forward ... ok
+test tests::tensor_unsqueeze_adds_dim_at_end ... ok
+test tests::tensor_unsqueeze_adds_dim_at_start ... ok
+test tests::tensor_transpose_invalid_dim_fails ... ok
+test tests::tensor_transpose_is_permute_special_case ... ok
+test tests::tensor_trunc_backward ... ok
+test tests::tensor_unsqueeze_invalid_dim_fails ... ok
+test tests::tensor_unsqueeze_backward ... ok
+test tests::tensor_unsqueeze_middle_dim ... ok
+test tests::tensor_values_reject_non_contiguous_layout ... ok
+test tests::tensor_values_rejects_unknown_node_id ... ok
+test tests::prop_hardened_reentrant_overflow_is_explicitly_flagged ... ok
+test tests::tensor_var_dim_forward_dim0 ... ok
+test tests::tensor_var_dim_forward_dim1 ... ok
+test tests::tensor_view_same_as_reshape ... ok
+test tests::tensor_var_dim_backward ... ok
+test tests::tensor_view_backward ... ok
+test tests::tensor_where_preserves_f32_dtype ... ok
+test tests::tensor_where_rejects_shape_mismatch_fail_closed ... ok
+test tests::tensor_sign_forward ... ok
+test tests::tensor_where_with_offset_views_uses_each_operand_layout ... ok
+test tests::to_dtype_f16_noop_same_type ... ok
+test tests::to_dtype_f32_to_f16 ... ok
+test tests::to_dtype_f32_to_f64 ... ok
+test tests::to_dtype_f64_to_bf16 ... ok
+test tests::to_dtype_f64_to_f32 ... ok
+test tests::to_dtype_noop_same_type ... ok
+test tests::to_dtype_rejects_bool_target ... ok
+test tests::to_dtype_rejects_non_float_target ... ok
+test tests::update_tensor_values_f32_updates_tensor ... ok
+test tests::unknown_node_returns_error ... ok
+test tests::to_f16_backward_is_identity ... ok
+test tests::view_backward_gradient_correct ... ok
+test tests::transpose_backward_grad_matches_finite_diff_nonsquare ... ok
+test tests::to_half_rejects_non_float_input ... ok
+test tests::update_tensor_values_rejects_unknown_node_id ... ok
+test tests::view_of_view_shares_storage ... ok
+test tests::view_shares_storage ... ok
+test tests::view_unflatten ... ok
+test tests::view_wrong_numel_errors ... ok
+test tests::view_f32_shares_storage ... ok
+test tests::view_flatten ... ok
+test tests::view_same_shape_returns_same_data ... ok
+test tests::f32_training_loop_manual_linear ... ok
+test tests::tensor_mish_large_backward_matches_serial_formula_bit_exact ... ok
+test tests::prop_tensor_backward_deterministic ... ok
+test tests::tensor_gelu_large_backward_matches_serial_formula_bit_exact ... ok
+
+test result: ok. 466 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.06s
+
+   Doc-tests ft_autograd
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+  [2m2026-06-15T06:13:05.302417Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=0 in 72240ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:13:05.302750Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook.rs:6425 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:13:05.302780Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/.scratch/frankentorch-next-20260615T045108Z on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:2106 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:13:05.753508Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 450ms (1 files, 1180 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2145 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T06:13:05.753538Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mArtifacts retrieved: 1 files, 1180 bytes in 450ms[0m
+    [2;3mat[0m rch/src/hook.rs:6458 [2;3mon[0m ThreadId(1)
+
+[RCH] remote ovh-a (82.7s)
