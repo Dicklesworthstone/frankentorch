@@ -9661,38 +9661,54 @@ impl TensorTape {
             ));
         }
 
-        // Cache-blocked fast path for the ubiquitous 2-D transpose (perm == [1, 0]).
-        // The generic per-element scatter below misses cache on nearly every write
-        // for a large matrix — dst[j*r + i] strides by `r`, so consecutive source
-        // elements land a full column apart in the destination. Tiling confines
+        // Cache-blocked fast path for a last-two-dims swap — the 2-D transpose
+        // (perm == [1, 0]) AND its batched form matrix_transpose/.mT/adjoint
+        // (perm == [0, 1, …, ndim-1, ndim-2], ubiquitous in attention's QKᵀ and
+        // batched linalg). The generic per-element scatter below misses cache on
+        // nearly every write for a large plane — dst[j*r + i] strides by `r`, so
+        // consecutive source elements land a full column apart. Tiling confines
         // each TILE×TILE block's reads and writes to cache, cutting DRAM
-        // round-trips ~TILE-fold. This is a pure permuted clone (no FP arithmetic),
-        // so the result is bit-for-bit identical to the generic loop for every
-        // dtype regardless of copy order. frankentorch cache-blocked transpose.
-        if ndim == 2 && perm[0] == 1 && perm[1] == 0 {
-            let r = src_shape[0];
-            let c = src_shape[1];
+        // round-trips ~TILE-fold. Each leading (batch) index maps to itself, so
+        // the op is an independent transpose of each contiguous [r, c] plane. This
+        // is a pure permuted clone (no FP arithmetic), bit-for-bit identical to the
+        // generic loop for every dtype regardless of copy order.
+        let is_last_two_swap = ndim >= 2
+            && perm[ndim - 2] == ndim - 1
+            && perm[ndim - 1] == ndim - 2
+            && (0..ndim - 2).all(|d| perm[d] == d);
+        if is_last_two_swap {
+            let r = src_shape[ndim - 2];
+            let c = src_shape[ndim - 1];
+            let plane = r * c;
             let mut dst = vec![src[0].clone(); numel];
             // 16×16 (~2 KB f64) fits L1, minimizing the transpose's destination
             // write cache-misses — a TILE sweep showed 16 clearly beats 32/64/128
             // (2.2x vs 1.2x at 2048², and large tiles regress as the working set
             // spills L1).
             const TILE: usize = 16;
-            let mut ii = 0;
-            while ii < r {
-                let i_end = (ii + TILE).min(r);
-                let mut jj = 0;
-                while jj < c {
-                    let j_end = (jj + TILE).min(c);
-                    for i in ii..i_end {
-                        let src_row = i * c;
-                        for j in jj..j_end {
-                            dst[j * r + i] = src[src_row + j].clone();
+            if plane > 0 {
+                let batch = numel / plane;
+                for b in 0..batch {
+                    let base = b * plane;
+                    let s = &src[base..base + plane];
+                    let d = &mut dst[base..base + plane];
+                    let mut ii = 0;
+                    while ii < r {
+                        let i_end = (ii + TILE).min(r);
+                        let mut jj = 0;
+                        while jj < c {
+                            let j_end = (jj + TILE).min(c);
+                            for i in ii..i_end {
+                                let src_row = i * c;
+                                for j in jj..j_end {
+                                    d[j * r + i] = s[src_row + j].clone();
+                                }
+                            }
+                            jj += TILE;
                         }
+                        ii += TILE;
                     }
-                    jj += TILE;
                 }
-                ii += TILE;
             }
             return Ok(dst);
         }
@@ -20908,6 +20924,42 @@ mod tests {
         assert_eq!(got.len(), want.len());
         for k in 0..want.len() {
             assert_eq!(got[k].to_bits(), want[k].to_bits(), "transpose idx={k}");
+        }
+    }
+
+    #[test]
+    fn tensor_batched_matrix_transpose_blocked_matches_naive() {
+        // Batched last-two-dims swap (perm == [0, 2, 1]) must hit the cache-blocked
+        // path and stay bit-identical to a naive per-plane scatter. Multi-tile,
+        // non-square planes, several batches.
+        let batch = 5usize;
+        let r = 70usize;
+        let c = 99usize;
+        let plane = r * c;
+        let data: Vec<f64> = (0..batch * plane)
+            .map(|i| (i % 9973) as f64 * 0.25 - 11.0)
+            .collect();
+        let mut tape = TensorTape::new();
+        let x = tape
+            .leaf(data.clone(), vec![batch, r, c], false)
+            .expect("leaf should succeed");
+        let y = tape
+            .permute(x, vec![0, 2, 1])
+            .expect("permute should succeed");
+        let got = tape.values(y).expect("values should exist");
+        // Naive reference: per batch plane, dst[j*r+i] = src[i*c+j].
+        let mut want = vec![0.0f64; batch * plane];
+        for b in 0..batch {
+            let base = b * plane;
+            for i in 0..r {
+                for j in 0..c {
+                    want[base + j * r + i] = data[base + i * c + j];
+                }
+            }
+        }
+        assert_eq!(got.len(), want.len());
+        for k in 0..want.len() {
+            assert_eq!(got[k].to_bits(), want[k].to_bits(), "batched mT idx={k}");
         }
     }
 
