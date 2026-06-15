@@ -11498,18 +11498,15 @@ impl TensorTape {
                 TensorNodeOp::Mish { input } => {
                     let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| {
+                    let contrib =
+                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
                             // softplus uses log1p(exp(x)) for numerical
                             // stability; matches ft-kernel-cpu::softplus_value.
-                            let sp = if *x > 20.0 { *x } else { x.exp().ln_1p() };
+                            let sp = if x > 20.0 { x } else { x.exp().ln_1p() };
                             let tsp = sp.tanh();
                             let sig = 1.0 / (1.0 + (-x).exp());
                             g * (tsp + x * sig * (1.0 - tsp * tsp))
-                        })
-                        .collect();
+                        });
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
@@ -18804,6 +18801,29 @@ impl TensorTape {
         Ok(())
     }
 
+    fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+    where
+        F: Fn(f64, f64) -> f64 + Send + Sync,
+    {
+        const PAR_MIN: usize = 1 << 15;
+        if incoming.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            incoming
+                .par_iter()
+                .copied()
+                .zip(values.par_iter().copied())
+                .map(|(grad, value)| f(grad, value))
+                .collect()
+        } else {
+            incoming
+                .iter()
+                .copied()
+                .zip(values.iter().copied())
+                .map(|(grad, value)| f(grad, value))
+                .collect()
+        }
+    }
+
     /// Accumulate a per-element gradient contribution computed lazily, without
     /// materialising it into an intermediate `Vec`. `contribution(i)` yields the
     /// i-th contribution; the running sum `target[i] += contribution(i)` is the
@@ -22149,6 +22169,35 @@ mod tests {
         let report = tape.backward(y).expect("backward");
         let expected = 1.0 / (1.0 + (-10.0_f64).exp());
         assert_eq!(report.gradient(x).expect("grad"), expected);
+    }
+
+    #[test]
+    fn tensor_mish_large_backward_matches_serial_formula_bit_exact() {
+        let size = (1 << 15) + 257;
+        let values: Vec<f64> = (0..size)
+            .map(|i| -3.0 + ((i % 1024) as f64) * (6.0 / 1023.0))
+            .collect();
+        let mut tape = TensorTape::new();
+        let x = tape.leaf(values.clone(), vec![size], true).expect("leaf");
+        let (y, _) = tape.mish(x, ExecutionMode::Strict).expect("mish");
+        let report = tape.backward(y).expect("backward");
+        let grads = report.gradient(x).expect("grad");
+
+        for (index, (&x_value, &grad)) in values.iter().zip(grads.iter()).enumerate() {
+            let sp = if x_value > 20.0 {
+                x_value
+            } else {
+                x_value.exp().ln_1p()
+            };
+            let tsp = sp.tanh();
+            let sig = 1.0 / (1.0 + (-x_value).exp());
+            let expected = tsp + x_value * sig * (1.0 - tsp * tsp);
+            assert_eq!(
+                grad.to_bits(),
+                expected.to_bits(),
+                "mish backward bit mismatch at index {index}: x={x_value}"
+            );
+        }
     }
 
     #[test]

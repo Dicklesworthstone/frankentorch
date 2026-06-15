@@ -1,0 +1,409 @@
+  [2m2026-06-15T05:00:30.364776Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ovh-a at ubuntu@51.222.245.56 (0 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:514 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:30.634139Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mStarting remote compilation pipeline for frankentorch-next-20260615T045108Z (hash: eccedb14f1dfd6c2)[0m
+    [2;3mat[0m rch/src/hook.rs:5994 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:30.634189Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook.rs:6016 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:31.490064Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSyncing project to worker ovh-a...[0m
+    [2;3mat[0m rch/src/hook.rs:6046 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:31.490186Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z -> /data/projects/.scratch/frankentorch-next-20260615T045108Z on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:32.058487Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 568ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:32.058611Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-api -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-api on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:32.528021Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 469ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:32.528157Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:33.122989Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 594ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:33.123157Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-conformance -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-conformance on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:33.673170Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 549ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:33.673322Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:34.159269Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 485ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:34.159404Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-data -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-data on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:34.626028Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 466ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:34.626146Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-device -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-device on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:35.093946Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 467ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:35.094078Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:35.682184Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 588ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:35.682347Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:36.148119Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 465ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:36.148245Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-nn -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-nn on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:36.619816Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 471ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:36.619968Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-optim -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-optim on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:37.083063Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 463ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:37.083182Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-runtime -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-runtime on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:37.553327Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 470ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:37.553462Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-serialize -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-serialize on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1434 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:38.159654Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 606ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1503 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:38.159705Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSync complete: 2876 files, 126501 bytes in 6661ms[0m
+    [2;3mat[0m rch/src/hook.rs:6209 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:40.208857Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mExecuting command remotely: cargo bench -j 1 -p ft-autograd --bench backward_bench -- activation_backward --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot[0m
+    [2;3mat[0m rch/src/hook.rs:6252 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-15T05:00:40.208911Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/tmp/cargo-target -> /data/projects/.scratch/frankentorch-next-20260615T045108Z/.rch-target-ovh-a-job-29884606035532470-1781499631490053976-0[0m
+    [2;3mat[0m rch/src/transfer.rs:712 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bit-set v0.8.0
+  Downloaded bit-vec v0.8.0
+  Downloaded bitflags v2.11.1
+  Downloaded anes v0.1.6
+  Downloaded anstyle v1.0.14
+  Downloaded autocfg v1.5.0
+  Downloaded bytemuck v1.25.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded fastrand v2.4.1
+  Downloaded fnv v1.0.7
+  Downloaded either v1.15.0
+  Downloaded is-terminal v0.4.17
+  Downloaded matrixmultiply v0.3.10
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded half v2.7.1
+  Downloaded num-complex v0.4.6
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded memchr v2.8.0
+  Downloaded rawpointer v0.2.1
+  Downloaded getrandom v0.3.4
+  Downloaded rayon-core v1.13.0
+  Downloaded libm v0.2.16
+  Downloaded insta v1.47.2
+  Downloaded quick-error v1.2.3
+  Downloaded rusty-fork v0.3.1
+  Downloaded rand_xorshift v0.4.0
+  Downloaded same-file v1.0.6
+  Downloaded zmij v1.0.21
+  Downloaded itoa v1.0.18
+  Downloaded clap_lex v1.1.0
+  Downloaded cfg-if v1.0.4
+  Downloaded plotters-svg v0.3.7
+  Downloaded errno v0.3.14
+  Downloaded plotters-backend v0.3.7
+  Downloaded rand_core v0.9.5
+  Downloaded oorandom v11.1.5
+  Downloaded quote v1.0.45
+  Downloaded wait-timeout v0.2.1
+  Downloaded ciborium-io v0.2.2
+  Downloaded walkdir v2.5.0
+  Downloaded criterion-plot v0.5.0
+  Downloaded cast v0.3.0
+  Downloaded unarray v0.1.4
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded once_cell v1.21.4
+  Downloaded num-traits v0.2.19
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded tinytemplate v1.2.1
+  Downloaded ciborium-ll v0.2.2
+  Downloaded rand_chacha v0.9.0
+  Downloaded proc-macro2 v1.0.106
+  Downloaded tempfile v3.27.0
+  Downloaded ciborium v0.2.2
+  Downloaded console v0.16.3
+  Downloaded serde_derive v1.0.228
+  Downloaded unicode-ident v1.0.24
+  Downloaded safe_arch v0.7.4
+  Downloaded clap v4.6.1
+  Downloaded serde_core v1.0.228
+  Downloaded similar v2.7.0
+  Downloaded serde v1.0.228
+  Downloaded wide v0.7.33
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded criterion v0.5.1
+  Downloaded rand v0.9.4
+  Downloaded itertools v0.10.5
+  Downloaded plotters v0.3.7
+  Downloaded serde_json v1.0.149
+  Downloaded regex v1.12.3
+  Downloaded clap_builder v4.6.0
+  Downloaded rayon v1.12.0
+  Downloaded proptest v1.11.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling syn v2.0.117
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.185
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling getrandom v0.3.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling serde_core v1.0.228
+   Compiling crossbeam-deque v0.8.6
+   Compiling rustix v1.1.4
+   Compiling matrixmultiply v0.3.10
+   Compiling linux-raw-sys v0.12.1
+   Compiling libm v0.2.16
+   Compiling once_cell v1.21.4
+   Compiling bitflags v2.11.1
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling rayon v1.12.0
+   Compiling rand_core v0.9.5
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling serde_derive v1.0.228
+   Compiling fastrand v2.4.1
+   Compiling regex-syntax v0.8.10
+   Compiling rawpointer v0.2.1
+   Compiling serde_json v1.0.149
+   Compiling tempfile v3.27.0
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-core)
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.0
+   Compiling ciborium-io v0.2.2
+   Compiling anstyle v1.0.14
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling clap_builder v4.6.0
+   Compiling ciborium-ll v0.2.2
+   Compiling plotters-svg v0.3.7
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-kernel-cpu)
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling criterion-plot v0.5.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling rand_chacha v0.9.0
+   Compiling regex v1.12.3
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-dispatch)
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling clap v4.6.1
+   Compiling tinytemplate v1.2.1
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling console v0.16.3
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling similar v2.7.0
+   Compiling anes v0.1.6
+   Compiling unarray v0.1.4
+   Compiling proptest v1.11.0
+   Compiling criterion v0.5.1
+   Compiling insta v1.47.2
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-next-20260615T045108Z/crates/ft-autograd)
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11293:65
+      |
+11293 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11293 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11308:65
+      |
+11308 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11308 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11339:65
+      |
+11339 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11339 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11371:65
+      |
+11371 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11371 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11386:65
+      |
+11386 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11386 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11462:65
+      |
+11462 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11462 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+error[E0308]: mismatched types
+     --> crates/ft-autograd/src/lib.rs:11481:65
+      |
+11481 |                     let contrib = Self::tensor_backward_zip_map(incoming, &input_values, |g, x| {
+      |                                   ----------------------------- ^^^^^^^^ expected `&[f64]`, found `Vec<f64>`
+      |                                   |
+      |                                   arguments to this function are incorrect
+      |
+      = note: expected reference `&[f64]`
+                    found struct `Vec<f64>`
+note: associated function defined here
+     --> crates/ft-autograd/src/lib.rs:18783:8
+      |
+18783 |     fn tensor_backward_zip_map<F>(incoming: &[f64], values: &[f64], f: F) -> Vec<f64>
+      |        ^^^^^^^^^^^^^^^^^^^^^^^    ----------------
+help: consider borrowing here
+      |
+11481 |                     let contrib = Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+      |                                                                 +
+
+For more information about this error, try `rustc --explain E0308`.
+error: could not compile `ft-autograd` (lib) due to 7 previous errors
+  [2m2026-06-15T05:03:06.417607Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mRemote command finished: exit=101 in 146208ms[0m
+    [2;3mat[0m rch/src/hook.rs:6376 [2;3mon[0m ThreadId(1)
+
+[RCH] remote ovh-a failed (exit 101)

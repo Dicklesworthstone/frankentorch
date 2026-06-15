@@ -84,6 +84,51 @@ fn build_add_chain(depth: usize, size: usize) -> (TensorTape, TensorNodeId) {
     (tape, cur)
 }
 
+#[derive(Clone, Copy)]
+enum Activation {
+    Gelu,
+    Silu,
+    Elu,
+    Erf,
+    Erfc,
+    Softplus,
+    Mish,
+}
+
+fn apply_activation(tape: &mut TensorTape, op: Activation, input: TensorNodeId) -> TensorNodeId {
+    match op {
+        Activation::Gelu => tape.gelu(input, ExecutionMode::Strict).expect("gelu").0,
+        Activation::Silu => tape.silu(input, ExecutionMode::Strict).expect("silu").0,
+        Activation::Elu => tape.elu(input, ExecutionMode::Strict).expect("elu").0,
+        Activation::Erf => tape.erf(input, ExecutionMode::Strict).expect("erf").0,
+        Activation::Erfc => tape.erfc(input, ExecutionMode::Strict).expect("erfc").0,
+        Activation::Softplus => {
+            tape.softplus(input, ExecutionMode::Strict)
+                .expect("softplus")
+                .0
+        }
+        Activation::Mish => tape.mish(input, ExecutionMode::Strict).expect("mish").0,
+    }
+}
+
+fn build_activation_chain(op: Activation, depth: usize, size: usize) -> (TensorTape, TensorNodeId) {
+    let mut tape = TensorTape::new();
+    let x = tape
+        .leaf(
+            (0..size)
+                .map(|i| -3.0 + ((i % 1024) as f64) * (6.0 / 1023.0))
+                .collect(),
+            vec![size],
+            true,
+        )
+        .expect("leaf x");
+    let mut cur = x;
+    for _ in 0..depth {
+        cur = apply_activation(&mut tape, op, cur);
+    }
+    (tape, cur)
+}
+
 fn bench_backward(c: &mut Criterion) {
     let mut group = c.benchmark_group("autograd_backward");
     let depth = 256;
@@ -129,5 +174,34 @@ fn bench_backward(c: &mut Criterion) {
     group.finish();
 }
 
-criterion_group!(benches, bench_backward);
+fn bench_activation_backward(c: &mut Criterion) {
+    let mut group = c.benchmark_group("activation_backward");
+    let depth = 16;
+    let size = 65536;
+
+    for (name, op) in [
+        ("gelu_chain_16x65536", Activation::Gelu),
+        ("silu_chain_16x65536", Activation::Silu),
+        ("elu_chain_16x65536", Activation::Elu),
+        ("erf_chain_16x65536", Activation::Erf),
+        ("erfc_chain_16x65536", Activation::Erfc),
+        ("softplus_chain_16x65536", Activation::Softplus),
+        ("mish_chain_16x65536", Activation::Mish),
+    ] {
+        group.bench_function(name, |b| {
+            b.iter_batched(
+                || build_activation_chain(op, depth, size),
+                |(mut tape, root)| {
+                    let report = tape.backward(root).expect("backward");
+                    black_box(report.gradient(TensorNodeId(0)).map(|g| g[0]))
+                },
+                BatchSize::SmallInput,
+            );
+        });
+    }
+
+    group.finish();
+}
+
+criterion_group!(benches, bench_backward, bench_activation_backward);
 criterion_main!(benches);
