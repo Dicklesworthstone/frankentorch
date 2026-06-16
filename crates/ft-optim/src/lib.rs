@@ -5078,49 +5078,67 @@ impl Optimizer for ASGD {
         let eta = self.eta;
         let lambd = self.lambd;
 
+        let mu = self.mu;
+        let weight_decay = self.weight_decay;
+        let maximize = self.maximize;
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match load_param_gradient(session, param)? {
-                Some(g) => g,
+            let grad_len = match session.tensor_accumulated_gradient_len(param)? {
+                Some(len) => len,
                 None => continue,
             };
+            let param_len = session.tensor_values_len(param)?;
+            ensure_grad_len_matches_param(param, param_len, grad_len)?;
 
-            let param_values = session.tensor_values(param)?;
-            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let mut effective_grad = grad;
+            let is_first = self.ax[i].is_none();
+            let ax = self.ax[i].get_or_insert_with(|| vec![0.0; grad_len]);
+            ensure_state_len(grad_len, ax.len(), "asgd average state length mismatch")?;
 
-            // maximize: negate the gradient first (before weight decay), torch parity.
-            if self.maximize {
-                for g in effective_grad.iter_mut() {
-                    *g = -*g;
-                }
-            }
-
-            if self.weight_decay != 0.0 {
-                for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
-                    *g += self.weight_decay * p;
-                }
-            }
-
-            // torch ASGD: param = param * (1 - lambd*eta) - eta*grad,
-            // i.e. param -= (lambd*eta)*param + eta*grad.
-            let update: Vec<f64> = param_values
-                .iter()
-                .zip(effective_grad.iter())
-                .map(|(p, g)| lambd * eta * p + eta * g)
-                .collect();
-            apply_param_update(session, param, &update)?;
-
-            // Update running average: ax = ax + mu * (param - ax)
-            let new_param_values = session.tensor_values(param)?;
-            let ax = self.ax[i].get_or_insert_with(|| new_param_values.clone());
-            ensure_state_len(
-                new_param_values.len(),
-                ax.len(),
-                "asgd average state length mismatch",
+            // Single fused in-place pass (Adam optpar pattern): the old path cloned
+            // grad + read the param TWICE (once for the step, once post-update for the
+            // averaging) + built an update Vec + apply_param_update — ~6 numel copies.
+            // Apply the step to the param buffer, then fold the running average using
+            // the UPDATED param in the same traversal, fanned over rayon above
+            // OPTIM_PARALLEL_THRESHOLD. Bit-for-bit identical per element (same ops +
+            // order): wd uses the OLD param; param = old*(1-lambd*eta) - eta*g_eff;
+            // ax = old_ax + mu*(new_param - old_ax) — and on the FIRST step ax is
+            // seeded to the post-update param (== torch's ax init, where the +mu*0
+            // term is a no-op). frankentorch-optpar.
+            session.tensor_update_param_values_f64_with_accumulated_gradient(
+                param,
+                |grad, param_values| {
+                    let body = |p: &mut f64, g: f64, a: &mut f64| {
+                        let g = if maximize { -g } else { g };
+                        let g_eff = if weight_decay != 0.0 {
+                            g + weight_decay * *p
+                        } else {
+                            g
+                        };
+                        // param -= lambd*eta*param + eta*g_eff (uses OLD param).
+                        *p -= lambd * eta * *p + eta * g_eff;
+                        if is_first {
+                            *a = *p;
+                        } else {
+                            *a += mu * (*p - *a);
+                        }
+                    };
+                    if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
+                        use rayon::prelude::*;
+                        param_values
+                            .par_iter_mut()
+                            .zip(grad.par_iter())
+                            .zip(ax.par_iter_mut())
+                            .for_each(|((p, g), a)| body(p, *g, a));
+                    } else {
+                        for ((p, g), a) in param_values
+                            .iter_mut()
+                            .zip(grad.iter())
+                            .zip(ax.iter_mut())
+                        {
+                            body(p, *g, a);
+                        }
+                    }
+                },
             )?;
-            for (a, p) in ax.iter_mut().zip(new_param_values.iter()) {
-                *a += self.mu * (p - *a);
-            }
         }
 
         // Decay eta and mu for the NEXT step (torch updates these post-step):
