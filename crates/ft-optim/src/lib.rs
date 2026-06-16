@@ -4516,66 +4516,64 @@ impl Optimizer for Adamax {
         self.validate_hyperparams()?;
 
         for (i, &param) in self.params.iter().enumerate() {
-            let grad = match load_param_gradient(session, param)? {
-                Some(g) => g,
+            let grad_len = match session.tensor_accumulated_gradient_len(param)? {
+                Some(len) => len,
                 None => continue,
             };
             let t =
                 advance_param_step_count(&mut self.step_counts, i, "adamax step counter overflow")?;
+            let param_len = session.tensor_values_len(param)?;
+            ensure_grad_len_matches_param(param, param_len, grad_len)?;
 
-            let param_values = session.tensor_values(param)?;
-            ensure_grad_len_matches_param(param, param_values.len(), grad.len())?;
-            let mut effective_grad = grad;
-
-            // maximize: negate the gradient first (before weight decay), torch parity.
-            if self.maximize {
-                for g in effective_grad.iter_mut() {
-                    *g = -*g;
-                }
-            }
-
-            if self.weight_decay != 0.0 {
-                for (g, p) in effective_grad.iter_mut().zip(param_values.iter()) {
-                    *g += self.weight_decay * p;
-                }
-            }
-
-            // Update biased first moment: m = beta1 * m + (1 - beta1) * g
-            let m = self.m[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
-            ensure_state_len(
-                effective_grad.len(),
-                m.len(),
-                "adamax first-moment state length mismatch",
-            )?;
-            for (m_val, g) in m.iter_mut().zip(effective_grad.iter()) {
-                *m_val = self.beta1 * *m_val + (1.0 - self.beta1) * g;
-            }
-
-            // Update infinity norm: u = max(beta2 * u, |g|)
-            let u = self.u[i].get_or_insert_with(|| vec![0.0; effective_grad.len()]);
-            ensure_state_len(
-                effective_grad.len(),
-                u.len(),
-                "adamax infinity-norm state length mismatch",
-            )?;
-            for (u_val, g) in u.iter_mut().zip(effective_grad.iter()) {
-                *u_val = f64::max(self.beta2 * *u_val, g.abs());
-            }
-
-            // Bias correction for first moment only
             let bias_correction1 = adam_bias_correction(self.beta1, t);
 
-            // Update: lr * m_hat / (u + eps)
-            let update: Vec<f64> = m
-                .iter()
-                .zip(u.iter())
-                .map(|(m_val, u_val)| {
-                    let m_hat = m_val / bias_correction1;
-                    self.lr * m_hat / (u_val + self.eps)
-                })
-                .collect();
+            let m = self.m[i].get_or_insert_with(|| vec![0.0; grad_len]);
+            ensure_state_len(grad_len, m.len(), "adamax first-moment state length mismatch")?;
+            let u_state = self.u[i].get_or_insert_with(|| vec![0.0; grad_len]);
+            ensure_state_len(grad_len, u_state.len(), "adamax infinity-norm state length mismatch")?;
 
-            apply_param_update(session, param, &update)?;
+            let (beta1, beta2, lr, eps) = (self.beta1, self.beta2, self.lr, self.eps);
+            let weight_decay = self.weight_decay;
+            let maximize = self.maximize;
+            // Single fused in-place pass (Adam optpar pattern): no grad/param clones
+            // + write-back. Bit-for-bit identical per element (same ops + order):
+            // maximize -> +wd*p -> m EMA -> u = max(beta2*u, |g|) -> p -= lr*m_hat/(u+eps).
+            // frankentorch-optpar.
+            session.tensor_update_param_values_f64_with_accumulated_gradient(
+                param,
+                |grad, param_values| {
+                    let body = |p: &mut f64, g: f64, m_val: &mut f64, u_val: &mut f64| {
+                        let g = if maximize { -g } else { g };
+                        let g_eff = if weight_decay != 0.0 {
+                            g + weight_decay * *p
+                        } else {
+                            g
+                        };
+                        *m_val = beta1 * *m_val + (1.0 - beta1) * g_eff;
+                        *u_val = f64::max(beta2 * *u_val, g_eff.abs());
+                        let m_hat = *m_val / bias_correction1;
+                        *p -= lr * m_hat / (*u_val + eps);
+                    };
+                    if param_values.len() >= OPTIM_PARALLEL_THRESHOLD {
+                        use rayon::prelude::*;
+                        param_values
+                            .par_iter_mut()
+                            .zip(grad.par_iter())
+                            .zip(m.par_iter_mut())
+                            .zip(u_state.par_iter_mut())
+                            .for_each(|(((p, g), m_val), u_val)| body(p, *g, m_val, u_val));
+                    } else {
+                        for (((p, g), m_val), u_val) in param_values
+                            .iter_mut()
+                            .zip(grad.iter())
+                            .zip(m.iter_mut())
+                            .zip(u_state.iter_mut())
+                        {
+                            body(p, *g, m_val, u_val);
+                        }
+                    }
+                },
+            )?;
         }
         Ok(())
     }
