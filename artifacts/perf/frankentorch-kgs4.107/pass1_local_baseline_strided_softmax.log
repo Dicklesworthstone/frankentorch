@@ -1,0 +1,99 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling syn v2.0.117
+   Compiling libc v0.2.185
+   Compiling cfg-if v1.0.4
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling zerocopy-derive v0.8.48
+   Compiling getrandom v0.3.4
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling bitflags v2.11.1
+   Compiling either v1.15.0
+   Compiling serde v1.0.228
+   Compiling rayon-core v1.13.0
+   Compiling zmij v1.0.21
+   Compiling once_cell v1.21.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling crossbeam-deque v0.8.6
+   Compiling rand_core v0.9.5
+   Compiling serde_derive v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling fastrand v2.4.1
+   Compiling regex-syntax v0.8.10
+   Compiling tempfile v3.27.0
+   Compiling matrixmultiply v0.3.10
+   Compiling memchr v2.8.0
+   Compiling libm v0.2.16
+   Compiling anstyle v1.0.14
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.0
+   Compiling ciborium-io v0.2.2
+   Compiling itoa v1.0.18
+   Compiling ciborium-ll v0.2.2
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling rayon v1.12.0
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling ppv-lite86 v0.2.21
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling rawpointer v0.2.1
+   Compiling bit-vec v0.8.0
+   Compiling fnv v1.0.7
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling walkdir v2.5.0
+   Compiling criterion-plot v0.5.0
+   Compiling rusty-fork v0.3.1
+   Compiling bit-set v0.8.0
+   Compiling rand_chacha v0.9.0
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling regex v1.12.3
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling console v0.16.3
+   Compiling is-terminal v0.4.17
+   Compiling similar v2.7.0
+   Compiling unarray v0.1.4
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling criterion v0.5.1
+   Compiling proptest v1.11.0
+   Compiling insta v1.47.2
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 4m 02s
+     Running benches/softmax_bench.rs (/data/tmp/frankentorch-a7xya-local-target/release/deps/softmax_bench-8f2bf4098da247cb)
+Gnuplot not found, using plotters backend
+Benchmarking softmax_f64_strided_4096x32x8_dim1
+Benchmarking softmax_f64_strided_4096x32x8_dim1: Warming up for 1.0000 s
+Benchmarking softmax_f64_strided_4096x32x8_dim1: Collecting 10 samples in estimated 3.0535 s (1485 iterations)
+Benchmarking softmax_f64_strided_4096x32x8_dim1: Analyzing
+softmax_f64_strided_4096x32x8_dim1
+                        time:   [2.0127 ms 2.0627 ms 2.1211 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+Benchmarking log_softmax_f64_strided_4096x32x8_dim1
+Benchmarking log_softmax_f64_strided_4096x32x8_dim1: Warming up for 1.0000 s
+Benchmarking log_softmax_f64_strided_4096x32x8_dim1: Collecting 10 samples in estimated 3.1012 s (1540 iterations)
+Benchmarking log_softmax_f64_strided_4096x32x8_dim1: Analyzing
+log_softmax_f64_strided_4096x32x8_dim1
+                        time:   [2.0130 ms 2.0489 ms 2.0815 ms]
+
