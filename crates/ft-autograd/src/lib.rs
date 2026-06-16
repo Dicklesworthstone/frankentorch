@@ -10002,77 +10002,88 @@ impl TensorTape {
     fn map_typed_storage<F>(
         storage: &TensorStorage,
         output_len: usize,
-        mut src_index_for_output: F,
+        src_index_for_output: F,
     ) -> Result<TensorStorage, AutogradError>
     where
-        F: FnMut(usize) -> Result<usize, AutogradError>,
+        F: Fn(usize) -> Result<usize, AutogradError> + Sync,
     {
         Ok(match storage {
             TensorStorage::F32(values) => TensorStorage::F32(Arc::new(Self::map_slice(
                 values,
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
             TensorStorage::F64(values) => TensorStorage::F64(Arc::new(Self::map_slice(
                 values,
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
             TensorStorage::F64Inline4(values) => TensorStorage::F64(Arc::new(Self::map_slice(
                 values.as_slice(),
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
             TensorStorage::F16(values) => TensorStorage::F16(Arc::new(Self::map_slice(
                 values,
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
             TensorStorage::BF16(values) => TensorStorage::BF16(Arc::new(Self::map_slice(
                 values,
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
             TensorStorage::Complex64(values) => TensorStorage::Complex64(Arc::new(
-                Self::map_slice(values, output_len, &mut src_index_for_output)?,
+                Self::map_slice(values, output_len, &src_index_for_output)?,
             )),
             TensorStorage::Complex128(values) => TensorStorage::Complex128(Arc::new(
-                Self::map_slice(values, output_len, &mut src_index_for_output)?,
+                Self::map_slice(values, output_len, &src_index_for_output)?,
             )),
             TensorStorage::QInt8(values) => TensorStorage::QInt8(Arc::new(Self::map_slice(
                 values,
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
             TensorStorage::QUInt8(values) => TensorStorage::QUInt8(Arc::new(Self::map_slice(
                 values,
                 output_len,
-                &mut src_index_for_output,
+                &src_index_for_output,
             )?)),
         })
     }
 
-    fn map_slice<T: Clone, F>(
+    fn map_slice<T: Clone + Send + Sync, F>(
         values: &[T],
         output_len: usize,
-        src_index_for_output: &mut F,
+        src_index_for_output: &F,
     ) -> Result<Vec<T>, AutogradError>
     where
-        F: FnMut(usize) -> Result<usize, AutogradError>,
+        F: Fn(usize) -> Result<usize, AutogradError> + Sync,
     {
-        let mut output = Vec::with_capacity(output_len);
-        for flat in 0..output_len {
+        let fetch = |flat: usize| -> Result<T, AutogradError> {
             let src = src_index_for_output(flat)?;
-            let value = values
+            values
                 .get(src)
+                .cloned()
                 .ok_or(AutogradError::DenseTensor(
                     DenseTensorError::InsufficientStorage {
                         needed: src + 1,
                         actual: values.len(),
                     },
-                ))?
-                .clone();
-            output.push(value);
+                ))
+        };
+        // Output-driven gather (each output index maps to one source index): every
+        // output is computed independently, so fanning over rayon is bit-for-bit
+        // identical to the serial map. Backs expand/broadcast materialization (hot:
+        // every broadcasted bias/mean/var in norm op-graphs). frankentorch-permpar.
+        const PAR_MIN: usize = 1 << 16;
+        if output_len >= PAR_MIN {
+            use rayon::prelude::*;
+            return (0..output_len).into_par_iter().map(fetch).collect();
+        }
+        let mut output = Vec::with_capacity(output_len);
+        for flat in 0..output_len {
+            output.push(fetch(flat)?);
         }
         Ok(output)
     }

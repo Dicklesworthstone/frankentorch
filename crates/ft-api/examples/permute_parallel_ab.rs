@@ -115,5 +115,32 @@ fn main() {
     out.push_str(&line4);
     out.push('\n');
 
+    // (5) expand/broadcast materialize: [N,1,D] -> [N,M,D] (hot: bias/mean/var
+    // broadcast in norm op-graphs).
+    let (en, em, ed) = (256usize, 256usize, 256usize);
+    let ev: Vec<f64> = (0..en * 1 * ed).map(|i| (i % 1009) as f64 * 0.001).collect();
+    let expand_op = |pool: &ThreadPool| -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..25 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(ev.clone(), vec![en, 1, ed], false).unwrap();
+            let t = Instant::now();
+            pool.install(|| {
+                s.tensor_expand(x, vec![en, em, ed]).unwrap();
+            });
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    };
+    let e1 = expand_op(&pool1);
+    let ep = expand_op(&pooln);
+    let line5 = format!(
+        "expand[256,1,256]->[256,256,256]: serial {e1:.3} ms / parallel({nthreads}t) {ep:.3} ms / {:.2}x",
+        e1 / ep
+    );
+    eprintln!("{line5}");
+    out.push_str(&line5);
+    out.push('\n');
+
     let _ = std::fs::write("artifacts/perf/permute_parallel_ab_result.txt", &out);
 }
