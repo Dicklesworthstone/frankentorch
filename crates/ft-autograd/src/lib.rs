@@ -9754,7 +9754,7 @@ impl TensorTape {
         })
     }
 
-    fn permute_slice<T: Clone>(
+    fn permute_slice<T: Clone + Send + Sync>(
         src: &[T],
         src_shape: &[usize],
         perm: &[usize],
@@ -9818,12 +9818,10 @@ impl TensorTape {
             // spills L1).
             const TILE: usize = 16;
             if plane > 0 {
+                use rayon::prelude::*;
                 let batch = numel / plane;
-                for bi in 0..batch {
-                    let base = bi * plane;
-                    let sgn = &src[base..base + plane];
-                    let dgn = &mut dst[base..base + plane];
-                    // transpose [a_dim, b_dim] of `elem`-length runs.
+                // One plane's cache-blocked [a_dim, b_dim] transpose of elem-runs.
+                let transpose_plane = |sgn: &[T], dgn: &mut [T]| {
                     let mut ii = 0;
                     while ii < a_dim {
                         let i_end = (ii + TILE).min(a_dim);
@@ -9842,6 +9840,48 @@ impl TensorTape {
                         }
                         ii += TILE;
                     }
+                };
+                // The transpose is pure data movement — each dst element is written
+                // exactly once, so any disjoint-chunk parallel split is bit-for-bit
+                // identical to the serial sweep. Fan out above PAR_MIN (tiny permutes
+                // keep serial so rayon split/join doesn't dominate). frankentorch-permpar.
+                const PAR_MIN: usize = 1 << 16;
+                if numel < PAR_MIN {
+                    for bi in 0..batch {
+                        let base = bi * plane;
+                        transpose_plane(&src[base..base + plane], &mut dst[base..base + plane]);
+                    }
+                } else if batch >= 2 {
+                    // Independent planes → disjoint contiguous dst chunks (covers the
+                    // batched attention/conv-layout permutes where batch = leading dims).
+                    dst.par_chunks_mut(plane)
+                        .zip(src[..numel].par_chunks(plane))
+                        .for_each(|(dgn, sgn)| transpose_plane(sgn, dgn));
+                } else {
+                    // Single large plane (e.g. a plain 2-D transpose): parallelize the
+                    // output row-tiles. A TILE block of output rows j ∈ [jj, j_end) owns
+                    // the contiguous dst region [jj·a_dim·elem .. j_end·a_dim·elem),
+                    // reading scattered src — disjoint writes, so still bit-exact.
+                    let row = a_dim * elem;
+                    dst.par_chunks_mut(row * TILE)
+                        .enumerate()
+                        .for_each(|(blk, dblk)| {
+                            let jj = blk * TILE;
+                            let j_end = jj + dblk.len() / row;
+                            let mut ii = 0;
+                            while ii < a_dim {
+                                let i_end = (ii + TILE).min(a_dim);
+                                for j in jj..j_end {
+                                    for i in ii..i_end {
+                                        let s_off = (i * b_dim + j) * elem;
+                                        let d_off = ((j - jj) * a_dim + i) * elem;
+                                        dblk[d_off..d_off + elem]
+                                            .clone_from_slice(&src[s_off..s_off + elem]);
+                                    }
+                                }
+                                ii += TILE;
+                            }
+                        });
                 }
             }
             return Ok(dst);
