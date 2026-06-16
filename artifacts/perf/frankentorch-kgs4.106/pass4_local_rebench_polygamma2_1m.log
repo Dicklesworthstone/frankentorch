@@ -1,0 +1,14 @@
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1m 38s
+     Running benches/special_bench.rs (/data/tmp/frankentorch-a7xya-local-target/release/deps/special_bench-3cdefed747920ba7)
+Gnuplot not found, using plotters backend
+Benchmarking polygamma2_1m
+Benchmarking polygamma2_1m: Warming up for 1.0000 s
+Benchmarking polygamma2_1m: Collecting 10 samples in estimated 3.2509 s (495 iterations)
+Benchmarking polygamma2_1m: Analyzing
+polygamma2_1m           time:   [6.1669 ms 6.3070 ms 6.5575 ms]
+                        change: [-5.7252% -1.6221% +2.8874%] (p = 0.51 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+

@@ -1,0 +1,18 @@
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling regex-syntax v0.8.10
+   Compiling regex-automata v0.4.14
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling regex v1.12.3
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch/crates/ft-runtime)
+   Compiling criterion v0.5.1
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 4m 33s
+     Running benches/special_bench.rs (/data/tmp/frankentorch-a7xya-local-target/release/deps/special_bench-3cdefed747920ba7)
+Gnuplot not found, using plotters backend
+Benchmarking polygamma2_1m
+Benchmarking polygamma2_1m: Warming up for 1.0000 s
+Benchmarking polygamma2_1m: Collecting 10 samples in estimated 3.0364 s (440 iterations)
+Benchmarking polygamma2_1m: Analyzing
+polygamma2_1m           time:   [6.2319 ms 6.4721 ms 6.6888 ms]
+

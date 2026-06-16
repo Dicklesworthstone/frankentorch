@@ -1,0 +1,13 @@
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 20.44s
+     Running unittests src/lib.rs (/data/tmp/frankentorch-a7xya-local-target/debug/deps/ft_api-4d4dd39d7b1afbd1)
+
+running 5 tests
+test tests::polygamma_matches_f64_reference_values ... ok
+test tests::polygamma_n1_trigamma ... ok
+test tests::polygamma_propagates_gradient_via_next_order ... ok
+test tests::polygamma2_unit_interval_fast_prefix_matches_original_bits ... ok
+test tests::polygamma_erfinv_erfcx_parallel_match_serial_bit_exact ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 2126 filtered out; finished in 0.03s
+
