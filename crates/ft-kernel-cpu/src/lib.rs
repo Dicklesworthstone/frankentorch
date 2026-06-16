@@ -4459,6 +4459,118 @@ pub fn conv2d_col2im_f64(
     dpadded
 }
 
+/// f32 mirror of [`conv2d_col2im_f64`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_col2im_f32(
+    dpanel: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+) -> Vec<f32> {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let mut dpadded = vec![0.0f32; batch * in_ch * ph * pw];
+    dpadded
+        .par_chunks_mut(in_ch * ph * pw)
+        .enumerate()
+        .for_each(|(b, dpb)| {
+            for pc in 0..patch_count {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow = (b * patch_count + pc) * patch_width;
+                for c in 0..in_ch {
+                    let ch_off = c * ph * pw;
+                    let pch = c * kh * kw;
+                    for kr in 0..kh {
+                        let irow = ch_off + (base_h + kr) * pw + base_w;
+                        let prow_off = prow + pch + kr * kw;
+                        for kc in 0..kw {
+                            dpb[irow + kc] += dpanel[prow_off + kc];
+                        }
+                    }
+                }
+            }
+        });
+    dpadded
+}
+
+/// f32 mirror of [`conv2d_backward_f64`]. Returns `(dpadded, dweight_flat,
+/// dbias?)`. Used by the f32 conv2d grad fast path (frankentorch-48w0b).
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn conv2d_backward_f32(
+    dout: &[f32],
+    padded: &[f32],
+    weight_flat: &[f32],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    let patch_width = in_ch * kh * kw;
+    let patch_count = oh * ow;
+    let flat = batch * patch_count;
+    let mut dout_flat = vec![0.0f32; flat * out_ch];
+    dout_flat
+        .par_chunks_mut(out_ch)
+        .enumerate()
+        .for_each(|(row, dr)| {
+            let n = row / patch_count;
+            let p = row % patch_count;
+            for (oc, d) in dr.iter_mut().enumerate() {
+                *d = dout[(n * out_ch + oc) * patch_count + p];
+            }
+        });
+    let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    let mut dout_t = vec![0.0f32; out_ch * flat];
+    dout_t
+        .par_chunks_exact_mut(flat)
+        .enumerate()
+        .for_each(|(oc, row)| {
+            for (r, slot) in row.iter_mut().enumerate() {
+                *slot = dout_flat[r * out_ch + oc];
+            }
+        });
+    let mut dweight = vec![0.0f32; out_ch * patch_width];
+    gemm::sgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    let mut dpanel = vec![0.0f32; flat * patch_width];
+    gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, &mut dpanel);
+    let dpadded = conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+    let dbias = if has_bias {
+        let mut db = vec![0.0f32; out_ch];
+        db.par_iter_mut().enumerate().for_each(|(oc, dbo)| {
+            let mut s = 0.0f32;
+            for n in 0..batch {
+                let base = (n * out_ch + oc) * patch_count;
+                for p in 0..patch_count {
+                    s += dout[base + p];
+                }
+            }
+            *dbo = s;
+        });
+        Some(db)
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
 /// Fused conv2d forward (f64) on a PADDED input: im2col + `panel @ weight_flat^T`
 /// (via `dgemm_bt`, no weight transpose) written straight to NCHW `[batch,
 /// out_ch, oh, ow]`, plus optional per-channel bias. Bit-exact to the no-grad
