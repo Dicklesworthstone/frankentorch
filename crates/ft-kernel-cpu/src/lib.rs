@@ -7695,6 +7695,46 @@ pub fn batch_norm_backward_f64(
     let cs = channels * spatial;
     let mut dweight = vec![0.0f64; channels];
     let mut dbias = vec![0.0f64; channels];
+    if spatial == 1 {
+        dweight
+            .par_iter_mut()
+            .zip(dbias.par_iter_mut())
+            .enumerate()
+            .for_each(|(c, (dwc, dbc))| {
+                let rstd = 1.0 / (var[c] + eps).sqrt();
+                let mut sw = 0.0f64;
+                let mut sb = 0.0f64;
+                for n in 0..batch {
+                    let idx = n * channels + c;
+                    let dyi = dy[idx];
+                    let xhat = (x[idx] - mean[c]) * rstd;
+                    sw += dyi * xhat;
+                    sb += dyi;
+                }
+                *dwc = sw;
+                *dbc = sb;
+            });
+        let rstd: Vec<f64> = (0..channels)
+            .map(|c| 1.0 / (var[c] + eps).sqrt())
+            .collect();
+        let mut dx = vec![0.0f64; x.len()];
+        dx.par_chunks_mut(channels)
+            .enumerate()
+            .for_each(|(n, dxrow)| {
+                let base = n * channels;
+                for c in 0..channels {
+                    let rstd_c = rstd[c];
+                    let w = weight[c];
+                    let c1 = w * dbias[c];
+                    let c2 = w * dweight[c];
+                    let idx = base + c;
+                    let xhat = (x[idx] - mean[c]) * rstd_c;
+                    let dxhat = dy[idx] * w;
+                    dxrow[c] = rstd_c * inv_m * (m * dxhat - c1 - xhat * c2);
+                }
+            });
+        return (dx, dweight, dbias);
+    }
     dweight
         .par_iter_mut()
         .zip(dbias.par_iter_mut())
