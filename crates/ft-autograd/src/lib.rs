@@ -18682,7 +18682,7 @@ impl TensorTape {
         })
     }
 
-    fn pad_slice<T: Clone>(
+    fn pad_slice<T: Clone + Send + Sync>(
         values: &[T],
         shape: &[usize],
         out_shape: &[usize],
@@ -18700,10 +18700,46 @@ impl TensorTape {
             ));
         }
 
-        let mut output = vec![fill; out_numel];
         let in_strides = ft_core::contiguous_strides(shape);
         let out_strides = ft_core::contiguous_strides(out_shape);
         let ndim = shape.len();
+
+        // Parallel output-driven build: each output position is computed
+        // independently — decode its coords, and if every coord lies in the
+        // interior window [pad_before[d], pad_before[d]+shape[d]) take the source
+        // element, else `fill`. Pure data movement (each output written once) →
+        // bit-for-bit identical to the serial scatter. Conv padding is hot, and
+        // the per-element O(ndim) decode parallelizes near-linearly above PAR_MIN.
+        // frankentorch-permpar.
+        const PAR_MIN: usize = 1 << 16;
+        if out_numel >= PAR_MIN {
+            use rayon::prelude::*;
+            let output = (0..out_numel)
+                .into_par_iter()
+                .map(|flat_out| {
+                    let mut rem = flat_out;
+                    let mut flat_in = 0usize;
+                    let mut interior = true;
+                    for d in 0..ndim {
+                        let oc = rem / out_strides[d];
+                        rem %= out_strides[d];
+                        if oc < pad_before[d] || oc >= pad_before[d] + shape[d] {
+                            interior = false;
+                            break;
+                        }
+                        flat_in += (oc - pad_before[d]) * in_strides[d];
+                    }
+                    if interior {
+                        values[flat_in].clone()
+                    } else {
+                        fill.clone()
+                    }
+                })
+                .collect();
+            return Ok(output);
+        }
+
+        let mut output = vec![fill; out_numel];
         let mut coords = vec![0usize; ndim];
         for (flat_in, val) in values.iter().enumerate().take(in_numel) {
             let mut rem = flat_in;

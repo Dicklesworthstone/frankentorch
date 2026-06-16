@@ -63,5 +63,31 @@ fn main() {
     out.push_str(&line2);
     out.push('\n');
 
+    // (3) Constant pad of a CNN feature map [N,C,H,W] by 1 on H,W (hot in conv).
+    let (pn, pc, ph, pw) = (16usize, 64usize, 64usize, 64usize);
+    let pv: Vec<f64> = (0..pn * pc * ph * pw).map(|i| (i % 1009) as f64 * 0.001).collect();
+    let pad_op = |pool: &ThreadPool| -> f64 {
+        let mut best = f64::INFINITY;
+        for _ in 0..25 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(pv.clone(), vec![pn, pc, ph, pw], false).unwrap();
+            let t = Instant::now();
+            pool.install(|| {
+                s.tensor_pad(x, &[1, 1, 1, 1], 0.0).unwrap();
+            });
+            best = best.min(t.elapsed().as_secs_f64() * 1e3);
+        }
+        best
+    };
+    let p1 = pad_op(&pool1);
+    let pp = pad_op(&pooln);
+    let line3 = format!(
+        "pad[16,64,64,64]+1hw: serial {p1:.3} ms / parallel({nthreads}t) {pp:.3} ms / {:.2}x",
+        p1 / pp
+    );
+    eprintln!("{line3}");
+    out.push_str(&line3);
+    out.push('\n');
+
     let _ = std::fs::write("artifacts/perf/permute_parallel_ab_result.txt", &out);
 }
