@@ -1,0 +1,10 @@
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 5.13s
+     Running benches/special_bench.rs (/data/tmp/frankentorch-a7xya-local-target/release/deps/special_bench-3cdefed747920ba7)
+Gnuplot not found, using plotters backend
+Benchmarking multigammaln_p4_1m
+Benchmarking multigammaln_p4_1m: Warming up for 1.0000 s
+Benchmarking multigammaln_p4_1m: Collecting 10 samples in estimated 3.2070 s (385 iterations)
+Benchmarking multigammaln_p4_1m: Analyzing
+multigammaln_p4_1m      time:   [7.1825 ms 7.4027 ms 7.7425 ms]
+
