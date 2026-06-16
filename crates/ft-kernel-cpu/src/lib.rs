@@ -4919,6 +4919,90 @@ pub fn depthwise_conv2d_backward_f64(
     (dpadded, dweight, dbias)
 }
 
+/// f32 mirror of [`depthwise_conv2d_backward_f64`].
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn depthwise_conv2d_backward_f32(
+    dout: &[f32],
+    padded: &[f32],
+    weight: &[f32],
+    batch: usize,
+    channels: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    has_bias: bool,
+) -> (Vec<f32>, Vec<f32>, Option<Vec<f32>>) {
+    let outplane = oh * ow;
+    let inplane = ph * pw;
+    let wsz = kh * kw;
+    let mut dpadded = vec![0.0f32; batch * channels * inplane];
+    dpadded
+        .par_chunks_mut(inplane)
+        .enumerate()
+        .for_each(|(plane, dp)| {
+            let c = plane % channels;
+            let wb = c * wsz;
+            let db = &dout[plane * outplane..plane * outplane + outplane];
+            for oy in 0..oh {
+                for ox in 0..ow {
+                    let g = db[oy * ow + ox];
+                    for kr in 0..kh {
+                        let row = (oy * sh + kr) * pw + ox * sw;
+                        let wr = wb + kr * kw;
+                        for kc in 0..kw {
+                            dp[row + kc] += g * weight[wr + kc];
+                        }
+                    }
+                }
+            }
+        });
+    let mut dweight = vec![0.0f32; channels * wsz];
+    dweight
+        .par_chunks_mut(wsz)
+        .enumerate()
+        .for_each(|(c, dw)| {
+            for n in 0..batch {
+                let plane = n * channels + c;
+                let db = &dout[plane * outplane..plane * outplane + outplane];
+                let pb = &padded[plane * inplane..plane * inplane + inplane];
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let g = db[oy * ow + ox];
+                        for kr in 0..kh {
+                            let row = (oy * sh + kr) * pw + ox * sw;
+                            for kc in 0..kw {
+                                dw[kr * kw + kc] += g * pb[row + kc];
+                            }
+                        }
+                    }
+                }
+            }
+        });
+    let dbias = if has_bias {
+        let mut db = vec![0.0f32; channels];
+        db.par_iter_mut().enumerate().for_each(|(c, dbc)| {
+            let mut s = 0.0f32;
+            for n in 0..batch {
+                let base = (n * channels + c) * outplane;
+                for i in 0..outplane {
+                    s += dout[base + i];
+                }
+            }
+            *dbc = s;
+        });
+        Some(db)
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
 /// Direct depthwise conv3d forward (groups == channels). 3-D analog of
 /// [`depthwise_conv2d_forward_f64`]: `padded` `[N, C, pd, ph, pw]`, `weight`
 /// `[C, 1, kd, kh, kw]` flattened, `bias` `[C]`, output `[N, C, od, oh, ow]`.
