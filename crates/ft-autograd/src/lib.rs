@@ -8901,6 +8901,114 @@ impl TensorTape {
         Ok(out)
     }
 
+    /// f32-output borrowed-inputs custom op (like
+    /// [`Self::apply_function_f32_output_borrowed_inputs`]) that ALSO registers a
+    /// create_graph backward, so the f32 conv/linear grad fast paths participate in
+    /// double-backward (f32 gradient-penalty / WGAN-GP in f32 or mixed-precision
+    /// training) without regressing the common 1st-order path. Regular backward
+    /// still borrows live f32 inputs; only the create_graph pass runs the cg
+    /// closure (which reads inputs from the tape by node id and builds f64-tape
+    /// grad nodes — typically nested apply_function nodes that cast to f32 and use
+    /// the f32 kernels to match torch's f32-precision backward). frankentorch-lboou.
+    pub fn apply_function_f32_output_with_create_graph_borrowed_inputs<F, B, CG>(
+        &mut self,
+        inputs: &[TensorNodeId],
+        forward_fn: F,
+        backward_fn: B,
+        create_graph_backward_fn: CG,
+    ) -> Result<TensorNodeId, AutogradError>
+    where
+        F: FnOnce(
+            &mut FunctionCtx,
+            &[(&[f32], &[usize])],
+        ) -> Result<(Vec<f32>, Vec<usize>), AutogradError>,
+        B: Fn(
+                &FunctionCtx,
+                &[&[f64]],
+                &[(&[f32], &[usize])],
+            ) -> Result<Vec<Option<Vec<f64>>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+        CG: Fn(
+                &FunctionCtx,
+                &[TensorNodeId],
+                &[TensorNodeId],
+                &mut TensorTape,
+            ) -> Result<Vec<Option<TensorNodeId>>, AutogradError>
+            + Send
+            + Sync
+            + 'static,
+    {
+        let mut needs_input_grad = Vec::with_capacity(inputs.len());
+        let mut input_numels = Vec::with_capacity(inputs.len());
+        let mut any_requires_grad = false;
+        let mut output_device = Device::Cpu;
+
+        let (ctx, output_values, output_shape) = {
+            let mut input_refs: Vec<(&[f32], &[usize])> = Vec::with_capacity(inputs.len());
+            for &input_id in inputs {
+                let node = self.node(input_id)?;
+                let rg = node.requires_grad && self.grad_enabled;
+                needs_input_grad.push(rg);
+                if rg {
+                    any_requires_grad = true;
+                }
+                let vals = node.tensor.contiguous_values_f32()?;
+                input_numels.push(vals.len());
+                output_device = node.tensor.meta().device();
+                input_refs.push((vals, node.tensor.meta().shape()));
+            }
+
+            let mut ctx = FunctionCtx::new(needs_input_grad);
+            let (output_values, output_shape) = forward_fn(&mut ctx, &input_refs)?;
+            (ctx, output_values, output_shape)
+        };
+
+        let inputs_owned = inputs.to_vec();
+        let out = TensorNodeId(self.nodes.len());
+
+        if !any_requires_grad || !self.grad_enabled {
+            self.nodes.push(TensorNode {
+                tensor: DenseTensor::from_contiguous_values_f32(
+                    output_values,
+                    output_shape,
+                    output_device,
+                )?,
+                requires_grad: false,
+                op: TensorNodeOp::Leaf,
+            });
+            return Ok(out);
+        }
+
+        let function_id = self.next_custom_function_id;
+        self.next_custom_function_id += 1;
+
+        self.custom_functions.insert(
+            function_id,
+            CustomFunctionRecord {
+                ctx,
+                backward: CustomFunctionBackward::BorrowedInputsF32Output(Arc::new(backward_fn)),
+                input_numel: input_numels,
+                create_graph_backward: Some(Arc::new(create_graph_backward_fn)),
+            },
+        );
+
+        self.nodes.push(TensorNode {
+            tensor: DenseTensor::from_contiguous_values_f32(
+                output_values,
+                output_shape,
+                output_device,
+            )?,
+            requires_grad: any_requires_grad,
+            op: TensorNodeOp::CustomFunction {
+                inputs: inputs_owned,
+                function_id,
+            },
+        });
+        Ok(out)
+    }
+
     pub fn masked_fill(
         &mut self,
         input: TensorNodeId,
