@@ -4398,6 +4398,72 @@ pub fn cross_entropy_backward_f64(
     dlogits
 }
 
+/// f32 mirror of [`cross_entropy_forward_f64`] (streaming per-row LSE − logit at
+/// target; never materialises the `[batch, classes]` log-softmax). Used by the
+/// f32 cross-entropy grad fast path (frankentorch-48w0b recipe).
+#[must_use]
+pub fn cross_entropy_forward_f32(
+    logits: &[f32],
+    target: &[usize],
+    batch: usize,
+    classes: usize,
+) -> Vec<f32> {
+    let mut loss = vec![0.0f32; batch];
+    loss.par_iter_mut().enumerate().for_each(|(i, li)| {
+        let row = &logits[i * classes..i * classes + classes];
+        let mut m = f32::NEG_INFINITY;
+        for &v in row {
+            if v > m {
+                m = v;
+            }
+        }
+        let mut s = 0.0f32;
+        for &v in row {
+            s += (v - m).exp();
+        }
+        let lse = m + s.ln();
+        *li = lse - row[target[i]];
+    });
+    loss
+}
+
+/// f32 mirror of [`cross_entropy_backward_f64`]: `dlogits[i][c] = dloss[i]·
+/// (softmax(logits[i])[c] − [c == target[i]])`, streamed per row.
+#[must_use]
+pub fn cross_entropy_backward_f32(
+    logits: &[f32],
+    target: &[usize],
+    dloss: &[f32],
+    batch: usize,
+    classes: usize,
+) -> Vec<f32> {
+    let mut dlogits = vec![0.0f32; batch * classes];
+    dlogits
+        .par_chunks_mut(classes)
+        .enumerate()
+        .for_each(|(i, drow)| {
+            let row = &logits[i * classes..i * classes + classes];
+            let mut m = f32::NEG_INFINITY;
+            for &v in row {
+                if v > m {
+                    m = v;
+                }
+            }
+            let mut s = 0.0f32;
+            for &v in row {
+                s += (v - m).exp();
+            }
+            let lse = m + s.ln();
+            let g = dloss[i];
+            let t = target[i];
+            for c in 0..classes {
+                let sm = (row[c] - lse).exp();
+                drow[c] = g * (sm - if c == t { 1.0 } else { 0.0 });
+            }
+        });
+    dlogits
+}
+
 /// Fused GroupNorm forward (f64). Input is `[batch, channels, spatial]` flattened
 /// (channels = num_groups·cpg). Each `(sample, group)` is a contiguous
 /// `cpg·spatial` block normalised over its own mean/var; the affine `weight`/`bias`
