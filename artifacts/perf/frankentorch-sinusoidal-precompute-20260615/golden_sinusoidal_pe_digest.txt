@@ -1,0 +1,5 @@
+frankentorch-tn0py sinusoidal positional encoding golden digest
+fixtures: (seq_len=128,d_model=128) and (seq_len=127,d_model=129)
+formula: serial per-element angle=(pos as f64)/10000.powf((2*(i/2))/d_model), sin even columns, cos odd columns
+digest_fn: FNV-1a64 over optimized output f64 bits in row-major fixture order
+digest: 0x3cc56e1b0a69108c
