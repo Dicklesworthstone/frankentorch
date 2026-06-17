@@ -99,6 +99,9 @@ Results:
   SHA-256 `ac099641c8888a85af8d558a17471d8da369572098bee6ab8b833ed85f6566e4`.
 - A later bounded UBS rerun timed out in the Rust scan; timeout artifact
   SHA-256 `ae6180a6c748978eb2098a258504c696c62750148babe825744ad9dfc08d83e0`.
+- The staged pre-commit UBS hook also timed out on the large `ft-api` scan after
+  its 300s window and instructed `UBS_SKIP=1 git commit ...`; the commit used
+  that bypass after the manual UBS artifacts above were retained.
 - `rustfmt --edition 2024 --check crates/ft-api/src/lib.rs crates/ft-kernel-cpu/src/lib.rs`
   reported existing file-wide drift in unrelated sections; formatting was not
   applied to avoid unrelated churn.
