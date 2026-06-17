@@ -1,14 +1,10 @@
-   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
-error[E0428]: the name `batch_norm_f64_spatial1_row_parallel_matches_serial_reference_bits` is defined multiple times
-     --> crates/ft-kernel-cpu/src/lib.rs:35073:5
-      |
-34969 |     fn batch_norm_f64_spatial1_row_parallel_matches_serial_reference_bits() {
-      |     ----------------------------------------------------------------------- previous definition of the value `batch_norm_f64_spatial1_row_parallel_matches_serial_reference_bits` here
-...
-35073 |     fn batch_norm_f64_spatial1_row_parallel_matches_serial_reference_bits() {
-      |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ `batch_norm_f64_spatial1_row_parallel_matches_serial_reference_bits` redefined here
-      |
-      = note: `batch_norm_f64_spatial1_row_parallel_matches_serial_reference_bits` must be defined only once in the value namespace of this module
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-kernel-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 23.62s
+     Running unittests src/lib.rs (/data/tmp/frankentorch-2rsa6-proof-target/debug/deps/ft_kernel_cpu-d26c108ecd1e4673)
 
-For more information about this error, try `rustc --explain E0428`.
-error: could not compile `ft-kernel-cpu` (lib test) due to 1 previous error
+running 1 test
+test tests::group_norm_saved_stats_matches_recompute_forward_backward_bits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 483 filtered out; finished in 0.01s
+
