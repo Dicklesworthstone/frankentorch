@@ -2114,6 +2114,8 @@ pub enum SparseTensorError {
     InvalidCrowIndexValue { index: usize, value: i64 },
     /// CSR column index out of bounds.
     ColIndexOutOfBounds { index: i64, ncols: usize },
+    /// CSR row contains the same column index more than once.
+    DuplicateCsrColumn { row: usize, col: i64 },
     /// Dense tensor error during conversion.
     DenseTensor(DenseTensorError),
     /// Only 2D sparse CSR tensors are supported.
@@ -2182,6 +2184,9 @@ impl fmt::Display for SparseTensorError {
             }
             Self::ColIndexOutOfBounds { index, ncols } => {
                 write!(f, "column index {index} out of bounds for {ncols} columns")
+            }
+            Self::DuplicateCsrColumn { row, col } => {
+                write!(f, "CSR row {row} contains duplicate column index {col}")
             }
             Self::DenseTensor(err) => write!(f, "dense tensor error: {err}"),
             Self::UnsupportedRank { rank } => {
@@ -2642,6 +2647,26 @@ impl SparseCSRTensor {
         for &col in col_data {
             if col < 0 || (col as usize) >= ncols {
                 return Err(SparseTensorError::ColIndexOutOfBounds { index: col, ncols });
+            }
+        }
+        for row in 0..nrows {
+            let start = usize::try_from(crow_data[row]).map_err(|_| {
+                SparseTensorError::InvalidCrowIndexValue {
+                    index: row,
+                    value: crow_data[row],
+                }
+            })?;
+            let end = usize::try_from(crow_data[row + 1]).map_err(|_| {
+                SparseTensorError::InvalidCrowIndexValue {
+                    index: row + 1,
+                    value: crow_data[row + 1],
+                }
+            })?;
+            for idx in start..end {
+                let col = col_data[idx];
+                if col_data[start..idx].contains(&col) {
+                    return Err(SparseTensorError::DuplicateCsrColumn { row, col });
+                }
             }
         }
 
@@ -4941,6 +4966,21 @@ mod tests {
         assert!(matches!(
             result,
             Err(SparseTensorError::ColIndexOutOfBounds { .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_csr_rejects_duplicate_row_columns() {
+        let crow =
+            DenseI64Tensor::from_contiguous_values(vec![0, 2], vec![2], Device::Cpu).unwrap();
+        let col = DenseI64Tensor::from_contiguous_values(vec![0, 0], vec![2], Device::Cpu).unwrap();
+        let values =
+            DenseTensor::from_contiguous_values(vec![2.0, 3.0], vec![2], Device::Cpu).unwrap();
+
+        let result = SparseCSRTensor::new(crow, col, values, [1, 2]);
+        assert!(matches!(
+            result,
+            Err(SparseTensorError::DuplicateCsrColumn { row: 0, col: 0 })
         ));
     }
 
