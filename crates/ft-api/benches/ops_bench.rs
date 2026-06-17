@@ -662,11 +662,30 @@ fn bench_layer_norm(c: &mut Criterion) {
     });
     // Forward + backward (training): exercises the fused grad LayerNorm op.
     group.bench_function("grad_2048x1024", |b| {
+        // RNG generated ONCE; each iter rebuilds the requires_grad leaves via
+        // tensor_variable (a cheap copy) so the measured time is forward+backward,
+        // not per-iter Gaussian RNG over 2M elements. A fresh session per iter
+        // still gives a clean tape. frankentorch-c55sy.
+        let (xd, wd, bd) = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![rows, hidden], false).unwrap();
+            let w = s.tensor_randn(vec![hidden], false).unwrap();
+            let bias = s.tensor_randn(vec![hidden], false).unwrap();
+            (
+                s.tensor_values(x).unwrap(),
+                s.tensor_values(w).unwrap(),
+                s.tensor_values(bias).unwrap(),
+            )
+        };
         b.iter(|| {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = session.tensor_randn(vec![rows, hidden], true).unwrap();
-            let w = session.tensor_randn(vec![hidden], true).unwrap();
-            let bias = session.tensor_randn(vec![hidden], true).unwrap();
+            let x = session
+                .tensor_variable(xd.clone(), vec![rows, hidden], true)
+                .unwrap();
+            let w = session.tensor_variable(wd.clone(), vec![hidden], true).unwrap();
+            let bias = session
+                .tensor_variable(bd.clone(), vec![hidden], true)
+                .unwrap();
             let out = session
                 .functional_layer_norm(x, vec![hidden], Some(w), Some(bias), 1e-5)
                 .unwrap();
@@ -782,13 +801,29 @@ fn bench_batch_norm(c: &mut Criterion) {
             });
         });
         group.bench_function("grad_1d_8192x1024", |b| {
+            // RNG generated ONCE; each iter rebuilds the leaves via tensor_variable
+            // (a cheap copy) so the measured time is forward+backward, not per-iter
+            // Gaussian RNG over 8.4M elements. frankentorch-c55sy.
+            let (xd, rmd, wtd, bd) = {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_randn(vec![bn, bc], false).unwrap();
+                let rm = s.tensor_randn(vec![bc], false).unwrap();
+                let wt = s.tensor_randn(vec![bc], false).unwrap();
+                let bias = s.tensor_randn(vec![bc], false).unwrap();
+                (
+                    s.tensor_values(x).unwrap(),
+                    s.tensor_values(rm).unwrap(),
+                    s.tensor_values(wt).unwrap(),
+                    s.tensor_values(bias).unwrap(),
+                )
+            };
             b.iter(|| {
                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-                let x = s.tensor_randn(vec![bn, bc], true).unwrap();
-                let rm = s.tensor_randn(vec![bc], false).unwrap();
+                let x = s.tensor_variable(xd.clone(), vec![bn, bc], true).unwrap();
+                let rm = s.tensor_variable(rmd.clone(), vec![bc], false).unwrap();
                 let rv = s.tensor_variable(vec![1.0; bc], vec![bc], false).unwrap();
-                let wt = s.tensor_randn(vec![bc], true).unwrap();
-                let bias = s.tensor_randn(vec![bc], true).unwrap();
+                let wt = s.tensor_variable(wtd.clone(), vec![bc], true).unwrap();
+                let bias = s.tensor_variable(bd.clone(), vec![bc], true).unwrap();
                 let (out, _, _) = s
                     .functional_batch_norm1d(
                         x,
@@ -832,15 +867,33 @@ fn bench_batch_norm(c: &mut Criterion) {
     });
     // Training forward + backward.
     group.bench_function("grad_train_32x256x28x28", |b| {
+        // RNG generated ONCE; each iter rebuilds the leaves via tensor_variable (a
+        // cheap copy) so the measured time is forward+backward, not per-iter
+        // Gaussian RNG over ~6.4M elements. frankentorch-c55sy.
+        let (xd, rmd, wtd, bd) = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ch, h, w], false).unwrap();
+            let rm = s.tensor_randn(vec![ch], false).unwrap();
+            let wt = s.tensor_randn(vec![ch], false).unwrap();
+            let bias = s.tensor_randn(vec![ch], false).unwrap();
+            (
+                s.tensor_values(x).unwrap(),
+                s.tensor_values(rm).unwrap(),
+                s.tensor_values(wt).unwrap(),
+                s.tensor_values(bias).unwrap(),
+            )
+        };
         b.iter(|| {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = session.tensor_randn(vec![n, ch, h, w], true).unwrap();
-            let rm = session.tensor_randn(vec![ch], false).unwrap();
+            let x = session
+                .tensor_variable(xd.clone(), vec![n, ch, h, w], true)
+                .unwrap();
+            let rm = session.tensor_variable(rmd.clone(), vec![ch], false).unwrap();
             let rv = session
                 .tensor_variable(vec![1.0; ch], vec![ch], false)
                 .unwrap();
-            let wt = session.tensor_randn(vec![ch], true).unwrap();
-            let bias = session.tensor_randn(vec![ch], true).unwrap();
+            let wt = session.tensor_variable(wtd.clone(), vec![ch], true).unwrap();
+            let bias = session.tensor_variable(bd.clone(), vec![ch], true).unwrap();
             let (out, _, _) = session
                 .functional_batch_norm2d(
                     x,
@@ -901,11 +954,27 @@ fn bench_group_norm(c: &mut Criterion) {
         });
     });
     group.bench_function("grad_32x256x28x28", |b| {
+        // RNG generated ONCE; each iter rebuilds the requires_grad leaves via
+        // tensor_variable (a cheap copy) so the measured time is forward+backward,
+        // not per-iter Gaussian RNG over ~6.4M elements. frankentorch-c55sy.
+        let (xd, wd, bd) = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![n, ch, h, w], false).unwrap();
+            let wt = s.tensor_randn(vec![ch], false).unwrap();
+            let bias = s.tensor_randn(vec![ch], false).unwrap();
+            (
+                s.tensor_values(x).unwrap(),
+                s.tensor_values(wt).unwrap(),
+                s.tensor_values(bias).unwrap(),
+            )
+        };
         b.iter(|| {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = session.tensor_randn(vec![n, ch, h, w], true).unwrap();
-            let wt = session.tensor_randn(vec![ch], true).unwrap();
-            let bias = session.tensor_randn(vec![ch], true).unwrap();
+            let x = session
+                .tensor_variable(xd.clone(), vec![n, ch, h, w], true)
+                .unwrap();
+            let wt = session.tensor_variable(wd.clone(), vec![ch], true).unwrap();
+            let bias = session.tensor_variable(bd.clone(), vec![ch], true).unwrap();
             let out = session
                 .functional_group_norm(x, groups, Some(wt), Some(bias), 1e-5)
                 .unwrap();
@@ -1031,10 +1100,21 @@ fn bench_rms_norm(c: &mut Criterion) {
         });
     });
     group.bench_function("grad_2048x1024", |b| {
+        // RNG generated ONCE; each iter rebuilds the requires_grad leaves via
+        // tensor_variable (a cheap copy) so the measured time is forward+backward,
+        // not per-iter Gaussian RNG over 2M elements. frankentorch-c55sy.
+        let (xd, wd) = {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_randn(vec![rows, hidden], false).unwrap();
+            let w = s.tensor_randn(vec![hidden], false).unwrap();
+            (s.tensor_values(x).unwrap(), s.tensor_values(w).unwrap())
+        };
         b.iter(|| {
             let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = session.tensor_randn(vec![rows, hidden], true).unwrap();
-            let w = session.tensor_randn(vec![hidden], true).unwrap();
+            let x = session
+                .tensor_variable(xd.clone(), vec![rows, hidden], true)
+                .unwrap();
+            let w = session.tensor_variable(wd.clone(), vec![hidden], true).unwrap();
             let out = session
                 .functional_rms_norm(x, vec![hidden], Some(w), 1e-6)
                 .unwrap();
