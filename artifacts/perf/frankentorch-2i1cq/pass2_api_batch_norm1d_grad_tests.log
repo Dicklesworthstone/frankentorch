@@ -1,0 +1,70 @@
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-kernel-cpu)
+   Compiling regex-syntax v0.8.10
+   Compiling regex-automata v0.4.14
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-autograd)
+   Compiling regex v1.12.3
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-runtime)
+   Compiling criterion v0.5.1
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 52s
+     Running unittests src/lib.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/ft_api-4d4dd39d7b1afbd1)
+
+running 2 tests
+batch_norm1d_golden:y:bff0f351e4524191,bff21523992fed02,bff336f54e0d9876,bfe0bbc7843e7934,3fde4abb3889ed24,3fd5173ae89ec3c0,3fda4dd1491767ba,3fdf8467a9900bb4,3ff6c8767c9642d9,bff6ba92f2f54200,bfe3816003ab8ad6,bfe43126152f8ae6,bfe4e0ec26b38af8,3fbb8e584f95877a,3ff616bbe8b7d15e,3fe8f0e139485a2c,3fed2009c1bc02fc,3ff0a7992517d5e6,bff356ab72a391ea,bfe06d0bb0bfd7da
+batch_norm1d_golden:gx:bfd5d692ebc93530,bfd83b3d52c6b5c1,bfd515643469a7d1,bfdbd6262d6ef65d,3fe05dfaae2049ef,3fdc08dbc76499a0,3fdf1b5d11d8d48a,bfe4a45051f4b27e,bfd3c0dbaddf568f,bfeaddf3818fd118,3fd3d4a58df0d328,3fd600fdd59aff56,3fe4a45051f4b27e,3feb00de20e6d9e6,bfe565eb43a0b9e9,bfda06ee698c3796,bfdce11d94ad1e20,3fd515643469a7d1,bfb9aae999fd9b7f,3fefe5e417104112
+batch_norm1d_golden:gw:3fe4ff2f8ee6ee03,3fe4ff2f8ee6ee04,bfc9833f8e9ef027,bfe9d6101ae18631,bfe335930c237d01
+batch_norm1d_golden:gb:bfceb851eb851ebc,3fe20c49ba5e3540,3fa374bc6a7ef9d8,3feaf1a9fbe76c8c,3fd4395810624dd1
+test tests::functional_batch_norm1d_grad_golden_bits ... ok
+test tests::functional_batch_norm1d_grad_matches_finite_diff ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 2130 filtered out; finished in 0.02s
+
+     Running tests/cholesky_double_backward_parity.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/cholesky_double_backward_parity-e2d07a2929f1fb5e)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/complex_fft_autograd_parity.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/complex_fft_autograd_parity-42b531a8ff50c618)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 6 filtered out; finished in 0.00s
+
+     Running tests/grad_fd_audit.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/grad_fd_audit-99e9f69cbffca240)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 24 filtered out; finished in 0.00s
+
+     Running tests/inverse_logdet_double_backward_parity.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/inverse_logdet_double_backward_parity-9c060809ded097ea)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 4 filtered out; finished in 0.00s
+
+     Running tests/logsumexp_double_backward_parity.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/logsumexp_double_backward_parity-cef1a68b4f2639c3)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+
+     Running tests/op_guards_cod4.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/op_guards_cod4-7b21e48623fc692f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 8 filtered out; finished in 0.00s
+
+     Running tests/solve_double_backward_parity.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/solve_double_backward_parity-e168b6601b312da9)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 2 filtered out; finished in 0.00s
+
+     Running tests/triangular_solve_double_backward_parity.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/triangular_solve_double_backward_parity-7d76815f59b0f67f)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 3 filtered out; finished in 0.00s
+

@@ -1,0 +1,74 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling syn v2.0.117
+   Compiling autocfg v1.5.0
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling zerocopy v0.8.48
+   Compiling num-traits v0.2.19
+   Compiling zerocopy-derive v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling half v2.7.1
+   Compiling crossbeam-epoch v0.9.18
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling serde_core v1.0.228
+   Compiling num-complex v0.4.6
+   Compiling matrixmultiply v0.3.10
+   Compiling libm v0.2.16
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-core)
+   Compiling rayon v1.12.0
+   Compiling safe_arch v0.7.4
+   Compiling zmij v1.0.21
+   Compiling rawpointer v0.2.1
+   Compiling serde v1.0.228
+   Compiling wide v0.7.33
+   Compiling serde_derive v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling libc v0.2.185
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-kernel-cpu)
+   Compiling plotters-backend v0.3.7
+   Compiling memchr v2.8.0
+   Compiling ciborium-io v0.2.2
+   Compiling clap_lex v1.1.0
+   Compiling regex-syntax v0.8.10
+   Compiling itoa v1.0.18
+   Compiling anstyle v1.0.14
+   Compiling clap_builder v4.6.0
+   Compiling regex-automata v0.4.14
+   Compiling ciborium-ll v0.2.2
+   Compiling plotters-svg v0.3.7
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-dispatch)
+   Compiling itertools v0.10.5
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling criterion-plot v0.5.0
+   Compiling walkdir v2.5.0
+   Compiling is-terminal v0.4.17
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-autograd)
+   Compiling plotters v0.3.7
+   Compiling ciborium v0.2.2
+   Compiling regex v1.12.3
+   Compiling tinytemplate v1.2.1
+   Compiling clap v4.6.1
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-runtime)
+   Compiling anes v0.1.6
+   Compiling once_cell v1.21.4
+   Compiling oorandom v11.1.5
+   Compiling criterion v0.5.1
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 5m 09s
+     Running benches/ops_bench.rs (/data/tmp/frankentorch-2i1cq-target/release/deps/ops_bench-8824b9e24f0b8087)
+Gnuplot not found, using plotters backend
+Benchmarking batch_norm/grad_1d_8192x1024
+Benchmarking batch_norm/grad_1d_8192x1024: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 7.3s.
+Benchmarking batch_norm/grad_1d_8192x1024: Collecting 10 samples in estimated 7.3190 s (10 iterations)
+Benchmarking batch_norm/grad_1d_8192x1024: Analyzing
+batch_norm/grad_1d_8192x1024
+                        time:   [690.38 ms 703.09 ms 715.15 ms]
+

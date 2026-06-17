@@ -1,0 +1,9 @@
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-kernel-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 3.81s
+     Running unittests src/lib.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/ft_kernel_cpu-d26c108ecd1e4673)
+
+running 1 test
+test tests::batch_norm_stats_f64_spatial1_row_major_matches_channel_reference_bits ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 485 filtered out; finished in 0.00s
+

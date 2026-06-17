@@ -1,0 +1,100 @@
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling syn v2.0.117
+   Compiling libc v0.2.185
+   Compiling cfg-if v1.0.4
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling getrandom v0.3.4
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling bytemuck v1.25.0
+   Compiling num-traits v0.2.19
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling once_cell v1.21.4
+   Compiling serde v1.0.228
+   Compiling zmij v1.0.21
+   Compiling bitflags v2.11.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling crossbeam-epoch v0.9.18
+   Compiling half v2.7.1
+   Compiling rand_core v0.9.5
+   Compiling serde_derive v1.0.228
+   Compiling fastrand v2.4.1
+   Compiling either v1.15.0
+   Compiling rayon-core v1.13.0
+   Compiling regex-syntax v0.8.10
+   Compiling serde_json v1.0.149
+   Compiling tempfile v3.27.0
+   Compiling crossbeam-deque v0.8.6
+   Compiling ciborium-io v0.2.2
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling plotters-backend v0.3.7
+   Compiling anstyle v1.0.14
+   Compiling clap_lex v1.1.0
+   Compiling clap_builder v4.6.0
+   Compiling plotters-svg v0.3.7
+   Compiling ciborium-ll v0.2.2
+   Compiling regex-automata v0.4.14
+   Compiling itertools v0.10.5
+   Compiling ppv-lite86 v0.2.21
+   Compiling matrixmultiply v0.3.10
+   Compiling wait-timeout v0.2.1
+   Compiling libm v0.2.16
+   Compiling same-file v1.0.6
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling cast v0.3.0
+   Compiling fnv v1.0.7
+   Compiling rusty-fork v0.3.1
+   Compiling criterion-plot v0.5.0
+   Compiling bit-set v0.8.0
+   Compiling walkdir v2.5.0
+   Compiling rand_chacha v0.9.0
+   Compiling regex v1.12.3
+   Compiling rayon v1.12.0
+   Compiling ciborium v0.2.2
+   Compiling tinytemplate v1.2.1
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling num-complex v0.4.6
+   Compiling safe_arch v0.7.4
+   Compiling console v0.16.3
+   Compiling is-terminal v0.4.17
+   Compiling oorandom v11.1.5
+   Compiling similar v2.7.0
+   Compiling anes v0.1.6
+   Compiling rawpointer v0.2.1
+   Compiling unarray v0.1.4
+   Compiling proptest v1.11.0
+   Compiling criterion v0.5.1
+   Compiling insta v1.47.2
+   Compiling wide v0.7.33
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-worktrees/ivorydeer-2rsa6/crates/ft-kernel-cpu)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 1m 08s
+     Running unittests src/lib.rs (/data/tmp/frankentorch-2i1cq-target/debug/deps/ft_kernel_cpu-d26c108ecd1e4673)
+
+running 1 test
+
+thread 'tests::batch_norm_stats_f64_spatial1_row_major_matches_channel_reference_bits' (3458055) panicked at crates/ft-kernel-cpu/src/lib.rs:35014:9:
+assertion `left == right` failed
+  left: 8779779005197156587
+ right: 0
+note: run with `RUST_BACKTRACE=1` environment variable to display a backtrace
+test tests::batch_norm_stats_f64_spatial1_row_major_matches_channel_reference_bits ... FAILED
+
+failures:
+
+failures:
+    tests::batch_norm_stats_f64_spatial1_row_major_matches_channel_reference_bits
+
+test result: FAILED. 0 passed; 1 failed; 0 ignored; 0 measured; 485 filtered out; finished in 0.00s
+
+error: test failed, to rerun pass `-p ft-kernel-cpu --lib`

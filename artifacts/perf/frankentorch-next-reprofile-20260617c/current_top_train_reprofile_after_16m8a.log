@@ -1,0 +1,93 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.12s
+     Running benches/ops_bench.rs (/data/tmp/frankentorch-16m8a-target/release/deps/ops_bench-8824b9e24f0b8087)
+Gnuplot not found, using plotters backend
+Benchmarking conv3d/grad
+Benchmarking conv3d/grad: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 2.2s or enable flat sampling.
+Benchmarking conv3d/grad: Collecting 10 samples in estimated 2.1739 s (55 iterations)
+Benchmarking conv3d/grad: Analyzing
+conv3d/grad             time:   [37.524 ms 38.273 ms 39.555 ms]
+
+Benchmarking max_pool2d/grad
+Benchmarking max_pool2d/grad: Warming up for 1.0000 s
+Benchmarking max_pool2d/grad: Collecting 10 samples in estimated 2.1321 s (20 iterations)
+Benchmarking max_pool2d/grad: Analyzing
+max_pool2d/grad         time:   [104.87 ms 107.04 ms 109.53 ms]
+
+Benchmarking avg_pool2d/grad
+Benchmarking avg_pool2d/grad: Warming up for 1.0000 s
+Benchmarking avg_pool2d/grad: Collecting 10 samples in estimated 2.1645 s (20 iterations)
+Benchmarking avg_pool2d/grad: Analyzing
+avg_pool2d/grad         time:   [104.25 ms 106.38 ms 108.83 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+
+Benchmarking max_pool3d/grad
+Benchmarking max_pool3d/grad: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 2.1s or enable flat sampling.
+Benchmarking max_pool3d/grad: Collecting 10 samples in estimated 2.0983 s (55 iterations)
+Benchmarking max_pool3d/grad: Analyzing
+max_pool3d/grad         time:   [37.093 ms 37.403 ms 37.738 ms]
+
+Benchmarking linear_train/hidden/2048
+Benchmarking linear_train/hidden/2048: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 2.3s or enable flat sampling.
+Benchmarking linear_train/hidden/2048: Collecting 10 samples in estimated 2.3053 s (55 iterations)
+Benchmarking linear_train/hidden/2048: Analyzing
+linear_train/hidden/2048
+                        time:   [43.609 ms 44.623 ms 45.315 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+
+Benchmarking sdpa/grad_16x512x64
+Benchmarking sdpa/grad_16x512x64: Warming up for 1.0000 s
+Benchmarking sdpa/grad_16x512x64: Collecting 10 samples in estimated 2.2091 s (20 iterations)
+Benchmarking sdpa/grad_16x512x64: Analyzing
+sdpa/grad_16x512x64     time:   [110.31 ms 111.89 ms 113.53 ms]
+
+Benchmarking layer_norm/grad_2048x1024
+Benchmarking layer_norm/grad_2048x1024: Warming up for 1.0000 s
+Benchmarking layer_norm/grad_2048x1024: Collecting 10 samples in estimated 3.1305 s (20 iterations)
+Benchmarking layer_norm/grad_2048x1024: Analyzing
+layer_norm/grad_2048x1024
+                        time:   [144.93 ms 147.54 ms 150.18 ms]
+
+Benchmarking rms_norm/grad_2048x1024
+Benchmarking rms_norm/grad_2048x1024: Warming up for 1.0000 s
+Benchmarking rms_norm/grad_2048x1024: Collecting 10 samples in estimated 3.0134 s (20 iterations)
+Benchmarking rms_norm/grad_2048x1024: Analyzing
+rms_norm/grad_2048x1024 time:   [146.98 ms 150.93 ms 154.95 ms]
+
+Benchmarking group_norm/grad_32x256x28x28
+Benchmarking group_norm/grad_32x256x28x28: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 4.8s.
+Benchmarking group_norm/grad_32x256x28x28: Collecting 10 samples in estimated 4.7650 s (10 iterations)
+Benchmarking group_norm/grad_32x256x28x28: Analyzing
+group_norm/grad_32x256x28x28
+                        time:   [475.26 ms 488.15 ms 499.75 ms]
+                        change: [-8.1462% -4.9687% -2.1960%] (p = 0.01 < 0.05)
+                        Performance has improved.
+
+Benchmarking batch_norm/grad_1d_8192x1024
+Benchmarking batch_norm/grad_1d_8192x1024: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 6.7s.
+Benchmarking batch_norm/grad_1d_8192x1024: Collecting 10 samples in estimated 6.7365 s (10 iterations)
+Benchmarking batch_norm/grad_1d_8192x1024: Analyzing
+batch_norm/grad_1d_8192x1024
+                        time:   [664.48 ms 670.59 ms 677.50 ms]
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high mild
+Benchmarking batch_norm/grad_train_32x256x28x28
+Benchmarking batch_norm/grad_train_32x256x28x28: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 2.0s. You may wish to increase target time to 5.1s.
+Benchmarking batch_norm/grad_train_32x256x28x28: Collecting 10 samples in estimated 5.0963 s (10 iterations)
+Benchmarking batch_norm/grad_train_32x256x28x28: Analyzing
+batch_norm/grad_train_32x256x28x28
+                        time:   [489.64 ms 500.78 ms 511.76 ms]
+
