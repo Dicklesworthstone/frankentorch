@@ -6262,6 +6262,14 @@ impl Module for Softshrink {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if !self.lambda.is_finite() || self.lambda < 0.0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Softshrink: lambda must be finite and non-negative",
+                },
+            )));
+        }
+
         // Softshrink(x) = x - λ  if x > λ
         //               = x + λ  if x < -λ
         //               = 0      otherwise
@@ -6324,6 +6332,14 @@ impl Module for Hardshrink {
         session: &mut FrankenTorchSession,
         input: TensorNodeId,
     ) -> Result<TensorNodeId, AutogradError> {
+        if !self.lambda.is_finite() || self.lambda < 0.0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "Hardshrink: lambda must be finite and non-negative",
+                },
+            )));
+        }
+
         // Hardshrink(x) = x if |x| > λ else 0.
         // Compose through tensor_abs + tensor_gt + tensor_where.
         // Backward is automatically piecewise-constant: 1 in the
@@ -29804,6 +29820,42 @@ mod tests {
         assert!(vals[1].abs() < 1e-10);
         assert!((vals[2] - (-2.0)).abs() < 1e-10);
         assert!(vals[3].abs() < 1e-10);
+    }
+
+    #[test]
+    fn softshrink_rejects_invalid_lambda() {
+        for lambda in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let ss = Softshrink::new(lambda);
+            let input = session
+                .tensor_variable(vec![1.0, -1.0], vec![2], false)
+                .unwrap();
+            let err = ss
+                .forward(&mut session, input)
+                .expect_err("Softshrink must reject invalid lambda");
+            assert!(
+                format!("{err:?}").contains("lambda"),
+                "rejection message should mention lambda, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn hardshrink_rejects_invalid_lambda() {
+        for lambda in [-0.1, f64::NAN, f64::INFINITY] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let hs = Hardshrink::new(lambda);
+            let input = session
+                .tensor_variable(vec![1.0, -1.0], vec![2], false)
+                .unwrap();
+            let err = hs
+                .forward(&mut session, input)
+                .expect_err("Hardshrink must reject invalid lambda");
+            assert!(
+                format!("{err:?}").contains("lambda"),
+                "rejection message should mention lambda, got {err:?}"
+            );
+        }
     }
 
     #[test]
