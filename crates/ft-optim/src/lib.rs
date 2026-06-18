@@ -6244,6 +6244,61 @@ mod tests {
     }
 
     #[test]
+    fn zero_gradient_steps_leave_default_optimizer_params_unchanged() {
+        fn value_bits(values: &[f64]) -> Vec<u64> {
+            values.iter().map(|value| value.to_bits()).collect()
+        }
+
+        fn is_zero_bits(value: f64) -> bool {
+            value.to_bits() & 0x7fff_ffff_ffff_ffff == 0
+        }
+
+        macro_rules! trial {
+            ($name:literal, $opt:expr) => {{
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = session
+                    .tensor_variable(vec![1.25, -2.5, 3.75], vec![3], true)
+                    .expect("variable should succeed");
+                let before = session.tensor_values(x).expect("before values");
+                let before_bits = value_bits(&before);
+
+                let zeroed = session
+                    .tensor_mul_scalar(x, 0.0)
+                    .expect("zero-gradient multiply should succeed");
+                let loss = session
+                    .tensor_sum(zeroed)
+                    .expect("zero-gradient loss should sum");
+                let report = session
+                    .tensor_backward(loss)
+                    .expect("zero-gradient backward should succeed");
+                let grad = session
+                    .tensor_accumulated_gradient(x)
+                    .expect("gradient lookup should succeed")
+                    .expect("gradient should be allocated");
+                assert!(
+                    grad.iter().all(|&value| is_zero_bits(value)),
+                    "{name} expected a true zero gradient, got {grad:?}"
+                );
+
+                let mut opt = $opt(x);
+                opt.step(&mut session, &report)
+                    .expect("zero-gradient step should succeed");
+                let after = session.tensor_values(x).expect("after values");
+                assert_eq!(
+                    value_bits(&after),
+                    before_bits,
+                    "{name} zero-gradient step changed params: before {before:?} after {after:?}"
+                );
+            }};
+        }
+
+        trial!("sgd", |x| SGD::new(vec![x], 0.1));
+        trial!("adam", |x| Adam::new(vec![x], 0.1));
+        trial!("rmsprop", |x| RMSprop::new(vec![x], 0.01));
+        trial!("adagrad", |x| Adagrad::new(vec![x], 0.1));
+    }
+
+    #[test]
     fn optimizer_trajectories_match_torch() {
         // Differential numeric parity: 3 steps on loss = sum(x^2) (grad = 2x)
         // starting from x = [1, 2]. Golden trajectories from torch 2.12.0+cpu
