@@ -6152,6 +6152,25 @@ mod tests {
     }
 
     #[test]
+    fn adam_first_step_golden_matches_torch() {
+        // Differential golden vs torch.optim.Adam 2.12: x=[2,-3], lr=0.1,
+        // loss=sum(x^2) (grad=[4,-6]); one Adam step (defaults) ==
+        // [1.90000000025, -2.900000000167] (bias correction + eps). frankentorch-e43y6.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, -3.0], vec![2], true).unwrap();
+        let sq = s.tensor_mul(x, x).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let mut opt = Adam::new(vec![x], 0.1);
+        opt.step(&mut s, &report).unwrap();
+        let after = s.tensor_values(x).unwrap();
+        let want = [1.900_000_000_25, -2.900_000_000_167];
+        for (g, w) in after.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-9, "adam step {g} != {w}");
+        }
+    }
+
+    #[test]
     fn optimizers_with_zero_gradient_leave_params_unchanged() {
         // Metamorphic invariant (no torch goldens): with a genuine zero gradient
         // (x*0) and default config (no weight decay), one step leaves params
