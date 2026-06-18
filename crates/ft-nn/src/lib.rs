@@ -22181,6 +22181,20 @@ mod tests {
     }
 
     #[test]
+    fn cosine_embedding_loss_golden_matches_torch() {
+        // Differential golden vs torch.nn.CosineEmbeddingLoss(margin=0) 2.12:
+        // x1=[[1,0],[1,1]], x2=[[1,0],[0,1]], target=[1,-1] -> 0.3535533906
+        // (y=1:1-cos; y=-1:max(0,cos-margin)). frankentorch-grjsb.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x1 = s.tensor_variable(vec![1.0, 0.0, 1.0, 1.0], vec![2, 2], false).unwrap();
+        let x2 = s.tensor_variable(vec![1.0, 0.0, 0.0, 1.0], vec![2, 2], false).unwrap();
+        let y = s.tensor_variable(vec![1.0, -1.0], vec![2], false).unwrap();
+        let out = CosineEmbeddingLoss::new(0.0).forward_triplet(&mut s, x1, x2, y).unwrap();
+        let got = s.tensor_values(out).unwrap()[0];
+        assert!((got - 0.353_553_390_6).abs() < 1e-9, "cosine_embedding loss {got} != 0.3535533906");
+    }
+
+    #[test]
     fn margin_ranking_loss_golden_matches_torch() {
         // Differential golden vs torch.nn.MarginRankingLoss(margin=0) 2.12:
         // x1=[1,2], x2=[2,1], target=[1,-1] -> 1.0 (mean of max(0,-y*(x1-x2)+margin)).
