@@ -2424,7 +2424,8 @@ impl SparseCOOTensor {
             let sparse_dim = dense_shape.len();
             let indices =
                 DenseI64Tensor::from_contiguous_values(vec![], vec![sparse_dim, 0], device)?;
-            let values_tensor = DenseTensor::from_contiguous_values(vec![], vec![0], device)?;
+            let values_tensor =
+                DenseTensor::from_contiguous_values(vec![], vec![0], device)?.to_dtype(dtype)?;
             return Self::new(indices, values_tensor, dense_shape, true);
         }
 
@@ -5038,6 +5039,23 @@ mod tests {
         let dense = sparse.to_dense().unwrap();
         let values = dense.contiguous_values().unwrap();
         assert!(values.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn sparse_coo_empty_preserves_requested_dtype() {
+        let sparse =
+            SparseCOOTensor::from_coords(&[], vec![], vec![2, 3], DType::F32, Device::Cpu)
+                .unwrap();
+
+        assert_eq!(sparse.dtype(), DType::F32);
+        assert!(matches!(
+            sparse.values().typed_storage(),
+            TensorStorage::F32(values) if values.is_empty()
+        ));
+
+        let dense = sparse.to_dense().unwrap();
+        assert_eq!(dense.meta().dtype(), DType::F32);
+        assert_eq!(dense.contiguous_values_f32().unwrap(), &[0.0; 6]);
     }
 
     #[test]
