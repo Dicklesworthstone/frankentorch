@@ -3518,11 +3518,11 @@ impl LRScheduler for LambdaLR {
     fn load_state_dict(&mut self, state: SchedulerState) {
         self.last_epoch = state.last_epoch;
         if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
+            self.last_lr = finite_non_negative_factor(lr);
         }
         for (key, val) in &state.extra {
             if key == "initial_lr" {
-                self.initial_lr = *val;
+                self.initial_lr = finite_non_negative_factor(*val);
             }
         }
     }
@@ -4266,11 +4266,11 @@ impl LRScheduler for MultiplicativeLR {
     fn load_state_dict(&mut self, state: SchedulerState) {
         self.last_epoch = state.last_epoch;
         if let Some(&lr) = state.last_lrs.first() {
-            self.last_lr = lr;
+            self.last_lr = finite_non_negative_factor(lr);
         }
         for (key, val) in &state.extra {
             if key == "initial_lr" {
-                self.initial_lr = *val;
+                self.initial_lr = finite_non_negative_factor(*val);
             }
         }
     }
@@ -10789,6 +10789,30 @@ mod tests {
     }
 
     #[test]
+    fn lambda_lr_loaded_invalid_scalars_are_clamped() {
+        for scalar in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("var");
+            let mut opt = SGD::new(vec![x], 1.0);
+            let mut scheduler = LambdaLR::new(&opt, |_epoch| 0.5);
+
+            scheduler.load_state_dict(SchedulerState {
+                last_epoch: -1,
+                last_lrs: vec![scalar],
+                extra: vec![("initial_lr".to_owned(), scalar)],
+            });
+            scheduler.step(&mut opt, Some(0));
+
+            let lr = opt.get_lr();
+            assert_eq!(lr, 0.0, "invalid loaded scalar {scalar:?}");
+            assert!(lr.is_finite(), "loaded lr must stay finite");
+            assert!(lr >= 0.0, "loaded lr must stay non-negative");
+        }
+    }
+
+    #[test]
     fn lambda_lr_state_dict_round_trip() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -12383,6 +12407,30 @@ mod tests {
             let lr = opt.get_lr();
             assert_eq!(lr, 0.0, "invalid factor {factor:?}");
             assert!(lr.is_finite(), "lr must stay finite for {factor:?}");
+        }
+    }
+
+    #[test]
+    fn multiplicative_lr_loaded_invalid_scalars_are_clamped() {
+        for scalar in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -2.0] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("variable");
+            let mut opt = SGD::new(vec![x], 1.0);
+            let mut scheduler = MultiplicativeLR::new(&opt, |_epoch| 0.5);
+
+            scheduler.load_state_dict(SchedulerState {
+                last_epoch: 0,
+                last_lrs: vec![scalar],
+                extra: vec![("initial_lr".to_owned(), scalar)],
+            });
+            scheduler.step(&mut opt, None);
+
+            let lr = opt.get_lr();
+            assert_eq!(lr, 0.0, "invalid loaded scalar {scalar:?}");
+            assert!(lr.is_finite(), "loaded lr must stay finite");
+            assert!(lr >= 0.0, "loaded lr must stay non-negative");
         }
     }
 
