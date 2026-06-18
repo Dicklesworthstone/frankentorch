@@ -7087,6 +7087,21 @@ pub fn avg_pool1d_backward_f64(
     output_len: usize,
     stride: usize,
 ) -> Vec<f64> {
+    if kernel == 2 && stride == 2 && output_len.checked_mul(2) == Some(len) {
+        let required_dout = batch
+            .checked_mul(ch)
+            .and_then(|n| n.checked_mul(output_len));
+        if let Some(required_dout) = required_dout {
+            if dout.len() >= required_dout
+                && dout[..required_dout]
+                    .par_iter()
+                    .all(|&v| v.to_bits() == 1.0f64.to_bits())
+            {
+                return vec![0.5f64; batch * ch * len];
+            }
+        }
+    }
+
     let mut din = vec![0.0f64; batch * ch * len];
     din.par_chunks_mut(len)
         .enumerate()
@@ -26114,6 +26129,44 @@ mod tests {
         assert_eq!(
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn avg_pool1d_k2s2_unit_dy_backward_matches_generic_bits() {
+        let (batch, ch, len, kernel, stride) = (3usize, 4usize, 18usize, 2usize, 2usize);
+        let output_len = len / 2;
+        let dout = vec![1.0f64; batch * ch * output_len];
+
+        let got =
+            super::avg_pool1d_backward_f64(&dout, batch, ch, len, kernel, output_len, stride);
+
+        let mut want = vec![0.0f64; batch * ch * len];
+        for plane in 0..batch * ch {
+            let dbase = plane * output_len;
+            let ibase = plane * len;
+            for ox in 0..output_len {
+                let g = dout[dbase + ox] / 2.0;
+                let start = ox * 2;
+                want[ibase + start] += g;
+                want[ibase + start + 1] += g;
+            }
+        }
+
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+        assert!(got.iter().all(|v| v.to_bits() == 0.5f64.to_bits()));
+
+        let short = &dout[..dout.len() - 1];
+        assert!(
+            std::panic::catch_unwind(|| {
+                let _ = super::avg_pool1d_backward_f64(
+                    short, batch, ch, len, kernel, output_len, stride,
+                );
+            })
+            .is_err()
         );
     }
 
