@@ -88,6 +88,39 @@ mod gemm {
         }
     }
 
+    pub fn dgemm_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f64,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..k * n];
+        let c = &mut c[..m * n];
+        if should_parallelize_cols(m, k, n) {
+            dgemm_col_parallel_scaled(m, k, n, alpha, a, b, c);
+        } else if should_parallelize(m, k, n) {
+            if n >= 2 * MIN_BLOCK_COLS {
+                dgemm_2d_parallel_scaled(m, k, n, alpha, a, b, c);
+            } else {
+                let br = block_rows(m);
+                c.par_chunks_mut(br * n)
+                    .zip(a.par_chunks(br * k))
+                    .for_each(|(c_blk, a_blk)| {
+                        dgemm_block_scaled(c_blk.len() / n, k, n, alpha, a_blk, b, c_blk);
+                    });
+            }
+        } else {
+            dgemm_block_scaled(m, k, n, alpha, a, b, c);
+        }
+    }
+
     // Column (N) parallelism for SMALL-m, LARGE-n matmuls that the row-split
     // misses — e.g. a linear layer `[batch, in] @ [in, out]^T` with batch << out:
     // there M is too small to row-split, so the whole GEMM ran serial. Each
@@ -178,6 +211,18 @@ mod gemm {
     /// transpose first. For each output element the K traversal matches the
     /// materialise-transpose-then-`dgemm` path.
     pub fn dgemm_tb(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+        dgemm_tb_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    pub fn dgemm_tb_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f64,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+    ) {
         if m == 0 || n == 0 {
             return;
         }
@@ -191,7 +236,7 @@ mod gemm {
                 m,
                 k,
                 n,
-                1.0,
+                alpha,
                 a.as_ptr(),
                 1,
                 m as isize,
@@ -632,6 +677,18 @@ mod gemm {
     // order is unchanged and the result is BIT-FOR-BIT equal to the single
     // dgemm_block call. frankentorch-kgs4.49.
     fn dgemm_col_parallel(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+        dgemm_col_parallel_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    fn dgemm_col_parallel_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f64,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+    ) {
         let nb = block_cols(n);
         let cp = TilePtr(c.as_mut_ptr());
         (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
@@ -647,7 +704,7 @@ mod gemm {
                     m,
                     k,
                     bw,
-                    1.0,
+                    alpha,
                     a.as_ptr(),
                     k as isize,
                     1,
@@ -713,6 +770,18 @@ mod gemm {
     }
 
     fn dgemm_2d_parallel(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+        dgemm_2d_parallel_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    fn dgemm_2d_parallel_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f64,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+    ) {
         let (mb, nb) = tile_shape(m, n);
         let cp = TilePtr(c.as_mut_ptr());
         (0..n.div_ceil(nb)).into_par_iter().for_each(|j_blk| {
@@ -737,7 +806,7 @@ mod gemm {
                         bi,
                         k,
                         bj,
-                        1.0,
+                        alpha,
                         a.as_ptr().add(i0 * k),
                         k as isize,
                         1,
@@ -787,6 +856,18 @@ mod gemm {
     }
 
     fn sgemm_2d_parallel(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        sgemm_2d_parallel_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    fn sgemm_2d_parallel_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) {
         let (mb, nb, tiles) = tile_blocks(m, n);
         let cp = TilePtr(c.as_mut_ptr());
         tiles.into_par_iter().for_each(|(i0, j0)| {
@@ -799,7 +880,7 @@ mod gemm {
                     bi,
                     k,
                     bj,
-                    1.0,
+                    alpha,
                     a.as_ptr().add(i0 * k),
                     k as isize,
                     1,
@@ -940,6 +1021,18 @@ mod gemm {
     }
 
     pub fn dgemm_block(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+        dgemm_block_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    pub fn dgemm_block_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f64,
+        a: &[f64],
+        b: &[f64],
+        c: &mut [f64],
+    ) {
         // SAFETY: matrixmultiply::dgemm requires valid pointers and correct dimensions.
         // a.len() == m*k, b.len() == k*n, c.len() == m*n (sliced exactly by `dgemm`).
         // Row-major layout: row stride = inner dimension, column stride = 1.
@@ -948,7 +1041,7 @@ mod gemm {
                 m,
                 k,
                 n,
-                1.0,
+                alpha,
                 a.as_ptr(),
                 k as isize,
                 1,
@@ -993,8 +1086,53 @@ mod gemm {
         }
     }
 
+    pub fn sgemm_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) {
+        if m == 0 || n == 0 {
+            return;
+        }
+        let a = &a[..m * k];
+        let b = &b[..k * n];
+        let c = &mut c[..m * n];
+        if should_parallelize_cols(m, k, n) {
+            sgemm_col_parallel_scaled(m, k, n, alpha, a, b, c);
+        } else if should_parallelize(m, k, n) {
+            if n >= 2 * MIN_BLOCK_COLS && k <= F32_2D_MAX_K {
+                sgemm_2d_parallel_scaled(m, k, n, alpha, a, b, c);
+            } else {
+                let br = block_rows(m);
+                c.par_chunks_mut(br * n)
+                    .zip(a.par_chunks(br * k))
+                    .for_each(|(c_blk, a_blk)| {
+                        sgemm_block_scaled(c_blk.len() / n, k, n, alpha, a_blk, b, c_blk);
+                    });
+            }
+        } else {
+            sgemm_block_scaled(m, k, n, alpha, a, b, c);
+        }
+    }
+
     // f32 mirror of dgemm_col_parallel: direct-write disjoint column windows.
     fn sgemm_col_parallel(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        sgemm_col_parallel_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    fn sgemm_col_parallel_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) {
         let nb = block_cols(n);
         let cp = TilePtr(c.as_mut_ptr());
         (0..n.div_ceil(nb)).into_par_iter().for_each(|blk| {
@@ -1007,7 +1145,7 @@ mod gemm {
                     m,
                     k,
                     bw,
-                    1.0,
+                    alpha,
                     a.as_ptr(),
                     k as isize,
                     1,
@@ -1079,6 +1217,18 @@ mod gemm {
 
     /// f32 mirror of [`dgemm_tb`]: `C[m,n] = A^T @ B` with A stored as `[k,m]`.
     pub fn sgemm_tb(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        sgemm_tb_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    pub fn sgemm_tb_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) {
         if m == 0 || n == 0 {
             return;
         }
@@ -1091,7 +1241,7 @@ mod gemm {
                 m,
                 k,
                 n,
-                1.0,
+                alpha,
                 a.as_ptr(),
                 1,
                 m as isize,
@@ -1129,13 +1279,25 @@ mod gemm {
     }
 
     pub fn sgemm_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        sgemm_block_scaled(m, k, n, 1.0, a, b, c);
+    }
+
+    pub fn sgemm_block_scaled(
+        m: usize,
+        k: usize,
+        n: usize,
+        alpha: f32,
+        a: &[f32],
+        b: &[f32],
+        c: &mut [f32],
+    ) {
         // SAFETY: see `dgemm_block`; slices are sized exactly by `sgemm`.
         unsafe {
             sgemm_mm(
                 m,
                 k,
                 n,
-                1.0,
+                alpha,
                 a.as_ptr(),
                 k as isize,
                 1,
@@ -3758,15 +3920,9 @@ pub fn sdpa_backward_f64(
             // dV = Pᵀ @ dOut  [seq_k, d_v], without materialising Pᵀ.
             gemm::dgemm_tb(seq_k, seq_q, d_v, &p, doh, dv_bh);
             // dQ = scale · dU @ K  [seq_q, d_k]
-            gemm::dgemm(seq_q, seq_k, d_k, &du, kh, dq_bh);
-            for x in dq_bh.iter_mut() {
-                *x *= scale;
-            }
+            gemm::dgemm_scaled(seq_q, seq_k, d_k, scale, &du, kh, dq_bh);
             // dK = scale · dUᵀ @ Q  [seq_k, d_k], without materialising dUᵀ.
-            gemm::dgemm_tb(seq_k, seq_q, d_k, &du, qh, dk_bh);
-            for x in dk_bh.iter_mut() {
-                *x *= scale;
-            }
+            gemm::dgemm_tb_scaled(seq_k, seq_q, d_k, scale, &du, qh, dk_bh);
         });
     (dq, dk, dv)
 }
@@ -3844,14 +4000,8 @@ pub fn sdpa_backward_f32(
                 }
             }
             gemm::sgemm_tb(seq_k, seq_q, d_v, &p, doh, dv_bh);
-            gemm::sgemm(seq_q, seq_k, d_k, &du, kh, dq_bh);
-            for x in dq_bh.iter_mut() {
-                *x *= scale;
-            }
-            gemm::sgemm_tb(seq_k, seq_q, d_k, &du, qh, dk_bh);
-            for x in dk_bh.iter_mut() {
-                *x *= scale;
-            }
+            gemm::sgemm_scaled(seq_q, seq_k, d_k, scale, &du, kh, dq_bh);
+            gemm::sgemm_tb_scaled(seq_k, seq_q, d_k, scale, &du, qh, dk_bh);
         });
     (dq, dk, dv)
 }
@@ -27325,6 +27475,80 @@ mod tests {
                     "sgemm_bt diverged at {idx} for ({m},{k},{n}): ref {r} vs bt {g}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn scaled_gemm_matches_post_scale_reference() {
+        let (m, k, n) = (7usize, 11usize, 5usize);
+        let alpha64 = 0.377_964_473_009_227_2_f64;
+        let a64: Vec<f64> = (0..m * k)
+            .map(|i| ((i % 17) as f64 - 8.0) * 0.19 + (i as f64) * 1e-6)
+            .collect();
+        let b64: Vec<f64> = (0..k * n)
+            .map(|i| ((i % 13) as f64 - 6.0) * 0.23 - (i as f64) * 1e-6)
+            .collect();
+        let mut reference64 = vec![0.0_f64; m * n];
+        crate::gemm::dgemm(m, k, n, &a64, &b64, &mut reference64);
+        for x in &mut reference64 {
+            *x *= alpha64;
+        }
+        let mut scaled64 = vec![0.0_f64; m * n];
+        crate::gemm::dgemm_scaled(m, k, n, alpha64, &a64, &b64, &mut scaled64);
+        for (idx, (reference, scaled)) in reference64.iter().zip(&scaled64).enumerate() {
+            assert!(
+                (*reference - *scaled).abs() <= 1e-12,
+                "dgemm_scaled diverged at {idx}: post-scale {reference} vs alpha {scaled}"
+            );
+        }
+
+        let a64_t: Vec<f64> = (0..k * m)
+            .map(|i| ((i % 19) as f64 - 9.0) * 0.17 + (i as f64) * 1e-6)
+            .collect();
+        let mut reference64_tb = vec![0.0_f64; m * n];
+        crate::gemm::dgemm_tb(m, k, n, &a64_t, &b64, &mut reference64_tb);
+        for x in &mut reference64_tb {
+            *x *= alpha64;
+        }
+        let mut scaled64_tb = vec![0.0_f64; m * n];
+        crate::gemm::dgemm_tb_scaled(m, k, n, alpha64, &a64_t, &b64, &mut scaled64_tb);
+        for (idx, (reference, scaled)) in reference64_tb.iter().zip(&scaled64_tb).enumerate() {
+            assert!(
+                (*reference - *scaled).abs() <= 1e-12,
+                "dgemm_tb_scaled diverged at {idx}: post-scale {reference} vs alpha {scaled}"
+            );
+        }
+
+        let alpha32 = 0.377_964_47_f32;
+        let a32: Vec<f32> = a64.iter().map(|&v| v as f32).collect();
+        let b32: Vec<f32> = b64.iter().map(|&v| v as f32).collect();
+        let mut reference32 = vec![0.0_f32; m * n];
+        crate::gemm::sgemm(m, k, n, &a32, &b32, &mut reference32);
+        for x in &mut reference32 {
+            *x *= alpha32;
+        }
+        let mut scaled32 = vec![0.0_f32; m * n];
+        crate::gemm::sgemm_scaled(m, k, n, alpha32, &a32, &b32, &mut scaled32);
+        for (idx, (reference, scaled)) in reference32.iter().zip(&scaled32).enumerate() {
+            assert!(
+                (*reference - *scaled).abs() <= 1e-5,
+                "sgemm_scaled diverged at {idx}: post-scale {reference} vs alpha {scaled}"
+            );
+        }
+
+        let a32_t: Vec<f32> = a64_t.iter().map(|&v| v as f32).collect();
+        let mut reference32_tb = vec![0.0_f32; m * n];
+        crate::gemm::sgemm_tb(m, k, n, &a32_t, &b32, &mut reference32_tb);
+        for x in &mut reference32_tb {
+            *x *= alpha32;
+        }
+        let mut scaled32_tb = vec![0.0_f32; m * n];
+        crate::gemm::sgemm_tb_scaled(m, k, n, alpha32, &a32_t, &b32, &mut scaled32_tb);
+        for (idx, (reference, scaled)) in reference32_tb.iter().zip(&scaled32_tb).enumerate() {
+            assert!(
+                (*reference - *scaled).abs() <= 1e-5,
+                "sgemm_tb_scaled diverged at {idx}: post-scale {reference} vs alpha {scaled}"
+            );
         }
     }
 
