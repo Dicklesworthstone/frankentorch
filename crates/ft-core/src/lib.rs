@@ -5513,6 +5513,46 @@ mod tests {
     }
 
     #[test]
+    fn sparse_coo_to_dense_preserves_complex_dense_value_blocks() {
+        let indices =
+            DenseI64Tensor::from_contiguous_values(vec![0, 1, 1, 0], vec![2, 2], Device::Cpu)
+                .unwrap();
+        let values_meta = TensorMeta::from_shape(vec![2, 2], DType::Complex128, Device::Cpu);
+        let values_storage = TensorStorage::Complex128(Arc::new(vec![
+            Complex128::new(1.0, 2.0),
+            Complex128::new(3.0, 4.0),
+            Complex128::new(-5.0, 6.0),
+            Complex128::new(7.0, -8.0),
+        ]));
+        let values = DenseTensor::from_typed_storage(values_meta, values_storage).unwrap();
+        let sparse = SparseCOOTensor::new(indices, values, vec![2, 2, 2], false).unwrap();
+
+        let dense = sparse.to_dense().unwrap();
+
+        assert_eq!(dense.meta().dtype(), DType::Complex128);
+        match dense.typed_storage() {
+            TensorStorage::Complex128(values) => {
+                let values: Vec<(f64, f64)> =
+                    values.iter().map(|value| (value.re, value.im)).collect();
+                assert_eq!(
+                    values,
+                    vec![
+                        (0.0, 0.0),
+                        (0.0, 0.0),
+                        (1.0, 2.0),
+                        (3.0, 4.0),
+                        (-5.0, 6.0),
+                        (7.0, -8.0),
+                        (0.0, 0.0),
+                        (0.0, 0.0),
+                    ]
+                );
+            }
+            other => panic!("expected Complex128 dense storage, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn sparse_coo_from_coords_supports_rank2_dense_blocks() {
         let coords = vec![vec![0, 1], vec![1, 0]];
         let values = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
