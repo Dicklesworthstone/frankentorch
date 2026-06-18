@@ -3181,9 +3181,23 @@ impl EmbeddingBag {
                 },
             )));
         }
+        if let Some(p) = padding_idx
+            && p >= num_embeddings
+        {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "EmbeddingBag padding_idx out of range for num_embeddings",
+                },
+            )));
+        }
 
         let weight_init = session.randn(vec![num_embeddings, embedding_dim], false)?;
-        let weight_values = session.tensor_values(weight_init)?;
+        let mut weight_values = session.tensor_values(weight_init)?;
+        if let Some(p) = padding_idx {
+            for v in &mut weight_values[p * embedding_dim..(p + 1) * embedding_dim] {
+                *v = 0.0;
+            }
+        }
         let weight =
             session.tensor_variable(weight_values, vec![num_embeddings, embedding_dim], true)?;
 
@@ -33920,6 +33934,40 @@ mod tests {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let eb = EmbeddingBag::new(&mut session, 10, 4, EmbeddingBagMode::Sum, None).unwrap();
         assert_eq!(eb.parameters().len(), 1);
+    }
+
+    #[test]
+    fn embedding_bag_padding_idx_zeroed_and_bounds_checked() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let err =
+            EmbeddingBag::new(&mut session, 4, 2, EmbeddingBagMode::Sum, Some(4))
+                .err()
+                .expect("out-of-range padding_idx must fail");
+        assert!(
+            err.to_string().contains("padding_idx out of range"),
+            "unexpected error: {err}"
+        );
+
+        let eb = EmbeddingBag::new(&mut session, 4, 2, EmbeddingBagMode::Sum, Some(2))
+            .expect("valid padding_idx");
+        let weight = session.tensor_values(eb.weight()).expect("weight values");
+        assert_eq!(&weight[4..6], &[0.0, 0.0]);
+
+        let indices = session
+            .tensor_variable(vec![0.0, 2.0, 3.0], vec![3], false)
+            .expect("indices");
+        let offsets = session
+            .tensor_variable(vec![0.0], vec![1], false)
+            .expect("offsets");
+        let output = eb
+            .forward_with_offsets(&mut session, indices, offsets, None)
+            .expect("forward");
+        let values = session.tensor_values(output).expect("output values");
+        assert_eq!(
+            values,
+            vec![weight[0] + weight[6], weight[1] + weight[7]],
+            "padding_idx row must not contribute to sum bags"
+        );
     }
 
     // ── frankentorch-gls: EmbeddingBag bounds check tests ─────────────
