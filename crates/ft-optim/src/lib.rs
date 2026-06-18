@@ -6152,6 +6152,25 @@ mod tests {
     }
 
     #[test]
+    fn adagrad_first_step_golden_matches_torch() {
+        // Differential golden vs torch.optim.Adagrad 2.12: x=[2,-3], lr=0.1,
+        // defaults (eps=1e-10); one step == [1.900000000002,-2.900000000002]
+        // (update=lr*g/(sqrt(g^2)+eps)). frankentorch-lrq67.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0, -3.0], vec![2], true).unwrap();
+        let sq = s.tensor_mul(x, x).unwrap();
+        let loss = s.tensor_sum(sq).unwrap();
+        let report = s.tensor_backward(loss).unwrap();
+        let mut opt = Adagrad::new(vec![x], 0.1);
+        opt.step(&mut s, &report).unwrap();
+        let after = s.tensor_values(x).unwrap();
+        let want = [1.900_000_000_002, -2.900_000_000_002];
+        for (g, w) in after.iter().zip(want.iter()) {
+            assert!((g - w).abs() < 1e-9, "adagrad step {g} != {w}");
+        }
+    }
+
+    #[test]
     fn rmsprop_first_step_golden_matches_torch() {
         // Differential golden vs torch.optim.RMSprop 2.12: x=[2,-3], lr=0.1,
         // defaults (alpha=0.99, eps=1e-8); one step == [1.000000025,-2.000000016667]
