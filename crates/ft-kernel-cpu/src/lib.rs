@@ -8723,6 +8723,60 @@ pub fn batch_norm_backward_f32(
     let m = (batch * spatial) as f32;
     let inv_m = 1.0f32 / m;
     let cs = channels * spatial;
+    if dy.par_iter().all(|&v| v.to_bits() == 1.0f32.to_bits()) {
+        let rstd: Vec<f32> = (0..channels)
+            .map(|c| 1.0f32 / (var[c] + eps).sqrt())
+            .collect();
+        let mut dweight = vec![0.0f32; channels];
+        let dbias = vec![m; channels];
+        dweight.par_iter_mut().enumerate().for_each(|(c, dwc)| {
+            let rstd_c = rstd[c];
+            let mut sw = 0.0f32;
+            for n in 0..batch {
+                let base = n * cs + c * spatial;
+                for s in 0..spatial {
+                    let xhat = (x[base + s] - mean[c]) * rstd_c;
+                    sw += xhat;
+                }
+            }
+            *dwc = sw;
+        });
+        let mut dx = vec![0.0f32; x.len()];
+        if spatial == 1 {
+            dx.par_chunks_mut(channels)
+                .enumerate()
+                .for_each(|(n, dxrow)| {
+                    let base = n * channels;
+                    for c in 0..channels {
+                        let rstd_c = rstd[c];
+                        let w = weight[c];
+                        let c1 = w * dbias[c];
+                        let c2 = w * dweight[c];
+                        let idx = base + c;
+                        let xhat = (x[idx] - mean[c]) * rstd_c;
+                        let dxhat = w;
+                        dxrow[c] = rstd_c * inv_m * (m * dxhat - c1 - xhat * c2);
+                    }
+                });
+        } else {
+            dx.par_chunks_mut(spatial)
+                .enumerate()
+                .for_each(|(idx, dxrow)| {
+                    let c = idx % channels;
+                    let base = idx * spatial;
+                    let rstd_c = rstd[c];
+                    let w = weight[c];
+                    let c1 = w * dbias[c];
+                    let c2 = w * dweight[c];
+                    for s in 0..spatial {
+                        let xhat = (x[base + s] - mean[c]) * rstd_c;
+                        let dxhat = w;
+                        dxrow[s] = rstd_c * inv_m * (m * dxhat - c1 - xhat * c2);
+                    }
+                });
+        }
+        return (dx, dweight, dbias);
+    }
     let mut dweight = vec![0.0f32; channels];
     let mut dbias = vec![0.0f32; channels];
     dweight
@@ -36147,6 +36201,82 @@ mod tests {
             }
         }
         assert_eq!(digest, 0x4edb3f2ac54649ea);
+    }
+
+    #[test]
+    fn batch_norm_f32_unit_dy_matches_general_reference_bits() {
+        for (batch, channels, spatial) in [(5usize, 7usize, 1usize), (3, 4, 15)] {
+            let eps = 1e-5f32;
+            let x: Vec<f32> = (0..batch * channels * spatial)
+                .map(|i| ((i % 37) as f32 - 18.0) * 0.03125 + (i as f32) * 0.0007)
+                .collect();
+            let dy = vec![1.0f32; x.len()];
+            let weight: Vec<f32> = (0..channels)
+                .map(|c| 0.8 + (c % 5) as f32 * 0.0625)
+                .collect();
+            let (mean, var) = crate::batch_norm_stats_f32(&x, batch, channels, spatial);
+
+            let m = (batch * spatial) as f32;
+            let inv_m = 1.0f32 / m;
+            let cs = channels * spatial;
+            let mut ref_dw = vec![0.0f32; channels];
+            let mut ref_db = vec![0.0f32; channels];
+            for c in 0..channels {
+                let rstd = 1.0f32 / (var[c] + eps).sqrt();
+                let mut sw = 0.0f32;
+                let mut sb = 0.0f32;
+                for n in 0..batch {
+                    let base = n * cs + c * spatial;
+                    for s in 0..spatial {
+                        let dyi = dy[base + s];
+                        let xhat = (x[base + s] - mean[c]) * rstd;
+                        sw += dyi * xhat;
+                        sb += dyi;
+                    }
+                }
+                ref_dw[c] = sw;
+                ref_db[c] = sb;
+            }
+            let mut ref_dx = vec![0.0f32; x.len()];
+            for idx in 0..batch * channels {
+                let c = idx % channels;
+                let base = idx * spatial;
+                let rstd = 1.0f32 / (var[c] + eps).sqrt();
+                let w = weight[c];
+                let c1 = w * ref_db[c];
+                let c2 = w * ref_dw[c];
+                for s in 0..spatial {
+                    let xhat = (x[base + s] - mean[c]) * rstd;
+                    let dxhat = dy[base + s] * w;
+                    ref_dx[base + s] = rstd * inv_m * (m * dxhat - c1 - xhat * c2);
+                }
+            }
+
+            let (dx, dw, db) = crate::batch_norm_backward_f32(
+                &dy, &x, &weight, &mean, &var, batch, channels, spatial, eps,
+            );
+            for (got, expected) in dx.iter().zip(ref_dx.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dx mismatch for spatial={spatial}"
+                );
+            }
+            for (got, expected) in dw.iter().zip(ref_dw.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dweight mismatch for spatial={spatial}"
+                );
+            }
+            for (got, expected) in db.iter().zip(ref_db.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dbias mismatch for spatial={spatial}"
+                );
+            }
+        }
     }
 
     #[test]
