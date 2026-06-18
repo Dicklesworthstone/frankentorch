@@ -22181,6 +22181,19 @@ mod tests {
     }
 
     #[test]
+    fn bce_loss_golden_matches_torch() {
+        // Differential golden vs torch.nn.functional.binary_cross_entropy 2.12:
+        // input(probs)=[0.6,0.4,0.8], target=[1,0,1] -> 0.4149315996
+        // (mean of -(t*log p + (1-t)*log(1-p))). frankentorch-lkxy9.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let i = s.tensor_variable(vec![0.6, 0.4, 0.8], vec![3], false).unwrap();
+        let t = s.tensor_variable(vec![1.0, 0.0, 1.0], vec![3], false).unwrap();
+        let out = BCELoss.forward(&mut s, i, t).unwrap();
+        let got = s.tensor_values(out).unwrap()[0];
+        assert!((got - 0.414_931_599_6).abs() < 1e-9, "bce loss {got} != 0.4149315996");
+    }
+
+    #[test]
     fn loss_modules_golden_match_torch() {
         // Differential golden vs torch.nn 2.12: input=[1,2,3,4], target=[1.5,1.5,2,5]
         // (mean): MSELoss==0.625, L1Loss==0.75, SmoothL1Loss(1)==0.3125,
