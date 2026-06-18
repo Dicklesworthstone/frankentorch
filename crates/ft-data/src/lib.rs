@@ -2140,6 +2140,23 @@ mod tests {
     }
 
     #[test]
+    fn dataloader_num_batches_uses_custom_index_count() {
+        let ds = make_dataset(3, 1);
+        let custom_indices = vec![2, 0, 2, 1, 0];
+
+        let loader =
+            DataLoader::with_indices(&ds, custom_indices.clone(), DataLoaderConfig::new(2));
+        assert_eq!(loader.num_batches(), 3);
+
+        let drop_last_loader = DataLoader::with_indices(
+            &ds,
+            custom_indices,
+            DataLoaderConfig::new(2).with_drop_last(true),
+        );
+        assert_eq!(drop_last_loader.num_batches(), 2);
+    }
+
+    #[test]
     fn dataloader_rejects_out_of_range_sampler_index() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let ds = make_dataset(2, 1);
