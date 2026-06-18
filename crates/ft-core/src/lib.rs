@@ -2116,6 +2116,14 @@ pub enum SparseTensorError {
     ColIndexOutOfBounds { index: i64, ncols: usize },
     /// CSR row contains the same column index more than once.
     DuplicateCsrColumn { row: usize, col: i64 },
+    /// A coalesced COO tensor contains duplicate coordinates.
+    DuplicateCooIndex { position: usize, coord: Vec<i64> },
+    /// A coalesced COO tensor contains coordinates out of lexicographic order.
+    UnsortedCooIndex {
+        position: usize,
+        previous: Vec<i64>,
+        current: Vec<i64>,
+    },
     /// Dense tensor error during conversion.
     DenseTensor(DenseTensorError),
     /// Only 2D sparse CSR tensors are supported.
@@ -2188,6 +2196,22 @@ impl fmt::Display for SparseTensorError {
             Self::DuplicateCsrColumn { row, col } => {
                 write!(f, "CSR row {row} contains duplicate column index {col}")
             }
+            Self::DuplicateCooIndex { position, coord } => {
+                write!(
+                    f,
+                    "coalesced COO index at position {position} duplicates coordinate {coord:?}"
+                )
+            }
+            Self::UnsortedCooIndex {
+                position,
+                previous,
+                current,
+            } => {
+                write!(
+                    f,
+                    "coalesced COO index at position {position} is out of order: {previous:?} > {current:?}"
+                )
+            }
             Self::DenseTensor(err) => write!(f, "dense tensor error: {err}"),
             Self::UnsupportedRank { rank } => {
                 write!(f, "sparse CSR only supports 2D tensors, got rank {rank}")
@@ -2202,6 +2226,17 @@ impl From<DenseTensorError> for SparseTensorError {
     fn from(value: DenseTensorError) -> Self {
         Self::DenseTensor(value)
     }
+}
+
+fn coo_coordinate(
+    indices_values: &[i64],
+    sparse_dim: usize,
+    nnz: usize,
+    position: usize,
+) -> Vec<i64> {
+    (0..sparse_dim)
+        .map(|dim| indices_values[dim * nnz + position])
+        .collect()
 }
 
 /// Sparse tensor in COO (Coordinate) format.
@@ -2322,6 +2357,36 @@ impl SparseCOOTensor {
                         index: idx,
                         size: dim_size,
                     });
+                }
+            }
+        }
+
+        if coalesced && nnz > 1 {
+            for position in 1..nnz {
+                let mut ordering = std::cmp::Ordering::Equal;
+                for dim in 0..sparse_dim {
+                    let previous = indices_values[dim * nnz + position - 1];
+                    let current = indices_values[dim * nnz + position];
+                    ordering = previous.cmp(&current);
+                    if !ordering.is_eq() {
+                        break;
+                    }
+                }
+                match ordering {
+                    std::cmp::Ordering::Less => {}
+                    std::cmp::Ordering::Equal => {
+                        return Err(SparseTensorError::DuplicateCooIndex {
+                            position,
+                            coord: coo_coordinate(indices_values, sparse_dim, nnz, position),
+                        });
+                    }
+                    std::cmp::Ordering::Greater => {
+                        return Err(SparseTensorError::UnsortedCooIndex {
+                            position,
+                            previous: coo_coordinate(indices_values, sparse_dim, nnz, position - 1),
+                            current: coo_coordinate(indices_values, sparse_dim, nnz, position),
+                        });
+                    }
                 }
             }
         }
@@ -4818,6 +4883,40 @@ mod tests {
         let expected = vec![0.0, 3.5, 0.0, 0.0];
         let actual = dense.contiguous_values().unwrap();
         assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn sparse_coo_coalesced_rejects_duplicate_indices() {
+        let indices =
+            DenseI64Tensor::from_contiguous_values(vec![0, 0, 1, 1], vec![2, 2], Device::Cpu)
+                .unwrap();
+        let values =
+            DenseTensor::from_contiguous_values(vec![1.0, 2.5], vec![2], Device::Cpu).unwrap();
+
+        let result = SparseCOOTensor::new(indices, values, vec![2, 2], true);
+
+        assert!(matches!(
+            result,
+            Err(SparseTensorError::DuplicateCooIndex { position: 1, .. })
+        ));
+    }
+
+    #[test]
+    fn sparse_coo_coalesced_rejects_unsorted_indices() {
+        // Coordinates are (1, 0), then (0, 1), which is decreasing in
+        // lexicographic COO order and therefore cannot be marked coalesced.
+        let indices =
+            DenseI64Tensor::from_contiguous_values(vec![1, 0, 0, 1], vec![2, 2], Device::Cpu)
+                .unwrap();
+        let values =
+            DenseTensor::from_contiguous_values(vec![1.0, 2.5], vec![2], Device::Cpu).unwrap();
+
+        let result = SparseCOOTensor::new(indices, values, vec![2, 2], true);
+
+        assert!(matches!(
+            result,
+            Err(SparseTensorError::UnsortedCooIndex { position: 1, .. })
+        ));
     }
 
     #[test]
