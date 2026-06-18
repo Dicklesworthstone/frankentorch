@@ -5220,6 +5220,271 @@ impl Module for MultiheadAttention {
     }
 }
 
+/// Efficient softmax approximation for large output spaces, matching
+/// `torch.nn.AdaptiveLogSoftmaxWithLoss` (Grave et al., "Efficient softmax
+/// approximation for GPUs").
+///
+/// The `n_classes` outputs are split into a high-frequency `head` (the first
+/// `cutoffs[0]` classes) plus `n_clusters = cutoffs.len()` lower-frequency tail
+/// clusters; the head additionally carries one routing token per cluster. Each
+/// tail cluster is a low-rank two-layer projection `Linear(in, hsz, bias=false)
+/// -> Linear(hsz, osz, bias=false)` with `hsz = floor(in_features /
+/// div_value^(i+1))`. `cutoffs` must be strictly increasing within `1..n_classes`.
+///
+/// Unlike torch (which permits a degenerate `hsz == 0`), this constructor rejects
+/// any config whose projected size floors to 0, since the inner `Linear` cannot
+/// have zero in/out features — failing loud is preferable to diverging from
+/// torch's values. frankentorch-otfr9.
+pub struct AdaptiveLogSoftmaxWithLoss {
+    head: Linear,
+    tail: Vec<(Linear, Linear)>,
+    /// Full cluster boundaries including the trailing `n_classes`,
+    /// e.g. `cutoffs=[2,4]`, `n_classes=10` -> `[2, 4, 10]`.
+    cutoffs: Vec<usize>,
+    shortlist_size: usize,
+    n_clusters: usize,
+    in_features: usize,
+    n_classes: usize,
+}
+
+impl AdaptiveLogSoftmaxWithLoss {
+    /// Create a new `AdaptiveLogSoftmaxWithLoss`.
+    ///
+    /// `cutoffs` must be strictly increasing with `1 <= cutoffs[0]` and
+    /// `cutoffs.last() < n_classes`. `div_value` controls the per-cluster
+    /// projection shrink factor (torch default `4.0`); `head_bias` adds a bias to
+    /// the head linear (torch default `false`).
+    pub fn new(
+        session: &mut FrankenTorchSession,
+        in_features: usize,
+        n_classes: usize,
+        cutoffs: &[usize],
+        div_value: f64,
+        head_bias: bool,
+    ) -> Result<Self, AutogradError> {
+        let cutoffs_ok = !cutoffs.is_empty()
+            && cutoffs[0] >= 1
+            && cutoffs.windows(2).all(|w| w[0] < w[1])
+            && *cutoffs.last().unwrap() < n_classes;
+        if in_features == 0 || !cutoffs_ok {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "AdaptiveLogSoftmaxWithLoss: need in_features>0 and strictly \
+                             increasing cutoffs within 1..n_classes",
+                },
+            )));
+        }
+        let mut full = cutoffs.to_vec();
+        full.push(n_classes);
+        let shortlist_size = full[0];
+        let n_clusters = full.len() - 1;
+        let head_size = shortlist_size + n_clusters;
+        let head = Linear::new(session, in_features, head_size, head_bias)?;
+        let mut tail = Vec::with_capacity(n_clusters);
+        for i in 0..n_clusters {
+            let osz = full[i + 1] - full[i];
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let hsz = (in_features as f64 / div_value.powi((i + 1) as i32)) as usize;
+            if hsz == 0 {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "AdaptiveLogSoftmaxWithLoss: div_value too large for \
+                                 in_features (a cluster projection floored to size 0)",
+                    },
+                )));
+            }
+            let l0 = Linear::new(session, in_features, hsz, false)?;
+            let l1 = Linear::new(session, hsz, osz, false)?;
+            tail.push((l0, l1));
+        }
+        Ok(Self {
+            head,
+            tail,
+            cutoffs: full,
+            shortlist_size,
+            n_clusters,
+            in_features,
+            n_classes,
+        })
+    }
+
+    /// Access the head linear.
+    #[must_use]
+    pub fn head(&self) -> &Linear {
+        &self.head
+    }
+
+    /// Access the tail cluster projections (`(first_linear, second_linear)` each).
+    #[must_use]
+    pub fn tail(&self) -> &[(Linear, Linear)] {
+        &self.tail
+    }
+
+    /// Number of output classes.
+    #[must_use]
+    pub fn n_classes(&self) -> usize {
+        self.n_classes
+    }
+
+    fn check_input_2d(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<usize, AutogradError> {
+        let shape = session.tensor_shape(input)?;
+        if shape.len() != 2 || shape[1] != self.in_features {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "AdaptiveLogSoftmaxWithLoss: input must be [N, in_features]",
+                },
+            )));
+        }
+        Ok(shape[0])
+    }
+
+    /// Forward pass. Returns `(output, loss)` where `output[n]` is the
+    /// log-probability of `target[n]` and `loss` is the mean negative
+    /// log-likelihood, matching `torch.nn.AdaptiveLogSoftmaxWithLoss.forward`.
+    pub fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+        target: TensorNodeId,
+    ) -> Result<(TensorNodeId, TensorNodeId), AutogradError> {
+        let n = self.check_input_2d(session, input)?;
+        let tgt_shape = session.tensor_shape(target)?;
+        if tgt_shape.len() != 1 || tgt_shape[0] != n {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "AdaptiveLogSoftmaxWithLoss: target must be 1-D [N]",
+                },
+            )));
+        }
+        let tgt = session.tensor_values(target)?;
+        // Route each row in plain Rust off the (non-grad) integer targets: head
+        // rows gather directly; cluster rows record their relative class + row.
+        let mut gather_inds = vec![0.0_f64; n];
+        let mut cluster_rows: Vec<Vec<f64>> = vec![Vec::new(); self.n_clusters];
+        let mut cluster_rel: Vec<Vec<f64>> = vec![Vec::new(); self.n_clusters];
+        for (r, &tv) in tgt.iter().enumerate() {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let cls = tv as usize;
+            if cls >= self.n_classes {
+                return Err(AutogradError::Dispatch(DispatchError::Key(
+                    DispatchKeyError::IncompatibleSet {
+                        reason: "AdaptiveLogSoftmaxWithLoss: target out of range [0, n_classes)",
+                    },
+                )));
+            }
+            if cls < self.shortlist_size {
+                gather_inds[r] = cls as f64;
+            } else {
+                let mut c = 0;
+                while c < self.n_clusters && !(cls >= self.cutoffs[c] && cls < self.cutoffs[c + 1])
+                {
+                    c += 1;
+                }
+                gather_inds[r] = (self.shortlist_size + c) as f64;
+                cluster_rows[c].push(r as f64);
+                cluster_rel[c].push((cls - self.cutoffs[c]) as f64);
+            }
+        }
+        let head_out = self.head.forward(session, input)?;
+        let head_logprob = session.tensor_log_softmax(head_out, 1)?;
+        let gi = session.tensor_variable(gather_inds, vec![n, 1], false)?;
+        let head_part = session.tensor_gather(head_logprob, 1, gi)?;
+        let mut output = session.tensor_reshape(head_part, vec![n])?;
+        for c in 0..self.n_clusters {
+            if cluster_rows[c].is_empty() {
+                continue;
+            }
+            let nr = cluster_rows[c].len();
+            let rows_t = session.tensor_variable(cluster_rows[c].clone(), vec![nr], false)?;
+            let subset = session.tensor_index_select(input, 0, rows_t)?;
+            let h = self.tail[c].0.forward(session, subset)?;
+            let cluster_out = self.tail[c].1.forward(session, h)?;
+            let cluster_logprob = session.tensor_log_softmax(cluster_out, 1)?;
+            let rel_t = session.tensor_variable(cluster_rel[c].clone(), vec![nr, 1], false)?;
+            let local = session.tensor_gather(cluster_logprob, 1, rel_t)?;
+            let local = session.tensor_reshape(local, vec![nr])?;
+            let zeros = session.tensor_zeros(vec![n], false)?;
+            let contrib = session.tensor_index_add(zeros, 0, rows_t, local)?;
+            output = session.tensor_add(output, contrib)?;
+        }
+        let neg = session.tensor_neg(output)?;
+        let loss = session.tensor_mean(neg)?;
+        Ok((output, loss))
+    }
+
+    /// Full `[N, n_classes]` log-probabilities, matching
+    /// `torch.nn.AdaptiveLogSoftmaxWithLoss.log_prob`.
+    pub fn log_prob(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.check_input_2d(session, input)?;
+        let head_out = self.head.forward(session, input)?;
+        let head_logprob = session.tensor_log_softmax(head_out, 1)?;
+        // Head classes [0, shortlist_size) take their head log-prob directly.
+        let mut parts = vec![session.tensor_narrow(head_logprob, 1, 0, self.shortlist_size)?];
+        for i in 0..self.n_clusters {
+            let h = self.tail[i].0.forward(session, input)?;
+            let cluster_out = self.tail[i].1.forward(session, h)?;
+            let cluster_logprob = session.tensor_log_softmax(cluster_out, 1)?;
+            // Cluster class log-prob = cluster routing-token log-prob + in-cluster
+            // log-prob (broadcast the [N,1] token column over the cluster width).
+            let tok = session.tensor_narrow(head_logprob, 1, self.shortlist_size + i, 1)?;
+            let cluster_lp = session.tensor_add(cluster_logprob, tok)?;
+            parts.push(cluster_lp);
+        }
+        session.tensor_cat(&parts, 1)
+    }
+
+    /// Predict the most likely class per row. Equivalent to
+    /// `self.log_prob(input).argmax(dim=1)`, matching torch's documented
+    /// `predict` semantics.
+    pub fn predict(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        let lp = self.log_prob(session, input)?;
+        session.tensor_argmax(lp, 1)
+    }
+}
+
+impl Module for AdaptiveLogSoftmaxWithLoss {
+    /// The trait `forward` exposes the full per-class log-probabilities
+    /// ([`Self::log_prob`]); use [`Self::forward`] for the `(output, loss)` pair
+    /// that needs a target.
+    fn forward(
+        &self,
+        session: &mut FrankenTorchSession,
+        input: TensorNodeId,
+    ) -> Result<TensorNodeId, AutogradError> {
+        self.log_prob(session, input)
+    }
+
+    fn parameters(&self) -> Vec<TensorNodeId> {
+        let mut params = self.head.parameters();
+        for (l0, l1) in &self.tail {
+            params.extend(l0.parameters());
+            params.extend(l1.parameters());
+        }
+        params
+    }
+
+    fn named_children(&self) -> Vec<(String, &dyn Module)> {
+        let mut children: Vec<(String, &dyn Module)> = vec![("head".to_string(), &self.head)];
+        for (i, (l0, l1)) in self.tail.iter().enumerate() {
+            children.push((format!("tail.{i}.0"), l0 as &dyn Module));
+            children.push((format!("tail.{i}.1"), l1 as &dyn Module));
+        }
+        children
+    }
+}
+
 /// Softmax module: applies softmax along a specified dimension.
 pub struct Softmax {
     dim: usize,
@@ -23695,6 +23960,81 @@ mod tests {
         for i in 0..3 {
             let row_sum: f64 = (0..3).map(|j| wv[i * 3 + j]).sum();
             assert!((row_sum - 1.0).abs() < 1e-9, "weights row {i} sums to {row_sum}");
+        }
+    }
+
+    #[test]
+    fn adaptive_log_softmax_with_loss_satisfies_torch_invariants() {
+        // Weights are random per construction, so instead of goldens this pins the
+        // exact mathematical contracts torch's module satisfies, which uniquely fix
+        // the head/cluster combination math (frankentorch-otfr9):
+        //  (1) log_prob rows are proper distributions: sum_j exp(lp[n,j]) == 1.
+        //  (2) forward's output[n] == log_prob[n, target[n]].
+        //  (3) loss == -mean(output).  (4) predict[n] == argmax_j log_prob[n,j].
+        //  (5) all log_prob <= 0.      (6) backward yields finite, non-trivial grads.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let (n, in_f, classes) = (6usize, 8usize, 10usize);
+        let alswl = AdaptiveLogSoftmaxWithLoss::new(&mut s, in_f, classes, &[3, 6], 2.0, true)
+            .expect("construct");
+        let xdata: Vec<f64> = (0..n * in_f).map(|i| (i as f64 % 7.0) * 0.13 - 0.4).collect();
+        let x = s.tensor_variable(xdata, vec![n, in_f], true).expect("x");
+        // Targets span head [0,3), cluster0 [3,6), cluster1 [6,10).
+        let tdata = vec![0.0, 2.0, 3.0, 5.0, 6.0, 9.0];
+        let target = s.tensor_variable(tdata.clone(), vec![n], false).expect("target");
+
+        let lp = alswl.log_prob(&mut s, x).expect("log_prob");
+        assert_eq!(s.tensor_shape(lp).unwrap(), vec![n, classes]);
+        let lpv = s.tensor_values(lp).expect("lpv");
+        for r in 0..n {
+            let mut psum = 0.0;
+            for c in 0..classes {
+                let v = lpv[r * classes + c];
+                assert!(v <= 1e-9, "log_prob[{r},{c}]={v} should be <= 0");
+                psum += v.exp();
+            }
+            assert!((psum - 1.0).abs() < 1e-9, "row {r} prob sum = {psum}");
+        }
+
+        let (output, loss) = alswl.forward(&mut s, x, target).expect("forward");
+        let ov = s.tensor_values(output).expect("ov");
+        for r in 0..n {
+            let cls = tdata[r] as usize;
+            assert!(
+                (ov[r] - lpv[r * classes + cls]).abs() < 1e-9,
+                "output[{r}]={} != log_prob[{r},{cls}]={}",
+                ov[r],
+                lpv[r * classes + cls]
+            );
+        }
+        let lossv = s.tensor_values(loss).expect("lossv")[0];
+        let mean_neg = -ov.iter().sum::<f64>() / n as f64;
+        assert!(
+            (lossv - mean_neg).abs() < 1e-9,
+            "loss {lossv} != -mean(output) {mean_neg}"
+        );
+
+        let pred = alswl.predict(&mut s, x).expect("predict");
+        let pv = s.tensor_values(pred).expect("pv");
+        for r in 0..n {
+            let mut best = 0usize;
+            for c in 1..classes {
+                if lpv[r * classes + c] > lpv[r * classes + best] {
+                    best = c;
+                }
+            }
+            assert_eq!(pv[r] as usize, best, "predict[{r}] != argmax {best}");
+        }
+
+        let report = s.tensor_backward(loss).expect("backward");
+        let xg = s.tensor_gradient(&report, x).expect("x grad");
+        assert!(
+            xg.iter().all(|v| v.is_finite()) && xg.iter().any(|&v| v != 0.0),
+            "input grad must be finite and non-trivial"
+        );
+        for p in alswl.parameters() {
+            if let Some(g) = s.tensor_gradient(&report, p) {
+                assert!(g.iter().all(|v| v.is_finite()), "param grad must be finite");
+            }
         }
     }
 
