@@ -3279,6 +3279,29 @@ mod tests {
     }
 
     #[test]
+    fn dense_view_preserves_quint8_quantization_metadata() {
+        let tensor = DenseTensor::from_contiguous_values_quint8(
+            vec![10, 14, 18, 22],
+            vec![4],
+            Device::Cpu,
+            0.25,
+            10,
+        )
+        .unwrap();
+
+        let view = tensor.view(vec![2, 2]).unwrap();
+
+        assert_eq!(view.storage_id(), tensor.storage_id());
+        assert_eq!(view.meta().shape(), &[2, 2]);
+        assert!(view.meta().quantization().is_some());
+        assert_eq!(view.contiguous_values_quint8().unwrap(), &[10, 14, 18, 22]);
+        assert_eq!(
+            view.dequantized_values_as_f64().unwrap(),
+            &[0.0, 1.0, 2.0, 3.0]
+        );
+    }
+
+    #[test]
     fn dense_quantized_offset_view_preserves_metadata() {
         let meta = TensorMeta::quantized_from_shape_and_strides(
             vec![2],
