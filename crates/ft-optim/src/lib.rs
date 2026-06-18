@@ -70,7 +70,7 @@ fn ensure_grad_len_matches_param(
     expected: usize,
     actual: usize,
 ) -> Result<(), AutogradError> {
-    if expected != actual {
+    if expected.cmp(&actual).is_ne() {
         return Err(AutogradError::TensorGradientShapeMismatch {
             node,
             expected,
@@ -85,25 +85,39 @@ fn ensure_state_len(
     actual: usize,
     mismatch_reason: &'static str,
 ) -> Result<(), AutogradError> {
-    if expected != actual {
+    if expected.cmp(&actual).is_ne() {
         return Err(optimizer_state_error(mismatch_reason));
     }
     Ok(())
 }
 
 fn decode_exact_usize_field(value: f64, min: usize) -> Option<usize> {
-    if !value.is_finite() || value.fract() != 0.0 || value < min as f64 || value > usize::MAX as f64
-    {
+    let upper_exclusive = (usize::MAX as f64) + 1.0;
+    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value >= upper_exclusive {
         return None;
     }
-    Some(value as usize)
+    let decoded = value as usize;
+    if decoded < min || decoded as f64 != value {
+        return None;
+    }
+    Some(decoded)
 }
 
 fn decode_exact_i64_field(value: f64, min: i64) -> Option<i64> {
-    if !value.is_finite() || value.fract() != 0.0 || value < min as f64 || value > i64::MAX as f64 {
+    let lower_inclusive = i64::MIN as f64;
+    let upper_exclusive = (i64::MAX as f64) + 1.0;
+    if !value.is_finite()
+        || value.fract() != 0.0
+        || value < lower_inclusive
+        || value >= upper_exclusive
+    {
         return None;
     }
-    Some(value as i64)
+    let decoded = value as i64;
+    if decoded < min || decoded as f64 != value {
+        return None;
+    }
+    Some(decoded)
 }
 
 fn powi_exponent_saturating(value: usize) -> i32 {
@@ -5562,7 +5576,7 @@ impl SparseAdam {
         let nnz = sparse_grad.nnz();
         let sparse_dim = sparse_grad.sparse_dim();
         let dense_shape = sparse_grad.dense_shape();
-        if dense_shape != param_meta.shape() {
+        if dense_shape.cmp(param_meta.shape()).is_ne() {
             return Err(optimizer_hparam_error(
                 "sparse_adam sparse gradient shape must match parameter shape",
             ));
@@ -6116,6 +6130,26 @@ mod tests {
     use ft_core::{DenseI64Tensor, DenseTensor, Device, ExecutionMode, SparseCOOTensor};
 
     use super::*;
+
+    #[test]
+    fn exact_usize_state_field_rejects_saturating_cast_boundary() {
+        let upper_exclusive = (usize::MAX as f64) + 1.0;
+        assert_eq!(decode_exact_usize_field(42.0, 1), Some(42));
+        assert_eq!(decode_exact_usize_field(0.5, 0), None);
+        assert_eq!(decode_exact_usize_field(upper_exclusive, 0), None);
+    }
+
+    #[test]
+    fn exact_i64_state_field_rejects_saturating_cast_boundary() {
+        let upper_exclusive = (i64::MAX as f64) + 1.0;
+        assert_eq!(decode_exact_i64_field(-1.0, -1), Some(-1));
+        assert_eq!(
+            decode_exact_i64_field(i64::MIN as f64, i64::MIN),
+            Some(i64::MIN)
+        );
+        assert_eq!(decode_exact_i64_field(-2.0, -1), None);
+        assert_eq!(decode_exact_i64_field(upper_exclusive, i64::MIN), None);
+    }
 
     #[test]
     fn sgd_basic_step_reduces_loss() {
@@ -9248,12 +9282,12 @@ mod tests {
             restored
                 .extra
                 .iter()
-                .find(|(key, _)| key == "step_size")
+                .find(|(key, _)| key.as_str().cmp("step_size").is_eq())
                 .map(|(_, value)| *value),
             original
                 .extra
                 .iter()
-                .find(|(key, _)| key == "step_size")
+                .find(|(key, _)| key.as_str().cmp("step_size").is_eq())
                 .map(|(_, value)| *value)
         );
     }
@@ -9728,8 +9762,14 @@ mod tests {
         assert_eq!(restored.last_lrs, vec![0.42]);
         for key in ["t_0", "t_mult", "t_cur", "t_i"] {
             assert_eq!(
-                restored.extra.iter().find(|(name, _)| name == key),
-                original.extra.iter().find(|(name, _)| name == key)
+                restored
+                    .extra
+                    .iter()
+                    .find(|(name, _)| name.as_str().cmp(key).is_eq()),
+                original
+                    .extra
+                    .iter()
+                    .find(|(name, _)| name.as_str().cmp(key).is_eq())
             );
         }
     }
@@ -11367,7 +11407,7 @@ mod tests {
             scheduler.step(&mut opt, None);
             let lr = opt.get_lr();
             assert!(
-                lr >= prev_lr || i == 0,
+                lr >= prev_lr || i.cmp(&0).is_eq(),
                 "lr should be non-decreasing in up phase, step {i}: prev={prev_lr}, cur={lr}"
             );
             prev_lr = lr;
@@ -11488,8 +11528,14 @@ mod tests {
         assert_eq!(restored.last_lrs, vec![0.006]);
         for key in ["step_size_up", "step_size_down", "iteration"] {
             assert_eq!(
-                restored.extra.iter().find(|(name, _)| name == key),
-                original.extra.iter().find(|(name, _)| name == key)
+                restored
+                    .extra
+                    .iter()
+                    .find(|(name, _)| name.as_str().cmp(key).is_eq()),
+                original
+                    .extra
+                    .iter()
+                    .find(|(name, _)| name.as_str().cmp(key).is_eq())
             );
         }
     }
@@ -11540,7 +11586,7 @@ mod tests {
                 .state_dict()
                 .extra
                 .iter()
-                .find(|(name, _)| name == "iteration")
+                .find(|(name, _)| name.as_str().cmp("iteration").is_eq())
                 .map(|(_, value)| *value),
             Some(usize::MAX as f64)
         );
@@ -12035,7 +12081,7 @@ mod tests {
         let expected = lr * grad_norm;
         assert!(
             (frob_norm(&delta) - expected).abs() < 1e-9,
-            "delta norm {} != lr*||grad|| {}",
+            "delta norm {} differs from lr*||grad|| {}",
             frob_norm(&delta),
             expected
         );
