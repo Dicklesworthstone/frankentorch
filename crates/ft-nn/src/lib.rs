@@ -22181,6 +22181,27 @@ mod tests {
     }
 
     #[test]
+    fn loss_modules_golden_match_torch() {
+        // Differential golden vs torch.nn 2.12: input=[1,2,3,4], target=[1.5,1.5,2,5]
+        // (mean): MSELoss==0.625, L1Loss==0.75, SmoothL1Loss(1)==0.3125,
+        // HuberLoss(1)==0.3125. frankentorch-izwhm.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let cases: Vec<(&str, Box<dyn LossModule>, f64)> = vec![
+            ("mse", Box::new(MSELoss), 0.625),
+            ("l1", Box::new(L1Loss), 0.75),
+            ("smooth_l1", Box::new(SmoothL1Loss::new(1.0)), 0.3125),
+            ("huber", Box::new(HuberLoss::new(1.0)), 0.3125),
+        ];
+        for (name, loss, want) in cases {
+            let i = s.tensor_variable(vec![1.0, 2.0, 3.0, 4.0], vec![4], false).unwrap();
+            let t = s.tensor_variable(vec![1.5, 1.5, 2.0, 5.0], vec![4], false).unwrap();
+            let out = loss.forward(&mut s, i, t).unwrap();
+            let got = s.tensor_values(out).unwrap()[0];
+            assert!((got - want).abs() < 1e-12, "{name} loss {got} != {want}");
+        }
+    }
+
+    #[test]
     fn layernorm_output_is_normalized_per_group() {
         // Metamorphic invariant (no torch goldens): a freshly-constructed LayerNorm
         // (affine initialized to identity) maps each normalized group to ~0 mean and
