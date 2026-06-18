@@ -26062,6 +26062,43 @@ mod tests {
     }
 
     #[test]
+    fn addmm_backward_beta_alpha_grads_match_torch_golden() {
+        let mut tape = TensorTape::new();
+        let input = tape
+            .leaf(vec![10.0, 20.0, 30.0, 40.0], vec![2, 2], true)
+            .expect("input leaf");
+        let mat1 = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true)
+            .expect("mat1 leaf");
+        let mat2 = tape
+            .leaf(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![3, 2], true)
+            .expect("mat2 leaf");
+
+        let (out, _) = tape
+            .addmm(input, mat1, mat2, 0.5, 2.0, ExecutionMode::Strict)
+            .expect("addmm");
+        let (loss, _) = tape.sum(out, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(loss).expect("backward");
+
+        assert_eq!(
+            tape.values(out).expect("addmm values should resolve"),
+            vec![13.0, 20.0, 35.0, 42.0]
+        );
+        assert_eq!(
+            report.gradient(input).expect("input grad should exist"),
+            &[0.5, 0.5, 0.5, 0.5]
+        );
+        assert_eq!(
+            report.gradient(mat1).expect("mat1 grad should exist"),
+            &[2.0, 2.0, 4.0, 2.0, 2.0, 4.0]
+        );
+        assert_eq!(
+            report.gradient(mat2).expect("mat2 grad should exist"),
+            &[10.0, 10.0, 14.0, 14.0, 18.0, 18.0]
+        );
+    }
+
+    #[test]
     fn permute_backward_grad_matches_finite_diff_3cycle() {
         // 3-cycle permutation [1,2,0] on [2,3,4]: a forward-vs-inverse permutation bug
         // in backward is masked by 2-cycle/square tests (self-inverse) but exposed here
