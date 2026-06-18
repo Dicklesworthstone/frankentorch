@@ -1751,9 +1751,16 @@ impl DenseTensor {
                 actual: self.meta.numel(),
             });
         }
-        let new_meta =
-            TensorMeta::from_shape(new_shape, self.meta.dtype(), self.meta.device())
-                .with_storage_offset(self.meta.storage_offset());
+        let new_meta = TensorMeta {
+            strides: contiguous_strides(&new_shape),
+            shape: new_shape,
+            numel: new_numel,
+            storage_offset: self.meta.storage_offset(),
+            dtype: self.meta.dtype(),
+            device: self.meta.device(),
+            quantization: self.meta.quantization.clone(),
+        };
+        new_meta.validate()?;
         Ok(Self {
             id: NEXT_TENSOR_ID.fetch_add(1, Ordering::Relaxed),
             storage_id: self.storage_id, // same storage
@@ -3237,6 +3244,29 @@ mod tests {
         assert_eq!(view.meta().storage_offset(), 1);
         assert_eq!(view.meta().shape(), &[1, 2]);
         assert_eq!(view.contiguous_values().unwrap(), &[1.0, 2.0]);
+    }
+
+    #[test]
+    fn dense_view_preserves_quantization_metadata() {
+        let tensor = DenseTensor::from_contiguous_values_qint8(
+            vec![0, 2, 4, 6],
+            vec![4],
+            Device::Cpu,
+            0.5,
+            -2,
+        )
+        .unwrap();
+
+        let view = tensor.view(vec![2, 2]).unwrap();
+
+        assert_eq!(view.storage_id(), tensor.storage_id());
+        assert_eq!(view.meta().shape(), &[2, 2]);
+        assert!(view.meta().quantization().is_some());
+        assert_eq!(view.contiguous_values_qint8().unwrap(), &[0, 2, 4, 6]);
+        assert_eq!(
+            view.dequantized_values_as_f64().unwrap(),
+            &[1.0, 2.0, 3.0, 4.0]
+        );
     }
 
     #[test]
