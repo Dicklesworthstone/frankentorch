@@ -8835,6 +8835,18 @@ pub fn addmm_tensor_contiguous_f64(
         return Err(KernelError::UnsupportedLayout { side: "input" });
     }
 
+    let input_at = |i: usize| {
+        if input_1d {
+            let col = i % n;
+            input[input_offset + col]
+        } else {
+            input[input_offset + i]
+        }
+    };
+    if alpha.to_bits() == 0 {
+        return Ok((0..out_numel).map(|i| beta * input_at(i)).collect());
+    }
+
     // Use optimized GEMM for mat1 @ mat2
     let mut gemm_out = vec![0.0_f64; out_numel];
     gemm::dgemm(
@@ -8847,22 +8859,11 @@ pub fn addmm_tensor_contiguous_f64(
     );
 
     // Apply: out = beta * input + alpha * (mat1 @ mat2)
-    let out: Vec<f64> = if input_1d {
-        gemm_out
-            .iter()
-            .enumerate()
-            .map(|(i, &g)| {
-                let col = i % n;
-                beta * input[input_offset + col] + alpha * g
-            })
-            .collect()
-    } else {
-        gemm_out
-            .iter()
-            .enumerate()
-            .map(|(i, &g)| beta * input[input_offset + i] + alpha * g)
-            .collect()
-    };
+    let out: Vec<f64> = gemm_out
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| beta * input_at(i) + alpha * g)
+        .collect();
 
     Ok(out)
 }
@@ -24089,6 +24090,18 @@ pub fn addmm_tensor_contiguous_f32(
         return Err(KernelError::UnsupportedLayout { side: "input" });
     }
 
+    let input_at = |i: usize| {
+        if input_1d {
+            let col = i % n;
+            input[input_offset + col]
+        } else {
+            input[input_offset + i]
+        }
+    };
+    if alpha.to_bits() == 0 {
+        return Ok((0..out_numel).map(|i| beta * input_at(i)).collect());
+    }
+
     // Use optimized GEMM for mat1 @ mat2
     let mut gemm_out = vec![0.0f32; out_numel];
     gemm::sgemm(
@@ -24101,22 +24114,11 @@ pub fn addmm_tensor_contiguous_f32(
     );
 
     // Apply: out = beta * input + alpha * (mat1 @ mat2)
-    let out: Vec<f32> = if input_1d {
-        gemm_out
-            .iter()
-            .enumerate()
-            .map(|(i, &g)| {
-                let col = i % n;
-                beta * input[input_offset + col] + alpha * g
-            })
-            .collect()
-    } else {
-        gemm_out
-            .iter()
-            .enumerate()
-            .map(|(i, &g)| beta * input[input_offset + i] + alpha * g)
-            .collect()
-    };
+    let out: Vec<f32> = gemm_out
+        .iter()
+        .enumerate()
+        .map(|(i, &g)| beta * input_at(i) + alpha * g)
+        .collect();
 
     Ok(out)
 }
@@ -27935,6 +27937,71 @@ mod tests {
         .expect("contiguous addmm should succeed");
         // mat1 @ mat2 = [[19, 22], [43, 50]]; + input(1) = [[20, 23], [44, 51]].
         assert_eq!(out, vec![20.0, 23.0, 44.0, 51.0]);
+    }
+
+    #[test]
+    fn addmm_alpha_zero_scales_input_after_validation() {
+        let input_meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let mat1_meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
+        let mat2_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let input = vec![10.0, -4.0];
+        let mat1 = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let mat2 = vec![7.0, 8.0, 9.0, 10.0, 11.0, 12.0];
+
+        let out = super::addmm_tensor_contiguous_f64(
+            &input,
+            &mat1,
+            &mat2,
+            &input_meta,
+            &mat1_meta,
+            &mat2_meta,
+            0.5,
+            0.0,
+        )
+        .expect("alpha-zero f64 addmm should scale broadcast input");
+        assert_eq!(out, vec![5.0, -2.0, 5.0, -2.0]);
+
+        let bad_mat1_meta =
+            TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu).with_storage_offset(1);
+        let err = super::addmm_tensor_contiguous_f64(
+            &input,
+            &mat1,
+            &mat2,
+            &input_meta,
+            &bad_mat1_meta,
+            &mat2_meta,
+            0.5,
+            0.0,
+        )
+        .expect_err("alpha-zero addmm must still validate mat1 storage");
+        assert!(matches!(
+            err,
+            KernelError::InsufficientStorage {
+                side: "mat1",
+                needed: 7,
+                available: 6
+            }
+        ));
+
+        let input_meta_f32 = TensorMeta::from_shape(vec![2, 2], DType::F32, Device::Cpu);
+        let mat1_meta_f32 = TensorMeta::from_shape(vec![2, 3], DType::F32, Device::Cpu);
+        let mat2_meta_f32 = TensorMeta::from_shape(vec![3, 2], DType::F32, Device::Cpu);
+        let input_f32 = vec![1.0f32, -2.0, 3.5, -4.5];
+        let mat1_f32 = vec![1.0f32; 6];
+        let mat2_f32 = vec![2.0f32; 6];
+
+        let out_f32 = super::addmm_tensor_contiguous_f32(
+            &input_f32,
+            &mat1_f32,
+            &mat2_f32,
+            &input_meta_f32,
+            &mat1_meta_f32,
+            &mat2_meta_f32,
+            -2.0,
+            0.0,
+        )
+        .expect("alpha-zero f32 addmm should scale 2-D input");
+        assert_eq!(out_f32, vec![-2.0, 4.0, -7.0, 9.0]);
     }
 
     #[test]
