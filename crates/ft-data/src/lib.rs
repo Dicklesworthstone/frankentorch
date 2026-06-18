@@ -2103,6 +2103,28 @@ mod tests {
     }
 
     #[test]
+    fn dataloader_reset_replays_custom_index_order() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ds = make_dataset(4, 1);
+        let config = DataLoaderConfig::new(2);
+        let mut loader = DataLoader::with_indices(&ds, vec![3, 1, 3, 0], config);
+
+        let mut first_epoch = Vec::new();
+        while let Some(batch) = loader.next_batch(&mut session).unwrap() {
+            first_epoch.extend(session.tensor_values(batch.target().unwrap()).unwrap());
+        }
+
+        loader.reset();
+        let mut second_epoch = Vec::new();
+        while let Some(batch) = loader.next_batch(&mut session).unwrap() {
+            second_epoch.extend(session.tensor_values(batch.target().unwrap()).unwrap());
+        }
+
+        assert_eq!(first_epoch, vec![3.0, 1.0, 3.0, 0.0]);
+        assert_eq!(second_epoch, first_epoch);
+    }
+
+    #[test]
     fn dataloader_rejects_out_of_range_sampler_index() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let ds = make_dataset(2, 1);
