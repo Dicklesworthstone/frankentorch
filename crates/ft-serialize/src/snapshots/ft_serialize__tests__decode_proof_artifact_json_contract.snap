@@ -3,8 +3,8 @@ source: crates/ft-serialize/src/lib.rs
 expression: pretty
 ---
 {
-  "proof_hash": 7443900393698568621,
-  "proof_hash_hex": "det64:674e0bf7f5cb29ad",
+  "proof_hash": "<asupersync-version-dependent>",
+  "proof_hash_hex": "<asupersync-version-dependent>",
   "received_symbol_count": 27,
   "recovered_bytes": 18,
   "schema_version": 1,

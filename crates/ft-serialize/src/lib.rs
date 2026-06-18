@@ -2601,10 +2601,25 @@ mod tests {
         // recovered_bytes. Tracked under frankentorch-6jfc.
         let (_sidecar, proof) = generate_raptorq_sidecar("hello frankentorch", 4)
             .expect("raptorq sidecar generation should succeed");
-        let pretty = serde_json::to_string_pretty(
-            &serde_json::to_value(&proof).expect("proof serializes to Value"),
-        )
-        .expect("pretty proof JSON should serialize");
+        // proof_hash / proof_hash_hex come from asupersync::raptorq's
+        // proof.content_hash(), an implementation detail that is NOT stable across
+        // asupersync versions (it drifted with the 0.3.4 upgrade and differs
+        // across build environments), so it must not be pinned as a cross-version
+        // golden. Pin the payload-derived schema contract here and redact the
+        // version-dependent hash; in-process determinism + non-zero are asserted
+        // below (and in decode_proof_hash_is_deterministic). frankentorch-fgw0u.
+        assert_ne!(proof.proof_hash, 0, "proof_hash must be populated");
+        let (_sidecar_repeat, proof_repeat) = generate_raptorq_sidecar("hello frankentorch", 4)
+            .expect("raptorq sidecar regeneration should succeed");
+        assert_eq!(
+            proof.proof_hash, proof_repeat.proof_hash,
+            "proof_hash must be deterministic within a build"
+        );
+        let mut value = serde_json::to_value(&proof).expect("proof serializes to Value");
+        value["proof_hash"] = json!("<asupersync-version-dependent>");
+        value["proof_hash_hex"] = json!("<asupersync-version-dependent>");
+        let pretty =
+            serde_json::to_string_pretty(&value).expect("pretty proof JSON should serialize");
         insta::assert_snapshot!("decode_proof_artifact_json_contract", pretty);
     }
 
