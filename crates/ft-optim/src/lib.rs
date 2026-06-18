@@ -2993,14 +2993,14 @@ impl LinearLR {
     /// Set the start multiplier (default: 1/3).
     #[must_use]
     pub fn start_factor(mut self, start_factor: f64) -> Self {
-        self.start_factor = start_factor;
+        self.start_factor = finite_non_negative_factor(start_factor);
         self
     }
 
     /// Set the end multiplier (default: 1.0).
     #[must_use]
     pub fn end_factor(mut self, end_factor: f64) -> Self {
-        self.end_factor = end_factor;
+        self.end_factor = finite_non_negative_factor(end_factor);
         self
     }
 
@@ -3092,8 +3092,8 @@ impl LRScheduler for LinearLR {
         for (key, val) in &state.extra {
             match key.as_str() {
                 "initial_lr" => self.initial_lr = *val,
-                "start_factor" => self.start_factor = *val,
-                "end_factor" => self.end_factor = *val,
+                "start_factor" => self.start_factor = finite_non_negative_factor(*val),
+                "end_factor" => self.end_factor = finite_non_negative_factor(*val),
                 "total_iters" => {
                     if let Some(total_iters) = decode_exact_usize_field(*val, 0) {
                         self.total_iters = total_iters;
@@ -10340,6 +10340,50 @@ mod tests {
 
         scheduler.step(&mut opt, Some(0));
         assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn linear_lr_invalid_factors_are_clamped() {
+        for factor in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.25] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("var");
+            let mut opt = SGD::new(vec![x], 2.0);
+            let mut scheduler = LinearLR::new(&opt)
+                .start_factor(factor)
+                .end_factor(1.0)
+                .total_iters(10);
+            scheduler.step(&mut opt, Some(0));
+            assert_eq!(opt.get_lr(), 0.0, "start factor {factor:?}");
+            assert!(opt.get_lr().is_finite(), "start lr must remain finite");
+
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("var");
+            let mut opt = SGD::new(vec![x], 2.0);
+            let mut scheduler = LinearLR::new(&opt)
+                .start_factor(1.0)
+                .end_factor(factor)
+                .total_iters(0);
+            scheduler.step(&mut opt, Some(0));
+            assert_eq!(opt.get_lr(), 0.0, "end factor {factor:?}");
+            assert!(opt.get_lr().is_finite(), "end lr must remain finite");
+
+            scheduler.load_state_dict(SchedulerState {
+                last_epoch: -1,
+                last_lrs: vec![2.0],
+                extra: vec![
+                    ("initial_lr".to_owned(), 2.0),
+                    ("start_factor".to_owned(), factor),
+                    ("end_factor".to_owned(), factor),
+                    ("total_iters".to_owned(), 0.0),
+                ],
+            });
+            scheduler.step(&mut opt, Some(0));
+            assert_eq!(opt.get_lr(), 0.0, "loaded factor {factor:?}");
+            assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
+        }
     }
 
     #[test]
