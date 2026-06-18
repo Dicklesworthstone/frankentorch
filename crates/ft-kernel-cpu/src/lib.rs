@@ -6460,6 +6460,97 @@ pub fn max_pool3d_forward_f32(
 
 /// Backward of [`max_pool3d_forward_f64`]: routes each output gradient to its
 /// window's (first) argmax. Parallel over `(batch,ch)`; overlaps accumulate.
+#[must_use]
+fn max_pool3d_backward_2x2s2_f64(
+    dout: &[f64],
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f64> {
+    let plane_len = id * ih * iw;
+    let out_plane_len = od * oh * ow;
+    let depth_stride = ih * iw;
+    let mut din = vec![0.0f64; batch * ch * plane_len];
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let input_plane = &input[plane * plane_len..plane * plane_len + plane_len];
+            let dout_plane = &dout[plane * out_plane_len..plane * out_plane_len + out_plane_len];
+            for oz in 0..od {
+                let z0 = (oz * 2) * depth_stride;
+                let z1 = z0 + depth_stride;
+                for oy in 0..oh {
+                    let row00 = z0 + (oy * 2) * iw;
+                    let row01 = row00 + iw;
+                    let row10 = z1 + (oy * 2) * iw;
+                    let row11 = row10 + iw;
+                    for ox in 0..ow {
+                        let x0 = ox * 2;
+                        let loc000 = row00 + x0;
+                        let loc001 = loc000 + 1;
+                        let loc010 = row01 + x0;
+                        let loc011 = loc010 + 1;
+                        let loc100 = row10 + x0;
+                        let loc101 = loc100 + 1;
+                        let loc110 = row11 + x0;
+                        let loc111 = loc110 + 1;
+                        let mut m = f64::NEG_INFINITY;
+                        let mut arg = loc000;
+
+                        let candidate = input_plane[loc000];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc000;
+                        }
+                        let candidate = input_plane[loc001];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc001;
+                        }
+                        let candidate = input_plane[loc010];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc010;
+                        }
+                        let candidate = input_plane[loc011];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc011;
+                        }
+                        let candidate = input_plane[loc100];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc100;
+                        }
+                        let candidate = input_plane[loc101];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc101;
+                        }
+                        let candidate = input_plane[loc110];
+                        if candidate > m {
+                            m = candidate;
+                            arg = loc110;
+                        }
+                        let candidate = input_plane[loc111];
+                        if candidate > m {
+                            arg = loc111;
+                        }
+
+                        drow[arg] += dout_plane[(oz * oh + oy) * ow + ox];
+                    }
+                }
+            }
+        });
+    din
+}
+
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn max_pool3d_backward_f64(
@@ -6480,6 +6571,12 @@ pub fn max_pool3d_backward_f64(
     sh: usize,
     sw: usize,
 ) -> Vec<f64> {
+    if kd == 2 && kh == 2 && kw == 2 && sd == 2 && sh == 2 && sw == 2 {
+        return max_pool3d_backward_2x2s2_f64(
+            dout, input, batch, ch, id, ih, iw, od, oh, ow,
+        );
+    }
+
     let mut din = vec![0.0f64; batch * ch * id * ih * iw];
     din.par_chunks_mut(id * ih * iw)
         .enumerate()
@@ -25505,6 +25602,67 @@ mod tests {
             vec![0.0, 2.0, 0.0, 0.0, 2.0, 0.0, 0.0, 0.0, 0.0]
         );
         assert_eq!(from_indices, from_rescan);
+    }
+
+    #[test]
+    fn max_pool3d_2x2s2_backward_matches_generic_first_tie_bits() {
+        let (batch, ch, id, ih, iw) = (2usize, 2usize, 4usize, 4usize, 4usize);
+        let (kd, kh, kw, sd, sh, sw) = (2usize, 2usize, 2usize, 2usize, 2usize, 2usize);
+        let (od, oh, ow) = (2usize, 2usize, 2usize);
+        let mut input: Vec<f64> = (0..batch * ch * id * ih * iw)
+            .map(|i| ((i * 37 + 11) % 53) as f64 * 0.125 - 2.0)
+            .collect();
+        input[0] = 9.0;
+        input[1] = 9.0;
+        input[4] = 2.0;
+        input[5] = 3.0;
+        input[16] = 4.0;
+        input[17] = 5.0;
+        input[20] = 6.0;
+        input[21] = 7.0;
+        let dout: Vec<f64> = (0..batch * ch * od * oh * ow)
+            .map(|i| ((i * 29 + 7) % 31) as f64 * 0.0625 - 0.5)
+            .collect();
+
+        let mut expected = vec![0.0f64; input.len()];
+        let plane_len = id * ih * iw;
+        let out_plane_len = od * oh * ow;
+        for plane in 0..batch * ch {
+            let ibase = plane * plane_len;
+            let dbase = plane * out_plane_len;
+            for oz in 0..od {
+                let bd = oz * sd;
+                for oy in 0..oh {
+                    let bh = oy * sh;
+                    for ox in 0..ow {
+                        let bw = ox * sw;
+                        let mut m = f64::NEG_INFINITY;
+                        let mut arg = 0usize;
+                        for kdd in 0..kd {
+                            let dz = (bd + kdd) * ih * iw;
+                            for kr in 0..kh {
+                                let loc = dz + (bh + kr) * iw + bw;
+                                for kc in 0..kw {
+                                    let v = input[ibase + loc + kc];
+                                    if v > m {
+                                        m = v;
+                                        arg = loc + kc;
+                                    }
+                                }
+                            }
+                        }
+                        expected[ibase + arg] += dout[dbase + (oz * oh + oy) * ow + ox];
+                    }
+                }
+            }
+        }
+
+        let got = super::max_pool3d_backward_f64(
+            &dout, &input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        assert_eq!(got[0].to_bits(), dout[0].to_bits(), "first tied argmax wins");
+        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
     }
 
     #[test]
