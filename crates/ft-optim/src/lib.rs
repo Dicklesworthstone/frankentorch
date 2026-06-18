@@ -6172,6 +6172,24 @@ mod tests {
     }
 
     #[test]
+    fn polynomial_lr_schedule_golden_matches_torch() {
+        // Differential golden vs torch.optim.lr_scheduler.PolynomialLR 2.12: base_lr=1,
+        // total_iters=4, power=2 -> per-epoch [1.0,0.5625,0.25,0.0625,0.0,0.0]
+        // (base*(1-epoch/total)^power, clamped). step(opt,None)+get_lr protocol;
+        // first step -> epoch 0 (= base, per the existing step_lr tests). frankentorch-h84wk.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![1.0], vec![1], true).unwrap();
+        let mut opt = SGD::new(vec![x], 1.0);
+        let mut sch = PolynomialLR::new(&opt, 4, 2.0);
+        let want = [1.0, 0.5625, 0.25, 0.0625, 0.0, 0.0];
+        for (epoch, w) in want.iter().enumerate() {
+            sch.step(&mut opt, None);
+            let lr = opt.get_lr();
+            assert!((lr - w).abs() < 1e-12, "PolynomialLR epoch {epoch} lr={lr} != {w}");
+        }
+    }
+
+    #[test]
     fn constant_lr_schedule_golden_matches_torch() {
         // Differential golden vs torch.optim.lr_scheduler.ConstantLR 2.12: base_lr=1,
         // factor=0.5, total_iters=3 -> [0.5,0.5,0.5,1.0,1.0] over epochs 0..4
