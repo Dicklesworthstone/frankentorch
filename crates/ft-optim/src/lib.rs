@@ -136,6 +136,14 @@ fn finite_non_negative_factor(value: f64) -> f64 {
     }
 }
 
+fn finite_unit_interval(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
 fn load_param_gradient(
     session: &FrankenTorchSession,
     param: TensorNodeId,
@@ -3764,7 +3772,7 @@ impl OneCycleLR {
 
     #[must_use]
     pub fn pct_start(mut self, pct_start: f64) -> Self {
-        self.pct_start = pct_start.clamp(0.0, 1.0);
+        self.pct_start = finite_unit_interval(pct_start);
         self
     }
 
@@ -4014,7 +4022,7 @@ impl LRScheduler for OneCycleLR {
                         self.total_steps = total_steps;
                     }
                 }
-                "pct_start" => self.pct_start = val.clamp(0.0, 1.0),
+                "pct_start" => self.pct_start = finite_unit_interval(*val),
                 "anneal_strategy" => {
                     self.anneal_strategy = if *val >= 0.5 {
                         OneCycleAnnealStrategy::Linear
@@ -11294,6 +11302,56 @@ mod tests {
             });
             scheduler.step(&mut opt, Some(2));
             assert_eq!(opt.get_lr(), 0.0, "loaded invalid max_lr {max_lr:?}");
+            assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
+            assert!(opt.get_lr() >= 0.0, "loaded lr must remain non-negative");
+        }
+    }
+
+    #[test]
+    fn one_cycle_lr_invalid_pct_start_is_clamped() {
+        for pct_start in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.5] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("var");
+            let mut opt = SGD::new(vec![x], 1.0);
+            let mut scheduler = OneCycleLR::new(&opt, 1.0, 1)
+                .pct_start(pct_start)
+                .cycle_momentum(false);
+
+            scheduler.step(&mut opt, Some(0));
+            assert!(
+                (opt.get_lr() - 4.0e-6).abs() < 1e-12,
+                "invalid pct_start {pct_start:?} produced {}",
+                opt.get_lr()
+            );
+            assert!(opt.get_lr().is_finite(), "lr must remain finite");
+            assert!(opt.get_lr() >= 0.0, "lr must remain non-negative");
+
+            scheduler.load_state_dict(SchedulerState {
+                last_epoch: -1,
+                last_lrs: vec![0.0],
+                extra: vec![
+                    ("max_lr".to_owned(), 1.0),
+                    ("total_steps".to_owned(), 1.0),
+                    ("pct_start".to_owned(), pct_start),
+                    ("anneal_strategy".to_owned(), 0.0),
+                    ("cycle_momentum".to_owned(), 0.0),
+                    ("base_momentum".to_owned(), 0.85),
+                    ("max_momentum".to_owned(), 0.95),
+                    ("div_factor".to_owned(), 25.0),
+                    ("final_div_factor".to_owned(), 1e4),
+                    ("three_phase".to_owned(), 0.0),
+                    ("last_momentum".to_owned(), f64::NAN),
+                    ("verbose".to_owned(), 0.0),
+                ],
+            });
+            scheduler.step(&mut opt, Some(0));
+            assert!(
+                (opt.get_lr() - 4.0e-6).abs() < 1e-12,
+                "loaded invalid pct_start {pct_start:?} produced {}",
+                opt.get_lr()
+            );
             assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
             assert!(opt.get_lr() >= 0.0, "loaded lr must remain non-negative");
         }
