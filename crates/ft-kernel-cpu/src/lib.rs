@@ -8914,9 +8914,13 @@ pub fn addmv_tensor_contiguous_f64(
     ensure_storage_len(vec_data, vec_meta, "vec")?;
     ensure_storage_len(input, input_meta, "input")?;
 
+    let input_start = input_meta.storage_offset();
+    if alpha.to_bits() == 0 {
+        return Ok((0..m).map(|row| beta * input[input_start + row]).collect());
+    }
+
     let mat_start = mat_meta.storage_offset();
     let vec_start = vec_meta.storage_offset();
-    let input_start = input_meta.storage_offset();
 
     // Push-based output skips the m-cell zero-init memset
     // (frankentorch-u04j); same row-major contract as matmul.
@@ -24166,9 +24170,13 @@ pub fn addmv_tensor_contiguous_f32(
     ensure_storage_len_f32(mat, mat_meta, "mat")?;
     ensure_storage_len_f32(vec_data, vec_meta, "vec")?;
     ensure_storage_len_f32(input, input_meta, "input")?;
+    let input_start = input_meta.storage_offset();
+    if alpha.to_bits() == 0 {
+        return Ok((0..m).map(|row| beta * input[input_start + row]).collect());
+    }
+
     let mat_start = mat_meta.storage_offset();
     let vec_start = vec_meta.storage_offset();
-    let input_start = input_meta.storage_offset();
     // Push-based output mirrors the f64 fix (frankentorch-u04j).
     let mut out = Vec::with_capacity(m);
     let mut scratch = vec![0.0f32; k];
@@ -28033,6 +28041,71 @@ mod tests {
                 available: 2
             }
         ));
+    }
+
+    #[test]
+    fn addmv_alpha_zero_scales_input_after_validation() {
+        let input_meta = TensorMeta::from_shape(vec![3], DType::F64, Device::Cpu);
+        let mat_meta = TensorMeta::from_shape(vec![3, 2], DType::F64, Device::Cpu);
+        let vec_meta = TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu);
+        let input = vec![8.0, -6.0, 4.0];
+        let mat = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let vec_data = vec![7.0, 8.0];
+
+        let out = super::addmv_tensor_contiguous_f64(
+            &input,
+            &mat,
+            &vec_data,
+            &input_meta,
+            &mat_meta,
+            &vec_meta,
+            0.25,
+            0.0,
+        )
+        .expect("alpha-zero f64 addmv should scale input");
+        assert_eq!(out, vec![2.0, -1.5, 1.0]);
+
+        let bad_vec_meta =
+            TensorMeta::from_shape(vec![2], DType::F64, Device::Cpu).with_storage_offset(1);
+        let err = super::addmv_tensor_contiguous_f64(
+            &input,
+            &mat,
+            &vec_data,
+            &input_meta,
+            &mat_meta,
+            &bad_vec_meta,
+            0.25,
+            0.0,
+        )
+        .expect_err("alpha-zero addmv must still validate vector storage");
+        assert!(matches!(
+            err,
+            KernelError::InsufficientStorage {
+                side: "vec",
+                needed: 3,
+                available: 2
+            }
+        ));
+
+        let input_meta_f32 = TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu);
+        let mat_meta_f32 = TensorMeta::from_shape(vec![2, 2], DType::F32, Device::Cpu);
+        let vec_meta_f32 = TensorMeta::from_shape(vec![2], DType::F32, Device::Cpu);
+        let input_f32 = vec![3.0f32, -5.0];
+        let mat_f32 = vec![1.0f32, 2.0, 3.0, 4.0];
+        let vec_f32 = vec![5.0f32, 6.0];
+
+        let out_f32 = super::addmv_tensor_contiguous_f32(
+            &input_f32,
+            &mat_f32,
+            &vec_f32,
+            &input_meta_f32,
+            &mat_meta_f32,
+            &vec_meta_f32,
+            -3.0,
+            0.0,
+        )
+        .expect("alpha-zero f32 addmv should scale input");
+        assert_eq!(out_f32, vec![-9.0, 15.0]);
     }
 
     #[test]

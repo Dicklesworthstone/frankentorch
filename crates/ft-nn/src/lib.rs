@@ -22141,6 +22141,27 @@ mod tests {
     }
 
     #[test]
+    fn layernorm_output_is_normalized_per_group() {
+        // Metamorphic invariant (no torch goldens): a freshly-constructed LayerNorm
+        // (affine initialized to identity) maps each normalized group to ~0 mean and
+        // ~1 biased variance, regardless of input scale/shift. frankentorch-vlfm9.
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let ln = LayerNorm::new(&mut session, vec![4], 1e-5).expect("layernorm");
+        let data: Vec<f64> = (0..12).map(|i| (i as f64) * 1.5 + 10.0).collect();
+        let x = session.tensor_variable(data, vec![3, 4], false).expect("x");
+        let y = ln.forward(&mut session, x).expect("forward");
+        let yv = session.tensor_values(y).expect("vals");
+        let d = 4usize;
+        for row in 0..3 {
+            let g = &yv[row * d..row * d + d];
+            let mean: f64 = g.iter().sum::<f64>() / d as f64;
+            let var: f64 = g.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / d as f64;
+            assert!(mean.abs() < 1e-3, "row {row} mean={mean} should be ~0");
+            assert!((var - 1.0).abs() < 1e-2, "row {row} var={var} should be ~1");
+        }
+    }
+
+    #[test]
     fn layernorm_multidim_normalized_shape() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         // Normalize over last 2 dims [2, 3]
