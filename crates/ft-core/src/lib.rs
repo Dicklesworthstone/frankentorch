@@ -2430,6 +2430,12 @@ impl SparseCOOTensor {
         }
 
         let sparse_dim = coords[0].len();
+        if sparse_dim > dense_shape.len() {
+            return Err(SparseTensorError::SparseDimMismatch {
+                indices_sparse_dim: sparse_dim,
+                expected: dense_shape.len(),
+            });
+        }
 
         // Build indices tensor [sparse_dim, nnz]
         let mut indices_data = vec![0i64; sparse_dim * nnz];
@@ -2448,7 +2454,10 @@ impl SparseCOOTensor {
         let indices =
             DenseI64Tensor::from_contiguous_values(indices_data, vec![sparse_dim, nnz], device)?;
 
-        let values_tensor = DenseTensor::from_contiguous_values(values, vec![nnz], device)?;
+        let values_shape: Vec<usize> = std::iter::once(nnz)
+            .chain(dense_shape[sparse_dim..].iter().copied())
+            .collect();
+        let values_tensor = DenseTensor::from_contiguous_values(values, values_shape, device)?;
         let values_tensor = values_tensor.to_dtype(dtype)?;
 
         Self::new(indices, values_tensor, dense_shape, false)
@@ -5026,6 +5035,23 @@ mod tests {
         let expected = vec![0.0, 0.0, 4.0, 6.0, 0.0, 0.0, 0.0, 0.0];
         let actual = dense.contiguous_values().unwrap();
         assert_eq!(actual, expected.as_slice());
+    }
+
+    #[test]
+    fn sparse_coo_from_coords_supports_dense_value_blocks() {
+        let coords = vec![vec![0, 1], vec![1, 0]];
+        let values = vec![1.0, 2.0, 3.0, 4.0];
+
+        let sparse =
+            SparseCOOTensor::from_coords(&coords, values, vec![2, 2, 2], DType::F64, Device::Cpu)
+                .unwrap();
+
+        assert_eq!(sparse.sparse_dim(), 2);
+        assert_eq!(sparse.values().meta().shape(), &[2, 2]);
+
+        let dense = sparse.to_dense().unwrap();
+        let expected = vec![0.0, 0.0, 1.0, 2.0, 3.0, 4.0, 0.0, 0.0];
+        assert_eq!(dense.contiguous_values().unwrap(), expected.as_slice());
     }
 
     #[test]
