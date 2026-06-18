@@ -64,7 +64,7 @@ impl EvidenceLedger {
     /// Lets long-running consumers reclaim ledger memory between batches without
     /// tearing down the whole `RuntimeContext`.
     pub fn clear(&mut self) {
-        self.entries.clear();
+        self.entries = Vec::new();
     }
 
     #[must_use]
@@ -481,6 +481,27 @@ mod tests {
 
         ctx.ledger_mut().clear();
         assert_eq!(ctx.ledger().len(), 0);
+    }
+
+    #[test]
+    fn evidence_ledger_clear_reclaims_retained_storage() {
+        let mut ledger = super::EvidenceLedger::new();
+        for i in 0..super::EvidenceLedger::SOFT_CAP {
+            ledger.record(EvidenceKind::Dispatch, format!("op {i}"));
+        }
+        assert!(
+            ledger.entries.capacity() >= super::EvidenceLedger::SOFT_CAP,
+            "setup should grow the ledger allocation"
+        );
+
+        ledger.clear();
+
+        assert!(ledger.is_empty());
+        assert_eq!(
+            ledger.entries.capacity(),
+            0,
+            "clear should release the retained allocation for long-running sessions"
+        );
     }
 
     #[cfg(feature = "asupersync-integration")]
