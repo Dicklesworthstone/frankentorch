@@ -4469,6 +4469,29 @@ mod tests {
     }
 
     #[test]
+    fn dense_tensor_to_dtype_compacts_offset_quint8_view() {
+        let meta = TensorMeta::quantized_from_shape_and_strides(
+            vec![2],
+            vec![1],
+            2,
+            DType::QUInt8,
+            Device::Cpu,
+            0.25,
+            10,
+        )
+        .expect("offset quantized meta");
+        let tensor = DenseTensor::from_storage_quint8(meta, vec![1, 3, 10, 14])
+            .expect("offset quantized tensor");
+
+        let cast = tensor.to_dtype(DType::F32).expect("cast offset quint8");
+
+        assert_eq!(cast.meta().dtype(), DType::F32);
+        assert_eq!(cast.meta().storage_offset(), 0);
+        assert_eq!(cast.typed_storage().as_f32().unwrap(), &[0.0, 1.0]);
+        assert_eq!(cast.contiguous_values_f32().unwrap(), &[0.0, 1.0]);
+    }
+
+    #[test]
     fn dense_tensor_to_dtype_same_is_clone() {
         let dt = DenseTensor::from_contiguous_values(vec![1.0, 2.0], vec![2], Device::Cpu)
             .expect("create tensor");
