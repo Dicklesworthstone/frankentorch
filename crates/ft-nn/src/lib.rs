@@ -16709,6 +16709,11 @@ impl LossModule for FocalLoss {
         }
 
         let num_classes = *input_shape.last().unwrap();
+        if num_classes == 0 {
+            return Err(incompatible_error(
+                "FocalLoss: class dimension must be greater than zero",
+            ));
+        }
         let last_dim = input_shape.len() - 1;
         let sample_shape = input_shape[..last_dim].to_vec();
         let target_shape = session.tensor_shape(target)?;
@@ -35285,6 +35290,21 @@ mod tests {
                 reason: "FocalLoss: target shape must match input shape without the class dimension"
             }))
         ));
+    }
+
+    #[test]
+    fn focal_loss_rejects_empty_class_dimension() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let fl = FocalLoss::new(0.25, 2.0, Reduction::Mean);
+        let logits = session.tensor_variable(Vec::new(), vec![0, 0], false).unwrap();
+        let target = session.tensor_variable(Vec::new(), vec![0], false).unwrap();
+        let err = fl
+            .forward(&mut session, logits, target)
+            .expect_err("empty class dimension must fail closed");
+        assert!(
+            format!("{err:?}").contains("class dimension must be greater than zero"),
+            "unexpected empty-class error: {err:?}"
+        );
     }
 
     #[test]
