@@ -3272,6 +3272,14 @@ impl EmbeddingBag {
         let n_indices = indices_vals.len();
         let num_emb = self.num_embeddings;
 
+        if num_bags == 0 && n_indices > 0 {
+            return Err(AutogradError::Dispatch(DispatchError::Key(
+                DispatchKeyError::IncompatibleSet {
+                    reason: "EmbeddingBag: offsets must be non-empty when indices are non-empty",
+                },
+            )));
+        }
+
         if per_sample_weights.is_some() && !matches!(self.mode, EmbeddingBagMode::Sum) {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
@@ -34413,6 +34421,18 @@ mod tests {
             .expect_err("first offset must be zero");
         assert!(
             err.to_string().contains("first offset must be zero"),
+            "unexpected error: {err}"
+        );
+
+        let indices = session
+            .tensor_variable(vec![0.0, 1.0], vec![2], false)
+            .unwrap();
+        let empty_offsets = session.tensor_variable(vec![], vec![0], false).unwrap();
+        let err = eb
+            .forward_with_offsets(&mut session, indices, empty_offsets, None)
+            .expect_err("empty offsets must not drop non-empty indices");
+        assert!(
+            err.to_string().contains("offsets must be non-empty"),
             "unexpected error: {err}"
         );
     }
