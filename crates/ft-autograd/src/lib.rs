@@ -25992,6 +25992,34 @@ mod tests {
     }
 
     #[test]
+    fn matmul_backward_grads_match_torch_golden() {
+        let mut tape = TensorTape::new();
+        let a = tape
+            .leaf(vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0], vec![2, 3], true)
+            .expect("lhs leaf");
+        let b = tape
+            .leaf(vec![1.0, 0.0, 0.0, 1.0, 1.0, 1.0], vec![3, 2], true)
+            .expect("rhs leaf");
+
+        let (out, _) = tape.matmul(a, b, ExecutionMode::Strict).expect("matmul");
+        let (loss, _) = tape.sum(out, ExecutionMode::Strict).expect("sum");
+        let report = tape.backward(loss).expect("backward");
+
+        assert_eq!(
+            tape.values(out).expect("matmul values should resolve"),
+            vec![4.0, 5.0, 10.0, 11.0]
+        );
+        assert_eq!(
+            report.gradient(a).expect("lhs grad should exist"),
+            &[1.0, 1.0, 2.0, 1.0, 1.0, 2.0]
+        );
+        assert_eq!(
+            report.gradient(b).expect("rhs grad should exist"),
+            &[5.0, 5.0, 7.0, 7.0, 9.0, 9.0]
+        );
+    }
+
+    #[test]
     fn bmm_backward_grads_match_finite_diff_nonsquare() {
         // batch=2: A[2,2,3] @ B[2,3,2] — non-square per batch, non-symmetric.
         let a: Vec<f64> = (1..=12).map(|v| v as f64).collect();
