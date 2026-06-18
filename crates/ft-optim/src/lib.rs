@@ -2594,7 +2594,7 @@ impl CosineAnnealingLR {
     /// Set the minimum learning rate (default: 0.0).
     #[must_use]
     pub fn eta_min(mut self, eta_min: f64) -> Self {
-        self.eta_min = eta_min;
+        self.eta_min = finite_non_negative_factor(eta_min);
         self
     }
 
@@ -2679,7 +2679,7 @@ impl LRScheduler for CosineAnnealingLR {
                         self.t_max = t_max;
                     }
                 }
-                "eta_min" => self.eta_min = *val,
+                "eta_min" => self.eta_min = finite_non_negative_factor(*val),
                 _ => {}
             }
         }
@@ -2729,7 +2729,7 @@ impl CosineAnnealingWarmRestarts {
     /// Set the minimum learning rate (default: 0.0).
     #[must_use]
     pub fn eta_min(mut self, eta_min: f64) -> Self {
-        self.eta_min = eta_min;
+        self.eta_min = finite_non_negative_factor(eta_min);
         self
     }
 
@@ -2840,7 +2840,7 @@ impl LRScheduler for CosineAnnealingWarmRestarts {
                         self.t_mult = t_mult;
                     }
                 }
-                "eta_min" => self.eta_min = *val,
+                "eta_min" => self.eta_min = finite_non_negative_factor(*val),
                 "t_cur" => {
                     if let Some(t_cur) = decode_exact_i64_field(*val, -1) {
                         self.t_cur = t_cur;
@@ -10062,6 +10062,37 @@ mod tests {
     }
 
     #[test]
+    fn cosine_annealing_lr_invalid_eta_min_is_clamped() {
+        for eta_min in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.25] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("var");
+            let mut opt = SGD::new(vec![x], 0.5);
+            let mut scheduler = CosineAnnealingLR::new(&opt, 10).eta_min(eta_min);
+
+            scheduler.step(&mut opt, Some(10));
+            assert_eq!(opt.get_lr(), 0.0, "invalid eta_min {eta_min:?}");
+            assert!(opt.get_lr().is_finite(), "lr must remain finite");
+            assert!(opt.get_lr() >= 0.0, "lr must remain non-negative");
+
+            scheduler.load_state_dict(SchedulerState {
+                last_epoch: -1,
+                last_lrs: vec![0.5],
+                extra: vec![
+                    ("initial_lr".to_owned(), 0.5),
+                    ("t_max".to_owned(), 10.0),
+                    ("eta_min".to_owned(), eta_min),
+                ],
+            });
+            scheduler.step(&mut opt, Some(10));
+            assert_eq!(opt.get_lr(), 0.0, "loaded invalid eta_min {eta_min:?}");
+            assert!(opt.get_lr().is_finite(), "loaded lr must remain finite");
+            assert!(opt.get_lr() >= 0.0, "loaded lr must remain non-negative");
+        }
+    }
+
+    #[test]
     fn cosine_annealing_lr_state_dict_round_trip() {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
@@ -10144,6 +10175,48 @@ mod tests {
 
         scheduler.step(&mut opt, Some(6));
         assert!((opt.get_lr() - 1.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn cosine_warm_restarts_invalid_eta_min_is_clamped() {
+        for eta_min in [f64::NAN, f64::INFINITY, f64::NEG_INFINITY, -0.25] {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(vec![1.0], vec![1], true)
+                .expect("var");
+            let mut opt = SGD::new(vec![x], 0.5);
+            let mut scheduler = CosineAnnealingWarmRestarts::new(&opt, 4).eta_min(eta_min);
+
+            scheduler.step(&mut opt, Some(2));
+            let lr = opt.get_lr();
+            assert!(
+                (lr - 0.25).abs() < 1e-12,
+                "invalid eta_min {eta_min:?} produced {lr}"
+            );
+            assert!(lr.is_finite(), "lr must remain finite");
+            assert!(lr >= 0.0, "lr must remain non-negative");
+
+            scheduler.load_state_dict(SchedulerState {
+                last_epoch: -1,
+                last_lrs: vec![0.5],
+                extra: vec![
+                    ("initial_lr".to_owned(), 0.5),
+                    ("t_0".to_owned(), 4.0),
+                    ("t_mult".to_owned(), 1.0),
+                    ("eta_min".to_owned(), eta_min),
+                    ("t_cur".to_owned(), -1.0),
+                    ("t_i".to_owned(), 4.0),
+                ],
+            });
+            scheduler.step(&mut opt, Some(2));
+            let loaded_lr = opt.get_lr();
+            assert!(
+                (loaded_lr - 0.25).abs() < 1e-12,
+                "loaded invalid eta_min {eta_min:?} produced {loaded_lr}"
+            );
+            assert!(loaded_lr.is_finite(), "loaded lr must remain finite");
+            assert!(loaded_lr >= 0.0, "loaded lr must remain non-negative");
+        }
     }
 
     #[test]
