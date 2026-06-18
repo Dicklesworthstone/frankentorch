@@ -6330,6 +6330,26 @@ mod tests {
     }
 
     #[test]
+    fn sgd_momentum_two_step_loop_golden_matches_torch() {
+        // Integration golden vs torch.optim.SGD(momentum=0.9) 2.12: x=[2], loss=x^2,
+        // TWO steps with zero_grad between -> x==0.92 (step1 buf=4 x=1.6; step2
+        // buf=0.9*4+3.2=6.8 x=0.92). Validates momentum buffer across steps +
+        // zero_grad/forward/backward/step loop. frankentorch-k6aw1.
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable(vec![2.0], vec![1], true).unwrap();
+        let mut opt = SGD::new(vec![x], 0.1).momentum(0.9);
+        for _ in 0..2 {
+            s.tensor_zero_grad(x).unwrap();
+            let sq = s.tensor_mul(x, x).unwrap();
+            let loss = s.tensor_sum(sq).unwrap();
+            let report = s.tensor_backward(loss).unwrap();
+            opt.step(&mut s, &report).unwrap();
+        }
+        let after = s.tensor_values(x).unwrap();
+        assert!((after[0] - 0.92).abs() < 1e-12, "sgd-mom 2-step {} != 0.92", after[0]);
+    }
+
+    #[test]
     fn sgd_training_step_integration_golden_matches_torch() {
         // Integration golden vs torch.optim.SGD 2.12: x=[2,-3], loss=sum(x^2),
         // backward, SGD(lr=0.1).step -> x==[1.6,-2.4]. Tests the full
