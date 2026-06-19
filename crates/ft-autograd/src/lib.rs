@@ -12362,8 +12362,20 @@ impl TensorTape {
                 }
                 TensorNodeOp::Sum { input, input_numel } => {
                     let grad_scalar = incoming[0];
-                    let sum_contrib = vec![grad_scalar; input_numel];
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sum_contrib)?;
+                    // d(sum(x))/dx_i = 1: every input element accumulates the same
+                    // scalar incoming gradient. Accumulate it lazily instead of
+                    // materializing a full `vec![grad_scalar; input_numel]` constant
+                    // contribution only to read it back once — that buffer is pure
+                    // alloc+fill+read traffic on the universal `loss.backward()`
+                    // reduction. Bit-identical to the prior form: same ascending
+                    // index order, same `target[i] += grad_scalar` f64 op.
+                    // frankentorch-96e5d.
+                    Self::accumulate_tensor_gradient_with(
+                        input,
+                        &mut grads[input.0],
+                        input_numel,
+                        |_| grad_scalar,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12380,8 +12392,18 @@ impl TensorTape {
                     } else {
                         0.0
                     };
-                    let mean_contrib = vec![grad_scalar * scale; input_numel];
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &mean_contrib)?;
+                    // d(mean(x))/dx_i = 1/n: as with Sum, accumulate the constant
+                    // `grad_scalar * scale` lazily rather than materializing a full
+                    // `mean_contrib` Vec. `contrib_val` is computed once so the f64
+                    // product is bit-identical to the prior per-slot fill, then added
+                    // in the same ascending index order. frankentorch-96e5d.
+                    let contrib_val = grad_scalar * scale;
+                    Self::accumulate_tensor_gradient_with(
+                        input,
+                        &mut grads[input.0],
+                        input_numel,
+                        |_| contrib_val,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 

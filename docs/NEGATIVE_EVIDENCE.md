@@ -600,3 +600,40 @@ is explicitly satisfied.
   unchanged) + lu_solve; measuring the solve lever through inv diluted + noise-masked
   the true (null) result and produced false 1.1-1.86x signals. The pure-lu_solve A/B
   (factor once outside the timing loop) gave the correct verdict.
+
+## 2026-06-19e - frankentorch-96e5d - WIN (shipped) + root-cause: avg_pool1d 25x gauntlet gap is the GENERIC backward machinery, not the kernel
+
+- ★ ROOT-CAUSE (phase-timing probe `crates/ft-api/examples/avgpool1d_phase_timing.rs`):
+  the avg_pool1d `[8,64,8192]` f64 sum-loss train step (gauntlet kgs4.122, 25.86x
+  slower than PyTorch) spends ~75% of its time in `tensor_backward` (~70-134 ms),
+  while the RAW `avg_pool1d_{forward,backward}_f64` kernels are only ~3 ms each.
+  Control tape `sum(x).backward()` on the SAME 4M leaf (NO pooling op) = 35-53 ms —
+  i.e. the cost is the GENERIC autograd backward machinery (large fresh-buffer alloc /
+  first-touch page faults / serial bandwidth-bound copy), NOT the pooling kernel.
+  This CONFIRMS + quantifies rao3v ("backward is bandwidth/alloc-bound") and explains
+  why the kgs4.122/kgs4.126 pooling-KERNEL fast paths were correctly reverted: the
+  kernel was never the bottleneck. DO NOT re-chase pooling-kernel fast paths.
+- ★ SHIPPED LEVER (bit-exact, can't-regress): the `Sum` and `Mean` first-order backward
+  arms materialized a full `vec![grad_scalar; numel]` (resp. `*scale`) constant
+  contribution only to read it back once via `accumulate_tensor_gradient`. rao3v fixed
+  Sub/Mul/Div this way but NOT Sum/Mean. Switched both to the existing lazy
+  `accumulate_tensor_gradient_with(input, target, numel, |_| c)` — no materialized Vec.
+  Bit-identical (same arithmetic, same ascending index order). Hits EVERY
+  `loss.backward()` (loss is ~always `.sum()`/`.mean()`).
+- MEASURED, SAME-PROCESS same-worker A/B, pre-faulted reused target buffers (m=4M, 64
+  reps): OLD `vec![scalar;m]`+acc min 14941 µs vs NEW lazy acc min 1088 µs = **13.73x**
+  on the eliminated Sum-arm contribution. (The throwaway 33 MB constant Vec was almost
+  pure alloc/fill/read.) Gates: ft-autograd 476/0, conformance 199/0 + all sub-suites,
+  clippy clean, fmt clean.
+- ★ METHODOLOGY: a naive A/B that re-allocs `target` each rep showed 0.73x (looked like
+  a REGRESSION) — first-touch page faults of the fresh target swamp the arithmetic and
+  INVERT the verdict. Pre-faulting/reusing the target buffer isolates the real removed
+  work. Same family as the rao3v "false 2.03x = worker variance" trap; allocation noise
+  cuts BOTH ways. Always pre-fault reused buffers when A/B-ing alloc-bound code.
+- REJECTED (not shipped): parallelizing the pure `target[i] += c` RMW. Apparent serial→
+  rayon 2.45x (4M `+=`: 21.7→8.85 ms) is the contended-single-thread bandwidth mirage
+  (bandwidth-bound; one thread starved under peer load, rayon grabs idle channels). On
+  an uncontended baseline this is <2x. Do not ship parallel accumulate as a "win".
+- Retry condition for the real ≥2x on these lanes: a backward grad-buffer scratch/
+  caching allocator (gmuml-class) that reuses the per-backward multi-MB grad/contrib
+  buffers across iterations instead of fresh-mmap+zero+page-fault each backward.
