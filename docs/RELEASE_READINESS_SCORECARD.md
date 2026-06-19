@@ -21,6 +21,21 @@ score: `0W / 9L / 0N`. Correctness guards are green and the SDPA, MaxPool3d, Lin
 and SmoothL1 levers include real internal speedups, but no measured workload is
 performance-dominant against PyTorch yet.
 
+### 2026-06-19 root-cause — the pooling-train-step losses are the generic backward machinery (`frankentorch-96e5d`)
+
+A phase-timing probe (`crates/ft-api/examples/avgpool1d_phase_timing.rs`) shows the
+`avg_pool1d [8,64,8192]` 25.86x gap (`kgs4.122`) is ~75% in `tensor_backward`
+(~70–134 ms) while the raw pooling kernels are ~3 ms; a control `sum(x).backward()`
+on the same 4 M leaf with NO pooling op is 35–53 ms. So the gap is the generic autograd
+backward machinery (fresh multi-MB grad/contrib alloc + first-touch page faults + serial
+bandwidth-bound copy), NOT the kernel — which is why the `kgs4.122`/`kgs4.126` pooling
+KERNEL fast paths were correctly reverted. Shipped one bit-exact, can't-regress slice:
+`Sum`/`Mean` backward now accumulate the constant gradient lazily (no materialized
+`vec![scalar; numel]`); same-process same-worker A/B = `13.73x` on the eliminated
+contribution. The remaining ≥2x lever is a backward grad-buffer caching allocator
+(`frankentorch-cbe4t`). Gates: ft-autograd 476/0, conformance 199/0 + all sub-suites,
+clippy clean.
+
 ## Current Gates
 
 | Gate | Scope | Result |
