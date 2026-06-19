@@ -4668,6 +4668,23 @@ pub fn rms_norm_backward_f32(
     norm_size: usize,
     eps: f32,
 ) -> (Vec<f32>, Option<Vec<f32>>) {
+    if dy.par_iter().all(|&v| v.to_bits() == 1.0f32.to_bits())
+        && x.par_iter().all(|v| v.is_finite())
+        && weight.is_none_or(|w| w.par_iter().all(|v| v.is_finite()))
+    {
+        return rms_norm_backward_f32_unit_dy_finite(x, weight, batch, norm_size, eps);
+    }
+    rms_norm_backward_f32_generic(dy, x, weight, batch, norm_size, eps)
+}
+
+fn rms_norm_backward_f32_generic(
+    dy: &[f32],
+    x: &[f32],
+    weight: Option<&[f32]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f32,
+) -> (Vec<f32>, Option<Vec<f32>>) {
     let inv_n = 1.0f32 / norm_size as f32;
     let mut dx = vec![0.0f32; batch * norm_size];
     dx.par_chunks_mut(norm_size)
@@ -4703,6 +4720,68 @@ pub fn rms_norm_backward_f32(
             let rstd = 1.0f32 / (ss * inv_n + eps).sqrt();
             for j in 0..norm_size {
                 dw[j] += dyrow[j] * xrow[j] * rstd;
+            }
+        }
+        dw
+    });
+    (dx, dweight)
+}
+
+fn rms_norm_backward_f32_unit_dy_finite(
+    x: &[f32],
+    weight: Option<&[f32]>,
+    batch: usize,
+    norm_size: usize,
+    eps: f32,
+) -> (Vec<f32>, Option<Vec<f32>>) {
+    let inv_n = 1.0f32 / norm_size as f32;
+    let rstds: Vec<f32> = (0..batch)
+        .into_par_iter()
+        .map(|r| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let mut ss = 0.0f32;
+            for &v in xrow {
+                ss += v * v;
+            }
+            1.0f32 / (ss * inv_n + eps).sqrt()
+        })
+        .collect();
+
+    let mut dx = vec![0.0f32; batch * norm_size];
+    dx.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, dxrow)| {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let rstd = rstds[r];
+            let mut c = 0.0f32;
+            if let Some(w) = weight {
+                for j in 0..norm_size {
+                    c += w[j] * xrow[j];
+                }
+            } else {
+                for &v in xrow {
+                    c += v;
+                }
+            }
+            let coef = rstd * rstd * rstd * c * inv_n;
+            if let Some(w) = weight {
+                for j in 0..norm_size {
+                    dxrow[j] = rstd * w[j] - coef * xrow[j];
+                }
+            } else {
+                for j in 0..norm_size {
+                    dxrow[j] = rstd - coef * xrow[j];
+                }
+            }
+        });
+
+    let dweight = weight.map(|_| {
+        let mut dw = vec![0.0f32; norm_size];
+        for r in 0..batch {
+            let xrow = &x[r * norm_size..r * norm_size + norm_size];
+            let rstd = rstds[r];
+            for j in 0..norm_size {
+                dw[j] += xrow[j] * rstd;
             }
         }
         dw
@@ -36811,6 +36890,39 @@ mod tests {
         let (fast_dx, fast_dw) =
             crate::rms_norm_backward_f64(&dy, &x, Some(&weight), batch, norm_size, eps);
         let (ref_dx, ref_dw) = crate::rms_norm_backward_f64_generic(
+            &dy,
+            &x,
+            Some(&weight),
+            batch,
+            norm_size,
+            eps,
+        );
+
+        for (got, expected) in fast_dx.iter().zip(ref_dx.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits(), "dx mismatch");
+        }
+        let fast_dw = fast_dw.expect("unit-dy path should return dweight");
+        let ref_dw = ref_dw.expect("generic path should return dweight");
+        for (got, expected) in fast_dw.iter().zip(ref_dw.iter()) {
+            assert_eq!(got.to_bits(), expected.to_bits(), "dweight mismatch");
+        }
+    }
+
+    #[test]
+    fn rms_norm_f32_unit_dy_fast_path_matches_generic_reference_bits() {
+        let (batch, norm_size) = (5usize, 11usize);
+        let eps = 1e-6f32;
+        let x: Vec<f32> = (0..batch * norm_size)
+            .map(|i| ((i % 29) as f32 - 14.0) * 0.0234375 + (i as f32) * 0.00073)
+            .collect();
+        let dy = vec![1.0f32; x.len()];
+        let weight: Vec<f32> = (0..norm_size)
+            .map(|j| 0.8125 + (j % 7) as f32 * 0.0390625)
+            .collect();
+
+        let (fast_dx, fast_dw) =
+            crate::rms_norm_backward_f32(&dy, &x, Some(&weight), batch, norm_size, eps);
+        let (ref_dx, ref_dw) = crate::rms_norm_backward_f32_generic(
             &dy,
             &x,
             Some(&weight),
