@@ -9019,6 +9019,44 @@ pub fn smooth_l1_backward_f64(
     (di, dt)
 }
 
+/// Smooth-L1 backward for reduced mean/sum losses where the upstream gradient is
+/// uniform for every logical element. `dloss_per_element` already includes any
+/// mean-reduction `1 / n` scaling.
+#[must_use]
+pub fn smooth_l1_backward_reduced_f64(
+    dloss_per_element: f64,
+    x: &[f64],
+    t: &[f64],
+    beta: f64,
+) -> (Vec<f64>, Vec<f64>) {
+    assert_eq!(
+        x.len(),
+        t.len(),
+        "smooth_l1_backward_reduced_f64 requires same-length slices"
+    );
+    let mut di = vec![0.0f64; x.len()];
+    let mut dt = vec![0.0f64; x.len()];
+    di.par_iter_mut()
+        .zip(dt.par_iter_mut())
+        .enumerate()
+        .for_each(|(i, (dii, dti))| {
+            let d = x[i] - t[i];
+            let g = if d.abs() < beta {
+                d / beta
+            } else if d > 0.0 {
+                1.0
+            } else if d < 0.0 {
+                -1.0
+            } else {
+                0.0
+            };
+            let v = dloss_per_element * g;
+            *dii = v;
+            *dti = -v;
+        });
+    (di, dt)
+}
+
 /// Per-channel batch statistics for BatchNorm over `[batch, channels, spatial]`
 /// (NCHW with `spatial = H·W`): `mean[c]`, `var[c]` over all `batch·spatial`
 /// elements of channel `c`. Works directly on the NCHW layout (channel `c` is
@@ -37560,6 +37598,28 @@ mod tests {
         let t = [];
         assert_eq!(super::smooth_l1_sum_f64(&x, &t, 1.0), 0.0);
         assert!(super::smooth_l1_mean_f64(&x, &t, 1.0).is_nan());
+    }
+
+    #[test]
+    fn smooth_l1_backward_reduced_f64_matches_uniform_dloss_bits() {
+        let n = super::SUM_PARALLEL_THRESHOLD + 129;
+        let beta = 0.75;
+        let x: Vec<f64> = (0..n)
+            .map(|i| ((i % 193) as f64 - 96.0) * 0.011)
+            .collect();
+        let t: Vec<f64> = (0..n)
+            .map(|i| ((i % 157) as f64 - 78.0) * -0.007)
+            .collect();
+
+        for scale in [1.0, -0.125] {
+            let dloss = vec![scale; n];
+            let (want_di, want_dt) = super::smooth_l1_backward_f64(&dloss, &x, &t, beta);
+            let (got_di, got_dt) = super::smooth_l1_backward_reduced_f64(scale, &x, &t, beta);
+            for i in 0..n {
+                assert_eq!(got_di[i].to_bits(), want_di[i].to_bits(), "di[{i}]");
+                assert_eq!(got_dt[i].to_bits(), want_dt[i].to_bits(), "dt[{i}]");
+            }
+        }
     }
 
     #[test]
