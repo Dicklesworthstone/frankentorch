@@ -573,3 +573,30 @@ is explicitly satisfied.
   multi-session rewrite (eigh vectors are tolerance-parity per qgce4, so the GEMM
   reassociation is allowed). form-Q is ~15% of eigh and eigh is reduce-bandwidth-
   capped, so even a perfect form-Q is ~1.1-1.15x on eigh total — low priority.
+
+## 2026-06-19d - frankentorch-x53r3b - REJECTED: column-blocking the parallel multi-RHS LU solve
+
+- Hypothesis: the column-PARALLEL lu_solve (`xt.par_chunks_mut(n)`, otbok) solves each
+  RHS column independently, RE-STREAMING the n×n LU factor once per column — the exact
+  anti-pattern the SERIAL path's comment calls out ("each L coeff loaded once across
+  all RHS ... beats a per-column solve that re-streams L"). Lever: column-BLOCK (gather
+  B RHS into a contiguous [n,B] buffer, run the right-looking rhs-inner kernel = factor
+  amortized + SIMD, parallel across blocks), or a strided in-place block.
+- MEASURED, two variants, same-worker A/B (16thr):
+  - Strided in-place block via inv: looked good at n=512 (1.86x @b=32) but REGRESSED at
+    n=2048 (0.84-0.89x, all blocks) — strided block access thrashes at large n.
+  - Gather-chunk (contiguous, bit-exact right-looking kernel) via inv: b=8 1.11/1.21/
+    1.07x @n=512/1024/2048 — looked like a modest win.
+  - BUT the PURE lu_solve A/B (factor excluded, num_rhs=n, the honest measurement):
+    NO win — scattered **0.76-1.09x around 1.0** at every size/block. The inv "wins"
+    were lu_factor dilution + worker variance, NOT a real solve speedup.
+- Root cause: the per-column parallel solve already streams the factor EFFICIENTLY
+  (sequential per-column access + hardware prefetch); the factor is not the RAM-
+  bandwidth bottleneck the hypothesis assumed at n<=2048. Column-blocking's gather/
+  copy + reduced amortization benefit cancel out.
+- Verdict: REJECTED and REVERTED (lib.rs restored bit-for-bit; override + example
+  removed). Do NOT re-attempt column-blocking the LU/cholesky/triangular solves.
+- ★ METHODOLOGY LESSON: A/B the PURE op, never a composite. inv = lu_factor (O(n^3),
+  unchanged) + lu_solve; measuring the solve lever through inv diluted + noise-masked
+  the true (null) result and produced false 1.1-1.86x signals. The pure-lu_solve A/B
+  (factor once outside the timing loop) gave the correct verdict.
