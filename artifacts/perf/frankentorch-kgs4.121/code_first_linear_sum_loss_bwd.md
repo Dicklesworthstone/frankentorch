@@ -32,29 +32,31 @@ For exact all-ones `dy`, those reduce to:
 2. one `x` column-sum row repeated across `out_features`
 3. constant `dbias[o] = batch`
 
-This pass adds the exact all-ones detector in the f64 `functional_linear`
-first-order backward closure and routes that training trace to the closed-form
-helper. Non-unit `dy` falls back to the existing `ft_kernel_cpu::linear_backward_f64`.
-
-The ideal kernel-level placement is temporarily avoided because
-`crates/ft-kernel-cpu/src/lib.rs` is actively leased by `OrangeCedar` for
-`frankentorch-kgs4.120`.
+This pass adds the exact all-ones detector inside
+`ft_kernel_cpu::linear_backward_f64` and routes that training trace to the
+closed-form helper. Non-unit `dy` falls back to the existing generic GEMM path,
+so every caller keeps one public backward entry point.
 
 ## Guard
 
 Added:
 
-- `linear_backward_all_ones_dy_matches_kernel_reference`
+- `linear_backward_f64_all_ones_dy_matches_generic_reference`
 
-The guard compares the closed-form helper with the existing generic
-`linear_backward_f64` reference on a non-square shape, including `dx`,
-`dweight`, and `dbias`.
+The kernel guard compares the closed-form helper with a copied generic GEMM
+reference on a non-square shape, including `dx`, `dweight`, and `dbias`.
 
 Local verification allowed by the campaign:
 
 ```text
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a cargo check -p ft-kernel-cpu
 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a cargo check -p ft-api
 ```
+
+Verification this pass:
+
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a cargo check -p ft-kernel-cpu` passed.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a cargo check -p ft-api` passed.
 
 Criterion, conformance, tests, clippy, fmt, and rch are intentionally pending
 for the batch gate.

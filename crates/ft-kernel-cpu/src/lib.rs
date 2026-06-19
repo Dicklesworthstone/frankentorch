@@ -9478,6 +9478,53 @@ pub fn linear_tensor_f64(
     y
 }
 
+#[inline]
+fn is_exact_all_ones_f64(values: &[f64]) -> bool {
+    !values.is_empty() && values.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+}
+
+fn linear_backward_f64_all_ones_dy(
+    x: &[f64],
+    weight: &[f64],
+    batch: usize,
+    in_features: usize,
+    out_features: usize,
+    need_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let ones_out = vec![1.0f64; out_features];
+    let mut dx_row = vec![0.0f64; in_features];
+    gemm::dgemm(
+        1,
+        out_features,
+        in_features,
+        &ones_out,
+        weight,
+        &mut dx_row,
+    );
+    let mut dx = vec![0.0f64; batch * in_features];
+    if in_features != 0 {
+        dx.par_chunks_mut(in_features)
+            .for_each(|row| row.copy_from_slice(&dx_row));
+    }
+
+    let ones_batch = vec![1.0f64; batch];
+    let mut dweight_row = vec![0.0f64; in_features];
+    gemm::dgemm(1, batch, in_features, &ones_batch, x, &mut dweight_row);
+    let mut dweight = vec![0.0f64; out_features * in_features];
+    if in_features != 0 {
+        dweight
+            .par_chunks_mut(in_features)
+            .for_each(|row| row.copy_from_slice(&dweight_row));
+    }
+
+    let dbias = if need_bias {
+        Some(vec![batch as f64; out_features])
+    } else {
+        None
+    };
+    (dx, dweight, dbias)
+}
+
 /// Backward of `y = x @ weight^T + bias` (the [`linear_tensor_f64`] forward).
 ///
 /// Given `dy` (gradient of `y`, row-major `[batch, out_features]`), the saved
@@ -9500,6 +9547,17 @@ pub fn linear_backward_f64(
     out_features: usize,
     need_bias: bool,
 ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    if is_exact_all_ones_f64(dy) {
+        return linear_backward_f64_all_ones_dy(
+            x,
+            weight,
+            batch,
+            in_features,
+            out_features,
+            need_bias,
+        );
+    }
+
     // dx = dy @ weight : [batch,out] @ [out,in] -> [batch,in].
     let mut dx = vec![0.0f64; batch * in_features];
     gemm::dgemm(batch, out_features, in_features, dy, weight, &mut dx);
@@ -36939,6 +36997,79 @@ mod tests {
         for (got, expected) in fast_dw.iter().zip(ref_dw.iter()) {
             assert_eq!(got.to_bits(), expected.to_bits(), "dweight mismatch");
         }
+    }
+
+    #[test]
+    fn linear_backward_f64_all_ones_dy_matches_generic_reference() {
+        fn generic_reference(
+            dy: &[f64],
+            x: &[f64],
+            weight: &[f64],
+            batch: usize,
+            in_features: usize,
+            out_features: usize,
+            need_bias: bool,
+        ) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+            let mut dx = vec![0.0f64; batch * in_features];
+            crate::gemm::dgemm(batch, out_features, in_features, dy, weight, &mut dx);
+
+            let mut dyt = vec![0.0f64; out_features * batch];
+            for b in 0..batch {
+                let row = &dy[b * out_features..(b + 1) * out_features];
+                for (o, &v) in row.iter().enumerate() {
+                    dyt[o * batch + b] = v;
+                }
+            }
+            let mut dweight = vec![0.0f64; out_features * in_features];
+            crate::gemm::dgemm(out_features, batch, in_features, &dyt, x, &mut dweight);
+
+            let dbias = if need_bias {
+                let mut db = vec![0.0f64; out_features];
+                for b in 0..batch {
+                    let row = &dy[b * out_features..(b + 1) * out_features];
+                    for (o, &v) in row.iter().enumerate() {
+                        db[o] += v;
+                    }
+                }
+                Some(db)
+            } else {
+                None
+            };
+            (dx, dweight, dbias)
+        }
+
+        fn assert_close(name: &str, got: &[f64], expected: &[f64]) {
+            assert_eq!(got.len(), expected.len(), "{name} length mismatch");
+            for (idx, (&g, &e)) in got.iter().zip(expected.iter()).enumerate() {
+                let tol = 1e-10 + 1e-10 * e.abs();
+                assert!(
+                    (g - e).abs() <= tol,
+                    "{name}[{idx}] got {g} expected {e}"
+                );
+            }
+        }
+
+        let (batch, in_f, out_f) = (5usize, 7usize, 11usize);
+        let x: Vec<f64> = (0..batch * in_f)
+            .map(|i| ((i % 13) as f64 - 6.0) * 0.125 + (i as f64) * 1e-4)
+            .collect();
+        let weight: Vec<f64> = (0..out_f * in_f)
+            .map(|i| ((i % 17) as f64 - 8.0) * 0.0625 - (i as f64) * 2e-4)
+            .collect();
+        let dy = vec![1.0f64; batch * out_f];
+
+        let (dx, dweight, dbias) =
+            crate::linear_backward_f64(&dy, &x, &weight, batch, in_f, out_f, true);
+        let (ref_dx, ref_dweight, ref_dbias) =
+            generic_reference(&dy, &x, &weight, batch, in_f, out_f, true);
+
+        assert_close("dx", &dx, &ref_dx);
+        assert_close("dweight", &dweight, &ref_dweight);
+        assert_close(
+            "dbias",
+            dbias.as_ref().expect("fast dbias"),
+            ref_dbias.as_ref().expect("reference dbias"),
+        );
     }
 
     #[test]
