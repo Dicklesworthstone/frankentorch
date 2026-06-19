@@ -30,12 +30,12 @@ measured workload is performance-dominant against PyTorch yet.
 | Correctness | `rch exec -- cargo test -p ft-kernel-cpu max_pool1d_direct_matches_2d_h1_first_tie_forward_backward_bit_exact` | passed on `ovh-a` |
 | Formatting | `rustfmt --edition 2024 --check crates/ft-api/benches/pytorch_gauntlet_bench.rs` | passed |
 | Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool1d --noplot` | completed locally; candidate FrankenTorch median `204.02 ms`, PyTorch median `7.4798 ms`; final reverted FrankenTorch median `184.99 ms`, PyTorch median `7.1539 ms`; rerun final median `181.94 ms`, PyTorch median `7.3011 ms` |
-| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `vmi1264463` after avg_pool1d revert |
-| Compile | `rch exec -- cargo check -p ft-kernel-cpu` | passed on `vmi1293453` after avg_pool1d revert |
-| Correctness | `rch exec -- cargo test -p ft-kernel-cpu avg_pool1d_direct_matches_2d_h1_forward_backward_bit_exact -- --nocapture` | passed on `hz1` for the clean detached avg_pool1d commit tree |
-| Correctness | `rch exec -- cargo test -p ft-api functional_avg_pool1d_fused_matches_reshape_2d_forward_and_backward_bits -- --nocapture` | passed on `hz2` for the clean detached avg_pool1d commit tree |
-| Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed on `vmi1149989` after avg_pool1d revert |
-| Clippy | `rch exec -- cargo clippy -p ft-kernel-cpu -- -D warnings` | passed on `vmi1167313` after avg_pool1d revert |
+| Remote build/bench | `rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool1d --noplot` | Rust bench built and ran on `vmi1227854`; PyTorch arm failed because remote `torch` was unavailable, so this is not ratio evidence |
+| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `vmi1152480` after avg_pool1d revert |
+| Correctness | `rch exec -- cargo test -p ft-kernel-cpu avg_pool1d_direct_matches_2d_h1_forward_backward_bit_exact -- --nocapture` | passed on `ovh-a` after avg_pool1d revert |
+| Correctness | `rch exec -- cargo test -p ft-api functional_avg_pool1d_fused_matches_reshape_2d_forward_and_backward_bits -- --nocapture` | passed on `vmi1227854` after avg_pool1d revert |
+| Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed on `hz1` after avg_pool1d revert |
+| Clippy | `rch exec -- cargo clippy -p ft-kernel-cpu -- -D warnings` | passed on `vmi1264463` after avg_pool1d revert |
 | UBS | `ubs crates/ft-api/benches/pytorch_gauntlet_bench.rs crates/ft-kernel-cpu/src/lib.rs crates/ft-api/benches/pytorch_avg_pool1d_grad.py` | no critical findings; existing `ft-kernel-cpu` warning inventories remain outside this revert |
 | Formatting | `rustfmt --edition 2024 --check crates/ft-api/benches/pytorch_gauntlet_bench.rs`; `git diff --check` on changed files | passed; whole-file `ft-kernel-cpu/src/lib.rs` rustfmt check still reports pre-existing formatting drift outside this avg_pool1d revert |
 | Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- linear --noplot` | completed locally; final FrankenTorch median `22.775 ms`, PyTorch median `9.2821 ms` |
