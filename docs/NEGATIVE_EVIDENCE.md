@@ -4,6 +4,42 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-19 - frankentorch-kgs4.117 - MaxPool3d saved-index sidecar
+
+- Lever: save compact f64 max-pool3d first-argmax offsets during forward and
+  scatter backward gradients from that sidecar instead of saving the full input
+  and rescanning each 2x2x2 window during backward.
+- Workload: `gauntlet_max_pool3d_grad`, deterministic f64
+  `[N,C,D,H,W]=[2,32,16,32,32]`, kernel `2x2x2`, stride `2x2x2`,
+  forward max_pool3d, scalar `sum`, backward.
+- Reference: local PyTorch `2.12.1+cpu` in
+  `/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`, 32 compute
+  threads and 32 interop threads on `thinkstation1`.
+- Parent-before-sidecar result at `c79d3a23`: FrankenTorch median `20.585 ms`;
+  PyTorch median `2.1381 ms`; ratio vs PyTorch `9.63x` slower.
+- Current post-lint result at `7cbaf731` plus clippy-only lint fixes:
+  FrankenTorch median `15.794 ms`; PyTorch median `1.6228 ms`; ratio vs
+  PyTorch `9.73x` slower. This is a `1.30x` internal FrankenTorch speedup vs
+  the parent-before-sidecar row, but not PyTorch dominance.
+- Supplemental remote row: rch `hz2` built the bench and measured current
+  FrankenTorch at `28.124 ms`, then failed the PyTorch arm because the worker
+  did not have `torch` installed. Treat this as build/FT-only evidence, not as
+  a ratio-vs-PyTorch result.
+- Verdict: keep as a measured internal win; classify as a PyTorch-loss row for
+  release readiness. No source revert.
+- Retry condition: do not retry max_pool3d sidecar-only or rescan-only variants
+  unless a fresh profile proves saved-context memory or backward window rescans
+  still dominate after session setup, allocation churn, and tensor materializing
+  costs are separated. The next max_pool3d gap-closing pass should target the
+  end-to-end PyTorch gap, not another standalone sidecar shape tweak.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/parent_local_warm_criterion.txt`
+  - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/current_local_warm_postlint_criterion.txt`
+  - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/current_criterion.txt`
+  - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/ft_kernel_cpu_max_pool3d_sidecar_test_postlint.log`
+  - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/ft_api_max_pool3d_grad_test_postlint.log`
+  - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/ft_api_bench_clippy_postlint.log`
+
 ## 2026-06-19 - frankentorch-kgs4.121 - Linear all-ones dy kernel move
 
 - Lever: detect exact all-ones `dy` from `tensor_linear(...).sum().backward()`

@@ -6,13 +6,14 @@ Updated: 2026-06-19
 
 | Bead | Workload | Result vs PyTorch | Before/after verdict | Release action |
 |---|---:|---:|---:|---|
+| `frankentorch-kgs4.117` | max_pool3d f64 train step `[2,32,16,32,32]` | `9.73x` slower | internal keep; `20.585 ms` -> `15.794 ms`; remote PyTorch arm unavailable on `hz2` | kept; profile deeper end-to-end gap |
 | `frankentorch-kgs4.121` | linear f64 train step `[32,512] -> 2048` | `2.45x` slower | API-local internal keep; `29.606 ms` -> `22.775 ms`; kernel move `26.459 ms` rejected | kept API helper; reverted kernel move |
 | `frankentorch-kgs4.124` | SmoothL1 f64 mean-loss backward, 8M elems | `1.99x` slower | internal keep; `963.16 ms` -> `757.63 ms` on `hz2` | kept; follow-up `frankentorch-kgs4.128` |
 | `frankentorch-kgs4.126` | max_pool1d f64 train step `[8,64,8192]` | `12.31x` slower | no gain; candidate median `184.41 ms` vs parent `178.47 ms` | reverted |
 
-Score: `3/5` for the measured gauntlet lanes. Correctness guards are green and
-the Linear and SmoothL1 levers are real internal speedups, but no measured
-workload is performance-dominant against PyTorch yet.
+Score: `4/5` for the measured gauntlet lanes. Correctness guards are green and
+the MaxPool3d, Linear, and SmoothL1 levers are real internal speedups, but no
+measured workload is performance-dominant against PyTorch yet.
 
 ## Current Gates
 
@@ -30,6 +31,13 @@ workload is performance-dominant against PyTorch yet.
 | Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- linear --noplot` | completed locally; final FrankenTorch median `22.775 ms`, PyTorch median `9.2821 ms` |
 | Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `vmi1152480` after restoring the API-local linear path |
 | Correctness | `rch exec -- cargo test -p ft-api linear_backward_all_ones_dy_matches_kernel_reference -- --nocapture` | passed on `vmi1293453` |
+| Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool3d --noplot` | completed locally; current FrankenTorch median `15.794 ms`, PyTorch median `1.6228 ms` |
+| Criterion baseline | parent worktree at `c79d3a23`, same max_pool3d harness | completed locally; parent FrankenTorch median `20.585 ms`, PyTorch median `2.1381 ms` |
+| Remote build/bench | `rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool3d --noplot` | built on `hz2`; current FrankenTorch median `28.124 ms`; PyTorch arm failed because remote `torch` was unavailable |
+| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `hz2` |
+| Correctness | `rch exec -- cargo test -p ft-kernel-cpu max_pool3d_indices_scatter_matches_rescan_first_tie_bits` | passed after clippy-only lint fixes |
+| Correctness | `rch exec -- cargo test -p ft-api functional_max_pool3d_grad_matches_finite_diff` | passed after clippy-only lint fixes |
+| Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed after narrow ft-kernel-cpu clippy fixes |
 
 Known caveat: `cargo fmt --check -p ft-api` remains blocked by pre-existing
 crate-wide formatting debt in unrelated examples and long `ft-api/src/lib.rs`
@@ -48,8 +56,11 @@ The `.124` result points toward deeper SmoothL1 training overhead: tape setup,
 input/materialization cost, loss backward kernel shape, SIMD, and cache layout.
 The `.126` result points away from tiny max_pool1d backward scatter branches and
 toward larger full-step costs: autograd/session setup, allocation churn, and
-forward saved-index materialization. The `.121` result points away from moving
-the all-ones linear backward shortcut into the generic CPU kernel; the remaining
-gap is end-to-end linear training overhead, not the already-collapsed
-row-sum/copy helper alone. Future work should profile those frames before
-trying another scalar-wrapper or one-off unit-gradient branch.
+forward saved-index materialization. The `.117` result keeps compact max_pool3d
+sidecars as an internal win but leaves a roughly 10x PyTorch gap, so the next
+pooling pass needs an end-to-end profile rather than another sidecar-only tweak.
+The `.121` result points away from moving the all-ones linear backward shortcut
+into the generic CPU kernel; the remaining gap is end-to-end linear training
+overhead, not the already-collapsed row-sum/copy helper alone. Future work
+should profile those frames before trying another scalar-wrapper or one-off
+unit-gradient branch.

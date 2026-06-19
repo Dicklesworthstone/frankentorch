@@ -4,6 +4,7 @@
 //!   PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python \
 //!   CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b \
 //!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool1d
+//!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool3d
 //!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- linear
 
 use std::path::PathBuf;
@@ -19,12 +20,26 @@ const MAX_POOL1D_C: usize = 64;
 const MAX_POOL1D_L: usize = 8192;
 const MAX_POOL1D_TOTAL: usize = MAX_POOL1D_N * MAX_POOL1D_C * MAX_POOL1D_L;
 
+const MAX_POOL3D_N: usize = 2;
+const MAX_POOL3D_C: usize = 32;
+const MAX_POOL3D_D: usize = 16;
+const MAX_POOL3D_H: usize = 32;
+const MAX_POOL3D_W: usize = 32;
+const MAX_POOL3D_TOTAL: usize =
+    MAX_POOL3D_N * MAX_POOL3D_C * MAX_POOL3D_D * MAX_POOL3D_H * MAX_POOL3D_W;
+
 const LINEAR_BATCH: usize = 32;
 const LINEAR_IN_FEATURES: usize = 512;
 const LINEAR_HIDDEN: usize = 2048;
 
 fn deterministic_pool1d_values() -> Vec<f64> {
     (0..MAX_POOL1D_TOTAL)
+        .map(|idx| (idx % 251) as f64 * 0.001 - 0.12)
+        .collect()
+}
+
+fn deterministic_pool3d_values() -> Vec<f64> {
+    (0..MAX_POOL3D_TOTAL)
         .map(|idx| (idx % 251) as f64 * 0.001 - 0.12)
         .collect()
 }
@@ -41,6 +56,10 @@ fn pytorch_python() -> String {
 
 fn pytorch_max_pool1d_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/pytorch_max_pool1d_grad.py")
+}
+
+fn pytorch_max_pool3d_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/pytorch_max_pool3d_grad.py")
 }
 
 fn pytorch_linear_train_script() -> PathBuf {
@@ -70,6 +89,19 @@ fn run_pytorch_max_pool1d_grad(iterations: u64) -> Duration {
     };
 
     parse_pytorch_elapsed(output, "PyTorch max_pool1d")
+}
+
+fn run_pytorch_max_pool3d_grad(iterations: u64) -> Duration {
+    let output = match Command::new(pytorch_python())
+        .arg(pytorch_max_pool3d_script())
+        .env("FT_GAUNTLET_ITERS", iterations.to_string())
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => fail(format!("failed to launch PyTorch benchmark: {err:?}")),
+    };
+
+    parse_pytorch_elapsed(output, "PyTorch max_pool3d")
 }
 
 fn run_pytorch_linear_train(iterations: u64) -> Duration {
@@ -144,6 +176,50 @@ fn bench_max_pool1d_unit_dout(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_max_pool3d_saved_indices(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gauntlet_max_pool3d_grad");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
+
+    let values = deterministic_pool3d_values();
+    let shape = vec![
+        MAX_POOL3D_N,
+        MAX_POOL3D_C,
+        MAX_POOL3D_D,
+        MAX_POOL3D_H,
+        MAX_POOL3D_W,
+    ];
+
+    group.bench_function("frankentorch_kgs4_117", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = require(
+                session.tensor_variable(black_box(values.clone()), black_box(shape.clone()), true),
+                "failed to create FrankenTorch tensor",
+            );
+            let out = require(
+                session.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)),
+                "failed to run FrankenTorch max_pool3d",
+            );
+            let loss = require(
+                session.tensor_sum(out),
+                "failed to reduce FrankenTorch output",
+            );
+            black_box(require(
+                session.tensor_backward(loss),
+                "failed to run FrankenTorch backward",
+            ))
+        });
+    });
+
+    group.bench_function("pytorch_2_12_cpu", |b| {
+        b.iter_custom(run_pytorch_max_pool3d_grad);
+    });
+
+    group.finish();
+}
+
 fn bench_linear_train_hidden_2048(c: &mut Criterion) {
     let mut group = c.benchmark_group("gauntlet_linear_train_hidden_2048");
     group.warm_up_time(Duration::from_secs(1));
@@ -202,6 +278,7 @@ fn bench_linear_train_hidden_2048(c: &mut Criterion) {
 criterion_group!(
     benches,
     bench_max_pool1d_unit_dout,
+    bench_max_pool3d_saved_indices,
     bench_linear_train_hidden_2048
 );
 criterion_main!(benches);

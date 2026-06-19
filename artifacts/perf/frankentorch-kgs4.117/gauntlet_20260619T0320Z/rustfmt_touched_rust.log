@@ -1,0 +1,395 @@
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:4591:
+             }
+         }
+         dw
+[31m-        });
+[m[32m+    });
+[m     (dx, dweight)
+ }
+ 
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:5508:
+     let mut dweight = vec![0.0f32; out_ch * patch_width];
+     gemm::sgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+     let mut dpanel = vec![0.0f32; flat * patch_width];
+[31m-    gemm::sgemm(flat, out_ch, patch_width, &dout_flat, weight_flat, &mut dpanel);
+[m[32m+    gemm::sgemm(
+[m[32m+        flat,
+[m[32m+        out_ch,
+[m[32m+        patch_width,
+[m[32m+        &dout_flat,
+[m[32m+        weight_flat,
+[m[32m+        &mut dpanel,
+[m[32m+    );
+[m     let dpadded = conv2d_col2im_f32(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+     let dbias = if has_bias {
+         let mut db = vec![0.0f32; out_ch];
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:5948:
+     // dweight: parallel over channels (each channel's [kh,kw] accumulates over all
+     // n,oy,ox; disjoint per-channel write region).
+     let mut dweight = vec![0.0f64; channels * wsz];
+[31m-    dweight
+[m[31m-        .par_chunks_mut(wsz)
+[m[31m-        .enumerate()
+[m[31m-        .for_each(|(c, dw)| {
+[m[31m-            for n in 0..batch {
+[m[31m-                let plane = n * channels + c;
+[m[31m-                let db = &dout[plane * outplane..plane * outplane + outplane];
+[m[31m-                let pb = &padded[plane * inplane..plane * inplane + inplane];
+[m[31m-                for oy in 0..oh {
+[m[31m-                    for ox in 0..ow {
+[m[31m-                        let g = db[oy * ow + ox];
+[m[31m-                        for kr in 0..kh {
+[m[31m-                            let row = (oy * sh + kr) * pw + ox * sw;
+[m[31m-                            for kc in 0..kw {
+[m[31m-                                dw[kr * kw + kc] += g * pb[row + kc];
+[m[31m-                            }
+[m[32m+    dweight.par_chunks_mut(wsz).enumerate().for_each(|(c, dw)| {
+[m[32m+        for n in 0..batch {
+[m[32m+            let plane = n * channels + c;
+[m[32m+            let db = &dout[plane * outplane..plane * outplane + outplane];
+[m[32m+            let pb = &padded[plane * inplane..plane * inplane + inplane];
+[m[32m+            for oy in 0..oh {
+[m[32m+                for ox in 0..ow {
+[m[32m+                    let g = db[oy * ow + ox];
+[m[32m+                    for kr in 0..kh {
+[m[32m+                        let row = (oy * sh + kr) * pw + ox * sw;
+[m[32m+                        for kc in 0..kw {
+[m[32m+                            dw[kr * kw + kc] += g * pb[row + kc];
+[m                         }
+                     }
+                 }
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:5970:
+             }
+[31m-        });
+[m[32m+        }
+[m[32m+    });
+[m     // dbias: per-channel sum of dout.
+     let dbias = if has_bias {
+         let mut db = vec![0.0f64; channels];
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:6033:
+             }
+         });
+     let mut dweight = vec![0.0f32; channels * wsz];
+[31m-    dweight
+[m[31m-        .par_chunks_mut(wsz)
+[m[31m-        .enumerate()
+[m[31m-        .for_each(|(c, dw)| {
+[m[31m-            for n in 0..batch {
+[m[31m-                let plane = n * channels + c;
+[m[31m-                let db = &dout[plane * outplane..plane * outplane + outplane];
+[m[31m-                let pb = &padded[plane * inplane..plane * inplane + inplane];
+[m[31m-                for oy in 0..oh {
+[m[31m-                    for ox in 0..ow {
+[m[31m-                        let g = db[oy * ow + ox];
+[m[31m-                        for kr in 0..kh {
+[m[31m-                            let row = (oy * sh + kr) * pw + ox * sw;
+[m[31m-                            for kc in 0..kw {
+[m[31m-                                dw[kr * kw + kc] += g * pb[row + kc];
+[m[31m-                            }
+[m[32m+    dweight.par_chunks_mut(wsz).enumerate().for_each(|(c, dw)| {
+[m[32m+        for n in 0..batch {
+[m[32m+            let plane = n * channels + c;
+[m[32m+            let db = &dout[plane * outplane..plane * outplane + outplane];
+[m[32m+            let pb = &padded[plane * inplane..plane * inplane + inplane];
+[m[32m+            for oy in 0..oh {
+[m[32m+                for ox in 0..ow {
+[m[32m+                    let g = db[oy * ow + ox];
+[m[32m+                    for kr in 0..kh {
+[m[32m+                        let row = (oy * sh + kr) * pw + ox * sw;
+[m[32m+                        for kc in 0..kw {
+[m[32m+                            dw[kr * kw + kc] += g * pb[row + kc];
+[m                         }
+                     }
+                 }
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:6055:
+             }
+[31m-        });
+[m[32m+        }
+[m[32m+    });
+[m     let dbias = if has_bias {
+         let mut db = vec![0.0f32; channels];
+         db.par_iter_mut().enumerate().for_each(|(c, dbc)| {
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:6828:
+     sw: usize,
+ ) -> Vec<f64> {
+     if kd == 2 && kh == 2 && kw == 2 && sd == 2 && sh == 2 && sw == 2 {
+[31m-        return max_pool3d_backward_2x2s2_f64(
+[m[31m-            dout, input, batch, ch, id, ih, iw, od, oh, ow,
+[m[31m-        );
+[m[32m+        return max_pool3d_backward_2x2s2_f64(dout, input, batch, ch, id, ih, iw, od, oh, ow);
+[m     }
+ 
+     let mut din = vec![0.0f64; batch * ch * id * ih * iw];
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:7216:
+                     }
+                 }
+             }
+[31m-    });
+[m[32m+        });
+[m     dp
+ }
+ 
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:23615:
+         return Err(KernelError::InvalidDimension { dim, ndim });
+     }
+     let reduce_size = shape[dim];
+[31m-    let (_, inner_size, numel) =
+[m[31m-        checked_dim_loop_sizes(shape, dim, "softmax_f32 overflow")?;
+[m[32m+    let (_, inner_size, numel) = checked_dim_loop_sizes(shape, dim, "softmax_f32 overflow")?;
+[m     if numel == 0 {
+         return Ok(Vec::new());
+     }
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26161:
+         let got = super::max_pool3d_backward_f64(
+             &dout, &input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+         );
+[31m-        assert_eq!(got[0].to_bits(), dout[0].to_bits(), "first tied argmax wins");
+[m[31m-        assert_eq!(got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+[m[31m-            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>());
+[m[32m+        assert_eq!(
+[m[32m+            got[0].to_bits(),
+[m[32m+            dout[0].to_bits(),
+[m[32m+            "first tied argmax wins"
+[m[32m+        );
+[m[32m+        assert_eq!(
+[m[32m+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+[m[32m+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+[m[32m+        );
+[m     }
+ 
+     #[test]
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26401:
+         let output_len = len / 2;
+         let dout = vec![1.0f64; batch * ch * output_len];
+ 
+[31m-        let got =
+[m[31m-            super::avg_pool1d_backward_f64(&dout, batch, ch, len, kernel, output_len, stride);
+[m[32m+        let got = super::avg_pool1d_backward_f64(&dout, batch, ch, len, kernel, output_len, stride);
+[m 
+         let mut want = vec![0.0f64; batch * ch * len];
+         for plane in 0..batch * ch {
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26442:
+             .map(|i| (((i * 41 + 17) % 193) as f64 - 91.0) * 0.015625)
+             .collect();
+ 
+[31m-        let direct = super::avg_pool1d_forward_f64(
+[m[31m-            &input, batch, ch, len, kernel, output_len, stride,
+[m[31m-        );
+[m[32m+        let direct =
+[m[32m+            super::avg_pool1d_forward_f64(&input, batch, ch, len, kernel, output_len, stride);
+[m         let via_2d = super::avg_pool2d_forward_f64(
+[31m-            &input,
+[m[31m-            batch,
+[m[31m-            ch,
+[m[31m-            1,
+[m[31m-            len,
+[m[31m-            1,
+[m[31m-            kernel,
+[m[31m-            1,
+[m[31m-            output_len,
+[m[31m-            1,
+[m[31m-            stride,
+[m[31m-            0,
+[m[31m-            0,
+[m[31m-            1,
+[m[31m-            len,
+[m[31m-            true,
+[m[32m+            &input, batch, ch, 1, len, 1, kernel, 1, output_len, 1, stride, 0, 0, 1, len, true,
+[m         );
+         assert_eq!(
+             direct.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26471:
+         let dout: Vec<f64> = (0..batch * ch * output_len)
+             .map(|i| (((i * 29 + 5) % 127) as f64 - 63.0) * 0.03125)
+             .collect();
+[31m-        let direct_grad = super::avg_pool1d_backward_f64(
+[m[31m-            &dout, batch, ch, len, kernel, output_len, stride,
+[m[31m-        );
+[m[32m+        let direct_grad =
+[m[32m+            super::avg_pool1d_backward_f64(&dout, batch, ch, len, kernel, output_len, stride);
+[m         let via_2d_grad = super::avg_pool2d_backward_f64(
+[31m-            &dout,
+[m[31m-            batch,
+[m[31m-            ch,
+[m[31m-            1,
+[m[31m-            len,
+[m[31m-            1,
+[m[31m-            kernel,
+[m[31m-            1,
+[m[31m-            output_len,
+[m[31m-            1,
+[m[31m-            stride,
+[m[31m-            0,
+[m[31m-            0,
+[m[31m-            1,
+[m[31m-            len,
+[m[31m-            true,
+[m[32m+            &dout, batch, ch, 1, len, 1, kernel, 1, output_len, 1, stride, 0, 0, 1, len, true,
+[m         );
+         assert_eq!(
+             direct_grad.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26502:
+             digest ^= bits;
+             digest = digest.wrapping_mul(0x100000001b3);
+         }
+[31m-        assert_eq!(digest, 0xfe6d6e661bd9cb67, "avg_pool1d direct golden digest");
+[m[32m+        assert_eq!(
+[m[32m+            digest, 0xfe6d6e661bd9cb67,
+[m[32m+            "avg_pool1d direct golden digest"
+[m[32m+        );
+[m     }
+ 
+     #[test]
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26779:
+         let (n, c, ph, pw, kh, kw, sh, sw) = (2usize, 3, 9, 11, 3, 2, 2, 2);
+         let oh = (ph - kh) / sh + 1;
+         let ow = (pw - kw) / sw + 1;
+[31m-        let padded: Vec<f64> = (0..n * c * ph * pw).map(|i| (i % 877) as f64 * 0.02 - 6.0).collect();
+[m[31m-        let weight: Vec<f64> = (0..c * kh * kw).map(|i| (i % 47) as f64 * 0.1 - 2.0).collect();
+[m[31m-        let dout: Vec<f64> = (0..n * c * oh * ow).map(|i| (i % 53) as f64 * 0.05 - 1.3).collect();
+[m[32m+        let padded: Vec<f64> = (0..n * c * ph * pw)
+[m[32m+            .map(|i| (i % 877) as f64 * 0.02 - 6.0)
+[m[32m+            .collect();
+[m[32m+        let weight: Vec<f64> = (0..c * kh * kw)
+[m[32m+            .map(|i| (i % 47) as f64 * 0.1 - 2.0)
+[m[32m+            .collect();
+[m[32m+        let dout: Vec<f64> = (0..n * c * oh * ow)
+[m[32m+            .map(|i| (i % 53) as f64 * 0.05 - 1.3)
+[m[32m+            .collect();
+[m         let (dpadded, dweight, dbias) = super::depthwise_conv2d_backward_f64(
+             &dout, &padded, &weight, n, c, ph, pw, kh, kw, oh, ow, sh, sw, true,
+         );
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:26832:
+         let padded: Vec<f64> = (0..n * c * ih * iw)
+             .map(|i| (i % 977) as f64 * 0.03 - 7.0)
+             .collect();
+[31m-        let weight: Vec<f64> = (0..c * kh * kw).map(|i| (i % 51) as f64 * 0.1 - 2.0).collect();
+[m[32m+        let weight: Vec<f64> = (0..c * kh * kw)
+[m[32m+            .map(|i| (i % 51) as f64 * 0.1 - 2.0)
+[m[32m+            .collect();
+[m         let bias: Vec<f64> = (0..c).map(|i| i as f64 * 0.5 - 1.0).collect();
+         let got = super::depthwise_conv2d_forward_f64(
+             &padded,
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:30682:
+         }
+ 
+         let soft64 = softmax_dim_tensor_contiguous_f64(&data64, &meta64, dim).unwrap();
+[31m-        let soft64_shift =
+[m[31m-            softmax_dim_tensor_contiguous_f64(&shifted64, &meta64, dim).unwrap();
+[m[32m+        let soft64_shift = softmax_dim_tensor_contiguous_f64(&shifted64, &meta64, dim).unwrap();
+[m         let log64 = log_softmax_dim_tensor_contiguous_f64(&data64, &meta64, dim).unwrap();
+[31m-        let log64_shift =
+[m[31m-            log_softmax_dim_tensor_contiguous_f64(&shifted64, &meta64, dim).unwrap();
+[m[32m+        let log64_shift = log_softmax_dim_tensor_contiguous_f64(&shifted64, &meta64, dim).unwrap();
+[m 
+         let soft32 = super::softmax_dim_tensor_contiguous_f32(&data32, &meta32, dim).unwrap();
+         let soft32_shift =
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:32089:
+             let want = serial_norm(&data, &shape, p, 1);
+             assert_eq!(got.len(), want.len());
+             for i in 0..got.len() {
+[31m-                assert_eq!(got[i].to_bits(), want[i].to_bits(), "norm_dim p={p} idx={i}");
+[m[32m+                assert_eq!(
+[m[32m+                    got[i].to_bits(),
+[m[32m+                    want[i].to_bits(),
+[m[32m+                    "norm_dim p={p} idx={i}"
+[m[32m+                );
+[m             }
+         }
+         // f32 twin, same shape/p.
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:32111:
+             }
+         }
+         for i in 0..gotf.len() {
+[31m-            assert_eq!(gotf[i].to_bits(), wantf[i].to_bits(), "norm_dim_f32 idx={i}");
+[m[32m+            assert_eq!(
+[m[32m+                gotf[i].to_bits(),
+[m[32m+                wantf[i].to_bits(),
+[m[32m+                "norm_dim_f32 idx={i}"
+[m[32m+            );
+[m         }
+     }
+ 
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:32162:
+         // (b) general strided path: [64, 32, 64], dim=1 (inner_size==64 > 1).
+         let shape_b = vec![64usize, 32, 64];
+         let nb: usize = shape_b.iter().product(); // 131072 > PARALLEL_THRESHOLD
+[31m-        let db: Vec<f32> = (0..nb).map(|i| ((i % 7001) as f32) * 0.0013 - 3.0).collect();
+[m[32m+        let db: Vec<f32> = (0..nb)
+[m[32m+            .map(|i| ((i % 7001) as f32) * 0.0013 - 3.0)
+[m[32m+            .collect();
+[m         let meta_b = TensorMeta::from_shape(shape_b.clone(), DType::F32, Device::Cpu);
+         let got_b = super::softmax_dim_tensor_contiguous_f32(&db, &meta_b, 1).unwrap();
+         let want_b = serial_softmax(&db, &shape_b, 1);
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:36969:
+             }
+         }
+ 
+[31m-        let (dx, dw, db) = crate::layer_norm_backward_f64(
+[m[31m-            &dy, &x, &weight, batch, norm_size, eps,
+[m[31m-        );
+[m[32m+        let (dx, dw, db) = crate::layer_norm_backward_f64(&dy, &x, &weight, batch, norm_size, eps);
+[m         for (got, expected) in dx.iter().zip(ref_dx.iter()) {
+             assert_eq!(got.to_bits(), expected.to_bits(), "dx mismatch");
+         }
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:37032:
+                 }
+             }
+ 
+[31m-            let (dx, dw, db) = crate::layer_norm_backward_f32(
+[m[31m-                &dy, &x, &weight, batch, norm_size, eps,
+[m[31m-            );
+[m[32m+            let (dx, dw, db) =
+[m[32m+                crate::layer_norm_backward_f32(&dy, &x, &weight, batch, norm_size, eps);
+[m             for (got, expected) in dx.iter().zip(ref_dx.iter()) {
+                 assert_eq!(
+                     got.to_bits(),
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:37073:
+ 
+         let (fast_dx, fast_dw) =
+             crate::rms_norm_backward_f64(&dy, &x, Some(&weight), batch, norm_size, eps);
+[31m-        let (ref_dx, ref_dw) = crate::rms_norm_backward_f64_generic(
+[m[31m-            &dy,
+[m[31m-            &x,
+[m[31m-            Some(&weight),
+[m[31m-            batch,
+[m[31m-            norm_size,
+[m[31m-            eps,
+[m[31m-        );
+[m[32m+        let (ref_dx, ref_dw) =
+[m[32m+            crate::rms_norm_backward_f64_generic(&dy, &x, Some(&weight), batch, norm_size, eps);
+[m 
+         for (got, expected) in fast_dx.iter().zip(ref_dx.iter()) {
+             assert_eq!(got.to_bits(), expected.to_bits(), "dx mismatch");
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:37106:
+ 
+         let (fast_dx, fast_dw) =
+             crate::rms_norm_backward_f32(&dy, &x, Some(&weight), batch, norm_size, eps);
+[31m-        let (ref_dx, ref_dw) = crate::rms_norm_backward_f32_generic(
+[m[31m-            &dy,
+[m[31m-            &x,
+[m[31m-            Some(&weight),
+[m[31m-            batch,
+[m[31m-            norm_size,
+[m[31m-            eps,
+[m[31m-        );
+[m[32m+        let (ref_dx, ref_dw) =
+[m[32m+            crate::rms_norm_backward_f32_generic(&dy, &x, Some(&weight), batch, norm_size, eps);
+[m 
+         for (got, expected) in fast_dx.iter().zip(ref_dx.iter()) {
+             assert_eq!(got.to_bits(), expected.to_bits(), "dx mismatch");
+Diff in /data/projects/frankentorch/crates/ft-kernel-cpu/src/lib.rs:37619:
+     fn smooth_l1_backward_reduced_f64_matches_uniform_dloss_bits() {
+         let n = super::SUM_PARALLEL_THRESHOLD + 129;
+         let beta = 0.75;
+[31m-        let x: Vec<f64> = (0..n)
+[m[31m-            .map(|i| ((i % 193) as f64 - 96.0) * 0.011)
+[m[31m-            .collect();
+[m[31m-        let t: Vec<f64> = (0..n)
+[m[31m-            .map(|i| ((i % 157) as f64 - 78.0) * -0.007)
+[m[31m-            .collect();
+[m[32m+        let x: Vec<f64> = (0..n).map(|i| ((i % 193) as f64 - 96.0) * 0.011).collect();
+[m[32m+        let t: Vec<f64> = (0..n).map(|i| ((i % 157) as f64 - 78.0) * -0.007).collect();
+[m 
+         for scale in [1.0, -0.125] {
+             let dloss = vec![scale; n];

@@ -2,7 +2,10 @@
 
 Agent: IvoryDeer / cod-b
 Date: 2026-06-19
-Status: in_progress, code-first batch-test pending
+Status: measured keep vs parent; PyTorch-loss row for release readiness
+
+Note: the original commit used `frankentorch-kgs4.127` in its subject while the
+live Beads entry for this max_pool3d lane is `frankentorch-kgs4.117`.
 
 ## Workload Trigger
 
@@ -51,7 +54,7 @@ bit-for-bit against the existing `max_pool3d_backward_f64` rescan path.
 
 | Attempt | Evidence | Decision |
 | --- | --- | --- |
-| MaxPool3d 2x2x2 stride2 unrolled rescan | `artifacts/perf/frankentorch-kgs4.117/code_first_max_pool3d_2x2x2s2_bwd.md`; code-first pending. | Do not repeat unroll-only work; this pass removes the rescan/input save. |
+| MaxPool3d 2x2x2 stride2 unrolled rescan | `artifacts/perf/frankentorch-kgs4.117/code_first_max_pool3d_2x2x2s2_bwd.md`; superseded by this sidecar measurement. | Do not repeat unroll-only work; this pass removes the rescan/input save. |
 | MaxPool2d borrowed-input tape plumbing | `artifacts/perf/frankentorch-pool2d-borrowed-max/report.md`; same-worker median regressed `99.832 ms -> 108.28 ms`. | Do not retry borrowed-input-only pool plumbing. |
 | MaxPool1d direct saved-index route | `artifacts/perf/frankentorch-kgs4.109/closeout_direct_max_pool1d_keep.md`; kept. | Positive adjacent sidecar evidence; this pass extends the sidecar pattern to 3-D. |
 
@@ -61,12 +64,28 @@ window rescans still dominate.
 
 ## Verification
 
-Required local-only gate:
+Measured under `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/`.
+
+- Parent-before-sidecar `c79d3a23`, local Criterion:
+  FrankenTorch median `20.585 ms`; PyTorch median `2.1381 ms`; ratio
+  `9.63x` slower than PyTorch.
+- Current post-lint tree, local Criterion:
+  FrankenTorch median `15.794 ms`; PyTorch median `1.6228 ms`; ratio
+  `9.73x` slower than PyTorch.
+- Internal verdict: keep; `1.30x` speedup vs parent on the same deterministic
+  workload.
+- Release verdict: PyTorch-loss row; not performance-dominant against the
+  original.
+- rch row: current FrankenTorch median `28.124 ms` on `hz2`; the PyTorch arm
+  failed there because `torch` was not installed on the remote worker.
+
+Post-measure gates:
 
 ```bash
-CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b cargo check -p ft-api
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo test -p ft-kernel-cpu max_pool3d_indices_scatter_matches_rescan_first_tie_bits
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo test -p ft-api functional_max_pool3d_grad_matches_finite_diff
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings
 ```
 
-Result: PASS on 2026-06-19.
-
-Not run by instruction: tests, rch, clippy, fmt, Criterion/conformance batch.
+Result: PASS on 2026-06-19 after clippy-only lint fixes in `ft-kernel-cpu`.
