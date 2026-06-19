@@ -34,5 +34,9 @@ harness = false
 name = "cdist_bench"
 harness = false
 
+[[bench]]
+name = "pytorch_gauntlet_bench"
+harness = false
+
 [lints]
 workspace = true

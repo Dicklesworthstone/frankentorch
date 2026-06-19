@@ -2,7 +2,21 @@
 
 Agent: IvoryDeer / cod-b
 Date: 2026-06-19
-Status: in_progress, code-first batch-test pending
+Status: superseded by measured gauntlet reject
+
+## Gauntlet Verdict
+
+Measured on 2026-06-19 and reverted.
+
+- Candidate median: `184.41 ms`
+- Parent-before-lever median: `178.47 ms`
+- PyTorch median in candidate run: `14.984 ms`
+- Ratio vs PyTorch: `12.31x` slower
+- Verdict: no statistically significant full-workload gain; point estimate was
+  `1.033x` slower than parent.
+
+See `artifacts/perf/frankentorch-kgs4.126/gauntlet_20260619T0113Z/summary.md`
+and `docs/NEGATIVE_EVIDENCE.md`.
 
 ## Workload Trigger
 

@@ -1,0 +1,156 @@
+diff --git a/crates/ft-api/benches/pytorch_gauntlet_bench.rs b/crates/ft-api/benches/pytorch_gauntlet_bench.rs
+new file mode 100644
+index 00000000..59e780c4
+--- /dev/null
++++ b/crates/ft-api/benches/pytorch_gauntlet_bench.rs
+@@ -0,0 +1,116 @@
++//! Targeted PyTorch-vs-FrankenTorch gauntlet benches.
++//!
++//! Run with an interpreter that has CPU PyTorch installed:
++//!   PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python \
++//!   CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b \
++//!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool1d
++
++use std::path::PathBuf;
++use std::process::{Command, exit};
++use std::time::Duration;
++
++use criterion::{Criterion, black_box, criterion_group, criterion_main};
++use ft_api::FrankenTorchSession;
++use ft_core::ExecutionMode;
++
++const MAX_POOL1D_N: usize = 8;
++const MAX_POOL1D_C: usize = 64;
++const MAX_POOL1D_L: usize = 8192;
++const MAX_POOL1D_TOTAL: usize = MAX_POOL1D_N * MAX_POOL1D_C * MAX_POOL1D_L;
++
++fn deterministic_pool_values() -> Vec<f64> {
++    (0..MAX_POOL1D_TOTAL)
++        .map(|idx| (idx % 251) as f64 * 0.001 - 0.12)
++        .collect()
++}
++
++fn pytorch_python() -> String {
++    std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string())
++}
++
++fn pytorch_script() -> PathBuf {
++    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/pytorch_max_pool1d_grad.py")
++}
++
++fn fail(message: String) -> ! {
++    eprintln!("{message}");
++    exit(1);
++}
++
++fn require<T, E: std::fmt::Debug>(result: Result<T, E>, context: &str) -> T {
++    match result {
++        Ok(value) => value,
++        Err(err) => fail(format!("{context}: {err:?}")),
++    }
++}
++
++fn run_pytorch_max_pool1d_grad(iterations: u64) -> Duration {
++    let output = match Command::new(pytorch_python())
++        .arg(pytorch_script())
++        .env("FT_GAUNTLET_ITERS", iterations.to_string())
++        .output()
++    {
++        Ok(output) => output,
++        Err(err) => fail(format!("failed to launch PyTorch benchmark: {err:?}")),
++    };
++
++    if !output.status.success() {
++        fail(format!(
++            "PyTorch benchmark failed with status {:?}\nstdout:\n{}\nstderr:\n{}",
++            output.status.code(),
++            String::from_utf8_lossy(&output.stdout),
++            String::from_utf8_lossy(&output.stderr)
++        ));
++    }
++
++    let stdout = require(
++        String::from_utf8(output.stdout),
++        "PyTorch benchmark emitted non-UTF8 stdout",
++    );
++    let seconds: f64 = require(
++        stdout.trim().parse(),
++        &format!("failed to parse PyTorch elapsed seconds `{stdout}`"),
++    );
++    Duration::from_secs_f64(seconds)
++}
++
++fn bench_max_pool1d_unit_dout(c: &mut Criterion) {
++    let mut group = c.benchmark_group("gauntlet_max_pool1d_grad");
++    group.warm_up_time(Duration::from_secs(1));
++    group.measurement_time(Duration::from_secs(3));
++    group.sample_size(10);
++
++    let values = deterministic_pool_values();
++    let shape = vec![MAX_POOL1D_N, MAX_POOL1D_C, MAX_POOL1D_L];
++
++    group.bench_function("frankentorch_kgs4_126", |b| {
++        b.iter(|| {
++            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
++            let x = require(
++                session.tensor_variable(black_box(values.clone()), black_box(shape.clone()), true),
++                "failed to create FrankenTorch tensor",
++            );
++            let out = require(
++                session.functional_max_pool1d(x, 2, 2),
++                "failed to run FrankenTorch max_pool1d",
++            );
++            let loss = require(
++                session.tensor_sum(out),
++                "failed to reduce FrankenTorch output",
++            );
++            black_box(require(
++                session.tensor_backward(loss),
++                "failed to run FrankenTorch backward",
++            ))
++        });
++    });
++
++    group.bench_function("pytorch_2_12_cpu", |b| {
++        b.iter_custom(run_pytorch_max_pool1d_grad);
++    });
++
++    group.finish();
++}
++
++criterion_group!(benches, bench_max_pool1d_unit_dout);
++criterion_main!(benches);
+diff --git a/crates/ft-api/benches/pytorch_max_pool1d_grad.py b/crates/ft-api/benches/pytorch_max_pool1d_grad.py
+new file mode 100644
+index 00000000..ce76b031
+--- /dev/null
++++ b/crates/ft-api/benches/pytorch_max_pool1d_grad.py
+@@ -0,0 +1,28 @@
++import os
++import time
++
++import torch
++import torch.nn.functional as F
++
++
++def main() -> None:
++    iters = int(os.environ["FT_GAUNTLET_ITERS"])
++    shape = (8, 64, 8192)
++    total = shape[0] * shape[1] * shape[2]
++    base = torch.arange(total, dtype=torch.float64).reshape(shape)
++    base = torch.remainder(base, 251).mul_(0.001).sub_(0.12)
++
++    start = time.perf_counter()
++    checksum = 0.0
++    for _ in range(iters):
++        x = base.detach().clone().requires_grad_(True)
++        out = F.max_pool1d(x, kernel_size=2, stride=2)
++        out.sum().backward()
++        checksum += float(x.grad.reshape(-1)[0])
++    elapsed = time.perf_counter() - start
++    print(f"{elapsed:.12f}")
++    print(f"checksum={checksum:.12f}", file=os.sys.stderr)
++
++
++if __name__ == "__main__":
++    main()

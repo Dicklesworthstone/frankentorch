@@ -1,0 +1,27 @@
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-kgs4-126-baseline-20260619T0115Z/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-kgs4-126-baseline-20260619T0115Z/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-kgs4-126-baseline-20260619T0115Z/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-kgs4-126-baseline-20260619T0115Z/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-kgs4-126-baseline-20260619T0115Z/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-kgs4-126-baseline-20260619T0115Z/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 52.00s
+     Running benches/pytorch_gauntlet_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/pytorch_gauntlet_bench-5f2ebc2fd9ddf042)
+Gnuplot not found, using plotters backend
+Benchmarking gauntlet_max_pool1d_grad/frankentorch_kgs4_126
+Benchmarking gauntlet_max_pool1d_grad/frankentorch_kgs4_126: Warming up for 1.0000 s
+Benchmarking gauntlet_max_pool1d_grad/frankentorch_kgs4_126: Collecting 10 samples in estimated 3.8352 s (20 iterations)
+Benchmarking gauntlet_max_pool1d_grad/frankentorch_kgs4_126: Analyzing
+gauntlet_max_pool1d_grad/frankentorch_kgs4_126
+                        time:   [173.95 ms 178.47 ms 182.74 ms]
+                        change: [-6.7456% -3.2225% +0.3865%] (p = 0.12 > 0.05)
+                        No change in performance detected.
+Benchmarking gauntlet_max_pool1d_grad/pytorch_2_12_cpu
+Benchmarking gauntlet_max_pool1d_grad/pytorch_2_12_cpu: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 13.4s.
+Benchmarking gauntlet_max_pool1d_grad/pytorch_2_12_cpu: Collecting 10 samples in estimated 13.447 s (10 iterations)
+Benchmarking gauntlet_max_pool1d_grad/pytorch_2_12_cpu: Analyzing
+gauntlet_max_pool1d_grad/pytorch_2_12_cpu
+                        time:   [14.290 ms 16.199 ms 18.250 ms]
+                        change: [-8.9426% +8.1070% +28.151%] (p = 0.42 > 0.05)
+                        No change in performance detected.
