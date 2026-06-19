@@ -8,6 +8,7 @@
 //!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool1d
 //!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool3d
 //!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- linear
+//!   cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa
 
 use std::path::PathBuf;
 use std::process::{Command, exit};
@@ -39,6 +40,11 @@ const MAX_POOL3D_TOTAL: usize =
 const LINEAR_BATCH: usize = 32;
 const LINEAR_IN_FEATURES: usize = 512;
 const LINEAR_HIDDEN: usize = 2048;
+
+const SDPA_BH: usize = 16;
+const SDPA_SEQ: usize = 512;
+const SDPA_D: usize = 64;
+const SDPA_TOTAL: usize = SDPA_BH * SDPA_SEQ * SDPA_D;
 
 fn deterministic_pool1d_values() -> Vec<f64> {
     (0..MAX_POOL1D_TOTAL)
@@ -86,6 +92,10 @@ fn pytorch_max_pool3d_script() -> PathBuf {
 
 fn pytorch_linear_train_script() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/pytorch_linear_train.py")
+}
+
+fn pytorch_sdpa_grad_script() -> PathBuf {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("benches/pytorch_sdpa_grad.py")
 }
 
 fn fail(message: String) -> ! {
@@ -163,6 +173,19 @@ fn run_pytorch_linear_train(iterations: u64) -> Duration {
     };
 
     parse_pytorch_elapsed(output, "PyTorch linear")
+}
+
+fn run_pytorch_sdpa_grad(iterations: u64) -> Duration {
+    let output = match Command::new(pytorch_python())
+        .arg(pytorch_sdpa_grad_script())
+        .env("FT_GAUNTLET_ITERS", iterations.to_string())
+        .output()
+    {
+        Ok(output) => output,
+        Err(err) => fail(format!("failed to launch PyTorch benchmark: {err:?}")),
+    };
+
+    parse_pytorch_elapsed(output, "PyTorch SDPA")
 }
 
 fn parse_pytorch_elapsed(output: std::process::Output, label: &str) -> Duration {
@@ -559,6 +582,54 @@ fn bench_linear_train_hidden_2048(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_sdpa_grad_16x512x64(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gauntlet_sdpa_grad_16x512x64");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
+
+    let q_values = deterministic_values(SDPA_TOTAL, 0.0);
+    let k_values = deterministic_values(SDPA_TOTAL, 1.0);
+    let v_values = deterministic_values(SDPA_TOTAL, 2.0);
+    let shape = vec![SDPA_BH, SDPA_SEQ, SDPA_D];
+
+    group.bench_function("frankentorch_kgs4_113", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let q = require(
+                session.tensor_variable(black_box(q_values.clone()), shape.clone(), true),
+                "failed to create FrankenTorch SDPA query",
+            );
+            let k = require(
+                session.tensor_variable(black_box(k_values.clone()), shape.clone(), true),
+                "failed to create FrankenTorch SDPA key",
+            );
+            let v = require(
+                session.tensor_variable(black_box(v_values.clone()), shape.clone(), true),
+                "failed to create FrankenTorch SDPA value",
+            );
+            let out = require(
+                session.scaled_dot_product_attention(q, k, v, None, 0.0, false),
+                "failed to run FrankenTorch SDPA",
+            );
+            let loss = require(
+                session.tensor_sum(out),
+                "failed to reduce FrankenTorch SDPA",
+            );
+            black_box(require(
+                session.tensor_backward(loss),
+                "failed to run FrankenTorch SDPA backward",
+            ))
+        });
+    });
+
+    group.bench_function("pytorch_2_12_cpu", |b| {
+        b.iter_custom(run_pytorch_sdpa_grad);
+    });
+
+    group.finish();
+}
+
 criterion_group!(
     benches,
     bench_avg_pool1d_unit_dy,
@@ -566,6 +637,7 @@ criterion_group!(
     bench_max_pool1d_unit_dout,
     bench_max_pool3d_saved_indices,
     bench_max_pool3d_stage_probe,
-    bench_linear_train_hidden_2048
+    bench_linear_train_hidden_2048,
+    bench_sdpa_grad_16x512x64
 );
 criterion_main!(benches);

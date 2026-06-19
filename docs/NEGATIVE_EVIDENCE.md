@@ -4,6 +4,43 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-19 - frankentorch-kgs4.113 - SDPA backward scaled GEMM alpha keep with PyTorch loss
+
+- Lever: fold SDPA backward's final `scale` multiply for `dQ` and `dK` into
+  f64/f32 GEMM alpha variants (`dgemm_scaled`, `dgemm_tb_scaled`,
+  `sgemm_scaled`, `sgemm_tb_scaled`) instead of streaming over the full
+  `dQ`/`dK` buffers after GEMM.
+- Workload: `ops_bench` `sdpa/grad_16x512x64`, f64
+  `[BH,S,D]=[16,512,64]`, default `1/sqrt(D)` scale, scalar `sum`, backward.
+- Same-worker rch A/B on `vmi1227854`: scaled-alpha current median
+  `82.730 ms`; temporary old post-scale variant median `114.40 ms`; new/old
+  latency ratio `0.723x`, or `1.38x` faster. Old post-scale regressed by
+  Criterion `[+21.885% +37.179% +55.712%]`, `p=0.00`; rejected and restored to
+  scaled alpha.
+- PyTorch head-to-head: local diagnostic gauntlet with PyTorch `2.12.0+cpu` in
+  `/tmp/torchvenv/bin/python`; FrankenTorch median `63.057 ms`, PyTorch median
+  `48.915 ms`; ratio vs PyTorch `1.29x` slower.
+- Remote PyTorch caveat: pinned rch gauntlet on `vmi1227854` built and ran the
+  FrankenTorch arm at median `53.254 ms`, then failed the PyTorch arm with
+  `ModuleNotFoundError: No module named 'torch'`. Treat remote rows as
+  FrankenTorch build/bench evidence only, not PyTorch ratio proof.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N`.
+- Verdict: keep the scaled GEMM-alpha SDPA backward path as a measured internal
+  win; classify as a PyTorch-loss row for release readiness. No source revert.
+- Retry condition: do not retry the old post-GEMM scale-stream shape. The next
+  SDPA pass should target the remaining gap with deeper levers: cache-blocked
+  softmax/GEMM scheduling, packed/reused Q/K panels proven on the whole
+  training row, f32-native training ratio work, arena/tape allocation removal,
+  or a fused loss/backward primitive.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/SCORECARD.md`
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/NEGATIVE_EVIDENCE_LEDGER.md`
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/current_ops_sdpa_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/post_scale_ops_sdpa_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/gauntlet_sdpa_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/local_gauntlet_sdpa_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/remote_python_torch_probe.log`
+
 ## 2026-06-19 - frankentorch-kgs4.112 - AvgPool2d 2x2s2 backward verify and assignment reject
 
 - Lever under verification: existing code-first f64 `avg_pool2d_backward_f64`

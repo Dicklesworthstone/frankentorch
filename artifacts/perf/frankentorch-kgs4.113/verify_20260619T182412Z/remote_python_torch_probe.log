@@ -1,0 +1,4 @@
+  [2m2026-06-19T18:29:24.005176Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: python3 -c 'import sys; print(sys.executable); import torch; print(torch.__version__)'[0m
+    [2;3mat[0m rch/src/hook.rs:702 [2;3mon[0m ThreadId(1)
+
+[RCH] remote required; refusing local fallback [RCH-E301] (non-compilation command)

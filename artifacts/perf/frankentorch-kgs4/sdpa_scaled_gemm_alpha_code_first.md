@@ -2,7 +2,7 @@
 
 Date: 2026-06-18
 Agent: IvoryDeer / cod-b
-Status: code-first, batch-test pending
+Status: measured keep on 2026-06-19
 Bead: frankentorch-kgs4.113
 
 ## Lever
@@ -37,15 +37,14 @@ contract without turning the batch suite into another benchmark.
 | Per-call packed f64 `dgemm_bt` panel | `artifacts/perf/frankentorch-kgs4-next/kgs4_53_packed_bt_panel_rejected.md` | Same-worker regressions / mixed results. | Rejected; do not retry per-call BT packing. |
 | Per-call packed f32 `sgemm_bt` panel | `artifacts/perf/frankentorch-nfvtp/rejected_sgemm_bt_packed_panel.md` | Regressed f32 linear BT shapes. | Rejected; do not retry per-call BT packing. |
 | Persistent linear weight cache | `artifacts/perf/frankentorch-kgs4.56/rejected_persistent_linear_weight_cache.md` | Existing rejection artifact. | Rejected; do not route SDPA through persistent weight cache. |
-| SDPA dQ/dK GEMM alpha scaling | `frankentorch-kgs4.113` | Local cargo check only by instruction; Criterion/conformance batch pending. | Pending measurement; revert if SDPA grad or conformance regresses. |
+| SDPA dQ/dK GEMM alpha scaling | `frankentorch-kgs4.113` | Follow-up evidence in `artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/`: same-worker rch `vmi1227854` current scaled-alpha median `82.730 ms` vs temporary old post-scale median `114.40 ms` (`0.723x` latency, `1.38x` faster). Local PyTorch diagnostic ratio remains a loss: FrankenTorch `63.057 ms` vs PyTorch `48.915 ms` (`1.29x` slower). | Measured keep internally; PyTorch-loss row for release readiness. |
 
-## Required batch follow-up
+## Batch follow-up
 
-When batch tests are allowed, run the focused SDPA grad criterion before and
-after on the same worker and preserve:
+Completed 2026-06-19 in
+`artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/`.
 
-- `sdpa/grad_16x512x64` f64/f32 deltas if available.
-- `cargo test -p ft-kernel-cpu scaled_gemm_matches_post_scale_reference`.
-- Any SDPA conformance/golden guard that covers backward outputs.
-
-No performance win is claimed until those measurements land.
+Remote PyTorch caveat: rch built and ran the FrankenTorch gauntlet arm on
+`vmi1227854`, but the PyTorch subprocess failed because that worker did not
+have `torch` installed. The local PyTorch ratio is diagnostic; the same-worker
+Rust A/B is the keep proof.

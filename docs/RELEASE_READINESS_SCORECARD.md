@@ -6,6 +6,7 @@ Updated: 2026-06-19
 
 | Bead | Workload | Result vs PyTorch | Before/after verdict | Release action |
 |---|---:|---:|---:|---|
+| `frankentorch-kgs4.113` | SDPA f64 train step `[16,512,64]` | `1.29x` slower | internal keep; same-worker rch `114.40 ms` old post-scale -> `82.730 ms` scaled alpha | kept; route remaining gap to SDPA scheduling/allocation/fusion |
 | `frankentorch-kgs4.112` | avg_pool2d f64 train step `[8,64,64,64]` | `4.54x` slower | existing 2x2s2 fast path verified; direct-assignment candidate `58.600 ms` -> `68.624 ms` rejected | keep gauntlet harness/evidence; product source unchanged |
 | `frankentorch-kgs4.117` | max_pool3d f64 train step `[2,32,16,32,32]` | `9.73x` slower | internal keep; `20.585 ms` -> `15.794 ms`; remote PyTorch arm unavailable on `hz2` | kept; profile deeper end-to-end gap |
 | `frankentorch-kgs4.121` | linear f64 train step `[32,512] -> 2048` | `2.45x` slower | API-local internal keep; `29.606 ms` -> `22.775 ms`; kernel move `26.459 ms` rejected | kept API helper; reverted kernel move |
@@ -15,8 +16,8 @@ Updated: 2026-06-19
 | `frankentorch-kgs4.127` | SmoothL1 f64 one-sided input grad, 8M elems | `1.79x` slower | internal keep; same-host local `746.26 ms` -> `647.44 ms` | kept; route remaining gap to tape/allocation/SIMD |
 | `frankentorch-kgs4.128` | max_pool3d f64 train step `[2,32,16,32,32]` | `9.38x` slower clean baseline | no gain; borrowed-input median `22.764 ms`, unit-dout median `16.160 ms`, sequential unit-dout median `22.465 ms` | reverted product candidates; keep stage probe |
 
-Measured-discipline score: `8/8` for the gauntlet lanes. PyTorch head-to-head
-score: `0W / 8L / 0N`. Correctness guards are green and the MaxPool3d, Linear,
+Measured-discipline score: `9/9` for the gauntlet lanes. PyTorch head-to-head
+score: `0W / 9L / 0N`. Correctness guards are green and the SDPA, MaxPool3d, Linear,
 and SmoothL1 levers include real internal speedups, but no measured workload is
 performance-dominant against PyTorch yet.
 
@@ -24,6 +25,15 @@ performance-dominant against PyTorch yet.
 
 | Gate | Scope | Result |
 |---|---|---|
+| Criterion | `RCH_WORKER=vmi1227854 RCH_WORKERS=vmi1227854 rch exec -- cargo bench -p ft-api --bench ops_bench -- sdpa/grad_16x512x64 --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | kgs4.113 current scaled-alpha path median `82.730 ms`; temporary old post-scale variant median `114.40 ms`; new/old ratio `0.723x` (`1.38x` faster), old shape rejected |
+| PyTorch gauntlet | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | local diagnostic PyTorch `2.12.0+cpu`; FrankenTorch median `63.057 ms`, PyTorch median `48.915 ms`, ratio `1.29x` slower |
+| Remote build/bench | `rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | built and ran FrankenTorch arm on `vmi1227854`, median `53.254 ms`; PyTorch arm failed because remote `torch` was unavailable |
+| Correctness | `rch exec -- cargo test -p ft-kernel-cpu scaled_gemm_matches_post_scale_reference -- --nocapture`; `rch exec -- cargo test -p ft-api sdpa_ -- --nocapture` | kernel guard passed on `hz2`; API SDPA group passed 17 unit tests plus finite-diff integration row |
+| Conformance | `rch exec -- cargo test -p ft-conformance` | passed on `vmi1149989`: 199 lib tests plus bins, E2E, PyTorch conformance, smoke, and doc-tests all green |
+| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `hz1` |
+| Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed on `hz1` |
+| UBS | `ubs crates/ft-api/benches/pytorch_gauntlet_bench.rs crates/ft-api/benches/pytorch_sdpa_grad.py docs/NEGATIVE_EVIDENCE.md docs/RELEASE_READINESS_SCORECARD.md artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/SCORECARD.md artifacts/perf/frankentorch-kgs4.113/verify_20260619T182412Z/NEGATIVE_EVIDENCE_LEDGER.md artifacts/perf/frankentorch-kgs4/sdpa_scaled_gemm_alpha_code_first.md` | zero critical or warning findings |
+| Formatting | `rustfmt --edition 2024 --check crates/ft-api/benches/pytorch_gauntlet_bench.rs`; `python -m py_compile crates/ft-api/benches/pytorch_sdpa_grad.py`; `git diff --check` | changed Rust bench, Python script, and diff whitespace passed; broad `cargo fmt --check` still reports pre-existing unrelated workspace drift |
 | Criterion | `rch exec -- cargo bench -p ft-api --bench ops_bench -- avg_pool2d/grad --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | kgs4.112 current fast path passed on `hz2`; median `58.600 ms`; direct-assignment candidate on same worker regressed to `68.624 ms` and was reverted |
 | PyTorch gauntlet | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool2d --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | local PyTorch `2.12.0+cpu`; FrankenTorch median `16.627 ms`, PyTorch median `3.6632 ms`, ratio `4.54x` slower |
 | Remote build/bench | `rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool2d --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | built and ran FrankenTorch arm on `hz2`, median `13.383 ms`; PyTorch arm failed because remote `torch` was unavailable |
@@ -91,6 +101,11 @@ verdict was available for the SmoothL1 `ft-api/src/lib.rs` closeout.
 
 The `.124` result points toward deeper SmoothL1 training overhead: tape setup,
 input/materialization cost, loss backward kernel shape, SIMD, and cache layout.
+The `.113` result rejects SDPA post-GEMM scale streams and keeps scaled GEMM
+alpha, but the remaining PyTorch gap should move to whole-row scheduling,
+cache-blocked softmax/GEMM interaction, f32-native ratio work, arena/tape
+allocation removal, or fused loss/backward primitives rather than another
+post-scale cleanup.
 The `.112` result verifies the current avg_pool2d 2x2s2 specialization but
 rejects direct assignment scatter writes; the remaining gap should move to
 whole-workload tape/allocation/sum-backward overhead, native f32 layout, or a
