@@ -21,14 +21,18 @@ is explicitly satisfied.
   median `7.0626 ms`; ratio vs PyTorch `25.47x` slower.
 - Final reverted-source result: FrankenTorch median `184.99 ms`; PyTorch median
   `7.1539 ms`; ratio vs PyTorch `25.86x` slower.
+- Final reverted-source rerun: FrankenTorch median `181.94 ms`; PyTorch median
+  `7.3011 ms`; ratio vs PyTorch `24.92x` slower.
 - Candidate vs fast-path-disabled baseline: `1.134x` slower by median.
 - Verdict: rejected and reverted. The standalone all-ones `dout` constant-fill
   branch regressed the realistic full training-style workload and must not be
   retried as a tiny avg_pool1d backward-only lever.
-- Retry condition: only revisit if profiling proves avg_pool1d backward fill is
-  dominant after forward, session/tape setup, allocation churn, and tensor
-  materialization overhead are separated. Otherwise target end-to-end pooling
-  overhead instead of another constant-gradient branch.
+- Retry condition: Retry only if a profiler attributes a clearly-above-noise
+  share to `avg_pool1d_backward_f64` fill/scatter work on the full
+  `gauntlet_avg_pool1d_grad` training workload after forward, session/tape
+  setup, allocation churn, and tensor materialization overhead are separated.
+  Otherwise target end-to-end pooling overhead instead of another
+  constant-gradient branch.
 - Evidence:
   - `artifacts/perf/frankentorch-kgs4.122/gauntlet_20260619T0358Z/current_criterion_avg_pool1d.log`
   - `artifacts/perf/frankentorch-kgs4.122/gauntlet_20260619T0358Z/current_env.txt`
@@ -36,6 +40,7 @@ is explicitly satisfied.
   - `artifacts/perf/frankentorch-kgs4.122/gauntlet_20260619T0358Z/baseline_minus_fastpath_env.txt`
   - `artifacts/perf/frankentorch-kgs4.122/gauntlet_20260619T0358Z/final_reverted_criterion_avg_pool1d.log`
   - `artifacts/perf/frankentorch-kgs4.122/gauntlet_20260619T0358Z/final_reverted_env.txt`
+  - `artifacts/perf/frankentorch-kgs4.122/gauntlet_20260619T0358Z/rerun_current_criterion_avg_pool1d.log`
 
 ## 2026-06-19 - frankentorch-kgs4.117 - MaxPool3d saved-index sidecar
 

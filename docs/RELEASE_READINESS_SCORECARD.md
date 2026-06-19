@@ -8,7 +8,7 @@ Updated: 2026-06-19
 |---|---:|---:|---:|---|
 | `frankentorch-kgs4.117` | max_pool3d f64 train step `[2,32,16,32,32]` | `9.73x` slower | internal keep; `20.585 ms` -> `15.794 ms`; remote PyTorch arm unavailable on `hz2` | kept; profile deeper end-to-end gap |
 | `frankentorch-kgs4.121` | linear f64 train step `[32,512] -> 2048` | `2.45x` slower | API-local internal keep; `29.606 ms` -> `22.775 ms`; kernel move `26.459 ms` rejected | kept API helper; reverted kernel move |
-| `frankentorch-kgs4.122` | avg_pool1d f64 train step `[8,64,8192]` | `25.86x` slower | no gain; candidate median `204.02 ms` vs fast-path-disabled `179.91 ms` | reverted |
+| `frankentorch-kgs4.122` | avg_pool1d f64 train step `[8,64,8192]` | `25.86x` slower; final rerun `24.92x` slower | no gain; candidate median `204.02 ms` vs fast-path-disabled `179.91 ms` | reverted |
 | `frankentorch-kgs4.124` | SmoothL1 f64 mean-loss backward, 8M elems | `1.99x` slower | internal keep; `963.16 ms` -> `757.63 ms` on `hz2` | kept; follow-up `frankentorch-kgs4.128` |
 | `frankentorch-kgs4.126` | max_pool1d f64 train step `[8,64,8192]` | `12.31x` slower | no gain; candidate median `184.41 ms` vs parent `178.47 ms` | reverted |
 
@@ -29,11 +29,15 @@ measured workload is performance-dominant against PyTorch yet.
 | Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `ovh-a` for final harness |
 | Correctness | `rch exec -- cargo test -p ft-kernel-cpu max_pool1d_direct_matches_2d_h1_first_tie_forward_backward_bit_exact` | passed on `ovh-a` |
 | Formatting | `rustfmt --edition 2024 --check crates/ft-api/benches/pytorch_gauntlet_bench.rs` | passed |
-| Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool1d --noplot` | completed locally; candidate FrankenTorch median `204.02 ms`, PyTorch median `7.4798 ms`; final reverted FrankenTorch median `184.99 ms`, PyTorch median `7.1539 ms` |
-| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `hz1` for the clean detached avg_pool1d commit tree |
-| Compile | `rch exec -- cargo check -p ft-kernel-cpu` | passed on `vmi1227854` for the clean detached avg_pool1d commit tree |
+| Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool1d --noplot` | completed locally; candidate FrankenTorch median `204.02 ms`, PyTorch median `7.4798 ms`; final reverted FrankenTorch median `184.99 ms`, PyTorch median `7.1539 ms`; rerun final median `181.94 ms`, PyTorch median `7.3011 ms` |
+| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `vmi1264463` after avg_pool1d revert |
+| Compile | `rch exec -- cargo check -p ft-kernel-cpu` | passed on `vmi1293453` after avg_pool1d revert |
 | Correctness | `rch exec -- cargo test -p ft-kernel-cpu avg_pool1d_direct_matches_2d_h1_forward_backward_bit_exact -- --nocapture` | passed on `hz1` for the clean detached avg_pool1d commit tree |
 | Correctness | `rch exec -- cargo test -p ft-api functional_avg_pool1d_fused_matches_reshape_2d_forward_and_backward_bits -- --nocapture` | passed on `hz2` for the clean detached avg_pool1d commit tree |
+| Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed on `vmi1149989` after avg_pool1d revert |
+| Clippy | `rch exec -- cargo clippy -p ft-kernel-cpu -- -D warnings` | passed on `vmi1167313` after avg_pool1d revert |
+| UBS | `ubs crates/ft-api/benches/pytorch_gauntlet_bench.rs crates/ft-kernel-cpu/src/lib.rs crates/ft-api/benches/pytorch_avg_pool1d_grad.py` | no critical findings; existing `ft-kernel-cpu` warning inventories remain outside this revert |
+| Formatting | `rustfmt --edition 2024 --check crates/ft-api/benches/pytorch_gauntlet_bench.rs`; `git diff --check` on changed files | passed; whole-file `ft-kernel-cpu/src/lib.rs` rustfmt check still reports pre-existing formatting drift outside this avg_pool1d revert |
 | Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- linear --noplot` | completed locally; final FrankenTorch median `22.775 ms`, PyTorch median `9.2821 ms` |
 | Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `vmi1152480` after restoring the API-local linear path |
 | Correctness | `rch exec -- cargo test -p ft-api linear_backward_all_ones_dy_matches_kernel_reference -- --nocapture` | passed on `vmi1293453` |
