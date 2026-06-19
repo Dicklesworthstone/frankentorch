@@ -12,7 +12,7 @@ use std::path::PathBuf;
 use std::process::{Command, exit};
 use std::time::Duration;
 
-use criterion::{Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
 
@@ -276,6 +276,166 @@ fn bench_max_pool3d_saved_indices(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_max_pool3d_stage_probe(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gauntlet_max_pool3d_grad_stage");
+    group.warm_up_time(Duration::from_secs(1));
+    group.measurement_time(Duration::from_secs(3));
+    group.sample_size(10);
+
+    let values = deterministic_pool3d_values();
+    let shape = vec![
+        MAX_POOL3D_N,
+        MAX_POOL3D_C,
+        MAX_POOL3D_D,
+        MAX_POOL3D_H,
+        MAX_POOL3D_W,
+    ];
+    let out_d = MAX_POOL3D_D / 2;
+    let out_h = MAX_POOL3D_H / 2;
+    let out_w = MAX_POOL3D_W / 2;
+    let dout = vec![1.0_f64; MAX_POOL3D_N * MAX_POOL3D_C * out_d * out_h * out_w];
+    let (_, arg_offsets) = ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
+        &values,
+        MAX_POOL3D_N,
+        MAX_POOL3D_C,
+        MAX_POOL3D_D,
+        MAX_POOL3D_H,
+        MAX_POOL3D_W,
+        2,
+        2,
+        2,
+        out_d,
+        out_h,
+        out_w,
+        2,
+        2,
+        2,
+    );
+
+    group.bench_function("frankentorch_setup_tensor", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            black_box(require(
+                session.tensor_variable(black_box(values.clone()), black_box(shape.clone()), true),
+                "failed to create FrankenTorch tensor",
+            ))
+        });
+    });
+
+    group.bench_function("frankentorch_forward_only", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = require(
+                    session.tensor_variable(values.clone(), shape.clone(), true),
+                    "failed to create FrankenTorch tensor",
+                );
+                (session, x)
+            },
+            |(mut session, x)| {
+                black_box(require(
+                    session.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)),
+                    "failed to run FrankenTorch max_pool3d",
+                ))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("frankentorch_sum_only", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = require(
+                    session.tensor_variable(values.clone(), shape.clone(), true),
+                    "failed to create FrankenTorch tensor",
+                );
+                let out = require(
+                    session.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)),
+                    "failed to run FrankenTorch max_pool3d",
+                );
+                (session, out)
+            },
+            |(mut session, out)| {
+                black_box(require(
+                    session.tensor_sum(out),
+                    "failed to reduce FrankenTorch output",
+                ))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("frankentorch_backward_only", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = require(
+                    session.tensor_variable(values.clone(), shape.clone(), true),
+                    "failed to create FrankenTorch tensor",
+                );
+                let out = require(
+                    session.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)),
+                    "failed to run FrankenTorch max_pool3d",
+                );
+                let loss = require(
+                    session.tensor_sum(out),
+                    "failed to reduce FrankenTorch output",
+                );
+                (session, loss)
+            },
+            |(mut session, loss)| {
+                black_box(require(
+                    session.tensor_backward(loss),
+                    "failed to run FrankenTorch backward",
+                ))
+            },
+            BatchSize::SmallInput,
+        );
+    });
+
+    group.bench_function("kernel_forward_with_indices", |b| {
+        b.iter(|| {
+            black_box(ft_kernel_cpu::max_pool3d_forward_with_indices_f64(
+                black_box(&values),
+                MAX_POOL3D_N,
+                MAX_POOL3D_C,
+                MAX_POOL3D_D,
+                MAX_POOL3D_H,
+                MAX_POOL3D_W,
+                2,
+                2,
+                2,
+                out_d,
+                out_h,
+                out_w,
+                2,
+                2,
+                2,
+            ))
+        });
+    });
+
+    group.bench_function("kernel_backward_from_indices", |b| {
+        b.iter(|| {
+            black_box(ft_kernel_cpu::max_pool3d_backward_from_indices_f64(
+                black_box(&dout),
+                black_box(&arg_offsets),
+                MAX_POOL3D_N,
+                MAX_POOL3D_C,
+                MAX_POOL3D_D,
+                MAX_POOL3D_H,
+                MAX_POOL3D_W,
+                out_d,
+                out_h,
+                out_w,
+            ))
+        });
+    });
+
+    group.finish();
+}
+
 fn bench_linear_train_hidden_2048(c: &mut Criterion) {
     let mut group = c.benchmark_group("gauntlet_linear_train_hidden_2048");
     group.warm_up_time(Duration::from_secs(1));
@@ -336,6 +496,7 @@ criterion_group!(
     bench_avg_pool1d_unit_dy,
     bench_max_pool1d_unit_dout,
     bench_max_pool3d_saved_indices,
+    bench_max_pool3d_stage_probe,
     bench_linear_train_hidden_2048
 );
 criterion_main!(benches);

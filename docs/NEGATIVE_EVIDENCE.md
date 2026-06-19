@@ -78,6 +78,57 @@ is explicitly satisfied.
   - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/ft_api_max_pool3d_grad_test_postlint.log`
   - `artifacts/perf/frankentorch-kgs4.117/gauntlet_20260619T0320Z/ft_api_bench_clippy_postlint.log`
 
+## 2026-06-19 - frankentorch-kgs4.128 - MaxPool3d end-to-end profile rejects
+
+- Levers:
+  - Borrowed-input custom autograd route for f64 `functional_max_pool3d` grad
+    fast path, replacing the owned-input `tensor_apply_function` materialization.
+  - Exact all-ones `dout` backward scatter branch from saved max-pool3d argmax
+    offsets, tested as both rayon plane-parallel and sequential plane-local
+    variants.
+- Workload: `gauntlet_max_pool3d_grad`, deterministic f64
+  `[N,C,D,H,W]=[2,32,16,32,32]`, kernel `2x2x2`, stride `2x2x2`,
+  forward max_pool3d, scalar `sum`, backward.
+- Reference: local PyTorch `2.12.1+cpu` in
+  `/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`, 32 compute
+  threads and 32 interop threads on `thinkstation1`.
+- Clean baseline: FrankenTorch median `15.303 ms`; PyTorch median `1.6325 ms`;
+  ratio vs PyTorch `9.38x` slower.
+- Stage baseline: setup tensor `215.47 us`; FrankenTorch forward-only
+  `4.1256 ms`; sum-only `1.3121 ms`; backward-only `43.433 ms` with severe
+  outliers; raw kernel forward+indices `727.15 us`; raw kernel backward
+  from indices `9.0069 ms` with severe outliers. Treat the stage probe as
+  routing evidence, not ratio proof.
+- Borrowed-input candidate: headline FrankenTorch median `22.764 ms`; PyTorch
+  median `1.6633 ms`; ratio vs PyTorch `13.69x` slower. The isolated
+  forward-only stage improved from `4.1256 ms` to `1.8935 ms`, but the full
+  workload regressed `1.49x` vs the clean baseline. Rejected and reverted.
+- Rayon all-ones `dout` candidate: headline FrankenTorch median `16.160 ms`;
+  PyTorch median `1.6543 ms`; ratio vs PyTorch `9.77x` slower. This was
+  `1.06x` slower than the clean baseline. Rejected and reverted.
+- Sequential all-ones `dout` candidate: headline FrankenTorch median
+  `22.465 ms`; the paired PyTorch row had severe high outliers, so using the
+  clean PyTorch baseline gives a routing ratio of `13.76x` slower. Rejected and
+  reverted.
+- Final reverted-source sanity row: FrankenTorch median `16.586 ms`; paired
+  PyTorch row had severe high outliers and is not primary ratio evidence.
+- Verdict: no product source kept. The durable result is negative evidence plus
+  a stage-probe benchmark harness for future max_pool3d gap work.
+- Retry condition: do not retry borrowed-input-only max_pool3d routes or
+  standalone unit-`dout` scatter branches. Revisit only with a fusion that
+  removes the sum-generated gradient buffer/tape edge end-to-end, an allocator
+  or arena change proven on the whole training row, or a fundamentally different
+  kernel/layout plan with fresh same-workload ratio evidence.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/env.txt`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/baseline_criterion_max_pool3d.log`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/baseline_stage_max_pool3d.log`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/candidate_criterion_max_pool3d.log`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/unit_dout_candidate_criterion_max_pool3d.log`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/unit_dout_sequential_candidate_criterion_max_pool3d.log`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/final_reverted_criterion_max_pool3d.log`
+  - `artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/summary.md`
+
 ## 2026-06-19 - frankentorch-kgs4.121 - Linear all-ones dy kernel move
 
 - Lever: detect exact all-ones `dy` from `tensor_linear(...).sum().backward()`

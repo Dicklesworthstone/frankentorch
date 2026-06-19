@@ -11,8 +11,9 @@ Updated: 2026-06-19
 | `frankentorch-kgs4.122` | avg_pool1d f64 train step `[8,64,8192]` | `25.86x` slower; final rerun `24.92x` slower | no gain; candidate median `204.02 ms` vs fast-path-disabled `179.91 ms` | reverted |
 | `frankentorch-kgs4.124` | SmoothL1 f64 mean-loss backward, 8M elems | `1.99x` slower | internal keep; `963.16 ms` -> `757.63 ms` on `hz2` | kept; follow-up `frankentorch-kgs4.128` |
 | `frankentorch-kgs4.126` | max_pool1d f64 train step `[8,64,8192]` | `12.31x` slower | no gain; candidate median `184.41 ms` vs parent `178.47 ms` | reverted |
+| `frankentorch-kgs4.128` | max_pool3d f64 train step `[2,32,16,32,32]` | `9.38x` slower clean baseline | no gain; borrowed-input median `22.764 ms`, unit-dout median `16.160 ms`, sequential unit-dout median `22.465 ms` | reverted product candidates; keep stage probe |
 
-Score: `5/5` for the measured gauntlet lanes. Correctness guards are green and
+Score: `6/6` for the measured gauntlet lanes. Correctness guards are green and
 the MaxPool3d, Linear, and SmoothL1 levers are real internal speedups, but no
 measured workload is performance-dominant against PyTorch yet.
 
@@ -48,6 +49,13 @@ measured workload is performance-dominant against PyTorch yet.
 | Correctness | `rch exec -- cargo test -p ft-kernel-cpu max_pool3d_indices_scatter_matches_rescan_first_tie_bits` | passed after clippy-only lint fixes |
 | Correctness | `rch exec -- cargo test -p ft-api functional_max_pool3d_grad_matches_finite_diff` | passed after clippy-only lint fixes |
 | Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed after narrow ft-kernel-cpu clippy fixes |
+| Criterion | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- 'gauntlet_max_pool3d_grad/' --noplot` | kgs4.128 clean baseline completed locally; FrankenTorch median `15.303 ms`, PyTorch median `1.6325 ms`; borrowed-input and unit-dout candidates rejected and product source reverted |
+| Stage probe | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- max_pool3d_grad_stage --noplot` | added diagnostic max_pool3d stage rows; forward-only `4.1256 ms` vs raw kernel forward+indices `727.15 us`; backward rows were noisy and used only as routing evidence |
+| Compile | `rch exec -- cargo check -p ft-api --bench pytorch_gauntlet_bench` | passed on `hz2` for the retained kgs4.128 stage-probe harness |
+| Correctness | `rch exec -- cargo test -p ft-api functional_max_pool3d_grad_matches_finite_diff -- --nocapture` | passed on `vmi1152480` after product candidates were reverted |
+| Clippy | `rch exec -- cargo clippy -p ft-api --bench pytorch_gauntlet_bench -- -D warnings` | passed on `vmi1152480` for the retained kgs4.128 stage-probe harness |
+| UBS | `ubs crates/ft-api/benches/pytorch_gauntlet_bench.rs docs/NEGATIVE_EVIDENCE.md docs/RELEASE_READINESS_SCORECARD.md artifacts/perf/frankentorch-kgs4.128/gauntlet_20260619T0521Z/summary.md` | zero critical or warning findings |
+| Formatting | `rustfmt --edition 2024 --check crates/ft-api/benches/pytorch_gauntlet_bench.rs`; `git diff --check` | passed for the kgs4.128 changed surface |
 
 Known caveat: `cargo fmt --check -p ft-api` remains blocked by pre-existing
 crate-wide formatting debt in unrelated examples and long `ft-api/src/lib.rs`
@@ -76,4 +84,8 @@ The `.121` result points away from moving the all-ones linear backward shortcut
 into the generic CPU kernel; the remaining gap is end-to-end linear training
 overhead, not the already-collapsed row-sum/copy helper alone. Future work
 should profile those frames before trying another scalar-wrapper or one-off
-unit-gradient branch.
+unit-gradient branch. The `.128` result rejects borrowed-input-only max_pool3d
+autograd and standalone unit-`dout` scatter branches; the next viable route is
+end-to-end fusion that removes the sum-generated gradient buffer/tape edge,
+allocator/arena work proven on the whole training row, or a fundamentally
+different layout/kernel plan with fresh ratio evidence.
