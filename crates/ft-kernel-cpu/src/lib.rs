@@ -21495,9 +21495,10 @@ fn qr_householder_panel_blocked_profiled(
     n: usize,
     k: usize,
     qcols: usize,
+    nb_block: usize,
     mut timings: Option<&mut QrStageTimings>,
 ) -> Vec<f64> {
-    const NB: usize = 32;
+    let nb_block = nb_block.max(1);
     let tiny = f64::EPSILON * 1e6;
     let profile_enabled = timings.is_some();
     // Forward pass reduces R and stores each panel's (V, T); Q is then built
@@ -21506,7 +21507,7 @@ fn qr_householder_panel_blocked_profiled(
     let mut panels: Vec<(usize, Vec<f64>, Vec<f64>)> = Vec::new();
     let mut p = 0;
     while p < k {
-        let pe = (p + NB).min(k);
+        let pe = (p + nb_block).min(k);
         let nb = pe - p;
 
         // --- Panel factorization: build V (m×nb) and tau, applying each reflector
@@ -21606,7 +21607,22 @@ fn qr_householder_panel_blocked(
     k: usize,
     qcols: usize,
 ) -> Vec<f64> {
-    qr_householder_panel_blocked_profiled(r_mat, m, n, k, qcols, None)
+    qr_householder_panel_blocked_profiled(r_mat, m, n, k, qcols, 32, None)
+}
+
+/// A/B entry point (NOT production dispatch): runs the blocked compact-WY QR with
+/// a caller-chosen panel width `nb_block`, so a same-worker A/B can find the NB
+/// that best amortizes the skinny-K trailing/reverse GEMMs. frankentorch-ct2yy.
+#[doc(hidden)]
+pub fn qr_householder_panel_blocked_nb_ab(
+    r_mat: &mut [f64],
+    m: usize,
+    n: usize,
+    k: usize,
+    qcols: usize,
+    nb_block: usize,
+) -> Vec<f64> {
+    qr_householder_panel_blocked_profiled(r_mat, m, n, k, qcols, nb_block, None)
 }
 
 /// Native f32 compact-WY blocked QR panel factorization (the f32 companion to
@@ -22141,7 +22157,7 @@ pub fn qr_contiguous_f64_stage_profile(
     qr_profile_record_ns(&mut timings.copy_zeroing_ns, Some(copy_start));
 
     let qcols = if reduced { k } else { m };
-    let q = qr_householder_panel_blocked_profiled(&mut r_mat, m, n, k, qcols, Some(&mut timings));
+    let q = qr_householder_panel_blocked_profiled(&mut r_mat, m, n, k, qcols, 32, Some(&mut timings));
 
     let zero_start = std::time::Instant::now();
     for i in 0..m {

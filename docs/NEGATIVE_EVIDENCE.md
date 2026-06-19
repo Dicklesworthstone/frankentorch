@@ -318,3 +318,57 @@ is explicitly satisfied.
 - Rejected: direct reduced Gaussian NLL grad in `frankentorch-fdn1v`,
   `829.27 ms` to `1.0274 s`. Do not generalize the SmoothL1 reduced-grad
   lever to Gaussian NLL without new profile proof.
+
+## 2026-06-19 - frankentorch-ct2yy - Blocked-QR panel width (NB) tuning
+
+- Lever: increase the blocked compact-WY QR panel width `NB` (production `32`)
+  to amortize the skinny-K (`K=nb`) trailing/reverse `gemm::dgemm` calls and cut
+  per-panel allocation churn in `qr_householder_panel_blocked_profiled`.
+- Method: same-worker, same-process A/B with `NB=32` as the ANCHOR, via the new
+  `qr_householder_panel_blocked_nb_ab` entry point and the
+  `ft-kernel-cpu --example qr_nb_ab` harness (deterministic LCG square matrix).
+- Result (8-thread rch worker): n=512 `NB=32` is BEST — `NB={48,64,96,128}` all
+  REGRESS to `0.92x / 0.71x / 0.75x / 0.60x`. n=1024 best is `NB={48,96}` at
+  only `1.15x` (NB=64/128 ~`1.02x`).
+- Verdict: rejected. NB tuning does not clear the Score>=2.0 bar and REGRESSES
+  small/medium matrices; `NB=32` is already near-optimal. Production dispatch
+  left at `NB=32` (the param refactor is behavior-preserving; default `32`).
+- Retry condition: only if a fundamentally different trailing-update structure
+  (e.g. transpose-free strided `dgemm_mm` reads eliminating the per-panel `vt`
+  build, or a recursive/leftlooking panel) is implemented; raw NB tuning alone
+  is exhausted.
+- Evidence: `crates/ft-kernel-cpu/examples/qr_nb_ab.rs`,
+  `crates/ft-kernel-cpu/examples/qr_stage_profile_run.rs` (stage breakdown:
+  n=1024 ~ panel+T 27% / trailingR 42% / reverseQ 28%).
+
+## 2026-06-19 - frankentorch-l9xod / t0b4l - Dense-linalg gap REMEASUREMENT (priority correction)
+
+- Finding: the standing memory claim that NON-symmetric eig (geev) is the
+  biggest vs-upstream perf gap (`12-40x`) is STALE. Fresh head-to-head on
+  IDENTICAL deterministic-LCG matrices (matrices verified identical via
+  `sum_re(eigvals)`) shows geev is now the SMALLEST dense gap; the real losses
+  are the symmetric-eig / SVD / QR factorizations.
+- Caveat: ft ran on 8-16 thread rch workers, torch (`/tmp/torchvenv`) on 32
+  threads, so ratios below are UPPER BOUNDS on the true equal-thread gap
+  (roughly halve for the parallel stages).
+- Measured (ft 16-thread worker vs torch 32-thread), ratio = ft/torch:
+  - geev: eigvals n512 `566/247=2.3x`, n256 `1.6x`, n128 `1.2x`; eig n512 `2.5x`.
+  - eigvalsh: n512 `4.5x`, n1024 `454/58=7.8x`.
+  - eigh: n512 `10x`, n1024 `1071/69=15.6x`.
+  - qr: n512 `6.2x`, n1024 `386/29=13x` (already blocked; see NB entry).
+  - svd: n512 `10.9x`, n1024 `3139/194=16x`.
+- Refuted/exhausted levers for the BIG gaps (do NOT re-probe):
+  - eigh/eigvalsh reduction (`dsytrd`): blocked WY `eigh_tridiag_reduce_blocked`
+    is BANDWIDTH-bound and MEASURED 0.37-0.70x SLOWER (t0b4l); two-stage band
+    reduction MEASURED 1.3-2.3x SLOWER (5oqum). The symmetric reduction wall is
+    not closeable with these. eigh total is further capped by this bandwidth
+    floor (~454ms of 1071ms at n1024 is the shared reduction).
+  - QR: already blocked compact-WY (ct2yy); NB tuning exhausted (entry above).
+- Genuine remaining swings (MULTI-SESSION, high verification risk — do not
+  start-and-park): geev multishift-QR + AED (fql10 -> qglh3 -> npxbw; eig
+  outputs are tolerance-parity per qgce4) and SVD blocked two-sided
+  bidiagonalization (`dgebrd`). The geev Francis QR back-substitution is only
+  ~3% (parallelizing it regresses) so AED is the sole geev lever.
+- Evidence (reproducible harnesses, this commit):
+  `crates/ft-kernel-cpu/examples/eig_random_gap.rs`,
+  `crates/ft-kernel-cpu/examples/linalg_gap_sweep.rs`.
