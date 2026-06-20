@@ -1,0 +1,30 @@
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 44.75s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/ops_bench-f346db443111867a)
+Gnuplot not found, using plotters backend
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Collecting 10 samples in estimated 3.0123 s (440 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_native
+                        time:   [6.3946 ms 6.6151 ms 6.7803 ms]
+                        change: [-1.7215% +5.3885% +13.394%] (p = 0.19 > 0.05)
+                        No change in performance detected.
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Collecting 10 samples in estimated 3.1971 s (660 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_scalar_sum
+                        time:   [5.0390 ms 5.1754 ms 5.2503 ms]
+                        change: [-7.3945% +4.8276% +18.099%] (p = 0.47 > 0.05)
+                        No change in performance detected.
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Collecting 10 samples in estimated 4.3618 s (110 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_fold_reference
+                        time:   [37.121 ms 40.052 ms 42.854 ms]
+                        change: [-39.149% -24.624% -11.130%] (p = 0.01 < 0.05)
+                        Performance has improved.
+

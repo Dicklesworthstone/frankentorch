@@ -1,0 +1,140 @@
+  [2m2026-06-20T18:23:09.807770Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz1 at root@87.99.133.171 (2 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:921 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:10.072550Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch-cod-a-push-kgs4-125 (hash: be971c854ccf6c66)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:10.072622Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:10.690788Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz1...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:10.690841Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch-cod-a-push-kgs4-125 -> /data/projects/frankentorch-cod-a-push-kgs4-125 on hz1[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:11.362881Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 672ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:11.362994Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-api -> /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-api on hz1[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:11.786147Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 423ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:11.786217Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd -> /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd on hz1[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:12.211083Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 424ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:12.211161Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-conformance -> /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-conformance on hz1[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:12.620948Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 409ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:12.621029Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-core -> /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-core on hz1[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:42.622132Z[0m [33m WARN[0m [1;33mrch::transfer[0m[33m: [33msync_to_remote: retryable error on attempt 1/3: sync_to_remote: timed out after 30000ms[0m
+    [2;3mat[0m rch/src/transfer.rs:339 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T18:23:42.673721Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mRemote execution failed: sync_to_remote: timed out after 30000ms, running locally[0m
+    [2;3mat[0m rch/src/hook.rs:1067 [2;3mon[0m ThreadId(1)
+
+[RCH] local (remote execution failed)
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling serde_core v1.0.228
+   Compiling libm v0.2.16
+   Compiling serde v1.0.228
+   Compiling zmij v1.0.21
+   Compiling rawpointer v0.2.1
+   Compiling serde_json v1.0.149
+   Compiling libc v0.2.185
+   Compiling itoa v1.0.18
+   Compiling plotters-backend v0.3.7
+   Compiling ciborium-io v0.2.2
+   Compiling memchr v2.8.0
+   Compiling anstyle v1.0.14
+   Compiling clap_lex v1.1.0
+   Compiling regex-syntax v0.8.10
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling once_cell v1.21.4
+   Compiling anes v0.1.6
+   Compiling oorandom v11.1.5
+   Compiling walkdir v2.5.0
+   Compiling itertools v0.10.5
+   Compiling clap_builder v4.6.0
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+   Compiling plotters-svg v0.3.7
+   Compiling crossbeam-epoch v0.9.18
+   Compiling syn v2.0.117
+   Compiling crossbeam-deque v0.8.6
+   Compiling is-terminal v0.4.17
+   Compiling num-complex v0.4.6
+   Compiling plotters v0.3.7
+   Compiling regex-automata v0.4.14
+   Compiling criterion-plot v0.5.0
+   Compiling rayon v1.12.0
+   Compiling clap v4.6.1
+   Compiling regex v1.12.3
+   Compiling bytemuck_derive v1.10.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling bytemuck v1.25.0
+   Compiling safe_arch v0.7.4
+   Compiling wide v0.7.33
+   Compiling tinytemplate v1.2.1
+   Compiling half v2.7.1
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-core)
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-runtime)
+   Compiling criterion v0.5.1
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 56.68s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/ops_bench-f346db443111867a)
+Gnuplot not found, using plotters backend
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Collecting 10 samples in estimated 3.0383 s (275 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_native
+                        time:   [11.129 ms 11.622 ms 12.148 ms]
+                        change: [-3.2250% +1.1908% +5.6928%] (p = 0.63 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Collecting 10 samples in estimated 3.2032 s (660 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_scalar_sum
+                        time:   [4.8402 ms 5.0014 ms 5.1322 ms]
+                        change: [-0.6842% +2.8924% +6.6847%] (p = 0.17 > 0.05)
+                        No change in performance detected.
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 3.3s or enable flat sampling.
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Collecting 10 samples in estimated 3.2961 s (55 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_fold_reference
+                        time:   [58.736 ms 59.337 ms 60.091 ms]
+                        change: [+2.3986% +4.6095% +6.7314%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+

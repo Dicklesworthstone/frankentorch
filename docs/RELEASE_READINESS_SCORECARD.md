@@ -6,6 +6,7 @@ Updated: 2026-06-20
 
 | Bead | Workload | Result vs PyTorch | Before/after verdict | Release action |
 |---|---:|---:|---:|---|
+| `frankentorch-kgs4.139` | BatchNorm1d f64 automatic `tensor_sum` shortcut `[16,128,256]` NCL | same-host `7.42x` slower | internal keep; local ordinary native `11.622 ms` -> automatic shortcut `6.6151 ms` (`1.76x` faster); rch after row `6.0836 ms`; explicit scalar API still faster at `5.1754 ms` | kept; route remaining gap to BatchNorm output deforestation, generated scalar-loss kernels, tape/session arena reuse, and saved-stat workspace reuse |
 | `frankentorch-kgs4.138` | BatchNorm1d f64 fused scalar-sum train step `[16,128,256]` NCL | same-host `4.52x` slower | internal keep; local native `11.178 ms` -> scalar-sum `4.7944 ms` (`2.33x` faster); rch same-run scalar/native `25.058 ms` / `43.610 ms` (`1.74x` faster) | kept; route remaining gap to automatic scalar-loss pattern matching, tape/session arena reuse, saved-stat workspace reuse, and algebraic zero-`dx` proof |
 | `frankentorch-kgs4.137` | RMSNorm f64 scalar-sum train step `[2048,1024]` | mixed-location `0.86x` PyTorch median, not release-counted | no gain; same-worker scalar `12.329 ms` vs materialized same-run `12.086 ms` and baseline `12.229 ms` | rejected/no source landed; route to tape/session allocation, workspace reuse, automatic scalar-loss fusion, or f32-native layout |
 | `frankentorch-kgs4.125` | BatchNorm1d f64 native NCL train step `[16,128,256]` | same-host `4.85x` slower | internal keep; RCH native `4.3741 ms` vs fold `30.484 ms`; local row-coarsening `11.865 ms` -> `10.914 ms` | kept; route remaining gap to f64 scalar-loss fusion, dense-dy removal, tape/workspace reuse, and saved-stat reuse |
@@ -29,14 +30,51 @@ Updated: 2026-06-20
 | `frankentorch-kgs4.133` | conv2d f64 train step `[4,64,64,64]`, 64 3x3 filters | `1.91x` slower; candidate `1.86x` slower | no gain; same-worker rch `121.07 ms` -> `117.92 ms`, `p=0.38`, no change detected | rejected; removed dormant all-ones-dout branch |
 | `frankentorch-grefr` | SmoothL1 f64 mean-loss backward, 8M elems | `1.35x` slower | internal keep; direct local `588.51 ms` -> `469.36 ms`; beta=1 derivative branch rejected | kept paired-randn fill; route remaining gap to tape/allocation/loss-kernel |
 
-Measured-discipline score: `22/22` for the gauntlet lanes. PyTorch head-to-head
-score: `0W / 21L / 1N`; the RMSNorm scalar-sum comparator is neutral for
+Measured-discipline score: `23/23` for the gauntlet lanes. PyTorch head-to-head
+score: `0W / 22L / 1N`; the RMSNorm scalar-sum comparator is neutral for
 release scoring because the candidate was faster than local PyTorch by
 mixed-location ratio but failed the same-worker FrankenTorch keep gate.
 Correctness guards are green and the SDPA, MaxPool3d,
 Linear, LayerNorm, BatchNorm1d/2d, GroupNorm, and SmoothL1 levers include real
 internal speedups, but no measured workload is performance-dominant against
 PyTorch yet.
+
+### 2026-06-20 BatchNorm1d automatic tensor_sum shortcut keep (`frankentorch-kgs4.139`)
+
+The ordinary `functional_batch_norm1d(...).tensor_sum()` path now recognizes
+f64 training-mode affine BatchNorm1d outputs and replaces the generic Sum
+backward edge with a scalar BatchNorm backward shortcut. It falls back to the
+materialized `Sum` path when retained grads or tensor hooks make the output
+gradient observable.
+
+The corrected RCH baseline (`cargo bench --profile release`; the first
+`--release` attempt was invalid for `cargo bench`) selected `hz1` but timed out
+during remote sync and fell back locally. That local fallback measured native
+ordinary BatchNorm1d+Sum at `[11.129 ms, 11.622 ms, 12.148 ms]`, explicit
+scalar-sum at `[4.8402 ms, 5.0014 ms, 5.1322 ms]`, and fold-reference at
+`[58.736 ms, 59.337 ms, 60.091 ms]`.
+
+After the automatic shortcut, local same-machine Criterion measured native
+ordinary call sites at `[6.3946 ms, 6.6151 ms, 6.7803 ms]`, explicit scalar-sum
+at `[5.0390 ms, 5.1754 ms, 5.2503 ms]`, and fold-reference at
+`[37.121 ms, 40.052 ms, 42.854 ms]`. The automatic path is `1.76x` faster than
+baseline ordinary call sites, but still `1.278x` slower than the explicit
+scalar API because it still materializes the BatchNorm output in forward.
+
+RCH after-run evidence on `hz2` measured native automatic `6.0836 ms`, explicit
+scalar `4.7261 ms`, and fold `48.006 ms`; because the before row fell back
+locally, this is routing evidence rather than same-worker proof. Local PyTorch
+`2.12.1+cpu`, 32 threads, clone/detach per rep, measured median `0.891630 ms`.
+The local automatic shortcut is still `7.42x` slower than PyTorch.
+
+Gates: focused `ft-api` shortcut tests 2/0, BatchNorm1d API filter 10/0, full
+`ft-conformance` green, `ft-autograd` check and clippy green, `ft-api`
+check/lib-clippy green. All-target `ft-api` clippy remains blocked by existing
+test lint debt outside this change; full-file rustfmt remains blocked by old
+large-file drift, but the touched BatchNorm shortcut hunks were manually
+formatted and the touched-symbol rustfmt grep is clean. Scoped UBS timed out
+after 240s on the giant Rust files with no findings emitted; docs/artifact-only
+UBS exited 0 but reported Markdown as no recognizable language.
 
 ### 2026-06-20 RMSNorm f32 unit-dy no-ship (`frankentorch-kgs4.123`)
 

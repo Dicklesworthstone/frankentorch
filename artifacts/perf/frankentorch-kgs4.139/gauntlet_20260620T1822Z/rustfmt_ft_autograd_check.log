@@ -1,0 +1,61 @@
+Diff in /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd/src/lib.rs:10389:
+     {
+         let fetch = |flat: usize| -> Result<T, AutogradError> {
+             let src = src_index_for_output(flat)?;
+-            values
+-                .get(src)
+-                .cloned()
+-                .ok_or(AutogradError::DenseTensor(
+-                    DenseTensorError::InsufficientStorage {
+-                        needed: src + 1,
+-                        actual: values.len(),
+-                    },
+-                ))
++            values.get(src).cloned().ok_or(AutogradError::DenseTensor(
++                DenseTensorError::InsufficientStorage {
++                    needed: src + 1,
++                    actual: values.len(),
++                },
++            ))
+         };
+         // Output-driven gather (each output index maps to one source index): every
+         // output is computed independently, so fanning over rayon is bit-for-bit
+Diff in /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd/src/lib.rs:21632:
+             .expect("f32 custom op");
+         // Output must be an F32 leaf with values x².
+         assert_eq!(tape.node(y).unwrap().tensor.meta().dtype(), DType::F32);
+-        let yvals = tape.node(y).unwrap().tensor.contiguous_values_f32().unwrap();
++        let yvals = tape
++            .node(y)
++            .unwrap()
++            .tensor
++            .contiguous_values_f32()
++            .unwrap();
+         assert_eq!(yvals, &[4.0f32, 9.0, 16.0]);
+         // backward of sum(x²): d/dx = 2x = [4,6,8].
+         let (s, _) = tape.sum(y, ExecutionMode::Strict).expect("sum");
+Diff in /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd/src/lib.rs:21743:
+             let want = generic(&data, &shape, &perm);
+             assert_eq!(got.len(), want.len());
+             for k in 0..want.len() {
+-                assert_eq!(got[k].to_bits(), want[k].to_bits(), "conv perm {perm:?} idx={k}");
++                assert_eq!(
++                    got[k].to_bits(),
++                    want[k].to_bits(),
++                    "conv perm {perm:?} idx={k}"
++                );
+             }
+         }
+     }
+Diff in /data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-autograd/src/lib.rs:24918:
+                 },
+                 |ctx, grad_outputs| {
+                     let scale = ctx.saved_tensors()[0][0];
+-                    let grad = grad_outputs[0]
+-                        .iter()
+-                        .map(|grad| grad * scale)
+-                        .collect();
++                    let grad = grad_outputs[0].iter().map(|grad| grad * scale).collect();
+                     Ok(vec![Some(grad)])
+                 },
+             )

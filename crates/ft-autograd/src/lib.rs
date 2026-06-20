@@ -4391,6 +4391,14 @@ impl TensorTape {
         Ok(self.retains_grad.contains(&id.0))
     }
 
+    pub fn tensor_has_hooks(&self, id: TensorNodeId) -> Result<bool, AutogradError> {
+        self.node(id)?;
+        Ok(self
+            .tensor_hooks
+            .get(&id.0)
+            .is_some_and(|hooks| !hooks.is_empty()))
+    }
+
     pub fn tensor_grad_fn(&self, id: TensorNodeId) -> Result<Option<String>, AutogradError> {
         let node = self.node(id)?;
         if matches!(node.op, TensorNodeOp::Leaf) {

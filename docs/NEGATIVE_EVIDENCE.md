@@ -4,6 +4,105 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-20 - frankentorch-kgs4.139 - automatic BatchNorm1d tensor_sum shortcut keep with PyTorch loss
+
+- Lever attempted: automatically recognize `tensor_sum(batch_norm1d_output)` for
+  f64 training-mode affine BatchNorm1d outputs and route the scalar loss
+  backward directly through `batch_norm_backward_scalar_f64`. This removes the
+  generic `Sum` tape node and dense all-ones `dy` backward contribution for
+  ordinary call sites, while falling back to the materialized `Sum` path when
+  the BatchNorm output has retained gradients, tensor hooks, in-place mutation,
+  detach, or graph truncation visibility.
+- Workload: f64 BatchNorm1d training forward plus scalar backward,
+  `[N,C,L]=[16,128,256]`, affine weight and bias require gradients, measured
+  through `ops_bench` `batch_norm/grad_1d_ncl_16x128x256`.
+- Source of idea: scalar-loss partial evaluation plus trace deforestation from
+  the alien-graveyard / alien-artifact pass, applied at the existing API/tape
+  boundary instead of adding a new public wrapper. The safety bar came from the
+  gauntlet rule: preserve observable autograd output edges when hooks or
+  retained grads make the materialized BatchNorm output visible.
+- Baseline evidence:
+  - First requested command,
+    `rch exec -- cargo bench -p ft-api --bench ops_bench --release -- ...`,
+    failed because this Cargo version does not accept `--release` for
+    `cargo bench`; the corrected command uses `--profile release`.
+  - Corrected RCH baseline selected `hz1`, then timed out during remote sync and
+    failed open to local execution. Local fallback medians were native
+    `11.622 ms`, explicit scalar-sum `5.0014 ms`, and fold-reference
+    `59.337 ms`. This local fallback is the before side for the local A/B.
+- Candidate evidence:
+  - Local same-machine after-run medians were native automatic shortcut
+    `6.6151 ms`, explicit scalar-sum `5.1754 ms`, and fold-reference
+    `40.052 ms`. Automatic/native before-after ratio is `0.5692x`, or
+    `1.76x` faster than ordinary materialized BatchNorm1d + Sum. Automatic
+    remains `1.278x` slower than the explicit scalar-sum API because the
+    ordinary call site still materializes the BatchNorm output in forward.
+  - RCH after-run on `hz2` measured native automatic shortcut `6.0836 ms`,
+    explicit scalar-sum `4.7261 ms`, and fold-reference `48.006 ms`. Because
+    the before RCH row fell back locally, the `hz2` row is remote routing
+    evidence rather than same-worker proof.
+- PyTorch comparator: local PyTorch `2.12.1+cpu`, 32 compute/inter-op threads,
+  same NCL f64 fixture, clone/detach per rep, measured median `0.891630 ms`,
+  mean `1.090152 ms`, min `0.677655 ms`, p95 `2.682704 ms`. Local automatic
+  shortcut/PyTorch median ratio is `7.42x` slower. The RCH after/PyTorch mixed
+  ratio is `6.82x` slower.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N`.
+- Verdict: keep. This is a measured internal win for the ordinary
+  `batch_norm1d(...).sum()` pattern (`1.76x` local same-machine), keeps
+  hook/retain-grad observability, and leaves the explicit `.138` scalar API
+  path intact. It does not dominate PyTorch.
+- Retry condition: do not retry another tape-only BatchNorm1d Sum shortcut that
+  still materializes the BatchNorm output. The remaining gap requires output
+  deforestation of the forward path, persistent saved-stat/workspace reuse,
+  session/tape arena allocation, generated fused scalar-loss kernels, or an
+  algebraic proof that can remove more gradient work without breaking PyTorch
+  observable autograd edges.
+- Gates:
+  - `rch exec -- cargo test -p ft-api functional_batch_norm1d_tensor_sum --lib -- --nocapture`:
+    passed after formatting patch, 2 focused shortcut/fallback tests.
+  - `rch exec -- cargo test -p ft-api functional_batch_norm1d --lib -- --nocapture`:
+    passed, 10 BatchNorm1d API tests.
+  - `rch exec -- cargo test -p ft-conformance`: passed, full conformance green.
+  - `rch exec -- cargo check -p ft-autograd --lib`: passed.
+  - `rch exec -- cargo check -p ft-api --lib --benches`: passed after
+    formatting patch.
+  - `rch exec -- cargo clippy -p ft-autograd --lib -- -D warnings`: passed.
+  - `rch exec -- cargo clippy -p ft-api --lib -- -D warnings`: passed.
+  - `rch exec -- cargo clippy -p ft-api --lib --benches -- -D warnings`:
+    failed on pre-existing ft-api test lint debt (`approx_constant`,
+    manual-range contains, no-effect ops, deref-addrof, manual memcpy, and
+    useless vec) outside this BatchNorm shortcut.
+  - `rustfmt --edition 2024 --check crates/ft-api/src/lib.rs` and
+    `crates/ft-autograd/src/lib.rs`: full-file checks remain blocked by
+    pre-existing unrelated drift; after the manual format patch, the
+    touched-symbol rustfmt grep emitted no BatchNorm shortcut hits.
+  - `git diff --check`: passed.
+  - `ubs` on the scoped source/docs/artifact summary surface timed out after
+    240s while scanning the large Rust files, with no findings emitted before
+    timeout. A docs/artifact-only UBS invocation exited 0 but reported no
+    recognizable languages for Markdown, so it is tool-limited evidence only.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/baseline_rch_ops_batch_norm1d_ncl.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/baseline_rch_ops_batch_norm1d_ncl_profile_release.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/after_local_ops_batch_norm1d_ncl_auto_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/after_rch_ops_batch_norm1d_ncl_auto_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/pytorch_batch_norm1d_ncl_f64_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/test_ft_api_batch_norm1d_tensor_sum_shortcut_after_fmt.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/test_ft_api_functional_batch_norm1d.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/test_ft_conformance.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/check_ft_autograd_lib.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/check_ft_api_lib_benches_after_fmt.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/clippy_ft_autograd_lib.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/clippy_ft_api_lib.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/clippy_ft_api_lib_benches.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/rustfmt_ft_api_touched_after_fmt.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/rustfmt_ft_autograd_check.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/git_diff_check.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/git_diff_check_after_docs.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/ubs_scoped.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/ubs_docs_artifact.log`
+  - `artifacts/perf/frankentorch-kgs4.139/gauntlet_20260620T1822Z/summary.md`
+
 ## 2026-06-20 - frankentorch-kgs4.123 - RMSNorm f32 unit-dy no-ship
 
 - Lever attempted: the existing code-first f32 `rms_norm_backward_f32`
