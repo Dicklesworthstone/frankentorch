@@ -359,6 +359,44 @@ is explicitly satisfied.
   - `artifacts/perf/frankentorch-kgs4.127/gauntlet_20260619T0530Z/clippy_ft_kernel_cpu.log`
   - `artifacts/perf/frankentorch-kgs4.127/gauntlet_20260619T0530Z/summary.md`
 
+## 2026-06-19 - frankentorch-grefr - SmoothL1 paired randn fill
+
+- Kept lever: f64 `randn` and f64 `randn_like` now fill outputs two at a time
+  from one Box-Muller transform, using both independent normal samples instead
+  of discarding the sine-side sample. The seeded f64 random-normal conformance
+  fixtures were updated to the new deterministic sequence.
+- Rejected lever in the same bead: beta=1 SmoothL1 backward derivative as a
+  saturated/clamped special case. Same-worker `vmi1227854` A/B regressed from
+  `517.82 ms` to `558.21 ms`, so the derivative candidate was reverted.
+- Workload: `smooth_l1/grad_8m`, 8,388,608 f64 elements, mean reduction,
+  including session creation, two `randn` tensors, forward loss, and backward.
+- Decisive internal A/B: direct local Criterion pre-lever median `588.51 ms`;
+  final paired-randn candidate median `469.36 ms`; internal speedup `1.25x`.
+- PyTorch head-to-head: local PyTorch `2.12.1+cpu`, 32 threads, median
+  `347.528377 ms`; final FrankenTorch/PyTorch ratio `1.35x` slower.
+- RCH evidence: pre-lever remote row on `vmi1264463` measured `2.1181 s`;
+  candidate remote row on `vmi1293453` measured `944.17 ms`; candidate retry
+  selected `vmi1264463` but fell back local after remote sync timeout. These
+  rows are retained as build/routing evidence, not decisive A/B proof.
+- Correctness: `rch exec -- cargo test -p ft-conformance` passed after the
+  f64 seeded-normal fixture update; `rch exec -- cargo check -p ft-api`,
+  `rch exec -- cargo clippy -p ft-api -- -D warnings`, and the narrow
+  `randn_creates_normal_values` guard passed.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N` for this bead.
+- Verdict: kept as a measured internal win that narrows the SmoothL1 train-step
+  gap, still a PyTorch loss. Next attempts should target remaining
+  session/tape/allocation/loss-kernel overhead rather than another scalar
+  SmoothL1 derivative branch.
+- Evidence:
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/summary.md`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/baseline_local_direct_after_randn_pair_revert.log`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/candidate_final_local_direct_smooth_l1_grad_8m.log`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/local_torch_smooth_l1_grad_8m.json`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/baseline_local_fallback_after_randn_pair_revert.log`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/candidate_randn_pair_rch_ft_api_smooth_l1_grad_8m.log`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/candidate_randn_pair_rch_vmi1264463_retry_ft_api_smooth_l1_grad_8m.log`
+  - `artifacts/perf/frankentorch-grefr/gauntlet_20260619T175945Z/test_ft_conformance_randn_pair_shared_helper.log`
+
 ## 2026-06-19 - frankentorch-kgs4.126 - max_pool1d unit-dout scatter
 
 - Lever: special-case `functional_max_pool1d` f64 backward when `dout` is exact

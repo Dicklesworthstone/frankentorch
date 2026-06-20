@@ -1,0 +1,13 @@
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 40.20s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/ops_bench-8824b9e24f0b8087)
+Gnuplot not found, using plotters backend
+Benchmarking smooth_l1/grad_8m
+Benchmarking smooth_l1/grad_8m: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 58.6s, or reduce sample count to 10.
+Benchmarking smooth_l1/grad_8m: Collecting 100 samples in estimated 58.605 s (100 iterations)
+Benchmarking smooth_l1/grad_8m: Analyzing
+smooth_l1/grad_8m       time:   [584.70 ms 588.51 ms 592.48 ms]
+                        change: [+29.724% +31.021% +32.272%] (p = 0.00 < 0.05)
+                        Performance has regressed.

@@ -1,0 +1,40 @@
+  [2m2026-06-19T23:51:03.991726Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1264463 at root@38.242.209.154 (2 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:866 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-19T23:51:04.291539Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: dbca29276fa80333)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-19T23:51:04.291577Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-19T23:51:15.804038Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1264463...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-19T23:51:15.804096Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch -> /data/projects/frankentorch on vmi1264463[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-19T23:51:45.804950Z[0m [33m WARN[0m [1;33mrch::transfer[0m[33m: [33msync_to_remote: retryable error on attempt 1/3: sync_to_remote: timed out after 30000ms[0m
+    [2;3mat[0m rch/src/transfer.rs:339 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-19T23:51:45.857821Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mRemote execution failed: sync_to_remote: timed out after 30000ms, running locally[0m
+    [2;3mat[0m rch/src/hook.rs:1012 [2;3mon[0m ThreadId(1)
+
+[RCH] local (remote execution failed)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 48.91s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/ops_bench-8824b9e24f0b8087)
+Gnuplot not found, using plotters backend
+Benchmarking smooth_l1/grad_8m
+Benchmarking smooth_l1/grad_8m: Warming up for 3.0000 s
+
+Warning: Unable to complete 100 samples in 5.0s. You may wish to increase target time to 45.0s, or reduce sample count to 10.
+Benchmarking smooth_l1/grad_8m: Collecting 100 samples in estimated 44.983 s (100 iterations)
+Benchmarking smooth_l1/grad_8m: Analyzing
+smooth_l1/grad_8m       time:   [446.23 ms 449.17 ms 452.15 ms]
+                        change: [-80.241% -78.794% -77.218%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 100 measurements (1.00%)
+  1 (1.00%) high mild

@@ -15,9 +15,10 @@ Updated: 2026-06-19
 | `frankentorch-kgs4.126` | max_pool1d f64 train step `[8,64,8192]` | `12.31x` slower | no gain; candidate median `184.41 ms` vs parent `178.47 ms` | reverted |
 | `frankentorch-kgs4.127` | SmoothL1 f64 one-sided input grad, 8M elems | `1.79x` slower | internal keep; same-host local `746.26 ms` -> `647.44 ms` | kept; route remaining gap to tape/allocation/SIMD |
 | `frankentorch-kgs4.128` | max_pool3d f64 train step `[2,32,16,32,32]` | `9.38x` slower clean baseline | no gain; borrowed-input median `22.764 ms`, unit-dout median `16.160 ms`, sequential unit-dout median `22.465 ms` | reverted product candidates; keep stage probe |
+| `frankentorch-grefr` | SmoothL1 f64 mean-loss backward, 8M elems | `1.35x` slower | internal keep; direct local `588.51 ms` -> `469.36 ms`; beta=1 derivative branch rejected | kept paired-randn fill; route remaining gap to tape/allocation/loss-kernel |
 
-Measured-discipline score: `9/9` for the gauntlet lanes. PyTorch head-to-head
-score: `0W / 9L / 0N`. Correctness guards are green and the SDPA, MaxPool3d, Linear,
+Measured-discipline score: `10/10` for the gauntlet lanes. PyTorch head-to-head
+score: `0W / 10L / 0N`. Correctness guards are green and the SDPA, MaxPool3d, Linear,
 and SmoothL1 levers include real internal speedups, but no measured workload is
 performance-dominant against PyTorch yet.
 
@@ -48,6 +49,12 @@ avg_pool1d 7/0 + max_pool1d 1/0, conformance 199/0 + all sub-suites, clippy clea
 
 | Gate | Scope | Result |
 |---|---|---|
+| Criterion | `cargo bench -p ft-api --bench ops_bench -- smooth_l1/grad_8m --noplot` | `frankentorch-grefr` direct local A/B completed; paired-randn candidate `469.36 ms` vs pre-lever `588.51 ms`; PyTorch `347.528377 ms`, ratio `1.35x` slower |
+| Remote build/bench | `rch exec -- cargo bench -p ft-api --bench ops_bench -- smooth_l1/grad_8m --noplot` | pre-lever remote row on `vmi1264463` `2.1181 s`; paired-randn candidate row on `vmi1293453` `944.17 ms`; candidate retry selected `vmi1264463` but fell back local after sync timeout; remote rows are routing evidence, not decisive A/B proof |
+| Compile | `rch exec -- cargo check -p ft-api` | passed for `frankentorch-grefr` |
+| Clippy | `rch exec -- cargo clippy -p ft-api -- -D warnings` | passed for `frankentorch-grefr` |
+| Correctness | `rch exec -- cargo test -p ft-api randn_creates_normal_values`; `rch exec -- cargo test -p ft-conformance` | both passed for `frankentorch-grefr` after seeded f64 normal fixture update |
+| UBS | `ubs` on changed files, docs-only, `crates/ft-api/src/lib.rs` retry, and pre-commit hook | docs-only exited 0; changed-file scan timed out after 300s, Rust-only retry timed out after 180s, and hook timed out on staged large-file Rust scan with no findings emitted before timeout |
 | Criterion | `RCH_WORKER=vmi1227854 RCH_WORKERS=vmi1227854 rch exec -- cargo bench -p ft-api --bench ops_bench -- sdpa/grad_16x512x64 --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | kgs4.113 current scaled-alpha path median `82.730 ms`; temporary old post-scale variant median `114.40 ms`; new/old ratio `0.723x` (`1.38x` faster), old shape rejected |
 | PyTorch gauntlet | `cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | local diagnostic PyTorch `2.12.0+cpu`; FrankenTorch median `63.057 ms`, PyTorch median `48.915 ms`, ratio `1.29x` slower |
 | Remote build/bench | `rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot` | built and ran FrankenTorch arm on `vmi1227854`, median `53.254 ms`; PyTorch arm failed because remote `torch` was unavailable |
