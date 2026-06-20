@@ -278,6 +278,24 @@ fn bench_avg_pool1d_unit_dy(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("frankentorch_kgs4_134_fused_sum_loss", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = require(
+                session.tensor_variable(black_box(values.clone()), black_box(shape.clone()), true),
+                "failed to create FrankenTorch tensor",
+            );
+            let loss = require(
+                session.functional_avg_pool1d_sum(x, 2, 2),
+                "failed to run FrankenTorch fused avg_pool1d sum",
+            );
+            black_box(require(
+                session.tensor_backward(loss),
+                "failed to run FrankenTorch fused avg_pool1d backward",
+            ))
+        });
+    });
+
     group.bench_function("pytorch_2_12_cpu", |b| {
         b.iter_custom(run_pytorch_avg_pool1d_grad);
     });

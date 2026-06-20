@@ -1,0 +1,31 @@
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 48.13s
+     Running benches/pytorch_gauntlet_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/pytorch_gauntlet_bench-5f2ebc2fd9ddf042)
+Gnuplot not found, using plotters backend
+Benchmarking gauntlet_avg_pool1d_grad/frankentorch_kgs4_122
+Benchmarking gauntlet_avg_pool1d_grad/frankentorch_kgs4_122: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 5.1s or enable flat sampling.
+Benchmarking gauntlet_avg_pool1d_grad/frankentorch_kgs4_122: Collecting 10 samples in estimated 5.0817 s (55 iterations)
+Benchmarking gauntlet_avg_pool1d_grad/frankentorch_kgs4_122: Analyzing
+gauntlet_avg_pool1d_grad/frankentorch_kgs4_122
+                        time:   [73.752 ms 79.285 ms 84.821 ms]
+                        change: [-26.932% -21.519% -16.438%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Benchmarking gauntlet_avg_pool1d_grad/pytorch_2_12_cpu
+Benchmarking gauntlet_avg_pool1d_grad/pytorch_2_12_cpu: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 19.3s.
+Benchmarking gauntlet_avg_pool1d_grad/pytorch_2_12_cpu: Collecting 10 samples in estimated 19.329 s (10 iterations)
+Benchmarking gauntlet_avg_pool1d_grad/pytorch_2_12_cpu: Analyzing
+gauntlet_avg_pool1d_grad/pytorch_2_12_cpu
+                        time:   [5.7328 ms 6.2886 ms 6.8511 ms]
+                        change: [-27.780% -9.2925% +10.353%] (p = 0.48 > 0.05)
+                        No change in performance detected.
+

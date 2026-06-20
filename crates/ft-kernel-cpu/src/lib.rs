@@ -7678,6 +7678,146 @@ pub fn avg_pool1d_backward_f64(
     din
 }
 
+fn avg_pool1d_sum_pairwise_leaf_f64(
+    input: &[f64],
+    start: usize,
+    len: usize,
+    kernel: usize,
+    output_len: usize,
+    stride: usize,
+    count: usize,
+) -> f64 {
+    let div = kernel as f64;
+    let mut acc = 0.0_f64;
+    for flat in start..start + count {
+        let plane = flat / output_len;
+        let ox = flat - plane * output_len;
+        let ibase = plane * len;
+        let input_start = ibase + ox * stride;
+        let mut sum = 0.0_f64;
+        for kx in 0..kernel {
+            sum += input[input_start + kx];
+        }
+        acc += sum / div;
+    }
+    acc
+}
+
+fn avg_pool1d_sum_pairwise_range_f64(
+    input: &[f64],
+    start: usize,
+    len: usize,
+    kernel: usize,
+    output_len: usize,
+    stride: usize,
+    count: usize,
+) -> f64 {
+    const BLOCK: usize = 128;
+    if count <= BLOCK {
+        return avg_pool1d_sum_pairwise_leaf_f64(
+            input, start, len, kernel, output_len, stride, count,
+        );
+    }
+    let mid = count / 2;
+    avg_pool1d_sum_pairwise_range_f64(input, start, len, kernel, output_len, stride, mid)
+        + avg_pool1d_sum_pairwise_range_f64(
+            input,
+            start + mid,
+            len,
+            kernel,
+            output_len,
+            stride,
+            count - mid,
+        )
+}
+
+fn avg_pool1d_sum_pairwise_range_f64_par(
+    input: &[f64],
+    start: usize,
+    len: usize,
+    kernel: usize,
+    output_len: usize,
+    stride: usize,
+    count: usize,
+) -> f64 {
+    const PAR_BLOCK: usize = 1 << 14;
+    if count <= PAR_BLOCK {
+        return avg_pool1d_sum_pairwise_range_f64(
+            input, start, len, kernel, output_len, stride, count,
+        );
+    }
+    let mid = count / 2;
+    let (left, right) = rayon::join(
+        || {
+            avg_pool1d_sum_pairwise_range_f64_par(
+                input, start, len, kernel, output_len, stride, mid,
+            )
+        },
+        || {
+            avg_pool1d_sum_pairwise_range_f64_par(
+                input,
+                start + mid,
+                len,
+                kernel,
+                output_len,
+                stride,
+                count - mid,
+            )
+        },
+    );
+    left + right
+}
+
+/// Fused `sum(avg_pool1d(...))` forward (f64) over `[batch, ch, len]`.
+///
+/// Computes the logical pooled output values in row-major order and reduces
+/// them with the same pairwise tree as [`sum_tensor_contiguous_f64`], but does
+/// not allocate the pooled tensor.
+#[must_use]
+pub fn avg_pool1d_sum_forward_f64(
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    len: usize,
+    kernel: usize,
+    output_len: usize,
+    stride: usize,
+) -> f64 {
+    let count = batch * ch * output_len;
+    if count >= SUM_PARALLEL_THRESHOLD {
+        avg_pool1d_sum_pairwise_range_f64_par(input, 0, len, kernel, output_len, stride, count)
+    } else {
+        avg_pool1d_sum_pairwise_range_f64(input, 0, len, kernel, output_len, stride, count)
+    }
+}
+
+/// Scalar-loss backward for [`avg_pool1d_sum_forward_f64`].
+///
+/// Equivalent to [`avg_pool1d_backward_f64`] with a dense output gradient filled
+/// with `upstream`, but avoids allocating the output-gradient buffer.
+#[must_use]
+pub fn avg_pool1d_backward_scalar_f64(
+    upstream: f64,
+    batch: usize,
+    ch: usize,
+    len: usize,
+    kernel: usize,
+    output_len: usize,
+    stride: usize,
+) -> Vec<f64> {
+    let mut din = vec![0.0f64; batch * ch * len];
+    din.par_chunks_mut(len).for_each(|drow| {
+        let g = upstream / kernel as f64;
+        for ox in 0..output_len {
+            let start = ox * stride;
+            for kx in 0..kernel {
+                drow[start + kx] += g;
+            }
+        }
+    });
+    din
+}
+
 /// Fused max-pool1d forward (f64) over `[batch, ch, len]`.
 /// Mirrors the `max_pool2d` `kh=1` first-argmax scan without routing through a
 /// rank-4 shape.
@@ -27144,6 +27284,49 @@ mod tests {
             digest = digest.wrapping_mul(0x100000001b3);
         }
         assert_eq!(digest, 0xfe6d6e661bd9cb67, "avg_pool1d direct golden digest");
+    }
+
+    #[test]
+    fn avg_pool1d_sum_scalar_backward_matches_materialized_bits() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        let (batch, ch, len) = (2usize, 3usize, 17usize);
+        let (kernel, stride) = (5usize, 3usize);
+        let output_len = (len - kernel) / stride + 1;
+        let input: Vec<f64> = (0..batch * ch * len)
+            .map(|i| (((i * 43 + 17) % 181) as f64 - 90.0) * 0.015625)
+            .collect();
+        let upstream = -0.375_f64;
+
+        let pooled =
+            super::avg_pool1d_forward_f64(&input, batch, ch, len, kernel, output_len, stride);
+        let meta = TensorMeta::from_shape(vec![batch, ch, output_len], DType::F64, Device::Cpu);
+        let expected_sum =
+            super::sum_tensor_contiguous_f64(&pooled, &meta).expect("materialized sum");
+        let got_sum =
+            super::avg_pool1d_sum_forward_f64(&input, batch, ch, len, kernel, output_len, stride);
+        assert_eq!(got_sum.to_bits(), expected_sum.to_bits());
+
+        let dense_dout = vec![upstream; batch * ch * output_len];
+        let expected_grad = super::avg_pool1d_backward_f64(
+            &dense_dout,
+            batch,
+            ch,
+            len,
+            kernel,
+            output_len,
+            stride,
+        );
+        let got_grad = super::avg_pool1d_backward_scalar_f64(
+            upstream, batch, ch, len, kernel, output_len, stride,
+        );
+        for (index, (&got, &want)) in got_grad.iter().zip(expected_grad.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "avg_pool1d scalar grad[{index}]"
+            );
+        }
     }
 
     #[test]

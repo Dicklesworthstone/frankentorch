@@ -4,6 +4,52 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-20 - frankentorch-kgs4.134 - AvgPool1d fused scalar-sum keep with PyTorch loss
+
+- Lever attempted: add a fused f64 `sum(avg_pool1d(input, kernel=2, stride=2))`
+  scalar-loss path that computes the pooled sum directly and backpropagates a
+  scalar upstream gradient without materializing the pooled output gradient
+  buffer.
+- Workload: `pytorch_gauntlet_bench` `avg_pool1d`, f64
+  `[N,C,L]=[8,64,8192]`, kernel `2`, stride `2`, scalar `sum` loss.
+- Baseline local PyTorch oracle run:
+  - Existing `frankentorch_kgs4_122` median `79.285 ms`.
+  - PyTorch `2.12` CPU median `6.2886 ms`.
+  - Baseline FT/PyTorch ratio `12.61x` slower.
+- Candidate local PyTorch oracle run:
+  - Same-run existing `frankentorch_kgs4_122` median `69.267 ms`.
+  - Candidate `frankentorch_kgs4_134_fused_sum_loss` median `59.050 ms`.
+  - Same-run fused/existing latency ratio `0.8525x`, or `1.17x` faster.
+  - PyTorch `2.12` CPU median `7.8192 ms`; candidate FT/PyTorch ratio
+    `7.55x` slower.
+- Remote rch Rust-only gauntlet:
+  - Worker `vmi1152480`; existing row median `134.74 ms`; fused row median
+    `87.564 ms`.
+  - Same-run fused/existing latency ratio `0.6500x`, or `1.54x` faster.
+  - Remote PyTorch arm failed with `ModuleNotFoundError: No module named
+    'torch'`; treat the rch row as Rust build/bench proof, not PyTorch ratio
+    evidence.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N`.
+- Verdict: keep. The fused scalar-sum path is bit-equivalent in focused API and
+  kernel tests, improves the measured avg_pool1d training row locally and on
+  rch, and narrows the PyTorch gap. It does not dominate PyTorch and remains a
+  release-readiness loss.
+- Retry condition: do not retry another avg_pool1d kernel-only 2x2-style
+  microlever for this row. The remaining gap should move deeper into
+  persistent gradient allocation, arena-backed tape/session buffers, a broader
+  fused loss/backward primitive family, or a profiler-backed path that removes
+  whole-buffer `.grad` traffic beyond this scalar-sum special case.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/baseline_local_pytorch_avg_pool1d.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/candidate_local_pytorch_avg_pool1d.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/baseline_rch_avg_pool1d.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/candidate_rch_avg_pool1d.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/test_ft_kernel_cpu_avg_pool1d_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/test_ft_api_avg_pool1d_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/test_ft_conformance.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/clippy_ft_kernel_cpu_lib.log`
+  - `artifacts/perf/frankentorch-kgs4.134/gauntlet_20260620T0607Z/clippy_ft_api_gauntlet.log`
+
 ## 2026-06-20 - frankentorch-maxpool3d-scalar-loss-grad-buffers-7wru6 - MaxPool3d accumulate-only report reject
 
 - Lever attempted: add a PyTorch-style `tensor_backward_accumulate` path that
