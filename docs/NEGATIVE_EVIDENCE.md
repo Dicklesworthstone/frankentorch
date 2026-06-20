@@ -4,6 +4,63 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-20 - frankentorch-kgs4.137 - RMSNorm scalar-sum no-ship
+
+- Lever attempted: a dedicated `functional_rms_norm_sum` scalar-loss candidate
+  for `sum(rms_norm(input, weight))`, backed by scalar forward/backward helpers
+  that avoid materializing the normalized output tensor, the `tensor_sum` tape
+  node, and dense all-ones `dy`.
+- Workload: f64 RMSNorm train scalar sum, shape `[2048,1024]`, affine weight
+  gradient enabled.
+- Source of idea: scalar-loss specialization and partial evaluation to remove
+  output allocation and dense upstream allocation before attacking deeper tape,
+  arena, and layout work.
+- Baseline same-worker evidence: rch Criterion on `vmi1227854`, materialized
+  `rms_norm/grad_2048x1024` time `[11.683 ms, 12.229 ms, 12.596 ms]`.
+- Candidate same-worker evidence: rch Criterion on `vmi1227854`, existing
+  materialized same-run time `[11.334 ms, 12.086 ms, 13.179 ms]`, Criterion
+  change `[-5.4276%, +2.1375%, +10.578%]`, `p=0.61`; scalar-sum candidate
+  time `[11.023 ms, 12.329 ms, 13.944 ms]`.
+- Ratios: scalar/materialized same-run `1.020x` slower; scalar/baseline
+  `1.008x` slower. The same-worker keep gate failed.
+- PyTorch comparator: rch workers lacked `torch`, so the PyTorch arm is a
+  local-only comparator. Local PyTorch `2.12.1+cpu`, 32 threads, clone/detach
+  per rep, measured median `14.360424 ms`, mean `13.693821 ms`, min
+  `4.994618 ms`, p95 `19.172968 ms`. Mixed-location scalar/PyTorch median
+  ratio is `0.8586x`, but this is not counted as a release win because the
+  candidate failed the same-worker FrankenTorch A/B gate.
+- Win/loss/neutral vs PyTorch: `0W / 0L / 1N` for release scoring. The
+  PyTorch ratio is recorded as mixed-location evidence only.
+- Verdict: reject and no-ship. Product source was not landed in the clean
+  closeout commit.
+- Retry condition: do not retry a scalar-loss wrapper that only removes
+  materialized output and dense `dy`. A retry must fuse below the tape/session
+  allocation boundary, reuse persistent RMSNorm row statistics or workspaces,
+  prove f32-native storage/layout gains, or add automatic scalar-loss pattern
+  matching that removes the session/tape overhead as well.
+- Gates:
+  - `rch exec -- cargo test -p ft-kernel-cpu scalar_backward --lib -- --nocapture`:
+    passed, 6 focused scalar-backward tests on the candidate branch.
+  - `rch exec -- cargo test -p ft-api rms_norm_sum_matches --lib -- --nocapture`:
+    passed, 2 focused API tests on the candidate branch.
+  - `rch exec -- cargo test -p ft-conformance strict_scheduler -- --nocapture`:
+    passed, 1 strict-scheduler conformance test.
+  - `rch exec -- cargo check -p ft-kernel-cpu --all-targets`: passed on the
+    candidate branch after unrelated example-warning cleanup.
+  - `rch exec -- cargo check -p ft-api --all-targets`: passed on the candidate
+    branch after unrelated example-warning cleanup.
+  - `rch exec -- cargo fmt --check`: passed on the candidate branch.
+  - `rch exec -- cargo clippy -p ft-kernel-cpu --all-targets -- -D warnings`
+    and `rch exec -- cargo clippy -p ft-api --all-targets -- -D warnings`
+    remained blocked by broad pre-existing all-target lint debt; no source was
+    shipped from this lane.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.137/gauntlet_20260620T133307Z/baseline_rch_ops_rms_norm_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.137/gauntlet_20260620T133307Z/candidate_rch_ops_rms_norm_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.137/gauntlet_20260620T133307Z/local_pytorch_rms_norm_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.137/gauntlet_20260620T133307Z/env.txt`
+  - `artifacts/perf/frankentorch-kgs4.137/gauntlet_20260620T133307Z/summary.md`
+
 ## 2026-06-20 - frankentorch-kgs4.136 - f32 BatchNorm2d scalar-sum keep with PyTorch loss
 
 - Lever attempted: add an affine f32 `functional_batch_norm2d_sum` scalar-loss

@@ -6,6 +6,7 @@ Updated: 2026-06-20
 
 | Bead | Workload | Result vs PyTorch | Before/after verdict | Release action |
 |---|---:|---:|---:|---|
+| `frankentorch-kgs4.137` | RMSNorm f64 scalar-sum train step `[2048,1024]` | mixed-location `0.86x` PyTorch median, not release-counted | no gain; same-worker scalar `12.329 ms` vs materialized same-run `12.086 ms` and baseline `12.229 ms` | rejected/no source landed; route to tape/session allocation, workspace reuse, automatic scalar-loss fusion, or f32-native layout |
 | `frankentorch-kgs4.136` | BatchNorm2d f32 fused scalar-sum train step `[32,256,28,28]` | mixed-location `13.94x` slower | internal keep; rch Criterion `114.23 ms` fused -> `78.166 ms` scalar-sum; direct diagnostic `10.80 ms` fused -> `1.66 ms` scalar-sum | kept; route remaining gap to stats/backward reuse, arena/tape allocation, automatic loss fusion, and f32 storage/layout |
 | `frankentorch-kgs4.135` | GroupNorm f32 fused scalar-sum train step `[8,64,28,28]`, groups `32` | direct A/B `5.58x` slower | internal keep; rch direct path `8.30 ms` fused -> `2.10 ms` scalar-sum; Criterion `17.139 ms` materialized -> `8.9874 ms` scalar-sum | kept; route remaining gap to automatic loss fusion, arena/tape allocation, f32 storage/layout, and scheduler work |
 | `frankentorch-kgs4.116` | LayerNorm f64 train step `[2048,1024]` | `3.58x` slower | internal keep; same-worker rch parent `90.723 ms` -> current `29.606 ms`; f32 diagnostic `1930.66 ms` -> `293.49 ms` | kept; route remaining gap to allocation/tape/loss fusion/workspaces/parallel reductions |
@@ -25,11 +26,36 @@ Updated: 2026-06-20
 | `frankentorch-kgs4.133` | conv2d f64 train step `[4,64,64,64]`, 64 3x3 filters | `1.91x` slower; candidate `1.86x` slower | no gain; same-worker rch `121.07 ms` -> `117.92 ms`, `p=0.38`, no change detected | rejected; removed dormant all-ones-dout branch |
 | `frankentorch-grefr` | SmoothL1 f64 mean-loss backward, 8M elems | `1.35x` slower | internal keep; direct local `588.51 ms` -> `469.36 ms`; beta=1 derivative branch rejected | kept paired-randn fill; route remaining gap to tape/allocation/loss-kernel |
 
-Measured-discipline score: `18/18` for the gauntlet lanes. PyTorch head-to-head
-score: `0W / 18L / 0N`. Correctness guards are green and the SDPA, MaxPool3d,
+Measured-discipline score: `19/19` for the gauntlet lanes. PyTorch head-to-head
+score: `0W / 18L / 1N`; the RMSNorm scalar-sum comparator is neutral for
+release scoring because the candidate was faster than local PyTorch by
+mixed-location ratio but failed the same-worker FrankenTorch keep gate.
+Correctness guards are green and the SDPA, MaxPool3d,
 Linear, LayerNorm, BatchNorm2d, GroupNorm, and SmoothL1 levers include real
 internal speedups, but no measured workload is performance-dominant against
 PyTorch yet.
+
+### 2026-06-20 RMSNorm scalar-sum no-ship (`frankentorch-kgs4.137`)
+
+A dedicated f64 `sum(rms_norm(input, weight))` scalar-loss candidate removed
+the normalized output allocation, the `tensor_sum` tape node, and dense
+all-ones upstream allocation, but did not clear the same-worker A/B gate.
+On `vmi1227854`, the materialized baseline was `[11.683 ms, 12.229 ms,
+12.596 ms]`. The candidate run measured the existing materialized row at
+`[11.334 ms, 12.086 ms, 13.179 ms]` with no detected change (`p=0.61`) and
+the scalar-sum row at `[11.023 ms, 12.329 ms, 13.944 ms]`. That is `1.020x`
+slower than materialized in the same run and `1.008x` slower than baseline.
+
+Remote PyTorch was unavailable on rch workers (`No module named 'torch'`).
+The local PyTorch `2.12.1+cpu` comparator, 32 threads with clone/detach per
+rep, measured median `14.360424 ms`, so the mixed-location scalar/PyTorch
+ratio was `0.8586x`. That ratio is recorded but not release-counted because
+the product candidate lost to the existing FrankenTorch path. Focused
+candidate-branch tests passed (`ft-kernel-cpu` scalar backward 6/0,
+`ft-api` RMSNorm scalar-sum 2/0), strict-scheduler conformance passed 1/0,
+`ft-api` and `ft-kernel-cpu` all-target checks passed, and `cargo fmt --check`
+passed. All-target clippy remains blocked by existing broad lint debt, and no
+source from this lane was shipped.
 
 ### 2026-06-19 root-cause — the pooling-train-step losses are the generic backward machinery (`frankentorch-96e5d`)
 

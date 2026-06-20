@@ -1,0 +1,254 @@
+  [2m2026-06-20T13:33:07.325191Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: vmi1227854 at root@109.123.245.77 (4 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:921 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:07.537951Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: dbca29276fa80333)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:07.537994Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:09.158360Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker vmi1227854...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:09.158410Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch -> /data/projects/frankentorch on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:17.058128Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 7899ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:17.058202Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-api -> /data/projects/frankentorch/crates/ft-api on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:18.924686Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1866ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:18.924758Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-autograd -> /data/projects/frankentorch/crates/ft-autograd on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:20.715146Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1790ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:20.715211Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-conformance -> /data/projects/frankentorch/crates/ft-conformance on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:22.610798Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1895ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:22.610871Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-core -> /data/projects/frankentorch/crates/ft-core on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:24.450350Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1839ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:24.450448Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-data -> /data/projects/frankentorch/crates/ft-data on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:26.340290Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1889ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:26.340380Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-device -> /data/projects/frankentorch/crates/ft-device on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:28.105568Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1765ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:28.105650Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-dispatch -> /data/projects/frankentorch/crates/ft-dispatch on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:30.040119Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1934ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:30.040205Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-kernel-cpu -> /data/projects/frankentorch/crates/ft-kernel-cpu on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:31.818174Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1777ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:31.818247Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-nn -> /data/projects/frankentorch/crates/ft-nn on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:33.652638Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1834ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:33.652711Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-optim -> /data/projects/frankentorch/crates/ft-optim on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:35.508833Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1856ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:35.508908Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-runtime -> /data/projects/frankentorch/crates/ft-runtime on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:37.279842Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1770ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:37.279962Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-serialize -> /data/projects/frankentorch/crates/ft-serialize on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:39.152532Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1872ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:39.152584Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 53574 files, 2051929 bytes in 29986ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:486 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:46.679822Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo bench -p ft-api --bench ops_bench -- rms_norm/grad_2048x1024 --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:33:46.679915Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/.rch-targets/frankentorch-cod-b -> /data/projects/frankentorch/.rch-target-vmi1227854-pool-a7b1c8c357b0059b1f61676dcab2f583[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anes v0.1.6
+  Downloaded anstyle v1.0.14
+  Downloaded autocfg v1.5.0
+  Downloaded aho-corasick v1.1.4
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded bytemuck v1.25.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded oorandom v11.1.5
+  Downloaded safe_arch v0.7.4
+  Downloaded memchr v2.8.0
+  Downloaded serde v1.0.228
+  Downloaded proc-macro2 v1.0.106
+  Downloaded clap_lex v1.1.0
+  Downloaded is-terminal v0.4.17
+  Downloaded matrixmultiply v0.3.10
+  Downloaded itoa v1.0.18
+  Downloaded rawpointer v0.2.1
+  Downloaded quote v1.0.45
+  Downloaded criterion v0.5.1
+  Downloaded unicode-ident v1.0.24
+  Downloaded serde_json v1.0.149
+  Downloaded same-file v1.0.6
+  Downloaded tinytemplate v1.2.1
+  Downloaded ciborium-ll v0.2.2
+  Downloaded ciborium v0.2.2
+  Downloaded serde_core v1.0.228
+  Downloaded either v1.15.0
+  Downloaded once_cell v1.21.4
+  Downloaded cast v0.3.0
+  Downloaded ciborium-io v0.2.2
+  Downloaded walkdir v2.5.0
+  Downloaded plotters-svg v0.3.7
+  Downloaded plotters-backend v0.3.7
+  Downloaded num-complex v0.4.6
+  Downloaded zmij v1.0.21
+  Downloaded cfg-if v1.0.4
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded clap_builder v4.6.0
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded num-traits v0.2.19
+  Downloaded clap v4.6.1
+  Downloaded criterion-plot v0.5.0
+  Downloaded serde_derive v1.0.228
+  Downloaded rayon-core v1.13.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded regex v1.12.3
+  Downloaded half v2.7.1
+  Downloaded wide v0.7.33
+  Downloaded itertools v0.10.5
+  Downloaded rayon v1.12.0
+  Downloaded plotters v0.3.7
+  Downloaded libm v0.2.16
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling either v1.15.0
+   Compiling rayon-core v1.13.0
+   Compiling serde_core v1.0.228
+   Compiling libm v0.2.16
+   Compiling rawpointer v0.2.1
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling serde_json v1.0.149
+   Compiling libc v0.2.185
+   Compiling plotters-backend v0.3.7
+   Compiling ciborium-io v0.2.2
+   Compiling itoa v1.0.18
+   Compiling memchr v2.8.0
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+   Compiling clap_lex v1.1.0
+   Compiling crossbeam-epoch v0.9.18
+   Compiling syn v2.0.117
+   Compiling regex-syntax v0.8.10
+   Compiling anstyle v1.0.14
+   Compiling crossbeam-deque v0.8.6
+   Compiling clap_builder v4.6.0
+   Compiling num-complex v0.4.6
+   Compiling rayon v1.12.0
+   Compiling plotters-svg v0.3.7
+   Compiling itertools v0.10.5
+   Compiling regex-automata v0.4.14
+   Compiling same-file v1.0.6
+   Compiling cast v0.3.0
+   Compiling walkdir v2.5.0
+   Compiling plotters v0.3.7
+   Compiling clap v4.6.1
+   Compiling is-terminal v0.4.17
+   Compiling anes v0.1.6
+   Compiling criterion-plot v0.5.0
+   Compiling oorandom v11.1.5
+   Compiling once_cell v1.21.4
+   Compiling bytemuck_derive v1.10.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling regex v1.12.3
+   Compiling bytemuck v1.25.0
+   Compiling safe_arch v0.7.4
+   Compiling wide v0.7.33
+   Compiling tinytemplate v1.2.1
+   Compiling half v2.7.1
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch/crates/ft-runtime)
+   Compiling criterion v0.5.1
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1m 35s
+     Running benches/ops_bench.rs (.rch-target-vmi1227854-pool-a7b1c8c357b0059b1f61676dcab2f583/release/deps/ops_bench-8824b9e24f0b8087)
+Gnuplot not found, using plotters backend
+Benchmarking rms_norm/grad_2048x1024
+Benchmarking rms_norm/grad_2048x1024: Warming up for 1.0000 s
+Benchmarking rms_norm/grad_2048x1024: Collecting 10 samples in estimated 3.4418 s (275 iterations)
+Benchmarking rms_norm/grad_2048x1024: Analyzing
+rms_norm/grad_2048x1024 time:   [11.683 ms 12.229 ms 12.596 ms]
+
+  [2m2026-06-20T13:35:29.064363Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 102384ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:653 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:29.064615Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:702 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:29.064632Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankentorch on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2246 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:30.973007Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1908ms (5 files, 1859 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2301 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:30.973041Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 5 files, 1859 bytes in 1908ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:735 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:30.973154Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankentorch/.rch-target-vmi1227854-pool-a7b1c8c357b0059b1f61676dcab2f583 on vmi1227854[0m
+    [2;3mat[0m rch/src/transfer.rs:2246 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:33.009202Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 2036ms (14 files, 554 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2301 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T13:35:33.009236Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 14 files, 554 bytes in 2036ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:859 [2;3mon[0m ThreadId(1)
+
+[RCH] remote vmi1227854 (145.7s)
