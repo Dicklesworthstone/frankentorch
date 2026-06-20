@@ -1,0 +1,32 @@
+[RCH] local (no admissible workers: critical_pressure=2,insufficient_slots=9)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch-cod-a-push-kgs4-125/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 41.90s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/ops_bench-f346db443111867a)
+Gnuplot not found, using plotters backend
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Collecting 10 samples in estimated 3.2586 s (495 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_native: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_native
+                        time:   [6.9664 ms 7.0438 ms 7.1372 ms]
+                        change: [+2.6115% +6.5082% +10.962%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Collecting 10 samples in estimated 3.2499 s (605 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_scalar_sum: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_scalar_sum
+                        time:   [4.9708 ms 5.1432 ms 5.4034 ms]
+                        change: [+2.1829% +7.9224% +14.236%] (p = 0.02 < 0.05)
+                        Performance has regressed.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Warming up for 1.0000 s
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Collecting 10 samples in estimated 5.4585 s (110 iterations)
+Benchmarking batch_norm/grad_1d_ncl_16x128x256_fold_reference: Analyzing
+batch_norm/grad_1d_ncl_16x128x256_fold_reference
+                        time:   [23.402 ms 25.714 ms 31.377 ms]
+                        change: [-35.599% -17.474% +6.1621%] (p = 0.16 > 0.05)
+                        No change in performance detected.
+

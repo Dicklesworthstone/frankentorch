@@ -10097,10 +10097,11 @@ pub fn batch_norm_backward_scalar_f64(
     let m = (batch * spatial) as f64;
     let inv_m = 1.0 / m;
     let cs = channels * spatial;
+    let rstd: Vec<f64> = (0..channels).map(|c| 1.0 / (var[c] + eps).sqrt()).collect();
     let mut dweight = vec![0.0f64; channels];
     if spatial == 1 {
         dweight.par_iter_mut().enumerate().for_each(|(c, dwc)| {
-            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let rstd = rstd[c];
             let mut sw = 0.0f64;
             for n in 0..batch {
                 let idx = n * channels + c;
@@ -10109,7 +10110,6 @@ pub fn batch_norm_backward_scalar_f64(
             *dwc = upstream * sw;
         });
         let dbias = vec![upstream * m; channels];
-        let rstd: Vec<f64> = (0..channels).map(|c| 1.0 / (var[c] + eps).sqrt()).collect();
         let mut dx = vec![0.0f64; x.len()];
         dx.par_chunks_mut(channels)
             .enumerate()
@@ -10128,7 +10128,7 @@ pub fn batch_norm_backward_scalar_f64(
         return (dx, dweight, dbias);
     }
     dweight.par_iter_mut().enumerate().for_each(|(c, dwc)| {
-        let rstd = 1.0 / (var[c] + eps).sqrt();
+        let rstd = rstd[c];
         let mut sw = 0.0f64;
         for n in 0..batch {
             let base = n * cs + c * spatial;
@@ -10146,7 +10146,7 @@ pub fn batch_norm_backward_scalar_f64(
         .for_each(|(idx, dxrow)| {
             let c = idx % channels;
             let base = idx * spatial;
-            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let rstd = rstd[c];
             let w = weight[c];
             let c1 = w * dbias[c];
             let c2 = w * dweight[c];

@@ -4,6 +4,107 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-20 - frankentorch-kgs4.140 - BatchNorm1d scalar-backward saved-rstd keep with PyTorch loss
+
+- Lever attempted: precompute per-channel `rstd = 1 / sqrt(var + eps)` once in
+  f64 `batch_norm_backward_scalar_f64` and reuse it in both the `dweight`
+  reduction and `dx` pass. This is saved-stat reuse inside the scalar-loss
+  backward primitive: no public API change, no hook/retain-grad visibility
+  change, and no new unsafe code.
+- Workload: f64 BatchNorm1d training forward plus scalar backward,
+  `[N,C,L]=[16,128,256]`, affine weight and bias require gradients, measured
+  through `ops_bench` `batch_norm/grad_1d_ncl_16x128x256`.
+- Source of idea: alien-graveyard/adaptive specialization and profiling pass:
+  reject broad JIT/arena changes until a narrow profile-backed primitive pays;
+  reuse per-channel saved statistics before moving to true forward
+  deforestation or generated scalar-loss kernels.
+- Baseline evidence:
+  - Initial `rch exec` baseline fell back locally because no workers were
+    admissible: native automatic `7.0438 ms`, explicit scalar `5.1432 ms`,
+    fold-reference `25.714 ms`. This row is recorded as routing evidence only.
+  - Same-worker parent rerun on `vmi1152480` measured native automatic
+    `5.6654 ms`, explicit scalar `6.0145 ms`, and fold-reference `62.683 ms`.
+- Rejected probes:
+  - Direct scalar-forward automatic shortcut: replacing the automatic
+    `tensor_sum(batch_norm1d_output)` value with `batch_norm_sum_forward_f64`
+    changed the retained-fallback loss bits by 16 ULPs in
+    `functional_batch_norm1d_tensor_sum_auto_shortcut_matches_retained_fallback`.
+    Reverted; do not retry unless the scalar reduction can preserve storage-order
+    bit identity or the observable contract is deliberately changed.
+  - Algebraic zero-gradient proof: returning zero `dx`/`dweight` for finite
+    scalar upstream passed the scaled tolerance kernel case, but failed
+    `batch_norm_f64_scalar_backward_matches_unit_dy_bits` for bit-exact `dx`
+    parity. Reverted; do not retry without a PyTorch-equivalent bit contract or
+    a separate mode that does not claim dense-backward bit parity.
+- Candidate evidence:
+  - Same-worker after-run on `vmi1152480` measured native automatic
+    `4.7142 ms`, explicit scalar `3.5559 ms`, and fold-reference `41.846 ms`.
+    Internal ratios: native `1.20x` faster, explicit scalar `1.69x` faster
+    (`p = 0.00`, Criterion significant), fold-reference `1.50x` faster
+    (`p = 0.00`).
+  - A prior candidate run on the same worker was mixed (`5.9294 ms` native,
+    `5.7389 ms` scalar, `62.918 ms` fold) and is retained as noise evidence;
+    the parent rerun plus final candidate rerun is the keep comparison.
+- PyTorch comparator: local PyTorch `2.12.1+cpu`, 32 threads, same NCL f64
+  fixture, clone/detach per rep, measured best stable median `0.880459 ms`
+  after a thread sweep. An anomalous `torch.set_num_interop_threads(32)` run
+  measured `114.048819 ms`; this was rejected as a comparator outlier because
+  the immediate thread probe measured 32-thread median `0.650027 ms` and the
+  full corrected 40-sample run measured `0.880459 ms`.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N`. The kept automatic native row is
+  still `5.35x` slower than PyTorch; explicit scalar is still `4.04x` slower.
+- Verdict: keep. The saved-`rstd` hunk is a small, bit-preserving primitive win
+  with same-worker evidence, and it improves both ordinary automatic
+  scalar-loss call sites and the explicit scalar API. It does not dominate
+  PyTorch.
+- Retry condition: the remaining BatchNorm1d gap should not retry scalar
+  backward square-root reuse. Target true output deforestation for
+  `batch_norm(...).sum()`, generated shape-specialized scalar-loss kernels,
+  tape/session arena reuse, or a stronger zero-gradient proof that satisfies
+  the existing bit tests or explicitly changes the mode contract.
+- Gates:
+  - `rch exec -- cargo test -p ft-kernel-cpu batch_norm_f64_scalar_backward_matches -- --nocapture`:
+    passed, 2 f64 scalar-backward tests.
+  - `rch exec -- cargo test -p ft-api functional_batch_norm1d -- --nocapture`:
+    passed, 10 BatchNorm1d API tests.
+  - `rch exec -- cargo test -p ft-conformance`: passed, full conformance green.
+  - `rch exec -- cargo check -p ft-kernel-cpu --lib`: passed.
+  - `rch exec -- cargo check -p ft-api --lib --benches`: passed.
+  - `rch exec -- cargo clippy -p ft-kernel-cpu --lib -- -D warnings`: passed.
+  - `rch exec -- cargo clippy -p ft-api --lib -- -D warnings`: passed.
+  - `rch exec -- cargo clippy -p ft-api --lib --benches -- -D warnings`:
+    failed on pre-existing unrelated ft-api test/bench lint debt
+    (`approx_constant`, `identity_op`, `needless_borrow`, `manual_memcpy`,
+    `useless_vec`) outside this kernel change.
+  - `rch exec -- cargo build -p ft-kernel-cpu --release`: passed.
+  - `rustfmt --edition 2024 --check crates/ft-kernel-cpu/src/lib.rs`: failed
+    on pre-existing full-file drift outside the touched BatchNorm hunk.
+  - `git diff --check`: passed.
+  - `ubs crates/ft-kernel-cpu/src/lib.rs`: exit 0, 0 critical issues, existing
+    large-file warning inventory.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/baseline_rch_ops_batch_norm1d_ncl.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/pytorch_best32_batch_norm1d_ncl_f64_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/pytorch_thread_probe_batch_norm1d_ncl_f64_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/test_auto_shortcut_candidate.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/test_kernel_batch_norm_f64_scalar_zero_candidate.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/test_kernel_batch_norm_f64_scalar_rstd_candidate.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/test_api_auto_shortcut_rstd_candidate.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/parent_rerun_rch_ops_batch_norm1d_ncl.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/candidate_rerun_rch_ops_batch_norm1d_ncl_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/test_ft_api_functional_batch_norm1d_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/test_ft_conformance_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/check_ft_kernel_cpu_lib_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/check_ft_api_lib_benches_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/clippy_ft_kernel_cpu_lib_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/clippy_ft_api_lib_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/clippy_ft_api_lib_benches_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/build_ft_kernel_cpu_release_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/rustfmt_ft_kernel_cpu_check_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/git_diff_check_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/ubs_ft_kernel_cpu_rstd.log`
+  - `artifacts/perf/frankentorch-kgs4.140/gauntlet_20260620T185743Z/summary.md`
+
 ## 2026-06-20 - frankentorch-kgs4.139 - automatic BatchNorm1d tensor_sum shortcut keep with PyTorch loss
 
 - Lever attempted: automatically recognize `tensor_sum(batch_norm1d_output)` for
