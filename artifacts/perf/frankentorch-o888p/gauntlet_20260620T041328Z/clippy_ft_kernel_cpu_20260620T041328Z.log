@@ -1,0 +1,425 @@
+  [2m2026-06-20T04:26:24.904227Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at root@178.104.77.29 (2 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:921 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:25.225345Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch-cod-b-bold-verify-20260620T041328Z (hash: 48040b574be30e0f)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:25.225446Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:26.978164Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:26.978211Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:29.986270Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 3008ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:29.986378Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-api -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-api on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:31.963080Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1976ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:31.963199Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-autograd -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-autograd on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:33.956777Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1993ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:33.956882Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-conformance -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-conformance on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:36.043066Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2086ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:36.043133Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-core -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-core on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:38.285526Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2242ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:38.285601Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-data -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-data on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:40.285951Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2000ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:40.286090Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-device -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-device on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:42.447060Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2160ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:42.447137Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-dispatch on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:44.768715Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2321ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:44.768793Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-kernel-cpu on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:46.719926Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1951ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:46.720034Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-nn -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-nn on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:48.673794Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1953ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:48.673877Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-optim -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-optim on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:50.834081Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2160ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:50.834155Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-runtime -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-runtime on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:52.963061Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2128ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:52.963130Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-serialize -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-serialize on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:54.852026Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1888ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:26:54.852065Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 4157 files, 177289 bytes in 27866ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:486 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:27:01.824792Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo clippy -p ft-kernel-cpu --all-targets -- -D warnings[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-20T04:27:01.824835Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/.rch-targets/frankentorch-cod-b -> /data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/.rch-target-hz2-pool-33e71094c7f7a7ee16aba39f90c4cc9c[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded anes v0.1.6
+  Downloaded bit-set v0.8.0
+  Downloaded bit-vec v0.8.0
+  Downloaded anstyle v1.0.14
+  Downloaded autocfg v1.5.0
+  Downloaded fnv v1.0.7
+  Downloaded ciborium-io v0.2.2
+  Downloaded criterion-plot v0.5.0
+  Downloaded cast v0.3.0
+  Downloaded cfg-if v1.0.4
+  Downloaded ciborium-ll v0.2.2
+  Downloaded plotters-svg v0.3.7
+  Downloaded itoa v1.0.18
+  Downloaded quick-error v1.2.3
+  Downloaded unarray v0.1.4
+  Downloaded is-terminal v0.4.17
+  Downloaded clap_lex v1.1.0
+  Downloaded rawpointer v0.2.1
+  Downloaded rand_xorshift v0.4.0
+  Downloaded wait-timeout v0.2.1
+  Downloaded zmij v1.0.21
+  Downloaded clap v4.6.1
+  Downloaded half v2.7.1
+  Downloaded errno v0.3.14
+  Downloaded same-file v1.0.6
+  Downloaded walkdir v2.5.0
+  Downloaded tinytemplate v1.2.1
+  Downloaded rusty-fork v0.3.1
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded num-complex v0.4.6
+  Downloaded rand_chacha v0.9.0
+  Downloaded fastrand v2.4.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded plotters-backend v0.3.7
+  Downloaded rand_core v0.9.5
+  Downloaded quote v1.0.45
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded either v1.15.0
+  Downloaded oorandom v11.1.5
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded ciborium v0.2.2
+  Downloaded bitflags v2.11.1
+  Downloaded getrandom v0.3.4
+  Downloaded once_cell v1.21.4
+  Downloaded console v0.16.3
+  Downloaded similar v2.7.0
+  Downloaded num-traits v0.2.19
+  Downloaded serde_derive v1.0.228
+  Downloaded unicode-ident v1.0.24
+  Downloaded bytemuck v1.25.0
+  Downloaded matrixmultiply v0.3.10
+  Downloaded proc-macro2 v1.0.106
+  Downloaded tempfile v3.27.0
+  Downloaded serde_core v1.0.228
+  Downloaded rayon-core v1.13.0
+  Downloaded safe_arch v0.7.4
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded aho-corasick v1.1.4
+  Downloaded serde v1.0.228
+  Downloaded wide v0.7.33
+  Downloaded memchr v2.8.0
+  Downloaded rand v0.9.4
+  Downloaded criterion v0.5.1
+  Downloaded insta v1.47.2
+  Downloaded itertools v0.10.5
+  Downloaded plotters v0.3.7
+  Downloaded libm v0.2.16
+  Downloaded regex v1.12.3
+  Downloaded rayon v1.12.0
+  Downloaded clap_builder v4.6.0
+  Downloaded proptest v1.11.0
+  Downloaded serde_json v1.0.149
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded rustix v1.1.4
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+  Downloaded linux-raw-sys v0.12.1
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling libc v0.2.185
+    Checking cfg-if v1.0.4
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling getrandom v0.3.4
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling rustix v1.1.4
+   Compiling rayon-core v1.13.0
+    Checking once_cell v1.21.4
+    Checking either v1.15.0
+    Checking linux-raw-sys v0.12.1
+   Compiling zmij v1.0.21
+    Checking bitflags v2.11.1
+   Compiling serde v1.0.228
+    Checking regex-syntax v0.8.10
+    Checking fastrand v2.4.1
+   Compiling serde_json v1.0.149
+    Checking plotters-backend v0.3.7
+    Checking anstyle v1.0.14
+    Checking memchr v2.8.0
+   Compiling libm v0.2.16
+    Checking itoa v1.0.18
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+    Checking clap_lex v1.1.0
+    Checking ciborium-io v0.2.2
+    Checking plotters-svg v0.3.7
+    Checking itertools v0.10.5
+    Checking rawpointer v0.2.1
+    Checking quick-error v1.2.3
+    Checking clap_builder v4.6.0
+    Checking cast v0.3.0
+    Checking same-file v1.0.6
+    Checking crossbeam-epoch v0.9.18
+    Checking bit-vec v0.8.0
+    Checking fnv v1.0.7
+    Checking walkdir v2.5.0
+    Checking similar v2.7.0
+    Checking oorandom v11.1.5
+    Checking anes v0.1.6
+    Checking bit-set v0.8.0
+    Checking crossbeam-deque v0.8.6
+    Checking unarray v0.1.4
+   Compiling syn v2.0.117
+    Checking num-complex v0.4.6
+    Checking plotters v0.3.7
+    Checking wait-timeout v0.2.1
+    Checking is-terminal v0.4.17
+    Checking console v0.16.3
+    Checking rayon v1.12.0
+    Checking rand_core v0.9.5
+    Checking criterion-plot v0.5.0
+    Checking rand_xorshift v0.4.0
+    Checking rand v0.9.4
+    Checking regex-automata v0.4.14
+    Checking clap v4.6.1
+    Checking tempfile v3.27.0
+    Checking rusty-fork v0.3.1
+    Checking insta v1.47.2
+    Checking regex v1.12.3
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling serde_derive v1.0.228
+    Checking bytemuck v1.25.0
+    Checking safe_arch v0.7.4
+    Checking wide v0.7.33
+    Checking tinytemplate v1.2.1
+    Checking half v2.7.1
+    Checking ppv-lite86 v0.2.21
+    Checking rand_chacha v0.9.0
+    Checking ciborium-ll v0.2.2
+    Checking ft-core v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-core)
+    Checking proptest v1.11.0
+    Checking ciborium v0.2.2
+    Checking criterion v0.5.1
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-cod-b-bold-verify-20260620T041328Z/crates/ft-kernel-cpu)
+error: for loop over a single element
+  --> crates/ft-kernel-cpu/examples/unary_cb_f32_ab.rs:49:5
+   |
+49 | /     for &numel in &[262_144usize] {
+50 | |         let pool1 = rayon::ThreadPoolBuilder::new()
+51 | |             .num_threads(1)
+52 | |             .build()
+...  |
+58 | |         pooln.install(|| run_all(numel, 40));
+59 | |     }
+   | |_____^
+   |
+   = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#single_element_loop
+   = note: `-D clippy::single-element-loop` implied by `-D warnings`
+   = help: to override `-D warnings` add `#[allow(clippy::single_element_loop)]`
+help: try
+   |
+49 ~     {
+50 +         let &numel = &262_144usize;
+51 +         let pool1 = rayon::ThreadPoolBuilder::new()
+52 +             .num_threads(1)
+53 +             .build()
+54 +             .unwrap();
+55 +         println!("numel={numel}  OLD (serial / 1-thread == pre-commit, f32 was fully serial):");
+56 +         pool1.install(|| run_all(numel, 40));
+57 +         let pooln = rayon::ThreadPoolBuilder::new().build().unwrap();
+58 +         println!("numel={numel}  NEW (full pool = {nthreads} threads):");
+59 +         pooln.install(|| run_all(numel, 40));
+60 +     }
+   |
+
+error: could not compile `ft-kernel-cpu` (example "unary_cb_f32_ab") due to 1 previous error
+warning: build failed, waiting for other jobs to finish...
+error: items after a test module
+    --> crates/ft-kernel-cpu/src/lib.rs:929:5
+     |
+ 929 |       mod tile_iso_tests {
+     |       ^^^^^^^^^^^^^^^^^^
+...
+1023 |       pub fn dgemm_block(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1027 | /     pub fn dgemm_block_scaled(
+1028 | |         m: usize,
+1029 | |         k: usize,
+1030 | |         n: usize,
+...    |
+1034 | |         c: &mut [f64],
+1035 | |     ) {
+     | |_____^
+...
+1059 |       pub fn sgemm(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1089 | /     pub fn sgemm_scaled(
+1090 | |         m: usize,
+1091 | |         k: usize,
+1092 | |         n: usize,
+...    |
+1096 | |         c: &mut [f32],
+1097 | |     ) {
+     | |_____^
+...
+1123 |       fn sgemm_col_parallel(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1127 | /     fn sgemm_col_parallel_scaled(
+1128 | |         m: usize,
+1129 | |         k: usize,
+1130 | |         n: usize,
+...    |
+1134 | |         c: &mut [f32],
+1135 | |     ) {
+     | |_____^
+...
+1165 |       pub fn sgemm_bt(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1219 |       pub fn sgemm_tb(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1223 | /     pub fn sgemm_tb_scaled(
+1224 | |         m: usize,
+1225 | |         k: usize,
+1226 | |         n: usize,
+...    |
+1230 | |         c: &mut [f32],
+1231 | |     ) {
+     | |_____^
+...
+1259 |       fn sgemm_bt_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1281 |       pub fn sgemm_block(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1285 | /     pub fn sgemm_block_scaled(
+1286 | |         m: usize,
+1287 | |         k: usize,
+1288 | |         n: usize,
+...    |
+1292 | |         c: &mut [f32],
+1293 | |     ) {
+     | |_____^
+...
+1321 |       pub fn read_mxcsr() -> u32 {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1337 |       pub fn set_mxcsr_default() {
+     |       ^^^^^^^^^^^^^^^^^^^^^^^^^^
+...
+1363 | /     unsafe fn dgemm_mm(
+1364 | |         m: usize,
+1365 | |         k: usize,
+1366 | |         n: usize,
+...    |
+1377 | |         csc: isize,
+1378 | |     ) {
+     | |_____^
+...
+1391 | /     unsafe fn sgemm_mm(
+1392 | |         m: usize,
+1393 | |         k: usize,
+1394 | |         n: usize,
+...    |
+1405 | |         csc: isize,
+1406 | |     ) {
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#items_after_test_module
+     = note: `-D clippy::items-after-test-module` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::items_after_test_module)]`
+     = help: move the items to before the test module was defined
+
+error: the loop variable `ci` is used to index `wb`
+     --> crates/ft-kernel-cpu/src/lib.rs:27433:23
+      |
+27433 |             for ci in 0..c {
+      |                       ^^^^
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#needless_range_loop
+      = note: `-D clippy::needless-range-loop` implied by `-D warnings`
+      = help: to override `-D warnings` add `#[allow(clippy::needless_range_loop)]`
+help: consider using an iterator and enumerate()
+      |
+27433 -             for ci in 0..c {
+27433 +             for (ci, <item>) in wb.iter_mut().enumerate().take(c) {
+      |
+
+error: this operation has no effect
+     --> crates/ft-kernel-cpu/src/lib.rs:32668:27
+      |
+32668 |                 let idx = c * 1 + r * cols; // strides [1, cols]
+      |                           ^^^^^ help: consider reducing it to: `c`
+      |
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#identity_op
+      = note: `-D clippy::identity-op` implied by `-D warnings`
+      = help: to override `-D warnings` add `#[allow(clippy::identity_op)]`
+
+error: could not compile `ft-kernel-cpu` (lib test) due to 3 previous errors
+  [2m2026-06-20T04:27:17.483820Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=101 in 15658ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:653 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 failed (exit 101)

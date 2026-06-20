@@ -6626,6 +6626,20 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
     sh: usize,
     sw: usize,
 ) -> f64 {
+    if kd == 2 && kh == 2 && kw == 2 && sd == 2 && sh == 2 && sw == 2 {
+        return max_pool3d_sum_2x2s2_leaf_with_indices_f64(
+            input,
+            arg_offsets,
+            start,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+    }
+
     let out_plane_len = od * oh * ow;
     let out_row_len = oh * ow;
     let mut plane = start / out_plane_len;
@@ -6656,6 +6670,105 @@ fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
                 }
             }
         }
+        *arg_slot = arg as f64;
+        sum += max_value;
+
+        ox += 1;
+        if ox == ow {
+            ox = 0;
+            oy += 1;
+            if oy == oh {
+                oy = 0;
+                oz += 1;
+                if oz == od {
+                    oz = 0;
+                    plane += 1;
+                }
+            }
+        }
+    }
+    sum
+}
+
+#[allow(clippy::too_many_arguments)]
+fn max_pool3d_sum_2x2s2_leaf_with_indices_f64(
+    input: &[f64],
+    arg_offsets: &mut [f64],
+    start: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+) -> f64 {
+    let plane_len = id * ih * iw;
+    let out_plane_len = od * oh * ow;
+    let out_row_len = oh * ow;
+    let depth_stride = ih * iw;
+    let mut plane = start / out_plane_len;
+    let mut rem = start - plane * out_plane_len;
+    let mut oz = rem / out_row_len;
+    rem -= oz * out_row_len;
+    let mut oy = rem / ow;
+    let mut ox = rem - oy * ow;
+    let mut sum = 0.0_f64;
+    for arg_slot in arg_offsets {
+        let input_plane_base = plane * plane_len;
+        let z0 = (oz * 2) * depth_stride;
+        let z1 = z0 + depth_stride;
+        let row00 = z0 + (oy * 2) * iw;
+        let row01 = row00 + iw;
+        let row10 = z1 + (oy * 2) * iw;
+        let row11 = row10 + iw;
+        let x0 = ox * 2;
+        let loc000 = row00 + x0;
+        let loc001 = loc000 + 1;
+        let loc010 = row01 + x0;
+        let loc011 = loc010 + 1;
+        let loc100 = row10 + x0;
+        let loc101 = loc100 + 1;
+        let loc110 = row11 + x0;
+        let loc111 = loc110 + 1;
+
+        let mut max_value = input[input_plane_base + loc000];
+        let mut arg = loc000;
+        let candidate = input[input_plane_base + loc001];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc001;
+        }
+        let candidate = input[input_plane_base + loc010];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc010;
+        }
+        let candidate = input[input_plane_base + loc011];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc011;
+        }
+        let candidate = input[input_plane_base + loc100];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc100;
+        }
+        let candidate = input[input_plane_base + loc101];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc101;
+        }
+        let candidate = input[input_plane_base + loc110];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc110;
+        }
+        let candidate = input[input_plane_base + loc111];
+        if candidate > max_value {
+            max_value = candidate;
+            arg = loc111;
+        }
+
         *arg_slot = arg as f64;
         sum += max_value;
 
@@ -7082,14 +7195,10 @@ pub fn max_pool3d_backward_from_indices_scalar_f64(
         .enumerate()
         .for_each(|(plane, drow)| {
             let dbase = plane * out_plane_len;
-            for oz in 0..od {
-                for oy in 0..oh {
-                    for ox in 0..ow {
-                        let oidx = dbase + (oz * oh + oy) * ow + ox;
-                        let arg = arg_offsets[oidx] as usize;
-                        drow[arg] += upstream;
-                    }
-                }
+            let plane_offsets = &arg_offsets[dbase..dbase + out_plane_len];
+            for &arg_offset in plane_offsets {
+                let arg = arg_offset as usize;
+                drow[arg] += upstream;
             }
         });
     din
