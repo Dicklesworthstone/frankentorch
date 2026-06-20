@@ -6608,6 +6608,270 @@ pub fn max_pool3d_forward_with_indices_f64(
     (out, arg_offsets)
 }
 
+#[allow(clippy::too_many_arguments)]
+fn max_pool3d_sum_pairwise_leaf_with_indices_f64(
+    input: &[f64],
+    arg_offsets: &mut [f64],
+    start: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> f64 {
+    let out_plane_len = od * oh * ow;
+    let out_row_len = oh * ow;
+    let mut plane = start / out_plane_len;
+    let mut rem = start - plane * out_plane_len;
+    let mut oz = rem / out_row_len;
+    rem -= oz * out_row_len;
+    let mut oy = rem / ow;
+    let mut ox = rem - oy * ow;
+    let mut sum = 0.0_f64;
+    for arg_slot in arg_offsets {
+        let ibase = plane * id * ih * iw;
+        let bd = oz * sd;
+        let bh = oy * sh;
+        let bw = ox * sw;
+        let mut max_value = f64::NEG_INFINITY;
+        let mut arg = 0usize;
+        for kdd in 0..kd {
+            let dz = (bd + kdd) * ih * iw;
+            for kr in 0..kh {
+                let loc = dz + (bh + kr) * iw + bw;
+                for kc in 0..kw {
+                    let candidate_arg = loc + kc;
+                    let v = input[ibase + candidate_arg];
+                    if v > max_value {
+                        max_value = v;
+                        arg = candidate_arg;
+                    }
+                }
+            }
+        }
+        *arg_slot = arg as f64;
+        sum += max_value;
+
+        ox += 1;
+        if ox == ow {
+            ox = 0;
+            oy += 1;
+            if oy == oh {
+                oy = 0;
+                oz += 1;
+                if oz == od {
+                    oz = 0;
+                    plane += 1;
+                }
+            }
+        }
+    }
+    sum
+}
+
+#[allow(clippy::too_many_arguments)]
+fn max_pool3d_sum_pairwise_range_with_indices_f64(
+    input: &[f64],
+    arg_offsets: &mut [f64],
+    start: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> f64 {
+    const BLOCK: usize = 128;
+    if arg_offsets.len() <= BLOCK {
+        return max_pool3d_sum_pairwise_leaf_with_indices_f64(
+            input,
+            arg_offsets,
+            start,
+            id,
+            ih,
+            iw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+        );
+    }
+    let mid = arg_offsets.len() / 2;
+    let (left, right) = arg_offsets.split_at_mut(mid);
+    max_pool3d_sum_pairwise_range_with_indices_f64(
+        input, left, start, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+    ) + max_pool3d_sum_pairwise_range_with_indices_f64(
+        input,
+        right,
+        start + mid,
+        id,
+        ih,
+        iw,
+        kd,
+        kh,
+        kw,
+        od,
+        oh,
+        ow,
+        sd,
+        sh,
+        sw,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn max_pool3d_sum_pairwise_range_with_indices_f64_par(
+    input: &[f64],
+    arg_offsets: &mut [f64],
+    start: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> f64 {
+    const PAR_BLOCK: usize = 1 << 14;
+    if arg_offsets.len() <= PAR_BLOCK {
+        return max_pool3d_sum_pairwise_range_with_indices_f64(
+            input,
+            arg_offsets,
+            start,
+            id,
+            ih,
+            iw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+        );
+    }
+    let mid = arg_offsets.len() / 2;
+    let (left, right) = arg_offsets.split_at_mut(mid);
+    let (ls, rs) = rayon::join(
+        || {
+            max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                input, left, start, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            )
+        },
+        || {
+            max_pool3d_sum_pairwise_range_with_indices_f64_par(
+                input,
+                right,
+                start + mid,
+                id,
+                ih,
+                iw,
+                kd,
+                kh,
+                kw,
+                od,
+                oh,
+                ow,
+                sd,
+                sh,
+                sw,
+            )
+        },
+    );
+    ls + rs
+}
+
+/// Fused `sum(max_pool3d(...))` forward plus first-argmax sidecar (f64).
+///
+/// This avoids materializing the pooled output while preserving the exact
+/// pairwise reduction tree used by `tensor_sum(max_pool3d(...))`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_sum_forward_with_indices_f64(
+    input: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    kd: usize,
+    kh: usize,
+    kw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+    sd: usize,
+    sh: usize,
+    sw: usize,
+) -> (f64, Vec<f64>) {
+    const FUSED_POOL_SUM_PARALLEL_THRESHOLD: usize = 1 << 13;
+    let len = batch * ch * od * oh * ow;
+    let mut arg_offsets = vec![0.0_f64; len];
+    let sum = if len >= FUSED_POOL_SUM_PARALLEL_THRESHOLD {
+        max_pool3d_sum_pairwise_range_with_indices_f64_par(
+            input,
+            &mut arg_offsets,
+            0,
+            id,
+            ih,
+            iw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+        )
+    } else {
+        max_pool3d_sum_pairwise_range_with_indices_f64(
+            input,
+            &mut arg_offsets,
+            0,
+            id,
+            ih,
+            iw,
+            kd,
+            kh,
+            kw,
+            od,
+            oh,
+            ow,
+            sd,
+            sh,
+            sw,
+        )
+    };
+    (sum, arg_offsets)
+}
+
 /// f32 mirror of [`max_pool3d_forward_f64`]: per output, the max over its
 /// `kd×kh×kw` window, one pass parallel over `(batch,ch)` volumes. Replaces the
 /// f32 op-graph (narrow/amax/cat) the f32 no-grad path fell through to.
@@ -6786,6 +7050,44 @@ pub fn max_pool3d_backward_from_indices_f64(
                         let oidx = dbase + (oz * oh + oy) * ow + ox;
                         let arg = arg_offsets[oidx] as usize;
                         drow[arg] += dout[oidx];
+                    }
+                }
+            }
+        });
+    din
+}
+
+/// Scalar-loss backward for [`max_pool3d_sum_forward_with_indices_f64`].
+///
+/// Equivalent to scattering a dense `dout` filled with `upstream`, but avoids
+/// allocating that output-gradient buffer for `loss = sum(pool)`.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn max_pool3d_backward_from_indices_scalar_f64(
+    upstream: f64,
+    arg_offsets: &[f64],
+    batch: usize,
+    ch: usize,
+    id: usize,
+    ih: usize,
+    iw: usize,
+    od: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f64> {
+    let plane_len = id * ih * iw;
+    let out_plane_len = od * oh * ow;
+    let mut din = vec![0.0f64; batch * ch * plane_len];
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| {
+            let dbase = plane * out_plane_len;
+            for oz in 0..od {
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let oidx = dbase + (oz * oh + oy) * ow + ox;
+                        let arg = arg_offsets[oidx] as usize;
+                        drow[arg] += upstream;
                     }
                 }
             }
@@ -26404,6 +26706,83 @@ mod tests {
         for (i, (&g, &e)) in sidecar_grad.iter().zip(rescan_grad.iter()).enumerate() {
             assert_eq!(g.to_bits(), e.to_bits(), "max_pool3d sidecar grad[{i}]");
         }
+    }
+
+    #[test]
+    fn max_pool3d_sum_scalar_backward_matches_materialized_bits() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        let (batch, ch, id, ih, iw) = (2usize, 2usize, 5usize, 4usize, 4usize);
+        let (kd, kh, kw, sd, sh, sw) = (3usize, 2usize, 2usize, 1usize, 2usize, 2usize);
+        let od = (id - kd) / sd + 1;
+        let oh = (ih - kh) / sh + 1;
+        let ow = (iw - kw) / sw + 1;
+        let mut input: Vec<f64> = (0..batch * ch * id * ih * iw)
+            .map(|i| ((i * 41 + 17) % 59) as f64 * 0.125 - 3.0)
+            .collect();
+        input[0] = 9.0;
+        input[1] = 9.0;
+        input[4] = 8.0;
+        input[16] = 7.0;
+        input[17] = 7.0;
+        let upstream = -0.375_f64;
+
+        let (pooled, arg_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        let meta = TensorMeta::from_shape(vec![batch, ch, od, oh, ow], DType::F64, Device::Cpu);
+        let expected_sum =
+            super::sum_tensor_contiguous_f64(&pooled, &meta).expect("materialized sum");
+        let (got_sum, got_arg_offsets) = super::max_pool3d_sum_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        assert_eq!(got_sum.to_bits(), expected_sum.to_bits());
+        assert_eq!(
+            got_arg_offsets
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            arg_offsets
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
+
+        let dense_dout = vec![upstream; batch * ch * od * oh * ow];
+        let expected_grad = super::max_pool3d_backward_from_indices_f64(
+            &dense_dout,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        let got_grad = super::max_pool3d_backward_from_indices_scalar_f64(
+            upstream,
+            &got_arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            got_grad
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>(),
+            expected_grad
+                .iter()
+                .map(|value| value.to_bits())
+                .collect::<Vec<_>>()
+        );
     }
 
     #[test]
