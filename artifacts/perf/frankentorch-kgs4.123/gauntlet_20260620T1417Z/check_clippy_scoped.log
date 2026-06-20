@@ -1,0 +1,144 @@
+  [2m2026-06-20T14:40:20.079122Z[0m [33m WARN[0m [1;33mrch::hook[0m[33m: [33mexec called with non-compilation command: bash -lc '
+set -euo pipefail
+cargo check -p ft-kernel-cpu --lib
+cargo check -p ft-api --bench ops_bench
+cargo clippy -p ft-kernel-cpu --lib -- -D warnings
+cargo clippy -p ft-api --bench ops_bench -- -D warnings
+'[0m
+    [2;3mat[0m rch/src/hook.rs:749 [2;3mon[0m ThreadId(1)
+
+    Checking ft-core v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-kernel-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.12s
+    Checking either v1.15.0
+    Checking memchr v2.8.0
+    Checking ciborium-io v0.2.2
+    Checking plotters-backend v0.3.7
+    Checking regex-syntax v0.8.10
+    Checking itoa v1.0.18
+    Checking anstyle v1.0.14
+    Checking clap_lex v1.1.0
+    Checking cast v0.3.0
+    Checking same-file v1.0.6
+    Checking oorandom v11.1.5
+    Checking anes v0.1.6
+    Checking once_cell v1.21.4
+    Checking serde_core v1.0.228
+    Checking zmij v1.0.21
+    Checking num-traits v0.2.19
+    Checking libc v0.2.185
+    Checking ciborium-ll v0.2.2
+    Checking walkdir v2.5.0
+    Checking rayon v1.12.0
+    Checking itertools v0.10.5
+    Checking clap_builder v4.6.0
+    Checking plotters-svg v0.3.7
+    Checking num-complex v0.4.6
+    Checking plotters v0.3.7
+    Checking regex-automata v0.4.14
+    Checking is-terminal v0.4.17
+    Checking ft-core v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-core)
+    Checking criterion-plot v0.5.0
+    Checking clap v4.6.1
+    Checking ft-runtime v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-runtime)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-kernel-cpu)
+    Checking serde v1.0.228
+    Checking serde_json v1.0.149
+    Checking regex v1.12.3
+    Checking ciborium v0.2.2
+    Checking tinytemplate v1.2.1
+    Checking criterion v0.5.1
+    Checking ft-dispatch v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-dispatch)
+    Checking ft-autograd v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-autograd)
+    Checking ft-api v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-api)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 10.60s
+    Checking ft-core v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-kernel-cpu)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 2.97s
+    Checking ft-core v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-kernel-cpu)
+    Checking ft-runtime v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-runtime)
+    Checking ft-dispatch v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-dispatch)
+    Checking ft-autograd v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-autograd)
+    Checking ft-api v0.1.0 (/data/projects/frankentorch-cod-b-bold-20260620T1416/crates/ft-api)
+error: for loop over a single element
+   --> crates/ft-api/benches/ops_bench.rs:436:5
+    |
+436 | /     for &(rows, cols) in &[(2048usize, 2048usize)] {
+437 | |         let shape_name = format!("{rows}x{cols}");
+438 | |         group.throughput(Throughput::Elements((rows * cols) as u64));
+439 | |         group.bench_with_input(
+...   |
+468 | |         );
+469 | |     }
+    | |_____^
+    |
+    = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#single_element_loop
+    = note: `-D clippy::single-element-loop` implied by `-D warnings`
+    = help: to override `-D warnings` add `#[allow(clippy::single_element_loop)]`
+help: try
+    |
+436 ~     {
+437 +         let &(rows, cols) = &(2048usize, 2048usize);
+438 +         let shape_name = format!("{rows}x{cols}");
+439 +         group.throughput(Throughput::Elements((rows * cols) as u64));
+440 +         group.bench_with_input(
+441 +             BenchmarkId::new("amax_f64_lastdim", &shape_name),
+442 +             &(rows, cols),
+443 +             |b, &(rows, cols)| {
+444 +                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+445 +                 let x = s
+446 +                     .tensor_variable(
+447 +                         deterministic_values(rows * cols, 0.125),
+448 +                         vec![rows, cols],
+449 +                         false,
+450 +                     )
+451 +                     .unwrap();
+452 +                 b.iter(|| black_box(s.tensor_amax(black_box(x), 1).unwrap()));
+453 +             },
+454 +         );
+455 +         group.bench_with_input(
+456 +             BenchmarkId::new("amin_f64_lastdim", &shape_name),
+457 +             &(rows, cols),
+458 +             |b, &(rows, cols)| {
+459 +                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+460 +                 let x = s
+461 +                     .tensor_variable(
+462 +                         deterministic_values(rows * cols, 0.125),
+463 +                         vec![rows, cols],
+464 +                         false,
+465 +                     )
+466 +                     .unwrap();
+467 +                 b.iter(|| black_box(s.tensor_amin(black_box(x), 1).unwrap()));
+468 +             },
+469 +         );
+470 +     }
+    |
+
+error: for loop over a single element
+    --> crates/ft-api/benches/ops_bench.rs:2060:5
+     |
+2060 | /     for &n in &[20_000usize] {
+2061 | |         let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+2062 | |         group.bench_function(format!("all_distinct_{n}"), |bch| {
+2063 | |             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+...    |
+2066 | |         });
+2067 | |     }
+     | |_____^
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#single_element_loop
+help: try
+     |
+2060 ~     {
+2061 +         let &n = &20_000usize;
+2062 +         let data: Vec<f64> = (0..n).map(|i| i as f64).collect();
+2063 +         group.bench_function(format!("all_distinct_{n}"), |bch| {
+2064 +             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+2065 +             let t = s.tensor_1d(&data, false).unwrap();
+2066 +             bch.iter(|| black_box(s.tensor_unique(black_box(t), false, false, false).unwrap()));
+2067 +         });
+2068 +     }
+     |
+
+error: could not compile `ft-api` (bench "ops_bench") due to 2 previous errors

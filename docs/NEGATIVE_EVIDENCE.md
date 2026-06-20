@@ -4,6 +4,81 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-20 - frankentorch-kgs4.123 - RMSNorm f32 unit-dy no-ship
+
+- Lever attempted: the existing code-first f32 `rms_norm_backward_f32`
+  all-ones-`dy` specialization, which precomputes per-row `rstd` values and
+  skips loading the dense upstream gradient for scalar-sum RMSNorm backward.
+- Workload: f32 RMSNorm train scalar sum, shape `[2048,1024]`, affine weight
+  gradient enabled, measured through the new `ops_bench`
+  `rms_norm/grad_f32_2048x1024` row.
+- Source of idea: branch-specialized all-ones upstream, partial evaluation of
+  scalar-loss backward, and cache-friendly row-stat reuse before deeper
+  arena/tape/layout work.
+- Candidate same-worker evidence: rch Criterion on `vmi1149989`, active
+  f32 unit-dy branch time `[63.618 ms, 67.574 ms, 70.695 ms]`.
+- Reverted/final same-worker evidence: same worker and target dir, f32 branch
+  removed from product source, final time `[18.942 ms, 19.613 ms, 20.940 ms]`.
+  The clean source removal is `3.445x` faster than the active candidate. The
+  temporary branch-disabled probe measured `[16.839 ms, 18.496 ms, 20.014 ms]`
+  and served as the initial no-ship signal.
+- PyTorch comparator: local CPU PyTorch `2.12.1+cpu`, 32 threads, clone/detach
+  per rep, same shape and scalar loss, median `10.970112 ms`, mean
+  `11.077591 ms`, min `9.038869 ms`, p95 `12.749818 ms`. rch workers still
+  lack `torch`, so this remains a mixed-location PyTorch ratio.
+- Ratios: active candidate/PyTorch `6.1598x` slower; final source/PyTorch
+  `1.7879x` slower. Final source remains a PyTorch loss, but the attempted
+  specialization was a much larger regression.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N`.
+- Verdict: reject and revert. Removed the f32 unit-dy branch, removed its
+  now-misleading f32 fast-path bit-reference test, and kept the benchmark row
+  so this gap stays visible. The f64 unit-dy path is separate and was left
+  untouched.
+- Retry condition: do not retry an f32 RMSNorm all-ones-`dy` branch that
+  materializes per-row `rstds` and guard-scans `dy`, `x`, and `weight`. A retry
+  must move below this abstraction boundary: persistent row-stat reuse from
+  forward into backward, scalar-loss fusion in the tape scheduler, arena/bump
+  allocation for session/tensor/grad buffers, f32-native storage that avoids
+  dtype churn, or a generated fused f32 RMSNorm-sum primitive with a
+  same-worker keep gate.
+- Gates:
+  - `rch exec -- cargo test -p ft-kernel-cpu rms_norm_f64_unit_dy_fast_path_matches_generic_reference_bits --lib -- --nocapture`:
+    passed, 1 focused f64 guard test, confirming the unrelated f64 fast path
+    still has bit parity.
+  - `rch exec -- cargo test -p ft-api functional_rms_norm_f32_grad_matches_f64_path --lib -- --nocapture`:
+    passed, 1 focused f32 API gradient parity test.
+  - `rch exec -- cargo test -p ft-conformance strict_scheduler -- --nocapture`:
+    passed, strict-scheduler conformance green.
+  - `rch exec -- cargo check -p ft-api --bench ops_bench`: passed.
+  - `rch exec -- cargo clippy -p ft-api --bench ops_bench -- -D warnings`:
+    passed after removing two pre-existing single-element loops in the touched
+    bench file and rewriting one synthetic class comparison that UBS
+    misclassified as a secret comparison. Re-ran after rebasing over
+    `origin/main` and resolving the `ops_bench` conflict; it still passed.
+  - `rch exec -- cargo clippy -p ft-kernel-cpu --lib -- -D warnings`: passed.
+  - `ubs` on the scoped source/docs/artifact summary surface: passed with
+    `0` critical issues after the synthetic class-comparison false positive
+    was rewritten; the scan still reports the existing broad warning inventory
+    in the two large Rust files.
+  - `rustfmt --edition 2024 --check` on the touched Rust files remains blocked
+    by existing whole-file rustfmt drift in `ops_bench.rs` and
+    `ft-kernel-cpu/src/lib.rs`; no broad reformat was applied.
+  - `git diff --check` on the scoped surface: passed.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/candidate_rch_ops_rms_norm_grad_f32.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/generic_disabled_rch_ops_rms_norm_grad_f32.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/final_removed_f32_fastpath_rch_ops_rms_norm_grad_f32.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/local_pytorch_rms_norm_f32_sum.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/test_ft_kernel_cpu_rms_norm_f64_unit_dy.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/test_ft_api_rms_norm_f32_grad.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/test_ft_conformance_strict_scheduler.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/check_ft_api_ops_bench.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/clippy_ft_api_ops_bench_after_ubs_eq.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/clippy_ft_api_ops_bench_after_rebase.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/clippy_ft_kernel_cpu_lib.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/ubs_scoped_after_eq.log`
+  - `artifacts/perf/frankentorch-kgs4.123/gauntlet_20260620T1417Z/summary.md`
+
 ## 2026-06-20 - frankentorch-kgs4.137 - RMSNorm scalar-sum no-ship
 
 - Lever attempted: a dedicated `functional_rms_norm_sum` scalar-loss candidate

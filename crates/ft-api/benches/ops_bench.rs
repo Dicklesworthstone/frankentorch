@@ -1220,6 +1220,26 @@ fn bench_rms_norm(c: &mut Criterion) {
             )
         });
     });
+    group.bench_function("grad_f32_2048x1024", |b| {
+        let xv: Vec<f32> = (0..rows * hidden)
+            .map(|i| ((i % 877) as f32 - 400.0) * 0.002)
+            .collect();
+        let wv: Vec<f32> = (0..hidden).map(|j| 1.0 + (j % 13) as f32 * 0.01).collect();
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable_f32(xv.clone(), vec![rows, hidden], true)
+                .unwrap();
+            let w = session
+                .tensor_variable_f32(wv.clone(), vec![hidden], true)
+                .unwrap();
+            let out = session
+                .functional_rms_norm(x, vec![hidden], Some(w), 1e-6)
+                .unwrap();
+            let loss = session.tensor_sum(out).unwrap();
+            black_box(session.tensor_backward(loss).unwrap())
+        });
+    });
     group.bench_function("grad_2048x1024", |b| {
         // RNG generated ONCE; each iter rebuilds the requires_grad leaves via
         // tensor_variable (a cheap copy) so the measured time is forward+backward,
@@ -1670,7 +1690,7 @@ fn bench_supcon_loss(c: &mut Criterion) {
         let labels_v: Vec<f64> = (0..n).map(|i| (i % 8) as f64).collect();
         let temperature = 0.07_f64;
         b.iter(|| {
-            let labels_i: Vec<i64> = labels_v.iter().map(|&x| x as i64).collect();
+            let cohorts: Vec<i64> = labels_v.iter().map(|&x| x as i64).collect();
             let mut pos_mask = vec![0.0f64; n * n];
             let mut diag_mask = vec![0.0f64; n * n];
             let mut pos_count = vec![0.0f64; n];
@@ -1680,7 +1700,7 @@ fn bench_supcon_loss(c: &mut Criterion) {
                 diag_mask[i * n + i] = -1e30;
                 let mut cc = 0.0;
                 for j in 0..n {
-                    if i != j && labels_i[i].eq(&labels_i[j]) {
+                    if i != j && cohorts[i].eq(&cohorts[j]) {
                         pos_mask[i * n + j] = 1.0;
                         cc += 1.0;
                     }

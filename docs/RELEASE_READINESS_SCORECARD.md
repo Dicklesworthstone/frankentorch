@@ -8,6 +8,7 @@ Updated: 2026-06-20
 |---|---:|---:|---:|---|
 | `frankentorch-kgs4.137` | RMSNorm f64 scalar-sum train step `[2048,1024]` | mixed-location `0.86x` PyTorch median, not release-counted | no gain; same-worker scalar `12.329 ms` vs materialized same-run `12.086 ms` and baseline `12.229 ms` | rejected/no source landed; route to tape/session allocation, workspace reuse, automatic scalar-loss fusion, or f32-native layout |
 | `frankentorch-kgs4.125` | BatchNorm1d f64 native NCL train step `[16,128,256]` | same-host `4.85x` slower | internal keep; RCH native `4.3741 ms` vs fold `30.484 ms`; local row-coarsening `11.865 ms` -> `10.914 ms` | kept; route remaining gap to f64 scalar-loss fusion, dense-dy removal, tape/workspace reuse, and saved-stat reuse |
+| `frankentorch-kgs4.123` | RMSNorm f32 train scalar-sum step `[2048,1024]` | mixed-location `1.79x` slower | no gain; active f32 unit-dy branch `67.574 ms` vs final generic `19.613 ms` on `vmi1149989` | rejected/reverted f32 unit-dy branch; keep benchmark row; route to row-stat reuse, scalar-loss tape fusion, arena allocation, and f32 storage/layout |
 | `frankentorch-kgs4.136` | BatchNorm2d f32 fused scalar-sum train step `[32,256,28,28]` | mixed-location `13.94x` slower | internal keep; rch Criterion `114.23 ms` fused -> `78.166 ms` scalar-sum; direct diagnostic `10.80 ms` fused -> `1.66 ms` scalar-sum | kept; route remaining gap to stats/backward reuse, arena/tape allocation, automatic loss fusion, and f32 storage/layout |
 | `frankentorch-kgs4.135` | GroupNorm f32 fused scalar-sum train step `[8,64,28,28]`, groups `32` | direct A/B `5.58x` slower | internal keep; rch direct path `8.30 ms` fused -> `2.10 ms` scalar-sum; Criterion `17.139 ms` materialized -> `8.9874 ms` scalar-sum | kept; route remaining gap to automatic loss fusion, arena/tape allocation, f32 storage/layout, and scheduler work |
 | `frankentorch-kgs4.116` | LayerNorm f64 train step `[2048,1024]` | `3.58x` slower | internal keep; same-worker rch parent `90.723 ms` -> current `29.606 ms`; f32 diagnostic `1930.66 ms` -> `293.49 ms` | kept; route remaining gap to allocation/tape/loss fusion/workspaces/parallel reductions |
@@ -27,14 +28,33 @@ Updated: 2026-06-20
 | `frankentorch-kgs4.133` | conv2d f64 train step `[4,64,64,64]`, 64 3x3 filters | `1.91x` slower; candidate `1.86x` slower | no gain; same-worker rch `121.07 ms` -> `117.92 ms`, `p=0.38`, no change detected | rejected; removed dormant all-ones-dout branch |
 | `frankentorch-grefr` | SmoothL1 f64 mean-loss backward, 8M elems | `1.35x` slower | internal keep; direct local `588.51 ms` -> `469.36 ms`; beta=1 derivative branch rejected | kept paired-randn fill; route remaining gap to tape/allocation/loss-kernel |
 
-Measured-discipline score: `20/20` for the gauntlet lanes. PyTorch head-to-head
-score: `0W / 19L / 1N`; the RMSNorm scalar-sum comparator is neutral for
+Measured-discipline score: `21/21` for the gauntlet lanes. PyTorch head-to-head
+score: `0W / 20L / 1N`; the RMSNorm scalar-sum comparator is neutral for
 release scoring because the candidate was faster than local PyTorch by
 mixed-location ratio but failed the same-worker FrankenTorch keep gate.
 Correctness guards are green and the SDPA, MaxPool3d,
 Linear, LayerNorm, BatchNorm1d/2d, GroupNorm, and SmoothL1 levers include real
 internal speedups, but no measured workload is performance-dominant against
 PyTorch yet.
+
+### 2026-06-20 RMSNorm f32 unit-dy no-ship (`frankentorch-kgs4.123`)
+
+The existing f32 all-ones-`dy` RMSNorm backward branch was batch-verified and
+failed hard. On `vmi1149989`, the active branch measured
+`[63.618 ms, 67.574 ms, 70.695 ms]` for
+`rms_norm/grad_f32_2048x1024`; disabling the branch measured
+`[16.839 ms, 18.496 ms, 20.014 ms]`, and the final product source with the
+branch/helper/test removed measured `[18.942 ms, 19.613 ms, 20.940 ms]`.
+So the active candidate was `3.45x` slower than final source and was removed.
+
+Local PyTorch CPU `2.12.1+cpu`, 32 threads, clone/detach per rep, measured
+`10.970112 ms` median for the same f32 scalar-sum train row. The final
+FrankenTorch path is still `1.79x` slower by this mixed-location ratio; the
+active rejected branch would have been `6.16x` slower. Gates passed for the
+f32 API grad parity test, strict-scheduler conformance, `ft-api` bench check,
+`ft-api` bench clippy, `ft-kernel-cpu` lib clippy, and scoped UBS with `0`
+critical issues. Whole-file rustfmt on the touched giant files remains blocked
+by existing unrelated drift, so no broad formatting rewrite was applied.
 
 ### 2026-06-20 RMSNorm scalar-sum no-ship (`frankentorch-kgs4.137`)
 

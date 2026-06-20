@@ -1,0 +1,10 @@
+/data/projects/.venvs/frankentorch-pytorch-cpu/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+torch_version=2.12.1+cpu
+threads=32
+shape=2048x1024 dtype=f32 op=rms_norm_sum_backward
+median_ms=10.970112
+mean_ms=11.077591
+min_ms=9.038869
+p95_ms=12.749818
+samples_ms=11.913174,11.530799,11.216865,11.386726,11.030372,10.750882,12.290728,11.239187,10.749880,10.580119,10.267968,10.152599,13.106534,12.327899,9.497658,9.748734,10.583294,9.921782,9.507968,10.909853,11.388971,9.038869,10.636556,10.646966,12.749818,9.951188,13.312625,11.693077,11.928442,12.268206
