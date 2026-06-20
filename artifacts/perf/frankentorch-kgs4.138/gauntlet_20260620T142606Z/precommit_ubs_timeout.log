@@ -1,0 +1,5 @@
+ubs: large file(s) staged: crates/ft-api/src/lib.rs
+ubs: running with extended timeout (300s) or use UBS_SKIP=1 to bypass
+ubs: timeout on large file scan
+ubs: run manually: ubs --only=rust crates/ft-api/src/lib.rs
+ubs: or commit with: UBS_SKIP=1 git commit ...

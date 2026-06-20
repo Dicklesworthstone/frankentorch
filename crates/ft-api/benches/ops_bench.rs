@@ -886,6 +886,33 @@ fn bench_batch_norm(c: &mut Criterion) {
                 black_box(s.tensor_backward(loss).unwrap())
             });
         });
+        group.bench_function("grad_1d_ncl_16x128x256_scalar_sum", |b| {
+            b.iter(|| {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s
+                    .tensor_variable(xd.clone(), vec![ncl_n, ncl_c, ncl_l], true)
+                    .unwrap();
+                let rm = s.tensor_variable(rmd.clone(), vec![ncl_c], false).unwrap();
+                let rv = s
+                    .tensor_variable(vec![1.0; ncl_c], vec![ncl_c], false)
+                    .unwrap();
+                let wt = s.tensor_variable(wtd.clone(), vec![ncl_c], true).unwrap();
+                let bias = s.tensor_variable(bd.clone(), vec![ncl_c], true).unwrap();
+                let (loss, _, _) = s
+                    .functional_batch_norm1d_sum(
+                        x,
+                        Some(rm),
+                        Some(rv),
+                        Some(wt),
+                        Some(bias),
+                        true,
+                        0.1,
+                        1e-5,
+                    )
+                    .unwrap();
+                black_box(s.tensor_backward(loss).unwrap())
+            });
+        });
         group.bench_function("grad_1d_ncl_16x128x256_fold_reference", |b| {
             b.iter(|| {
                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);

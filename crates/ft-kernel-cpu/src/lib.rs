@@ -9838,6 +9838,42 @@ pub fn batch_norm_apply_f64(
     out
 }
 
+/// Scalar forward for `sum(BatchNorm(x, weight, bias))` in f64 training/eval
+/// lanes. This mirrors [`batch_norm_apply_f64`] but reduces directly to one
+/// scalar, avoiding the materialized normalized output for scalar-loss traces.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn batch_norm_sum_forward_f64(
+    x: &[f64],
+    mean: &[f64],
+    var: &[f64],
+    weight: Option<&[f64]>,
+    bias: Option<&[f64]>,
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    eps: f64,
+) -> f64 {
+    let cs = channels * spatial;
+    let per_channel: Vec<f64> = (0..channels)
+        .into_par_iter()
+        .map(|c| {
+            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let scale = rstd * weight.map_or(1.0, |w| w[c]);
+            let shift = bias.map_or(0.0, |b| b[c]) - mean[c] * scale;
+            let mut sum = 0.0f64;
+            for n in 0..batch {
+                let base = n * cs + c * spatial;
+                for s in 0..spatial {
+                    sum += x[base + s] * scale + shift;
+                }
+            }
+            sum
+        })
+        .collect();
+    per_channel.iter().sum()
+}
+
 /// f32 mirror of [`batch_norm_stats_f64`]: per-channel mean/var over the
 /// `(batch, spatial)` window, parallel over channels.
 #[must_use]
@@ -10106,6 +10142,88 @@ pub fn batch_norm_backward_f64(
                 }
             });
     }
+    (dx, dweight, dbias)
+}
+
+/// Scalar-upstream f64 BatchNorm backward for `sum(BatchNorm(...))`.
+///
+/// Algebraically identical to [`batch_norm_backward_f64`] with dense constant
+/// `dy = upstream`, without allocating or rereading that output-gradient buffer.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn batch_norm_backward_scalar_f64(
+    upstream: f64,
+    x: &[f64],
+    weight: &[f64],
+    mean: &[f64],
+    var: &[f64],
+    batch: usize,
+    channels: usize,
+    spatial: usize,
+    eps: f64,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>) {
+    let m = (batch * spatial) as f64;
+    let inv_m = 1.0 / m;
+    let cs = channels * spatial;
+    let mut dweight = vec![0.0f64; channels];
+    if spatial == 1 {
+        dweight.par_iter_mut().enumerate().for_each(|(c, dwc)| {
+            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let mut sw = 0.0f64;
+            for n in 0..batch {
+                let idx = n * channels + c;
+                sw += (x[idx] - mean[c]) * rstd;
+            }
+            *dwc = upstream * sw;
+        });
+        let dbias = vec![upstream * m; channels];
+        let rstd: Vec<f64> = (0..channels).map(|c| 1.0 / (var[c] + eps).sqrt()).collect();
+        let mut dx = vec![0.0f64; x.len()];
+        dx.par_chunks_mut(channels)
+            .enumerate()
+            .for_each(|(n, dxrow)| {
+                let base = n * channels;
+                for c in 0..channels {
+                    let rstd_c = rstd[c];
+                    let w = weight[c];
+                    let c1 = w * dbias[c];
+                    let c2 = w * dweight[c];
+                    let xhat = (x[base + c] - mean[c]) * rstd_c;
+                    let dxhat = upstream * w;
+                    dxrow[c] = rstd_c * inv_m * (m * dxhat - c1 - xhat * c2);
+                }
+            });
+        return (dx, dweight, dbias);
+    }
+    dweight.par_iter_mut().enumerate().for_each(|(c, dwc)| {
+        let rstd = 1.0 / (var[c] + eps).sqrt();
+        let mut sw = 0.0f64;
+        for n in 0..batch {
+            let base = n * cs + c * spatial;
+            for s in 0..spatial {
+                sw += (x[base + s] - mean[c]) * rstd;
+            }
+        }
+        *dwc = upstream * sw;
+    });
+    let dbias = vec![upstream * m; channels];
+    let mut dx = vec![0.0f64; x.len()];
+    dx.par_chunks_mut(spatial)
+        .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+        .enumerate()
+        .for_each(|(idx, dxrow)| {
+            let c = idx % channels;
+            let base = idx * spatial;
+            let rstd = 1.0 / (var[c] + eps).sqrt();
+            let w = weight[c];
+            let c1 = w * dbias[c];
+            let c2 = w * dweight[c];
+            let dxhat = upstream * w;
+            for s in 0..spatial {
+                let xhat = (x[base + s] - mean[c]) * rstd;
+                dxrow[s] = rstd * inv_m * (m * dxhat - c1 - xhat * c2);
+            }
+        });
     (dx, dweight, dbias)
 }
 
@@ -38360,6 +38478,95 @@ mod tests {
             }
         }
         assert_eq!(digest, 0x4edb3f2ac54649ea);
+    }
+
+    #[test]
+    fn batch_norm_f64_scalar_backward_matches_unit_dy_bits() {
+        for (batch, channels, spatial) in [(5usize, 7usize, 1usize), (3, 4, 15)] {
+            let eps = 1e-5f64;
+            let x: Vec<f64> = (0..batch * channels * spatial)
+                .map(|i| ((i % 37) as f64 - 18.0) * 0.03125 + (i as f64) * 0.0007)
+                .collect();
+            let dy = vec![1.0f64; x.len()];
+            let weight: Vec<f64> = (0..channels)
+                .map(|c| 0.8 + (c % 5) as f64 * 0.0625)
+                .collect();
+            let (mean, var) = crate::batch_norm_stats_f64(&x, batch, channels, spatial);
+
+            let (want_dx, want_dw, want_db) = crate::batch_norm_backward_f64(
+                &dy, &x, &weight, &mean, &var, batch, channels, spatial, eps,
+            );
+            let (got_dx, got_dw, got_db) = crate::batch_norm_backward_scalar_f64(
+                1.0, &x, &weight, &mean, &var, batch, channels, spatial, eps,
+            );
+
+            for (got, expected) in got_dx.iter().zip(want_dx.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dx mismatch for spatial={spatial}"
+                );
+            }
+            for (got, expected) in got_dw.iter().zip(want_dw.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dweight mismatch for spatial={spatial}"
+                );
+            }
+            for (got, expected) in got_db.iter().zip(want_db.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dbias mismatch for spatial={spatial}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn batch_norm_f64_scalar_backward_matches_scaled_dy_tolerance() {
+        for (batch, channels, spatial, upstream) in [
+            (5usize, 7usize, 1usize, -0.375f64),
+            (3usize, 4usize, 15usize, 0.625f64),
+        ] {
+            let eps = 1e-5f64;
+            let x: Vec<f64> = (0..batch * channels * spatial)
+                .map(|i| ((i % 37) as f64 - 18.0) * 0.03125 + (i as f64) * 0.0007)
+                .collect();
+            let dy = vec![upstream; x.len()];
+            let weight: Vec<f64> = (0..channels)
+                .map(|c| 0.8 + (c % 5) as f64 * 0.0625)
+                .collect();
+            let (mean, var) = crate::batch_norm_stats_f64(&x, batch, channels, spatial);
+
+            let (want_dx, want_dw, want_db) = crate::batch_norm_backward_f64(
+                &dy, &x, &weight, &mean, &var, batch, channels, spatial, eps,
+            );
+            let (got_dx, got_dw, got_db) = crate::batch_norm_backward_scalar_f64(
+                upstream, &x, &weight, &mean, &var, batch, channels, spatial, eps,
+            );
+
+            for (got, expected) in got_dx.iter().zip(want_dx.iter()) {
+                assert!(
+                    (got - expected).abs() <= 2.0e-14,
+                    "dx mismatch for spatial={spatial}: {got} vs {expected}"
+                );
+            }
+            for (got, expected) in got_dw.iter().zip(want_dw.iter()) {
+                assert!(
+                    (got - expected).abs() <= 2.0e-13,
+                    "dweight mismatch for spatial={spatial}: {got} vs {expected}"
+                );
+            }
+            for (got, expected) in got_db.iter().zip(want_db.iter()) {
+                assert_eq!(
+                    got.to_bits(),
+                    expected.to_bits(),
+                    "dbias mismatch for spatial={spatial}"
+                );
+            }
+        }
     }
 
     #[test]
