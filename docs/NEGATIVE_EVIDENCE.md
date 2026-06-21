@@ -3722,3 +3722,23 @@ strided scatter), gated outer_size<16 && inner_size>=2 && numel>=PARALLEL_THRESH
 par-over-outer path BYTE-UNCHANGED. LOW parity risk (sort logic untouched — only the parallelism axis
 changes; verify vs existing sort tests + head-to-head). Expect ~5x (570 -> ~100-150ms). f32 mirror after.
 Deferred to a fresh focused turn (parity-critical core op, same as the cummax precedent which worked).
+
+## 2026-06-21be - REFUTED: sort dim=0 lane-parallel does NOT beat PyTorch (strided gather/scatter is the floor)
+
+Implemented the filed sort-dim0 lane-parallel path (extract sort_one_lane_f64 + par over outer*inner
+lanes, collect columns + serial scatter; existing per-outer path unchanged). BIT-EXACT (12 sort kernel +
+29 ft-api sort tests pass). MEASURED dim=0 [262144,64]: FT 717ms vs PyTorch 554ms = FT 1.29x SLOWER. REFUTED.
+WHY (key lesson): unlike cumsum — where the loop REORDER (`for d { for inner }`) made the access
+CONTIGUOUS — sort's per-lane GATHER of a strided column (in_block[d*inner_size+inner]) is IRREDUCIBLY
+strided (cache-wasteful); the radix sort is already on contiguous keys, so the win was never compute, it
+was the gather/scatter bandwidth. The safe-Rust parallel path needs collect-columns (128MB+128MB allocs)
++ a serial strided SCATTER (16M strided writes ~100-200ms); that overhead, on top of a bandwidth-bound
+strided gather, pushes FT past PyTorch (which is ALSO bandwidth-bound at strided sort). An UNSAFE in-place
+strided parallel write would avoid collect/scatter but the campaign is safe-Rust. The transpose approach
+(transpose->sort-dim1->transpose) does 2x strided 128MB transposes ~= the gather cost (uncertain,
+overhead-heavy — same overhead the cumsum transpose-trick exploration hit). => sort dim=0 is
+BANDWIDTH-WALLED for safe Rust. The scan-family cache-REORDER lever does NOT generalize to sort: scans
+write in-place (reorderable to contiguous); sort gathers a strided column (irreducible). REVERTED
+(discarded, never committed). diff/flip/roll already FINE (21bd). The strided-non-last-dim vein is now
+fully bounded: it wins ONLY where the op can be REORDERED to contiguous access (cumsum/cumprod/cummax/
+cummin — element-wise scans), NOT where it must gather a strided lane (sort).
