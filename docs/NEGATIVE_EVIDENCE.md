@@ -3636,3 +3636,20 @@ path). VERIFIED ft-kernel-cpu 504/0, ft-api cumprod 6/0. cumprod BACKWARD deferr
 zero-branch, more complex). cummax (PyTorch dim=0 425ms!) + logcumsumexp (215ms) are apply_function in
 ft-api (not ft-kernel-cpu kernels) — separate lever. Scan-family cache-reorder win now = cumsum + cumprod
 forward (both f64/f32). Generalizable strided-scan cache lever PyTorch CPU lacks.
+
+## 2026-06-21ay - scan-reorder vein scoped: reductions dim=0 are cache-friendly (no win); cummax dim-aware = biggest weakness (425ms) but a feature gap
+
+Probed the strided-dim=0 lever beyond cumsum/cumprod. MEASURED PyTorch dim=0 [262144,64]:
+  REDUCTIONS (output is SMALL -> only strided READS, PyTorch accumulates row-friendly):
+    sum 4.86ms, prod 5.10ms (FAST, ~2x last-dim) ; max 31ms, argmax 35ms, var 29ms (slower but
+    bandwidth/extra-work, argmax already known DRAM-bound). => reductions have NO scan-like win; the
+    strided lever is SCAN-SPECIFIC (scans WRITE all elements strided = 2x cache waste, reductions don't).
+  SCANS (write all elements): cummax dim=0 = 425ms (!!), logcumsumexp 215ms.
+=> ★ cummax/cummin dim-aware is the BIGGEST PyTorch CPU weakness found (425ms - writes BOTH values AND
+indices strided) BUT FT only has a 1-D FLATTENED tensor_cummax (cummax_tensor->tensor_cummax); there is
+NO dim-aware torch.cummax(x,dim) equivalent. So it's a FEATURE GAP + ~4x perf opportunity, filed as a
+bead (cummax-dim-aware) for a dedicated effort: cummax_dim_f64/f32 kernel (cache-friendly for d { for
+inner } with acc_max[inner]+acc_idx[inner], tie >= + NaN-freeze per existing verified flattened
+semantics) + tensor_cummax_dim API + argmax-routing grad + parity tests (values+indices+tie+NaN vs
+torch). logcumsumexp = Sleef-walled (exp dominates). cumprod BACKWARD reorder = complex (division +
+O(dim²) zero-branch). Scan-FORWARD reorder vein (cumsum+cumprod, 21aw/21ax) is the clean harvest.
