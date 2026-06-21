@@ -3667,3 +3667,18 @@ parallel-matches-serial), full ft-kernel-cpu 509/0. Addresses the KERNEL half of
 frankentorch-cummax-dim-aware-yklin. REMAINING: ft-api tensor_cummax_dim wiring + argmax-routing grad +
 f32 mirror (follow-up). 3rd clean scan-family vs-PyTorch win (cumsum 2.83x / cumprod-fwd 2.65x /
 cummax-dim 3.32x) — all the same strided-non-last-dim cache lever PyTorch CPU lacks.
+
+## 2026-06-21ba - cummax-dim USER-FACING: tensor_cummax_dim API = 3.11x vs PyTorch end-to-end, bit-exact + grad
+
+Wired tensor_cummax_dim(input, dim) -> (values, indices) over the cummax_dim kernel (21az). No-grad f64
+FAST path borrows the input (contiguous_values, no 128MB copy) + MOVES both outputs (dropped a wasteful
+128MB indices.clone) -> end-to-end FT 150.9ms vs PyTorch 469ms = 3.11x (nearly the kernel's bare 3.32x;
+the first naive wiring with lossy-read + indices.clone was only 1.32x — the copy/clone overhead, same
+lesson as the cumsum value-extraction note). Grad / non-f64 path: gather along dim by the argmax indices
+(differentiable — its backward scatter-adds grad to the argmax positions = exactly the cummax gradient;
+dtype-preserving, so f32 is correct now, just not yet the fast kernel).
+VERIFIED: cummax_dim_values_indices_and_grad (dim0+dim1 values+indices + grad-scatter [[1,2,1],[1,0,1]]),
+ft-api 2336 pass (3 pre-existing peer reds: complex_arithmetic + 2 batch_norm, unrelated), API head-to-
+head 3.11x correct (examples/cummax_dim_api_headtohead.rs). cummax-dim is now USER-FACING + winning.
+REMAINING (bead cummax-dim-aware): cummin_dim + f32 fast kernels (f32 correct via gather today). 4th
+clean scan-family vs-PyTorch win (cumsum 2.83x / cumprod-fwd 2.65x / cummax-kernel 3.32x / cummax-API 3.11x).
