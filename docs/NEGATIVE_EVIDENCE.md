@@ -2266,3 +2266,15 @@ is explicitly satisfied.
   `save_for_backward` clones for ops whose backward needs the input (convertible to
   borrowed_inputs per-op, kgs4.119/132 pattern, ft-api). Neither is a clean generic engine
   lever. Parallelism levers remain dead in the rch ~10-core sandbox (2026-06-20b).
+
+## 2026-06-20j - avg_pool2d head-to-head validates 20q7c (create_graph forward-borrow)
+
+- avg_pool2d `[8,64,64,64]` f64 sum-loss train step uses `apply_function_with_create_graph`
+  (cqmed double-backward), so it is a direct beneficiary of 20q7c's create_graph Cow-borrow.
+- Local same-env head-to-head (torch 2.12.0+cpu, both arms, FT side tight): FrankenTorch
+  median **13.71 ms** (range 13.58-13.90), PyTorch **4.11 ms** (noisy 3.19-5.28) = **~3.3x
+  slower**, down from kgs4.112's **4.54x** (FT ~16.6 ms). FT-side ~16.6 -> 13.7 ms (~1.2x)
+  from the cumulative create_graph forward-borrow (20q7c) + lazy-slot/owned-move backward
+  levers.
+- Confirms 20q7c helps real create_graph lanes, not just the special-function long tail.
+  Caveat: local 64-core env, noisy PyTorch arm — directional.
