@@ -3477,3 +3477,28 @@ masked win intact). PLAN: first DRY the 4 masked branches into ONE shared helper
 (try_masked_sdpa_fast_path), THEN apply the (div,stride) + broadcast-H extension in that single place.
 Narrow gap (broadcast-H padding only); moderate value; deferred to the clean refactor. PyTorch f64 masked
 is always math, so once routed it WILL win (~1.6x) like the other masked cases.
+
+## 2026-06-21at - masked f64 SDPA GQA correction: primary/tensor win, GQA loss
+
+Re-verified the masked f64 SDPA entry points head-to-head after the GQA claim. Same-host proof used the
+retrieved FrankenTorch release example binary from the warm target dir plus local PyTorch CPU; RCH remote
+PyTorch was unavailable on `vmi1153651`, so the remote FT-only run is routing evidence, not the ratio source.
+
+Same-host measured ratios (`artifacts/perf/frankentorch-kgs4.cod-b-masked-gqa-20260621/`):
+- primary masked f64 SDPA: FT 8.013ms vs PyTorch 20.846ms = **2.60x FASTER**, rel-diff 3.29e-14.
+- tensor masked f64 SDPA: FT 7.916ms vs PyTorch 21.558ms = **2.72x FASTER**, rel-diff 3.29e-14.
+- masked f64 GQA: FT 38.224ms vs PyTorch 4.545ms = **8.41x SLOWER**, rel-diff 3.19e-14.
+
+Scorecard: **2W / 1L / 0N** overall for the three measured lanes; **0W / 1L / 0N** for GQA specifically.
+This corrects the earlier broad "GQA correct+winning" wording: GQA is correct, but not winning on this
+same-host head-to-head. The likely loss mechanism is repeated K/V head materialization before the masked
+flash kernel, while PyTorch's GQA path avoids or heavily optimizes that expansion.
+
+RCH FT-only sanity on `vmi1153651`: primary 23.767ms, tensor 23.519ms, GQA 44.048ms. Local PyTorch-only
+sanity: primary 22.313ms, tensor 22.012ms, GQA 5.067ms. Conformance gate after the shared-checkout API
+compatibility adaptation: `rch exec -- cargo test -p ft-conformance --profile release` passed on
+`vmi1227854` (199 lib tests plus conformance bins/integration/smoke/doctests all green).
+
+No product source kept in this evidence commit. Retry predicate: implement a direct grouped masked f64
+flash kernel that indexes `kv_head = q_head / group` without expanding K/V heads, then rerun the same
+three-lane PyTorch head-to-head.

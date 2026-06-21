@@ -1,0 +1,601 @@
+  [2m2026-06-21T08:48:30.098289Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at root@178.104.77.29 (0 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:921 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:30.362652Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: 8bff0f160f3f4ce1)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:30.362685Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:32.008422Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:32.008474Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch -> /data/projects/frankentorch on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:41.507894Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 9499ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:41.507976Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-api -> /data/projects/frankentorch/crates/ft-api on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:43.362980Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1854ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:43.363060Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-autograd -> /data/projects/frankentorch/crates/ft-autograd on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:45.202450Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1839ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:45.202508Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-conformance -> /data/projects/frankentorch/crates/ft-conformance on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:47.110804Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1908ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:47.110888Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-core -> /data/projects/frankentorch/crates/ft-core on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:48.951613Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1840ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:48.951675Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-data -> /data/projects/frankentorch/crates/ft-data on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:50.787001Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1835ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:50.787062Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-device -> /data/projects/frankentorch/crates/ft-device on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:52.679239Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1892ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:52.679313Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-dispatch -> /data/projects/frankentorch/crates/ft-dispatch on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:54.582703Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1903ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:54.582766Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-kernel-cpu -> /data/projects/frankentorch/crates/ft-kernel-cpu on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:56.584392Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2001ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:56.584472Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-nn -> /data/projects/frankentorch/crates/ft-nn on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:58.389961Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1805ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:48:58.390043Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-optim -> /data/projects/frankentorch/crates/ft-optim on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:00.288250Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1898ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:00.288323Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-runtime -> /data/projects/frankentorch/crates/ft-runtime on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:02.156431Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1868ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:02.156504Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-serialize -> /data/projects/frankentorch/crates/ft-serialize on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:04.001965Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1845ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:04.001997Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 53853 files, 1985522 bytes in 31987ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:486 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:11.170056Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo test -p ft-conformance --profile release[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-21T08:49:11.170088Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/.rch-targets/frankentorch-cod-b -> /data/projects/frankentorch/.rch-target-hz2-pool-f9267e1ec5d1223616a90f276787c4af[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded bincode_derive-next v2.1.0
+  Downloaded bit-set v0.8.0
+  Downloaded aead v0.5.2
+  Downloaded cfg-if v1.0.4
+  Downloaded allocation-counter v0.8.1
+  Downloaded autocfg v1.5.0
+  Downloaded bit-vec v0.8.0
+  Downloaded curve25519-dalek-derive v0.1.1
+  Downloaded block-buffer v0.10.4
+  Downloaded crossbeam-queue v0.3.12
+  Downloaded cpufeatures v0.3.0
+  Downloaded block-buffer v0.12.0
+  Downloaded crypto-common v0.2.1
+  Downloaded cpufeatures v0.2.17
+  Downloaded base64ct v1.8.3
+  Downloaded cipher v0.4.4
+  Downloaded cfg_aliases v0.2.1
+  Downloaded cmov v0.5.3
+  Downloaded crypto-common v0.1.7
+  Downloaded ctr v0.9.2
+  Downloaded ctutils v0.4.2
+  Downloaded errno v0.3.14
+  Downloaded fnv v1.0.7
+  Downloaded futures-core v0.3.32
+  Downloaded futures-io v0.3.32
+  Downloaded hex v0.4.3
+  Downloaded itoa v1.0.18
+  Downloaded allocator-api2 v0.2.21
+  Downloaded anyhow v1.0.102
+  Downloaded bitflags v2.11.1
+  Downloaded inout v0.1.4
+  Downloaded lazy_static v1.5.0
+  Downloaded equivalent v1.0.2
+  Downloaded poly1305 v0.8.0
+  Downloaded memoffset v0.9.1
+  Downloaded ghash v0.5.1
+  Downloaded franken-kernel v0.3.4
+  Downloaded parking v2.2.1
+  Downloaded rawpointer v0.2.1
+  Downloaded rustc_version v0.4.1
+  Downloaded sha1 v0.11.0
+  Downloaded rusty-fork v0.3.1
+  Downloaded safetensors v0.7.0
+  Downloaded subtle v2.6.1
+  Downloaded signal-hook-registry v1.4.8
+  Downloaded unarray v0.1.4
+  Downloaded visibility v0.1.1
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded generic-array v0.14.7
+  Downloaded version_check v0.9.5
+  Downloaded franken-evidence v0.3.4
+  Downloaded zeroize_derive v1.4.3
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded chacha20 v0.9.1
+  Downloaded universal-hash v0.5.1
+  Downloaded pin-project-internal v1.1.11
+  Downloaded wait-timeout v0.2.1
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded signature v2.2.0
+  Downloaded rand_xorshift v0.4.0
+  Downloaded quick-error v1.2.3
+  Downloaded crc32fast v1.5.0
+  Downloaded scopeguard v1.2.0
+  Downloaded thiserror-impl v2.0.18
+  Downloaded lock_api v0.4.14
+  Downloaded nu-ansi-term v0.50.3
+  Downloaded thiserror v2.0.18
+  Downloaded pkcs8 v0.10.2
+  Downloaded either v1.15.0
+  Downloaded thread_local v1.1.9
+  Downloaded pin-project-lite v0.2.17
+  Downloaded tracing-log v0.2.0
+  Downloaded data-encoding v2.11.0
+  Downloaded ed25519 v2.2.3
+  Downloaded opaque-debug v0.3.1
+  Downloaded zmij v1.0.21
+  Downloaded nkeys v0.4.5
+  Downloaded pem-rfc7468 v0.7.0
+  Downloaded fastrand v2.4.1
+  Downloaded rmp v0.8.15
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded num-complex v0.4.6
+  Downloaded semver v1.0.28
+  Downloaded smallvec v1.15.1
+  Downloaded spki v0.7.3
+  Downloaded tempfile v3.27.0
+  Downloaded polyval v0.6.2
+  Downloaded franken-decision v0.3.4
+  Downloaded slab v0.4.12
+  Downloaded sha2 v0.11.0
+  Downloaded signal-hook v0.4.4
+  Downloaded sha2 v0.10.9
+  Downloaded rayon-core v1.13.0
+  Downloaded once_cell v1.21.4
+  Downloaded hmac v0.12.1
+  Downloaded safe_arch v0.7.4
+  Downloaded foldhash v0.2.0
+  Downloaded sharded-slab v0.1.7
+  Downloaded socket2 v0.6.3
+  Downloaded unicode-ident v1.0.24
+  Downloaded zeroize v1.8.2
+  Downloaded parking_lot_core v0.9.12
+  Downloaded serde_derive v1.0.228
+  Downloaded const-oid v0.10.2
+  Downloaded unty-next v0.1.1
+  Downloaded tracing-core v0.1.36
+  Downloaded virtue-next v0.1.3
+  Downloaded base64 v0.22.1
+  Downloaded ppv-lite86 v0.2.21
+  Downloaded prost-derive v0.14.4
+  Downloaded rand_chacha v0.9.0
+  Downloaded rand_core v0.9.5
+  Downloaded serde_core v1.0.228
+  Downloaded rand_core v0.6.4
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded digest v0.10.7
+  Downloaded digest v0.11.2
+  Downloaded wide v0.7.33
+  Downloaded getrandom v0.2.17
+  Downloaded hybrid-array v0.4.10
+  Downloaded signatory v0.27.1
+  Downloaded const-oid v0.9.6
+  Downloaded chacha20poly1305 v0.10.1
+  Downloaded quote v1.0.45
+  Downloaded tracing-attributes v0.1.31
+  Downloaded getrandom v0.3.4
+  Downloaded half v2.7.1
+  Downloaded serde_json v1.0.149
+  Downloaded sysinfo v0.33.1
+  Downloaded tracing-subscriber v0.3.23
+  Downloaded prost v0.14.4
+  Downloaded pin-project v1.1.11
+  Downloaded parking_lot v0.12.5
+  Downloaded regex-syntax v0.8.10
+  Downloaded bytemuck v1.25.0
+  Downloaded num-traits v0.2.19
+  Downloaded futures-lite v2.6.1
+  Downloaded polling v3.11.0
+  Downloaded zerocopy v0.8.48
+  Downloaded hmac v0.13.0
+  Downloaded rustix v1.1.4
+  Downloaded rmp-serde v1.3.1
+  Downloaded tracing v0.1.44
+  Downloaded bytes v1.11.1
+  Downloaded matrixmultiply v0.3.10
+  Downloaded rand_chacha v0.3.1
+  Downloaded proc-macro2 v1.0.106
+  Downloaded log v0.4.29
+  Downloaded bincode-next v2.1.0
+  Downloaded getrandom v0.4.2
+  Downloaded der v0.7.10
+  Downloaded rand v0.8.6
+  Downloaded ed25519-dalek v2.2.0
+  Downloaded aes v0.8.4
+  Downloaded memchr v2.8.0
+  Downloaded itertools v0.10.5
+  Downloaded rand v0.9.4
+  Downloaded aes-gcm v0.10.3
+  Downloaded serde v1.0.228
+  Downloaded hashbrown v0.16.1
+  Downloaded typenum v1.20.0
+  Downloaded hashbrown v0.17.0
+  Downloaded hkdf v0.12.4
+  Downloaded libm v0.2.16
+  Downloaded rayon v1.12.0
+  Downloaded proptest v1.11.0
+  Downloaded syn v2.0.117
+  Downloaded curve25519-dalek v4.1.3
+  Downloaded nix v0.31.2
+  Downloaded libc v0.2.185
+  Downloaded linux-raw-sys v0.12.1
+  Downloaded asupersync v0.3.4
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling cfg-if v1.0.4
+   Compiling libc v0.2.185
+   Compiling typenum v1.20.0
+   Compiling version_check v0.9.5
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling subtle v2.6.1
+   Compiling crossbeam-utils v0.8.21
+   Compiling serde_core v1.0.228
+   Compiling cpufeatures v0.2.17
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling getrandom v0.3.4
+   Compiling serde v1.0.228
+   Compiling once_cell v1.21.4
+   Compiling libm v0.2.16
+   Compiling bitflags v2.11.1
+   Compiling rustix v1.1.4
+   Compiling rawpointer v0.2.1
+   Compiling generic-array v0.14.7
+   Compiling semver v1.0.28
+   Compiling base64ct v1.8.3
+   Compiling zmij v1.0.21
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+   Compiling const-oid v0.9.6
+   Compiling opaque-debug v0.3.1
+   Compiling linux-raw-sys v0.12.1
+   Compiling serde_json v1.0.149
+   Compiling rustc_version v0.4.1
+   Compiling pem-rfc7468 v0.7.0
+   Compiling memchr v2.8.0
+   Compiling cmov v0.5.3
+   Compiling const-oid v0.10.2
+   Compiling crossbeam-epoch v0.9.18
+   Compiling curve25519-dalek v4.1.3
+   Compiling syn v2.0.117
+   Compiling hybrid-array v0.4.10
+   Compiling ctutils v0.4.2
+   Compiling fastrand v2.4.1
+   Compiling anyhow v1.0.102
+   Compiling itoa v1.0.18
+   Compiling crossbeam-deque v0.8.6
+   Compiling memoffset v0.9.1
+   Compiling tracing-core v0.1.36
+   Compiling smallvec v1.15.1
+   Compiling num-complex v0.4.6
+   Compiling parking_lot_core v0.9.12
+   Compiling cfg_aliases v0.2.1
+   Compiling log v0.4.29
+   Compiling block-buffer v0.12.0
+   Compiling crypto-common v0.2.1
+   Compiling equivalent v1.0.2
+   Compiling foldhash v0.2.0
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling allocator-api2 v0.2.21
+   Compiling nix v0.31.2
+   Compiling lazy_static v1.5.0
+   Compiling itertools v0.10.5
+   Compiling signal-hook v0.4.4
+   Compiling rayon v1.12.0
+   Compiling cpufeatures v0.3.0
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling crc32fast v1.5.0
+   Compiling virtue-next v0.1.3
+   Compiling scopeguard v1.2.0
+   Compiling rand_core v0.6.4
+   Compiling getrandom v0.4.2
+   Compiling digest v0.11.2
+   Compiling thiserror v2.0.18
+   Compiling pin-project-lite v0.2.17
+   Compiling crypto-common v0.1.7
+   Compiling lock_api v0.4.14
+   Compiling signal-hook-registry v1.4.8
+   Compiling sharded-slab v0.1.7
+   Compiling digest v0.10.7
+   Compiling universal-hash v0.5.1
+   Compiling aead v0.5.2
+   Compiling polyval v0.6.2
+   Compiling poly1305 v0.8.0
+   Compiling tracing-log v0.2.0
+   Compiling signature v2.2.0
+   Compiling sha2 v0.10.9
+   Compiling ghash v0.5.1
+   Compiling ed25519 v2.2.3
+   Compiling hmac v0.12.1
+   Compiling bincode_derive-next v2.1.0
+   Compiling rmp v0.8.15
+   Compiling thread_local v1.1.9
+   Compiling unty-next v0.1.1
+   Compiling parking v2.2.1
+   Compiling futures-io v0.3.32
+   Compiling data-encoding v2.11.0
+   Compiling futures-core v0.3.32
+   Compiling bytes v1.11.1
+   Compiling nu-ansi-term v0.50.3
+   Compiling futures-lite v2.6.1
+   Compiling hkdf v0.12.4
+   Compiling hashbrown v0.16.1
+   Compiling parking_lot v0.12.5
+   Compiling tracing-subscriber v0.3.23
+   Compiling sha2 v0.11.0
+   Compiling sha1 v0.11.0
+   Compiling tempfile v3.27.0
+   Compiling polling v3.11.0
+   Compiling hmac v0.13.0
+   Compiling hashbrown v0.17.0
+   Compiling socket2 v0.6.3
+   Compiling crossbeam-queue v0.3.12
+   Compiling slab v0.4.12
+   Compiling hex v0.4.3
+   Compiling base64 v0.22.1
+   Compiling allocation-counter v0.8.1
+   Compiling sysinfo v0.33.1
+   Compiling rand_core v0.9.5
+   Compiling wait-timeout v0.2.1
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling bit-vec v0.8.0
+   Compiling rand v0.9.4
+   Compiling rusty-fork v0.3.1
+   Compiling rand_xorshift v0.4.0
+   Compiling regex-syntax v0.8.10
+   Compiling unarray v0.1.4
+   Compiling bit-set v0.8.0
+   Compiling zerocopy-derive v0.8.48
+   Compiling bytemuck_derive v1.10.2
+   Compiling zeroize_derive v1.4.3
+   Compiling serde_derive v1.0.228
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling thiserror-impl v2.0.18
+   Compiling pin-project-internal v1.1.11
+   Compiling zeroize v1.8.2
+   Compiling prost-derive v0.14.4
+   Compiling tracing-attributes v0.1.31
+   Compiling cipher v0.4.4
+   Compiling der v0.7.10
+   Compiling visibility v0.1.1
+   Compiling chacha20 v0.9.1
+   Compiling aes v0.8.4
+   Compiling ctr v0.9.2
+   Compiling bytemuck v1.25.0
+   Compiling chacha20poly1305 v0.10.1
+   Compiling safe_arch v0.7.4
+   Compiling ed25519-dalek v2.2.0
+   Compiling pin-project v1.1.11
+   Compiling aes-gcm v0.10.3
+   Compiling wide v0.7.33
+   Compiling tracing v0.1.44
+   Compiling spki v0.7.3
+   Compiling prost v0.14.4
+   Compiling pkcs8 v0.10.2
+   Compiling signatory v0.27.1
+   Compiling franken-kernel v0.3.4
+   Compiling franken-evidence v0.3.4
+   Compiling rmp-serde v1.3.1
+   Compiling safetensors v0.7.0
+   Compiling bincode-next v2.1.0
+   Compiling franken-decision v0.3.4
+   Compiling half v2.7.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling rand_chacha v0.3.1
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+   Compiling rand v0.8.6
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch/crates/ft-runtime)
+   Compiling nkeys v0.4.5
+   Compiling asupersync v0.3.4
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+error[E0061]: this function takes 12 arguments but 11 arguments were supplied
+    --> crates/ft-api/src/lib.rs:5236:29
+     |
+5236 |   ...                   ft_kernel_cpu::sdpa_forward_masked_f64(
+     |  _______________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+5237 | | ...                       qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale, mv, mbs,
+5238 | | ...                   )
+     | |_______________________- argument #12 of type `usize` is missing
+     |
+note: function defined here
+    --> crates/ft-kernel-cpu/src/lib.rs:3764:8
+     |
+3764 | pub fn sdpa_forward_masked_f64(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+     |
+5236 -                             ft_kernel_cpu::sdpa_forward_masked_f64(
+5237 -                                 qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale, mv, mbs,
+5238 -                             )
+5236 +                             ft_kernel_cpu::sdpa_forward_masked_f64(qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale, mv, mbs, /* usize */)
+     |
+
+error[E0061]: this function takes 12 arguments but 11 arguments were supplied
+    --> crates/ft-api/src/lib.rs:5312:43
+     |
+5312 |   ...                   let out = ft_kernel_cpu::sdpa_forward_masked_f64(
+     |  _________________________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+5313 | | ...                       qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale,
+5314 | | ...                       &mask_fwd, mbs,
+5315 | | ...                   );
+     | |_______________________- argument #12 of type `usize` is missing
+     |
+note: function defined here
+    --> crates/ft-kernel-cpu/src/lib.rs:3764:8
+     |
+3764 | pub fn sdpa_forward_masked_f64(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+     |
+5312 -                                 let out = ft_kernel_cpu::sdpa_forward_masked_f64(
+5313 -                                     qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale,
+5314 -                                     &mask_fwd, mbs,
+5315 -                                 );
+5312 +                                 let out = ft_kernel_cpu::sdpa_forward_masked_f64(qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale, &mask_fwd, mbs, /* usize */);
+     |
+
+error[E0061]: this function takes 13 arguments but 12 arguments were supplied
+    --> crates/ft-api/src/lib.rs:5326:52
+     |
+5326 |   ...                   let (dq, dk, dv) = ft_kernel_cpu::sdpa_backward_masked_f64(
+     |  __________________________________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+5327 | | ...                       &saved[0], &saved[1], &saved[2], dout, q_bh, seq_q, seq_k,
+5328 | | ...                       d_k_dim, d_v, scale, &mask_bwd, mbs,
+5329 | | ...                   );
+     | |_______________________- argument #13 of type `usize` is missing
+     |
+note: function defined here
+    --> crates/ft-kernel-cpu/src/lib.rs:4000:8
+     |
+4000 | pub fn sdpa_backward_masked_f64(
+     |        ^^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+     |
+5326 -                                 let (dq, dk, dv) = ft_kernel_cpu::sdpa_backward_masked_f64(
+5327 -                                     &saved[0], &saved[1], &saved[2], dout, q_bh, seq_q, seq_k,
+5328 -                                     d_k_dim, d_v, scale, &mask_bwd, mbs,
+5329 -                                 );
+5326 +                                 let (dq, dk, dv) = ft_kernel_cpu::sdpa_backward_masked_f64(&saved[0], &saved[1], &saved[2], dout, q_bh, seq_q, seq_k, d_k_dim, d_v, scale, &mask_bwd, mbs, /* usize */);
+     |
+
+error[E0061]: this function takes 12 arguments but 11 arguments were supplied
+     --> crates/ft-api/src/lib.rs:19293:29
+      |
+19293 |   ...                   ft_kernel_cpu::sdpa_forward_masked_f64(
+      |  _______________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+19294 | | ...                       qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale_factor, mv, mbs,
+19295 | | ...                   )
+      | |_______________________- argument #12 of type `usize` is missing
+      |
+note: function defined here
+     --> crates/ft-kernel-cpu/src/lib.rs:3764:8
+      |
+ 3764 | pub fn sdpa_forward_masked_f64(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+      |
+19293 -                             ft_kernel_cpu::sdpa_forward_masked_f64(
+19294 -                                 qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale_factor, mv, mbs,
+19295 -                             )
+19293 +                             ft_kernel_cpu::sdpa_forward_masked_f64(qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, scale_factor, mv, mbs, /* usize */)
+      |
+
+error[E0061]: this function takes 12 arguments but 11 arguments were supplied
+     --> crates/ft-api/src/lib.rs:19366:43
+      |
+19366 |   ...                   let out = ft_kernel_cpu::sdpa_forward_masked_f64(
+      |  _________________________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+19367 | | ...                       qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, sc, &mask_fwd,
+19368 | | ...                       mbs,
+19369 | | ...                   );
+      | |_______________________- argument #12 of type `usize` is missing
+      |
+note: function defined here
+     --> crates/ft-kernel-cpu/src/lib.rs:3764:8
+      |
+ 3764 | pub fn sdpa_forward_masked_f64(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+      |
+19366 -                                 let out = ft_kernel_cpu::sdpa_forward_masked_f64(
+19367 -                                     qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, sc, &mask_fwd,
+19368 -                                     mbs,
+19369 -                                 );
+19366 +                                 let out = ft_kernel_cpu::sdpa_forward_masked_f64(qv, kv, vv, q_bh, seq_q, seq_k, d_k_dim, d_v, sc, &mask_fwd, mbs, /* usize */);
+      |
+
+error[E0061]: this function takes 13 arguments but 12 arguments were supplied
+     --> crates/ft-api/src/lib.rs:19376:52
+      |
+19376 |   ...                   let (dq, dk, dv) = ft_kernel_cpu::sdpa_backward_masked_f64(
+      |  __________________________________________^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^-
+19377 | | ...                       borrowed[0].0,
+19378 | | ...                       borrowed[1].0,
+19379 | | ...                       borrowed[2].0,
+...     |
+19388 | | ...                       mbs,
+19389 | | ...                   );
+      | |_______________________- argument #13 of type `usize` is missing
+      |
+note: function defined here
+     --> crates/ft-kernel-cpu/src/lib.rs:4000:8
+      |
+ 4000 | pub fn sdpa_backward_masked_f64(
+      |        ^^^^^^^^^^^^^^^^^^^^^^^^
+help: provide the argument
+      |
+19376 |                                 let (dq, dk, dv) = ft_kernel_cpu::sdpa_backward_masked_f64(
+  ...
+19388 |                                     mbs,
+19389 ~                                     /* usize */,
+19390 ~                                 );
+      |
+
+For more information about this error, try `rustc --explain E0061`.
+error: could not compile `ft-api` (lib) due to 6 previous errors
+warning: build failed, waiting for other jobs to finish...
+  [2m2026-06-21T08:51:05.058340Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=101 in 113888ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:653 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 failed (exit 101)

@@ -1,0 +1,13 @@
+masked f64 SDPA no-grad, 5 iters MIN:
+  FrankenTorch primary:    8.013 ms   checksum -9.829413e0
+  FrankenTorch tensor:    7.916 ms   checksum -9.829413e0
+  FrankenTorch GQA  :   38.224 ms   checksum -6.194718e1
+  PyTorch primary   :   20.846 ms   checksum -9.829413e0
+  CORRECTNESS primary: rel-diff 3.29e-14  (MATCH)
+  => primary: FT 2.60x FASTER
+  PyTorch tensor    :   21.558 ms   checksum -9.829413e0
+  CORRECTNESS tensor : rel-diff 3.29e-14  (MATCH)
+  => tensor: FT 2.72x FASTER
+  PyTorch GQA       :    4.545 ms   checksum -6.194718e1
+  CORRECTNESS GQA    : rel-diff 3.19e-14  (MATCH)
+  => GQA: FT 8.41x slower
