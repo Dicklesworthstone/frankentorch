@@ -4177,3 +4177,20 @@ batched-tiny matmul diagnosis -- core-op + partly out-of-lane + best-case ~parit
 bandwidth-optimal, FT can't DOMINATE it). FILED as lead; value is unlocking hermitian-pinv (eigh-fast + fast
 bmm -> ~8x est), not dominating bmm itself. LESSON: localize a perf gap to the exact layer (kernel vs API/tape)
 with a no-op-elsewhere probe BEFORE optimizing -- my kernel fix targeted the wrong layer.
+
+## 2026-06-21ch - WIN (28th) + major fix: batched matmul fast path = 20-34x faster, DOMINATES PyTorch at k>=16
+
+ROOT CAUSE (corrects cg): the 50x tensor_matmul batched-tiny gap was NOT the kernel -- it was tensor_matmul
+ALWAYS routing through tensor_broadcast_to + tensor_reshape even for the matched-batch 3-D case [B,m,k]@
+[B,k,n], where they are NO-OPS yet cost ~47ms for B=100000 (proven: tensor_bmm direct 3.4ms vs tensor_matmul
+51ms; kernel-direct 1.9ms). FIX (ft-api, in-lane): fast path in tensor_matmul -- 3-D @ 3-D with identical
+batch -> call tensor_bmm directly (bit-identical: the skipped broadcast/reshape are identity ops here).
+MEASURED (examples/matmul_batched_h2h.rs):
+  [100000,4,4]  51 -> 2.5ms (20x; FT 2.63x slower than torch MKL bmm) chk MATCH
+  [50000,8,8]   -> 3.3ms (2.60x slower) chk MATCH
+  [20000,16,16] 193 -> 5.7ms (34x; FT 1.59x FASTER than torch -- DOMINATES)
+ft-api matmul 19/0 + bmm 8/0 (no regression; the cg kernel-tiny-path was correctly NOT shipped -- the kernel
+was never the bottleneck). 28th win (dominates k>=16; closes the 20-53x gap to within 2.6x at k=4). UNLOCKS
+the reconstruction ops (hermitian-pinv / batched-linalg-grad compose matmul -- now fast; re-probe next).
+LESSON: localize with tensor_bmm-vs-tensor_matmul (op-vs-composition) -- the culprit was the no-op
+broadcast/reshape round-trip in the API composition, not the kernel.
