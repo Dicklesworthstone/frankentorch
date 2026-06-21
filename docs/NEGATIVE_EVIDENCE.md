@@ -4,6 +4,53 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-21 - frankentorch-kgs4.146 - avg_pool1d exact-coverage scalar-fill no-ship
+
+- Lever attempted: specialize `avg_pool1d_backward_scalar_f64` for the exact
+  non-overlap scalar-sum case (`stride == kernel`, full coverage) by replacing
+  the scatter loop with a closed-form constant gradient fill. The idea came from
+  the alien-graveyard/alien-artifact affine-loop pass: for `kernel=2`,
+  `stride=2`, every input element receives exactly `upstream / kernel`.
+- Workload: `pytorch_gauntlet_bench` `avg_pool1d`, f64 `[N,C,L]=[8,64,8192]`,
+  kernel `2`, stride `2`, scalar-sum loss and backward.
+- Correctness gate: with the candidate enabled,
+  `rch exec -- cargo test -p ft-kernel-cpu
+  avg_pool1d_sum_scalar_backward_matches_materialized_bits --lib --
+  --nocapture` passed on `ovh-a`.
+- RCH evidence:
+  - Candidate routing run on `hz2`: standard row `101.57 ms`, fused scalar row
+    `65.018 ms`; remote PyTorch failed because the worker lacks `torch`.
+  - Temporary disabled-source baseline on `ovh-a`: standard row `51.218 ms`,
+    fused scalar row `27.461 ms`; remote PyTorch failed for the same reason.
+  - Re-enabled candidate on the same worker `ovh-a`: standard row `52.488 ms`,
+    fused scalar row `48.523 ms`. Criterion reported the fused scalar row as
+    `+75.172%..+80.383%` slower, central `+77.804%`, `p = 0.00`.
+  - The candidate regressed because `vec![g; len]` gave up the current
+    `par_chunks_mut` per-plane parallelism. The existing parallel scatter does
+    more arithmetic but keeps the large fill parallel.
+- PyTorch comparator: local PyTorch `2.12.1+cpu`, five 40-iteration totals
+  `0.519620356034`, `0.637934194994`, `0.511600713013`,
+  `0.495164387976`, `0.515944739920` seconds; median `12.898618498 ms/iter`.
+  Final reverted fused FT/PyTorch ratio: `27.461 / 12.898618498 = 2.13x`
+  slower. Candidate fused FT/PyTorch ratio:
+  `48.523 / 12.898618498 = 3.76x` slower.
+- Win/loss/neutral vs PyTorch: `0W / 1L / 0N`.
+- Final source state: candidate branch reverted; no product code kept.
+- Gates after revert:
+  - `rch exec -- cargo check -p ft-kernel-cpu --lib`: passed on `ovh-a`.
+  - `rch exec -- cargo test -p ft-conformance --profile release`: passed on
+    `vmi1227854`; full `ft-conformance` crate, binaries, integration tests,
+    smoke tests, and doctests green.
+- Verdict: rejected/reverted. Do not retry serial constant-fill shortcuts for
+  exact-coverage avg_pool1d scalar backward.
+- Retry condition: only revisit this lane with a lever that preserves or improves
+  parallel fill bandwidth, such as a parallel constant-fill primitive compared
+  directly against the current scatter, or the allocator/cache work identified by
+  the fair-gauntlet evidence.
+- Evidence:
+  - `artifacts/perf/frankentorch-kgs4.146/baseline_rch_avg_pool1d_frankentorch.log`
+  - `artifacts/perf/frankentorch-kgs4.146/gauntlet_20260621T0421Z/SCORECARD.md`
+
 ## 2026-06-21 - frankentorch-kgs4.138 - restart verification of BatchNorm1d f64 scalar-sum path
 
 - Context: fresh `cod-a` restart re-verified the existing f64 BatchNorm1d NCL

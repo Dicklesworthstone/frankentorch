@@ -1,0 +1,47 @@
+frankentorch-kgs4.146 avg_pool1d scalar-fill no-ship evidence summary
+
+This file was kept as a compact text log for the reverted avg_pool1d
+exact-coverage scalar-fill probe. The canonical verdict and full scorecard live
+at:
+
+  artifacts/perf/frankentorch-kgs4.146/gauntlet_20260621T0421Z/SCORECARD.md
+
+Commands used in the proof bundle set:
+
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b \
+  AGENT_NAME=IvoryDeer \
+  rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- avg_pool1d --noplot
+
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b \
+  AGENT_NAME=IvoryDeer \
+  rch exec -- cargo test -p ft-kernel-cpu \
+    avg_pool1d_sum_scalar_backward_matches_materialized_bits --lib -- --nocapture
+
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b \
+  AGENT_NAME=IvoryDeer \
+  rch exec -- cargo check -p ft-kernel-cpu --lib
+
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b \
+  AGENT_NAME=IvoryDeer \
+  rch exec -- cargo test -p ft-conformance --profile release
+
+Same-worker RCH result on ovh-a:
+
+  disabled/original fused scalar row: 27.461 ms
+  re-enabled candidate fused scalar row: 48.523 ms
+  criterion central regression: +77.804%, p = 0.00
+
+Local PyTorch comparator:
+
+  totals: 0.519620356034, 0.637934194994, 0.511600713013,
+          0.495164387976, 0.515944739920 seconds for 40 iterations
+  median: 12.898618498 ms/iter
+
+Ratios:
+
+  final reverted fused FT/PyTorch: 2.13x slower
+  candidate fused FT/PyTorch: 3.76x slower
+  candidate vs same-worker disabled fused baseline: 1.77x slower
+
+Verdict: rejected and reverted. Do not retry serial constant-fill shortcuts for
+exact-coverage avg_pool1d scalar backward.
