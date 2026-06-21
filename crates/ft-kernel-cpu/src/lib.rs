@@ -3704,52 +3704,62 @@ pub fn sdpa_forward_f64(
     let k_stride = seq_k * d_k;
     let v_stride = seq_k * d_v;
     let o_stride = seq_q * d_v;
-    out.par_chunks_mut(o_stride)
-        .enumerate()
-        .for_each(|(bh, o_chunk)| {
-            let qh = &q[bh * q_stride..bh * q_stride + q_stride];
-            let kh = &k[bh * k_stride..bh * k_stride + k_stride];
-            let vh = &v[bh * v_stride..bh * v_stride + v_stride];
-            // Scratch score tile, reused across the head's query blocks.
-            let mut scores = vec![0.0f64; BR.min(seq_q) * seq_k];
+    // One independent BR-row block: scores = scale*(q_block @ kh^T), causal-masked + stable
+    // softmax per row, then o_block = softmax @ vh. Blocks within a head are independent.
+    let block = |bh: usize, q0: usize, o_block: &mut [f64]| {
+        let br = o_block.len() / d_v;
+        let qh = &q[bh * q_stride..bh * q_stride + q_stride];
+        let kh = &k[bh * k_stride..bh * k_stride + k_stride];
+        let vh = &v[bh * v_stride..bh * v_stride + v_stride];
+        let mut sc = vec![0.0f64; br * seq_k];
+        let q_block = &qh[q0 * d_k..(q0 + br) * d_k];
+        gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, &mut sc);
+        for r in 0..br {
+            let qi = q0 + r;
+            let limit = if causal { (qi + 1).min(seq_k) } else { seq_k };
+            let row = &mut sc[r * seq_k..(r + 1) * seq_k];
+            let mut m = f64::NEG_INFINITY;
+            for s in row.iter_mut().take(limit) {
+                *s *= scale;
+                if *s > m {
+                    m = *s;
+                }
+            }
+            let mut sum = 0.0f64;
+            for s in row.iter_mut().take(limit) {
+                let e = (*s - m).exp();
+                *s = e;
+                sum += e;
+            }
+            for s in row.iter_mut().take(limit) {
+                *s /= sum;
+            }
+            for s in row.iter_mut().skip(limit) {
+                *s = 0.0;
+            }
+        }
+        gemm::dgemm(br, seq_k, d_v, &sc, vh, o_block);
+    };
+    // Few heads (B*H) but many cores: also split each head's independent BR-row blocks
+    // across the pool (the causal case especially, where late blocks carry more work).
+    // Head-heavy inputs already saturate the outer split, so keep the serial inner loop.
+    if num_bh < rayon::current_num_threads() && seq_q > BR {
+        out.par_chunks_mut(o_stride).enumerate().for_each(|(bh, o_chunk)| {
+            o_chunk
+                .par_chunks_mut(BR * d_v)
+                .enumerate()
+                .for_each(|(blk, o_block)| block(bh, blk * BR, o_block));
+        });
+    } else {
+        out.par_chunks_mut(o_stride).enumerate().for_each(|(bh, o_chunk)| {
             let mut q0 = 0;
             while q0 < seq_q {
                 let br = (q0 + BR).min(seq_q) - q0;
-                let q_block = &qh[q0 * d_k..(q0 + br) * d_k];
-                let sc = &mut scores[..br * seq_k];
-                // scores[br, seq_k] = q_block[br, d_k] @ kh^T  (kh is [seq_k, d_k]).
-                gemm::dgemm_bt(br, d_k, seq_k, q_block, kh, sc);
-                // Per row: scale, (causal mask), stable softmax.
-                for r in 0..br {
-                    let qi = q0 + r;
-                    let limit = if causal { (qi + 1).min(seq_k) } else { seq_k };
-                    let row = &mut sc[r * seq_k..(r + 1) * seq_k];
-                    let mut m = f64::NEG_INFINITY;
-                    for s in row.iter_mut().take(limit) {
-                        *s *= scale;
-                        if *s > m {
-                            m = *s;
-                        }
-                    }
-                    let mut sum = 0.0f64;
-                    for s in row.iter_mut().take(limit) {
-                        let e = (*s - m).exp();
-                        *s = e;
-                        sum += e;
-                    }
-                    for s in row.iter_mut().take(limit) {
-                        *s /= sum;
-                    }
-                    for s in row.iter_mut().skip(limit) {
-                        *s = 0.0;
-                    }
-                }
-                // out_block[br, d_v] = sc[br, seq_k] @ vh[seq_k, d_v].
-                let o_block = &mut o_chunk[q0 * d_v..(q0 + br) * d_v];
-                gemm::dgemm(br, seq_k, d_v, sc, vh, o_block);
+                block(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v]);
                 q0 += br;
             }
         });
+    }
     out
 }
 
