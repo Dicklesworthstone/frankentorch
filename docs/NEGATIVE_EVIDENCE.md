@@ -4,6 +4,21 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-21 - grid_sample no-grad save-skip - NO GAIN (reverted), refines the save-skip heuristic
+
+- Lever tried: gate the two `save_for_backward` clones (input NCHW + grid) in `tensor_grid_sample`
+  on `needs_input_grad` (the xtziq no-grad save-skip pattern), to skip them in no-grad inference.
+- Result: NO measurable gain. Same-host no-grad inference [N8,C64,H64,W64], 60 iters, reused
+  inputs: clone baseline `844-850 ms` total vs save-skip `888 ms` (within noise; checksum
+  identical `6.678208e5`). REVERTED (and the probe example removed). bit-exact but neutral.
+- WHY (refines the rule): save-skip only wins when the elided clone is a LARGE fraction of the
+  op cost. grid_sample's bilinear sampling over N*C*H*W=2M outputs is ~12 ms; the input clone is
+  16 MB ≈ <1 ms memcpy → <10% → lost in noise. Contrast: logaddexp (xtziq) is a CHEAP elementwise
+  op where 2×numel clone dominates → real win; embedding_bag (kgs4.156) elides a 51 MB clone whose
+  cost (~30 ms) was comparable to the op → 1.68x. RULE: only pursue save-skip / borrowed-inputs
+  where (clone bytes / op FLOPs) is high — cheap ops with big saves, or huge saves. Heavy
+  compute ops (conv/sampling/matmul-backed) clone-elision is negligible; don't probe them.
+
 ## 2026-06-21 - frankentorch-kgs4.156 - embedding_bag save-skip (dead full-weight clone) keep, PyTorch loss 4.1x
 
 - Lever: `tensor_embedding_bag` f64 grad path cloned the ENTIRE `[num_embeddings, embedding_dim]`
