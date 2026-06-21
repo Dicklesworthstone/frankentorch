@@ -3795,3 +3795,16 @@ changes (SIMD-transcendental under a tolerance policy) — blocked by parity-abs
 NOT re-probe): sort/gather (bandwidth), selection/topk (PyTorch-fast), reductions (cache-friendly),
 non-contiguous (TensorIterator), grad-path (autograd-amortized), dense (vendor), attention-4D (PyTorch
 flash/fast; the 3-D "win" was a gauntlet-shape artifact).
+
+## 2026-06-21bi - logcumsumexp dim=0 cache-angle CHECKED: still walled (libm-exp penalty offsets cache fix)
+
+Re-checked logcumsumexp (a strided write-all SCAN I'd dismissed as Sleef-walled) for the cache angle
+that won the other scans (measure-don't-assume). MEASURED dim=0 [262144,64] no-grad: FT 285ms vs PyTorch
+195ms (dim=1 ref 74ms) = FT 1.46x SLOWER (tol-match 1.5e-14). PyTorch's cache penalty here is only 2.6x
+(195/74) — NOT the ~6x I'd optimistically estimated — and the libm-vs-Sleef EXP penalty (~2-4x) offsets
+the cache fix: a cache-reordered FT logcumsumexp would land ~150-285ms ~= parity-to-loss vs PyTorch
+195ms, NOT a clear win. Unlike cumsum/cumprod/cummax/cummin (NO transcendental -> pure cache win),
+logcumsumexp is EXP-bound -> the cache lever can't overcome the libm wall. Dismissal STANDS: it is the
+ONE strided write-all scan the cache lever does NOT win. The scan-win set is exactly the
+non-transcendental scans (the 7 shipped). Probe discarded. Winnable surface remains comprehensively
+harvested (21bh).
