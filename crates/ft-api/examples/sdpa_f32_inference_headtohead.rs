@@ -23,15 +23,31 @@ fn seq_f32(n: usize, shift: f32) -> Vec<f32> {
 }
 
 // Full no-grad f32 SDPA through the public session API (requires_grad=false -> no tape,
-// f32 fast-path flash kernel `sdpa_forward_f32`). The dominant serving path.
-fn ft_infer(qb: &[f32], kb: &[f32], vb: &[f32], causal: bool) -> f64 {
+// f32 fast-path flash kernel `sdpa_forward_f32`). The dominant serving path. Inputs are
+// created ONCE and the timed region is op+read only — matching PyTorch's harness, which
+// builds q/k/v once and times `F.scaled_dot_product_attention(...).abs().sum()` per iter.
+fn bench_ft(qb: &[f32], kb: &[f32], vb: &[f32], causal: bool, iters: usize) -> (f64, f64) {
     let shape = vec![BH, SEQ, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let q = s.tensor_variable_f32(qb.to_vec(), shape.clone(), false).unwrap();
     let k = s.tensor_variable_f32(kb.to_vec(), shape.clone(), false).unwrap();
     let v = s.tensor_variable_f32(vb.to_vec(), shape, false).unwrap();
-    let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, causal).unwrap();
-    s.tensor_values_f32(out).unwrap().iter().map(|x| x.abs() as f64).sum()
+    let op = |s: &mut FrankenTorchSession| -> f64 {
+        let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, causal).unwrap();
+        s.tensor_values_f32(out).unwrap().iter().map(|x| x.abs() as f64).sum()
+    };
+    for _ in 0..3 {
+        let _ = op(&mut s);
+    }
+    let mut times = Vec::with_capacity(iters);
+    let mut sum = 0.0;
+    for _ in 0..iters {
+        let t = Instant::now();
+        sum = op(&mut s);
+        times.push(t.elapsed().as_secs_f64() * 1e3);
+    }
+    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+    (times[0], sum)
 }
 
 const PY: &str = r#"
@@ -59,21 +75,6 @@ ts.sort()
 print("ELAPSED_MS", ts[0])
 print("CHECKSUM", chk)
 "#;
-
-fn bench_ft(qb: &[f32], kb: &[f32], vb: &[f32], causal: bool, iters: usize) -> (f64, f64) {
-    for _ in 0..3 {
-        let _ = ft_infer(qb, kb, vb, causal);
-    }
-    let mut times = Vec::with_capacity(iters);
-    let mut sum = 0.0;
-    for _ in 0..iters {
-        let t = Instant::now();
-        sum = ft_infer(qb, kb, vb, causal);
-        times.push(t.elapsed().as_secs_f64() * 1e3);
-    }
-    times.sort_by(|a, b| a.partial_cmp(b).unwrap());
-    (times[0], sum)
-}
 
 fn py(causal: bool, iters: usize) -> Option<(f64, f64)> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());

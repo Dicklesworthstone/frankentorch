@@ -42,18 +42,20 @@ CORRECTION (2026-06-21, cc): the earlier claim that the no-grad f32 *session* pa
 `UnsupportedDType(F32)` was WRONG — **frankentorch-y5ubx closed as NOT-A-BUG**. The f32
 no-grad `scaled_dot_product_attention` works end-to-end; the error came from reading the F32
 output with the f64 `tensor_values` instead of `tensor_values_f32`. The example now measures
-the full through-session path. End-to-end (32 torch threads, `tensor_values_f32` read):
+the full through-session path with PyTorch's harness methodology — q/k/v created ONCE, the
+timed region is `scaled_dot_product_attention` + `tensor_values_f32` read per iter (PyTorch
+likewise builds q/k/v once and times `F.scaled_dot_product_attention(...).abs().sum()`).
+End-to-end (32 torch threads, rel-diff MATCH 1.29e-9 / 1.05e-8, 3 runs):
 
-| Lane | FT through-session | PyTorch f32 | verdict |
+| Lane | FT op+read | PyTorch f32 | verdict |
 | --- | ---: | ---: | --- |
-| non-causal | `6.9–7.2 ms` | `6.9–7.3 ms` | ~tie (1.0–1.06x) |
-| causal | `3.1–4.3 ms` | `6.4–6.9 ms` | FT 1.5–2.1x faster |
+| non-causal | `3.11–3.19 ms` | `6.7–7.3 ms` | **FT 2.13–2.29x faster** |
+| causal | `2.74–2.94 ms` | `7.1–7.3 ms` | **FT 2.43–2.65x faster** |
 
-The RAW kernel is `~1.6 ms` but the no-grad inference **session overhead (~5 ms:
-3× `tensor_variable_f32` input materialization + `tensor_values_f32` output copy) dominates**
-and caps the end-to-end win. So the kernel lever (this card) is real and stands; the next
-f32-serving lever is the **session/API overhead**, not the kernel (same pattern the f64
-`sdpa_inference_headtohead` PHASES row shows: tensor_variable ~4.6 ms + read ~2.4 ms ≫ kernel).
+So f32 no-grad SDPA serving is a **real ~2.1–2.65x end-to-end win** (RAW kernel ~1.6 ms + f32
+output read ~1.4 ms vs PyTorch ~7 ms). The earlier "~tie" reading was a *harness* artifact:
+the FT loop was re-materialising q/k/v (3× `tensor_variable_f32`) and the output every iter
+while PyTorch reused pre-built tensors — apples-to-oranges. Fixed; numbers above are fair.
 
 ## Win/loss/neutral vs PyTorch (32t): `2W / 0N` (kernel-level; widens an existing win)
 
