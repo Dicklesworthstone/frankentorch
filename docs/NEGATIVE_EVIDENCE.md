@@ -3808,3 +3808,18 @@ logcumsumexp is EXP-bound -> the cache lever can't overcome the libm wall. Dismi
 ONE strided write-all scan the cache lever does NOT win. The scan-win set is exactly the
 non-transcendental scans (the 7 shipped). Probe discarded. Winnable surface remains comprehensively
 harvested (21bh).
+
+## 2026-06-21bj - transpose+contiguous = PARITY now (both cache-hostile ~3 GB/s) BUT tiling is a FRESH potential lever (~2-3x)
+
+Probed transpose-materialize (fresh, bit-exact, VERY common op). First measured 1.16x FT-faster but that
+EXCLUDED tensor_transpose's eager materialize (timed only tensor_values) — same exclusion-error class as
+the SDPA input-regen. FAIR full transpose+materialize: FT 89 vs PyTorch 86ms [4096^2] (1.04x slower);
+FT 373 vs 388ms [8192^2] (1.04x faster) -> PARITY, bit-exact (MATCH).
+★ KEY: BOTH FT and PyTorch run the transpose at only ~3-3.4 GB/s (128MB transpose = 256MB traffic /
+~85ms) — WELL below ~15 GB/s memory bandwidth -> BOTH are cache-hostile. A properly cache-tiled /
+cache-oblivious transpose (32x32 or 64x64 blocks, right loop order) routinely hits ~10 GB/s => potential
+~2-3x vs PyTorch's contiguous(). This REOPENS a lever beyond the "harvested" conclusion (the non-contig
+scout 21bh saw contiguous()=84ms but didn't assess the tiling headroom). 3 GB/s is genuinely low ->
+likely FT's transpose-materialize path is a naive strided copy (NOT the blocked permute-vein kernel).
+FILED as a bead. Bit-exact (pure data movement). NEXT: locate FT's eager-transpose materialize path
+(tensor_tape.transpose), check naive-vs-blocked, implement a tiled transpose if naive, head-to-head.
