@@ -3742,3 +3742,20 @@ write in-place (reorderable to contiguous); sort gathers a strided column (irred
 (discarded, never committed). diff/flip/roll already FINE (21bd). The strided-non-last-dim vein is now
 fully bounded: it wins ONLY where the op can be REORDERED to contiguous access (cumsum/cumprod/cummax/
 cummin — element-wise scans), NOT where it must gather a strided lane (sort).
+
+## 2026-06-21bf - backward scans are AUTOGRAD-OVERHEAD-walled: cumsum bwd-step PARITY, cumprod loses; not winnable
+
+Measured the full fwd+bwd STEP dim=0 [262144,64] (examples/scan_bwd_headtohead.rs, grad MATCH):
+  cumsum  : FT 490ms vs PyTorch 492ms = 1.00x (PARITY)
+  cumprod : FT 861ms vs PyTorch 564ms = 1.53x SLOWER
+WHY: PyTorch's grad-path dim=0 is strided-slow (463/522ms) so a kernel win SHOULD exist, BUT the full
+backward STEP is dominated by FT's AUTOGRAD machinery (session tape, save_for_backward, backward-graph
+traversal, gradient extraction), NOT the kernel. cumsum's fwd AND bwd kernels are both cache-reordered
+(the fwd alone wins 2.83x no-grad) yet the grad step is autograd-overhead-bound -> the kernel win is
+masked -> parity. cumprod backward is additionally strided+serial (outer=1, NOT reordered) -> loses;
+reordering it would only reach ~parity (autograd-bound), NOT a vs-PyTorch win -> NOT pursued.
+=> The strided-scan cache lever wins the NO-GRAD forward path (7 shipped wins) but the GRAD path is
+AUTOGRAD-PLUMBING-walled (parity ceiling). Scan-family vein FULLY harvested + bounded: forward WINS,
+backward autograd-walled, sort bandwidth-walled (21be). Pushing the grad step to a win would require
+reducing FT's autograd overhead (~130ms, e.g. borrowed-inputs) — a DIFFERENT lever class, not the cache
+reorder. NEXT: a genuinely different lever (the strided-non-last-dim vein is exhausted).
