@@ -4098,3 +4098,20 @@ near-threshold singular value's count; inherent rank threshold-discontinuity, NO
 exact match). cond on (near-)singular data -> inf/NaN both sides (undefined). 21 vs-PyTorch wins. SVD-DERIVED
 family DONE (norm2/nuc/cond/matrix_rank, all via batched svdvals composition). NEXT (bead ogu1e): f32 geev/svd
 2-D kernels (eigvals/eig/svd/svdvals f32 -- bigger lift).
+
+## 2026-06-21cb - NEW WINS (22nd-24th): f32 batched eigvals/eig/svdvals via dtype-cast = 3.7-8.3x (+ svd f32 verified)
+
+Added the dt!=F64 cast (f32 -> f64 -> batched f64 kernel -> cast back) to tensor_linalg_eigvals / eig /
+svdvals (tensor_linalg_svd already had it). This routes batched f32 through the fast f64 batched paths --
+NO native f32 geev/svd kernel needed; the cast overhead is tiny vs the batched-parallel win. MEASURED
+(examples/batched_f32_linalg_h2h.rs, well-conditioned data, chk OK within f32 tol):
+  svd f32     [100000,4,4] 8.51x | [20000,16,16] 4.26x   (existing cast, now verified)
+  svdvals f32 8.25x / 3.71x   (NEW cast)
+  eigvals f32 7.33x / 5.06x   (NEW cast)
+  eig f32     8.21x / 5.61x   (NEW cast)
+ft-api eigvals 6/0 + svdvals 3/0 + linalg_eig 1/0 (no regression; the cast also restores the f32 dtype
+contract for the 2-D path). 24 vs-PyTorch wins. Batched-linalg f32: eigh/eigvalsh/qr/matrix_exp (native)
++ eigvals/eig/svd/svdvals (via cast). BONUS: matrix_norm/cond/matrix_rank f32 batched now also route through
+the svdvals cast (untested but enabled). NEXT (bead ogu1e): measure those + re-sweep; native f32 geev/svd
+kernels are NO LONGER needed (cast suffices). LESSON: for an f64-only kernel family, a dtype-cast wrapper
+delivers the f32 batched win for free -- check for/add the cast before writing native f32 kernels.
