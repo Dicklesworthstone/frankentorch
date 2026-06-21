@@ -4230,3 +4230,18 @@ symmetrization mutated a[i][j] in-place while reading a[j][i], corrupting the lo
 data -> eigh-pinv "wrong". Fix: symmetrize each (i,j) pair ONCE (j in i+1..k, write both). The kernel was
 correct all along. (3rd artifact this campaign: stale-build, randn-in-loop, now in-place-symmetrize -- always
 sanity-check the TEST DATA before concluding a kernel bug.)
+
+## 2026-06-21ck - WIN (30th): fused batched GENERAL pinv (svd-based) = 7.2-11.9x vs PyTorch
+
+pinv_batched_contiguous_f64 (FUSED: per-plane reduced SVD + V Σ⁺ Uᵀ reconstruction inline, parallel, no
+tape/reshape/Option; σ⁺ threshold handles rank-deficient) + tensor_linalg_pinv batched no-grad f64 fast
+path. MEASURED (examples/pinv_general_h2h.rs):
+  [100000,4,4]  FT 30.6ms  vs torch 363.6ms = 11.89x FASTER
+  [20000,16,16] FT 99.3ms  vs torch 927.2ms = 9.34x
+  [4000,32,32]  FT 109.8ms vs torch 795.1ms = 7.24x
+CORRECT: A@pinv-I err ~1e-16 + Moore-Penrose A@pinv@A≈A (kernel test pinv_batched_satisfies_moore_penrose,
+square + tall). ft-kernel-cpu 525/0 + ft-api pinv 9/0. General pinv is PyTorch's SLOWEST linalg (full
+svd-loop). The earlier QR-pinv batched attempt (21bv) FAILED (pinv_qr Option -> svd-walled fallback ->
+regressed, reverted); this FUSED svd-pinv (no QR, no Option, fused reconstruction, no tape/materialization)
+is the clean win. Validates the fused-kernel lever: matmul fix (ch) -> unlock -> fused kernels (hermitian-pinv
+7-11x cj + general pinv 7-12x ck). 30 vs-PyTorch wins.

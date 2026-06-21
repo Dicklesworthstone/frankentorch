@@ -18350,6 +18350,72 @@ pub fn eigh_contiguous_f32(data: &[f32], meta: &TensorMeta) -> Result<EighResult
     })
 }
 
+/// Batched general (Moore-Penrose) pseudo-inverse: input `[..., m, n]` -> pinv `[B*n*m]` where each
+/// plane's pinv = `V diag(σ⁺) Uᵀ` (A = U Σ Vʰ reduced SVD), σ⁺_i = 1/σ_i if σ_i > tol else 0
+/// (tol = max(m,n)·eps·σ_max, matching torch.linalg.pinv's default rtol). FUSED: each plane's reduced
+/// SVD + reconstruction run in ONE parallel pass — no autograd tape, no reshape/view materialization,
+/// no QR-Option/SVD-fallback split. PyTorch loops LAPACK gesdd per plane (~338-690ms small m,n).
+/// frankentorch-batched-eigh. (BlackThrush)
+pub fn pinv_batched_contiguous_f64(
+    data: &[f64],
+    meta: &TensorMeta,
+) -> Result<Vec<f64>, KernelError> {
+    ensure_unary_layout_and_storage(data, meta)?;
+    let shape = meta.shape();
+    let nd = shape.len();
+    if nd < 2 {
+        return Err(KernelError::InvalidDimension { dim: nd, ndim: 2 });
+    }
+    let m = shape[nd - 2];
+    let n = shape[nd - 1];
+    let kk = m.min(n);
+    let bb: usize = shape[..nd - 2].iter().product();
+    let plane_in = m * n;
+    let plane_out = n * m;
+    let offset = meta.storage_offset();
+    let data = &data[offset..offset + bb * plane_in];
+    let pmeta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+    let mut out = vec![0.0f64; bb * plane_out];
+    let first_err = std::sync::Mutex::new(None);
+    out.par_chunks_mut(plane_out)
+        .zip(data.par_chunks(plane_in))
+        .for_each(|(o, pl)| match svd_contiguous_f64(pl, &pmeta, false) {
+            Ok(r) => {
+                let u = &r.u; // [m, kk] row-major
+                let s = &r.s; // [kk] descending
+                let vh = &r.vh; // [kk, n] row-major
+                let smax = s.first().copied().unwrap_or(0.0);
+                let tol = (m.max(n) as f64) * f64::EPSILON * smax;
+                let mut sp = vec![0.0f64; kk];
+                for i in 0..kk {
+                    if s[i] > tol {
+                        sp[i] = 1.0 / s[i];
+                    }
+                }
+                // pinv[a][b] = Σ_i V[a][i]·σ⁺_i·Uᵀ[i][b] = Σ_i vh[i][a]·σ⁺_i·u[b][i],  a∈0..n, b∈0..m.
+                for a in 0..n {
+                    for b in 0..m {
+                        let mut acc = 0.0;
+                        for i in 0..kk {
+                            acc += vh[i * n + a] * sp[i] * u[b * kk + i];
+                        }
+                        o[a * m + b] = acc;
+                    }
+                }
+            }
+            Err(e) => {
+                let mut g = first_err.lock().unwrap();
+                if g.is_none() {
+                    *g = Some(e);
+                }
+            }
+        });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(out)
+}
+
 /// Batched Hermitian (symmetric) pseudo-inverse: input `[..., k, k]` (symmetric) -> pinv `[B*k*k]`
 /// where each plane's pinv = `V diag(λ⁺) Vᵀ`, λ⁺_i = 1/λ_i if |λ_i| > tol else 0 (tol = k·eps·max|λ|,
 /// matching torch.linalg.pinv(hermitian=True)'s default rtol on |eigenvalues|). FUSED: each plane's
@@ -31329,6 +31395,55 @@ mod tests {
                 super::matrix_exp_contiguous_f32(&dataf[b * k * k..(b + 1) * k * k], &kmetaf).unwrap();
             for t in 0..k * k {
                 assert_eq!(outf[b * k * k + t].to_bits(), r[t].to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn pinv_batched_satisfies_moore_penrose() {
+        // General (non-symmetric) batched pinv: A @ pinv @ A ≈ A (Moore-Penrose), for square + tall.
+        for (bb, m, n) in [(6usize, 5usize, 5usize), (5, 7, 4)] {
+            let mut data = vec![0.0f64; bb * m * n];
+            for x in 0..bb * m * n {
+                data[x] = (((x * 2654435761usize) % 9973) as f64) * 0.001 - 5.0;
+            }
+            // make full-rank-ish: bump the diagonal
+            for b in 0..bb {
+                for d in 0..m.min(n) {
+                    data[b * m * n + d * n + d] += (m + n) as f64;
+                }
+            }
+            let meta = TensorMeta::from_shape(vec![bb, m, n], DType::F64, Device::Cpu);
+            let pinv = super::pinv_batched_contiguous_f64(&data, &meta).unwrap();
+            assert_eq!(pinv.len(), bb * n * m);
+            for b in 0..bb {
+                let a = &data[b * m * n..(b + 1) * m * n]; // [m,n]
+                let p = &pinv[b * n * m..(b + 1) * n * m]; // [n,m]
+                // ap = A @ pinv  [m,m]
+                let mut ap = vec![0.0f64; m * m];
+                for i in 0..m {
+                    for j in 0..m {
+                        let mut s = 0.0;
+                        for t in 0..n {
+                            s += a[i * n + t] * p[t * m + j];
+                        }
+                        ap[i * m + j] = s;
+                    }
+                }
+                // apa = ap @ A  [m,n], must ≈ A
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut s = 0.0;
+                        for t in 0..m {
+                            s += ap[i * m + t] * a[t * n + j];
+                        }
+                        assert!(
+                            (s - a[i * n + j]).abs() < 1e-8,
+                            "A@pinv@A != A at ({i},{j}) m={m} n={n}: {s} vs {}",
+                            a[i * n + j]
+                        );
+                    }
+                }
             }
         }
     }
