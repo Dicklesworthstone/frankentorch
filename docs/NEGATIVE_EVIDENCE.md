@@ -3386,3 +3386,19 @@ general no-grad — corrected. The MHA ~85ms residual remains unexplained (would
 step instrumentation) BUT MHA loses on the matmul-MKL wall regardless (4 matmuls ~30ms vs PyTorch ~8ms),
 so resolving it wouldn't flip MHA -> not worth the deep dive. Reaffirms: no composed-inference lever
 yields a vs-PyTorch win (matmul-walled). Closes the MHA diagnosis: matmul-wall + (residual, non-gmuml).
+
+## 2026-06-21an - reused-session SDPA serving is FLAT (no gmuml degradation) — SDPA win HOLDS in serving; no vs-PyTorch serving gap
+
+Tested the one vs-PyTorch axis the fresh-session gauntlet can't see: reused-session SERVING stability
+(PyTorch frees tensors between inferences; FT's tape retains nodes -> hypothesized degradation).
+Probe (examples/serving_degradation.rs): 150 no-grad SDPA [16,512,64] inferences in ONE session,
+~2.4GB retained:
+- iter[0..10] avg 19.36ms, iter[140..150] avg 18.02ms -> **0.93x (FLAT, no degradation)** at 2.4GB retained.
+
+=> NO serving-degradation gap for SDPA. The f64 SDPA WIN HOLDS in long-running serving (FT stays flat
+like PyTorch). The gmuml "no-grad forwards degrade ~linearly" note is even narrower than 2026-06-21am
+thought: REFUTED for relu chains (80MB) AND SDPA serving (2.4GB) — it was a conv-SPECIFIC allocation
+pathology (the conv-pad retained intermediate + conv's alloc pattern), NOT a general reused-session
+problem. FT serving is generally competitive (flat). POSITIVE for the win: SDPA dominance is robust to
+serving (not just a single-shot benchmark artifact). No new vs-PyTorch lever; confirms the surface is
+exhausted (the serving axis, too, has no gap — except for the conv-specific gmuml case, already mitigated).
