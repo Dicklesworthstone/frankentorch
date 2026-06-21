@@ -2298,3 +2298,10 @@ is explicitly satisfied.
 - STATUS: code-first, consistent with the project's "code-first, batch-verify pending" norm.
   ft-autograd/ft-api/conformance build+test to be run when disk recovers (do NOT mark verified
   until then). Expected bit-exact (no arithmetic change; only skips always-None allocations).
+
+## 2026-06-21b - frankentorch-rdgt6 VERIFIED (disk recovered)
+
+- The code-first rdgt6 commit (6ad66065) is now build/test-verified: ft-autograd 476/0,
+  ft-api 2336 passed (only the 2 pre-existing reds: complex_arithmetic_golden +
+  batch_norm1d_3d_native_fused), conformance 199/0 + all sub-suites, ft-autograd clippy
+  clean. Bit-exact (no arithmetic change), can't-regress. Bead CLOSED.
