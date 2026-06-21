@@ -3502,3 +3502,29 @@ compatibility adaptation: `rch exec -- cargo test -p ft-conformance --profile re
 No product source kept in this evidence commit. Retry predicate: implement a direct grouped masked f64
 flash kernel that indexes `kv_head = q_head / group` without expanding K/V heads, then rerun the same
 three-lane PyTorch head-to-head.
+
+## 2026-06-21at - ★★ CRITICAL CORRECTION: the SDPA win is 3-D-LAYOUT-SPECIFIC — FT LOSES the standard 4-D layout
+
+Probing 4-D broadcast masks revealed FT LOSES 4-D masked SDPA (FT 11.6ms vs PyTorch 4.7ms = 2.47x,
+correct 9e-15). Investigated with a layout sweep — PyTorch f64 SDPA unmasked, torch 2.12 CPU:
+- 3-D [16,512,64]     : 22.96 ms  (SLOW)
+- 4-D [2,8,512,64]    :  4.53 ms  (FAST)
+- 4-D [1,16,512,64]   :  4.50 ms
+- 4-D [16,1,512,64]   :  4.50 ms
+Same bh=16, seq=512, identical FLOPs — but PyTorch is ~5x faster for the STANDARD 4-D [B,H,seq,d] layout.
+
+=> PyTorch f64 SDPA HAS a fast CPU path — for 4-D. My "PyTorch CPU has no f64 flash-attn" assumption
+(the basis of the entire SDPA win) was WRONG: the slowness is 3-D-[bh,seq,d]-LAYOUT-SPECIFIC (PyTorch's
+optimized f64 SDPA expects the 4-D [B,H,seq,d] layout; the gauntlet's 3-D shape misses it). ALL my SDPA
+wins (unmasked/causal/masked, train+inference, both entries, GQA) were measured at 3-D [16,512,64] and
+are LAYOUT ARTIFACTS of the gauntlet's unrepresentative 3-D shape. For real 4-D transformers, FT (which
+folds 4-D to bh, ~11ms inference) LOSES ~2.5x to PyTorch 4-D (~4.5ms).
+HONEST RE-CHARACTERIZATION: FT wins the GAUNTLET'S 3-D SDPA shape (real for that shape) but LOSES the
+standard 4-D layout that real models use. The capstone (18549b84) "one win: f64 SDPA" + the headline
+"2 wins" are OVER-BROAD — they hold only for the gauntlet's 3-D shape, not real-world 4-D usage.
+Reverted the broadcast-H 4-D work (it loses). NET vs-PyTorch perf reality: with the standard 4-D layout
++ a fair allocator, FT has NO measured vs-PyTorch SDPA win; the surface is vendor-walled including attention.
+LESSON (humbling, the campaign's measure-don't-assume principle applied to my biggest claim): measure
+across REPRESENTATIVE shapes, not just the gauntlet's — the 3-D gauntlet shape hid that PyTorch f64 4-D
+SDPA is fast. The masked-broadcast detour (which "failed" to win) is what surfaced this. The gauntlet
+SDPA lane (kgs4.113, 3-D) should be re-examined by the swarm: it measures an unrepresentative layout.
