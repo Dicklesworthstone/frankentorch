@@ -4420,3 +4420,25 @@ integration, smoke, and doctests green). Source disposition: rejected and remove
 or `conv3d_backward_scalar_f64` shipped. NEXT: do not retry API-level scalar-loss wrappers for Conv3d.
 The remaining gap is deeper than dense `dout` materialization: profile direct-conv kernel scheduling,
 workspace/reuse, cache blocking, or a oneDNN-class convolution algorithm before another Conv3d attempt.
+
+## 2026-06-21cs - WIN (36th): batched lstsq QR = 1.82-14.27x vs PyTorch
+
+Added `lstsq_qr_batched_contiguous_f64` (parallel per-plane QR, bit-identical to looping the existing
+2-D QR path) and routed no-grad f64 `tensor_linalg_lstsq(A, B)` for exact-batch
+`A[...,m,n]`, `B[...,m,rhs]`, `m >= n` through QR before the existing SVD-based batched fallback.
+This directly follows the `pinv` negative lesson: QR is only a first attempt, and `None` falls through
+to the already-merged SVD `lstsq` fallback instead of erroring or masking a slow/incorrect fallback.
+
+MEASURED final-source FT on RCH `ovh-a` with
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo run --release -p ft-api --example batched_lstsq_h2h`.
+RCH workers still lack torch, so PyTorch ran through the local CPU sidecar
+(`/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`, torch `2.12.1+cpu`, 8 threads):
+  [100000,8,4,rhs=2]  FT 11.469ms vs PyTorch 163.709ms = 14.27x FASTER (sum MATCH -1.400442176e-1)
+  [20000,16,8,rhs=2]  FT 11.398ms vs PyTorch 54.562ms  = 4.79x FASTER (sum MATCH 6.660585681e-1)
+  [8000,32,16,rhs=2]  FT 28.766ms vs PyTorch 52.378ms  = 1.82x FASTER (sum MATCH 4.776251654e-1)
+
+VERIFIED: `lstsq_qr_batched_matches_looping_2d_and_defers` and
+`tensor_linalg_lstsq_batched_qr_matches_looping_2d` passed on RCH `hz2`; release-profile
+`ft-conformance` passed on RCH `vmi1153651`. Score for this pass: `3W / 0L / 0N` vs PyTorch.
+Batched-linalg class now includes f64 `lstsq` QR on top of the SVD fallback. REMAINING: qr/eig batched
+grad, `svdvals` f32, tiny-k `svd`, and f32 mirrors of eigvals/eig.

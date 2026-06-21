@@ -24756,6 +24756,93 @@ pub fn lstsq_qr_contiguous_f64(
     Ok(Some(x))
 }
 
+/// Batched least-squares solve for full-rank overdetermined systems.
+///
+/// Input `A` is `[..., m, n]`, `B` is `[..., m, k]`, and output is
+/// `[..., n, k]` in row-major batch order. Each plane delegates to the verified
+/// 2-D QR fast path, so successful outputs are bit-identical to explicitly
+/// looping [`lstsq_qr_contiguous_f64`]. If any plane is outside the QR contract
+/// (underdetermined or rank-deficient), returns `Ok(None)` and leaves fallback
+/// policy to the API layer.
+pub fn lstsq_qr_batched_contiguous_f64(
+    a_data: &[f64],
+    a_meta: &TensorMeta,
+    b_data: &[f64],
+    b_meta: &TensorMeta,
+) -> Result<Option<Vec<f64>>, KernelError> {
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    ensure_unary_layout_and_storage(a_data, a_meta)?;
+    ensure_unary_layout_and_storage(b_data, b_meta)?;
+    let a_shape = a_meta.shape();
+    let b_shape = b_meta.shape();
+    let nd = a_shape.len();
+    if nd < 3 || b_shape.len() != nd {
+        return Err(KernelError::ShapeMismatch {
+            lhs: a_shape.to_vec(),
+            rhs: b_shape.to_vec(),
+        });
+    }
+    if a_shape[..nd - 2] != b_shape[..nd - 2] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: a_shape.to_vec(),
+            rhs: b_shape.to_vec(),
+        });
+    }
+    let m = a_shape[nd - 2];
+    let n = a_shape[nd - 1];
+    let k = b_shape[nd - 1];
+    if b_shape[nd - 2] != m {
+        return Err(KernelError::ShapeMismatch {
+            lhs: a_shape.to_vec(),
+            rhs: b_shape.to_vec(),
+        });
+    }
+    if m == 0 || n == 0 || k == 0 || m < n {
+        return Ok(None);
+    }
+
+    let batch: usize = a_shape[..nd - 2].iter().product();
+    let a_plane = m * n;
+    let b_plane = m * k;
+    let out_plane = n * k;
+    let a_offset = a_meta.storage_offset();
+    let b_offset = b_meta.storage_offset();
+    let a_data = &a_data[a_offset..a_offset + batch * a_plane];
+    let b_data = &b_data[b_offset..b_offset + batch * b_plane];
+    let a_plane_meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+    let b_plane_meta = TensorMeta::from_shape(vec![m, k], DType::F64, Device::Cpu);
+    let mut out = vec![0.0_f64; batch * out_plane];
+    let declined = AtomicBool::new(false);
+    let first_err = std::sync::Mutex::new(None);
+
+    out.par_chunks_mut(out_plane)
+        .zip(a_data.par_chunks(a_plane))
+        .zip(b_data.par_chunks(b_plane))
+        .for_each(|((dst, a_plane_data), b_plane_data)| {
+            match lstsq_qr_contiguous_f64(a_plane_data, &a_plane_meta, b_plane_data, &b_plane_meta) {
+                Ok(Some(x)) => dst.copy_from_slice(&x),
+                Ok(None) => {
+                    declined.store(true, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let mut guard = first_err.lock().unwrap();
+                    if guard.is_none() {
+                        *guard = Some(e);
+                    }
+                }
+            }
+        });
+
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    if declined.load(Ordering::Relaxed) {
+        return Ok(None);
+    }
+    Ok(Some(out))
+}
+
 fn pinv_qr_full_column_rank_f64(a: &[f64], m: usize, n: usize) -> Option<Vec<f64>> {
     if m == 0 || n == 0 || m < n {
         return None;
@@ -38896,6 +38983,65 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "underdetermined must defer"
+        );
+    }
+
+    #[test]
+    fn lstsq_qr_batched_matches_looping_2d_and_defers() {
+        let batch = 9usize;
+        let m = 10usize;
+        let n = 4usize;
+        let nrhs = 3usize;
+        let mut a = vec![0.0_f64; batch * m * n];
+        let mut b = vec![0.0_f64; batch * m * nrhs];
+        for plane in 0..batch {
+            for r in 0..m {
+                for c in 0..n {
+                    let noise =
+                        ((((plane + 1) * (r + 3) * (c + 5)) % 23) as f64 - 11.0) * 0.0005;
+                    a[plane * m * n + r * n + c] =
+                        noise + if r == c { 2.0 + (plane % 7) as f64 * 0.001 } else { 0.0 };
+                }
+                for c in 0..nrhs {
+                    b[plane * m * nrhs + r * nrhs + c] =
+                        ((((plane + 7) * (r + 2) * (c + 11)) % 31) as f64 - 15.0) * 0.01;
+                }
+            }
+        }
+        let a_meta = TensorMeta::from_shape(vec![batch, m, n], DType::F64, Device::Cpu);
+        let b_meta = TensorMeta::from_shape(vec![batch, m, nrhs], DType::F64, Device::Cpu);
+        let got = super::lstsq_qr_batched_contiguous_f64(&a, &a_meta, &b, &b_meta)
+            .expect("batched lstsq should not error")
+            .expect("all planes are full-rank overdetermined systems");
+
+        let a_plane_meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+        let b_plane_meta = TensorMeta::from_shape(vec![m, nrhs], DType::F64, Device::Cpu);
+        let mut want = Vec::with_capacity(batch * n * nrhs);
+        for plane in 0..batch {
+            let a0 = plane * m * n;
+            let b0 = plane * m * nrhs;
+            let x = super::lstsq_qr_contiguous_f64(
+                &a[a0..a0 + m * n],
+                &a_plane_meta,
+                &b[b0..b0 + m * nrhs],
+                &b_plane_meta,
+            )
+            .expect("plane lstsq should not error")
+            .expect("plane should take QR path");
+            want.extend_from_slice(&x);
+        }
+        assert_eq!(got, want, "batched QR lstsq must equal looping 2-D QR");
+
+        let mut rank_deficient = a.clone();
+        for r in 0..m {
+            rank_deficient[r * n + 1] = rank_deficient[r * n];
+        }
+        let declined =
+            super::lstsq_qr_batched_contiguous_f64(&rank_deficient, &a_meta, &b, &b_meta)
+                .expect("rank-deficient batch should not error");
+        assert!(
+            declined.is_none(),
+            "any rank-deficient plane must defer instead of emitting a partial batch"
         );
     }
 
