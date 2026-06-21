@@ -4392,3 +4392,31 @@ CORRECT: grad-2A err ~1e-15 (kernel test svdvals_grad_batched_reconstructs_a_whe
 -> grad_A = U diag(σ) Vʰ = A, square + tall). ft-kernel-cpu 528/0 + ft-api svdvals 3/0. GRAD vein:
 eigvalsh (cq) + svdvals (cr), both 6-9x via fused-backward-kernel + apply_function (in-lane). 35 wins.
 NEXT: qr/eig batched grad (more complex VJPs).
+
+## 2026-06-21ct - NEGATIVE: Conv3d scalar-loss fused backward wrapper is slower; retry condition closed
+
+Tried the explicit `.119` retry condition: a direct `sum(functional_conv3d(...))` path that avoids the
+dense output-gradient buffer by routing first-order f64 5-D Conv3d through a scalar-loss backward helper.
+The prototype was bit-equivalent to `functional_conv3d(...).tensor_sum().backward()` in the focused f64
+gradient test, but it lost on the full gauntlet row and was reverted.
+
+MEASURED on RCH `ovh-a` with
+`AGENT_NAME=cod-a CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a RCH_WORKER=ovh-a
+RCH_WORKERS=ovh-a rch exec -- cargo bench --profile release -p ft-api --bench pytorch_gauntlet_bench --
+gauntlet_conv3d_grad/frankentorch --noplot`:
+  materialized current `frankentorch_kgs4_119`:       [18.830, 19.413, 19.961] ms
+  fused scalar-loss prototype `frankentorch_kgs4_148`: [19.311, 20.604, 22.307] ms
+The candidate is `1.061x` slower than the current borrowed-input Conv3d row.
+
+PyTorch sidecar, local CPU oracle, `FT_GAUNTLET_ITERS=40 FT_TORCH_THREADS=32
+FT_TORCH_INTEROP_THREADS=32 /data/projects/.venvs/frankentorch-pytorch-cpu/bin/python
+crates/ft-api/benches/pytorch_conv3d_grad.py`: elapsed `0.309669579030s` total = `7.741739ms/iter`.
+Ratios: candidate `20.604 / 7.741739 = 2.66x` slower than PyTorch; current `.119` row
+`19.413 / 7.741739 = 2.51x` slower than PyTorch. Score for this pass: `0W / 1L / 0N`.
+
+VERIFIED after rejection: `cargo check --release -p ft-api --bench pytorch_gauntlet_bench` passed on RCH
+`ovh-a`; `cargo test --profile release -p ft-conformance` passed on RCH `vmi1153651` (lib 199/0 plus bins,
+integration, smoke, and doctests green). Source disposition: rejected and removed; no `functional_conv3d_sum`
+or `conv3d_backward_scalar_f64` shipped. NEXT: do not retry API-level scalar-loss wrappers for Conv3d.
+The remaining gap is deeper than dense `dout` materialization: profile direct-conv kernel scheduling,
+workspace/reuse, cache blocking, or a oneDNN-class convolution algorithm before another Conv3d attempt.
