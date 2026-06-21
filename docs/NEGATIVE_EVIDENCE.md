@@ -4286,3 +4286,17 @@ chk MATCH at k=4 (k=16/32 diff = FT-vs-torch GEMM accumulation rounding, matmul 
 matmul is ATTENTION-shaped (hot); now DOMINATES at k>=16 (common head-dim range). 33 wins. The ci
 materialization-wall finding directly enabled this (BYPASS reshape rather than fix it). NOTE: the underlying
 bmm kernel is MKL-competitive (wins k>=16, loses tiny k=4) -- the win is closing the broadcast/reshape gap.
+
+## 2026-06-21co - NEGATIVE: f32 4-D matmul LOSES to MKL (FT f32 bmm inefficient — slower than its own f64)
+
+Extended the N-D matmul fast path to f32 (bmm_tensor_contiguous_f32 on contiguous storage) — correct
+(matmul 19/0) but it LOSES: f32 [10000,8,16,16] FT 59.1ms vs torch 18.8ms = 3.14x SLOWER; [2000,12,32,32]
+3.84x; [10000,8,4,4] 11.77x. ROOT CAUSE: FT's f32 bmm (59.1ms) is SLOWER than its own f64 bmm (21.8ms,
+same shape) — backwards (f32 should be ~2x faster: half the bytes + SIMD). PyTorch f32 GEMM is MKL SIMD-
+vectorized (18.8 vs its f64 39.1ms = 2x faster). So the f64 N-D win (cn, 1.79x) does NOT mirror to f32:
+the routing fast-path is fine, but FT's f32 GEMM (sgemm path / possible f64-backed-storage conversion in
+contiguous_values_f32) is the wall — a separate, deeper f32-GEMM-kernel inefficiency, NOT a routing fix.
+REVERTED the f32 extension (won't ship a 3x-PyTorch-loss path as a "win"). f64 N-D matmul win (cn) stands.
+33 wins. LEAD: FT f32 batched GEMM is ~2.7x slower than its f64 — investigate sgemm / f32 storage (would
+unlock f32 attention matmul); deeper kernel work. LESSON: a win in f64 does NOT auto-mirror to f32 when
+the vendor (MKL) has a SIMD f32 advantage AND FT's f32 path is unoptimized.
