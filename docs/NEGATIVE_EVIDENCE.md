@@ -3970,3 +3970,19 @@ release-profile passed after the revert on RCH `ovh-a`.
 Score for this pass: `0W / 2L / 0N` as routing evidence only. Retry only from current `origin/main` with
 same-worker baseline/candidate proof and a PyTorch-capable comparator, or if a future profile isolates
 cumprod backward as a current-origin loss after the scan and batched-linalg wins.
+
+## 2026-06-21bt - NEW WINS (13th+14th): native f32 batched eigvalsh = 4.6-8.6x + qr = 6.0-7.5x vs PyTorch
+
+eigvalsh_batched_contiguous_f32 + qr_batched_contiguous_f32 (native f32, par over planes) + tensor_
+linalg_eigvalsh/qr native f32 batched fast paths (before the f64 cast). MEASURED
+(examples/batched_f32_evq_h2h.rs, esum / sum(R^2) within tol = OK):
+  [100000,4,4]  eigvalsh FT 6.3 vs 54.1ms = 8.62x | qr FT 5.1 vs 38.0ms = 7.46x
+  [20000,16,16] eigvalsh 5.88x | qr 5.88x
+  [4000,32,32]  eigvalsh 4.62x | qr 6.02x
+VERIFIED: eigvalsh_qr_batched_f32_match_looping_2d_bit_exact (both bit-exact vs FT 2-D). NOTE: ft-api
+full lib suite has 3 PRE-EXISTING failures (complex_arithmetic_golden UnsupportedDType(F32), batch_norm2d_
+f32 shortcut-tolerance, +1) — CONFIRMED identical on CLEAN origin/main without my change (stash-test);
+peer complex-f32 WIP + a tolerance flake, NOT mine. My eigh/eigvalsh/qr area is green. Batched-linalg
+class: eigh(f64+f32), eigvalsh(f64+f32), svdvals(f64), qr(f64+f32). 14 vs-PyTorch wins. REMAINING (bead
+ogu1e): svdvals f32 (needs new svdvals_contiguous_f32 kernel) + svd (tiny-k). gotcha: `gen` is a reserved
+keyword now — use genm in test/example data vars.

@@ -19194,6 +19194,48 @@ fn eigh_tql2_values_only_f32(n: usize, d: &mut [f32], e: &mut [f32]) {
 /// so the public f32 eigvalsh avoids the f32->f64->f32 round trip and matches
 /// torch's f32 eigvalsh (tolerance parity: f32 eigenvalues are ~f32-accurate, the
 /// expected contract for an f32 input). frankentorch-b6pem.
+/// f32 mirror of [`eigvalsh_batched_contiguous_f64`]: batched symmetric eigenvalues `[..., k, k]` ->
+/// `[B*k]` f32, native (no f64 round trip), parallel over the batch. Bit-identical to looping the 2-D
+/// f32 eigvalsh. (BlackThrush)
+pub fn eigvalsh_batched_contiguous_f32(
+    data: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    ensure_unary_layout_and_storage_f32(data, meta)?;
+    let shape = meta.shape();
+    let nd = shape.len();
+    if nd < 2 || shape[nd - 1] != shape[nd - 2] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![nd],
+        });
+    }
+    let k = shape[nd - 1];
+    let bb: usize = shape[..nd - 2].iter().product();
+    let plane = k * k;
+    let offset = meta.storage_offset();
+    let data = &data[offset..offset + bb * plane];
+    let kmeta = TensorMeta::from_shape(vec![k, k], DType::F32, Device::Cpu);
+    let mut evals = vec![0.0f32; bb * k];
+    let first_err = std::sync::Mutex::new(None);
+    evals
+        .par_chunks_mut(k)
+        .zip(data.par_chunks(plane))
+        .for_each(|(ev, pl)| match eigvalsh_contiguous_f32(pl, &kmeta) {
+            Ok(w) => ev.copy_from_slice(&w),
+            Err(e) => {
+                let mut g = first_err.lock().unwrap();
+                if g.is_none() {
+                    *g = Some(e);
+                }
+            }
+        });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(evals)
+}
+
 pub fn eigvalsh_contiguous_f32(data: &[f32], meta: &TensorMeta) -> Result<Vec<f32>, KernelError> {
     ensure_unary_layout_and_storage_f32(data, meta)?;
     let shape = meta.shape();
@@ -23336,6 +23378,57 @@ fn qr_householder_panel_blocked_f32(
 /// Householder sweep below that. Computed entirely in f32 so the public f32 QR
 /// avoids the f32->f64->f32 round trip and matches torch's f32 QR (tolerance
 /// parity: blocked WY reassociates). frankentorch-b3o90.
+/// f32 mirror of [`qr_batched_contiguous_f64`]: batched QR `[..., m, n]` -> `(Q [B*m*kq], R [B*kq*n])`
+/// f32, native, parallel over the batch. Bit-identical to looping the 2-D f32 qr. (BlackThrush)
+pub fn qr_batched_contiguous_f32(
+    data: &[f32],
+    meta: &TensorMeta,
+    reduced: bool,
+) -> Result<(Vec<f32>, Vec<f32>), KernelError> {
+    ensure_unary_layout_and_storage_f32(data, meta)?;
+    let shape = meta.shape();
+    let nd = shape.len();
+    if nd < 2 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![nd],
+        });
+    }
+    let m = shape[nd - 2];
+    let n = shape[nd - 1];
+    let kq = if reduced { m.min(n) } else { m };
+    let bb: usize = shape[..nd - 2].iter().product();
+    let plane = m * n;
+    let qp = m * kq;
+    let rp = kq * n;
+    let offset = meta.storage_offset();
+    let data = &data[offset..offset + bb * plane];
+    let pmeta = TensorMeta::from_shape(vec![m, n], DType::F32, Device::Cpu);
+    let mut q_out = vec![0.0f32; bb * qp];
+    let mut r_out = vec![0.0f32; bb * rp];
+    let first_err = std::sync::Mutex::new(None);
+    q_out
+        .par_chunks_mut(qp)
+        .zip(r_out.par_chunks_mut(rp))
+        .zip(data.par_chunks(plane))
+        .for_each(|((qc, rc), pl)| match qr_contiguous_f32(pl, &pmeta, reduced) {
+            Ok(res) => {
+                qc.copy_from_slice(&res.q);
+                rc.copy_from_slice(&res.r);
+            }
+            Err(e) => {
+                let mut g = first_err.lock().unwrap();
+                if g.is_none() {
+                    *g = Some(e);
+                }
+            }
+        });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok((q_out, r_out))
+}
+
 pub fn qr_contiguous_f32(
     data: &[f32],
     meta: &TensorMeta,
@@ -30742,6 +30835,55 @@ mod tests {
             let w = super::eigvalsh_contiguous_f64(&data[b * k * k..(b + 1) * k * k], &kmeta).unwrap();
             for i in 0..k {
                 assert_eq!(evals[b * k + i].to_bits(), w[i].to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn eigvalsh_qr_batched_f32_match_looping_2d_bit_exact() {
+        let (bb, k) = (9usize, 5usize);
+        // symmetric for eigvalsh
+        let mut sym = vec![0.0f32; bb * k * k];
+        for b in 0..bb {
+            for i in 0..k {
+                for j in 0..k {
+                    sym[b * k * k + i * k + j] = (((b * 3 + i * 11 + j * 7) % 89) as f32) * 0.1;
+                }
+            }
+        }
+        for b in 0..bb {
+            for i in 0..k {
+                for j in 0..k {
+                    let s = (sym[b * k * k + i * k + j] + sym[b * k * k + j * k + i]) * 0.5;
+                    sym[b * k * k + i * k + j] = s;
+                }
+            }
+            for i in 0..k {
+                sym[b * k * k + i * k + i] += k as f32;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![bb, k, k], DType::F32, Device::Cpu);
+        let kmeta = TensorMeta::from_shape(vec![k, k], DType::F32, Device::Cpu);
+        let ev = super::eigvalsh_batched_contiguous_f32(&sym, &meta).unwrap();
+        for b in 0..bb {
+            let w = super::eigvalsh_contiguous_f32(&sym[b * k * k..(b + 1) * k * k], &kmeta).unwrap();
+            for i in 0..k {
+                assert_eq!(ev[b * k + i].to_bits(), w[i].to_bits());
+            }
+        }
+        // general for qr
+        let genm: Vec<f32> = (0..bb * k * k)
+            .map(|x| (((x * 2246822519usize) % 9941) as f32) * 0.002 - 9.0)
+            .collect();
+        let (q, r) = super::qr_batched_contiguous_f32(&genm, &meta, true).unwrap();
+        for b in 0..bb {
+            let res =
+                super::qr_contiguous_f32(&genm[b * k * k..(b + 1) * k * k], &kmeta, true).unwrap();
+            for t in 0..q.len() / bb {
+                assert_eq!(q[b * (q.len() / bb) + t].to_bits(), res.q[t].to_bits());
+            }
+            for t in 0..r.len() / bb {
+                assert_eq!(r[b * (r.len() / bb) + t].to_bits(), res.r[t].to_bits());
             }
         }
     }
