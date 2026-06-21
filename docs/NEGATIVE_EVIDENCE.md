@@ -3156,3 +3156,18 @@ The backward causal-skip is the real lever BUT not cleanly bit-exact (the dv/dk 
 rows i; blocking them changes FP accumulation order). No-grad inference uses a SEPARATE fast-path kernel.
 Per REVERT-~0-gain, reverted the kernel change; kept the example (records the WIN). Forward-skip would
 help only larger-seq / forward-heavy causal (scales O(seq)); deferred.
+
+## 2026-06-21aa - f32 SDPA is a LOSS — the SDPA win is f64-SPECIFIC (bounds the win)
+
+Probed whether the SDPA wins (f64 ~2.3x non-causal, ~1.24-2x causal) hold for f32 (the common ML
+inference dtype). Head-to-head (crates/ft-api/examples/sdpa_f32_headtohead.rs, [16,512,64] f32 fwd+bwd):
+- non-causal: FT 45.2 ms vs PyTorch 19.3 ms = **FT ~2.34x SLOWER (LOSS)**
+- causal:     FT 41.6 ms vs PyTorch 20.1 ms = **FT ~2.07x SLOWER (LOSS)**
+
+★ The SDPA win is f64-SPECIFIC. PyTorch's CPU `_scaled_dot_product_flash_attention_for_cpu` covers
+f32/bf16/f16 (fused AVX → ~19-20 ms) but NOT f64, which falls to the unfused math path (~50 ms) — that
+f64 gap is what FT's fused kernel wins. On f32, PyTorch's tuned flash CPU beats FT's f32 sdpa ~2x
+(another tuned-vendor-kernel wall, like oneDNN conv / Sleef transcendental). Note FT's f32 sdpa (~45 ms)
+≈ FT's f64 sdpa (~24-46 ms) — FT doesn't specialize f32 hard; PyTorch f32 (19 ms) << PyTorch f64 (50 ms).
+HONEST BOUND: the 2 SDPA wins are real on the f64 gauntlet basis but do NOT extend to f32 inference.
+Tally: 2W (f64 sdpa ±causal) + this f32 LOSS recorded. No f32-sdpa lever (PyTorch flash CPU is tuned AVX).
