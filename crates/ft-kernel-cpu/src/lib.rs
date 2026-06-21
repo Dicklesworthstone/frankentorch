@@ -18176,6 +18176,53 @@ fn eigh_tql2_z_deferred_f32(n: usize, d: &mut [f32], e: &mut [f32], z: &mut [f32
 /// implicit-shift QL with rotation accumulation, so the public f32 eigh avoids the
 /// f32->f64->f32 round trip and matches torch's f32 dtype contract (eigenvectors
 /// non-unique up to sign; eigenvalues f32-accurate). frankentorch-b6pem follow-up.
+/// f32 mirror of [`eigh_batched_contiguous_f64`]: batched symmetric eig `[..., k, k]` ->
+/// `(eigenvalues [B*k], eigenvectors [B*k*k])` f32, computed natively in f32 (no f64 round trip),
+/// parallel over the batch. Bit-identical to looping the 2-D f32 eigh. (BlackThrush)
+pub fn eigh_batched_contiguous_f32(
+    data: &[f32],
+    meta: &TensorMeta,
+) -> Result<(Vec<f32>, Vec<f32>), KernelError> {
+    ensure_unary_layout_and_storage_f32(data, meta)?;
+    let shape = meta.shape();
+    let nd = shape.len();
+    if nd < 2 || shape[nd - 1] != shape[nd - 2] {
+        return Err(KernelError::ShapeMismatch {
+            lhs: shape.to_vec(),
+            rhs: vec![nd],
+        });
+    }
+    let k = shape[nd - 1];
+    let bb: usize = shape[..nd - 2].iter().product();
+    let plane = k * k;
+    let offset = meta.storage_offset();
+    let data = &data[offset..offset + bb * plane];
+    let kmeta = TensorMeta::from_shape(vec![k, k], DType::F32, Device::Cpu);
+    let mut evals = vec![0.0f32; bb * k];
+    let mut evecs = vec![0.0f32; bb * plane];
+    let first_err = std::sync::Mutex::new(None);
+    evals
+        .par_chunks_mut(k)
+        .zip(evecs.par_chunks_mut(plane))
+        .zip(data.par_chunks(plane))
+        .for_each(|((ev, vc), pl)| match eigh_contiguous_f32(pl, &kmeta) {
+            Ok(r) => {
+                ev.copy_from_slice(&r.eigenvalues);
+                vc.copy_from_slice(&r.eigenvectors);
+            }
+            Err(e) => {
+                let mut g = first_err.lock().unwrap();
+                if g.is_none() {
+                    *g = Some(e);
+                }
+            }
+        });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok((evals, evecs))
+}
+
 pub fn eigh_contiguous_f32(data: &[f32], meta: &TensorMeta) -> Result<EighResultF32, KernelError> {
     ensure_unary_layout_and_storage_f32(data, meta)?;
     let shape = meta.shape();
@@ -30695,6 +30742,42 @@ mod tests {
             let w = super::eigvalsh_contiguous_f64(&data[b * k * k..(b + 1) * k * k], &kmeta).unwrap();
             for i in 0..k {
                 assert_eq!(evals[b * k + i].to_bits(), w[i].to_bits());
+            }
+        }
+    }
+
+    #[test]
+    fn eigh_batched_f32_matches_looping_2d_bit_exact() {
+        let (bb, k) = (8usize, 5usize);
+        let mut data = vec![0.0f32; bb * k * k];
+        for b in 0..bb {
+            for i in 0..k {
+                for j in 0..k {
+                    data[b * k * k + i * k + j] = (((b * 7 + i * 13 + j * 5) % 97) as f32) * 0.1;
+                }
+            }
+        }
+        for b in 0..bb {
+            for i in 0..k {
+                for j in 0..k {
+                    let s = (data[b * k * k + i * k + j] + data[b * k * k + j * k + i]) * 0.5;
+                    data[b * k * k + i * k + j] = s;
+                }
+            }
+            for i in 0..k {
+                data[b * k * k + i * k + i] += k as f32;
+            }
+        }
+        let meta = TensorMeta::from_shape(vec![bb, k, k], DType::F32, Device::Cpu);
+        let kmeta = TensorMeta::from_shape(vec![k, k], DType::F32, Device::Cpu);
+        let (evals, evecs) = super::eigh_batched_contiguous_f32(&data, &meta).unwrap();
+        for b in 0..bb {
+            let r = super::eigh_contiguous_f32(&data[b * k * k..(b + 1) * k * k], &kmeta).unwrap();
+            for i in 0..k {
+                assert_eq!(evals[b * k + i].to_bits(), r.eigenvalues[i].to_bits());
+            }
+            for t in 0..k * k {
+                assert_eq!(evecs[b * k * k + t].to_bits(), r.eigenvectors[t].to_bits());
             }
         }
     }

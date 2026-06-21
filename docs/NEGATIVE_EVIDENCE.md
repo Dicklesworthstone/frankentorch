@@ -3935,3 +3935,13 @@ rsq MATCH (k=4,16) / ~1e-9 sum-order diff (k=32, 4M-term R^2 sum). CORRECTNESS: 
 looping_2d_bit_exact (Q AND R bit-identical vs FT 2-D qr). ft-api linalg_qr 1/0. Batched-linalg class
 now 4 ops (eigh+eigvalsh+svdvals+qr). REMAINING (bead ogu1e): svd (tuple U,S,V — tiny-k, FT svd scalar)
 + f32 mirrors of eigh/eigvalsh. 11 vs-PyTorch wins (7 scan + eigh + eigvalsh + svdvals + qr).
+
+## 2026-06-21bs - NEW WIN (12th): native f32 batched eigh = 8.1-12.1x vs PyTorch
+
+eigh_batched_contiguous_f32 (native f32, par over planes) + tensor_linalg_eigh native f32 batched
+no-grad fast path (before the f64 cast — avoids the round trip). MEASURED (examples/batched_eigh_f32_h2h.rs,
+eigenvalue-sum exact MATCH): [100000,4,4] FT 10.1ms vs PyTorch 121.5ms = 12.07x FASTER; [20000,16,16]
+8.14x; [4000,32,32] 9.55x. f32 wins MORE than f64 (less memory traffic). VERIFIED:
+eigh_batched_f32_matches_looping_2d_bit_exact + ft-api eigh 44/0. Batched-linalg class: eigh(f64+f32),
+eigvalsh, svdvals, qr. 12 vs-PyTorch wins. REMAINING (bead ogu1e): f32 mirrors for eigvalsh/svdvals/qr
+(same pattern) + svd (tiny-k only).
