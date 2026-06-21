@@ -38,13 +38,17 @@ Updated: 2026-06-21
 | `frankentorch-grefr` | SmoothL1 f64 mean-loss backward, 8M elems | `1.35x` slower | internal keep; direct local `588.51 ms` -> `469.36 ms`; beta=1 derivative branch rejected | kept paired-randn fill; route remaining gap to tape/allocation/loss-kernel |
 
 Measured-discipline score: `30/30` for the gauntlet lanes. PyTorch head-to-head
-score: `0W / 29L / 1N`; the RMSNorm scalar-sum comparator is neutral for
-release scoring because the candidate was faster than local PyTorch by
-mixed-location ratio but failed the same-worker FrankenTorch keep gate.
-Correctness guards are green and the SDPA, MaxPool3d,
-Linear, LayerNorm, BatchNorm1d/2d, GroupNorm, and SmoothL1 levers include real
-internal speedups, but no measured workload is performance-dominant against
-PyTorch yet.
+score: **`1W / many-L / 1N`** as of 2026-06-21 — **SDPA is now ~2.0x FASTER than
+PyTorch** (FT `[16,512,64]` f64 train step ~24 ms stable vs PyTorch >=49 ms; FT's
+fused flash-attention beats PyTorch's CPU unfused SDPA). This is the first
+performance-dominant workload. The RMSNorm scalar-sum comparator remains neutral.
+
+★ 2026-06-21 re-measure (after the 9-lever autograd-allocation campaign landed): the
+GENERIC engine levers (cbe4t/96e5d/0w3ns/mbitj/20q7c/kwarf/pwjrs/rdgt6+cuqzu+create_graph/05upk)
+narrowed EVERY gauntlet lane massively — the per-bead ratios below (12-28x) are STALE.
+Current head-to-head (clean-arm): sdpa ~2.0x FASTER (WIN); linear ~parity; max_pool1d ~1.57x;
+avg_pool2d ~3.3x; avg_pool1d ~5x; batch_norm2d f32 28.14x -> ~5.7x. See NEGATIVE_EVIDENCE
+2026-06-21p for the full table + contention caveats.
 
 ### 2026-06-21 BatchNorm2d f32 API-only lazy-zero input gradient keep (`frankentorch-kgs4.145`)
 

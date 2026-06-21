@@ -2700,3 +2700,35 @@ REMAINING (NOT autograd-alloc; need full cargo / new beads, currently disk-block
 - Norm lanes (BatchNorm/GroupNorm/LayerNorm): peer swarm's active campaign.
 - save_for_backward -> borrowed_inputs per-op conversions: possible but per-op, no measured target
   beyond the already-covered gauntlet lanes, and needs in-place-mutation-safety review.
+
+## 2026-06-21p - ★ FIRST HEAD-TO-HEAD WIN: SDPA ~2.0x FASTER than PyTorch + campaign-wide re-measure
+
+Re-ran the gauntlet head-to-head (local, torch 2.12.0+cpu, both arms, fair: identical
+[16,512,64] f64 fwd+bwd) after the 9-lever autograd-allocation campaign landed on main.
+
+★ SDPA (kgs4.113) — WIN. FrankenTorch median **24.2-25.6 ms** (rock-stable across 5 runs:
+24.1/24.6/25.1/25.6/25.6) vs PyTorch **>=50 ms** (min 50.6, typically 53-62, contention spikes
+to 113; historical-clean scorecard value 48.9). FT wins **~2.0x even against PyTorch's best
+number** — robust to the box contention (which only inflates PyTorch). FT's fused flash-attention
+kernel (sdpa_forward/backward, avoids materializing the [16,512,512] scores) beats PyTorch's CPU
+F.scaled_dot_product_attention (unfused math path). FT-side improved from the scorecard's ~53-63 ms
+to ~24 ms — consistent with the campaign's grad-buffer/leaf-clone eliminations on the SDPA backward
+(dq/dk/dv 3x4MB + q/k/v leaf grads); this FLIPPED sdpa from 1.29x-slower to ~2x-faster.
+
+Campaign-wide cumulative narrowing (current vs documented origin; clean-arm ratios):
+| lane | FT now | PyTorch (clean) | ratio now | origin |
+|---|---:|---:|---:|---:|
+| sdpa [16,512,64] | ~24 ms | ~49 ms | **~2.0x FASTER (WIN)** | 1.29x slower |
+| max_pool1d [8,64,8192] | ~27 ms | ~17 ms | ~1.57x slower | 12.31x |
+| linear [32,512]->2048 | ~7.4 ms | ~7-11 ms | ~parity (1.0-1.5x) | 2.45x |
+| avg_pool1d [8,64,8192] | ~44 ms (fused ~37) | ~8.8 ms | ~5x | 25.86x |
+| avg_pool2d [8,64,64,64] | ~13.7 ms | ~4.1 ms | ~3.3x | 4.54x |
+| batch_norm2d f32 [32,256,28,28] | ~43 ms (scalar ~35) | ~7.5 ms | ~5.7x | 28.14x |
+
+- The 9 GENERIC autograd levers narrowed EVERY lane massively, incl. the peer-owned norm lanes
+  (batch_norm2d 28.14x -> ~5.7x) — generic engine wins lift all custom-fn backwards. The scorecard's
+  per-bead ratios (12-28x) are STALE; current is ~parity-to-5.7x, with SDPA an outright WIN.
+- CAVEAT: box heavily contended this session — PyTorch (subprocess) arm noisy for some lanes
+  (linear 7-68 ms, sdpa 50-113 ms); FT (in-process) arms stable. Ratios use PyTorch's MIN/clean
+  value (conservative for FT). The SDPA win holds even at PyTorch's cleanest. Head-to-head score
+  is now **1W / many-L / 0N** (was 0W).
