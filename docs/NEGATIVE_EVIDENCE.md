@@ -3462,3 +3462,18 @@ unmasked win: PyTorch CPU has NO f64 flash (masked/causal/unmasked all materiali
 flash f32 (masked/causal/unmasked -> FT loses). Did NOT implement f32 flash-masked (would regress). The
 f64 masked win (inference + training, both entry points + GQA, 21ap/21aq) is the complete masked win.
 Measured-not-assumed: tested the dismissal, refuted the f32-masked-opportunity hypothesis.
+
+## 2026-06-21as - masked SDPA: one remaining gap = 4-D broadcast-over-heads mask [B,1,seq,seq]; deferred (branch DRY refactor needed)
+
+The shipped masked win (21ap/21aq) handles [seq_q,seq_k] (shared) + [bh,seq_q,seq_k] (per-bh, 3-D).
+A 4-D attention [B,H,seq,d] with a FULL [B,H,seq,seq] mask FOLDS to [B*H,seq,seq] -> handled. The ONLY
+unhandled masked case is [B,1,seq,seq] BROADCAST-over-heads (the common per-batch padding mask) — it
+can't be folded without materializing ~B*H*seq*seq (33MB at [2,8,512]), which defeats the flash point.
+ATTEMPTED a clean fix: generalize the masked kernels' mask offset to (mask_div, mask_stride) with
+offset(bh) = (bh/mask_div)*mask_stride (covers shared/per-bh/broadcast-H/4D-full uniformly). The kernels
+changed fine, but it forces editing 4 near-identical masked fast-path branches (2 entry points x
+{no-grad, grad}) — not individually targetable safely. REVERTED to the shipped state (zero regression;
+masked win intact). PLAN: first DRY the 4 masked branches into ONE shared helper
+(try_masked_sdpa_fast_path), THEN apply the (div,stride) + broadcast-H extension in that single place.
+Narrow gap (broadcast-H padding only); moderate value; deferred to the clean refactor. PyTorch f64 masked
+is always math, so once routed it WILL win (~1.6x) like the other masked cases.
