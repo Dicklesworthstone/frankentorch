@@ -2411,3 +2411,20 @@ so the swarm does not re-probe what is already harvested or proven-locked:
 - STATUS: code-first (build PAUSED, disk-low). VERIFY when disk recovers: ft-autograd +
   ft-api (IndexSelect sparse path) + conformance. Expected bit-exact. Bead cuqzu in_progress
   until green.
+
+## 2026-06-21e - frankentorch-05upk - implementation plan committed (disk-low, no builds; awaits compiler-verify)
+
+- The next substantive lever (Arc-share the leaf grad between report.gradients and
+  persistent_grads to kill the per-backward leaf to_vec clone) is a CORE-PUBLIC-TYPE change
+  (~15-20 sites incl GradScaler scaled_clone + optimizer read path + 2 ft-nn test callers).
+  It MUST be compiler-verified before merge — implementing it blind during a build pause would
+  risk breaking shared `main` for the whole swarm, which no directive licenses.
+- Therefore this turn delivers the COMPLETE paste-ready implementation with exact before/after
+  for every site: artifacts/perf/frankentorch-05upk/arc_refactor_plan.md. Apply + run the full
+  workspace verification (ft-autograd/ft-api/ft-conformance/clippy) when disk recovers and
+  ft-nn has landed (the 2 gradients() test callers would otherwise collide with its WIP).
+  Expected bit-exact (Arc share + make_mut preserve values).
+- NOTE on "no trivial churn": the remaining safe code-first alloc skips are exhausted (rdgt6 +
+  cuqzu took the per-backward node-count Vecs; telemetry allocs are contract-locked per
+  2026-06-21c). 05upk is the only substantive lever left and it is compiler-gated, so the
+  honest code-only deliverable this turn is the exact implementation plan, not a blind core edit.
