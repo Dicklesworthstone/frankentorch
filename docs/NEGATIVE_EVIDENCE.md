@@ -3759,3 +3759,22 @@ AUTOGRAD-PLUMBING-walled (parity ceiling). Scan-family vein FULLY harvested + bo
 backward autograd-walled, sort bandwidth-walled (21be). Pushing the grad step to a win would require
 reducing FT's autograd overhead (~130ms, e.g. borrowed-inputs) — a DIFFERENT lever class, not the cache
 reorder. NEXT: a genuinely different lever (the strided-non-last-dim vein is exhausted).
+
+## 2026-06-21bg - SCOUT (negative): selection NOT a winnable lever (PyTorch topk is fast); strided-dim surface FULLY HARVESTED
+
+Scouted more dim=0 [262144,64] ops for a winnable strided weakness:
+  var/std/logsumexp/nansum/count_nonzero dim=0 ~= dim=1 -> cache-friendly reductions, NO gap.
+  mode 71ms, unique_consec 241ms -> data-dependent/sort-based (gather-walled / niche).
+  kthvalue dim=0 322ms LOOKED slow BUT it's PyTorch's OWN slow kthvalue impl: PyTorch TOPK dim=0 k=8
+  = 36ms (FAST, proper partial selection). So selection is NOT a fundamental PyTorch weakness.
+MEASURED FT topk dim=0 k=8 = 139ms vs PyTorch 36ms = FT 3.82x SLOWER (FT's topk kernel is serial for
+dim=0 / outer=1 — same flaw as cumsum, BUT PyTorch's topk is well-optimized so even a lane-par FT would
+only reach ~parity, NOT a win). FT kthvalue is FLATTENED (feature gap) but moot (topk is the fast ref).
+=> NO new winnable lever. The strided-non-last-dim surface is now FULLY HARVESTED + characterized:
+  - reorderable in-place SCANS (cumsum/cumprod/cummax/cummin) -> WIN (7 shipped, 2.6-3.8x).
+  - GATHER+SCATTER (sort) -> bandwidth-walled (21be).
+  - SELECTION (topk) -> PyTorch-fast, FT parity-ceiling (no win).
+  - REDUCTIONS (sum/prod/var/std/logsumexp/nansum) -> PyTorch cache-friendly (no gap).
+  - TRANSCENDENTAL -> Sleef-walled. GRAD path -> autograd-walled (21bf).
+STOP probing the strided-dim vein — exhausted. FT topk dim=0 serial is a low-priority DEFENSIVE
+(loss->parity) fix, not a DOMINATE win. NEXT requires a genuinely different lever class.
