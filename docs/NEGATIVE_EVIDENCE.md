@@ -3371,3 +3371,18 @@ clean anchor (e.g. FT gauntlet sdpa ~23ms) flags FT-rayon contention; (2) RAW-ke
 kernel-vs-API overhead; (3) measure, don't assume (every "PyTorch materializes -> FT wins" hypothesis was
 refuted by measurement: conv3d/max_pool3d/cdist/f32-sdpa); (4) op-dispatch inspection beats measuring for
 borrow-vs-clone questions; (5) GOTCHA caught twice — never regenerate inputs via sin() inside the timed loop.
+
+## 2026-06-21am - gmuml tape-retention REFUTED for no-grad op chains (MHA gap is NOT tape-degradation)
+
+Tested whether the unexplained MHA composed-inference overhead (~85ms residual beyond accounted
+components) is the gmuml tape-retention issue ("no-grad forwards degrade ~linearly"). Probe
+(examples/nograd_tape_degradation.rs): chain of 40 no-grad relu [512,512] ops in ONE session (tape
+grows to 41 nodes), time each:
+- op[0] 1.165ms, op[20] 1.353ms, op[39] 1.163ms — FLAT, slope ~-0.0001 ms/op-added, op[last]/op[0]=1.00x.
+- fresh-session control: 0.837ms/op.
+=> NO tape-growth degradation for no-grad op chains. The MHA gap is NOT general gmuml tape-retention.
+The gmuml memory note ("no-grad forwards degrade linearly") is OP/CONTEXT-specific (conv-pad case), NOT
+general no-grad — corrected. The MHA ~85ms residual remains unexplained (would need MHA-internal
+step instrumentation) BUT MHA loses on the matmul-MKL wall regardless (4 matmuls ~30ms vs PyTorch ~8ms),
+so resolving it wouldn't flip MHA -> not worth the deep dive. Reaffirms: no composed-inference lever
+yields a vs-PyTorch win (matmul-walled). Closes the MHA diagnosis: matmul-wall + (residual, non-gmuml).
