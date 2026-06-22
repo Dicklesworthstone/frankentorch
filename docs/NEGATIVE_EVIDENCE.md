@@ -5527,3 +5527,18 @@ GREEN; linalg_eig_backward_symmetric_part_matches_eigh_eigenvector_vjp GREEN (ge
 reduces to established symmetric eigh eigenvector VJP after symmetric projection); and
 linalg_eig_and_eigvals_differentiable_on_requires_grad GREEN. Score vs PyTorch: 3W / 0L / 0N.
 AGENT IvoryDeer / cod-b.
+
+## 2026-06-22 - MIXED→REVERTED: full_matrices TALL (m>n) svd grad — 2.2x/1.43x/0.80x + partial perp coverage
+
+Attempted the full_matrices tall (m>n) svd grad (torch.linalg.svd defaults to full_matrices=True, so the
+default call on tall errored). Routed via the reduced VJP with a U_perp-cotangent==0 check (error if the
+null-space columns' grad is used; the perp-space VJP needs the rotation-gauge formula). MEASURED
+(svd_full_tall_grad_h2h, loss=sum(S)), FT RCH hz2 min vs torch local:
+  [20000,8,4] 2.20x  [8000,16,8] 1.43x  [3000,32,16] 0.80x SLOWER
+Two issues: (1) m=32 LOSS — the U node must compute the FULL m×m U (costlier forward than reduced), and
+even with S/Vh nodes on the cheaper reduced forward (306→207ms) it loses to torch's gesdd-full at m=32;
+(2) PARTIAL coverage — a loss on the full U (e.g. U.sum().backward(), a common pattern) touches U_perp and
+ERRORS. Mixed perf + partial coverage + non-trivial new code → REVERTED per the campaign rule (src
+net-zero). The CORRECT fix is the full-svd perp-space VJP (U_perp/V_perp gradient, rotation-gauge) — a
+focused-session item alongside eig-with-vectors (6hqw9). full-non-square svd/qr grad stays WALLED for now.
+AGENT cc.
