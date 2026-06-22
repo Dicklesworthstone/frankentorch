@@ -5134,3 +5134,27 @@ torch inv/solve backward are MKL-fast = those grads stay walled; only lstsq is w
 VERIFIED: test `tensor_linalg_lstsq_batched_grad_matches_per_plane_2d` (grad_A & grad_B
 match looping the 2-D lstsq grad within `1e-8 + 1e-6·|x|`) GREEN on RCH `hz2`;
 `ft-conformance --profile release` GREEN. Score vs PyTorch: `3W / 0L / 0N`.
+
+## 2026-06-22 - WIN: batched pinv GRADIENT = 1.31-2.07x vs PyTorch, ORACLE-EXACT (code shipped with lstsq)
+
+Standalone confirmation of the batched-pinv grad path landed as the lstsq keystone
+(5dc2f8bc). torch's `pinv` is slow even at FORWARD (looped per-plane gesdd SVD: 93-162ms
+measured) and its grad step is 89-188ms. FrankenTorch's requires_grad pinv path uses the
+parallel normal-equations composition `(AᵀA)⁻¹Aᵀ` (batched matmul + fast batched inv), so
+the grad step is much faster.
+
+MEASURED (examples/batched_pinv_grad_h2h.rs, fwd+bwd step, loss = sum(A⁺⊙A⁺)), FT on RCH
+`hz2` vs PyTorch `2.12.0+cpu` local (8 threads, mixed-location — FT remote):
+  `[20000,8,4]`  FT 43.229 ms  vs PyTorch 89.433 ms  = `2.07x` faster
+  `[8000,16,8]`  FT 79.246 ms  vs PyTorch 119.887 ms = `1.51x` faster
+  `[3000,32,16]` FT 143.612 ms vs PyTorch 187.676 ms = `1.31x` faster
+
+ORACLE-EXACT: full-rank pinv is gauge-free, FT grad-sum matches PyTorch to all printed
+digits (e.g. -1.978211e4, -8.503482e3). No new source (the pinv batched grad path shipped
+in 5dc2f8bc); this entry adds the standalone benchmark + ledger record.
+
+PROBE SWEEP (disk-free torch fwd-vs-fwd+bwd, this pass): cholesky bwd 9-23ms,
+slogdet bwd 5-13ms, matrix_power bwd 4-9ms — all MKL/potrf-bound with cheap forwards =
+NOT winnable (FT can't beat MKL batched potrf/matmul). pinv = the only standout
+(slow looped-SVD forward), already captured by the composition grad path. Score vs
+PyTorch: `3W / 0L / 0N`.
