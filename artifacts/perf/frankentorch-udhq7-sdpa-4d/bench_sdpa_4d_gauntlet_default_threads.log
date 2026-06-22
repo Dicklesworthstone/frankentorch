@@ -1,0 +1,25 @@
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.14s
+     Running benches/pytorch_gauntlet_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/pytorch_gauntlet_bench-660553189fe21307)
+Gnuplot not found, using plotters backend
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/frankentorch_kgs4_113
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/frankentorch_kgs4_113: Warming up for 1.0000 s
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/frankentorch_kgs4_113: Collecting 10 samples in estimated 3.3251 s (165 iterations)
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/frankentorch_kgs4_113: Analyzing
+gauntlet_sdpa_grad_2x8x512x64/frankentorch_kgs4_113
+                        time:   [19.321 ms 34.885 ms 75.686 ms]
+                        change: [-8.9850% +70.494% +229.34%] (p = 0.62 > 0.05)
+                        No change in performance detected.
+Found 2 outliers among 10 measurements (20.00%)
+  2 (20.00%) high severe
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/pytorch_2_12_cpu
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/pytorch_2_12_cpu: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 20.3s.
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/pytorch_2_12_cpu: Collecting 10 samples in estimated 20.310 s (10 iterations)
+Benchmarking gauntlet_sdpa_grad_2x8x512x64/pytorch_2_12_cpu: Analyzing
+gauntlet_sdpa_grad_2x8x512x64/pytorch_2_12_cpu
+                        time:   [19.780 ms 21.628 ms 24.011 ms]
+                        change: [-31.696% -24.597% -16.575%] (p = 0.00 < 0.05)
+                        Performance has improved.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high mild

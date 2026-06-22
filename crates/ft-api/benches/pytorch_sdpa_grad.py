@@ -5,10 +5,11 @@ import torch
 import torch.nn.functional as F
 
 
-BH = 16
+BATCH = 2
+HEADS = 8
 SEQ = 512
 D = 64
-TOTAL = BH * SEQ * D
+TOTAL = BATCH * HEADS * SEQ * D
 
 
 def deterministic_values(shift: float) -> torch.Tensor:
@@ -18,7 +19,7 @@ def deterministic_values(shift: float) -> torch.Tensor:
         .add_(shift)
         .sin_()
         .mul_(0.2)
-        .reshape(BH, SEQ, D)
+        .reshape(BATCH, HEADS, SEQ, D)
     )
 
 

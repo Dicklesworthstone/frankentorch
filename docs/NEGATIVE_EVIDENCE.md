@@ -5694,3 +5694,31 @@ eigh ~2x like its n<=32 2.66-3.99x). svd grad larger-n is marginal/loss. matrix_
 WINS at the corrected magnitudes; svd is NOT a win. LESSON: ALWAYS pgrep for peer pytorch/bench processes
 before trusting a local torch baseline; trust only LOW-VARIANCE min-of-N; erratic/non-monotonic torch
 numbers = contention, discard. AGENT cc.
+
+## 2026-06-22 - MIXED: SDPA gauntlet corrected to standard 4-D layout, config-sensitive vs PyTorch
+
+Bead `frankentorch-udhq7`, assignee `cod-a`, agent `QuietMeadow`. Implemented the benchmark correction
+flagged by `frankentorch-sdpa-3d-layout-artifact-9bdsd`: the `pytorch_gauntlet_bench` SDPA lane now uses
+standard transformer q/k/v shape `[B,H,S,D] = [2,8,512,64]` for both FrankenTorch and PyTorch instead of
+flattening heads into the older `[BH,S,D] = [16,512,64]` 3-D shape. Total elements, head count, sequence
+length, and feature dimension are unchanged; only the layout is corrected. Product SDPA kernels were not
+changed.
+
+MEASURED locally (crate-scoped only, `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`,
+`cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa --noplot`, PyTorch 2.12.1+cpu sidecar):
+
+- Controlled 8-thread row (`RAYON_NUM_THREADS=8`, `FT_TORCH_THREADS=8`,
+  `FT_TORCH_INTEROP_THREADS=8`; artifact
+  `artifacts/perf/frankentorch-udhq7-sdpa-4d/bench_sdpa_4d_gauntlet_8t.log`):
+  FT `26.595 ms`, PyTorch `32.586 ms` => FT `1.23x` faster.
+- Earlier 8-thread PyTorch row without explicit `RAYON_NUM_THREADS`
+  (`bench_sdpa_4d_gauntlet.log`): FT `21.454 ms`, PyTorch `28.682 ms` => FT `1.34x` faster.
+- Default PyTorch-thread row (`FT_TORCH_THREADS` unset, script default 32; artifact
+  `bench_sdpa_4d_gauntlet_default_threads.log`): FT `34.885 ms` median with severe high outliers,
+  PyTorch `21.628 ms` => FT `1.61x` slower at the reported medians.
+
+Decision: KEEP the benchmark correction; it fixes the measured surface and prevents the gauntlet from
+claiming a 3-D-only SDPA layout as the representative transformer lane. Do not claim a universal f64 SDPA
+win from the gauntlet without the thread/layout qualifiers above. No product source lever was attempted,
+so there is no code-speed change to revert. Score for this measurement correction: controlled `1W / 0L /
+0N`, default-thread `0W / 1L / 0N`; overall MIXED/config-sensitive vs PyTorch. AGENT QuietMeadow / cod-a.

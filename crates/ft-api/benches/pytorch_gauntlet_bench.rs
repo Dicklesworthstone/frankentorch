@@ -66,10 +66,11 @@ const LINEAR_BATCH: usize = 32;
 const LINEAR_IN_FEATURES: usize = 512;
 const LINEAR_HIDDEN: usize = 2048;
 
-const SDPA_BH: usize = 16;
+const SDPA_BATCH: usize = 2;
+const SDPA_HEADS: usize = 8;
 const SDPA_SEQ: usize = 512;
 const SDPA_D: usize = 64;
-const SDPA_TOTAL: usize = SDPA_BH * SDPA_SEQ * SDPA_D;
+const SDPA_TOTAL: usize = SDPA_BATCH * SDPA_HEADS * SDPA_SEQ * SDPA_D;
 
 fn deterministic_pool1d_values() -> Vec<f64> {
     (0..MAX_POOL1D_TOTAL)
@@ -858,8 +859,8 @@ fn bench_linear_train_hidden_2048(c: &mut Criterion) {
     group.finish();
 }
 
-fn bench_sdpa_grad_16x512x64(c: &mut Criterion) {
-    let mut group = c.benchmark_group("gauntlet_sdpa_grad_16x512x64");
+fn bench_sdpa_grad_2x8x512x64(c: &mut Criterion) {
+    let mut group = c.benchmark_group("gauntlet_sdpa_grad_2x8x512x64");
     group.warm_up_time(Duration::from_secs(1));
     group.measurement_time(Duration::from_secs(3));
     group.sample_size(10);
@@ -867,7 +868,7 @@ fn bench_sdpa_grad_16x512x64(c: &mut Criterion) {
     let q_values = deterministic_values(SDPA_TOTAL, 0.0);
     let k_values = deterministic_values(SDPA_TOTAL, 1.0);
     let v_values = deterministic_values(SDPA_TOTAL, 2.0);
-    let shape = vec![SDPA_BH, SDPA_SEQ, SDPA_D];
+    let shape = vec![SDPA_BATCH, SDPA_HEADS, SDPA_SEQ, SDPA_D];
 
     group.bench_function("frankentorch_kgs4_113", |b| {
         b.iter(|| {
@@ -916,6 +917,6 @@ criterion_group!(
     bench_max_pool3d_saved_indices,
     bench_max_pool3d_stage_probe,
     bench_linear_train_hidden_2048,
-    bench_sdpa_grad_16x512x64
+    bench_sdpa_grad_2x8x512x64
 );
 criterion_main!(benches);

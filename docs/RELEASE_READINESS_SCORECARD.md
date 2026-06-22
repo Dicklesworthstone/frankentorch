@@ -64,13 +64,14 @@ Updated: 2026-06-22
 | `frankentorch-grefr` | SmoothL1 f64 mean-loss backward, 8M elems | `1.35x` slower | internal keep; direct local `588.51 ms` -> `469.36 ms`; beta=1 derivative branch rejected | kept paired-randn fill; route remaining gap to tape/allocation/loss-kernel |
 
 Measured-discipline score: `33/33` for the gauntlet lanes/features. Default
-PyTorch head-to-head score is now **`2W / many-L / 1N`** as of 2026-06-21 — **f64 SDPA is
-~2.3x FASTER (non-causal) and ~1.24-2x FASTER (causal, is_causal=true)** than PyTorch
-(FT `[16,512,64]` f64 train step ~24 ms vs PyTorch ~50-56 ms; FT's fused flash-attention
-beats PyTorch's CPU **unfused f64** SDPA). BOUND (measured, NEGATIVE_EVIDENCE 2026-06-21aa):
-the win is **f64-specific** — f32 SDPA is a ~2.1-2.3x LOSS (PyTorch's CPU flash-attn covers
-f32/bf16/f16 but not f64). These are the performance-dominant workloads. The RMSNorm
-scalar-sum comparator remains neutral.
+PyTorch head-to-head score is now layout/config-sensitive for SDPA. The original f64 SDPA win was
+measured on the gauntlet's flattened 3-D `[BH,seq,d]=[16,512,64]` lane. As of `frankentorch-udhq7`
+(2026-06-22) that lane is corrected to standard transformer 4-D `[B,H,seq,d]=[2,8,512,64]`. The
+controlled 8-thread 4-D train row still favors FT (`26.595 ms` vs PyTorch `32.586 ms`, `1.23x` faster),
+but the default PyTorch-thread row is noisy and flips at the median (FT `34.885 ms` vs PyTorch
+`21.628 ms`, `1.61x` slower). BOUND (measured, NEGATIVE_EVIDENCE 2026-06-21aa and 2026-06-22):
+the win is **f64-specific** and **layout/thread-config-sensitive**; f32 SDPA is a ~2.1-2.3x LOSS because
+PyTorch's CPU flash-attn covers f32/bf16/f16. The RMSNorm scalar-sum comparator remains neutral.
 The default-off fair allocator gauntlet switch adds allocator-normalized avg_pool1d
 evidence (`2W / 1L / 1N` across two RCH workers), but it is not counted as a
 default product-speed win because the same-worker system-vs-fair A/B did not land.
