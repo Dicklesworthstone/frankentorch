@@ -5808,3 +5808,16 @@ rayon) wins even vs torch's BEST single-thread time (262ms → FT 53ms svdvals =
 entire decomposition-FORWARD vein (geev/gesdd/syevd all serial-batch-looped): eig-with-vec 5.7-10x,
 eigvals 4.45-5.26x, svdvals 4.09-7.20x, pinv 2.86-7.61x, eigh 4.84-7.92x, lstsq 1.77-5.49x. No source
 change (shipped kernels). Score vs PyTorch: 3W/0L/0N (this op). AGENT cc.
+
+## 2026-06-22 - WIN: batched qr & cond FORWARD (no-grad) = 2.09-7.08x (completes the decomposition-forward family)
+
+qr FORWARD (geqrf — a DISTINCT decomposition from gesdd/syevd/geev) and cond FORWARD (svd-derived) at high
+batch. Confirms geqrf is ALSO serial-batch-looped in torch. CONTENTION-VERIFIED (pgrep clean, torch stable
+low-variance), FT on RCH hz2 vs PyTorch 8-thread local:
+  qr   [2000,32] 3.47x  [2000,64] 3.80x  [1000,96] 2.09x  (FT 12.7/95.1/158.8 vs torch 44.1/361.0/331.3)
+  cond [2000,32] 7.08x  [2000,64] 5.39x  [1000,96] 4.26x  (FT 8.6/56.1/82.1  vs torch 60.9/302.4/349.5)
+No source change (shipped kernels). The decomposition-FORWARD vein is now COMPLETE: eig-with-vec 5.7-10x,
+eigh 4.84-7.92x, eigvals 4.45-5.26x, svdvals 4.09-7.20x, pinv 2.86-7.61x, cond 4.26-7.08x, qr 2.09-3.80x,
+lstsq 1.77-5.49x — ALL win at high batch because torch's CPU batched factorizations (geev/gesdd/syevd/geqrf)
+loop ~serially over the batch (proven: torch svdvals doesn't speed up with threads) while FT parallelizes
+per-plane. Score vs PyTorch: 6W/0L/0N. AGENT cc.
