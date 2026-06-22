@@ -19325,6 +19325,37 @@ pub fn qr_backward_tall_f64(
     grad_a
 }
 
+/// Batched VJP of the reduced tall/square QR: for each of `bb` planes (`Q` m×n,
+/// `R` n×n, cotangents `grad_q` m×n, `grad_r` n×n), parallelizes the verified 2-D
+/// [`qr_backward_tall_f64`] over the batch (each plane bit-identical to the 2-D call).
+/// PyTorch loops the per-plane QR backward serially; this fans the independent planes
+/// across cores. TOLERANCE-parity. frankentorch batched-qr-grad.
+pub fn qr_backward_tall_batched_contiguous_f64(
+    q: &[f64],
+    r: &[f64],
+    grad_q: &[f64],
+    grad_r: &[f64],
+    bb: usize,
+    m: usize,
+    n: usize,
+) -> Vec<f64> {
+    let qplane = m * n;
+    let rplane = n * n;
+    let mut out = vec![0.0f64; bb * qplane];
+    if bb == 0 || n == 0 {
+        return out;
+    }
+    out.par_chunks_mut(qplane).enumerate().for_each(|(b, o)| {
+        let qp = &q[b * qplane..(b + 1) * qplane];
+        let rp = &r[b * rplane..(b + 1) * rplane];
+        let gqp = &grad_q[b * qplane..(b + 1) * qplane];
+        let grp = &grad_r[b * rplane..(b + 1) * rplane];
+        let g = qr_backward_tall_f64(qp, rp, gqp, grp, m, n);
+        o.copy_from_slice(&g);
+    });
+    out
+}
+
 /// Reverse-mode VJP of the lower Cholesky factorization `L = chol(A)` from the
 /// factor cotangent `grad_l` (n×n):
 ///   Φ = ½·diag + tril(Lᵀ·grad_L, −1) ; grad_A = sym(L⁻ᵀ·(Φ·L⁻¹)).

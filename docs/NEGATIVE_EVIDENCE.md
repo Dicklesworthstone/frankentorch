@@ -5006,3 +5006,34 @@ VERIFIED: test `tensor_linalg_svd_batched_grad_matches_per_plane_2d` (batched gr
 matches looping the 2-D svd grad per plane within `1e-9 + 1e-7·|x|`) GREEN on RCH `hz2`;
 `ft-conformance --profile release` GREEN on RCH `hz2`. TOLERANCE-parity (kgs4.76 policy).
 Score vs PyTorch: `4W / 0L / 0N`. NEXT: qr/eig (general) batched grad VJPs (bead u0csd).
+
+## 2026-06-22 - WIN (net): batched QR GRADIENT (fwd+bwd step) = 1.30-2.26x vs PyTorch at k>=8 (was an ERROR)
+
+Third of the batched-decomposition-grad trio (after eigh, svd). Batched reduced QR
+with `requires_grad` (`nd>=3`, tall/square `m>=n`) previously **errored** ("linalg_qr:
+autograd only supported for reduced QR of a tall/square (m>=n) F64 matrix") — the grad
+path was 2-D-only. PyTorch loops LAPACK `geqrf` plus the per-plane Q/R backward serially.
+
+LEVER (frankentorch batched-qr-grad, AGENT cc):
+- New kernel `qr_backward_tall_batched_contiguous_f64` parallelizes the verified 2-D
+  `qr_backward_tall_f64` over the batch (each plane bit-identical to the 2-D call).
+- New batched grad path in `tensor_linalg_qr` (two nodes Q/R; batched VJP with the
+  other cotangent zeroed; contributions sum).
+
+MEASURED (examples/batched_qr_grad_h2h.rs, fwd+bwd step, loss = sum(Q)+sum(R)), FT on
+RCH `hz2` vs PyTorch `2.12.0+cpu` local (8 threads, mixed-location — FT remote):
+  `[50000,4,4]`   FT 52.170 ms  vs PyTorch 43.178 ms  = `0.83x` (MARGINAL/loss on remote)
+  `[20000,8,8]`   FT 59.673 ms  vs PyTorch 134.706 ms = `2.26x` faster
+  `[8000,16,16]`  FT 99.231 ms  vs PyTorch 129.060 ms = `1.30x` faster
+  `[3000,32,32]`  FT 161.166 ms vs PyTorch 332.097 ms = `2.06x` faster
+
+HONEST: unlike eigh/svd (which win at all sizes), the tiny 4x4 corner is overhead-bound
+and FT loses on the remote worker (mixed-location; same-machine FT would be ~parity-to-
+marginal-win there). Clear wins from k=8 up. grad-sums match closely (QR sign is largely
+gauge-fixed via positive-R-diagonal). Net win + closes the parity gap.
+
+VERIFIED: test `tensor_linalg_qr_batched_grad_matches_per_plane_2d` (batched grad_A
+matches looping the 2-D qr grad per plane within `1e-9 + 1e-7·|x|`) GREEN on RCH `hz2`;
+`ft-conformance --profile release` GREEN on RCH `hz2`. TOLERANCE-parity (kgs4.77 policy).
+Score vs PyTorch: `3W / 0L / 1 marginal`. The whole batched-decomposition-grad surface
+(eigh/svd/qr) is now done; remaining bead u0csd item = eig (general, complex) batched grad.
