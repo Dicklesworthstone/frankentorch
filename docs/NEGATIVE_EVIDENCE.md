@@ -72,6 +72,14 @@ is explicitly satisfied.
   (feature + perf), needs owner sign-off and likely BlackThrush linalg-crate coordination. Filed
   as **frankentorch-qe48n** with the baselines. (matrix_exp/eig/svd/eigvalsh/svdvals batched paths
   are already shipped wins — the batched-linalg PERF vein is harvested for the ops that batch.)
+- BROAD misc scan (2026-06-22, cov/corrcoef/logdet/vander/cross/tensordot/etc.): NO fresh slow-PyTorch
+  compute-dominated op outside the mapped families. Slowest were cov [4000,2000] 162ms and corrcoef
+  222ms — but those are GEMM-DOMINATED (centered X·Xᵀ = 3.2e10-FLOP matmul) → MKL-walled (PyTorch's MKL
+  GEMM beats FT's matrixmultiply for large square GEMMs, see GEMM-bandwidth note), so not FT wins. Rest
+  fast (logdet 35ms LU, vander 2.4, cross 14, tensordot 54, prod/trace <1ms). Confirms the compute-
+  dominated win seam is harvested: wins are the slow-PyTorch DECOMPOSITIONS (mapped) + SDPA-math-backend
+  + fused composed-norm/distance; everything else is MKL-GEMM / bandwidth / pocketfft / getrf / getrs
+  walled. Don't re-scan the misc surface.
 - NN/STRUCTURAL/MISC op scan COMPLETE (2026-06-21, don't re-scan): PyTorch-only timing found the slow
   ops are all BANDWIDTH-bound (output-size-dominated), NOT compute levers — kron(200×200) 1564ms writes
   a 40000×40000=1.6B-elem=12.8GB output (the write IS the cost), one_hot(2M,100) 267ms = 1.6GB output,
