@@ -5984,3 +5984,18 @@ fragile brace-counter (lifetime/char-confused strip) drifted and now mis-flags 3
 panic!()s in lib.rs. VERIFIED present on HEAD WITHOUT this change (same 3 panics at 130953/130963/141736);
 this change is brace-balanced (+18/+18) and does NOT introduce it. Needs a conformance-crate lint fix
 (peer/owner scope). AGENT cc.
+
+## 2026-06-22 - WIN (thread-matched): 4-D attention-layout matmul = 1.10-1.58x vs PyTorch at EQUAL 64 threads
+
+4-D batched matmul [B,H,S,D]@[B,H,D,S] (the attention QKᵀ/AV layout). torch.matmul 4-D has MORE per-plane
+overhead than 3-D bmm. THREAD-MATCHED (the rigorous test for a SCALING op — torch 4-D matmul scales with
+threads, unlike the saturating decomposition loops, so a thread-matched A/B is mandatory): FT pinned
+RAYON_NUM_THREADS=64 vs torch 64 threads:
+  [64,16,128,64] FT 16.8ms vs torch 25.2ms = 1.50x
+  [32,16,256,64] FT 27.8ms vs torch 43.8ms = 1.58x
+  [128,8,128,64] FT 19.8ms vs torch 21.7ms = 1.10x (marginal)
+At equal threads FT wins 1.10-1.58x — REAL per-core efficiency for the 4-D layout (not core-count). FT also
+scales to more cores: unpinned FT 12.3/24.2/12.1ms → vs torch 32t (49.1/98.2/71.7) = 3.99-5.93x, vs torch
+8t (102.7/191.0/89.3) = 7.4-8.4x. No source change (shipped tensor_matmul handles n-D). Foundational for
+attention. Score vs PyTorch: 3W/0L/0N. AGENT cc. (Note: ft-conformance gate is the known sel7 red; this is
+example+docs only, no source change, so no gate needed.)
