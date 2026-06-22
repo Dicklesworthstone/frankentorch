@@ -57,8 +57,17 @@ is explicitly satisfied.
   [4000,4000] = 233ms vs PyTorch 87ms (2.67x slower), [20000,2000] 588 vs 206ms (2.85x). The radix
   key-computation + perm-tracking + index-output overhead loses to PyTorch's highly-tuned introsort.
   Confirmed loss, different mechanism than selection's nth_element wall. diff/roll/
-  renorm/repeat_interleave/flip are BANDWIDTH-bound (cheap elementwise/gather/copy — FT ≈ parity, no
+  repeat_interleave/flip are BANDWIDTH-bound (cheap elementwise/gather/copy — FT ≈ parity, no
   algorithmic lever). No fresh perf lever in this family.
+- renorm MEASURED LOSS 2.40x (2026-06-22, was assumed "bandwidth ≈parity"): FT tensor_renorm has NO
+  fused no-grad kernel — it COMPOSES ~10 autograd primitives (permute→abs→pow→sum→clamp→div→mul→...),
+  ~10 full passes over numel. FT 334ms vs PyTorch 139ms @[4000,4000] p2 dim0 (2.40x slower). LEVER (NOT
+  pursued — niche + parity risk): a fused no-grad renorm kernel (par-over-slices: per-slice L_p norm +
+  conditional scale, 1-2 passes) could plausibly hit ~30-50ms and BEAT PyTorch's 139ms (~3x). BUT (a)
+  renorm is niche (mainly embedding max_norm regularization), and (b) PARITY RISK — a fused parallel
+  norm reduction won't bit-match the composed path's tensor_sum order (value op → "parity absolute"
+  applies), so it needs either exact replication of the composed reduction or a tolerance-policy call.
+  Low-EV given niche+parity; recorded as a flagged lever, not shipped.
 - quantile_dim single-q no-grad was 5.7x SLOW (silent) — routed to the parallel quickselect fast path
   → 5x internal, PARITY with PyTorch (not yet a win): a selection-op scan found PyTorch's `quantile` is
   SORT-based + slow (73ms / 190ms @[4000,4000]/[20000,2000], dim=1) while its `median` is introselect-
