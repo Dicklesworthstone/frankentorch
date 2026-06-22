@@ -5641,3 +5641,34 @@ grad kernel is batched==per-plane-2D (550ac7d2); grad-sum vs torch differs by th
 (loss uses sum(V)), so NOT oracle-exact — correctness via the internal test, not the torch checksum. No
 source change (kernel handles any n). The win is largest at high batch count (FT flat; torch dominated by
 the looped/pathological per-plane backward). Score vs PyTorch: 3W / 0L / 0N. AGENT cc.
+
+## 2026-06-22 - NEGATIVE (reverted): cdist p=2 GRAD saved-distance backward loses on same worker
+
+Bead `frankentorch-kgs4.147`, assignee `cod-a`, agent `QuietMeadow`. Tried the obvious follow-up to
+`frankentorch-kgs4.146`: save the p=2 forward distance matrix in the f64 borrowed-input custom autograd
+context, then use `g / distance` during backward instead of recomputing `sumsq.sqrt()` for every pair.
+
+MEASURED (crate-scoped only, `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`,
+`cargo run --release -p ft-api --example cdist_grad_h2h`; PyTorch unavailable on RCH, so PyTorch ratios
+use the same torch 2.12.0 local reference rows recorded for kgs4.146: 5.1ms for `[1500,1500,8]` p=2 and
+2.7ms for `[1000,1000,16]` p=2):
+
+- Baseline FT on RCH `vmi1149989`
+  (`artifacts/perf/frankentorch-kgs4.147-cdist-saved-distance/baseline_cdist_grad_h2h.log`):
+  `[1500,1500,8]` p=2 `11.597ms` = `2.27x` slower than PyTorch reference; `[1000,1000,16]` p=2
+  `9.221ms` = `3.42x` slower than PyTorch reference.
+- Ungated saved-distance attempt on the same worker
+  (`artifacts/perf/frankentorch-kgs4.147-cdist-saved-distance/after_saved_distance_cdist_grad_h2h.log`):
+  `[1500,1500,8]` p=2 `20.933ms` = `0.55x` vs baseline / `4.10x` slower than PyTorch reference;
+  `[1000,1000,16]` p=2 `6.630ms` = `1.39x` vs baseline / `2.46x` slower than PyTorch reference.
+- Gated `m >= 16` saved-distance attempt, pinned same worker with `RCH_WORKER=vmi1149989`
+  (`artifacts/perf/frankentorch-kgs4.147-cdist-saved-distance/after_gated_saved_distance_cdist_grad_h2h_vmi1149989.log`):
+  `[1500,1500,8]` p=2 `18.778ms` = `0.62x` vs baseline / `3.68x` slower than PyTorch reference;
+  `[1000,1000,16]` p=2 `13.220ms` = `0.70x` vs baseline / `4.90x` slower than PyTorch reference.
+
+Decision: REVERTED source to net-zero. Saving the distance matrix trades one feature-loop/sqrt pass for a
+full `[P,R]` clone/save/read through the autograd context; on the benchmark rows it is mixed when ungated
+and loses on both p=2 rows once gated and remeasured on the baseline worker. Do not retry saved-distance
+memoization for cdist p=2 grad without a lower-level profile proving the saved matrix stays hot and avoids
+the context clone. Score for this lever: `0W / 2L / 0N` vs baseline and still `0W / 2L / 0N` vs PyTorch.
+AGENT QuietMeadow / cod-a.
