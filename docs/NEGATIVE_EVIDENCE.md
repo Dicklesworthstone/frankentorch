@@ -5318,3 +5318,19 @@ PyTorch 2.12.0 local f32 (mixed-location):
 f32 grad-sums match the f64 oracle values to printed digits (cond -2.525130e4 etc.). VERIFIED: test
 tensor_linalg_cond_matrixnorm_f32_batched_grad_matches_f64_cast GREEN on RCH hz2; ft-conformance
 --profile release GREEN. TOLERANCE-parity (f32, via f64 batched svdvals). Score vs PyTorch: 9W / 0L / 0N.
+
+## 2026-06-22 - WIN: f32 batched eigvals + matrix_exp GRADIENT = 1.24-3.86x vs PyTorch
+
+f32 mirrors of the f64 eigvals (c9d94d2b) and matrix_exp (474b09ca) batched-grad wins. f32 routes
+through the f64 batched grad via cast (tiny vs the decomposition). torch f32 loops geev /
+scaling-squaring per plane.
+
+MEASURED (examples/eigvals_matexp_f32_grad_h2h.rs, fwd+bwd step, loss=sum(out⊙out)), FT on RCH hz2
+vs PyTorch 2.12.0 local f32 (mixed-location):
+  eigvals    [20000,4] 2.54x  [8000,8] 3.17x  [3000,16] 3.07x  [1000,32] 3.86x
+  matrix_exp [20000,4] 1.24x  [8000,8] 1.86x  [3000,16] 1.45x  [1000,32] 1.26x
+f32 grad-sums match the f64 oracle values to printed digits (eigvals 8.151600e7, matrix_exp 1.979895e5).
+matrix_exp f32 ratio is smaller (torch f32 scaling-squaring is cheaper than f64, and FT pays the cast
++ 2n×2n augmented expm), but still a win at every shape. VERIFIED: test
+tensor_eigvals_matexp_f32_batched_grad_matches_f64_cast GREEN on RCH hz2; ft-conformance GREEN.
+TOLERANCE-parity (f32 via f64). Score vs PyTorch: 8W / 0L / 0N.
