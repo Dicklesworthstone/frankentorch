@@ -4,6 +4,18 @@ Updated: 2026-06-22
 
 ## Performance Gauntlet
 
+### Batched grad sweep follow-ups (2026-06-22, cc) — beyond the f64 decomposition-grad rows below
+- f32 grad mirrors (route via f64 batched grad): cond 3.5-5.6x, matrix_norm 4.0-5.7x, eigvals 2.5-3.9x,
+  matrix_exp 1.2-1.9x, eigh 1.5-2.2x, lstsq 1.2-2.5x, eigvalsh 2.2-3.7x, svdvals 3.5-4.8x (WINS);
+  svd/qr f32 marginal/mixed.
+- Uncovered-shape extensions: underdetermined m<n lstsq grad 1.85-4.20x (069bd130), wide m<n svd grad
+  3.0-4.1x (a0b2a6a6), wide m<n qr grad 1.12-2.52x (dbb5c4ac) — all FD/oracle-validated, GREEN.
+- pinv standalone grad 1.31-2.07x oracle-exact (0a48b897). lu(P,L,U) grad: parity-closure, MIXED perf
+  (1.27/0.71/1.21x, kept, 9487cea8). lu_factor grad: reverted (torch backward fast, 630187c8).
+- WALLED (measured, don't pursue): cdist, inv, solve, cholesky, det, slogdet, matrix_power,
+  cholesky_inverse, lu_factor, special-fns, binning/search, pinv_hermitian. Remaining deep levers:
+  eig-with-vectors grad (6hqw9), packed-GEMM/SIMD-exp/allocator (e4yuj).
+
 | Bead | Workload | Result vs PyTorch | Before/after verdict | Release action |
 |---|---:|---:|---:|---|
 | `6cd43c96` (cc) | batched `matrix_norm` (nuc/±2) GRAD `[B,n,n]` n=8/16/32 | `7.0-10.1x` faster (oracle-exact grad-sum) | was an ERROR (2-D-only); batched svdvals grad + sum/max/min_dim; FT hz2 vs PyTorch local | keep |
