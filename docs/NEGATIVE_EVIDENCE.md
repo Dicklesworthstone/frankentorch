@@ -49,14 +49,15 @@ is explicitly satisfied.
   PyTorch win yet: FT's per-lane quickselect is ~10x slower than PyTorch's introselect (the 7ms median
   proves O(n) selection can do this fast) — the gap is per-lane Vec gather + `total_cmp` comparator +
   par_chunks granularity. Shipped the routing fix (tested, conformance green, no regression).
-  FOLLOW-UP UPDATE (tried + reverted): the in-place inner==1 path (select on a mutable `vals` clone via
-  par_chunks_mut(dim_size), NO per-lane gather Vec) gave NO GAIN (82→82ms) — so the gather is NOT the
-  bottleneck; the `select_nth_unstable_by(total_cmp)` quickselect ITSELF is the ~10x-vs-introselect wall
-  (or tensor_values' 128MB read). The ONLY remaining lever is a faster selection: map each NaN-free lane
-  f64→order-preserving-u64 ONCE (O(n)) then `select_nth_unstable` on the u64 keys (default Ord, no
-  per-comparison closure — total_cmp does bit-twiddling on EVERY compare), unmap the selected key. This
-  is the one untested path to actually beat PyTorch's 73ms quantile; uncertain (best ~1.5x, since FT is
-  already at 1.13x parity) and not pursued (effort vs modest upside). The routing-to-parity win stands.
+  LEVER CLOSED (two optimizations tried + reverted, both NO GAIN): (1) in-place inner==1 select on a
+  mutable `vals` clone via par_chunks_mut, no per-lane gather Vec → 82→82ms (gather is NOT the
+  bottleneck). (2) map each NaN-free lane f64→order-preserving-u64 once then `select_nth_unstable` on
+  integer keys (no per-compare `total_cmp` closure) → 82→83ms (the COMPARATOR is NOT the bottleneck
+  either). CONCLUSION: Rust stdlib `select_nth_unstable`'s PARTITION ITSELF is the ~82ms wall for
+  4000×4000 selection — PyTorch's 7ms median uses a far more tuned `nth_element` (SIMD/cache-blocked
+  partition). Beating it needs a custom hand-tuned partition (massive, out of warm-target scope), NOT a
+  comparator/gather tweak. quantile lever DONE at PyTorch-parity (the routing-to-parity 5x-internal win
+  stands); don't re-probe the comparator/gather angle.
 - BATCHED-LINALG COVERAGE MAP COMPLETE (2026-06-21 PyTorch-only scan, don't re-scan): measured every
   slow PyTorch batched linalg op at [20000,16,16]/[5000,32,32] to find the dispatch-overhead weakness.
   Slowest PyTorch ops: pinv 690-1174ms, lstsq 159-255ms, qr 92-108ms, cholesky_solve 46-84ms,
