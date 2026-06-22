@@ -4,6 +4,38 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-22 - WIN: public argsort_tensor wrapper now uses argsort-only kernels
+
+Bead `frankentorch-9q7mq`, assignee `cod-a`, agent `QuietMeadow`. The
+lower-level `tensor_argsort` path had already shipped f64/f32 argsort-only
+kernels, but the public `argsort_tensor` convenience wrapper still called full
+`tensor_sort` and discarded sorted values. That left wrapper callers on the old
+value+index materialization path.
+
+Lever shipped: route `argsort_tensor` directly to
+`argsort_tensor_contiguous_f64` / `argsort_tensor_contiguous_f32` and return the
+kernel's `Vec<usize>` without creating sorted values or an intermediate index
+tensor. The first attempted route through `tensor_argsort` plus `tensor_values`
+was measured and rejected because the index-tensor materialization/readback made
+the wrapper slower (`311.026/736.385 ms`).
+
+Same-host head-to-head, local torch `2.12.1+cpu`, warm
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`, command
+`cargo +nightly-2026-06-09 run --release -p ft-api --example
+argsort_wrapper_h2h`, dim=1, checksums exact:
+
+- Baseline wrapper:
+  - `[4000,4000]`: FT `181.381 ms` vs PyTorch `126.653 ms` = `1.43x SLOWER`
+  - `[20000,2000]`: FT `480.479 ms` vs PyTorch `305.176 ms` = `1.57x SLOWER`
+- Direct-kernel wrapper after patch, steadier 5-rep run:
+  - `[4000,4000]`: FT `110.636 ms` vs PyTorch `137.283 ms` = `1.24x FASTER`
+  - `[20000,2000]`: FT `263.075 ms` vs PyTorch `296.505 ms` = `1.13x FASTER`
+
+Decision: KEEP. Internal speedup is `1.64x` / `1.83x`, and the public wrapper
+now flips from a PyTorch loss to a modest PyTorch win on both measured shapes.
+This does not change `tensor_sort`; it only removes dead value materialization
+for wrapper callers that ask for argsort indices only.
+
 ## 2026-06-22 - KEEP (internal), PyTorch loss: f32 cdist p=2 no-grad fused route
 
 Bead `frankentorch-jpn1d`, assignee `cod-b`, agent `IvoryDeer`. The f64
