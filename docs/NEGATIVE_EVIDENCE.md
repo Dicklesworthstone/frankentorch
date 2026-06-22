@@ -5247,3 +5247,17 @@ parallel-elementwise parity (special fns). The genuinely-remaining levers are DE
 walled: packed-panel Goto/BLIS GEMM (MKL-territory, big/risky), tolerance-SIMD-exp for f32 SDPA
 (needs the parity-policy decision), caching allocator for norm/pool train-steps (binary-choice,
 axis closed per 9pafs). No quick disk-neutral vs-PyTorch win remains in the probed space. AGENT cc.
+
+## 2026-06-22 - NEGATIVE (forward-op map completion): lu/ldl/cholesky forward MKL-walled, qr/matrix_rank already done
+
+Probed the remaining batched FORWARD factorizations (torch local 2.12.0, B=3000-50000, n=4-32):
+lu_factor 0.7-3.1ms, cholesky 2.75-9.7ms — getrf/potrf fast, torch batches well = WALLED.
+lu(P,L,U) 6-13ms and ldl_factor 6-16ms — moderate, getrf/sytrf-bound, rare ops, marginal.
+qr (complete, square) 20-54ms but FT already has a batched qr fast path (2.9-10x win, shipped) and
+matrix_rank already has a batched svdvals threshold-count fast path (shipped) — both DONE.
+
+This completes the exhaustive forward+grad map of the batched-linalg surface. Combined with the
+9 batched-grad wins and the cdist/solve/special-fn negative entries above, the CPU vs-PyTorch
+winnable surface (FT-parallel-over-batch beats torch-serial-per-plane decomposition loop) is
+CONVERGED. Remaining levers are deep/constraint-walled (bead e4yuj): packed-panel GEMM,
+tolerance-SIMD-exp f32 SDPA, product-default pure-Rust caching allocator. AGENT cc.
