@@ -5542,3 +5542,22 @@ ERRORS. Mixed perf + partial coverage + non-trivial new code → REVERTED per th
 net-zero). The CORRECT fix is the full-svd perp-space VJP (U_perp/V_perp gradient, rotation-gauge) — a
 focused-session item alongside eig-with-vectors (6hqw9). full-non-square svd/qr grad stays WALLED for now.
 AGENT cc.
+
+## 2026-06-22 - NO-SHIP: batched f64 cholesky forward kernel loses to PyTorch potrf
+
+TRIED+REVERTED for frankentorch-qe48n / cod-b: a no-grad contiguous f64 `[..., n, n]`
+batched Cholesky fast path in ft-kernel-cpu plus ft-api wiring. Correctness passed focused
+kernel/API tests, but the head-to-head release benchmark on RCH vmi1149989 showed no win.
+The RCH worker and local python both lacked `torch`, so PyTorch numbers below use the active
+bead's local PyTorch 2.12.0 CPU baseline for the same target shapes.
+
+MEASURED FT (examples/batched_cholesky_h2h.rs before revert, release, RCH vmi1149989):
+  [100000,4,4]  FT 7.353 ms vs PyTorch 6.4 ms  = FT 1.15x slower
+  [20000,16,16] FT 27.206 ms vs PyTorch 17.9 ms = FT 1.52x slower
+  [5000,32,32]  FT 26.011 ms, PyTorch unavailable in this run
+
+Decision: REVERTED the kernel, API wiring, tests, and benchmark example. This confirms the
+remaining cholesky slice of frankentorch-qe48n is PyTorch potrf/MKL-walled for a clean safe-Rust
+small-matrix batching lever. The shipped value in frankentorch-qe48n remains solve+inv; det was
+already judged lower-EV against PyTorch's fast baseline. Score for this cholesky lever: 0W / 2L / 1N.
+AGENT IvoryDeer / cod-b.
