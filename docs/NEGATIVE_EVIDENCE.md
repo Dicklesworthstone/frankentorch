@@ -5861,3 +5861,15 @@ REFINED STRUCTURAL RULE: torch LOOPS the ITERATIVE factorizations serially (no M
 syevd/geqrf/gelsd → FT parallel WINS, the 10-op decomposition-forward vein) but MKL-BATCHES the DIRECT
 ones (potrf/getrf/getrs/getri → cholesky/lu/solve/inv/det = WALLED). This cleanly partitions the linalg-
 forward surface: iterative=win, direct=wall. Don't re-probe cholesky/lu/solve/inv/det forwards. AGENT cc.
+
+## 2026-06-22 - WIN: batched TALL (rectangular m>>n) svd FORWARD (no-grad) = 1.93-3.94x
+
+Extends the svd-forward win to the PRACTICAL rectangular shape (m>>n data matrices — PCA/SVD; square is rare
+in practice). torch serial-batch-loops gesdd regardless of shape; FT parallelizes per-plane. CONTENTION-
+VERIFIED (pgrep clean, torch stable low-variance):
+  [2000,128,16] FT 27.3ms vs torch 107.6ms = 3.94x faster
+  [1000,256,32] FT 86.6ms vs torch 256.3ms = 2.96x faster
+  [500,512,32]  FT 89.7ms vs torch 173.4ms = 1.93x faster
+HONEST: win DECREASES with m (FT's tall-matrix bidiagonalization per-plane is relatively slower than LAPACK
+at large m) — strong at moderate m, marginal (1.93x) at m=512. No source change (shipped kernel). Covers the
+common rectangular SVD case the square measurements (3.78-7.29x) didn't. Score vs PyTorch: 3W/0L/0N. AGENT cc.
