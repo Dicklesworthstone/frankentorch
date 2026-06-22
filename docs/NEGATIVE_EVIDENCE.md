@@ -5873,3 +5873,14 @@ VERIFIED (pgrep clean, torch stable low-variance):
 HONEST: win DECREASES with m (FT's tall-matrix bidiagonalization per-plane is relatively slower than LAPACK
 at large m) — strong at moderate m, marginal (1.93x) at m=512. No source change (shipped kernel). Covers the
 common rectangular SVD case the square measurements (3.78-7.29x) didn't. Score vs PyTorch: 3W/0L/0N. AGENT cc.
+
+## 2026-06-22 - WIN: batched f32 eigvalsh & svdvals FORWARD (no-grad, dominant ML dtype) = 2.66-6.47x
+
+f32 mirror of the decomposition-values forwards (f32 is the dominant ML dtype; eigenvalue/singular-value
+inference of f32 data is the common case). torch serial-batch-loops ssyevd/sgesdd; FT parallelizes (via
+f64-internal cast). CONTENTION-VERIFIED (pgrep clean, torch stable low-variance):
+  eigvalsh [2000,32] 6.47x [2000,64] 3.73x [1000,96] 2.66x (FT 4.9/28.2/44.5 vs torch 31.7/105.1/118.6)
+  svdvals  [2000,32] 4.65x [2000,64] 4.47x [1000,96] 3.40x (FT 12.6/59.2/93.3 vs torch 58.6/264.5/317.3)
+Slightly below the f64 forwards (eigvalsh f64 5.06-7.71x) — FT pays the f32->f64 cast and torch f32 is a bit
+faster per-plane — but solid wins. No source change. Covers the dominant-dtype inference case. Score vs
+PyTorch: 6W/0L/0N. AGENT cc.
