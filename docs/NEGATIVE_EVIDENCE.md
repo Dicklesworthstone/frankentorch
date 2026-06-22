@@ -5956,3 +5956,21 @@ NEW FINDING: the win depends on the CONTRACTION dim K — strong at K=64 (attent
 torch's best) but MARGINAL at K=128 (1.08x, MKL more competitive when K grows). So tiny-bmm wins are
 strongest exactly at attention-head shapes (K=D=64-128). No source change (shipped matmul). Foundational for
 attention matmuls (the QKᵀ/AV bmms, separate from the parity-walled softmax). Score vs PyTorch: 3W/0L/0N. AGENT cc.
+
+## 2026-06-22 - WIN + parity-closure: batched matrix_power = 1.61-2.08x vs torch best (was an ERROR)
+
+FT's tensor_matrix_power was 2-D-only — batched (nd>=3) ERRORED (ShapeMismatch). torch supports batched
+matrix_power (loops saturating bmm). Closed the gap: relaxed the guard to nd>=2 square + lazy-init binary
+exponentiation over the batched grad-aware tensor_matmul chain (so batched forward AND grad work; the
+tiny-bmm WIN compounds through the squaring chain). CORRECTNESS-VERIFIED: test
+tensor_matrix_power_batched_matches_per_plane_2d (batched == per-plane 2-D for k=0,1,3,5, within
+1e-9+1e-7|x|) GREEN. THREAD-VERIFIED, FT RCH hz2 vs torch 8t/32t local (k=16):
+  [10000,32] FT 27.5ms vs torch 77.8(8t)/57.3(32t)  = 2.83x / 2.08x
+  [5000,64]  FT 59.9ms vs torch 156.2(8t)/113.4(32t) = 2.61x / 1.89x
+  [2000,96]  FT 62.2ms vs torch 135.4(8t)/100.3(32t) = 2.18x / 1.61x
+The bmm advantage COMPOUNDS (matpow 1.6-2.08x > single-bmm 1.48-1.51x). NOTE: ft-conformance has a
+PRE-EXISTING lint false-positive (production_code_contains_no_forbidden_stub_or_panic_macros) — its
+fragile brace-counter (lifetime/char-confused strip) drifted and now mis-flags 3 legitimate test-module
+panic!()s in lib.rs. VERIFIED present on HEAD WITHOUT this change (same 3 panics at 130953/130963/141736);
+this change is brace-balanced (+18/+18) and does NOT introduce it. Needs a conformance-crate lint fix
+(peer/owner scope). AGENT cc.
