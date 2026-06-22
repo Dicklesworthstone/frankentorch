@@ -5502,3 +5502,28 @@ f32 mirrors of the shape-extension grads (route through the f64 batched grad via
 f32 ratios are compressed vs f64 (torch f32 gesdd/gelsd/gelsd is cheaper than f64, and FT pays the
 f32->f64 cast). KEEP lstsq_under f32 as a win; svd_wide/pinv_wide f32 marginal (not claimed). No source
 change (f32 routes through the existing f64 batched grad paths; correctness inherited). AGENT cc.
+
+## 2026-06-22 - WIN: batched general eig WITH eigenvectors GRADIENT = 4.55-7.51x vs PyTorch (was an ERROR)
+
+Implements the missing `torch.linalg.eig`-style gradient path for contiguous square F64 inputs,
+including batched nd>=3 tensors. The tuple output is represented as two deterministic autograd
+nodes (eigenvalues and eigenvectors) over the same input, with the new complex non-symmetric VJP:
+`V^-H [diag(grad_w) + F* o (V^H grad_V - gauge_diag)] V^H`, real-projected for the real input.
+Eigenvectors are normalized on both grad and no-grad paths so the saved basis follows the unit-norm
+PyTorch convention.
+
+MEASURED (examples/batched_eig_grad_h2h.rs, fwd+bwd step, loss=sum(evals^2)+sum(evecs)), FT on RCH
+ovh-a. The RCH worker had no `torch` module, so the PyTorch numbers are the active bead's local
+PyTorch 2.12.0 baseline for the same shapes:
+  [8000,8,8]   FT 12.125 ms vs PyTorch 91 ms  = 7.51x faster
+  [3000,16,16] FT 25.005 ms vs PyTorch 148 ms = 5.92x faster
+  [1000,32,32] FT 50.085 ms vs PyTorch 228 ms = 4.55x faster
+PyTorch unavailable on the RCH worker was recorded in
+artifacts/perf/frankentorch-6hqw9.cod-b-eig-grad/bench_after_eig_grad_h2h.log.
+
+VERIFIED: linalg_eig_backward_matches_finite_difference_for_real_distinct_spectrum GREEN
+(central finite difference, stable non-symmetric real spectrum); tensor_linalg_eig_batched_grad_matches_per_plane_2d
+GREEN; linalg_eig_backward_symmetric_part_matches_eigh_eigenvector_vjp GREEN (general eig VJP
+reduces to established symmetric eigh eigenvector VJP after symmetric projection); and
+linalg_eig_and_eigvals_differentiable_on_requires_grad GREEN. Score vs PyTorch: 3W / 0L / 0N.
+AGENT IvoryDeer / cod-b.
