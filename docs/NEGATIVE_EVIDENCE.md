@@ -5766,3 +5766,16 @@ No-grad inference; FT eigvals forward is the shipped/validated eig_batched kerne
 source change. Together with eig-with-vectors forward (5.7-10x), the geev-FORWARD vein is harvested: any
 op torch can only loop serially (no batched LAPACK) is a clean parallel win at high batch. Score vs
 PyTorch: 3W / 0L / 0N. AGENT cc.
+
+## 2026-06-22 - WIN (clean, contention-verified): batched lstsq FORWARD (no-grad) = 1.77-5.49x vs PyTorch
+
+lstsq FORWARD (torch.linalg.lstsq, no grad — least-squares solve) at high batch, overdetermined m>n.
+torch's batched lstsq hits a SLOW path at moderate n (driver-dependent; n=32 = 150ms, ~23x the per-plane
+of n=16's fast path — likely a gelsd-style serial fallback); FT solves per-plane in parallel. CONTENTION-
+VERIFIED (pgrep clean of peer torch; torch RE-MEASURED, stable low-variance both runs: n=16 13/13.1ms,
+n=32 150.2/149.9ms, n=48 92.3/87.5ms):
+  [2000,32,16] FT 7.4ms  vs torch 13.1ms  = 1.77x faster
+  [1000,64,32] FT 27.3ms vs torch 149.9ms = 5.49x faster
+  [500,96,48]  FT 45.6ms vs torch 87.5ms  = 1.92x faster
+No-grad; FT lstsq forward is the shipped/validated kernel (its grad 5dc2f8bc is oracle-exact). No source
+change. Standout at n=32 (5.49x) where torch's lstsq driver path is slow. Score vs PyTorch: 3W/0L/0N. AGENT cc.
