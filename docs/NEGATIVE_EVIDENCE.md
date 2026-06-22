@@ -5397,3 +5397,18 @@ given P; grad-sums match PyTorch to all printed digits, e.g. 8.777617e5). KEPT a
 (batched lu grad worked nowhere before; PyTorch supports it) — strictly better than erroring. VERIFIED:
 test tensor_linalg_lu_batched_grad_matches_per_plane_2d GREEN; ft-conformance --profile release GREEN.
 Score vs PyTorch: 2W / 1L (mixed). AGENT cc.
+
+## 2026-06-22 - NEGATIVE (reverted): batched lu_factor GRAD loses — torch's lu_factor backward is fast
+
+Tried batched lu_factor (packed LU, single output) grad expecting a clean win (no 3x recompute,
+unlike lu(P,L,U)). Implemented (lu_factor_batched_contiguous_f64 + single-node grad via
+lu_backward_batched) and MEASURED: FT on RCH hz2 vs PyTorch 2.12.0 local:
+  [20000,8]  FT 48.2ms  vs torch 36.8ms = 0.76x SLOWER
+  [8000,16]  FT 69.8ms  vs torch 39.0ms = 0.56x SLOWER
+  [3000,32]  FT 103.3ms vs torch 97.0ms = 0.94x SLOWER
+torch's lu_factor backward is FAST here (36-97ms, getrf + a fast VJP) — an earlier random-fixture
+probe (34-98ms) over-suggested slowness; with this fixture torch is well-optimized and FT's
+2x-forward (pivots-outside + node) + lu_backward can't beat it. Pure loss at all sizes -> REVERTED
+the lu_factor batched grad source per the campaign rule. lu_factor grad WALLED. (NOTE: lu(P,L,U) grad
+shipped 9487cea8 as a mixed/parity-closure is the related kept case; lu_factor is a cleaner-looking
+single-node design that still loses.) AGENT cc.
