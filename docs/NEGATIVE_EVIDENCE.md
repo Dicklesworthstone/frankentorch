@@ -5158,3 +5158,27 @@ slogdet bwd 5-13ms, matrix_power bwd 4-9ms — all MKL/potrf-bound with cheap fo
 NOT winnable (FT can't beat MKL batched potrf/matmul). pinv = the only standout
 (slow looped-SVD forward), already captured by the composition grad path. Score vs
 PyTorch: `3W / 0L / 0N`.
+
+## 2026-06-22 - WIN: batched cond (p=±2) GRADIENT = 6.87-9.66x vs PyTorch, ORACLE-EXACT (was an ERROR)
+
+Found via the disk-free torch backward probe ([[feedback_torch_backward_probe]]):
+torch's `linalg.cond` is slow at BOTH forward (looped per-plane SVD, 37-46ms) and backward
+(56-130ms), totalling 206-499ms fwd+bwd. Batched cond with `requires_grad` (`nd>=3`, p=±2)
+previously **errored** (2-D-only guard ahead of the grad composition). FrankenTorch's
+composition `σ_max/σ_min` via batched `svdvals` (grad-aware, 6-9x win) + narrow + div is fast.
+
+LEVER (frankentorch batched-cond-grad, AGENT cc): batched p=±2 grad branch in
+`tensor_linalg_cond` before the 2-D guard — `svdvals` (batched grad) then narrow the
+first/last singular value over the last dim + div. Correctness inherited from the validated
+batched-svdvals grad + narrow/div primitives.
+
+MEASURED (examples/batched_cond_grad_h2h.rs, fwd+bwd step, loss = sum(cond)), FT on RCH
+`hz2` vs PyTorch `2.12.0+cpu` local (8 threads, mixed-location — FT remote):
+  `[20000,8,8]`   FT 30.013 ms vs PyTorch 206.307 ms = `6.87x` faster
+  `[8000,16,16]`  FT 31.164 ms vs PyTorch 265.660 ms = `8.52x` faster
+  `[3000,32,32]`  FT 51.687 ms vs PyTorch 499.095 ms = `9.66x` faster
+
+ORACLE-EXACT: the condition number is gauge-free, FT grad-sum matches PyTorch to all
+printed digits (e.g. -2.525130e4, -1.080715e5). VERIFIED: test
+`tensor_linalg_cond_batched_grad_matches_per_plane_2d` GREEN on RCH `hz2`;
+`ft-conformance --profile release` GREEN. Score vs PyTorch: `3W / 0L / 0N`.
