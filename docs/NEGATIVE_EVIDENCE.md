@@ -5605,3 +5605,19 @@ ORACLE-EXACT: matrix_exp grad is gauge-free; FT grad-sums bit-match torch to all
 (9.849406e6 / 6.885658e6 / 5.842672e6). No source change (the kernel handles any n; correctness inherited
 + confirmed by the oracle match). The matrix_exp grad win GROWS with n — strongest in the large-matrix
 regime that matters most. Score vs PyTorch: 3W / 0L / 0N. AGENT cc.
+
+## 2026-06-22 - WIN: batched eigh GRAD (with eigenvectors) at LARGER n (64-128) = 9.0-33.2x vs PyTorch
+
+Larger-n re-measure of the shipped eigh grad (550ac7d2, 2.66-3.99x at n<=32). torch's BATCHED eigh
+EIGENVECTOR-VJP backward (the V.sum() path) is pathologically slow at larger n×batch — ~7.2s for ~1.5
+Gflop of work (~240x off the flop estimate), a known torch eigh-backward weakness (materializes the
+F-matrix + batched matmuls inefficiently). FT parallelizes the per-plane VJP over the batch. MEASURED
+(examples/eigh_largen_grad_h2h.rs, fwd+bwd, loss=sum(w)+sum(V)), FT on RCH hz2 vs PyTorch 2.12.0 local:
+  [2000,64,64]   FT 218ms vs torch 7234ms = 33.2x faster
+  [800,96,96]    FT 235ms vs torch 6298ms = 26.8x faster
+  [400,128,128]  FT 251ms vs torch 2263ms = 9.0x faster
+(torch warmup step was even slower, 28s; using the steady-state timed min.) Internal-validated: the eigh
+grad kernel is batched==per-plane-2D (550ac7d2); grad-sum vs torch differs by the eigenvector SIGN GAUGE
+(loss uses sum(V)), so NOT oracle-exact — correctness via the internal test, not the torch checksum. No
+source change (kernel handles any n). The win is largest at high batch count (FT flat; torch dominated by
+the looped/pathological per-plane backward). Score vs PyTorch: 3W / 0L / 0N. AGENT cc.
