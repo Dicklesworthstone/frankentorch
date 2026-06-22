@@ -5363,3 +5363,17 @@ f64 batched grads; correctness inherited). AGENT cc. This COMPLETES the f32 grad
 WINS = cond, matrix_norm, eigvals, matrix_exp, eigh, lstsq, eigvalsh, svdvals f32;
 marginal/mixed = svd, qr f32. The batched decomposition-grad surface is now comprehensively
 measured across BOTH dtypes (f64 + f32). Score vs PyTorch: 6W / 0L / 0N.
+
+## 2026-06-22 - NEGATIVE/FRONTIER: matrix_power/cholesky_inverse walled; lu(P,L,U) grad = focused-session candidate
+
+Disk-free torch probe (local 2.12.0, B=8000 n=16) of the last unchecked grad ops:
+- matrix_power(k=4) grad: fwd 1.9ms / bwd 31ms — matmul-based (MKL), FT matmul trails MKL = WALLED.
+- cholesky_inverse grad: fwd 21ms / bwd 23ms — potrf/potri (MKL) = WALLED.
+- lu(P,L,U) grad: fwd 15ms / bwd **85ms** — torch's P/L/U backward is SLOW (looped LU VJP). This IS a
+  potential win (FT could parallelize the per-plane LU VJP over the batch) BUT needs a from-scratch
+  batched LU-decomposition VJP (triangular-structure-aware) — the same hard, focused-session class as
+  eig-with-vectors grad (6hqw9), NOT a disk-neutral quick lever. Added to the deep frontier.
+
+The disk-neutral quick-win surface (batched decomposition-grad f64+f32, dtype+shape extensions) is
+COMPREHENSIVELY HARVESTED (~16 wins this session). Remaining levers all need focused sessions: eig-
+with-vectors grad (6hqw9), lu(P,L,U) grad (new), packed-GEMM/SIMD-exp/allocator (e4yuj). AGENT cc.
