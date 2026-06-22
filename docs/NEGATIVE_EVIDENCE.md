@@ -94,6 +94,17 @@ is explicitly satisfied.
   read-back); that ~140ms floor is independent of the op math, vs PyTorch's fused/in-place 26ms. This is
   the session-arena / gmuml owner-scope wall, NOT an op-level lever. Shipped the bit-exact cleanup
   (removes the powf+expand waste, reaches the achievable FT floor); the 5.4x gap needs session-arena.
+- cdist measured across p (2026-06-22, [2000,100]): a SPLIT — FT WINS general p, loses p=2 hugely.
+  PyTorch only has fast paths for p=1 (8.5ms) and p=2 (3.56ms, the ‖x−y‖²=‖x‖²+‖y‖²−2x·y MATMUL trick);
+  general p is slow (p=3 210ms, p=4 249ms, p=0.5 561ms — no trick, O(n·m·d) powf). FT (parallel powf,
+  compute-dominated so clears the session floor) WINS general p: **p=3 1.26x, p=4 1.50x, p=0.5 1.79x**
+  faster — an existing win, no change. BUT FT p=2 = 163ms vs PyTorch 3.56ms = **45.77x SLOWER** (FT does
+  naive O(n·m·d); PyTorch uses the GEMM trick). LEVER (high value, 45x, but POLICY-GATED — not done): a
+  p=2 matmul-trick fast path (X@Yᵀ via FT's fast GEMM + ‖·‖² + sqrt) would ~match PyTorch's 3.56ms, but
+  the trick has CATASTROPHIC CANCELLATION for nearby points — FT's naive cdist is MORE accurate, and the
+  trick changes FT's cdist p=2 values (breaks existing accuracy + tests). PyTorch itself gates this
+  (`compute_mode=donot_use_mm_for_euclid_dist`). So matching PyTorch's speed = adopting PyTorch's
+  accuracy downgrade — an owner/parity-policy decision, flagged not shipped. pdist p=2 likely same.
 - quantile_dim single-q no-grad was 5.7x SLOW (silent) — routed to the parallel quickselect fast path
   → 5x internal, PARITY with PyTorch (not yet a win): a selection-op scan found PyTorch's `quantile` is
   SORT-based + slow (73ms / 190ms @[4000,4000]/[20000,2000], dim=1) while its `median` is introselect-
