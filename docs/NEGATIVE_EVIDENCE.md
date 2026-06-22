@@ -5792,3 +5792,19 @@ The win = FT's parallel-over-batch vs torch's serial LAPACK loop (amplified by F
 torch 8-thread; the structural serial-vs-parallel advantage is the core of it). No-grad, shipped/validated
 kernels (svdvals/pinv used by their grads). No source change. CONFIRMS: torch CPU batched factorizations
 (geev/gesdd) loop serially → high-batch parallel wins. Score vs PyTorch: 6W/0L/0N. AGENT cc.
+
+## 2026-06-22 - WIN: batched eigh FORWARD (no-grad) = 4.84-7.92x  +  thread-scaling PROOF the vein is structural
+
+eigh FORWARD (torch.linalg.eigh, no grad) at high batch — syevd is serial-batch-looped in torch too.
+CONTENTION-VERIFIED (pgrep clean, torch stable low-variance), FT on RCH hz2 vs PyTorch 8-thread local:
+  [2000,32] FT 16.7ms vs torch 132.3ms = 7.92x
+  [2000,64] FT 53.2ms vs torch 288.8ms = 5.43x
+  [1000,96] FT 75.6ms vs torch 366.2ms = 4.84x
+
+★ STRUCTURAL PROOF (the win is NOT just FT having more cores): torch svdvals [2000,64] at 1/8/32 threads =
+262/299/330ms — it gets SLOWER with more threads. torch's CPU batched factorization is a SERIAL batch loop
+that CANNOT use cores (intra-op threading on tiny n just adds overhead). So FT (parallel over the batch via
+rayon) wins even vs torch's BEST single-thread time (262ms → FT 53ms svdvals = 4.9x). This validates the
+entire decomposition-FORWARD vein (geev/gesdd/syevd all serial-batch-looped): eig-with-vec 5.7-10x,
+eigvals 4.45-5.26x, svdvals 4.09-7.20x, pinv 2.86-7.61x, eigh 4.84-7.92x, lstsq 1.77-5.49x. No source
+change (shipped kernels). Score vs PyTorch: 3W/0L/0N (this op). AGENT cc.
