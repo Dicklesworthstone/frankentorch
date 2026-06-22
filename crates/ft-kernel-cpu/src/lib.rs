@@ -16951,6 +16951,60 @@ pub fn matrix_exp_batched_contiguous_f64(
     Ok(out)
 }
 
+/// Batched reverse-mode backward of `Y = expm(A)`: for each of `bb` `n×n` planes
+/// (input `a`, output cotangent `grad_y`), `grad_A` is the top-right n×n block of
+/// `expm([[Aᵀ, grad_Y], [0, Aᵀ]])` (Higham/Al-Mohy adjoint). Parallelizes the verified
+/// 2-D augmented-expm backward over the batch (each plane bit-identical to the 2-D path).
+/// PyTorch loops the per-plane backward serially. frankentorch batched-matrix-exp-grad.
+pub fn matrix_exp_backward_batched_contiguous_f64(
+    a: &[f64],
+    grad_y: &[f64],
+    bb: usize,
+    n: usize,
+) -> Result<Vec<f64>, KernelError> {
+    let plane = n * n;
+    let mut out = vec![0.0f64; bb * plane];
+    if bb == 0 || n == 0 {
+        return Ok(out);
+    }
+    let m2 = 2 * n;
+    let meta2 = TensorMeta::from_shape(vec![m2, m2], DType::F64, Device::Cpu);
+    let first_err = std::sync::Mutex::new(None);
+    out.par_chunks_mut(plane).enumerate().for_each(|(b, o)| {
+        let ap = &a[b * plane..(b + 1) * plane];
+        let gp = &grad_y[b * plane..(b + 1) * plane];
+        // Augmented M = [[Aᵀ, grad_Y], [0, Aᵀ]] (row-major 2n×2n).
+        let mut aug = vec![0.0f64; m2 * m2];
+        for i in 0..n {
+            for j in 0..n {
+                let at = ap[j * n + i]; // Aᵀ[i][j] = A[j][i]
+                aug[i * m2 + j] = at;
+                aug[(i + n) * m2 + (j + n)] = at;
+                aug[i * m2 + (j + n)] = gp[i * n + j];
+            }
+        }
+        match matrix_exp_contiguous_f64(&aug, &meta2) {
+            Ok(expm) => {
+                for i in 0..n {
+                    for j in 0..n {
+                        o[i * n + j] = expm[i * m2 + (j + n)];
+                    }
+                }
+            }
+            Err(e) => {
+                let mut g = first_err.lock().unwrap();
+                if g.is_none() {
+                    *g = Some(e);
+                }
+            }
+        }
+    });
+    if let Some(e) = first_err.into_inner().unwrap() {
+        return Err(e);
+    }
+    Ok(out)
+}
+
 /// f32 mirror of [`matrix_exp_batched_contiguous_f64`]. (BlackThrush)
 pub fn matrix_exp_batched_contiguous_f32(
     data: &[f32],

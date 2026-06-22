@@ -5069,3 +5069,31 @@ VERIFIED: focused test GREEN on RCH `hz2`; `ft-conformance --profile release` GR
 `hz2`. Distinct-eigenvalue case only (defective/repeated → singular, errors loud, as torch).
 Score vs PyTorch: `4W / 0L / 0N`. Batched-decomposition-grad surface COMPLETE
 (eigh/svd/qr/eigvals); bead u0csd fully resolved.
+
+## 2026-06-22 - WIN: batched matrix_exp GRADIENT = 3.29-4.19x vs PyTorch, ORACLE-EXACT (was an ERROR)
+
+Batched matrix exponential with `requires_grad` (`nd>=3`) previously **errored** (2-D-only
+grad path). The backward computes `grad_A` = top-right n×n block of
+`expm([[Aᵀ, grad_Y], [0, Aᵀ]])` (Higham/Al-Mohy adjoint) — an expm of a 2n×2n matrix PER
+PLANE. PyTorch loops this serially; FrankenTorch parallelizes both forward and backward
+over the batch. Single output -> 1x forward.
+
+LEVER (frankentorch batched-matrix-exp-grad, AGENT cc):
+- New kernel `matrix_exp_backward_batched_contiguous_f64` parallelizes the verified 2-D
+  augmented-expm backward over the batch (each plane bit-identical to the 2-D path).
+- Batched grad path in `tensor_matrix_exp` (forward `matrix_exp_batched_contiguous_f64`).
+
+MEASURED (examples/batched_matrix_exp_grad_h2h.rs, fwd+bwd step, loss = sum(Y⊙Y)), FT on
+RCH `hz2` vs PyTorch `2.12.0+cpu` local (8 threads, mixed-location — FT remote):
+  `[20000,4,4]`  FT 15.396 ms vs PyTorch 50.718 ms  = `3.29x` faster
+  `[8000,8,8]`   FT 20.059 ms vs PyTorch 69.031 ms  = `3.44x` faster
+  `[3000,16,16]` FT 32.967 ms vs PyTorch 117.657 ms = `3.57x` faster
+  `[1000,32,32]` FT 44.040 ms vs PyTorch 184.306 ms = `4.19x` faster
+
+ORACLE-EXACT: matrix_exp is gauge-free (no eigenvector/sign ambiguity), so the FT grad-sum
+matches PyTorch's to all printed digits at every shape (e.g. 1.979895e5, 4.637249e5) —
+direct oracle validation of correctness, not just the internal batched-vs-2D test.
+
+VERIFIED: test `tensor_matrix_exp_batched_grad_matches_per_plane_2d` GREEN on RCH `hz2`;
+`ft-conformance --profile release` GREEN. Score vs PyTorch: `4W / 0L / 0N`. Extends the
+batched-decomposition-grad sweep (eigh/svd/qr/eigvals) to the matrix-function family.
