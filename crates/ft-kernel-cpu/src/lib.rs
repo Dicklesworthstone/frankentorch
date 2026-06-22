@@ -26439,6 +26439,44 @@ pub fn matmul_tensor_contiguous_f32_into(
     Ok(())
 }
 
+const BMM_F32_4X4_BATCH_CHUNK: usize = 256;
+
+#[inline(always)]
+fn matmul_4x4_f32(lhs: &[f32], rhs: &[f32], out: &mut [f32]) {
+    debug_assert!(lhs.len() >= 16);
+    debug_assert!(rhs.len() >= 16);
+    debug_assert!(out.len() >= 16);
+
+    let b00 = rhs[0];
+    let b01 = rhs[1];
+    let b02 = rhs[2];
+    let b03 = rhs[3];
+    let b10 = rhs[4];
+    let b11 = rhs[5];
+    let b12 = rhs[6];
+    let b13 = rhs[7];
+    let b20 = rhs[8];
+    let b21 = rhs[9];
+    let b22 = rhs[10];
+    let b23 = rhs[11];
+    let b30 = rhs[12];
+    let b31 = rhs[13];
+    let b32 = rhs[14];
+    let b33 = rhs[15];
+
+    for row in 0..4 {
+        let a0 = lhs[row * 4];
+        let a1 = lhs[row * 4 + 1];
+        let a2 = lhs[row * 4 + 2];
+        let a3 = lhs[row * 4 + 3];
+        let base = row * 4;
+        out[base] = a3.mul_add(b30, a2.mul_add(b20, a1.mul_add(b10, a0 * b00)));
+        out[base + 1] = a3.mul_add(b31, a2.mul_add(b21, a1.mul_add(b11, a0 * b01)));
+        out[base + 2] = a3.mul_add(b32, a2.mul_add(b22, a1.mul_add(b12, a0 * b02)));
+        out[base + 3] = a3.mul_add(b33, a2.mul_add(b23, a1.mul_add(b13, a0 * b03)));
+    }
+}
+
 pub fn dot_tensor_contiguous_f32(
     lhs: &[f32],
     rhs: &[f32],
@@ -26555,6 +26593,42 @@ pub fn bmm_tensor_contiguous_f32(
     let mut out = vec![0.0f32; out_numel];
 
     if out_batch_stride == 0 {
+        return Ok(out);
+    }
+
+    if m == 4 && k == 4 && n == 4 {
+        let lhs_batches = &lhs[lhs_start..lhs_start + batch * lhs_batch_stride];
+        let rhs_batches = &rhs[rhs_start..rhs_start + batch * rhs_batch_stride];
+        if batch < BMM_F32_4X4_BATCH_CHUNK {
+            for b in 0..batch {
+                let lhs_base = b * lhs_batch_stride;
+                let rhs_base = b * rhs_batch_stride;
+                let out_base = b * out_batch_stride;
+                matmul_4x4_f32(
+                    &lhs_batches[lhs_base..lhs_base + lhs_batch_stride],
+                    &rhs_batches[rhs_base..rhs_base + rhs_batch_stride],
+                    &mut out[out_base..out_base + out_batch_stride],
+                );
+            }
+        } else {
+            out.par_chunks_mut(out_batch_stride * BMM_F32_4X4_BATCH_CHUNK)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let first_batch = chunk_idx * BMM_F32_4X4_BATCH_CHUNK;
+                    for (local_b, out_batch) in
+                        out_chunk.chunks_exact_mut(out_batch_stride).enumerate()
+                    {
+                        let b = first_batch + local_b;
+                        let lhs_base = b * lhs_batch_stride;
+                        let rhs_base = b * rhs_batch_stride;
+                        matmul_4x4_f32(
+                            &lhs_batches[lhs_base..lhs_base + lhs_batch_stride],
+                            &rhs_batches[rhs_base..rhs_base + rhs_batch_stride],
+                            out_batch,
+                        );
+                    }
+                });
+        }
         return Ok(out);
     }
 
@@ -31664,6 +31738,43 @@ mod tests {
             out,
             vec![34.0, 37.0, 78.0, 85.0, 166.0, 177.0, 226.0, 241.0]
         );
+    }
+
+    #[test]
+    fn bmm_tensor_contiguous_f32_4x4_fast_path_matches_reference_with_offsets() {
+        let batch = 260usize;
+        let lhs_offset = 3usize;
+        let rhs_offset = 5usize;
+        let lhs_meta = TensorMeta::from_shape(vec![batch, 4, 4], DType::F32, Device::Cpu)
+            .with_storage_offset(lhs_offset);
+        let rhs_meta = TensorMeta::from_shape(vec![batch, 4, 4], DType::F32, Device::Cpu)
+            .with_storage_offset(rhs_offset);
+        let mut lhs = vec![99.0f32; lhs_offset + batch * 16];
+        let mut rhs = vec![77.0f32; rhs_offset + batch * 16];
+        for i in 0..batch * 16 {
+            lhs[lhs_offset + i] = (i % 7) as f32 - 3.0;
+            rhs[rhs_offset + i] = (i % 11) as f32 - 5.0;
+        }
+
+        let out = bmm_tensor_contiguous_f32(&lhs, &rhs, &lhs_meta, &rhs_meta)
+            .expect("4x4 f32 bmm should succeed");
+
+        let mut expected = vec![0.0f32; batch * 16];
+        for b in 0..batch {
+            let lhs_base = lhs_offset + b * 16;
+            let rhs_base = rhs_offset + b * 16;
+            let out_base = b * 16;
+            for row in 0..4 {
+                for col in 0..4 {
+                    let mut acc = 0.0f32;
+                    for kk in 0..4 {
+                        acc += lhs[lhs_base + row * 4 + kk] * rhs[rhs_base + kk * 4 + col];
+                    }
+                    expected[out_base + row * 4 + col] = acc;
+                }
+            }
+        }
+        assert_eq!(out, expected);
     }
 
     #[test]

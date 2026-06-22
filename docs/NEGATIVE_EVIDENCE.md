@@ -118,6 +118,47 @@ retry k=4 through another routing-only lever. Further k=4 work needs a lower
 per-plane f32 microkernel or explicit acceptance that MKL's tiny `sgemm` path is
 the wall.
 
+## 2026-06-22 - KEEP: f32 4x4 bmm microkernel narrows tiny PyTorch residual
+
+Bead `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`. The
+`frankentorch-dxjn9` keep above narrowed f32 tiny batched matmul by parallelizing
+over batch planes, but each 4x4 plane still paid one `matrixmultiply::sgemm`
+call. That left the documented k=4 row as a PyTorch win.
+
+Lever shipped: add a narrow safe-Rust 4x4 f32 microkernel inside
+`bmm_tensor_contiguous_f32` when `m == k == n == 4`, with 256-batch chunks for
+the parallel branch. Larger f32 bmm shapes, f64 bmm, dtype/layout validation,
+storage offsets, and all non-4x4 shapes stay on the existing GEMM route. The
+N-D no-grad f32 matmul path benefits because it flattens identical leading
+batches into contiguous bmm storage before returning the original output shape.
+
+Same-host head-to-head, local torch `2.12.1+cpu`, 32 threads, warm
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`. FT baseline
+and after were the direct returned release binary
+`/data/projects/.rch-targets/frankentorch-cod-a/release/examples/bmm_tiny_h2h`;
+PyTorch used prebuilt contiguous tensors and best-of-five `torch.matmul` timings:
+
+- f32 3-D `[100000,4,4]`:
+  - baseline FT `2.546 ms` vs PyTorch `0.471 ms` = `5.41x SLOWER`
+  - after FT `1.256 ms` vs PyTorch `0.471 ms` = `2.67x SLOWER`
+  - internal speedup `2.03x`
+- f32 4-D `[10000,8,4,4]`:
+  - baseline FT `1.749 ms` vs PyTorch `0.363 ms` = `4.82x SLOWER`
+  - after FT `1.051 ms` vs PyTorch `0.363 ms` = `2.90x SLOWER`
+  - internal speedup `1.66x`
+
+RCH smoke timings also moved in the expected direction for the same example:
+current-tree baseline on `vmi1153651` was f32 3-D `3.891 ms` and f32 4-D
+`3.269 ms`; after the patch on `ovh-a` was f32 3-D `1.250 ms` and f32 4-D
+`1.094 ms`. Those are routing evidence only because the worker changed.
+
+Decision: KEEP. This does not clear PyTorch's tiny-matrix wall, but it removes
+the largest avoidable per-plane overhead left after batch-parallel bmm and gives
+a same-host `2.03x` / `1.66x` internal win. Remaining k=4 work should not retry
+batch routing or another thin wrapper; it needs either lower allocation/session
+overhead around the public matmul path or acceptance that PyTorch's tiny
+threaded kernel still wins by about `2.7-2.9x` on these rows.
+
 ## 2026-06-22 - KEEP (internal), PyTorch loss: f32 cdist p=2 no-grad fused route
 
 Bead `frankentorch-jpn1d`, assignee `cod-b`, agent `IvoryDeer`. The f64
