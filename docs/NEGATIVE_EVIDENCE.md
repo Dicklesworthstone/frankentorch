@@ -82,6 +82,18 @@ is explicitly satisfied.
   passes; near-parity, a fuse-to-1-pass could reach ~parity/slight-win but low-EV at 1.16x). normalize:
   PyTorch 26ms (fast, not probed). LESSON: measure composed ops individually — cosine_sim's norm
   composition already beats PyTorch (the "composed = slow" inference from renorm does NOT generalize).
+- F.normalize MEASURED 8.44x loss → fused to 1.56x-internal but STILL 5.4x loss (SESSION-OVERHEAD wall):
+  FT normalize [4000,4000] dim1 p2 was 220ms vs PyTorch 26ms (8.44x). Two real bugs found+fixed in a
+  no-grad fused path (bit-exact, 11 normalize lib tests + 199 conformance pass): (1) it called
+  `tensor_norm_dim` which for p=2 uses libm `powf` for |x|^2 — but `cosine_similarity` (the 1.96x WIN)
+  computes its norm as `x*x` (the torch-correct fast norm); switched to inline `sqrt(sum x*x)`. (2) it
+  materialised a full numel-sized `tensor_expand` of the broadcast denom before dividing; replaced with
+  an in-place per-slice divide. Result 220→141ms (1.56x internal). BUT still 5.4x slower than PyTorch's
+  26ms — and FT's fused renorm hit the SAME ~140ms floor. ROOT CAUSE: FT session overhead — each no-grad
+  op materialises the 128MB tensor several times (`tensor_values` in + `tensor_variable` out + caller
+  read-back); that ~140ms floor is independent of the op math, vs PyTorch's fused/in-place 26ms. This is
+  the session-arena / gmuml owner-scope wall, NOT an op-level lever. Shipped the bit-exact cleanup
+  (removes the powf+expand waste, reaches the achievable FT floor); the 5.4x gap needs session-arena.
 - quantile_dim single-q no-grad was 5.7x SLOW (silent) — routed to the parallel quickselect fast path
   → 5x internal, PARITY with PyTorch (not yet a win): a selection-op scan found PyTorch's `quantile` is
   SORT-based + slow (73ms / 190ms @[4000,4000]/[20000,2000], dim=1) while its `median` is introselect-
