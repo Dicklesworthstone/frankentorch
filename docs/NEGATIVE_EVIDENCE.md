@@ -5097,3 +5097,40 @@ direct oracle validation of correctness, not just the internal batched-vs-2D tes
 VERIFIED: test `tensor_matrix_exp_batched_grad_matches_per_plane_2d` GREEN on RCH `hz2`;
 `ft-conformance --profile release` GREEN. Score vs PyTorch: `4W / 0L / 0N`. Extends the
 batched-decomposition-grad sweep (eigh/svd/qr/eigvals) to the matrix-function family.
+
+## 2026-06-22 - WIN: batched lstsq GRADIENT = 1.55-3.03x vs PyTorch, ORACLE-EXACT (was an ERROR)
+
+Batched least-squares with `requires_grad` (`nd>=3`) previously **errored** (lstsq grad
+composes via `pinv`, whose requires_grad path was 2-D-only, AND lstsq had a 2-D-only guard
+ahead of the grad block). Unlike the decomposition grads, this one was found by a DISK-FREE
+torch-only PROBE: torch's batched lstsq BACKWARD is pathologically slow (~100-210ms,
+20-50x its own inv/solve backward, which are MKL-fast at 1-7ms). So FT's parallel
+composition wins even though FT's individual matmuls trail MKL.
+
+LEVER (frankentorch batched-lstsq-grad / batched-inv-grad / batched-pinv-grad, AGENT cc):
+- New kernel `inv_backward_batched_contiguous_f64` (parallel per-plane `-Yᵀ grad_Y Yᵀ`).
+- Batched `inv` grad path in `tensor_linalg_inv` (forward = parallel batched LU-solve;
+  backward = the new kernel) — the keystone.
+- Batched `pinv` grad path: the normal-equations composition `(AᵀA)⁻¹Aᵀ` extended to the
+  leading batch dims via batched transpose/matmul/inv (correctness inherited from the
+  validated primitives).
+- Reordered `tensor_linalg_lstsq`: the requires_grad `pinv`@B composition now runs BEFORE
+  the 2-D-only guard, so batched grad reaches it.
+
+MEASURED (examples/batched_lstsq_grad_h2h.rs, fwd+bwd step, loss = sum(X⊙X)), FT on RCH
+`hz2` vs PyTorch `2.12.0+cpu` local (8 threads, mixed-location — FT remote):
+  `[20000,8,4]`  FT 44.628 ms  vs PyTorch 135.264 ms = `3.03x` faster
+  `[8000,16,8]`  FT 73.684 ms  vs PyTorch 148.548 ms = `2.02x` faster
+  `[3000,32,16]` FT 139.450 ms vs PyTorch 216.542 ms = `1.55x` faster
+
+ORACLE-EXACT: the full-rank least-squares solution is gauge-free, so the FT grad-sum
+matches PyTorch to all printed digits at every shape (e.g. -2.754533e2, -1.741766e2) —
+direct oracle validation. Ratio shrinks with N as FT's (non-MKL) matmuls grow.
+
+NOTE: the obvious worry — that the inv-composition is getrf-walled — is FALSE here because
+the comparator is torch's SLOW lstsq backward, not torch's fast standalone inv. (Probed:
+torch inv/solve backward are MKL-fast = those grads stay walled; only lstsq is winnable.)
+
+VERIFIED: test `tensor_linalg_lstsq_batched_grad_matches_per_plane_2d` (grad_A & grad_B
+match looping the 2-D lstsq grad within `1e-8 + 1e-6·|x|`) GREEN on RCH `hz2`;
+`ft-conformance --profile release` GREEN. Score vs PyTorch: `3W / 0L / 0N`.

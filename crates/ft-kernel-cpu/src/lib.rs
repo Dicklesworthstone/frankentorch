@@ -19697,6 +19697,31 @@ pub fn inv_backward_f64(y: &[f64], grad_y: &[f64], n: usize) -> Vec<f64> {
     grad_a
 }
 
+/// Batched VJP of the matrix inverse: for each of `bb` `n×n` planes (`y` = A⁻¹,
+/// cotangent `grad_y`), `grad_A = -Yᵀ·grad_Y·Yᵀ`. Parallelizes the verified 2-D
+/// [`inv_backward_f64`] over the batch (each plane bit-identical to the 2-D call).
+/// frankentorch batched-inv-grad.
+pub fn inv_backward_batched_contiguous_f64(
+    y: &[f64],
+    grad_y: &[f64],
+    bb: usize,
+    n: usize,
+) -> Vec<f64> {
+    let plane = n * n;
+    let mut out = vec![0.0f64; bb * plane];
+    if bb == 0 || n == 0 {
+        return out;
+    }
+    out.par_chunks_mut(plane)
+        .zip(y.par_chunks(plane))
+        .zip(grad_y.par_chunks(plane))
+        .for_each(|((o, yp), gp)| {
+            let g = inv_backward_f64(yp, gp, n);
+            o.copy_from_slice(&g);
+        });
+    out
+}
+
 /// VJP of `cholesky_solve` wrt the factor: grad_L = −sym(grad_B·Xᵀ)·L (lower) or
 /// −L·sym(grad_B·Xᵀ) (upper), where `grad_b` is the already-solved RHS cotangent
 /// (n×nrhs), `x` the saved solution (n×nrhs), `l` the n×n factor. Routes the matmuls
