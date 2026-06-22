@@ -46,6 +46,15 @@ is explicitly satisfied.
   [2000,64,64] FT 60.9ms vs 317ms = **5.2x** (FT Taylor scaling-squaring vs PyTorch's batched Padé).
   Both existing wins (batched-eigh / b3o90 native paths), documented. matrix_power^4 36ms / lu_solve
   64ms = PyTorch bmm/getrs-moderate (not probed for FT, likely ~parity/loss like the getrf class).
+- getrs-ONLY class is NOT an FT win (completes the linalg surface map, 2026-06-22): the ops that are
+  ONLY a triangular/backsolve given a precomputed factor — cholesky_solve, lu_solve, solve_triangular —
+  are FT's weak spot. tensor_cholesky_solve is 2-D ONLY (errors on batched 3-D = a FEATURE gap; PyTorch
+  batches it ~46ms). PyTorch's getrs is only MODERATE (cholesky_solve 46ms, lu_solve 64ms — NOT
+  gesdd/geev-slow), and FT's standalone substitution is the slow path (see the solve_triangular 2.67x
+  loss + tri-solve finding). So FT wins the FULL solve/inv (fused LU+solve amortises) and the
+  DECOMPOSITIONS (gesdd/geev/syev/geqrf slow) but NOT the bare-getrs class. THREE-WAY LINALG RULE now
+  complete: FT WINS decompositions+full-solve (5-27x); LOSES factorizations det/cholesky/lu (getrf/potrf
+  fast); NEUTRAL/loss on bare-getrs cholesky_solve/lu_solve/triangular_solve (substitution-bound). Done.
 
 ## 2026-06-21 - batched cholesky/det/inv/solve - FT 2-D-only (torch-parity FEATURE gap + perf opportunity, filed qe48n)
 
