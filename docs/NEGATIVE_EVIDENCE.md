@@ -5289,3 +5289,17 @@ hz2 vs PyTorch 2.12.0 local (mixed-location):
 ORACLE-EXACT: min-norm lstsq solution is unique, FT grad-sum matches PyTorch to all printed digits
 (e.g. -4.830782e2). VERIFIED: test tensor_linalg_lstsq_underdetermined_batched_grad_matches_per_plane_2d
 GREEN on RCH hz2; ft-conformance --profile release GREEN. Score vs PyTorch: 3W / 0L / 0N.
+
+## 2026-06-22 - NEGATIVE: pinv_hermitian GRAD not a clean win (both compositions parity-to-loss)
+
+Probed pinv_hermitian (square SPD) grad: torch's pinv(hermitian=True) uses the SLOW eigh path
+(fwd+bwd 117-322ms measured). FT's two candidate compositions both fail to clearly beat it:
+- general pinv (AᵀA)⁻¹Aᵀ (current shipped path): MIXED — FT hz2 vs torch local 1.41x (n=8) but
+  0.87x (n=16) / 0.76x (n=32); forms A² (extra matmul, worse conditioning) so loses at larger n.
+- eigh-composition V diag(1/λ) Vᵀ (torch's own path; TRIED then REVERTED): parity-to-loss 0.80-0.97x
+  AND regressed n=8 (83->121ms) — FT's batched eigh GRAD overhead (two-node eigh recompute + the
+  eigenvector VJP F-matrix) eats the batch-parallelism advantage.
+Net ~0-gain-to-loss → reverted the eigh source change per the campaign rule. gradsums oracle-match
+(pinv_hermitian gradient is gauge-free) in all cases — correctness fine, perf not a win. Kept a
+correctness test (tensor_linalg_pinv_hermitian_batched_grad_matches_per_plane_2d, general-pinv path).
+pinv_hermitian grad WALLED. AGENT cc.
