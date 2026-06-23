@@ -27,7 +27,8 @@ fn run_ft(b: usize, m: usize, n: usize) -> Result<f64, Box<dyn Error>> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (b, m, n) in [(200usize, 96usize, 64usize)] {
+    {
+        let (b, m, n) = (200usize, 96usize, 64usize);
         let ft_ms = run_ft(b, m, n)?;
         println!("B={b} m={m} n={n}: FT matrix_rank {ft_ms:.1} ms");
     }

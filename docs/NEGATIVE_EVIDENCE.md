@@ -4,6 +4,57 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-23 - WIN: BatchNorm2d f32 scalar-loss identity skips annihilated scans
+
+Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
+The tracker was still not claimable because `br ready --json` and
+`br list --status in_progress --json` fail on duplicate id
+`frankentorch-kgs4.150`, so this pass proceeded under the contended-tracker
+rule.
+
+Measured residual: f32 affine training BatchNorm2d scalar sum on
+`[32,256,28,28]` NCHW. The current same-worktree baseline with warm
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`, command
+`cargo bench -p ft-api --bench pytorch_gauntlet_bench --
+gauntlet_batch_norm2d_f32_grad/frankentorch_kgs4_136_scalar_sum --warm-up-time 1
+--measurement-time 3 --sample-size 10 --noplot`, measured
+`[35.405 ms 35.815 ms 36.331 ms]`.
+
+Lever shipped: the f32 BatchNorm2d training scalar-loss path now uses the
+identity `sum(batch_norm(x, weight, bias)) = sum(bias) * (N*H*W)` and returns
+algebraic zero for the input and weight gradients. Running-stat updates still
+use the same f32 batch stats as the materialized path, and retained output
+hooks still force the ordinary materialized `Sum` edge. Tests now explicitly
+bound the tiny f32 materialized-path residue while requiring the shortcut's
+annihilated `dx`/`dweight` to be zero.
+
+Same-worker candidate with the same Criterion command measured
+`[31.555 ms 32.265 ms 32.844 ms]`, `change: [-13.419% -10.803% -8.1092%]`,
+`p = 0.00`, so the scalar row improved by `1.11x` at the midpoints. The smaller
+direct A/B harness
+`cargo run --release -p ft-api --example batch_norm_f32_grad_ab` moved scalar
+from `1.42 ms` to `1.11 ms` on `[16,64,28,28]`.
+
+PyTorch sidecar for the same gauntlet script, torch `2.12.0+cpu`, 32 threads,
+`FT_GAUNTLET_ITERS=110`, reported `0.811256892979 s`, or `7.375 ms/iter`.
+That narrows this pass's scalar FT/PyTorch ratio from `4.86x SLOWER`
+(`35.815 / 7.375`) to `4.38x SLOWER` (`32.265 / 7.375`). A local PyTorch
+residue probe on the smaller direct shape produced max `dx` `7.32e-8` and max
+`dweight` `2.52e-4`, confirming the removed work is numerical residue rather
+than semantic gradient signal.
+
+Decision: KEEP. Gates: `cargo test -p ft-api functional_batch_norm2d_f32 --lib
+-- --nocapture` passed 6/0; `cargo check -p ft-api --all-targets` passed;
+`cargo clippy -p ft-api --all-targets -- -D warnings` passed after a mechanical
+`matrix_rank_h2h` single-element-loop cleanup. `cargo fmt -p ft-api --check`
+remains red from pre-existing package-wide rustfmt drift in unrelated examples
+and older `src/lib.rs` hunks; this pass did not rewrite those peer files. UBS
+on `crates/ft-api/src/lib.rs` and `crates/ft-api/examples/matrix_rank_h2h.rs`
+ran to completion after 573s and exited 1 on the longstanding broad `ft-api`
+inventory (panic macros in old tests, direct indexing, token-comparison
+heuristics, etc.); its internal fmt, clippy, cargo check, and test-build
+subchecks were clean and no new changed-hunk issue was identified.
+
 ## 2026-06-23 - WIN: GroupNorm f32 scalar-sum cpg=2 avoids extra element scans
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
