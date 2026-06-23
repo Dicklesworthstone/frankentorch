@@ -20577,6 +20577,11 @@ pub fn eig_batched_contiguous_f64(
     let mut evals = vec![0.0f64; bb * val_plane];
     let mut evecs = vec![0.0f64; bb * plane];
     let first_err = std::sync::Mutex::new(None);
+    // Batch saturates the pool -> run each per-plane geev SERIALLY (no nested rayon). Restored after.
+    let serial_inner = bb >= rayon::current_num_threads();
+    if serial_inner {
+        EIG_BATCHED_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     evals
         .par_chunks_mut(val_plane)
         .zip(evecs.par_chunks_mut(plane))
@@ -20593,6 +20598,9 @@ pub fn eig_batched_contiguous_f64(
                 }
             }
         });
+    if serial_inner {
+        EIG_BATCHED_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(e) = first_err.into_inner().unwrap() {
         return Err(e);
     }
@@ -21026,6 +21034,12 @@ fn eig_initial_q_acc(n: usize, want_vectors: bool) -> Vec<f64> {
     q_acc
 }
 
+// When set, eig_impl uses SERIAL inner loops (no nested rayon). The batched eig/eigvals paths set this
+// when the batch saturates the thread pool: nesting the per-plane rayon inside the batch par_chunks adds
+// dispatch overhead that WORSENS with thread count (eigvals B=150 n=96 measured @8 21ms -> @32 33ms).
+// Bit-exact — the inner row/col updates are independent, so serial == parallel. frankentorch eig-batched-no-nest.
+static EIG_BATCHED_SERIAL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigResult, KernelError> {
     ensure_unary_layout_and_storage(data, meta)?;
     let shape = meta.shape();
@@ -21093,7 +21107,8 @@ fn eig_impl(data: &[f64], meta: &TensorMeta, want_vectors: bool) -> Result<EigRe
             // path's per-row dot/scale expression and arithmetic order). The big
             // Hessenberg O(n^3) phase of the non-symmetric eig (frankentorch-l9xod).
             let m_sub = n - k - 1;
-            let par = n >= 64;
+            let par = n >= 64
+                && !EIG_BATCHED_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
 
             // Left multiply. For eigvals-only, columns before k are outside the
             // active Hessenberg band and are never read by the QR phase; skipping
@@ -21823,7 +21838,8 @@ pub fn eig_francis_profile_f64(
             }
 
             let m_sub = n - k - 1;
-            let par = n >= 64;
+            let par = n >= 64
+                && !EIG_BATCHED_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
             let left_start = if want_vectors { 0 } else { k };
             let mut left_scale = vec![0.0f64; n - left_start];
             let col_scale = |(j_rel, slot): (usize, &mut f64)| {
@@ -21966,7 +21982,8 @@ pub fn eig_francis_shadow_profile_f64(
             }
 
             let m_sub = n - k - 1;
-            let par = n >= 64;
+            let par = n >= 64
+                && !EIG_BATCHED_SERIAL.load(std::sync::atomic::Ordering::Relaxed);
             let left_start = if want_vectors { 0 } else { k };
             let mut left_scale = vec![0.0f64; n - left_start];
             let col_scale = |(j_rel, slot): (usize, &mut f64)| {
@@ -22126,6 +22143,11 @@ pub fn eigvals_batched_contiguous_f64(
     let kmeta = TensorMeta::from_shape(vec![k, k], DType::F64, Device::Cpu);
     let mut out = vec![0.0f64; bb * out_plane];
     let first_err = std::sync::Mutex::new(None);
+    // Batch saturates the pool -> run each per-plane geev SERIALLY (no nested rayon). Restored after.
+    let serial_inner = bb >= rayon::current_num_threads();
+    if serial_inner {
+        EIG_BATCHED_SERIAL.store(true, std::sync::atomic::Ordering::Relaxed);
+    }
     out.par_chunks_mut(out_plane)
         .zip(data.par_chunks(plane))
         .for_each(|(o, pl)| match eigvals_contiguous_f64(pl, &kmeta) {
@@ -22137,6 +22159,9 @@ pub fn eigvals_batched_contiguous_f64(
                 }
             }
         });
+    if serial_inner {
+        EIG_BATCHED_SERIAL.store(false, std::sync::atomic::Ordering::Relaxed);
+    }
     if let Some(e) = first_err.into_inner().unwrap() {
         return Err(e);
     }

@@ -6506,3 +6506,15 @@ sort/introselect are well-optimized AND thread-SCALE (unlike the linalg loops), 
 them. (NB torch.median 6.5ms crushes FT quantile for q=0.5 specifically — torch.median is the fast q=0.5 path;
 torch.quantile sorts for arbitrary q.) DOMAIN WALLED — don't re-probe median/quantile/kthvalue/sort/topk for
 perf. The saturate-insight DOESN'T apply here (these SCALE in torch, they don't saturate). AGENT cc.
+
+## 2026-06-23 - ★WIN (FT-internal scaling fix): batched eig/eigvals no-nest — eigvals @32 33.4→16.1ms (2.1x), win 6.6x→13.8x
+
+FT batched eig/eigvals OVERSUBSCRIBED at high thread count: the batch par_chunks_mut(plane) loop called per-plane
+eig_impl which ITSELF used inner rayon (par_chunks_mut over n=96 rows) at 2 sites → nested-rayon dispatch overhead
+that WORSENED with threads (clean monotonic: eigvals B=150 n=96 @8 21.1 / @16 27.8 / @32 33.4ms — FT getting
+SLOWER with more cores). FIX: gate eig_impl's inner `par` off (EIG_BATCHED_SERIAL AtomicBool) when the batch
+saturates the pool (bb >= rayon::current_num_threads()) — batch parallelism alone, no nesting. BIT-EXACT (inner
+row/col updates are independent → serial == parallel; ft-kernel-cpu eig 33/33 + ft-api eig 6/6 green). AFTER:
+eigvals @8 19.9 / @32 16.1ms (now SCALES). vs torch (saturates @8 217.5/@32 222.4ms): @8 10.9x, @32 13.8x (was
+6.6x@32 pre-fix). Applies to BOTH eig_batched (vectors) + eigvals_batched. ★This is the eig-family analog of why
+svdvals-composites scaled fine (they don't nest) — geev nested, now fixed. AGENT cc.
