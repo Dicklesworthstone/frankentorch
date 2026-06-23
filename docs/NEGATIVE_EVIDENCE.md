@@ -6518,3 +6518,16 @@ row/col updates are independent → serial == parallel; ft-kernel-cpu eig 33/33 
 eigvals @8 19.9 / @32 16.1ms (now SCALES). vs torch (saturates @8 217.5/@32 222.4ms): @8 10.9x, @32 13.8x (was
 6.6x@32 pre-fix). Applies to BOTH eig_batched (vectors) + eigvals_batched. ★This is the eig-family analog of why
 svdvals-composites scaled fine (they don't nest) — geev nested, now fixed. AGENT cc.
+
+## 2026-06-23 - NEGATIVE (audit closed): nested-rayon audit of qr/svd/eigh — NO new victims; eig/eigvals was the only one
+
+Followed up the eig/eigvals nested-rayon fix (009a1d4c) by auditing the other batched decompositions for the same
+@8→@32 monotonic-slowdown (nested rayon: batch par_chunks over planes + per-plane kernel with its own inner par).
+Inner-par site counts: svd_contiguous_f64 0, eigh_contiguous_f64 1, qr_contiguous_f64 3. MEASURED scaling
+(B=150 n=96, FT): qr 164.8→34.3ms (4.8x), eigh 132.2→33.6ms (3.9x), svd 435.7→171.1ms (2.5x). ALL SCALE (none
+oversubscribe) — despite qr/eigh having inner-par sites, their n-thresholds / heavier per-plane work avoid the
+pathology that hit eig/eigvals (which nested at n=96). So eig/eigvals was the SOLE nested-rayon victim; the
+generalizable-lever audit is CLOSED (don't re-probe qr/svd/eigh for nesting). ⚠️ SEPARATE observation (NOT
+nesting, svd has 0 inner-par): svd scales only 2.5x@8→@32 (sub-linear vs qr/eigh ~4x) — possible load-imbalance
+(static par_chunks stragglers) or a partly-serial bidiag/replay phase; a deeper future lever, lower priority.
+AGENT cc.
