@@ -6413,3 +6413,14 @@ oversubscription, NOT missing-batched-LAPACK serial loops. The cholesky_inverse 
 KEPT as a correct API feature (parity with torch.cholesky_inverse, ~tie perf) but is NOT a perf win.
 HARDENED RULE: batched tiny-matrix LAPACK MUST be measured thread-matched at torch's best (8-32t), NEVER 64t.
 This is the 2nd time high-thread torch artifacts faked wins (cf. peer-bench contention correction 8b2db303). AGENT cc.
+
+## 2026-06-23 - ★WIN (PROPERLY THREAD-MATCHED): matrix_rank 2.2x@8 / 5.8x@32 — torch saturates, FT scales
+
+torch.linalg.matrix_rank (B=200 m=96 n=64) is SVD-based (gesdd) and SATURATES with threads (clean low-variance:
+@8 53.0ms [56,53,53,54], @32 56.8ms [57,57,57,58] — FLAT, torch can't parallelize the looped per-plane gesdd).
+FT tensor_linalg_matrix_rank (batched svdvals + count) SCALES: @8 24.1ms, @32 9.8ms. THREAD-MATCHED ratios:
+2.2x @8, 5.8x @32 (scorecard convention). This is the CORRECT methodology (cf. the orgqr/cholesky correction
+9a8a8ae4): SATURATE (torch flat across thread counts → FT-scales-the-batch is REAL) vs OVERSUBSCRIBE (torch
+erratically worse at 64t → false). matrix_rank inherits the sound batched-svdvals decomposition-forward vein.
+No source change (FT already batched-parallel); correctness ft-api matrix_rank 4/4 GREEN. Example+ledger only.
+AGENT cc.
