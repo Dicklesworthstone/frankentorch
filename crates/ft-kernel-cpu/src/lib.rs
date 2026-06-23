@@ -5298,6 +5298,48 @@ pub fn group_norm_sum_forward_f32(
 ) -> f32 {
     let group_numel = cpg * spatial;
     let inv_m = 1.0f32 / group_numel as f32;
+    if cpg == 2 {
+        let group_sums: Vec<f32> = (0..batch * num_groups)
+            .into_par_iter()
+            .map(|grp| {
+                let g = grp % num_groups;
+                let base = grp * group_numel;
+                let (x0, x1) = x[base..base + group_numel].split_at(spatial);
+                let mut sum = 0.0f32;
+                let mut sum0 = 0.0f32;
+                for &v in x0 {
+                    sum += v;
+                    sum0 += v;
+                }
+                let mut sum1 = 0.0f32;
+                for &v in x1 {
+                    sum += v;
+                    sum1 += v;
+                }
+                let mean = sum * inv_m;
+                let mut vsum = 0.0f32;
+                for &v in x0 {
+                    let d = v - mean;
+                    vsum += d * d;
+                }
+                for &v in x1 {
+                    let d = v - mean;
+                    vsum += d * d;
+                }
+                let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+                let c0 = g * 2;
+                let c1 = c0 + 1;
+                let w0 = weight.map_or(1.0f32, |w| w[c0]);
+                let w1 = weight.map_or(1.0f32, |w| w[c1]);
+                let b0 = bias.map_or(0.0f32, |b| b[c0]);
+                let b1 = bias.map_or(0.0f32, |b| b[c1]);
+                let spatial_f = spatial as f32;
+                rstd * (w0 * (sum0 - spatial_f * mean) + w1 * (sum1 - spatial_f * mean))
+                    + spatial_f * (b0 + b1)
+            })
+            .collect();
+        return group_sums.into_iter().sum();
+    }
     let group_sums: Vec<f32> = (0..batch * num_groups)
         .into_par_iter()
         .map(|grp| {
@@ -5593,6 +5635,83 @@ pub fn group_norm_backward_scalar_f32(
     let group_numel = cpg * spatial;
     let inv_m = 1.0f32 / group_numel as f32;
     let channels = num_groups * cpg;
+    if cpg == 2 {
+        let stats: Vec<(f32, f32, f32, f32)> = (0..batch * num_groups)
+            .into_par_iter()
+            .map(|grp| {
+                let base = grp * group_numel;
+                let (x0, x1) = x[base..base + group_numel].split_at(spatial);
+                let mut sum = 0.0f32;
+                let mut sum0 = 0.0f32;
+                for &v in x0 {
+                    sum += v;
+                    sum0 += v;
+                }
+                let mut sum1 = 0.0f32;
+                for &v in x1 {
+                    sum += v;
+                    sum1 += v;
+                }
+                let mean = sum * inv_m;
+                let mut vsum = 0.0f32;
+                for &v in x0 {
+                    let d = v - mean;
+                    vsum += d * d;
+                }
+                for &v in x1 {
+                    let d = v - mean;
+                    vsum += d * d;
+                }
+                let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+                (mean, rstd, sum0, sum1)
+            })
+            .collect();
+        let mut dx = vec![0.0f32; batch * num_groups * group_numel];
+        let spatial_f = spatial as f32;
+        dx.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| {
+                let g = grp % num_groups;
+                let base = grp * group_numel;
+                let xb = &x[base..base + group_numel];
+                let (mean, rstd, sum0, sum1) = stats[grp];
+                let c0 = g * 2;
+                let c1 = c0 + 1;
+                let w0 = weight.map_or(1.0f32, |w| w[c0]);
+                let w1 = weight.map_or(1.0f32, |w| w[c1]);
+                let dxhat0 = upstream * w0;
+                let dxhat1 = upstream * w1;
+                let c1_sum = spatial_f * (dxhat0 + dxhat1);
+                let c2_sum = rstd
+                    * (dxhat0 * (sum0 - spatial_f * mean) + dxhat1 * (sum1 - spatial_f * mean));
+                for i in 0..spatial {
+                    let xhat = (xb[i] - mean) * rstd;
+                    dxrow[i] = rstd * (dxhat0 - (c1_sum + xhat * c2_sum) * inv_m);
+                }
+                for i in 0..spatial {
+                    let idx = spatial + i;
+                    let xhat = (xb[idx] - mean) * rstd;
+                    dxrow[idx] = rstd * (dxhat1 - (c1_sum + xhat * c2_sum) * inv_m);
+                }
+            });
+        let (dweight, dbias) = if weight.is_some() {
+            let mut dw = vec![0.0f32; channels];
+            let mut db = vec![0.0f32; channels];
+            for (grp, &(mean, rstd, sum0, sum1)) in stats.iter().enumerate() {
+                let g = grp % num_groups;
+                let c0 = g * 2;
+                let c1 = c0 + 1;
+                dw[c0] += upstream * rstd * (sum0 - spatial_f * mean);
+                dw[c1] += upstream * rstd * (sum1 - spatial_f * mean);
+                db[c0] += upstream * spatial_f;
+                db[c1] += upstream * spatial_f;
+            }
+            (Some(dw), Some(db))
+        } else {
+            (None, None)
+        };
+        return (dx, dweight, dbias);
+    }
     let stats: Vec<(f32, f32)> = (0..batch * num_groups)
         .into_par_iter()
         .map(|grp| {

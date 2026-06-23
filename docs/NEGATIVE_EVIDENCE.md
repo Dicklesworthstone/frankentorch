@@ -4,6 +4,53 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-23 - WIN: GroupNorm f32 scalar-sum cpg=2 avoids extra element scans
+
+Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
+The tracker was still not claimable because `br ready --json` and
+`br list --status in_progress --json` fail on duplicate id
+`frankentorch-kgs4.150`, so this pass proceeded under the contended-tracker
+rule.
+
+Measured residual: f32 affine GroupNorm scalar-sum training on
+`[8,64,28,28]`, `groups=32`, so each group has `cpg=2` channels. The prior
+scorecard row had the scalar-sum direct path at `2.10 ms` vs PyTorch best
+`0.376 ms` (`5.58x SLOWER`) after the larger scalar-loss fusion had already
+shipped.
+
+Lever shipped: add a narrow `cpg == 2` path in
+`group_norm_sum_forward_f32` and `group_norm_backward_scalar_f32`. It reuses
+per-channel sums to compute the scalar forward contribution and affine gradients
+instead of doing another full element scan after mean/rstd. The existing
+bit-exact `cpg=3` unit-dy kernel guard remains on the old route; the cpg=2 API
+proof uses tolerance against the materialized path, matching the scalar-sum
+contract.
+
+Same-host direct A/B, warm
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`, command
+`cargo run --release -p ft-api --example group_norm_f32_grad_ab`:
+
+- Baseline before the kernel edit: composed `88.12 ms`, fused `8.79 ms`,
+  scalar_sum `2.67 ms`.
+- Candidate after the edit: composed `95.91 ms`, fused `7.50 ms`,
+  scalar_sum `1.34 ms`.
+- Internal scalar-sum speedup: `1.99x`.
+
+Local PyTorch comparator on the exact same shape/data generation, torch
+`2.12.0+cpu`, 32 threads, clone/detach per rep: min `0.4609 ms`, median
+`0.6452 ms`, checksum `401207.9892024994`. The FT/PyTorch direct ratio narrows
+from `5.79x SLOWER` (`2.67 / 0.4609`) to `2.91x SLOWER` (`1.34 / 0.4609`).
+
+Supporting Criterion after-run for the existing bench row:
+`cargo bench -p ft-api --bench ops_bench --
+group_norm/grad_f32_sum_8x64x28x28 --warm-up-time 1 --measurement-time 3
+--sample-size 10 --noplot` measured `[2.4965 ms 2.5367 ms 2.5900 ms]`.
+
+Decision: KEEP. This is a real targeted internal win, but GroupNorm f32 remains
+PyTorch-bound by about `2.9x` on the direct row; the next pass should move to
+allocator/tape/session overhead or a wider normalization workspace strategy
+rather than another cpg=2 affine-sum algebra pass.
+
 ## 2026-06-23 - NEGATIVE (reverted): cdist p=2 f32 borrowed-input clone elision no-gain
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
