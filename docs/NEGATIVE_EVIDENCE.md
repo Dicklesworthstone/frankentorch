@@ -6454,3 +6454,16 @@ WALLS (torch MKL-batched-fast, NOT winnable — don't re-probe, B=150 n=96 @8/@3
 lu(P,L,U) 2.5/1.4ms, slogdet 1.6/0.7ms (all getrf/sytrf-batched). Confirms: only the EXPENSIVE iterative
 decompositions (geev/syevd/gesdd → eigvals/eigh/svdvals + their value-only composites) saturate+win; the
 CHEAP direct factorizations (getrf/potrf/sytrf → lu/cholesky/ldl/slogdet/det) are MKL-batched walls. AGENT cc.
+
+## 2026-06-23 - NEGATIVE: selection/sort domain WALLED (torch scales well thread-matched); quantile only 1.10x@32
+
+Pivoted off dense-linalg (now mapped) to the selection/sort domain. Thread-matched ([2000,8000] dim=1, clean):
+  median(dim):  torch @8 25.0/@32 6.5ms  (introselect, SCALES, very fast)
+  kthvalue:     torch @8 67.8/@32 38.8ms (introselect, scales)
+  sort:         torch @8 157.5/@32 65.5ms (radix/intro, scales)
+  quantile:     torch @8 163.7/@32 68.0ms (SORT-based, scales) | FT (quickselect, parallel per-lane) @8 111.2/@32 62.1ms
+FT quantile = 1.47x@8 but only 1.10x@32 (MARGINAL/TIE at scorecard convention) — ~0-gain, NOT shipped. torch's
+sort/introselect are well-optimized AND thread-SCALE (unlike the linalg loops), so FT can't meaningfully beat
+them. (NB torch.median 6.5ms crushes FT quantile for q=0.5 specifically — torch.median is the fast q=0.5 path;
+torch.quantile sorts for arbitrary q.) DOMAIN WALLED — don't re-probe median/quantile/kthvalue/sort/topk for
+perf. The saturate-insight DOESN'T apply here (these SCALE in torch, they don't saturate). AGENT cc.
