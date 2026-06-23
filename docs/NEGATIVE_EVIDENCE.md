@@ -6578,3 +6578,15 @@ generalizable-lever audit is CLOSED (don't re-probe qr/svd/eigh for nesting). �
 nesting, svd has 0 inner-par): svd scales only 2.5x@8→@32 (sub-linear vs qr/eigh ~4x) — possible load-imbalance
 (static par_chunks stragglers) or a partly-serial bidiag/replay phase; a deeper future lever, lower priority.
 AGENT cc.
+
+## 2026-06-23 - ★WIN (thread-matched): cummax/cummin 6.8-9.1x — torch's cumulative max/min is SERIAL (saturates)
+
+torch.cummax/cummin are SERIAL and slow: [4000,20000] dim=1 torch cummax @8 721.6 / @32 725.1ms (FLAT — does
+NOT thread-scale at all, ~6x slower than torch.cumsum 95-117ms). FT tensor_cummax_dim/cummin_dim parallelize
+over the independent outer lanes (kernel par_chunks_mut over outer, gated outer>=2): @8 84.2/79.1ms, @32
+106.9/109.0ms. THREAD-MATCHED: cummax 8.6x@8 / 6.8x@32, cummin 9.1x@8 / 6.9x@32. (FT @32 slightly worse than
+@8 — cummax is BANDWIDTH-bound, 640MB read+write, more threads contend; @8 is near the bandwidth floor.) This is
+a SATURATION win (torch cummax serial) bigger than the code's "~3x strided dim" note (that was a strided regime;
+contiguous last-dim = 6.8-9.1x). No source change (FT kernel already parallel); cummax/cummin 7/7 green.
+Example+ledger only. ★NEW domain pivot success: torch's SCAN family is uneven — cumsum parallel/fast (walled)
+but cummax/cummin SERIAL (win). AGENT cc.
