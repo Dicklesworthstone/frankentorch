@@ -8039,6 +8039,99 @@ fn avg_pool2d_backward_2x2s2_f64(
     dp
 }
 
+/// Scalar-loss backward for `sum(avg_pool2d(...))`.
+///
+/// Equivalent to [`avg_pool2d_backward_f64`] with a dense `dout` filled with
+/// `upstream`, but avoids allocating that output-gradient buffer.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+pub fn avg_pool2d_backward_scalar_f64(
+    upstream: f64,
+    batch: usize,
+    ch: usize,
+    ph: usize,
+    pw: usize,
+    kh: usize,
+    kw: usize,
+    oh: usize,
+    ow: usize,
+    sh: usize,
+    sw: usize,
+    pad_h: usize,
+    pad_w: usize,
+    ih: usize,
+    iw: usize,
+    count_include_pad: bool,
+) -> Vec<f64> {
+    if kh == 2
+        && kw == 2
+        && sh == 2
+        && sw == 2
+        && pad_h == 0
+        && pad_w == 0
+        && count_include_pad
+        && ph == ih
+        && pw == iw
+        && oh == ih / 2
+        && ow == iw / 2
+    {
+        return avg_pool2d_backward_scalar_2x2s2_f64(upstream, batch, ch, ih, iw, oh, ow);
+    }
+    let mut dp = vec![0.0f64; batch * ch * ph * pw];
+    dp.par_chunks_mut(ph * pw).for_each(|dprow| {
+        for oy in 0..oh {
+            let rs = oy * sh;
+            let re = (rs + kh).min(ph);
+            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+            for ox in 0..ow {
+                let cs = ox * sw;
+                let ce = (cs + kw).min(pw);
+                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                let div = if count_include_pad {
+                    ((re - rs) * (ce - cs)) as f64
+                } else {
+                    (vrlen * vclen) as f64
+                };
+                let g = upstream / div;
+                for r in rs..re {
+                    let irow = r * pw;
+                    for c in cs..ce {
+                        dprow[irow + c] += g;
+                    }
+                }
+            }
+        }
+    });
+    dp
+}
+
+fn avg_pool2d_backward_scalar_2x2s2_f64(
+    upstream: f64,
+    batch: usize,
+    ch: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+) -> Vec<f64> {
+    let mut dp = vec![0.0f64; batch * ch * ih * iw];
+    dp.par_chunks_mut(ih * iw).for_each(|drow| {
+        let g = upstream / 4.0;
+        for oy in 0..oh {
+            let row0 = (oy * 2) * iw;
+            let row1 = row0 + iw;
+            for ox in 0..ow {
+                let col0 = ox * 2;
+                drow[row0 + col0] += g;
+                drow[row0 + col0 + 1] += g;
+                drow[row1 + col0] += g;
+                drow[row1 + col0 + 1] += g;
+            }
+        }
+    });
+    dp
+}
+
 /// f32 mirror of [`avg_pool2d_backward_f64`]: distributes `dout/divisor` over each
 /// window at f32 precision (matches torch's f32 avg_pool2d backward).
 /// frankentorch-cqmed.

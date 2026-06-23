@@ -4,6 +4,65 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-23 - KEEP: avg_pool2d f64 scalar-loss backward skips dense dout
+
+Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
+Tracker state remains contended: `br ready --json` fails on duplicate id
+`frankentorch-kgs4.150`; `bv --robot-triage` still ranked
+`frankentorch-kgs4` as the active in-progress perf lane. This pass avoided the
+peer-active `pdist` direct-kernel surface and landed the previously documented
+`avg_pool2d` scalar-loss half.
+
+Measured residual: `pytorch_gauntlet_bench`
+`gauntlet_avg_pool2d_grad`, f64 `[N,C,H,W]=[8,64,64,64]`, kernel `(2,2)`,
+stride `(2,2)`, no padding, scalar-sum loss and backward. Baseline on current
+`origin/main`, warm `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`,
+command `cargo bench -p ft-api --bench pytorch_gauntlet_bench --
+gauntlet_avg_pool2d_grad/frankentorch_kgs4_112 --warm-up-time 1
+--measurement-time 3 --sample-size 10 --noplot`, measured
+`[10.161 ms 10.368 ms 10.540 ms]`.
+
+Lever shipped: add `functional_avg_pool2d_sum` for f64 scalar losses. The
+forward still uses the optimized `avg_pool2d_forward_f64` and reduces the
+materialized pooled values with `sum_tensor_contiguous_f64`, preserving the
+same scalar value as `functional_avg_pool2d(...).sum()`. The backward uses new
+`avg_pool2d_backward_scalar_f64` to distribute the scalar upstream gradient
+without allocating a dense all-ones output-gradient buffer. Non-f64 and general
+API callers fall back to the existing materialized path.
+
+Candidate paired run, same command filtered to
+`gauntlet_avg_pool2d_grad/frankentorch_kgs4`, measured materialized row
+`[10.182 ms 10.309 ms 10.373 ms]` and scalar row
+`[8.2737 ms 8.4347 ms 8.5442 ms]`, `change: [-54.492% -46.747% -35.302%]`,
+`p = 0.00`. Internal speedup for the paired run is `1.22x`
+(`10.309 / 8.4347`). A candidate-only run immediately before the paired run
+was noisy and slower (`14.007 ms` median), so the paired same-binary run is the
+acceptance evidence.
+
+PyTorch comparator in the same Criterion harness, local
+`/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`, reported
+`[2.4884 ms 2.6383 ms 2.7969 ms]`. Current FT/PyTorch ratio is
+`3.20x SLOWER` (`8.4347 / 2.6383`), narrowed from the materialized current
+ratio of `3.91x SLOWER` (`10.309 / 2.6383`). Win/loss/neutral vs PyTorch:
+`0W / 1L / 0N`.
+
+Decision: KEEP. Gates:
+`cargo test -p ft-api --lib functional_avg_pool2d_sum_matches_pool_sum_backward_bits
+-- --nocapture` passed; `cargo test -p ft-kernel-cpu avg_pool2d --lib
+-- --nocapture` passed; `cargo check -p ft-kernel-cpu --all-targets` passed;
+`cargo clippy -p ft-kernel-cpu --all-targets -- -D warnings` passed;
+`cargo check -p ft-api --all-targets` passed;
+`cargo clippy -p ft-api --all-targets -- -D warnings` passed;
+`cargo test -p ft-api` passed 2373/0/1 ignored plus integration and doctests.
+`cargo fmt -p ft-kernel-cpu --check` and `cargo fmt -p ft-api --check`
+remain red from pre-existing package formatting drift outside the touched
+avg-pool regions; this pass did not rewrite unrelated files. `git diff --check`
+passed. UBS on the three changed Rust files plus this ledger ran 596s and
+exited 1 on the longstanding broad `ft-api`/`ft-kernel-cpu` inventory
+(panic macros in old tests, direct indexing, token-comparison heuristics,
+etc.); its internal formatting, clippy, cargo check, test-build, audit, and
+deny subchecks were clean, with no changed-hunk-specific issue identified.
+
 ## 2026-06-23 - WIN: pdist f32 p=2 writes condensed output directly
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.

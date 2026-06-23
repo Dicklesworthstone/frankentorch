@@ -400,6 +400,24 @@ fn bench_avg_pool2d_unit_dy(c: &mut Criterion) {
         });
     });
 
+    group.bench_function("frankentorch_kgs4_147_scalar_sum", |b| {
+        b.iter(|| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = require(
+                session.tensor_variable(black_box(values.clone()), black_box(shape.clone()), true),
+                "failed to create FrankenTorch tensor",
+            );
+            let loss = require(
+                session.functional_avg_pool2d_sum(x, (2, 2), (2, 2), (0, 0), false, true),
+                "failed to run FrankenTorch fused avg_pool2d sum",
+            );
+            black_box(require(
+                session.tensor_backward(loss),
+                "failed to run FrankenTorch fused avg_pool2d backward",
+            ))
+        });
+    });
+
     group.bench_function("pytorch_2_12_cpu", |b| {
         b.iter_custom(run_pytorch_avg_pool2d_grad);
     });
