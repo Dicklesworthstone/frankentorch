@@ -4,6 +4,59 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-23 - WIN: pdist f32 p=2 writes condensed output directly
+
+Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
+The tracker remains contended: `br ready --json` and
+`br list --status in_progress --json` still fail on duplicate id
+`frankentorch-kgs4.150`, while `bv --robot-triage` keeps
+`frankentorch-kgs4` as the in-progress no-gaps perf lane.
+
+Measured residual: after the f32 SGEMM `tensor_pdist(x, p=2)` fast path
+landed, the focused `512x64` no-grad row still trailed PyTorch by a large
+constant-factor margin. The first SGEMM pass assembled the condensed upper
+triangle by allocating one `Vec<f32>` per source row in Rayon, then flattening
+the row list into the final tensor.
+
+Baseline on current `origin/main`, warm
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`, command
+`cargo bench -p ft-api --bench cdist_bench -- pdist_f32_p2_mm/512x64
+--warm-up-time 2 --measurement-time 5 --sample-size 15 --noplot`, measured
+`[1.9948 ms 2.0940 ms 2.1845 ms]`.
+
+Lever shipped: keep the same f32 Gram-matrix computation and canonical PyTorch
+condensed-pdist ordering, but write distances directly into one output buffer
+with `Vec::with_capacity(out_len)` and row-major upper-triangle `push` calls.
+This removes the per-row heap allocation, Rayon scheduling, and final flatten
+copy for the small/medium output assembly row. Grad-enabled f32 still takes the
+composed tape path, and f64 is unchanged.
+
+Candidate with the same Criterion command measured
+`[946.82 us 952.44 us 957.46 us]`, `change: [-54.646% -52.291% -49.222%]`,
+`p = 0.00`. Internal speedup for this pass is `2.20x` (`2.0940 / 0.95244`).
+
+PyTorch sidecar for the same `512x64` f32 shape, torch `2.12.0+cpu`, 32
+threads, local `/data/projects/frankentorch/.venv-oracle/bin/python`, reported
+`min=0.049333 ms`, `p50=0.051878 ms`, `p95=0.086584 ms`. The current
+FT/PyTorch ratio narrows from `42.45x SLOWER` (`2.0940 / 0.049333`) to
+`19.31x SLOWER` (`0.95244 / 0.049333`). Relative to the pre-SGEMM composed
+baseline from the previous entry (`42.727 ms`), the two kept f32 pdist passes
+now total `44.86x` internal speedup.
+
+Decision: KEEP. Gates:
+`cargo test -p ft-api pdist_p2_f32_fused_nograd_matches_composed_path --lib
+-- --nocapture` passed; `cargo check -p ft-api --all-targets` passed;
+`cargo clippy -p ft-api --all-targets -- -D warnings` passed;
+`cargo test -p ft-api` passed 2372/0/1 ignored plus all `ft-api`
+integration/doc tests. `git diff --check` passed. `cargo fmt -p ft-api
+--check` remains red from pre-existing package-wide rustfmt drift in unrelated
+examples and older `src/lib.rs` regions; this pass did not rewrite those files.
+UBS on `crates/ft-api/src/lib.rs` plus this ledger ran 557s and exited 1 on
+the longstanding broad `ft-api` inventory (panic macros in old tests, direct
+indexing, token-comparison heuristics, etc.); its internal formatting, clippy,
+cargo check, test-build, audit, and deny subchecks were clean, with no
+changed-hunk-specific issue identified.
+
 ## 2026-06-23 - WIN: pdist f32 p=2 no-grad uses SGEMM upper-triangle assembly
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
