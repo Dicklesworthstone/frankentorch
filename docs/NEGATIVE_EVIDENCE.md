@@ -4,6 +4,62 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-23 - WIN: pdist f32 p=2 no-grad uses SGEMM upper-triangle assembly
+
+Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
+The tracker remains contended: `br ready --json` fails on duplicate id
+`frankentorch-kgs4.150`, so this pass proceeded under the contended-tracker
+rule after `bv --robot-triage` still ranked `frankentorch-kgs4` as the active
+quick-win lane.
+
+Measured residual: no-grad `tensor_pdist(x, p=2)` for f32 contiguous input.
+The existing f64 path already used the Gram-matrix identity, while f32 still
+fell through the composed tensor graph. A new same-binary Criterion row in
+`crates/ft-api/benches/cdist_bench.rs` records both the composed graph and the
+production call.
+
+Baseline, warm `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`,
+command `cargo bench -p ft-api --bench cdist_bench -- pdist_f32_p2
+--warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot`:
+
+- `pdist_f32_p2_mm/512x64`: `[41.809 ms 42.727 ms 43.803 ms]`.
+- `pdist_f32_p2_composed/512x64`: `[40.716 ms 42.940 ms 44.232 ms]`.
+
+Lever shipped: add a narrow f32 no-grad `p == 2` fast path in
+`tensor_pdist`. It mirrors the f64 route: read contiguous f32 values, compute
+per-row norms, call `ft_kernel_cpu::matmul_rhs_transposed_contiguous_f32`, and
+assemble the strict upper triangle directly as f32 distances. Grad-enabled f32
+still takes the composed tape path. A new unit test forces that composed path
+with `requires_grad=true` and compares the fused no-grad f32 output within the
+same tolerance used by the existing cdist f32 SGEMM proof.
+
+Final candidate on the scoped tree, command `cargo bench -p ft-api --bench
+cdist_bench -- pdist_f32_p2_mm/512x64 --warm-up-time 2 --measurement-time 6
+--sample-size 20 --noplot`, measured `[1.7567 ms 1.7927 ms 1.8229 ms]`. Using
+the baseline midpoint, the internal FT speedup is `23.84x`
+(`42.727 / 1.7927`).
+
+PyTorch sidecar for the same `512x64` f32 shape, torch `2.12.0+cpu`, 32
+threads, local `/data/projects/frankentorch/.venv-oracle/bin/python`, reported
+`min=0.051428 ms`, `p50=0.053251 ms`, `p95=0.057479 ms`. The FT/PyTorch ratio
+narrows from `830.8x SLOWER` (`42.727 / 0.051428`) to `34.86x SLOWER`
+(`1.7927 / 0.051428`). This is a keep, but the remaining gap is still dominated
+by session/kernel overhead around a very small PyTorch primitive.
+
+Incidental green repairs while proving the crate: non-grad complex binary ops
+now compose through real/imag arithmetic instead of the generic tape path, and
+BatchNorm1d scalar-sum folded-reference tests allow sub-`1e-12` residue for
+analytically zero `dx`/`dweight`.
+
+Decision: KEEP. Gates on the scoped two-file tree:
+`cargo check -p ft-api --all-targets` passed; `cargo clippy -p ft-api
+--all-targets -- -D warnings` passed; `cargo test -p ft-api` passed
+2372/0/1 ignored plus all `ft-api` integration/doc tests. Package-wide
+`cargo fmt -p ft-api` was not kept because it rewrites 100+ unrelated example
+files from pre-existing ft-api rustfmt drift; that accidental formatting churn
+is preserved separately in `stash@{0}` as `cod-a-accidental-ft-api-fmt-churn`
+and is not part of this commit.
+
 ## 2026-06-23 - WIN: BatchNorm2d f32 scalar-loss identity skips annihilated scans
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.

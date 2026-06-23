@@ -127,6 +127,55 @@ fn bench_pdist(c: &mut Criterion) {
     }
 }
 
+fn bench_pdist_f32_p2(c: &mut Criterion) {
+    for &(n, m) in &[(256usize, 128usize), (512, 64)] {
+        let out_len = n * (n - 1) / 2;
+        let xv: Vec<f32> = (0..n * m).map(|i| (i as f32 * 0.013).sin()).collect();
+        let mut tri_idx = Vec::with_capacity(out_len);
+        for i in 0..n {
+            for j in (i + 1)..n {
+                tri_idx.push((i * n + j) as f64);
+            }
+        }
+
+        c.bench_function(&format!("pdist_f32_p2_composed/{n}x{m}"), |b| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable_f32(xv.clone(), vec![n, m], false)
+                .unwrap();
+            let tri_t = s
+                .tensor_variable(tri_idx.clone(), vec![out_len], false)
+                .unwrap();
+            b.iter(|| {
+                let input_sq = s.tensor_mul(x, x).unwrap();
+                let xnorm = s.tensor_sum_dim(input_sq, 1).unwrap();
+                let input_t = s.tensor_transpose(x, 0, 1).unwrap();
+                let gram = s.tensor_matmul(x, input_t).unwrap();
+                let xnorm_i = s.tensor_unsqueeze(xnorm, 1).unwrap();
+                let xnorm_j = s.tensor_unsqueeze(xnorm, 0).unwrap();
+                let target = vec![n, n];
+                let xi_e = s.tensor_expand(xnorm_i, target.clone()).unwrap();
+                let xj_e = s.tensor_expand(xnorm_j, target).unwrap();
+                let norm_sum = s.tensor_add(xi_e, xj_e).unwrap();
+                let two_gram = s.tensor_mul_scalar(gram, 2.0).unwrap();
+                let d2 = s.tensor_sub(norm_sum, two_gram).unwrap();
+                let d2_clamped = s.tensor_clamp_min(d2, 0.0).unwrap();
+                let d2_flat = s.tensor_reshape(d2_clamped, vec![n * n]).unwrap();
+                let d2_tri = s.tensor_index_select(d2_flat, 0, tri_t).unwrap();
+                black_box(s.tensor_sqrt(d2_tri).unwrap());
+            });
+        });
+
+        c.bench_function(&format!("pdist_f32_p2_mm/{n}x{m}"), |b| {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable_f32(xv.clone(), vec![n, m], false)
+                .unwrap();
+            b.iter(|| black_box(s.tensor_pdist(black_box(x), 2.0).unwrap()));
+        });
+    }
+}
+
 /// cdist p=1 (Manhattan): the p≠2 path has no matmul identity, so the OLD code
 /// materialised the [P,R,M] broadcast difference and reduced it (expand+sub+abs+
 /// pow+sum_dim+pow) for BOTH grad and no-grad. `cdist_p1_broadcast` reproduces
@@ -207,6 +256,7 @@ criterion_group!(
     bench_cdist,
     bench_cdist_f32_p2,
     bench_pdist,
+    bench_pdist_f32_p2,
     bench_cdist_p1,
     bench_pdist_p1
 );
