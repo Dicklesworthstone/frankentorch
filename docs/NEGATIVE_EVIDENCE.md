@@ -6435,3 +6435,11 @@ NEGATIVE — pinv: torch.linalg.pinv @8 251ms / @32 289ms (saturates) but FT ten
 full-SVD-WITH-VECTORS + reconstruct is slower than torch's looped gesdd here (svdvals-only is fast, but
 forming+applying U/V is not). So the svdvals-saturation win extends to VALUE-ONLY composites (matrix_rank, cond,
 matrix_norm 2/nuc) but NOT to vector-reconstruction composites (pinv). Example+ledger only. AGENT cc.
+
+## 2026-06-23 - ★WIN (thread-matched): matrix_norm(ord=2/nuc/-2) 4.0-5.8x — value-only svdvals composite
+
+The SVD matrix norms (B=200 n=96) SATURATE in torch (clean low-variance, flat @8/@32): ord=2 95.6/97.0ms,
+nuc 91.5/95.1ms, ord=-2 90.0/95.1ms. FT tensor_matrix_norm (batched svdvals fast path + reduction) SCALES:
+ord=2 @8 24.1/@32 20.6ms (4.0x/4.7x), nuc @8 20.8/@32 16.9ms (4.4x/5.6x), -2 @8 20.8/@32 16.4ms (4.3x/5.8x).
+Third confirmation of the VALUE-ONLY svdvals-saturation win (after matrix_rank 5.8x, cond 5.2x). No source
+change; matrix_norm 8/8 green. Example+ledger only. AGENT cc.
