@@ -4,6 +4,26 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-24 - NEGATIVE (reverted): cumsum BACKWARD dim=0 transpose trick — tape-walled, 1.9x slower end-to-end
+
+After shipping the forward cumsum/cumprod/cummax/cummin dim=0 transpose trick (6-8x, below), the
+natural next target was the matching `cumsum_backward_tensor_contiguous_f64/f32` kernels — same
+`outer_size >= 2` gate, so a leading scan dim (dim=0) ran the single reverse-scan lane block
+serially. Wired the same fused reverse-scan transpose trick (`cumsum_backward_block_transpose_
+trick_f64/f32`) + a bit-exact kernel test (passed: grad rel 0.0e0 vs serial reference).
+
+MEASURED end-to-end vs PyTorch (`sum(cumsum(x,0)).backward()`, [262144,64] f64, 15-iter min backward,
+best-of-3): FT **384-406ms vs PyTorch 202-213ms = 1.88-1.92x SLOWER** (grad MATCH, rel 0.0e0). The
+`tensor_backward` wall is FT's tape/session machinery (gradient node accumulation + allocations,
+the known no-free tape), NOT the cumsum_backward kernel — the kernel-level reverse-scan
+parallelization is real but completely masked by tape overhead, so the change produced ~0 measurable
+end-to-end benefit. REVERTED the kernel edits, test, and harness (no source change landed).
+
+Disposition: REVERT. Do not retry kernel-level parallelization of scan BACKWARD passes for an
+end-to-end win — the backward surface is tape-overhead-bound, not kernel-bound (distinct from the
+forward, which is no-grad/kernel-bound and won 6-8x). A backward win needs a tape/RAII rewrite, not
+a kernel lever. AGENT cc.
+
 ## 2026-06-24 - NEGATIVE (reverted): pdist f32 p=2 row-parallel f32x8 direct writer regresses
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `PearlReef`.
