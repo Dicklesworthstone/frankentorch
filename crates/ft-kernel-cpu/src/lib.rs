@@ -11847,7 +11847,29 @@ pub fn softmax_dim_tensor_contiguous_f64(
             }
         }
     };
-    if numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // When the reduce dim is a LEADING dim (e.g. dim=0), `outer_size` is small (1 for a 2-D
+    // tensor) so the outer fan-out leaves the pool idle and the block runs serially over its
+    // `inner_size` independent columns — and softmax is exp-bound (compute, not bandwidth), so the
+    // idle cores hurt. Parallelize the columns instead via the transpose trick (bit-exact per lane).
+    let outer_size = numel / block;
+    let threads = rayon::current_num_threads();
+    let use_trick = numel >= PARALLEL_THRESHOLD
+        && threads > 1
+        && inner_size >= 8
+        && reduce_size >= 2
+        && outer_size < threads
+        && block >= PARALLEL_THRESHOLD;
+    if use_trick {
+        for o in 0..outer_size {
+            let base = o * block;
+            softmax_dim_block_transpose_trick_f64(
+                &data[base..base + block],
+                &mut output[base..base + block],
+                reduce_size,
+                inner_size,
+            );
+        }
+    } else if numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         output
             .par_chunks_mut(block)
             .zip(data[..numel].par_chunks(block))
@@ -11864,6 +11886,47 @@ pub fn softmax_dim_tensor_contiguous_f64(
     }
 
     Ok(output)
+}
+
+/// Softmax transpose trick for a leading reduce dim (small outer, large inner): the plain block
+/// loops the `inner_size` independent columns serially. Here each column is softmaxed on its own
+/// rayon lane — gather the strided column into a contiguous `[inner, reduce]` scratch row, take the
+/// max (same `fold(NEG_INFINITY, f64::max)` order), `exp(x-max)`, `pairwise_sum_f64`, divide — then
+/// a parallel transpose copies the scratch back into the `[reduce, inner]` output. Per-column the
+/// gather/max/exp/sum order is identical to [`softmax_dim_tensor_contiguous_f64`]'s serial block, so
+/// the result is bit-for-bit identical. Disjoint `par_chunks_mut`, no unsafe; softmax is exp-bound
+/// so the extra transpose bandwidth is dwarfed by the parallelized transcendental work.
+fn softmax_dim_block_transpose_trick_f64(
+    in_block: &[f64],
+    out_block: &mut [f64],
+    reduce: usize,
+    inner: usize,
+) {
+    let mut out_t = vec![0.0; reduce * inner];
+    out_t
+        .par_chunks_mut(reduce)
+        .enumerate()
+        .for_each(|(col, trow)| {
+            for (r, slot) in trow.iter_mut().enumerate() {
+                *slot = in_block[r * inner + col];
+            }
+            let max_val = trow.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            for v in trow.iter_mut() {
+                *v = (*v - max_val).exp();
+            }
+            let sum = pairwise_sum_f64(trow);
+            for v in trow.iter_mut() {
+                *v /= sum;
+            }
+        });
+    out_block
+        .par_chunks_mut(inner)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            for (col, slot) in orow.iter_mut().enumerate() {
+                *slot = out_t[col * reduce + r];
+            }
+        });
 }
 
 pub fn log_softmax_dim_tensor_contiguous_f64(
@@ -11942,7 +12005,27 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
             }
         }
     };
-    if numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Leading reduce dim (small outer, large inner) → column-parallel transpose trick (compute-bound
+    // log-sum-exp; see softmax_dim kernel). Bit-exact per column.
+    let outer_size = numel / block;
+    let threads = rayon::current_num_threads();
+    let use_trick = numel >= PARALLEL_THRESHOLD
+        && threads > 1
+        && inner_size >= 8
+        && reduce_size >= 2
+        && outer_size < threads
+        && block >= PARALLEL_THRESHOLD;
+    if use_trick {
+        for o in 0..outer_size {
+            let base = o * block;
+            log_softmax_dim_block_transpose_trick_f64(
+                &data[base..base + block],
+                &mut output[base..base + block],
+                reduce_size,
+                inner_size,
+            );
+        }
+    } else if numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         output
             .par_chunks_mut(block)
             .zip(data[..numel].par_chunks(block))
@@ -11959,6 +12042,40 @@ pub fn log_softmax_dim_tensor_contiguous_f64(
     }
 
     Ok(output)
+}
+
+/// log_softmax transpose trick — sister of [`softmax_dim_block_transpose_trick_f64`]. Per column:
+/// gather, max (`fold(NEG_INFINITY, f64::max)`), `pairwise_sum_map_f64(exp(x-max))`, `ln`, then
+/// `(x-max) - log_sum_exp`. Same per-column FP order as the serial block → bit-for-bit identical.
+fn log_softmax_dim_block_transpose_trick_f64(
+    in_block: &[f64],
+    out_block: &mut [f64],
+    reduce: usize,
+    inner: usize,
+) {
+    let mut out_t = vec![0.0; reduce * inner];
+    out_t
+        .par_chunks_mut(reduce)
+        .enumerate()
+        .for_each(|(col, trow)| {
+            for (r, slot) in trow.iter_mut().enumerate() {
+                *slot = in_block[r * inner + col];
+            }
+            let max_val = trow.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let sum_exp = pairwise_sum_map_f64(trow, |x| (x - max_val).exp());
+            let log_sum_exp = sum_exp.ln();
+            for v in trow.iter_mut() {
+                *v = (*v - max_val) - log_sum_exp;
+            }
+        });
+    out_block
+        .par_chunks_mut(inner)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            for (col, slot) in orow.iter_mut().enumerate() {
+                *slot = out_t[col * reduce + r];
+            }
+        });
 }
 
 pub fn argmax_dim_tensor_contiguous_f64(
@@ -27954,7 +28071,26 @@ pub fn softmax_dim_tensor_contiguous_f32(
             }
         }
     };
-    if numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Leading reduce dim (small outer, large inner) → column-parallel transpose trick (see f64).
+    let outer_size = numel / block;
+    let threads = rayon::current_num_threads();
+    let use_trick = numel >= PARALLEL_THRESHOLD
+        && threads > 1
+        && inner_size >= 8
+        && reduce_size >= 2
+        && outer_size < threads
+        && block >= PARALLEL_THRESHOLD;
+    if use_trick {
+        for o in 0..outer_size {
+            let base = o * block;
+            softmax_dim_block_transpose_trick_f32(
+                &data[base..base + block],
+                &mut output[base..base + block],
+                reduce_size,
+                inner_size,
+            );
+        }
+    } else if numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         output
             .par_chunks_mut(block)
             .zip(data[..numel].par_chunks(block))
@@ -28013,6 +28149,27 @@ pub fn log_softmax_dim_tensor_contiguous_f32(
         return Ok(output);
     }
 
+    // Leading reduce dim (small outer, large inner) → column-parallel transpose trick (see f64).
+    let block = reduce_size * inner_size;
+    let threads = rayon::current_num_threads();
+    let use_trick = numel >= PARALLEL_THRESHOLD
+        && threads > 1
+        && inner_size >= 8
+        && reduce_size >= 2
+        && outer_size < threads
+        && block >= PARALLEL_THRESHOLD;
+    if use_trick {
+        for o in 0..outer_size {
+            let base = o * block;
+            log_softmax_dim_block_transpose_trick_f32(
+                &data[base..base + block],
+                &mut output[base..base + block],
+                reduce_size,
+                inner_size,
+            );
+        }
+        return Ok(output);
+    }
     let mut scratch = vec![0.0f32; reduce_size];
     for outer in 0..outer_size {
         for inner in 0..inner_size {
@@ -28029,6 +28186,72 @@ pub fn log_softmax_dim_tensor_contiguous_f32(
         }
     }
     Ok(output)
+}
+
+/// f32 mirror of [`softmax_dim_block_transpose_trick_f64`]. Bit-exact per column.
+fn softmax_dim_block_transpose_trick_f32(
+    in_block: &[f32],
+    out_block: &mut [f32],
+    reduce: usize,
+    inner: usize,
+) {
+    let mut out_t = vec![0.0f32; reduce * inner];
+    out_t
+        .par_chunks_mut(reduce)
+        .enumerate()
+        .for_each(|(col, trow)| {
+            for (r, slot) in trow.iter_mut().enumerate() {
+                *slot = in_block[r * inner + col];
+            }
+            let max_val = trow.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            for v in trow.iter_mut() {
+                *v = (*v - max_val).exp();
+            }
+            let sum = pairwise_sum_f32(trow);
+            for v in trow.iter_mut() {
+                *v /= sum;
+            }
+        });
+    out_block
+        .par_chunks_mut(inner)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            for (col, slot) in orow.iter_mut().enumerate() {
+                *slot = out_t[col * reduce + r];
+            }
+        });
+}
+
+/// f32 mirror of [`log_softmax_dim_block_transpose_trick_f64`]. Bit-exact per column.
+fn log_softmax_dim_block_transpose_trick_f32(
+    in_block: &[f32],
+    out_block: &mut [f32],
+    reduce: usize,
+    inner: usize,
+) {
+    let mut out_t = vec![0.0f32; reduce * inner];
+    out_t
+        .par_chunks_mut(reduce)
+        .enumerate()
+        .for_each(|(col, trow)| {
+            for (r, slot) in trow.iter_mut().enumerate() {
+                *slot = in_block[r * inner + col];
+            }
+            let max_val = trow.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp = pairwise_sum_map_f32(trow, |x| (x - max_val).exp());
+            let log_sum_exp = sum_exp.ln();
+            for v in trow.iter_mut() {
+                *v = (*v - max_val) - log_sum_exp;
+            }
+        });
+    out_block
+        .par_chunks_mut(inner)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            for (col, slot) in orow.iter_mut().enumerate() {
+                *slot = out_t[col * reduce + r];
+            }
+        });
 }
 
 pub fn argmax_dim_tensor_contiguous_f32(
@@ -37654,6 +37877,94 @@ mod tests {
         for i in 0..n {
             let want = y[i].atan2(x[i]);
             assert_eq!(got[i].to_bits(), want.to_bits(), "atan2 f32 idx={i}");
+        }
+    }
+
+    #[test]
+    fn softmax_log_softmax_dim0_transpose_trick_bit_exact() {
+        // [512,256] dim=0 (outer_size==1) exercises the column-parallel transpose-trick path.
+        // Reference replicates the serial per-column gather/max/exp/pairwise-sum order exactly.
+        let (rows, cols) = (512usize, 256usize);
+        let input: Vec<f64> = (0..rows * cols)
+            .map(|i| ((i as f64) * 0.0007).sin() * 4.0)
+            .collect();
+        let meta = TensorMeta::from_shape(vec![rows, cols], DType::F64, Device::Cpu);
+        // softmax f64
+        let got = super::softmax_dim_tensor_contiguous_f64(&input, &meta, 0).unwrap();
+        let mut want = vec![0.0; input.len()];
+        for c in 0..cols {
+            let scratch: Vec<f64> = (0..rows).map(|r| input[r * cols + c]).collect();
+            let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let ex: Vec<f64> = scratch.iter().map(|&x| (x - max_val).exp()).collect();
+            let sum = super::pairwise_sum_f64(&ex);
+            for r in 0..rows {
+                want[r * cols + c] = ex[r] / sum;
+            }
+        }
+        for i in 0..got.len() {
+            assert_eq!(
+                got[i].to_bits(),
+                want[i].to_bits(),
+                "softmax dim0 f64 idx={i}"
+            );
+        }
+        // log_softmax f64
+        let gotl = super::log_softmax_dim_tensor_contiguous_f64(&input, &meta, 0).unwrap();
+        let mut wantl = vec![0.0; input.len()];
+        for c in 0..cols {
+            let scratch: Vec<f64> = (0..rows).map(|r| input[r * cols + c]).collect();
+            let max_val = scratch.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+            let sum_exp = super::pairwise_sum_map_f64(&scratch, |x| (x - max_val).exp());
+            let lse = sum_exp.ln();
+            for r in 0..rows {
+                wantl[r * cols + c] = (scratch[r] - max_val) - lse;
+            }
+        }
+        for i in 0..gotl.len() {
+            assert_eq!(
+                gotl[i].to_bits(),
+                wantl[i].to_bits(),
+                "log_softmax dim0 f64 idx={i}"
+            );
+        }
+        // f32 softmax + log_softmax
+        let input32: Vec<f32> = input.iter().map(|&x| x as f32).collect();
+        let meta32 = TensorMeta::from_shape(vec![rows, cols], DType::F32, Device::Cpu);
+        let got32 = super::softmax_dim_tensor_contiguous_f32(&input32, &meta32, 0).unwrap();
+        let mut want32 = vec![0.0f32; input32.len()];
+        for c in 0..cols {
+            let scratch: Vec<f32> = (0..rows).map(|r| input32[r * cols + c]).collect();
+            let max_val = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let ex: Vec<f32> = scratch.iter().map(|&x| (x - max_val).exp()).collect();
+            let sum = super::pairwise_sum_f32(&ex);
+            for r in 0..rows {
+                want32[r * cols + c] = ex[r] / sum;
+            }
+        }
+        for i in 0..got32.len() {
+            assert_eq!(
+                got32[i].to_bits(),
+                want32[i].to_bits(),
+                "softmax dim0 f32 idx={i}"
+            );
+        }
+        let gotl32 = super::log_softmax_dim_tensor_contiguous_f32(&input32, &meta32, 0).unwrap();
+        let mut wantl32 = vec![0.0f32; input32.len()];
+        for c in 0..cols {
+            let scratch: Vec<f32> = (0..rows).map(|r| input32[r * cols + c]).collect();
+            let max_val = scratch.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+            let sum_exp = super::pairwise_sum_map_f32(&scratch, |x| (x - max_val).exp());
+            let lse = sum_exp.ln();
+            for r in 0..rows {
+                wantl32[r * cols + c] = (scratch[r] - max_val) - lse;
+            }
+        }
+        for i in 0..gotl32.len() {
+            assert_eq!(
+                gotl32[i].to_bits(),
+                wantl32[i].to_bits(),
+                "log_softmax dim0 f32 idx={i}"
+            );
         }
     }
 

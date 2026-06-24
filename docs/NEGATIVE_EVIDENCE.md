@@ -4,6 +4,36 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-24 - ★WIN: softmax/log_softmax dim=0 column-parallel transpose trick — closes a 12x LOSS to parity
+
+NEW op family for the dim=0 transpose trick (beyond the scan family). `softmax_dim`/`log_softmax_dim`
+`_f64`/`_f32` general strided path parallelizes over OUTER blocks, so a LEADING reduce dim (dim=0 of
+a 2-D tensor, `outer_size==1`) ran the single block SERIALLY over its `inner_size` independent
+columns — and softmax is exp-BOUND (compute, not bandwidth), so the idle cores cost dearly.
+
+Baseline MEASURED (`crates/ft-api/examples/softmax_dim0_h2h.rs`, softmax dim=0 [4096,4096] f64,
+12-iter min): FT **329.73ms vs PyTorch 27.5ms = 11.99x SLOWER** (sum rel 8e-15, bit-exact).
+
+LEVER (cc): wire a column-parallel transpose trick into all four kernels
+(`softmax/log_softmax_dim_block_transpose_trick_f64/f32`), gated `outer_size < current_num_threads()
+&& inner_size>=8 && reduce_size>=2 && block>=PARALLEL_THRESHOLD`. Each inner column is softmaxed on
+its own rayon lane: gather the strided column into a contiguous `[inner,reduce]` scratch row, max
+(`fold(NEG_INFINITY, f64::max)`), `exp(x-max)`, `pairwise_sum`(_map), divide / `(x-max)-ln(sum)` —
+then a parallel transpose copies the scratch back. Per-column FP order identical to the serial block
+→ bit-for-bit identical. Disjoint `par_chunks_mut`, no unsafe; exp work dwarfs the transpose bandwidth.
+
+After MEASURED (best-of-3, dim=0 [4096,4096], all sum rel <= 7.3e-14):
+  - softmax     f64: 329.73 -> **31.66ms = 1.02-1.20x** vs torch (~PARITY, was 11.99x slower)
+  - log_softmax f64: **37.0ms = 1.17-1.33x** vs torch (same serial path, now ~parity)
+A ~10.8x internal speedup that erases the 12x loss. f32 kernels got the identical trick + bit-exact
+kernel test, but pure-f32 softmax is not currently routed through the ft-api `tensor_softmax`
+(`UnsupportedDType(F32)`) — the f32 change is correctness-verified at the kernel level only (a
+separate API-routing gap, not regressed by this change).
+
+Correctness: new kernel test `softmax_log_softmax_dim0_transpose_trick_bit_exact` ([512,256] dim=0,
+all four kernels, per-column serial reference, `to_bits()` equality); `cargo test -p ft-kernel-cpu
+--lib` 545/0, `cargo test -p ft-api softmax` 16/0. Source disposition: KEEP. AGENT cc.
+
 ## 2026-06-24 - NEGATIVE (reverted): cumsum BACKWARD dim=0 transpose trick — tape-walled, 1.9x slower end-to-end
 
 After shipping the forward cumsum/cumprod/cummax/cummin dim=0 transpose trick (6-8x, below), the
