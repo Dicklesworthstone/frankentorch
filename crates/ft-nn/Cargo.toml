@@ -15,6 +15,7 @@ rayon = "1.10"
 [dev-dependencies]
 criterion = { workspace = true }
 insta = "1.47.2"
+ft-serialize = { workspace = true }
 
 [[bench]]
 name = "nn_bench"

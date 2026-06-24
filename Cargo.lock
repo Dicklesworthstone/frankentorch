@@ -857,6 +857,7 @@ dependencies = [
  "ft-core",
  "ft-dispatch",
  "ft-kernel-cpu",
+ "ft-serialize",
  "insta",
  "rayon",
 ]
