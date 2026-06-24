@@ -4135,7 +4135,10 @@ impl Conv1d {
                 },
             )));
         }
-        if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+        if groups == 0
+            || !in_channels.is_multiple_of(groups)
+            || !out_channels.is_multiple_of(groups)
+        {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
                     reason: "Conv1d groups must be > 0 and divide both in_channels and out_channels",
@@ -4995,6 +4998,7 @@ impl MultiheadAttention {
     /// variable-length sequences. It is broadcast to every head and query
     /// position (`[N, S_k] -> [N*num_heads, S_q, S_k]`) and summed with the
     /// optional broadcastable `attn_mask` before the scaled-dot-product attention.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_qkv_key_padding(
         &self,
         session: &mut FrankenTorchSession,
@@ -5172,6 +5176,7 @@ impl MultiheadAttention {
     /// (torch's default) they are averaged over heads to `[N, S_q, S_k]`.
     /// `attn_mask` / `is_causal` are honored identically in both the output and
     /// the returned weights.
+    #[allow(clippy::too_many_arguments)]
     pub fn forward_qkv_with_weights(
         &self,
         session: &mut FrankenTorchSession,
@@ -7382,7 +7387,10 @@ impl Conv2d {
                 },
             )));
         }
-        if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+        if groups == 0
+            || !in_channels.is_multiple_of(groups)
+            || !out_channels.is_multiple_of(groups)
+        {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
                     reason: "Conv2d groups must be > 0 and divide both in_channels and out_channels",
@@ -10786,7 +10794,10 @@ impl ConvTranspose1d {
                 },
             )));
         }
-        if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+        if groups == 0
+            || !in_channels.is_multiple_of(groups)
+            || !out_channels.is_multiple_of(groups)
+        {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
                     reason: "ConvTranspose1d groups must be > 0 and divide both in_channels and out_channels",
@@ -11149,7 +11160,10 @@ impl Conv3d {
                 },
             )));
         }
-        if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+        if groups == 0
+            || !in_channels.is_multiple_of(groups)
+            || !out_channels.is_multiple_of(groups)
+        {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
                     reason: "Conv3d groups must be > 0 and divide both in_channels and out_channels",
@@ -11625,7 +11639,10 @@ impl ConvTranspose2d {
                 },
             )));
         }
-        if groups == 0 || in_channels % groups != 0 || out_channels % groups != 0 {
+        if groups == 0
+            || !in_channels.is_multiple_of(groups)
+            || !out_channels.is_multiple_of(groups)
+        {
             return Err(AutogradError::Dispatch(DispatchError::Key(
                 DispatchKeyError::IncompatibleSet {
                     reason: "ConvTranspose2d groups must be > 0 and divide both in_channels and out_channels",
@@ -14976,10 +14993,10 @@ impl TransformerDecoderLayer {
     ///
     /// * `tgt` - target sequence `[batch, tgt_len, d_model]`
     /// * `memory` - encoder output `[batch, src_len, d_model]`
-    /// Run one attention block through the masked MHA: routes to
-    /// `forward_qkv_key_padding` when a key-padding mask is present, else
-    /// `forward_qkv_masked` (which with `mask=None, is_causal=false` is plain
-    /// attention). Used for both the self- and cross-attention of the decoder.
+    ///   Run one attention block through the masked MHA: routes to
+    ///   `forward_qkv_key_padding` when a key-padding mask is present, else
+    ///   `forward_qkv_masked` (which with `mask=None, is_causal=false` is plain
+    ///   attention). Used for both the self- and cross-attention of the decoder.
     #[allow(clippy::too_many_arguments)]
     fn decoder_attn(
         &self,

@@ -114,6 +114,94 @@ condensed writer with same-worker proof against the shipped SGEMM path, or move
 below pdist into the f32 GEMM/session-output floor. Score vs PyTorch for this
 lever: `0W / 1L / 0N`.
 
+## 2026-06-24 - KEEP: GroupNorm f32 automatic tensor_sum scalar-backward shortcut
+
+Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
+This lands the measured cod-a scratch win from
+`.scratch/frankentorch-cod-a-bold-bn1d-zerograd-20260620` that was not yet on
+`main`. Current `main` already had the explicit `functional_group_norm_sum`
+path, but ordinary training code still used
+`tensor_sum(functional_group_norm(...))` and therefore allocated the dense
+all-ones output-gradient buffer.
+
+Lever shipped: register f32 affine `functional_group_norm` outputs in a
+session-local shortcut table. A later plain `tensor_sum(output)` keeps the
+materialized forward value unchanged, but uses
+`group_norm_backward_scalar_f32` for the backward edge. The shortcut is skipped
+when the GroupNorm output retains grad or has tensor hooks, preserving
+PyTorch-observable output-gradient behavior. Tape truncation, full graph clear,
+in-place mutation, and in-place detach all invalidate the cached shortcut.
+
+Measured evidence from the owned cod-a worktree:
+
+- RCH direct A/B, same worker `vmi1149989`, warm
+  `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a`,
+  `cargo run --release -p ft-api --example group_norm_f32_grad_ab`:
+  ordinary f32 GroupNorm scalar-loss row `7.48 ms -> 6.04 ms`, `1.24x`
+  internal speedup. The explicit scalar-sum row in that run drifted
+  `2.68 ms -> 4.76 ms`, so it was treated only as route context for this
+  automatic shortcut.
+- Local paired fallback on the same host and worktree family:
+  ordinary row `13.29 ms -> 7.30 ms`, `1.82x` internal speedup.
+  Explicit scalar row `3.28 ms -> 6.27 ms` again remained route context, not
+  the keep criterion.
+- Local PyTorch CPU oracle, torch `2.12.1+cpu`, same f32 `[8,64,28,28]`,
+  groups `32`, affine grad scalar-sum lane: median `0.720635 ms`, best
+  `0.662703 ms`. Candidate ordinary row remains `10.13x SLOWER` than PyTorch
+  by median (`7.30 / 0.720635`), narrowed from the materialized ordinary ratio
+  of `18.44x SLOWER` (`13.29 / 0.720635`). Win/loss/neutral vs PyTorch:
+  `0W / 1L / 0N`.
+
+Decision: KEEP as an internal win that narrows the PyTorch gap but does not
+beat PyTorch. Landing checks on current `origin/main`:
+
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo test -p ft-api functional_group_norm_f32_tensor_sum --lib --
+  --nocapture` on `vmi1152480`: 2/0 passed.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo bench --profile release -p ft-api --bench ops_bench --
+  group_norm/grad_f32 --warm-up-time 1 --measurement-time 3 --sample-size 10
+  --noplot` on `ovh-a`: ordinary automatic-shortcut row
+  `[1.0893 ms 1.6464 ms 2.0534 ms]`; explicit scalar row
+  `[902.08 us 1.0864 ms 1.5097 ms]`. Against the same local PyTorch median,
+  current ordinary FT/PyTorch is `2.28x SLOWER` (`1.6464 / 0.720635`).
+- `RCH_WORKER=vmi1153651 RCH_WORKERS=vmi1153651
+  CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo test -p ft-conformance --profile release`: passed on rerun,
+  including 199 lib tests, all ft-conformance bins, integration tests, smoke,
+  and doctests. The first run exposed four old `panic!` macro smoke findings
+  outside the GroupNorm change; landing includes the minimal macro-free cleanup
+  at those sites so conformance is green. Final current-tree rerun used the
+  same command and target dir, fell back locally because RCH reported no workers
+  above health threshold, and passed with the same ft-conformance coverage.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo check -p ft-api --all-targets`: passed on `vmi1152480`.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo clippy -p ft-api --all-targets -- -D warnings`: passed on
+  `vmi1152480`.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo check -p ft-nn --example bert_rerank_spike`: passed on `ovh-b`.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo clippy -p ft-nn --example bert_rerank_spike -- -D warnings`:
+  passed on `ovh-b` after the minimal ft-nn lint cleanup that keeps the
+  conformance smoke gate macro-free.
+- `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec
+  -- cargo fmt -p ft-nn --check`: passed.
+- `git diff --check -- crates/ft-api/src/lib.rs crates/ft-nn/src/lib.rs
+  crates/ft-nn/examples/bert_rerank_spike.rs docs/NEGATIVE_EVIDENCE.md`:
+  passed.
+- `ubs crates/ft-api/src/lib.rs crates/ft-nn/src/lib.rs
+  crates/ft-nn/examples/bert_rerank_spike.rs docs/NEGATIVE_EVIDENCE.md`:
+  manually interrupted after about 3.5 minutes because the scoped Rust scan
+  emitted no progress or findings after startup. The commit hook's staged scan
+  then hit its own large-file timeout and printed the documented `UBS_SKIP=1`
+  bypass command. The broader ft-api formatter check remains blocked by
+  pre-existing rustfmt drift across that crate and was not mass-formatted in
+  this perf commit.
+
+The same pre-existing broad crate formatting/UBS debt noted in adjacent
+entries remains outside this change.
+
 ## 2026-06-23 - KEEP: avg_pool2d f64 scalar-loss backward skips dense dout
 
 Bead/thread `frankentorch-kgs4`, assignee `cod-a`, agent `QuietMeadow`.
