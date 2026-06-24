@@ -26937,8 +26937,13 @@ pub fn quantize_per_output_channel_i8(w: &[f32], out: usize, in_: usize) -> (Vec
 /// `bias[n]` is added. This mirrors ONNX `DynamicQuantizeLinear` +
 /// `MatMulInteger` (symmetric, zero-point 0).
 ///
-/// Parallelized with rayon over output rows (sequence positions). Additive
-/// inference-only kernel — independent of the f32/f64 GEMM dispatch.
+/// Sequential over output rows by design: callers parallelize at the batch /
+/// document level (the reranker fans documents across a session pool), so this
+/// kernel stays single-threaded. Parallelizing here would nest rayon inside a
+/// parallel caller that holds a lock across the call, which deadlocks (a doc
+/// worker holding its session `Mutex` while waiting on inner rayon work that
+/// can only run on a worker blocked on another `Mutex`). Additive inference-only
+/// kernel — independent of the f32/f64 GEMM dispatch.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn linear_int8_dynamic_f32(
@@ -26950,7 +26955,6 @@ pub fn linear_int8_dynamic_f32(
     n: usize,
     bias: Option<&[f32]>,
 ) -> Vec<f32> {
-    use rayon::prelude::*;
     assert_eq!(x.len(), m * k, "x length must equal m*k");
     assert_eq!(w_i8.len(), n * k, "w_i8 length must equal n*k");
     assert_eq!(w_scales.len(), n, "w_scales length must equal n");
@@ -26973,13 +26977,13 @@ pub fn linear_int8_dynamic_f32(
         a_scales[s] = scale;
     }
 
-    // i32-accumulate GEMM + dequant + bias, parallel over output rows. The
+    // i32-accumulate GEMM + dequant + bias, sequential over output rows. The
     // inner k-loop is a tight i32 multiply-accumulate that LLVM autovectorizes;
     // a hand-written SIMD dot (wide/VNNI) is a future micro-opt (see bead).
     let mut out = vec![0f32; m * n];
-    out.par_chunks_mut(n)
-        .zip(x_i8.par_chunks(k))
-        .zip(a_scales.par_iter())
+    out.chunks_mut(n)
+        .zip(x_i8.chunks(k))
+        .zip(a_scales.iter())
         .for_each(|((out_row, x_row), &a_scale)| {
             for o in 0..n {
                 let w_row = &w_i8[o * k..(o + 1) * k];
