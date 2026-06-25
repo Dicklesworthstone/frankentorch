@@ -8029,3 +8029,45 @@ check into the kernel) tops out ~2.0-2.4x for a NARROW case (quantile on small-i
 data is uncommon), at materially higher complexity/risk on shared main. SOURCE REVERTED;
 recorded as surfaced negative/marginal evidence. The counting lever's high-value target
 was mode (shipped 15.51x), not quantile. AGENT BlackThrush.
+
+## 2026-06-25 - WIN: f32 mode counting fast path = 14.26x FASTER vs PyTorch
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Extended the shipped f64 mode
+counting win (c79b47b5, 15.51x) to f32 — THE common ML dtype. torch.mode(f32) is
+sort-based and slow (same as f64), and FT's f32 mode otherwise upcast to f64 and sorted.
+New f32 branch mirrors the f64 path on the f32 storage: zero-copy `values_f32_borrowed`,
+256-bucket per-lane histogram (rayon over outer slices), DIRECT `leaf_f32` value from the
+winning key (integers 0..=255 are exactly representable in f32 → bit-exact, no gather).
+Index tie-break is identical to the f32 slow sort path (last occurrence of the
+smallest-value max-count key). Any out-of-range/non-integer/non-finite value or a
+non-contiguous view falls through to the unchanged slow path.
+
+★ IMPLEMENTATION TRAP (recorded for the next counting fast path): a first cut used
+`tensor_values_lossy_f64` (128MB upcast clone) + `tensor_gather` for the value output (to
+"preserve f32 dtype the safe way") and measured 1.44x SLOWER — FT 99.7ms vs torch 69.1ms.
+The lossy clone + the gather TAPE OP killed the win. Rewriting to mirror the f64 path
+(zero-copy borrow + DIRECT typed leaf from best_key) hit 4.58ms. LESSON: build the VALUE
+output as a direct typed leaf from the winning key; NEVER gather (gather = full tape node
++ kernel dispatch, dwarfs the counting savings). best_key is exact in the dtype, so a
+direct leaf is also bit-exact.
+
+MEASURED `mode(x, dim=-1) [4096,4096]` f32 no-grad, 8-iter MIN
+(`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-bt-verify`,
+`PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`):
+- FrankenTorch `4.581 ms` / PyTorch `65.334 ms` => FT `14.26x FASTER`. value-sum rel `0.0`.
+
+Test `mode_f32_bounded_counting_keeps_f32_and_matches_sort_contract` asserts f32 output
+dtype + value + index. ft-api mode suite 18/18 green. AGENT BlackThrush.
+
+## 2026-06-25 - REJECT (re-confirmed wall): bounded-int sort-along-dim = FT-radix vs torch-bounded-fastpath LOSS
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Probed whether the counting-sort
+lever (that won mode + unique) extends to `torch.sort` on bounded-integer data. It does
+NOT. FT already uses a parallel RADIX sort (already O(n) for bounded keys), and torch has
+its own tuned bounded-value fast path — so neither side is comparison-bound and a counting
+sort adds nothing. MEASURED `sort(x, dim=1) [4096,4096]` f64 bounded-int [0,210] no-grad,
+6-iter MIN: FT `200.8 ms` / torch `105.6 ms` => FT `1.90x SLOWER`, weighted-sum rel `0.0`
+(sorted values AND order match). Re-confirms the prior sort wall (NEGATIVE_EVIDENCE
+2026-06-22/23: FT 1.58x slower on NaN-free random floats). The counting/data-distribution
+lever wins ONLY where FT's baseline is SLOW (mode/unique were sort-based; quantile diluted
+by the materialization floor); sort is already radix on both sides → walled. AGENT BlackThrush.

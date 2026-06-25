@@ -1,0 +1,2 @@
+test tests::mode_f32_bounded_counting_keeps_f32_and_matches_sort_contract ... ok
+test result: ok. 18 passed; 0 failed; 0 ignored; 0 measured; 2361 filtered out; finished in 0.01s
