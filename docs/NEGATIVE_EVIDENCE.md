@@ -8071,3 +8071,28 @@ sort adds nothing. MEASURED `sort(x, dim=1) [4096,4096]` f64 bounded-int [0,210]
 2026-06-22/23: FT 1.58x slower on NaN-free random floats). The counting/data-distribution
 lever wins ONLY where FT's baseline is SLOW (mode/unique were sort-based; quantile diluted
 by the materialization floor); sort is already radix on both sides → walled. AGENT BlackThrush.
+
+## 2026-06-25 - CORRECTION + clean re-measure: quantile_dim counting is 1.31x (torch is ~125ms, NOT the ledger's stale 73ms)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. A cheap pure-torch scan
+(torch 2.x, 8 threads) corrected a stale baseline used in the 4dbc980e quantile
+revert: `torch.quantile(0.5, dim=1) [4000,4000]` f64 = **124.66 ms** (sort-based),
+NOT the ~73 ms an older ledger note assumed. Sibling scan: `median(dim)` 15.85ms /
+`nanmedian(dim)` 17.73ms (both introselect-FAST → walled), `quantile` 124.66 /
+`nanquantile` 152.80 (both sort-SLOW), `sort` 124.32 / `argsort` 116.44.
+
+Re-applied the reverted counting source and CLEAN re-measured (box recovered, no
+local bench): FT `98.14 ms` / torch `128.70 ms` => **1.31x FASTER**, value-sum rel
+`0.0`. So the revert CONCLUSION still holds (sub-2.0), but the REASON is sharper:
+FT counting quantile is genuinely ~98ms STEADY (NOT contention-throttled, as the
+earlier 89.7ms-contended de-inflation guessed). The ~98ms is FT's own OVERHEAD, not
+the O(n) counting: `tensor_quantile_dim_multi_nograd_f64` reads inputs via
+`tensor_values` (CLONES the full-numel 128MB f64 — unlike mode's zero-copy
+`values_borrowed`), runs a separate global bounded-check pass, and allocs a per-lane
+`selected` Vec for 4000 lanes. ★ LIVE FUTURE LEVER: clone-elide the input (borrow via
+`values_f32_borrowed`/`values_borrowed`, scoped before the `&mut self` output build) +
+fold the bounded check into the per-lane loop + stack the per-lane scratch. torch's
+125ms leaves headroom: if those drop FT below ~64ms the counting path clears 2.0x.
+NOT done this cycle (clone-elision through the multi-dim strided kernel + the borrow
+scoping is real surface); re-applied source re-reverted (stashed + patch in scratch).
+AGENT BlackThrush.
