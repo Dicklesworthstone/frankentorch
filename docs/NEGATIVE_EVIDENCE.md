@@ -8253,3 +8253,26 @@ Tolerance-parity (1e-4 for f32). New test
 `global_var_std_prod_f32_parallel_bypass_keeps_f32_and_matches_reference` (alternating
 +/-1 keeps f32 var exact; asserts f32 output dtype + values). ft-api lib + conformance
 green. AGENT BlackThrush.
+## 2026-06-25 - diff no-grad fast path + structural-bandwidth vein scan (flip/roll surfaced; cumsum/cumprod confirmed WINS)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. A broad op-scan (op_scan2_h2h.rs,
+[4000,4000] f64 no-grad) past the reduction vein found a STRUCTURAL-BANDWIDTH cluster:
+- diff   FT 176ms / torch 23.7ms = 7.43x SLOWER  <- FIXED -> 2.90x FASTER (WIN)
+- roll   FT 158ms / torch 27.0ms = 5.86x SLOWER  <- surfaced (ft-autograd tape op)
+- flip   FT 99ms  / torch 21.4ms = 4.64x SLOWER  <- surfaced (ft-autograd tape op)
+- cumsum FT 6.31ms/ torch 22.2ms = 3.52x FASTER  (existing win, confirmed on main)
+- cumprod FT 6.96ms/torch 21.1ms = 3.03x FASTER  (existing win, confirmed)
+- cov    1.04x (GEMM parity); trace tiny (0.055ms).
+
+DIFF FIX: `tensor_diff_full` composes `narrow(x,dim,1,len-1) - narrow(x,dim,0,len-1)` —
+subtracting two NON-CONTIGUOUS views + building narrow/narrow/sub tape nodes (~5x worse
+than bandwidth). Added a no-grad fast path (order 1, no prepend/append): borrow the
+contiguous storage, compute the adjacent difference directly with a parallel strided
+unravel, build the [shape with dim-1] leaf. BIT-EXACT (one fused subtract per output;
+existing diff_basic/diff_basic_f32 + new diff_nograd_fast_path_strided_and_large pass).
+MEASURED diff [4000,4000] dim=1 f64 no-grad: 176ms -> FT **8.65ms / torch 25.1ms = 2.90x FASTER** (a ~22x swing, NOT bandwidth-walled — torch.diff apparently materializes the narrows; FT's parallel direct subtract beats it). f32 covered too (diff_basic_f32 + grad tests pass).
+
+flip/roll are the same class (bandwidth ops at ~2.5GB/s vs torch ~12GB/s) but live in the
+ft-autograd tape kernels (tensor_tape.flip/roll) and affect the grad path — a follow-up
+(parallelize the kernel copy; bit-exact since pure permutation). These are bandwidth ops so
+the ceiling is ~parity (regression fixes), not clean wins, like count_nonzero. AGENT BlackThrush.
