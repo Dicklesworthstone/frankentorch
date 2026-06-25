@@ -28586,6 +28586,24 @@ pub fn prod_dim_tensor_contiguous_f32(
     }
     let offset = meta.storage_offset();
     let data = &input[offset..];
+    // GLOBAL/near-global reduce fast path (f32 mirror of prod_dim_f64): too few output
+    // lanes to fill the cores + contiguous columns (inner_size==1) -> reduce WITHIN each
+    // lane in parallel (rayon tree product). Tolerance-parity (1e-5), not bit-exact.
+    if inner_size == 1
+        && out_numel <= rayon::current_num_threads()
+        && reduce_size >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let output: Vec<f32> = (0..out_numel)
+            .map(|out_idx| {
+                data[out_idx * reduce_size..out_idx * reduce_size + reduce_size]
+                    .par_iter()
+                    .copied()
+                    .product::<f32>()
+            })
+            .collect();
+        return Ok(output);
+    }
     // Per-lane parallel; bit-exact vs the serial sequential product. frankentorch-kgs4.52.
     let lane = |out_idx: usize| -> f32 {
         let outer = out_idx / inner_size;
@@ -28633,6 +28651,31 @@ pub fn var_dim_tensor_contiguous_f32(
     let correction = (reduce_size - 1) as f32;
     #[allow(clippy::cast_precision_loss)]
     let n_div = reduce_size as f32;
+
+    // GLOBAL/near-global reduce fast path (f32 mirror of var_dim_f64): too few lanes to
+    // fill the cores + contiguous columns -> reduce WITHIN each lane in parallel.
+    // Tolerance-parity (1e-5), not bit-exact.
+    if inner_size == 1
+        && out_numel <= rayon::current_num_threads()
+        && reduce_size >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let output: Vec<f32> = (0..out_numel)
+            .map(|out_idx| {
+                let col = &data[out_idx * reduce_size..out_idx * reduce_size + reduce_size];
+                let mean = col.par_iter().copied().sum::<f32>() / n_div;
+                let var_sum = col
+                    .par_iter()
+                    .map(|&x| {
+                        let d = x - mean;
+                        d * d
+                    })
+                    .sum::<f32>();
+                var_sum / correction
+            })
+            .collect();
+        return Ok(output);
+    }
 
     // F32 mirror of the parallel var_dim_f64 (frankentorch-kgs4.53): per-lane
     // gather + pairwise mean + pairwise squared-deviation; parallelized over lanes

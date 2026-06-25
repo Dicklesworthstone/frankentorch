@@ -8227,3 +8227,29 @@ Reduction parity is tolerance-based (1e-5; the parallel accumulation order diffe
 serial). New test `global_var_std_prod_large_parallel_path_matches_reference` checks the
 parallel path vs analytic var/std/prod of 0..N (N=20000). ft-api lib + conformance green.
 F32 prod/var/std still slow (bypass is F64-only) — same fix applies, a follow-up. AGENT BlackThrush.
+## 2026-06-25 - WIN: F32 global var/std/prod — same fix as the f64 1e2eb102 win, now the common ML dtype
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Extended the f64 global-reduction
+win (1e2eb102) to F32, THE common ML dtype (batchnorm/layernorm stats etc.). Same two
+parts, f32-typed: (1) within-lane parallel fast path in `prod_dim_tensor_contiguous_f32` +
+`var_dim_tensor_contiguous_f32` (`std_dim_f32` = sqrt of var, free), using raw rayon
+`par_iter().sum()`/`.product()` (no f32 `maybe_par` helper exists). (2) No-grad bypass in
+`tensor_prod`/`tensor_var`/`tensor_std` for F32: borrow `contiguous_values_f32`, call the
+f32 kernel directly, wrap the scalar in a [1] `leaf_f32` (output stays f32, torch parity).
+var/std bypass gates on `correction == 1` (torch default; the kernel computes correction=1
+— other corrections fall through to the tape path to avoid an f32 rescale multiply).
+
+MEASURED `[4000,4000]` f32 no-grad, 6-iter MIN:
+- prod: 47x-class SLOWER -> FT `4.99ms` / torch `0.557ms` = **8.96x SLOWER** (torch f32 SIMD product is very fast; prod stays bandwidth/SIMD-walled).
+- var:  49x-class SLOWER -> FT `7.49ms` / torch `2.71ms` = **2.76x SLOWER**.
+- std:  46x-class SLOWER -> FT `5.72ms` / torch `2.55ms` = **2.24x SLOWER**.
+NOT a vs-torch WIN (unlike the f64 case): torch's f32 reductions use fast SIMD (var 2.7ms,
+prod 0.56ms) whereas its f64 path was slow — so f32 lands at a REGRESSION-FIX (45x->2-9x,
+~20x FT-side), not parity. (FT f32 var 7.5ms > FT f64 var 4ms: the raw rayon par_iter sum
+is less tuned than the f64 pairwise reducer — a further f32-reduction optimization is a
+follow-up.)
+
+Tolerance-parity (1e-4 for f32). New test
+`global_var_std_prod_f32_parallel_bypass_keeps_f32_and_matches_reference` (alternating
++/-1 keeps f32 var exact; asserts f32 output dtype + values). ft-api lib + conformance
+green. AGENT BlackThrush.
