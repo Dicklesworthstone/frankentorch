@@ -1,0 +1,1 @@
+PYTORCH_LOGSUMEXP rows=16384 cols=256 threads=8 best_ms=7.423192 checksum=94552.975547531852

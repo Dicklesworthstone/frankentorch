@@ -4,6 +4,46 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-24 - NEGATIVE (reverted): logsumexp no-grad output-lane parallel fast path regresses
+
+Bead/thread `frankentorch-kgs4`, agent `PearlReef`. Fresh worktree ancestry
+check found no unlanded measured win: the only non-ancestor worktree,
+`/data/projects/frankentorch-gxpb2-pass10`, was a rejection-only artifact with
+no retained source diff and no PyTorch win.
+
+Alien route: vectorized/morsel-driven tensor reductions and cache-aware lane
+parallelism looked applicable because `tensor_logsumexp` still computes each
+forward lane in a serial closure and unconditionally saves input/output for
+backward. One lever tried: f64 no-grad `tensor_logsumexp` fast path that mapped
+independent output lanes over Rayon and skipped the backward-only saves while
+preserving the exact per-lane max then exp-sum order. Tracked/autograd calls
+stayed on the existing analytical-backward path.
+
+Behavior proof while the candidate was present:
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec --
+cargo test -p ft-api logsumexp_nograd_fast_path_matches_tracked_bits --lib --
+--nocapture` passed on RCH `vmi1167313` (`1 passed; 2376 filtered out`).
+
+Measured head-to-head after the candidate, local torch sidecar available,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a
+RAYON_NUM_THREADS=16 PYTORCH_PYTHON=/data/projects/frankentorch/.venv-oracle/bin/python
+cargo +nightly-2026-06-09 run --release -p ft-api --example logsumexp_ab`,
+shape `[16384,256]`, dim `1`, f64:
+
+- Current serial+saves baseline in the same harness: `42.31 ms`.
+- Candidate no-grad fast path: `43.22 ms`, internal ratio `0.98x` (slower).
+- PyTorch `torch.logsumexp`, torch `2.12.0+cpu`, 8 threads, same fixture:
+  `7.423192 ms`, checksum `94552.975547531852`.
+- Baseline FT/PyTorch ratio: `5.70x SLOWER`; candidate FT/PyTorch ratio:
+  `5.82x SLOWER`.
+
+Decision: REVERT/no source retained. This output-lane Rayon + save-skip shape is
+not a keepable logsumexp lever; it adds scheduling/session overhead without
+beating the serial closure. Do not retry unless a lower-level profile first
+proves the residual has moved away from exp/libm throughput and into
+session/materialization overhead. Artifacts:
+`artifacts/perf/frankentorch-kgs4.pearlreef-logsumexp-20260624/`.
+
 ## 2026-06-24 - ★WIN: tensor_isin O(n*m) serial scan -> hash-set + parallel — flips 23.9x LOSS to 5.7-7.4x WIN vs PyTorch
 
 ★Finding via the "torch op is serial" probe: **`torch.isin` is SERIAL** (177ms @8 ≈ 167ms @32 for
