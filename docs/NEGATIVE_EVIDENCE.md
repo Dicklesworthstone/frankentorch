@@ -4,6 +4,56 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-25 - NEGATIVE (reverted): f64 SDPA all-ones dout reduction improves FT but still loses to PyTorch
+
+Bead/thread `frankentorch-kgs4`, agent `PearlReef`. Fresh worktree scan found
+no clean unlanded measured win to land: the only ahead worktree was
+`/data/projects/frankentorch-gxpb2-pass10`, an explicit large-n row-SIMD
+rejection. Current `main` was fast-forwarded to `e2642b5c` before probing.
+
+Target selection: the current ledger's remaining public PyTorch-facing gaps
+still include SDPA training rows, and the code showed an asymmetry: f32 SDPA
+already had an all-ones upstream-gradient shortcut for `sum(SDPA).backward()`,
+while f64 SDPA still ran the dense `dout @ V^T` and `P^T @ dout` GEMMs. This
+mapped to the graveyard profile-first/vectorized-kernel guidance and the
+artifact-coding algebraic-specialization pattern: one exact reduction artifact,
+fallback to dense backward for non-all-ones gradients.
+
+Lever tried and reverted: add `sdpa_backward_f64_unit_dout` mirroring the
+existing f32 unit-dout path, route both f64 SDPA API entry points to it only
+when `grad_outputs[0]` is exact all-ones, and add a kernel proof test against
+the dense all-ones backward.
+
+Bench notes:
+
+- The user-requested exact command form was attempted:
+  `AGENT_NAME=PearlReef PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo bench --release -p ft-api --bench pytorch_gauntlet_bench -- sdpa --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot`.
+  This Cargo rejected `cargo bench --release` as `unexpected argument
+  '--release'`; artifact:
+  `artifacts/perf/frankentorch-cod-b-boldverify-sdpa-20260625/baseline_sdpa_exact_cargo_bench_release.log`.
+- Accepted per-crate bench command:
+  `AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo bench -p ft-api --bench pytorch_gauntlet_bench -- sdpa --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot`.
+- Remote PyTorch rows failed on both workers because worker Python had no
+  `torch`; FT Criterion rows completed.
+- Baseline FT from detached `origin/main` worktree on `vmi1227854`:
+  `[25.351 ms 26.339 ms 28.071 ms]`.
+- Candidate FT on `hz2`: `[21.214 ms 22.289 ms 23.671 ms]`, an internal
+  midpoint speedup of `26.339 / 22.289 = 1.18x`.
+- Local PyTorch sidecar for the same script/fixture, torch `2.12.1+cpu`, 32
+  threads: captured run `0.397009555018 s / 20 = 19.850 ms`, checksum
+  `0.103877428238`; first same-session uncaptured run
+  `0.362935346086 s / 20 = 18.147 ms`, same checksum.
+
+FT/PyTorch ratio: baseline was `1.33-1.45x slower`; candidate was still
+`1.12-1.23x slower` (`22.289 / 19.850` to `22.289 / 18.147`). Decision:
+REVERT. This is a real internal improvement, but not a PyTorch win. Do not retry
+f64 SDPA unit-dout reduction as a standalone lever unless a same-worker PyTorch
+comparator is available and the candidate clears `<1.0x` FT/PyTorch, or a deeper
+fused forward+backward pass removes more than the two all-ones GEMMs.
+
+Artifacts:
+`artifacts/perf/frankentorch-cod-b-boldverify-sdpa-20260625/`.
+
 ## 2026-06-25 - BOLD-VERIFY (kept): affine-uniform searchsorted learned-index fast path
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Fresh worktree scan found
