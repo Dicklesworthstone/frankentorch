@@ -1,0 +1,10 @@
+test tests::mode_1d ... ok
+test tests::mode_2d ... ok
+test tests::mode_propagates_gradient_to_winning_position ... ok
+test tests::mode_single_element ... ok
+test tests::mode_scalar_errors ... ok
+test tests::mode_zero_last_dim_errors ... ok
+test tests::mode_switch_is_supported ... ok
+test tests::mode_non_contiguous_f64_bounded_falls_back_and_matches_contiguous ... ok
+test tests::mode_bounded_no_grad_fast_path_matches_sort_contract ... ok
+test result: ok. 17 passed; 0 failed; 0 ignored; 0 measured; 2361 filtered out; finished in 0.01s

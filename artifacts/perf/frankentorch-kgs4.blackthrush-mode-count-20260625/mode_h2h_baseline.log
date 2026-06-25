@@ -1,0 +1,14 @@
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 57.66s
+     Running `/data/projects/.rch-targets/frankentorch-cod-a/release/examples/mode_h2h`
+/data/projects/.venvs/frankentorch-pytorch-cpu/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+mode(x, dim=-1) [4096,4096] f64 no-grad, 8 iters MIN:
+  FrankenTorch :  190.202 ms   chk 7.859000e3
+  PyTorch      :   65.565 ms   chk 7.859000e3  (value-sum rel 0.0e0)
+  => FT 2.90x SLOWER

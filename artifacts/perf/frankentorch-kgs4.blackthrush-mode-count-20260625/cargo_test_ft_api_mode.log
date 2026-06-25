@@ -1,0 +1,42 @@
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445/crates/ft-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 51.12s
+     Running unittests src/lib.rs (/data/projects/.rch-targets/frankentorch-cod-a/debug/deps/ft_api-4fa2327a283f58d8)
+
+running 29 tests
+test tests::fft2_ifft2_norm_modes_match_torch_golden ... ok
+test tests::fftn_ifftn_norm_modes_match_torch_golden ... ok
+test tests::fft_ifft_norm_modes_match_torch_golden ... ok
+test tests::grid_sample_matches_torch_all_modes ... ok
+test tests::histc_mode_support_f32_inputs ... ok
+test tests::interpolate_rejects_invalid_mode ... ok
+test tests::mode_1d ... ok
+test tests::mode_2d ... ok
+test tests::init_kaiming_invalid_mode ... ok
+test tests::mode_scalar_errors ... ok
+test tests::mode_switch_is_supported ... ok
+test tests::mode_zero_last_dim_errors ... ok
+test tests::mse_loss_reduction_modes_golden_matches_torch ... ok
+test tests::interpolate_area_mode_matches_torch ... ok
+test tests::mode_propagates_gradient_to_winning_position ... ok
+test tests::pad1d_modes_golden_matches_torch ... ok
+test tests::pad_mode_rejects_shape_overflow ... ok
+test tests::mode_single_element ... ok
+test tests::nanquantile_interpolation_modes_match_torch ... ok
+test tests::pad_constant_mode_matches_tensor_pad ... ok
+test tests::quantile_interpolation_modes_match_torch ... ok
+test tests::test_inference_mode ... ok
+test tests::rfft2_irfft2_norm_modes_match_torch_golden ... ok
+test tests::rfftn_irfftn_norm_modes_match_torch_golden ... ok
+test tests::functional_max_pool2d_ceil_mode_matches_torch ... ok
+test tests::functional_max_pool2d_ceil_mode_drops_window_starting_in_padding ... ok
+test tests::max_pool2d_ceil_mode_matches_torch ... ok
+test tests::functional_max_pool2d_ceil_mode_grad_only_to_argmax ... ok
+test tests::mode_bounded_no_grad_fast_path_matches_sort_contract ... ok
+
+test result: ok. 29 passed; 0 failed; 0 ignored; 0 measured; 2348 filtered out; finished in 0.01s
+

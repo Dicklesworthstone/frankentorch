@@ -7764,3 +7764,36 @@ Correctness: `cargo test -p ft-kernel-cpu pinv_` passes including the new direct
 `pinv_gram_rank_deficient_satisfies_moore_penrose` test. This re-opens the vector-reconstruction SVD composite
 lane only for cases where the Gram route satisfies the full Moore-Penrose contract; ill-conditioned or unsafe
 planes still use SVD. Source disposition: KEEP. AGENT QuietMeadow/cod-b.
+
+## 2026-06-25 - WIN: bounded-integer counting fast path for tensor_mode = 15.51x FASTER vs PyTorch
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. `torch.mode(x, dim=-1)` over
+small-integer (categorical / token-id / vote) data is the common case, yet FT's
+`tensor_mode` always ran an O(M log M) comparison sort + run-length count per outer
+slice — 2.90x SLOWER than PyTorch at `[4096,4096]` f64.
+
+Lever: when the input is no-grad, contiguous F64, has `numel >= 1<<13`, and every value
+is a finite integer in `[0,255]`, replace the per-slice comparison sort with a 256-bucket
+counting histogram (O(M) per slice, parallelized over outer slices with Rayon). Tie-break
+is byte-for-byte identical to the existing sort path: smallest value among count-ties
+(strict `>` on the histogram), `last_seen[best_key]` for the index (the sort path is a
+stable sort whose run-walk likewise lands on the last occurrence of the winning value),
+so values AND indices match the prior contract. Any out-of-range / non-integer /
+non-finite value, or a non-contiguous f64 view (zero-copy borrow fails), falls through to
+the unchanged layout-agnostic sort path.
+
+Measured `mode(x, dim=-1) [4096,4096]` f64 no-grad, 8-iter MIN
+(`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-bt-verify`,
+`PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`,
+no peer bench contention):
+- baseline (sort path): FrankenTorch `190.20 ms`, PyTorch `65.57 ms` => FT 2.90x SLOWER
+- counting fast path:   FrankenTorch `  4.457 ms`, PyTorch `69.110 ms` => FT 15.51x FASTER
+
+Checksum (value-sum) MATCH vs PyTorch, rel `0.0`. Bit-exact: the fast path reconstructs
+`best_key as f64`, and integers `0..=255` are exactly representable in f64.
+
+New unit tests: `mode_bounded_no_grad_fast_path_matches_sort_contract` (fast-path value +
+index contract) and `mode_non_contiguous_f64_bounded_falls_back_and_matches_contiguous`
+(a transposed `>=1<<13` f64 view does NOT error on the zero-copy borrow — it falls back to
+the slow path and matches a contiguous clone). Full ft-api `mode` suite: 17/17 green.
+AGENT BlackThrush.
