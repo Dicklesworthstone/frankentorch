@@ -28357,6 +28357,143 @@ pub fn bmm_tensor_contiguous_f32(
     Ok(out)
 }
 
+/// In-place batched matmul: identical math to [`bmm_tensor_contiguous_f32`] but
+/// writes the `[batch, m, n]` result into a caller-provided `out` (its first
+/// `batch*m*n` elements) instead of allocating a fresh `Vec`. Lets a hot inference
+/// loop reuse one scratch buffer across many calls, eliding the per-call allocation
+/// and its zero-fill (the matmul paths overwrite every element, so no pre-zeroing is
+/// needed except for the degenerate `k == 0` contraction, which is filled here).
+///
+/// Deliberately a separate function rather than a shared refactor of
+/// `bmm_tensor_contiguous_f32`: that one is on the autograd path, and FrankenTorch's
+/// invariant is that autograd correctness outranks kernel speed, so it stays
+/// byte-for-byte untouched. The small dispatch duplication is the cost of not
+/// perturbing the gradient-critical kernel.
+pub fn bmm_tensor_contiguous_f32_into(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+    out: &mut [f32],
+) -> Result<(), KernelError> {
+    ensure_dtype_device_and_layout_f32(lhs_meta, rhs_meta)?;
+    if lhs_meta.shape().len() != 3 || rhs_meta.shape().len() != 3 {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    let batch = lhs_meta.shape()[0];
+    let m = lhs_meta.shape()[1];
+    let k = lhs_meta.shape()[2];
+    let rhs_batch = rhs_meta.shape()[0];
+    let rhs_k = rhs_meta.shape()[1];
+    let n = rhs_meta.shape()[2];
+    if batch != rhs_batch || k != rhs_k {
+        return Err(KernelError::ShapeMismatch {
+            lhs: lhs_meta.shape().to_vec(),
+            rhs: rhs_meta.shape().to_vec(),
+        });
+    }
+    let lhs_batch_stride = checked_mul(m, k, "bmm_f32 lhs batch stride overflow")?;
+    let rhs_batch_stride = checked_mul(k, n, "bmm_f32 rhs batch stride overflow")?;
+    let out_batch_stride = checked_mul(m, n, "bmm_f32 output batch stride overflow")?;
+    checked_mul(batch, lhs_batch_stride, "bmm_f32 lhs overflow")?;
+    checked_mul(batch, rhs_batch_stride, "bmm_f32 rhs overflow")?;
+    let out_numel = checked_mul(batch, out_batch_stride, "bmm_f32 output overflow")?;
+    ensure_storage_len_f32(lhs, lhs_meta, "lhs")?;
+    ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
+    if out.len() < out_numel {
+        return Err(KernelError::ShapeMismatch {
+            lhs: vec![out.len()],
+            rhs: vec![out_numel],
+        });
+    }
+    let lhs_start = lhs_meta.storage_offset();
+    let rhs_start = rhs_meta.storage_offset();
+    let out = &mut out[..out_numel];
+
+    if out_batch_stride == 0 {
+        return Ok(());
+    }
+    if k == 0 {
+        // The contraction is empty; the gemm paths below would leave the (reused,
+        // possibly stale) buffer unwritten, so produce the all-zero result explicitly.
+        out.fill(0.0);
+        return Ok(());
+    }
+
+    if m == 4 && k == 4 && n == 4 {
+        let lhs_batches = &lhs[lhs_start..lhs_start + batch * lhs_batch_stride];
+        let rhs_batches = &rhs[rhs_start..rhs_start + batch * rhs_batch_stride];
+        if batch < BMM_F32_4X4_BATCH_CHUNK {
+            for b in 0..batch {
+                let lhs_base = b * lhs_batch_stride;
+                let rhs_base = b * rhs_batch_stride;
+                let out_base = b * out_batch_stride;
+                matmul_4x4_f32(
+                    &lhs_batches[lhs_base..lhs_base + lhs_batch_stride],
+                    &rhs_batches[rhs_base..rhs_base + rhs_batch_stride],
+                    &mut out[out_base..out_base + out_batch_stride],
+                );
+            }
+        } else {
+            out.par_chunks_mut(out_batch_stride * BMM_F32_4X4_BATCH_CHUNK)
+                .enumerate()
+                .for_each(|(chunk_idx, out_chunk)| {
+                    let first_batch = chunk_idx * BMM_F32_4X4_BATCH_CHUNK;
+                    for (local_b, out_batch) in
+                        out_chunk.chunks_exact_mut(out_batch_stride).enumerate()
+                    {
+                        let b = first_batch + local_b;
+                        let lhs_base = b * lhs_batch_stride;
+                        let rhs_base = b * rhs_batch_stride;
+                        matmul_4x4_f32(
+                            &lhs_batches[lhs_base..lhs_base + lhs_batch_stride],
+                            &rhs_batches[rhs_base..rhs_base + rhs_batch_stride],
+                            out_batch,
+                        );
+                    }
+                });
+        }
+        return Ok(());
+    }
+
+    if batch < 8 {
+        for b in 0..batch {
+            let lhs_base = lhs_start + b * lhs_batch_stride;
+            let rhs_base = rhs_start + b * rhs_batch_stride;
+            let out_base = b * out_batch_stride;
+            gemm::sgemm(
+                m,
+                k,
+                n,
+                &lhs[lhs_base..lhs_base + lhs_batch_stride],
+                &rhs[rhs_base..rhs_base + rhs_batch_stride],
+                &mut out[out_base..out_base + out_batch_stride],
+            );
+        }
+        return Ok(());
+    }
+
+    out.par_chunks_exact_mut(out_batch_stride)
+        .enumerate()
+        .for_each(|(b, out_batch)| {
+            let lhs_base = lhs_start + b * lhs_batch_stride;
+            let rhs_base = rhs_start + b * rhs_batch_stride;
+            gemm::sgemm(
+                m,
+                k,
+                n,
+                &lhs[lhs_base..lhs_base + lhs_batch_stride],
+                &rhs[rhs_base..rhs_base + rhs_batch_stride],
+                out_batch,
+            );
+        });
+
+    Ok(())
+}
+
 pub fn trace_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f32, KernelError> {
     ensure_unary_layout_and_storage_f32(input, meta)?;
     if meta.shape().len() != 2 {
@@ -32899,8 +33036,9 @@ mod tests {
         acos_tensor_contiguous_f64, add_scalar, add_tensor_broadcast_f64,
         add_tensor_contiguous_f64, argmax_dim_tensor_contiguous_f64,
         argmin_dim_tensor_contiguous_f64, asin_scalar, asin_tensor_contiguous_f64, atan_scalar,
-        atan_tensor_contiguous_f64, bmm_tensor_contiguous_f32, bmm_tensor_contiguous_f64,
-        cat_tensor_contiguous_f32, cat_tensor_contiguous_f64, ceil_scalar,
+        atan_tensor_contiguous_f64, bmm_tensor_contiguous_f32, bmm_tensor_contiguous_f32_into,
+        bmm_tensor_contiguous_f64, cat_tensor_contiguous_f32, cat_tensor_contiguous_f64,
+        ceil_scalar,
         ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar,
         cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64, div_scalar,
         div_tensor_contiguous_f64, dot_tensor_contiguous_f64, eq_scalar, eq_tensor_contiguous_f64,
@@ -33922,6 +34060,44 @@ mod tests {
             }
         }
         assert_eq!(out, expected);
+    }
+
+    #[test]
+    fn bmm_into_matches_alloc_across_dispatch_paths_and_reuses_buffer() {
+        // Cover the three dispatch paths: 4x4 fast path, general batch<8, general
+        // batch>=8 parallel — plus a non-4x4 small-K shape like the reranker's
+        // attention. For each, `_into` must equal the allocating `bmm`, even when the
+        // out buffer is oversized and pre-filled with stale garbage (no zero-init).
+        let cases = [
+            (3usize, 4usize, 4usize, 4usize), // 4x4 fast path, batch<chunk
+            (300, 4, 4, 4),                   // 4x4 fast path, parallel
+            (5, 7, 3, 6),                     // general, batch<8
+            (12, 32, 32, 32),                 // general, parallel (attention-like)
+        ];
+        for (batch, m, k, n) in cases {
+            let lhs_meta = TensorMeta::from_shape(vec![batch, m, k], DType::F32, Device::Cpu);
+            let rhs_meta = TensorMeta::from_shape(vec![batch, k, n], DType::F32, Device::Cpu);
+            let lhs: Vec<f32> = (0..batch * m * k).map(|i| (i % 13) as f32 - 6.0).collect();
+            let rhs: Vec<f32> = (0..batch * k * n).map(|i| (i % 17) as f32 - 8.0).collect();
+            let want = bmm_tensor_contiguous_f32(&lhs, &rhs, &lhs_meta, &rhs_meta).unwrap();
+            // Oversized scratch pre-poisoned with NaN to prove every element is rewritten.
+            let mut scratch = vec![f32::NAN; batch * m * n + 37];
+            bmm_tensor_contiguous_f32_into(&lhs, &rhs, &lhs_meta, &rhs_meta, &mut scratch).unwrap();
+            assert_eq!(&scratch[..batch * m * n], want.as_slice(), "shape {batch}x{m}x{k}x{n}");
+            // Reuse the same scratch for a second, smaller matmul — must not leak prior data.
+            let lm2 = TensorMeta::from_shape(vec![2, 2, 2], DType::F32, Device::Cpu);
+            let rm2 = TensorMeta::from_shape(vec![2, 2, 2], DType::F32, Device::Cpu);
+            let l2 = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0];
+            let r2 = vec![8.0, 7.0, 6.0, 5.0, 4.0, 3.0, 2.0, 1.0];
+            let want2 = bmm_tensor_contiguous_f32(&l2, &r2, &lm2, &rm2).unwrap();
+            bmm_tensor_contiguous_f32_into(&l2, &r2, &lm2, &rm2, &mut scratch).unwrap();
+            assert_eq!(&scratch[..8], want2.as_slice());
+        }
+        // Undersized buffer is rejected, not UB.
+        let meta = TensorMeta::from_shape(vec![1, 2, 2], DType::F32, Device::Cpu);
+        let v = vec![1.0f32; 4];
+        let mut tiny = vec![0.0f32; 3];
+        assert!(bmm_tensor_contiguous_f32_into(&v, &v, &meta, &meta, &mut tiny).is_err());
     }
 
     #[test]
