@@ -31,6 +31,9 @@ Fixture: `torch.masked_select(x[4_000_000], x > 0)`, f64 no-grad,
 - Candidate FrankenTorch: `116.36 ms`.
 - PyTorch: `31.74 ms`.
 - Ratio: FT `3.67x SLOWER`.
+- Supplemental cod-a warm-target rerun, same dirty candidate before source
+  restore: FrankenTorch `100.75 ms`, PyTorch `27.04 ms`, FT `3.73x SLOWER`;
+  output matched PyTorch with kept `2_001_643`, checksum `1.274286e6`.
 - Prior serial-index baseline from the 2026-06-25 BOLD-VERIFY artifact:
   FrankenTorch `38.50 ms`, PyTorch `29.21 ms`, FT `1.32x SLOWER`.
 
@@ -40,7 +43,8 @@ dominate before the existing serial `index_select` gather. Do not retry this
 family unless the implementation moves to a fused typed mask+gather kernel with
 one pass over input/mask and a proof for dtype/autograd/broadcast behavior.
 Artifacts:
-`artifacts/perf/frankentorch-kgs4.cod-b-masked-select-idx-20260625/`.
+`artifacts/perf/frankentorch-kgs4.cod-b-masked-select-idx-20260625/` and
+`artifacts/perf/frankentorch-kgs4.cod-b-bold-verify-20260625/masked_select_h2h_pearlreef_cod_a_dirty_candidate.log`.
 
 ## 2026-06-25 - ★WIN (kept existing implementation): tensor_combinations r=2 beats PyTorch by 1.33x
 
