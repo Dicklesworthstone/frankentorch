@@ -27590,6 +27590,71 @@ pub fn quantize_per_output_channel_i8(w: &[f32], out: usize, in_: usize) -> (Vec
     (w_i8, scales)
 }
 
+/// Per-row symmetric int8 dynamic quantization of `[m, k]` activations: returns
+/// `(x_i8, a_scales)` with `a_scale[s] = max(|x[s,:]|)/127` (or `1.0` for an
+/// all-zero row) and `x_i8[s,i] = round(x[s,i]/a_scale[s])`. Each row is
+/// independent, so the result is bit-identical serial-vs-parallel; rows are
+/// quantized across rayon when the input is large enough to amortize the fan-out.
+/// Shared by the row-major and pre-packed int8 GEMM kernels.
+#[must_use]
+#[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn quantize_rows_i8(x: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
+    use rayon::prelude::*;
+    assert_eq!(x.len(), m * k, "x length must equal m*k");
+    let mut x_i8 = vec![0i8; m * k];
+    let mut a_scales = vec![0f32; m];
+    let quant_row = |dst: &mut [i8], a_scale: &mut f32, row: &[f32]| {
+        let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
+        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+        let inv = 1.0 / scale;
+        for (d, &v) in dst.iter_mut().zip(row.iter()) {
+            *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+        }
+        *a_scale = scale;
+    };
+    if m >= 8 && m * k >= 8192 && rayon::current_num_threads() > 1 {
+        x_i8.par_chunks_mut(k)
+            .zip(a_scales.par_iter_mut())
+            .zip(x.par_chunks(k))
+            .for_each(|((dst, a_scale), row)| quant_row(dst, a_scale, row));
+    } else {
+        x_i8.chunks_mut(k)
+            .zip(a_scales.iter_mut())
+            .zip(x.chunks(k))
+            .for_each(|((dst, a_scale), row)| quant_row(dst, a_scale, row));
+    }
+    (x_i8, a_scales)
+}
+
+/// Pre-pack row-major `[n, k]` int8 weights into the NR=4 panel-interleaved layout
+/// that [`linear_int8_dynamic_prepacked_f32`]'s aarch64 SDOT micro-kernel consumes:
+/// for each group of 4 output rows, the 16-byte k-chunks of the 4 rows are
+/// interleaved (`row0[c], row1[c], row2[c], row3[c]` back-to-back), so the inner
+/// loop's four weight loads land in ONE contiguous 64-byte cache line instead of
+/// four loads `k` bytes apart. Requires `n % 4 == 0` and `k % 16 == 0`. Because
+/// the model weights are static this is done once at load — a zero-per-forward
+/// version of MLAS's `PackB`. Same byte count as the input, just reordered, so the
+/// GEMM result is bit-identical to the row-major kernel.
+#[must_use]
+pub fn pack_int8_weights_nr4(w_i8: &[i8], n: usize, k: usize) -> Vec<i8> {
+    assert_eq!(w_i8.len(), n * k, "w_i8 length must equal n*k");
+    assert_eq!(n % 4, 0, "pack_int8_weights_nr4 requires n % 4 == 0");
+    assert_eq!(k % 16, 0, "pack_int8_weights_nr4 requires k % 16 == 0");
+    let mut packed = vec![0i8; n * k];
+    let chunks = k / 16;
+    for g in 0..(n / 4) {
+        let group_base = g * 4 * k;
+        for c in 0..chunks {
+            for j in 0..4 {
+                let src = (4 * g + j) * k + c * 16;
+                let dst = group_base + c * 64 + j * 16;
+                packed[dst..dst + 16].copy_from_slice(&w_i8[src..src + 16]);
+            }
+        }
+    }
+    packed
+}
+
 /// Int8 dynamic-quantized linear layer:
 /// `y[m, n] = dequant(quant_per_row(x[m, k]) @ w_i8[n, k]^T) + bias[n]`.
 ///
@@ -27628,34 +27693,8 @@ pub fn linear_int8_dynamic_f32(
         assert_eq!(b.len(), n, "bias length must equal n");
     }
 
-    // Per-row dynamic quantization of the activations. Each row is independent
-    // (its own abs-max scale), so this is bit-identical whether run serially or
-    // across rayon — parallelize it to match the GEMM below instead of leaving a
-    // single-threaded scalar prologue in front of the parallel matmul (it is a
-    // real fraction of the wide FFN linears). Small inputs (few rows / tiny k)
-    // stay serial to avoid fan-out overhead.
-    let mut x_i8 = vec![0i8; m * k];
-    let mut a_scales = vec![0f32; m];
-    let quant_row = |dst: &mut [i8], a_scale: &mut f32, row: &[f32]| {
-        let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
-        let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let inv = 1.0 / scale;
-        for (d, &v) in dst.iter_mut().zip(row.iter()) {
-            *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
-        }
-        *a_scale = scale;
-    };
-    if m >= 8 && m * k >= 8192 && rayon::current_num_threads() > 1 {
-        x_i8.par_chunks_mut(k)
-            .zip(a_scales.par_iter_mut())
-            .zip(x.par_chunks(k))
-            .for_each(|((dst, a_scale), row)| quant_row(dst, a_scale, row));
-    } else {
-        x_i8.chunks_mut(k)
-            .zip(a_scales.iter_mut())
-            .zip(x.chunks(k))
-            .for_each(|((dst, a_scale), row)| quant_row(dst, a_scale, row));
-    }
+    // Per-row dynamic quantization of the activations.
+    let (x_i8, a_scales) = quantize_rows_i8(x, m, k);
 
     // i32-accumulate GEMM + dequant + bias, parallel over output rows. The inner
     // dot product dispatches to a hand-written SIMD kernel (aarch64 SDOT / x86
@@ -27786,6 +27825,151 @@ unsafe fn gemm_block4_sdot(
             out_blk[r * n + o] = y;
         }
         o += 1;
+    }
+}
+
+/// Int8 dynamic-quant linear over **pre-packed** weights — same result as
+/// [`linear_int8_dynamic_f32`] but the weights are in the NR=4 panel-interleaved
+/// layout from [`pack_int8_weights_nr4`] (`n % 4 == 0`, `k % 16 == 0`). On
+/// aarch64+SDOT the four weight loads per k-chunk are then one contiguous 64-byte
+/// cache line (vs four loads `k` bytes apart in the row-major kernel) and there
+/// are no `n % 4` / `k % 16` tails, so the micro-kernel is both more
+/// cache-friendly and branch-free. Bit-identical to the row-major kernel: vdotq
+/// accumulates the identical i32 sums in the identical order. A scalar
+/// reads-the-packed-layout fallback keeps non-aarch64 / no-dotprod targets
+/// correct (the reranker only opts into packing on aarch64, where SDOT is
+/// universal, so the fallback is a safety net rather than a hot path).
+#[must_use]
+#[allow(unsafe_code, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+pub fn linear_int8_dynamic_prepacked_f32(
+    x: &[f32],
+    m: usize,
+    k: usize,
+    w_packed: &[i8],
+    w_scales: &[f32],
+    n: usize,
+    bias: Option<&[f32]>,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    assert_eq!(x.len(), m * k, "x length must equal m*k");
+    assert_eq!(w_packed.len(), n * k, "w_packed length must equal n*k");
+    assert_eq!(w_scales.len(), n, "w_scales length must equal n");
+    assert_eq!(n % 4, 0, "prepacked requires n % 4 == 0");
+    assert_eq!(k % 16, 0, "prepacked requires k % 16 == 0");
+    if let Some(b) = bias {
+        assert_eq!(b.len(), n, "bias length must equal n");
+    }
+    let (x_i8, a_scales) = quantize_rows_i8(x, m, k);
+    let mut out = vec![0f32; m * n];
+    #[cfg(target_arch = "aarch64")]
+    {
+        if std::arch::is_aarch64_feature_detected!("dotprod") {
+            const MR: usize = 4;
+            out.par_chunks_mut(MR * n).enumerate().for_each(|(blk, out_blk)| {
+                let sp = blk * MR;
+                let rows = out_blk.len() / n;
+                // SAFETY: dotprod confirmed; n%4==0, k%16==0; rows<=MR; w_packed is
+                // the NR=4-packed [n,k] from pack_int8_weights_nr4.
+                unsafe {
+                    gemm_block4_sdot_packed(
+                        &x_i8, &a_scales, sp, rows, k, w_packed, w_scales, n, bias, out_blk,
+                    );
+                }
+            });
+            return out;
+        }
+    }
+    // Portable / no-dotprod fallback: scalar dot that reads the NR=4-packed layout
+    // directly (weight byte for output `o`, column `c*16+t` lives at
+    // `(o/4)*4*k + c*64 + (o%4)*16 + t`).
+    let chunks = k / 16;
+    out.par_chunks_mut(n)
+        .zip(x_i8.par_chunks(k))
+        .zip(a_scales.par_iter())
+        .for_each(|((out_row, x_row), &a_scale)| {
+            for o in 0..n {
+                let group_base = (o / 4) * 4 * k;
+                let j = o % 4;
+                let mut acc: i32 = 0;
+                for c in 0..chunks {
+                    let wbase = group_base + c * 64 + j * 16;
+                    let xbase = c * 16;
+                    for t in 0..16 {
+                        acc += i32::from(x_row[xbase + t]) * i32::from(w_packed[wbase + t]);
+                    }
+                }
+                let mut y = acc as f32 * a_scale * w_scales[o];
+                if let Some(b) = bias {
+                    y += b[o];
+                }
+                out_row[o] = y;
+            }
+        });
+    out
+}
+
+/// NR=4 packed-weight SDOT micro-kernel: the pre-packed twin of
+/// [`gemm_block4_sdot`]. `w_packed` is `pack_int8_weights_nr4` output, so the four
+/// weight rows of each output group are interleaved 16 bytes at a time — the four
+/// `vld1q_s8`s per k-chunk are one contiguous 64-byte line. Requires `n % 4 == 0`
+/// and `k % 16 == 0` (no tails). Bit-identical i32 accumulation to the row-major
+/// kernel.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "dotprod")]
+#[allow(
+    unsafe_code,
+    unsafe_op_in_unsafe_fn,
+    clippy::too_many_arguments,
+    clippy::cast_precision_loss
+)]
+unsafe fn gemm_block4_sdot_packed(
+    x_i8: &[i8],
+    a_scales: &[f32],
+    sp: usize,
+    rows: usize,
+    k: usize,
+    w_packed: &[i8],
+    w_scales: &[f32],
+    n: usize,
+    bias: Option<&[f32]>,
+    out_blk: &mut [f32],
+) {
+    use std::arch::aarch64::{vaddvq_s32, vdotq_s32, vdupq_n_s32, vld1q_s8};
+    let chunks = k / 16;
+    let xp = x_i8.as_ptr();
+    let wp = w_packed.as_ptr();
+    let mut o = 0;
+    while o < n {
+        let group_base = (o / 4) * 4 * k;
+        // acc[r][j]: x-row (sp+r) dotted with w-row (o+j).
+        let mut acc = [[vdupq_n_s32(0); 4]; 4];
+        for c in 0..chunks {
+            let p = group_base + c * 64;
+            let w0 = vld1q_s8(wp.add(p)); // four contiguous weight chunks =
+            let w1 = vld1q_s8(wp.add(p + 16)); // one 64-byte cache line
+            let w2 = vld1q_s8(wp.add(p + 32));
+            let w3 = vld1q_s8(wp.add(p + 48));
+            let kk = c * 16;
+            for r in 0..rows {
+                let xv = vld1q_s8(xp.add((sp + r) * k + kk));
+                acc[r][0] = vdotq_s32(acc[r][0], xv, w0);
+                acc[r][1] = vdotq_s32(acc[r][1], xv, w1);
+                acc[r][2] = vdotq_s32(acc[r][2], xv, w2);
+                acc[r][3] = vdotq_s32(acc[r][3], xv, w3);
+            }
+        }
+        for r in 0..rows {
+            let s = a_scales[sp + r];
+            for j in 0..4 {
+                let sum = vaddvq_s32(acc[r][j]);
+                let mut y = sum as f32 * s * w_scales[o + j];
+                if let Some(b) = bias {
+                    y += b[o + j];
+                }
+                out_blk[r * n + o + j] = y;
+            }
+        }
+        o += 4;
     }
 }
 
@@ -31103,6 +31287,26 @@ mod tests {
         let a = super::linear_int8_dynamic_f32(&x, m, k, &w_i8, &w_scales, n, None);
         let b = super::linear_int8_dynamic_f32(&x, m, k, &w_i8, &w_scales, n, None);
         assert_eq!(a, b, "int8 linear must be bit-identical across runs");
+    }
+
+    #[test]
+    fn linear_int8_prepacked_matches_rowmajor_bit_identical() {
+        // The NR=4 pre-packed kernel only reorders the weight bytes, so it must
+        // produce byte-identical output to the row-major kernel — the contract the
+        // reranker's load-time weight packing relies on.
+        for (m, k, n) in [(7usize, 384usize, 384usize), (32, 384, 1536), (33, 1536, 384)] {
+            let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
+            let w: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
+            let bias: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001 - 0.5).collect();
+            let (w_i8, w_scales) = super::quantize_per_output_channel_i8(&w, n, k);
+            let packed = super::pack_int8_weights_nr4(&w_i8, n, k);
+            let row =
+                super::linear_int8_dynamic_f32(&x, m, k, &w_i8, &w_scales, n, Some(&bias));
+            let pre = super::linear_int8_dynamic_prepacked_f32(
+                &x, m, k, &packed, &w_scales, n, Some(&bias),
+            );
+            assert_eq!(row, pre, "prepacked must equal row-major for m={m} k={k} n={n}");
+        }
     }
 
     // The batched LU-solve kernel must match the per-matrix 2-D lu_factor+lu_solve path
