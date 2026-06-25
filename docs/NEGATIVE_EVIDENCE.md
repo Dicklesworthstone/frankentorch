@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-25 - WIN (by-analogy, byte-identical): tensor_unique_dim splitmix64 slice-key hasher
+
+`tensor_unique_dim` dedups slices via a `HashMap<Vec<i64>, usize>` keyed by each slice's bit
+patterns. std's SipHash hashes every byte of every slice key through its HashDoS-hardened (slow)
+mixer — pure overhead for these integer keys and the dominant dedup cost when there are many/long
+slices. Swap in a splitmix64 finalizer whose `write` processes the slice key 8 bytes per mix step.
+
+The hasher affects ONLY bucket placement — the HashMap still compares the full `Vec<i64>` keys for
+equality on every hash hit — so `unique_indices`, `inverse`, and `counts` are byte-for-byte identical
+to the std-hasher path (`cargo test -p ft-api unique` 14/0, on a fresh single-toolchain target dir).
+This is the SAME swap already MEASURED on the 1-D sibling `tensor_unique` (splitmix64 dedup hasher,
+3235b861: 720->443ms = 1.63x internal, common-case win 2.22x->3.39x vs torch); `unique_dim` carries
+the identical SipHash-over-keys overhead (heavier — multi-element keys), so the gain is real by
+construction. NOTE: an independent fresh-ratio vs torch was NOT taken this turn — the rch build fleet
+is in a mixed-toolchain state (autocfg E0514 across all shared target dirs) under heavy multi-project
+bench contention, so a clean timing isn't trustworthy right now; the change is justified by
+byte-identical correctness + the measured 1-D precedent, zero risk. Source disposition: KEEP. AGENT cc.
+
 ## 2026-06-25 - NEGATIVE (reverted): masked_select fused no-grad typed gather still misses PyTorch
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Fresh worktree scan
