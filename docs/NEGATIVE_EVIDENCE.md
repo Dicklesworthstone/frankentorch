@@ -8299,3 +8299,23 @@ Existing flip/roll tests (session_flip_1d/2d_dim0, flip_roll_golden_matches_torc
 backward tests via the tape fallback) all pass; f64+f32. ft-api lib + conformance green.
 The same "torch.flip/roll materialize + FT's direct parallel block copy wins" pattern as
 diff — torch is NOT at the bandwidth wall here. AGENT BlackThrush.
+## 2026-06-25 - index_select no-grad fast path (indexing-family scan; repeat/tile surfaced)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. An indexing-family op-scan
+(op_scan3_h2h.rs, [4000,4000] f64 no-grad) found the SAME division-unravel/clone anti-
+pattern (after diff/flip/roll): index_select 7.25x SLOWER (159ms), repeat 2.48x, tile 2.49x
+SLOWER (repeat_interleave on a 2D tensor returns Err in FT — a SEPARATE correctness gap,
+not perf).
+
+INDEX_SELECT FIX: `tensor_index_select` delegated to the tape kernel (clone input +
+per-element division unravel + save-for-backward). A gather along `dim` is a CONTIGUOUS
+block copy (`inner` elements) per (outer, picked-index): out[o,i,k] = in[o, idx[i], k].
+Added a no-grad fast path: read the indices, borrow the contiguous storage, parallelize
+over output blocks (one cheap division per BLOCK, not per element), block-copy. Bit-exact;
+non-contiguous / grad fall through. MEASURED index_select [4000,4000] dim=0 f64 no-grad:
+159ms -> FT `7.04ms` / torch `21.1ms` = **3.00x FASTER** (~22x swing; same as diff/flip/roll — torch materializes, FT block-gathers).
+
+repeat/tile (2.48x) replicate data (output 2x = 256MB) — a smaller, more bandwidth-genuine
+gap, surfaced for a follow-up (likely the same division-unravel in the tape repeat). The
+division-unravel anti-pattern in ft-autograd structural/indexing kernels is the recurring
+LOSS->WIN lever this session. AGENT BlackThrush.
