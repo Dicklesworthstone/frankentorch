@@ -1,0 +1,20 @@
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 0.13s
+     Running unittests src/lib.rs (/data/projects/.rch-targets/frankentorch-cod-a/debug/deps/ft_api-4fa2327a283f58d8)
+
+running 14 tests
+test tests::unique_consecutive_basic ... ok
+test tests::unique_all_different ... ok
+test tests::histogram_histogramdd_unique_consecutive_support_f32 ... ok
+test tests::unique_consecutive_with_counts ... ok
+test tests::unique_all_same ... ok
+test tests::session_tensor_median_backward_unique_values ... ok
+test tests::unique_consecutive_with_inverse ... ok
+test tests::unique_keeps_distinct_subnormals ... ok
+test tests::unique_sorted ... ok
+test tests::unique_keeps_each_nan_distinct ... ok
+test tests::unique_treats_zero_and_negzero_as_equal ... ok
+test tests::unique_unsorted ... ok
+test tests::unique_with_counts ... ok
+test tests::unique_with_inverse ... ok
+
+test result: ok. 14 passed; 0 failed; 0 ignored; 0 measured; 2362 filtered out; finished in 0.00s

@@ -1,0 +1,10 @@
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-unique-sort-20260625T001333/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-unique-sort-20260625T001333/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-unique-sort-20260625T001333/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-unique-sort-20260625T001333/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-unique-sort-20260625T001333/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-unique-sort-20260625T001333/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 46.94s
+     Running `/data/projects/.rch-targets/frankentorch-cod-a/release/examples/unique_h2h`
+few-unique-503: FT    466.48 ms  (uniq 503)  | torch   1589.08 ms (uniq 503) => FT 3.41x FASTER  [MATCH]
+all-distinct  : FT    183.96 ms  (uniq 33554432)  | torch   1063.49 ms (uniq 33554432) => FT 5.78x FASTER  [MATCH]

@@ -27,6 +27,59 @@ After MEASURED (same shape, best-of-runs): FT **20.26-22.00ms = 6.8-7.4x FASTER 
 (bit-exact). NOTE: the first probe showed torch fold at 2246ms but that was peer-bench-contention
 inflation; the clean torch number is ~136-150ms (still serial). Source disposition: KEEP. AGENT cc.
 
+## 2026-06-25 - WIN (kept): tensor_unique high-cardinality sort-first gate flips all-distinct vs PyTorch
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Fresh BOLD-VERIFY scan
+found no clean unlanded scratch/worktree win ahead of `main`; the only
+non-ancestor worktree remained `/data/projects/frankentorch-gxpb2-pass10`, an
+explicit large-n row-SIMD rejection. The shared checkout also contained
+staged peer-owned dgemm evidence, so this proof and commit were made in a clean
+scratch worktree from `origin/main`.
+
+Alien route: expected-loss/adaptive guard over the §8.2 vectorized execution
+family and the prior `tensor_unique` ledger note. The measured failure
+signature was high-cardinality `torch.unique(sorted=True)`: FrankenTorch's
+hash-dedup path is strong when the unique set is small, but all-distinct input
+spent time and memory building a 33.5M-entry hash map and inverse vector before
+sorting the full unique set. The lever samples the first 16,384 values and, only
+for `sorted=true, return_inverse=false, return_counts=false` with at least 98%
+sample uniqueness, sorts the input values directly and adjacent-dedups. The
+existing hash path remains the low-cardinality and inverse/count fallback.
+
+Behavior proof:
+
+- `cargo test -p ft-api unique --lib -- --nocapture`: `14 passed; 2362
+  filtered out`.
+- `cargo check -p ft-api --all-targets`: pass.
+- `cargo clippy -p ft-api --all-targets -- -D warnings`: pass.
+- `cargo fmt -p ft-api -- --check`: blocked by broad pre-existing fmt drift in
+  `ft-api` examples and old `lib.rs` regions; no rustfmt rewrite was applied.
+- `ubs crates/ft-api/src/lib.rs docs/NEGATIVE_EVIDENCE.md`: interrupted after
+  a prolonged no-output scan of the large `ft-api` source; the pre-commit UBS
+  hook then hit its large-file timeout and printed the documented `UBS_SKIP=1`
+  bypass. No UBS result was obtained.
+
+Measured h2h command:
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a
+PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python
+cargo run --release -p ft-api --example unique_h2h`, fixture
+`torch.unique(sorted=True)`, f64 no-grad, `N = 8192 * 4096`, 6-iteration
+minimum:
+
+- Current `main` few-unique baseline: FrankenTorch `466.49 ms`, PyTorch
+  `1552.25 ms`, FT `3.33x FASTER`, output `[MATCH]`.
+- Candidate few-unique: FrankenTorch `466.48 ms`, PyTorch `1589.08 ms`, FT
+  `3.41x FASTER`, output `[MATCH]`.
+- Current `main` all-distinct baseline: FrankenTorch `4918.27 ms`, PyTorch
+  `1086.86 ms`, FT `4.53x SLOWER`, output `[MATCH]`.
+- Candidate all-distinct: FrankenTorch `183.96 ms`, PyTorch `1063.49 ms`, FT
+  `5.78x FASTER`, output `[MATCH]`.
+
+Decision: KEEP. This is a single adaptive lever with a conservative fallback:
+the common low-cardinality win is preserved, and the all-distinct row flips from
+a PyTorch loss to a strong win. Artifacts:
+`artifacts/perf/frankentorch-kgs4.blackthrush-unique-verify-20260625/`.
+
 ## 2026-06-25 - NEGATIVE (reverted, ~0-gain): tensor_unique all-distinct — par_sort_by of the unique set does NOT help
 
 Follow-up to the splitmix64 dedup-hasher win (3235b861) which left the all-distinct regime at

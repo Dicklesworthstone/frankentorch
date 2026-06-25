@@ -1,0 +1,8 @@
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 48.51s
+     Running `/data/projects/.rch-targets/frankentorch-cod-a/release/examples/unique_h2h`
+few-unique-503: FT    466.49 ms  (uniq 503)  | torch   1552.25 ms (uniq 503) => FT 3.33x FASTER  [MATCH]
+all-distinct  : FT   4918.27 ms  (uniq 33554432)  | torch   1086.86 ms (uniq 33554432) => FT 4.53x slower  [MATCH]
