@@ -4,6 +4,26 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-25 - WIN (landed): xlogy + xlog1py + logaddexp no-grad single-pass (flips 4.32x/3.77x/7.47x LOSS to ~2.3-2.6x WIN)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Two-input log-family scan (examples/logops_h2h.rs,
+[4000,4000] f64 no-grad positive operands, cat-anchor healthy). logaddexp2 already WIN (3x, routes to the
+parallel `_custom`); xlogy/xlog1py/logaddexp all LOSE (composed multi-op paths):
+
+- `tensor_xlogy` composed log+mul+full_like+eq+isnan+eq+mul+where (~8 passes), 136ms = 4.32x SLOWER.
+- `tensor_xlog1py` same shape with log1p, 138ms = 3.77x SLOWER.
+- `tensor_logaddexp` (base e) CLONED both operands for a finite check (tensor_values_lossy_f64 x2) then
+  COMPOSED ~9 ops (max+sub x2+exp x2+add+log+add), 240ms = 7.47x SLOWER — while logaddexp2 routes straight
+  to the parallel single-pass `_custom`.
+
+Fix: no-grad equal-shape contiguous f64 fast paths. xlogy/xlog1py: borrow both + one parallel pass of
+`(x==0 && !isnan(y)) ? 0 : x*ln(y)` (resp. `x*ln_1p(y)`) — bit-exact with the composed mask (incl
+x=0/y=NaN -> NaN). logaddexp: route directly through `tensor_logaddexp_custom(a,b,false)` (handles NaN/±inf
+identically, save-skipped, parallel) — bit-identical to the composed finite path. xlogy 136->13.2ms = 2.39x
+FASTER; xlog1py 138->15.4ms = 2.29x FASTER; logaddexp 240->12.6ms (~19x internal) = 2.63x FASTER. f32 /
+grad / broadcast / non-contiguous fall through. 19 tests + ft-api lib 2385/0 + conformance 39/0 green.
+AGENT BlackThrush.
+
 ## 2026-06-25 - WIN (landed): sinc no-grad single-pass fast path (flips 4.01x LOSS to 3.74x WIN) + unary special scan
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Unary special-function scan (examples/
