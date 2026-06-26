@@ -4,6 +4,21 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): lerp kernel serial->parallel (3.63x; grad-path / direct-caller)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Serial-kernel hunt (comprehensive awk classifier over
+all *_contiguous_f64 kernels): `lerp_tensor_contiguous_f64`/`_f32` ran serial inline `.iter().zip().map()`
+(`sv + weight*(ev-sv)`). The ft-api no-grad lerp is already fast-pathed, but the SERIAL kernel still backs
+the grad path + direct callers. Parallelized with `par_iter` above PARALLEL_THRESHOLD — bit-identical
+(per-element map, indexed parallel collect preserves order). MEASURED via same-worker RAYON A/B
+(examples/lerp_ab.rs, kernel called directly), [4000,4000] f64: 1t **81.3ms** -> 64t **22.4ms** = **3.63x**
+(1t IS old serial; ratio compressed by box load ~40). ft-api lib 2387/0 + ft-kernel-cpu 548/0 + conformance
+39/0 + ft-api lerp 5/0, bit-exact. NOTE: this concludes the readily-parallelizable serial-kernel surface —
+remaining SERIAL kernels are no-grad-bypassed cat/stack (grad-only, low value), reduction-blocked
+(dot/norm/trace = FP sum order), inherent single-plane linalg (det/eig/svd/inv/qr), or bandwidth-walled
+(index/scatter/masked_select/gather). mean_dim/std_dim flagged SERIAL are FALSE POSITIVES (call parallel
+sum_dim/var_dim, then a tiny serial scale over the small output). AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): cummax last-dim lane parallelization (4.24x; cummax was the lone serial outlier vs cummin)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Serial-kernel hunt: `cummax_dim_tensor_contiguous_f64`

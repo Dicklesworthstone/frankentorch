@@ -11167,10 +11167,21 @@ pub fn lerp_tensor_contiguous_f64(
     }
     let s = &start[offset..offset + numel];
     let e = &end[offset..offset + numel];
-    Ok(s.iter()
-        .zip(e.iter())
-        .map(|(&sv, &ev)| sv + weight * (ev - sv))
-        .collect())
+    // Pure per-element map → parallel above PARALLEL_THRESHOLD (bit-identical to the serial
+    // zip-map; indexed parallel collect preserves order). The no-grad ft-api lerp is already
+    // fast-pathed; this parallelizes the kernel for the grad path / direct callers.
+    if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        Ok(s.par_iter()
+            .zip(e.par_iter())
+            .map(|(&sv, &ev)| sv + weight * (ev - sv))
+            .collect())
+    } else {
+        Ok(s.iter()
+            .zip(e.iter())
+            .map(|(&sv, &ev)| sv + weight * (ev - sv))
+            .collect())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30910,10 +30921,21 @@ pub fn lerp_tensor_contiguous_f32(
     }
     let s = &start[offset..offset + numel];
     let e = &end[offset..offset + numel];
-    Ok(s.iter()
-        .zip(e.iter())
-        .map(|(&sv, &ev)| sv + weight * (ev - sv))
-        .collect())
+    // Pure per-element map → parallel above PARALLEL_THRESHOLD (bit-identical to the serial
+    // zip-map; indexed parallel collect preserves order). The no-grad ft-api lerp is already
+    // fast-pathed; this parallelizes the kernel for the grad path / direct callers.
+    if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        Ok(s.par_iter()
+            .zip(e.par_iter())
+            .map(|(&sv, &ev)| sv + weight * (ev - sv))
+            .collect())
+    } else {
+        Ok(s.iter()
+            .zip(e.iter())
+            .map(|(&sv, &ev)| sv + weight * (ev - sv))
+            .collect())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
