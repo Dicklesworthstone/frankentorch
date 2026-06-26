@@ -4,6 +4,26 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): expand/broadcast row-structured materialization in ft-autograd (meshgrid 4.95x SLOWER -> 3.21x FASTER vs torch)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. struct_survey2_h2h flagged `meshgrid` = **4.95x
+SLOWER** (182ms to build two [4000,4000] grids from [4000]). ROOT CAUSE: meshgrid = reshape + `tensor_expand`,
+and `expand_typed_storage` (ft-autograd, the REAL broadcast path — NOT the test-only
+`expand_tensor_contiguous_f64` kernel, which 121c6b14 already row-structured but which nothing on the expand
+path calls) materialised via `map_typed_storage`'s GENERIC per-element gather: for EVERY output element it ran
+a full `nd`-dim div/mod unravel + a bounds-checked clone. FIX: row-structured fast path for the hot float
+dtypes (F64/F32/F64Inline4) — the innermost target dim is either BROADCAST (input stride 0 → the whole inner
+row is one value → `fill`) or COPIED (stride 1 → a contiguous input run → `copy_from_slice`); unravel the OUTER
+coords ONCE PER ROW (not per element), parallel over rows. Bit-identical to the generic gather (same source
+value at every output position — verified by meshgrid_ij_golden_matches_torch + broadcasting_forward/backward_
+golden_matches_torch + session_tensor_expand_* + 44/0 ft-autograd expand/broadcast tests). Exotic dtypes
+(f16/bf16/complex/quant) + non-contiguous fall through to the unchanged generic path. MEASURED
+(examples/struct_survey2_h2h.rs, torch set_num_threads(8) vs FT-64t, cat_anchor=3.7x FASTER healthy): meshgrid
+**182ms -> 11.7ms** (~15.5x internal) now **3.21x FASTER** than torch (was 4.95x SLOWER). Helps ALL broadcast
+materialization (every broadcasted bias/mean/var in norm op-graphs). ft-autograd 476/0 + ft-api lib 2387/0 +
+conformance 39/0, bit-exact. EDITED ft-autograd via the clean throwaway-worktree pattern. NOTE: survey also
+shows movedim (2.8x) + repeat_interleave (3.1x) still SLOWER — NEXT levers. AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): diagonal no-grad direct strided-gather fast path (68ms -> 0.047ms = 1445x internal; kills 128MB clone)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. The struct survey (prev entry) flagged `tensor_diagonal`

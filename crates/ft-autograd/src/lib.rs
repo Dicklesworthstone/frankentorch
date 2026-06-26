@@ -10338,6 +10338,36 @@ impl TensorTape {
         let output_strides = ft_core::contiguous_strides(target_shape);
         let input_strides =
             Self::broadcast_input_strides(shape, target_shape, "expand input strides overflow")?;
+        // Fast path: ROW-STRUCTURED broadcast for the hot float dtypes. The innermost target dim is
+        // either broadcast (input stride 0 → the whole inner row is one repeated value → fill) or
+        // copied (stride 1 → the row is a contiguous slice of the input → copy_from_slice). Unravel
+        // the OUTER coords ONCE PER ROW instead of running the full per-element div/mod gather over
+        // all output_numel elements. Bit-identical to the generic map_typed_storage gather below
+        // (same source value at every output position). Backs expand/broadcast materialization —
+        // meshgrid + every broadcasted bias/mean/var in norm op-graphs.
+        let nd = target_shape.len();
+        if output_numel > 0 && nd >= 1 && input_strides[nd - 1] <= 1 {
+            let fast = match &storage {
+                TensorStorage::F64(v) if !v.is_empty() => Some(TensorStorage::F64(Arc::new(
+                    Self::expand_row_structured(v, output_numel, target_shape, &input_strides),
+                ))),
+                TensorStorage::F64Inline4(v) if !v.as_slice().is_empty() => {
+                    Some(TensorStorage::F64(Arc::new(Self::expand_row_structured(
+                        v.as_slice(),
+                        output_numel,
+                        target_shape,
+                        &input_strides,
+                    ))))
+                }
+                TensorStorage::F32(v) if !v.is_empty() => Some(TensorStorage::F32(Arc::new(
+                    Self::expand_row_structured(v, output_numel, target_shape, &input_strides),
+                ))),
+                _ => None,
+            };
+            if let Some(out) = fast {
+                return Ok(out);
+            }
+        }
         Self::map_typed_storage(&storage, output_numel, |flat| {
             let mut remaining = flat;
             let mut src_flat = 0usize;
@@ -10348,6 +10378,58 @@ impl TensorTape {
             }
             Ok(src_flat)
         })
+    }
+
+    /// Row-structured broadcast materialization for a contiguous expand (see `expand_typed_storage`).
+    /// The innermost target dim is broadcast (`input_strides[last] == 0` → fill) or copied
+    /// (`== 1` → copy_from_slice); the outer coords are unravelled once per row. Bit-identical to the
+    /// per-element gather. Caller guarantees `values` non-empty, `output_numel > 0`, `inner_stride<=1`.
+    fn expand_row_structured<T: Copy + Send + Sync>(
+        values: &[T],
+        output_numel: usize,
+        target_shape: &[usize],
+        input_strides: &[usize],
+    ) -> Vec<T> {
+        let nd = target_shape.len();
+        let inner = target_shape[nd - 1];
+        let inner_stride = input_strides[nd - 1];
+        // Outer-space strides over the first nd-1 dims (row index r unravels into outer coords).
+        let mut outer_strides = vec![1usize; nd.saturating_sub(1)];
+        for d in (0..nd.saturating_sub(1)).rev() {
+            if d + 1 < nd - 1 {
+                outer_strides[d] = outer_strides[d + 1] * target_shape[d + 1];
+            }
+        }
+        let row_base = |r: usize| -> usize {
+            let mut idx = 0usize;
+            for d in 0..nd - 1 {
+                let c = (r / outer_strides[d]) % target_shape[d];
+                idx += c * input_strides[d];
+            }
+            idx
+        };
+        let mut output = vec![values[0]; output_numel];
+        let fill_row = |r: usize, row: &mut [T]| {
+            let base = row_base(r);
+            if inner_stride == 0 {
+                row.fill(values[base]);
+            } else {
+                row.copy_from_slice(&values[base..base + inner]);
+            }
+        };
+        const PAR_MIN: usize = 1 << 16;
+        if output_numel >= PAR_MIN {
+            use rayon::prelude::*;
+            output
+                .par_chunks_mut(inner)
+                .enumerate()
+                .for_each(|(r, row)| fill_row(r, row));
+        } else {
+            for (r, row) in output.chunks_mut(inner).enumerate() {
+                fill_row(r, row);
+            }
+        }
+        output
     }
 
     fn broadcast_input_strides(
