@@ -1,0 +1,19 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1,active_project_exclusion=1)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 58.79s
+     Running benches/cdist_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/cdist_bench-659f6d43b8e09062)
+Gnuplot not found, using plotters backend
+Benchmarking pdist_f32_p2_mm/512x64
+Benchmarking pdist_f32_p2_mm/512x64: Warming up for 1.0000 s
+Benchmarking pdist_f32_p2_mm/512x64: Collecting 10 samples in estimated 3.0141 s (3080 iterations)
+Benchmarking pdist_f32_p2_mm/512x64: Analyzing
+pdist_f32_p2_mm/512x64  time:   [973.49 µs 998.37 µs 1.0478 ms]
+                        change: [+19.316% +22.953% +27.744%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+Found 2 outliers among 10 measurements (20.00%)
+  1 (10.00%) low mild
+  1 (10.00%) high severe
+

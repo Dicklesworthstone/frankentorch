@@ -4,6 +4,65 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - NEGATIVE (reverted): pdist f32 p=2 blocked upper-GEMM condensed writer regresses
+
+Bead/thread `frankentorch-kgs4`, agent `PearlReef`. Fresh worktree scan found
+no unlanded measured win to land: the only worktree ahead of `origin/main` was
+`/data/projects/frankentorch-gxpb2-pass10`, an explicit large-n row-SIMD
+rejection. Agent Mail registration/reservation was blocked by its corruption
+circuit breaker, and `br list --status in_progress --json` still failed on the
+duplicate `frankentorch-kgs4.150` issue id, so this pass proceeded read-only
+for coordination and did not disturb peer-owned source dirt.
+
+Target selection: current ledger evidence still shows `pdist_f32_p2_mm/512x64`
+as the largest remaining PyTorch-facing gap after the shipped SGEMM/direct
+condensed-output keeps. Prior direct pair loops, row-parallel `f32x8`, flat
+direct SIMD, and Gram-buffer compaction attempts were already rejected. This
+retry moved below the rejected per-pair loops: keep matrixmultiply's SGEMM
+microkernel, but compute only upper-triangle row tiles and write the condensed
+output directly instead of materializing the full `N x N` Gram matrix.
+
+Required literal command probe:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo bench --release -p ft-api --bench cdist_bench --
+pdist_f32_p2_mm/512x64 --warm-up-time 1 --measurement-time 3 --sample-size 10
+--noplot` failed because this Cargo rejects `--release` for `cargo bench`;
+artifact:
+`artifacts/perf/frankentorch-kgs4.cod-b-pdist-output-floor-20260626T004516Z/baseline_literal_cargo_bench_release.log`.
+
+Accepted per-crate bench command:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo bench -p ft-api --bench cdist_bench --
+pdist_f32_p2_mm/512x64 --warm-up-time 1 --measurement-time 3 --sample-size 10
+--noplot`.
+
+Measured:
+
+- Current shipped anchor on RCH worker `vmi1227854`:
+  `pdist_f32_p2_mm/512x64 [673.71 us 694.52 us 712.73 us]`.
+- Candidate blocked-upper-GEMM writer fell back locally because no RCH worker
+  slot was admissible, but used the same crate-scoped command and warm target:
+  `[779.99 us 799.19 us 820.08 us]`, Criterion change
+  `[+10.973% +14.624% +18.816%]`, `p = 0.00`, performance regressed.
+- Post-revert local fallback rerun was noisy and slower
+  `[973.49 us 998.37 us 1.0478 ms]`, so it is not used as a same-worker
+  acceptance comparator.
+- Fresh local PyTorch sidecar, torch `2.12.0+cpu`, 32 threads, same `512x64`
+  f32 `torch.pdist(x, p=2.0)` fixture: `min=0.051077 ms`, `p50=0.054784 ms`,
+  checksum `883173.937500`.
+
+FT/PyTorch ratio by PyTorch min: shipped remote anchor `13.60x SLOWER`
+(`0.69452 / 0.051077`); candidate `15.65x SLOWER`
+(`0.79919 / 0.051077`). Decision: REVERT. Do not retry blocked upper-tile
+SGEMM condensed writing for `pdist_f32_p2_mm/512x64` unless the retry first
+shows same-worker lower-level evidence that upper-tile SGEMM beats one full
+`sgemm_bt` call plus the current condensed output assembly. Score vs PyTorch
+for this lever: `0W / 1L / 0N`.
+
+Gates: `cargo test -p ft-api pdist_p2_f32_fused_nograd_matches_composed_path
+--lib -- --nocapture` passed; `cargo test -p ft-conformance` passed. Artifacts:
+`artifacts/perf/frankentorch-kgs4.cod-b-pdist-output-floor-20260626T004516Z/`.
+
 ## 2026-06-25 - WIN (landed): repeat + tile no-grad block-copy fast path (last-dim repeat)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. `tensor_repeat`/`tensor_tile` (tile
