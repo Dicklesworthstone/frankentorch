@@ -4,6 +4,86 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - NEGATIVE (reverted): f64 logical binary single-pass still loses to PyTorch bool kernels
+
+Bead/thread `frankentorch-kgs4`, agent `PearlReef`. Fresh worktree scan found
+no unlanded measured win to land. The only ahead worktree was
+`/data/projects/frankentorch-gxpb2-pass10`, an explicit large-n row-SIMD
+rejection. Agent Mail registration/reservation was blocked by the corruption
+circuit breaker (`database disk image is malformed`); Beads reads/sync remain
+blocked by duplicate issue id `frankentorch-kgs4.150`.
+
+Gap selection: current `compare_h2h` reproduced `tensor_logical_and` as a
+large PyTorch-facing gap while the cat anchor was healthy. Baseline h2h from
+the retrieved release binary and local PyTorch sidecar:
+
+- `cat_anchor`: FT `16.029 ms`, PyTorch `56.261 ms`, FT `3.51x FASTER`.
+- `logical_and`: FT `35.820 ms`, PyTorch `4.444 ms`, FT `8.06x SLOWER`.
+
+Graveyard route: the candidate maps to vectorized execution / packed boolean
+data layout lessons, especially succinct bitvectors and Roaring-style bitmap
+operators. The single-pass direct map is the lowest-risk probe, but the
+candidate still writes a full f64 0/1 output because that is the current public
+logical convention; PyTorch's comparator is a compact bool tensor. That output
+representation mismatch is the likely remaining wall.
+
+Lever tested: equal-shape contiguous f64 no-grad `logical_and`/`logical_or`/
+`logical_xor` helper that borrows both operands and writes the 0/1 result in one
+Rayon pass, preserving torch truthiness for `-0.0` and `NaN`. Broadcast, grad,
+non-f64, and non-contiguous paths fell through to the existing composed route.
+
+Correctness while candidate was present:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo test -p ft-api logical --lib -- --nocapture`, remote `hz2`,
+`7 passed`.
+
+Candidate h2h command:
+`AGENT_NAME=PearlReef PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec --
+cargo run --release -p ft-api --example compare_h2h`. Remote workers lacked
+`torch`, so the retrieved release binary was run locally against the PyTorch
+sidecar for ratios.
+
+Measured candidate:
+
+- Default local sidecar run: `logical_and` FT `33.464 ms`, PyTorch
+  `16.090 ms`, FT `2.08x SLOWER`.
+- Controlled `RAYON_NUM_THREADS=8` run: `logical_and` FT `14.395 ms`, PyTorch
+  `5.600 ms`, FT `2.57x SLOWER`; `cat_anchor` stayed healthy at FT
+  `2.41x FASTER`.
+
+Required literal bench probe:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo bench --release -p ft-api --bench ops_bench --
+logical_and_probe/f64_4000x4000 --warm-up-time 1 --measurement-time 3
+--sample-size 10 --noplot` failed because this Cargo rejects `--release` for
+`cargo bench`; artifact:
+`artifacts/perf/frankentorch-kgs4.cod-b-logical-f64-20260626T061300Z/cargo_bench_release_rejected.log`.
+
+Accepted temporary Criterion row, added and then removed:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo bench -p ft-api --bench ops_bench --
+logical_and_probe/f64_4000x4000 --warm-up-time 1 --measurement-time 3
+--sample-size 10 --noplot`, RCH local fallback, measured
+`[58.407 ms 61.231 ms 64.455 ms]`.
+
+Decision: REVERT. The one-pass logical map reduces composition but does not
+clear PyTorch because FT's f64 logical-output contract remains bandwidth-heavy.
+Do not retry this surface as a standalone f64 direct-map lever; the next
+credible route is a real bool/bitpacked logical representation plus conversion
+contract, not another f64 map. Source, test, and temporary bench row were
+removed before this ledger commit. Post-revert gates:
+
+- `cargo test -p ft-api logical --lib -- --nocapture` passed, `6 passed`.
+- `cargo test -p ft-conformance` passed, including `199` library tests, all
+  ft-conformance binaries, `5` e2e training tests, PyTorch conformance tests,
+  `39` smoke tests, and doctests.
+
+Score vs PyTorch for this lever: `0W / 1L / 0N`.
+
+Artifacts:
+`artifacts/perf/frankentorch-kgs4.cod-b-logical-f64-20260626T061300Z/`.
+
 ## 2026-06-26 - VERIFICATION (contention-robust A/B): the 52169ffe loss fast paths beat their OLD composed paths 1.52-1.93x
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. With vs-torch measurement still blocked (DRAM
