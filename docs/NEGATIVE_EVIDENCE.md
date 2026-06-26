@@ -4,6 +4,28 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): loss functions (smooth_l1/huber/soft_margin/bce) reduction='none' + core mul_scalar — flips 5.77x/10.75x/2.02x/4.76x LOSS to 2.96x/3.01x/4.09x/5.13x WIN
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Loss-function scan (examples/loss_h2h.rs,
+[4000,4000] f64 no-grad, reduction='none', operands in (0,1), cat-anchor healthy 3.8x). l1/mse already win.
+FOUR composed losers, ALL fixed bit-exact:
+
+- `tensor_smooth_l1_loss` reduction='none' no-grad CLONED both inputs via tensor_values x2 (the parallel
+  forward kernel exists; the clone was the wall) — 189ms = 5.77x SLOWER → BORROW both contiguous → 2.96x.
+- `tensor_huber_loss` = delta*smooth_l1: routing through smooth_l1 + mul_scalar = TWO passes — 340ms =
+  10.75x SLOWER → no-grad 'none' DIRECT one-pass `s=smooth_l1_value(beta=delta); s*delta` → 3.01x. (mean/sum
+  keep the composed route: reduce-then-scale ≠ scale-then-reduce in FP, so don't fold.)
+- `tensor_soft_margin_loss` composed mul+neg+exp+full+add+log — 140ms = 2.02x SLOWER → no-grad borrow
+  single-pass `log(1+exp(-t*x))` (all reductions) → 4.09x.
+- `tensor_bce_loss` reduction='none' composed ~9 ops — 206ms = 4.76x SLOWER → no-grad borrow single-pass
+  `-(t*ln(x)+(1-t)*ln(1-x))` (SAME ops/order as the existing fused mean/sum path) → 5.13x.
+
+★ CORE FIX: `tensor_mul_scalar` routed through the tape op (clone + SERIAL `value*scalar`) even no-grad —
+this was the residual ~136ms in huber and is a HOT op used everywhere. Added a no-grad contiguous-f64 borrow
++ parallel `x*scalar` fast path (bit-identical, mul commutes). FULL ft-api lib 2385/0 (no regression from the
+core change) + conformance 39/0 green. 38 loss tests pass. NOTE: gaussian_nll_loss has the same
+tensor_values-clone 'none' bug (line ~12265) — UNSCANNED follow-up. AGENT BlackThrush.
+
 ## 2026-06-25 - NEGATIVE (no lever): structural big-output ops (outer/vander/diag_embed) are bandwidth-walled / already fast
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Following the cross-product win (narrow/cat composed,
