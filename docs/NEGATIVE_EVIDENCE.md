@@ -4,6 +4,19 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - VERIFICATION (contention-robust A/B): the 52169ffe loss fast paths beat their OLD composed paths 1.52-1.93x
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. With vs-torch measurement still blocked (DRAM
+contention everywhere; remote workers lack the torch venv), confirmed the 52169ffe loss fixes are REAL wins
+(not regressions/zero-gain) via a torch-free SAME-PROCESS A/B (examples/loss_ab.rs): each loss's NEW API
+fast path vs a faithful reconstruction of its OLD composed path (the literal pre-fix code, public ops), in
+ONE process so the old/new ratio cancels contention. MEASURED [4000,4000] f64 no-grad (worker itself loaded,
+cat-anchor 142ms — but the RATIO is contention-robust): soft_margin NEW 1.62x / kl_div 1.52x / hinge 1.93x
+FASTER than OLD-composed. These ratios UNDERSTATE the vs-torch win (the OLD reconstruction already benefits
+from this session's landed tensor_mul/add/log/scalar fast paths), so the true vs-torch wins are ~2-4x like
+the measured siblings (smooth_l1/bce 2.96-5.13x). Conclusion: 52169ffe is a confirmed bit-exact win; only the
+exact vs-torch NUMBER (not the win itself) awaits a clean window. AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed, bit-exact; vs-torch confirmation BLOCKED by peer DRAM contention): gaussian_nll/kl_div/hinge_embedding 'none' no-grad
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Continuing the loss-fn vein (examples/loss2_h2h.rs).
