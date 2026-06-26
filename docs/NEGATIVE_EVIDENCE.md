@@ -4,6 +4,22 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): repeat_interleave serial push -> parallel chunk-fill (3.1x SLOWER -> 2.85x FASTER vs torch)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. struct_survey2_h2h flagged `repeat_interleave` (1D,
+scalar repeats) = **3.1x SLOWER**. ROOT: its apply_function FORWARD ran a serial nested per-element push
+(`for v in vals { for _ in 0..repeats { result.push(v) } }`) and BACKWARD a serial `grad_in[j/repeats]+=g[j]`.
+Each input element becomes `repeats` CONSECUTIVE output copies (a structured chunk-fill), and grad_in[i] is
+the sum of the i-th contiguous repeats-chunk of grad_output. FIX: forward → pre-alloc + `par_chunks_mut(repeats)`
++ `chunk.fill(vals[i])` (no per-element push); backward → `par_iter_mut` over input lanes, each summing its
+contiguous chunk (per-lane sum order matches the serial `+=` → bit-identical). repeats==0 / empty guarded
+(chunks_mut(0) would panic). Bit-exact: repeat_interleave_basic/_one/_outer_kron_golden_matches_torch/
+_propagates_gradient_via_sum_of_repeats + 8/0 repeat_interleave tests. MEASURED (struct_survey2_h2h.rs, torch
+set_num_threads(8) vs FT-64t, cat_anchor=3.82x FASTER healthy): repeat_interleave [4M]x3 **47ms -> 5.47ms**
+(~8.6x internal) now **2.85x FASTER** than torch (was 3.1x SLOWER). ft-api lib 2387/0 + conformance 39/0,
+bit-exact. EDITED ft-api via the clean throwaway-worktree pattern. NOTE: survey movedim still 3.0x SLOWER
+(transpose materialize vs torch view — permute_slice already cache-blocked; harder lever). AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): expand/broadcast row-structured materialization in ft-autograd (meshgrid 4.95x SLOWER -> 3.21x FASTER vs torch)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. struct_survey2_h2h flagged `meshgrid` = **4.95x
