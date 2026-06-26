@@ -1,0 +1,9 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1)
+error: unexpected argument '--release' found
+
+  tip: a similar argument exists: '--examples'
+  tip: to pass '--release' as a value, use '-- --release'
+
+Usage: cargo bench --examples [BENCHNAME] [-- [ARGS]...]
+
+For more information, try '--help'.

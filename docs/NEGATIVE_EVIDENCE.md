@@ -4,6 +4,72 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - NEGATIVE (reverted): f32 prod finite-zero scan regresses the PyTorch gap
+
+Bead/thread `frankentorch-kgs4`, agent `PearlReef`. Fresh worktree scan found
+no unlanded measured win to land. The only ahead worktree was
+`/data/projects/frankentorch-gxpb2-pass10`, an explicit large-n row-SIMD
+rejection. The dirty mode-count worktree
+`/data/projects/.scratch/frankentorch-blackthrush-mode-count-20260625T0445`
+contains a measured mode win, but that win is already on `main` in
+`c79b47b5` and `7fe0f424` with ledger entries, so this pass moved to a new
+lever on the current f32 global reduction gap.
+
+Lever tested: a no-grad f32 `tensor_prod` finite-zero shortcut for contiguous
+global prod. The candidate scanned f32 storage with Rayon for any zero,
+nonfinite value, and sign parity, then returned signed zero when PyTorch's
+finite-zero contract permitted it. A PyTorch sidecar check confirmed the
+required zero contract before benchmarking: odd negative parity keeps `-0.0`,
+even parity keeps `+0.0`, and `inf * 0` / `nan * 0` remain `NaN`.
+
+Targeted correctness for the candidate passed before rejection:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo test -p ft-api global_prod_f32_zero_shortcut --lib --
+--nocapture` on RCH worker `hz2`, `1 passed`.
+
+Head-to-head h2h command:
+`AGENT_NAME=PearlReef PYTORCH_PYTHON=/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python
+CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec --
+cargo run --release -p ft-api --example reduction_f32_h2h`.
+
+Measured h2h candidate, RCH local fallback:
+
+- `prod` f32 `[4000,4000]`: FT `6.560 ms`, PyTorch `0.450 ms`,
+  `14.59x SLOWER`.
+- Current shipped ledger anchor for the same row was FT `4.99 ms`, PyTorch
+  `0.557 ms`, `8.96x SLOWER`.
+
+Required literal bench probe:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo bench --release -p ft-api --bench ops_bench --
+prod_zero_probe/f32_4000x4000 --warm-up-time 1 --measurement-time 3
+--sample-size 10 --noplot` failed because this Cargo rejects `--release` for
+`cargo bench`; artifact:
+`artifacts/perf/frankentorch-kgs4.cod-b-f32-prod-zero-20260626T012000Z/cargo_bench_release_rejected.log`.
+
+Accepted temporary Criterion row, added and then removed:
+`AGENT_NAME=PearlReef CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo bench -p ft-api --bench ops_bench --
+prod_zero_probe/f32_4000x4000 --warm-up-time 1 --measurement-time 3
+--sample-size 10 --noplot`, RCH local fallback, measured
+`[13.960 ms 14.909 ms 15.849 ms]`.
+
+Decision: REVERT. The extra scan adds a full memory pass and worsens the live
+PyTorch ratio instead of reducing the product gap. Source, candidate test, and
+temporary bench harness were removed before this ledger commit. Post-revert
+gates:
+
+- `cargo test -p ft-api global_var_std_prod_f32_parallel_bypass_keeps_f32_and_matches_reference --lib -- --nocapture`
+  passed, `1 passed`.
+- `cargo test -p ft-conformance` passed, including `199` library tests, all
+  ft-conformance binaries, `5` e2e training tests, PyTorch conformance tests,
+  `39` smoke tests, and doctests.
+
+Score vs PyTorch for this lever: `0W / 1L / 0N`.
+
+Artifacts:
+`artifacts/perf/frankentorch-kgs4.cod-b-f32-prod-zero-20260626T012000Z/`.
+
 ## 2026-06-26 - NEGATIVE (reverted): masked_fill direct no-grad Criterion row reconfirms no-ship
 
 Bead/thread `frankentorch-kgs4`, agent `PearlReef`. Fresh worktree scan found

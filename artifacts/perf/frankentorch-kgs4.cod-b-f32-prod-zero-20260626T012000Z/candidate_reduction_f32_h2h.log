@@ -1,0 +1,4 @@
+op (f32 [4000,4000])   FT(ms)   PT(ms)   ratio
+  prod        6.560    0.450   FT 14.59x SLOWER
+  var         5.253    2.304   FT 2.28x SLOWER
+  std         4.278    1.984   FT 2.16x SLOWER
