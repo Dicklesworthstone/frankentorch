@@ -4,6 +4,20 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): core scalar ops add_scalar/sub_scalar/mul_scalar/div_scalar no-grad — flips ~4x LOSS to ~1.2-2.5x WIN
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Binary/scalar arithmetic scan (examples/binops_h2h.rs,
+[4000,4000] f64 no-grad, cat-anchor healthy 2.9x). The BINARY ops (add/mul/div tensor-tensor) already WIN
+(1.9-2.2x). But the SCALAR ops `add_scalar`/`sub_scalar`/`mul_scalar`/`div_scalar` (the
+scalar_leaf_matching_dtype + broadcasting-binary-op family at lib.rs ~74948, distinct from the tape-routed
+tensor_mul_scalar) build a FULL-SIZE scalar leaf then run a binary op — MEASURED 116/107/105ms = 4.35x /
+4.04x / 4.07x SLOWER than `x <op> c`. Added a shared `no_grad_scalar_map_f64` helper: for no-grad
+contiguous f64, borrow the input and apply `x <op> scalar` in ONE parallel pass — no scalar leaf, no binary
+op. Bit-exact (the binary kernel computes the same per-element expression against a constant operand).
+116->18.7ms = 1.42x FASTER (add), 107->18.2ms = 1.46x (mul), 105->23ms = 1.20x (div) — measured on a
+CONTENDED run (anchor 2.23x); clean ~2-2.5x. ALL flip the ~4x loss. Hot core ops used everywhere. FULL
+ft-api lib 2385/0 (no regression) + conformance 39/0 green.
+
 ## 2026-06-26 - WIN (landed): loss functions (smooth_l1/huber/soft_margin/bce) reduction='none' + core mul_scalar — flips 5.77x/10.75x/2.02x/4.76x LOSS to 2.96x/3.01x/4.09x/5.13x WIN
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Loss-function scan (examples/loss_h2h.rs,
