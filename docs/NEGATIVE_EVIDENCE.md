@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-25 - WIN (landed): nextafter + heaviside no-grad borrow + parallelize (flips 22.12x / 8.82x LOSS to 2.29x / 3.15x WIN)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Continuing the elementwise-binary clone+serial vein
+(examples/elembin2_h2h.rs scan, [4000,4000] f64 no-grad, cat-anchor healthy 4.0x). Both no-grad-only ops
+read both operands via `tensor_values` (CLONE x2) then stepped each element SERIALLY:
+
+`tensor_nextafter` (broadcast + tensor_values + serial IEEE next_up/next_down): MEASURED 571ms = 22.12x
+SLOWER. `tensor_heaviside` (broadcast + tensor_values + serial step): 221ms = 8.82x SLOWER. Fix (both): a
+no-grad equal-shape contiguous f64 fast path that BORROWS both operands and steps in PARALLEL — no clones.
+Bit-exact (same per-element predicate; nextafter NaN→NaN, heaviside NaN→0). f32 / broadcast / non-contiguous
+fall through to the original clone path. nextafter 571ms -> 10.2ms (~56x internal) = **2.29x FASTER**;
+heaviside 221ms -> 7.8ms (~28x internal) = **3.15x FASTER**.
+
+12 nextafter/heaviside tests + ft-api lib 2385/0 + conformance 39/0 green. Running tally for the
+elementwise-binary clone+serial vein (commits 8478c92b/28f0e830/THIS): maximum/minimum, hypot, copysign,
+nextafter, heaviside all flipped LOSS→WIN; comparison floor-limited (kept). atan2/fmod/remainder already
+win. AGENT BlackThrush.
+
 ## 2026-06-25 - WIN (landed): hypot + copysign no-grad save-skip + parallelize (flips 10.05x / 7.46x LOSS to 3.09x / 2.29x WIN)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Continuing the elementwise-binary clone-bug vein
