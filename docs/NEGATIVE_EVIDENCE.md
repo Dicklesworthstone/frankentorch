@@ -4,6 +4,22 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): stack kernel serial->parallel block-copy (4.52x; grad-path / direct-caller)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. SIBLING of cat: `stack_tensor_contiguous_f64` built
+the output with a SERIAL `for outer { for input { output.extend_from_slice(&d[range]) } }` double loop. The
+ft-api no-grad stack is already fast, but the SERIAL kernel still backs grad stack + direct callers. Stack is
+CLEANER than cat — all inputs are validated identical shape, so every per-input block is uniformly
+`inner_size` (no empty-input edge: inner_size==0 → out_numel==0 → early return), and `data[offset..]` is
+always valid. Rewrote: precompute each input's `data[offset..]` window, pre-allocate the output, then
+PARALLELIZE over outer rows via `par_chunks_mut(num_inputs*inner_size)` — each outer copies every input's
+`inner_size` block into its disjoint `out_row_len` region with copy_from_slice. Bit-identical to the serial
+extend (same bytes at the same offsets). MEASURED via same-worker RAYON A/B (examples/stack_ab.rs, kernel
+called directly), stack dim=1 [4000,4,4000] f64 (K=4 inputs): 1t **322.9ms** -> 64t **71.5ms** = **4.52x**
+(1t IS old serial). ft-kernel-cpu 548/0 (3/0 stack) + conformance 199/0, bit-exact. This CONCLUDES the
+serial block-copy kernel surface (cat + stack both landed; both were the lone grad-path serial outliers).
+AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): cat kernel serial->parallel block-copy (3.76x; grad-path / direct-caller)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. `cat_tensor_contiguous_f64` built the output with a

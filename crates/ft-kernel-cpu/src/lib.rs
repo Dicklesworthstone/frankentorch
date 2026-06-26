@@ -12777,14 +12777,33 @@ pub fn stack_tensor_contiguous_f64(
     if out_numel == 0 {
         return Ok(Vec::new());
     }
-    let mut output = Vec::with_capacity(out_numel);
-
-    for outer in 0..outer_size {
-        for (data, meta) in inputs {
-            let offset = meta.storage_offset();
-            let d = &data[offset..];
-            let range = checked_contiguous_range(outer, inner_size, "stack slice range overflow")?;
-            output.extend_from_slice(&d[range]);
+    // Parallelize over outer rows (sibling of cat): each outer owns a disjoint
+    // `num_inputs*inner_size` output region into which every input's `inner_size` block is
+    // copied. All inputs share the (validated, non-empty when out_numel>0) shape, so the per-
+    // input block is uniformly `inner_size` and `data[offset..]` is always valid — no empty-
+    // input edge case. Bit-identical to the serial extend (same bytes at the same offsets).
+    let out_row_len = checked_mul(num_inputs, inner_size, "stack row length overflow")?;
+    let windows: Vec<&[f64]> = inputs
+        .iter()
+        .map(|(data, meta)| &data[meta.storage_offset()..])
+        .collect();
+    let mut output = vec![0.0_f64; out_numel];
+    let fill_row = |outer: usize, orow: &mut [f64]| {
+        let base = outer * inner_size;
+        for (k, &window) in windows.iter().enumerate() {
+            orow[k * inner_size..(k + 1) * inner_size]
+                .copy_from_slice(&window[base..base + inner_size]);
+        }
+    };
+    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        output
+            .par_chunks_mut(out_row_len)
+            .enumerate()
+            .for_each(|(outer, orow)| fill_row(outer, orow));
+    } else {
+        for (outer, orow) in output.chunks_mut(out_row_len).enumerate() {
+            fill_row(outer, orow);
         }
     }
 
