@@ -4,6 +4,20 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): where + masked_fill kernels serial->parallel (3.09x / 2.78x same-worker)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Continuing the serial-kernel hunt (the
+contention-immune lever from the clamp win): `where_tensor_contiguous_f64`/`_f32` and
+`masked_fill_tensor_contiguous_f64`/`_f32` in ft-kernel-cpu ran serial inline `.iter().zip().map()`. The
+ft-api no-grad equal-shape `where` fast-paths the kernel, but the SERIAL kernel still backs grad/broadcast
+`where` AND in-place `masked_fill_` (hot in attention causal-masking). Parallelized with `par_iter` above
+PARALLEL_THRESHOLD — bit-identical (pure per-element select, indexed parallel collect preserves order).
+MEASURED via same-worker RAYON_NUM_THREADS A/B calling the kernels directly (examples/whmf_ab.rs;
+contention-robust — 1t IS the old serial), [4000,4000] f64: where 1t **110.1ms** -> 64t **35.6ms** =
+**3.09x**; masked_fill 1t **95.3ms** -> 64t **34.3ms** = **2.78x**. Ratios COMPRESSED by an extreme box load
+(~99) — the parallel run is core/DRAM-starved; clean would be higher (cf clamp 8.76x at load ~45). ft-api
+lib 2386/0 + ft-kernel-cpu 548/0 + conformance 39/0, no regression. AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): clamp kernel serial->parallel (8.76x same-worker speedup; clamp was single-threaded)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Found by CODE INSPECTION (contention-immune, while

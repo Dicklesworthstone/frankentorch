@@ -13415,11 +13415,21 @@ pub fn masked_fill_tensor_contiguous_f64(
     }
 
     let data = &input[offset..offset + numel];
-    let output = data
-        .iter()
-        .zip(mask[offset..offset + numel].iter())
-        .map(|(&d, &m)| if m != 0.0 { value } else { d })
-        .collect();
+    let mask_w = &mask[offset..offset + numel];
+    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial zip-map). The serial form
+    // left in-place masked_fill_ (hot in attention causal-masking) single-threaded.
+    let output = if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        data.par_iter()
+            .zip(mask_w.par_iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    } else {
+        data.iter()
+            .zip(mask_w.iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    };
 
     Ok(output)
 }
@@ -13457,12 +13467,23 @@ pub fn where_tensor_contiguous_f64(
     let x_data = &x[offset..offset + numel];
     let y_data = &y[offset..offset + numel];
 
-    let output = cond
-        .iter()
-        .zip(x_data.iter())
-        .zip(y_data.iter())
-        .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
-        .collect();
+    // Pure per-element select → parallel above PARALLEL_THRESHOLD (bit-identical to the serial
+    // zip-map; indexed parallel collect preserves order). The serial form left grad/broadcast
+    // `where` single-threaded (the no-grad equal-shape path is fast-pathed in ft-api).
+    let output = if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        cond.par_iter()
+            .zip(x_data.par_iter())
+            .zip(y_data.par_iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    } else {
+        cond.iter()
+            .zip(x_data.iter())
+            .zip(y_data.iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    };
 
     Ok(output)
 }
@@ -29983,11 +30004,20 @@ pub fn masked_fill_tensor_contiguous_f32(
         });
     }
     let data = &input[offset..offset + numel];
-    let output = data
-        .iter()
-        .zip(mask[offset..offset + numel].iter())
-        .map(|(&d, &m)| if m != 0.0 { value } else { d })
-        .collect();
+    let mask_w = &mask[offset..offset + numel];
+    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial zip-map; f32 companion).
+    let output = if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        data.par_iter()
+            .zip(mask_w.par_iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    } else {
+        data.iter()
+            .zip(mask_w.iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    };
     Ok(output)
 }
 
@@ -30018,12 +30048,21 @@ pub fn where_tensor_contiguous_f32(
     let cond = &condition[offset..offset + numel];
     let x_data = &x[offset..offset + numel];
     let y_data = &y[offset..offset + numel];
-    let output = cond
-        .iter()
-        .zip(x_data.iter())
-        .zip(y_data.iter())
-        .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
-        .collect();
+    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial zip-map; f32 companion).
+    let output = if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        cond.par_iter()
+            .zip(x_data.par_iter())
+            .zip(y_data.par_iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    } else {
+        cond.iter()
+            .zip(x_data.iter())
+            .zip(y_data.iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    };
     Ok(output)
 }
 
