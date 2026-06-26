@@ -4,6 +4,28 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-25 - WIN (landed): hypot + copysign no-grad save-skip + parallelize (flips 10.05x / 7.46x LOSS to 3.09x / 2.29x WIN)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Continuing the elementwise-binary clone-bug vein
+(examples/elembin_h2h.rs scan, [4000,4000] f64 no-grad, cat-anchor healthy 3.7x). atan2/fmod/remainder
+already win (1.4-3.0x, lean tape ops — left alone). Two losers, both f64 output (no mask floor) → winnable:
+
+`tensor_hypot` (apply_function): the forward UNCONDITIONALLY `save_for_backward(x.to_vec())` x2 (2*numel
+dead clones in no-grad — the no-grad save-skip vein) AND computed `x.hypot(y)` SERIALLY over numel.
+MEASURED 292ms = 10.05x SLOWER. Fix: gate the saves on `ctx.needs_input_grad().iter().any()` + parallelize
+the per-element hypot. 292ms -> 11.6ms (~25x internal) = **3.09x FASTER**. Grad path untouched (saves still
+happen when grad is needed).
+
+`tensor_copysign` (no-grad-only): read both operands via `tensor_values_lossy_f64` (CLONE x2) then copysign
+SERIALLY. MEASURED 218ms = 7.46x SLOWER. Fix: for equal-shape contiguous f64, BORROW both + parallel
+copysign; f32/non-contiguous fall through to the (now parallel) lossy path. 218ms -> 12.8ms (~17x internal)
+= **2.29x FASTER**. Bit-exact (IEEE sign-of-zero preserved by f64::copysign).
+
+Both bit-exact (per-element, order-independent). 11 hypot/copysign tests + ft-api lib 2385/0 + conformance
+39/0 green. VEIN NOTE: the win is the (save-skip OR borrow) + parallelize combo for f64-output elementwise
+binaries; the f64-MASK ops (comparison) stay floor-limited, but f64-VALUE ops (max/min/hypot/copysign) win
+cleanly. AGENT BlackThrush.
+
 ## 2026-06-25 - WIN (landed): maximum/minimum no-grad borrow fast path (flips 14.67x LOSS to ~2-2.86x WIN) + comparison clone-elision (40x->2.3x gap reduction)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Two elementwise-binary clone bugs found by a
