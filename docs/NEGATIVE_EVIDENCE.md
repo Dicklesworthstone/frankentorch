@@ -4,6 +4,25 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-25 - WIN (landed): multi-dim + outer-dim flip col_map fast path (flips 3.61x / 2.95x LOSS to ~2.2-2.4x WIN)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. `tensor_flip` only fast-pathed `dims.len()==1`,
+and even that UNDER-PARALLELIZED an outer-dim flip: for `flip([0])` on [4000,4000], `outer==1` so the
+block-reversal split over `outer` ran fully SERIAL (measured 2.95x SLOWER, 61ms). Multi-dim `flip([0,1])`
+fell through to the tape's per-element division-unravel (3.61x SLOWER, 90ms). LEVER (same col_map trick
+as the reflect-pad win): the last dim's source-column map is identical for every row (reversed iff the
+last dim is flipped), so precompute `col_map[in_last]` ONCE; then per output ROW decode the OUTER coords,
+reverse the flipped outer dims to get the source row, gather via col_map. Parallel over OUTPUT ROWS
+(~outer rows) regardless of which dims flip — this single path subsumes the old single-dim path AND fixes
+the outer-dim serial pathology AND adds multi-dim. Input BORROWED (f64 + f32). Bit-identical to the tape
+flip (covered by session_flip_2d_both_dims / _dim0; out-of-range/duplicate/empty dims fall through to the
+tape's validation). grad / non-contiguous fall through.
+
+MEASURED [4000,4000] f64 no-grad: flip([0,1]) 90ms->10.7ms = 3.61x SLOWER -> 1.93-2.23x FASTER;
+flip([0]) 61ms->9.6ms = 2.95x SLOWER -> 2.40-2.41x FASTER; flip([1]) stays a win (1.85-2.32x, no
+regression) (flip_roll_h2h, two runs, cat-anchor healthy 2.5-2.8x). ft-api lib 2385/0 + conformance 39/0
+green. AGENT BlackThrush.
+
 ## 2026-06-25 - WIN (landed): reflect/replicate/circular pad no-grad col_map fast path (flips ~3.3-3.8x LOSS to ~3.5x WIN)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. The no-grad reflect/replicate/circular pad
