@@ -4,6 +4,23 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): diagonal no-grad direct strided-gather fast path (68ms -> 0.047ms = 1445x internal; kills 128MB clone)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. The struct survey (prev entry) flagged `tensor_diagonal`
+= **68ms** to extract the 4000-elt main diagonal of a [4000,4000] f64 (= **3800x SLOWER** than torch's view).
+ROOT CAUSE: it `tensor_reshape(input,[m*n])` — which MATERIALISES (clones) the whole 16M-elt / 128MB storage —
+then `index_select`s diag_len elements out of it. Added a NO-GRAD f64 fast path: when the input is contiguous,
+no-grad, f64, read the `diag_len` strided diagonal elements DIRECTLY (`vals[(row_start+i)*n+col_start+i]`) into
+a small Vec and return it as a no-grad leaf — no reshape, no 128MB clone, no gather. Bit-identical (same
+diagonal values, same f64 dtype, same no-grad leaf); grad / f32 / f16 / bf16 / non-contiguous fall through to
+the unchanged reshape+index_select tape path (verified: diagonal_propagates_gradient* + *_f32_offset + 32/0
+diagonal tests still pass). MEASURED [4000,4000] f64 (examples/struct_survey_h2h.rs): **68ms -> 0.047ms =
+~1445x** FT-internal; vs torch the gap collapses from **3800x SLOWER -> 3.22x SLOWER** — and that 3.22x is now
+just torch returning a ZERO-COPY VIEW (0.015ms) vs FT materialising 4000 elts (0.047ms, session-alloc bound),
+i.e. effectively at-parity for a materialising framework; the pathological clone is GONE. ft-api lib 2386/0
+(32/0 diagonal) + conformance 39/0, bit-exact. EDITED ft-api via the clean throwaway-worktree pattern (peer
+PearlReef still holds count_nonzero WIP in main; different fn → clean rebase). AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): tril+triu serial apply_function closure -> parallel (1.95x SLOWER -> 5.1x FASTER vs torch)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Data-driven dig: with the box verified CLEAR (Rust 200MB
