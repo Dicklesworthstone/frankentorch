@@ -9196,3 +9196,32 @@ MEASURED stack([x,x], dim=0) [4000,4000] f64 no-grad: 73.9ms -> FT `13.3ms` / to
 wherever a block-copy fast path has few/large blocks. ft-api lib + conformance green
 (stack dim0 / cat_stack golden / vstack/hstack/dstack / grad-fallthrough tests pass).
 AGENT BlackThrush.
+
+## 2026-06-26 - REJECT: direct scalar masked_fill no-grad path regressed vs PyTorch
+
+Agent `PearlReef`. Tested the obvious follow-up from the 2026-06-25 structural/select
+scan: replace `tensor_masked_fill(input, mask, value)`'s `full(shape, value) + where`
+composition with a same-shape no-grad contiguous-f64 direct scalar fill loop:
+`out[i] = mask[i] != 0 ? value : input[i]`. This removes the full-value tensor
+allocation, but it also loses the currently optimized composed path's behavior enough
+to regress the real h2h.
+
+Current-main baseline, local PyTorch oracle
+(`/data/projects/frankentorch/.venv-oracle/bin/python`, torch `2.12.0+cpu`), command
+`PYTORCH_PYTHON=/data/projects/frankentorch/.venv-oracle/bin/python /data/projects/.rch-targets/frankentorch-cod-a/release/examples/op_scan4_h2h`:
+
+- `masked_fill`: FT `75.319 ms`, PyTorch `45.547 ms` => FT `1.65x SLOWER`.
+
+Candidate after direct scalar fill, command
+`PYTORCH_PYTHON=/data/projects/frankentorch/.venv-oracle/bin/python CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a cargo run --release -p ft-api --example op_scan4_h2h`:
+
+- `masked_fill`: FT `89.142 ms`, PyTorch `39.230 ms` => FT `2.27x SLOWER`.
+
+Verdict: measured loss. Candidate was manually reverted; `crates/ft-api/src/lib.rs`
+has no remaining diff. The branchy direct loop is not the right lever for this surface;
+the remaining `where`/`masked_fill` gap needs SIMD/select machinery or a different
+mask-density strategy, not a scalar par-iter rewrite. `rch exec -- cargo bench --release
+-p ft-api --no-run` was also attempted per campaign instruction and failed because Cargo
+does not accept `--release` for `bench`; the per-crate `rch exec -- cargo run --release
+-p ft-api --example op_scan4_h2h` build succeeded on `vmi1227854` but that worker lacks
+`torch`, so the PyTorch ratio above is from the local oracle run. AGENT PearlReef.
