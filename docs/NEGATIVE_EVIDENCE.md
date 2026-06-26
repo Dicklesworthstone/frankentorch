@@ -4,6 +4,28 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed, bit-exact; vs-torch confirmation BLOCKED by peer DRAM contention): gaussian_nll/kl_div/hinge_embedding 'none' no-grad
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Continuing the loss-fn vein (examples/loss2_h2h.rs).
+Three more composed/clone losers, all fixed with the SAME recipe already proven on smooth_l1/huber/
+soft_margin/bce (measured 2.96-5.13x FASTER on a CLEAN worker earlier this session):
+- `tensor_gaussian_nll_loss` 'none' CLONED 3 inputs via tensor_values → borrow contiguous + same parallel
+  gaussian_nll_forward_f64 kernel (bit-identical).
+- `tensor_kl_div` 'none' composed exp/log+sub+mul → no-grad borrow single-pass (SAME per-element formula
+  as the existing fused mean/sum path: log_target ? exp(t)*(t-x) : t*(ln t - x)).
+- `tensor_hinge_embedding_loss` composed full x3+sub+maximum+eq+where → no-grad borrow single-pass
+  `t==1 ? x : maximum(0, margin-x)` (NaN-PROPAGATING max to match tensor_maximum).
+
+★ MEASUREMENT BLOCKER (surfaced): the local box is under PEER DRAM-BANDWIDTH contention (a sblast.py
+process saturating memory). The cat-anchor — a guaranteed FT win, normally 3-4x FASTER — reads 2.45-2.83x
+SLOWER across 6 runs and at both 64t and 8t, so FT's 64-thread bandwidth-bound ops CANNOT be fairly measured
+vs torch's 8-thread right now (the win comes from many threads, which DRAM starvation kills). EVIDENCE the
+fixes are real regardless: bit-exact (full ft-api lib 2385/0 + conformance 39/0, loss tests validate vs torch
+goldens), and FT ABSOLUTE time dropped under the SAME contention — gaussian_nll 555→254ms, kl_div 268→172ms,
+hinge 468→174ms (1.5-2.7x internal). Reverting bit-exact work-reducing code over a transient peer-contention
+window would be wrong; clean vs-torch ratios (expected ~2-4x like the sibling losses) to be re-captured when
+the anchor recovers. AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): core scalar ops add_scalar/sub_scalar/mul_scalar/div_scalar no-grad — flips ~4x LOSS to ~1.2-2.5x WIN
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Binary/scalar arithmetic scan (examples/binops_h2h.rs,
