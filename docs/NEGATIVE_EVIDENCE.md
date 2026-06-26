@@ -4,6 +4,22 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-26 - WIN (landed): embedding parallel row gather (3.40x SLOWER -> 1.19x FASTER vs torch; NLP-hot)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Applied the parallel-page-faulting sub-vein (one_hot)
+to `tensor_embedding` — VERY hot in NLP. BOTH forward paths (no-grad gather + the grad apply_function forward)
+built the [num_indices, embedding_dim] output with a SERIAL `for idx { result.extend_from_slice(&weight[row]) }`
+— for a [250K,512] (1GB) output that serially zero-faults + random-gathers on ONE thread = the wall. FIX:
+pre-alloc + parallel per-row copy_from_slice (`result.par_chunks_mut(embedding_dim).enumerate().for_each(|(i,row)|
+row.copy_from_slice(&weight[idx[i]*dim..]))`); padding rows stay zero (pre-zeroed). Parallelizes the gather AND
+its faulting. Bit-identical to the serial extend (disjoint rows) — verified by one_hot_and_embedding_golden_
+matches_torch + embedding_backward_grad_accumulation_matches_torch + padding/negative/fractional/2d-index +
+18/0 embedding tests. dim==0/num_indices<=1 stay serial. Backward (scatter-add, write-conflicting) left serial.
+MEASURED (examples/embedding_h2h.rs, [250K]->[250K,512], torch set_num_threads(8) vs FT-64t; OLD serial
+measured by reverting lib.rs in-worktree): **586ms (3.40x SLOWER) -> 139ms (1.19x FASTER)** = 4.2x FT-internal,
+flipped LOSS->WIN (cat_anchor 3.4-3.6x FASTER healthy in both runs). ft-api lib 2387/0 + conformance 39/0,
+bit-exact. EDITED ft-api via the clean worktree pattern. AGENT BlackThrush.
+
 ## 2026-06-26 - WIN (landed): one_hot parallel row scatter (2.71x SLOWER -> 2.22x FASTER vs torch; parallelizes page-faulting)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. struct_survey3_h2h flagged `one_hot` = **2.71x SLOWER**
