@@ -9,7 +9,7 @@
 use std::fmt;
 
 use rayon::prelude::*;
-use wide::{f32x8, f64x4};
+use wide::{CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, f32x8, f64x4};
 
 const BATCH_NORM_MIN_PAR_ROWS: usize = 8;
 
@@ -27791,36 +27791,117 @@ define_binary_f32!(remainder_tensor_contiguous_f32, |a: f32, b: f32| a
 
 // ── Comparison ops f32 ──────────────────────────────────────────────────
 
-define_binary_f32!(eq_tensor_contiguous_f32, |l: f32, r: f32| if l == r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(ne_tensor_contiguous_f32, |l: f32, r: f32| if l != r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(lt_tensor_contiguous_f32, |l: f32, r: f32| if l < r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(gt_tensor_contiguous_f32, |l: f32, r: f32| if l > r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(le_tensor_contiguous_f32, |l: f32, r: f32| if l <= r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(ge_tensor_contiguous_f32, |l: f32, r: f32| if l >= r {
-    1.0f32
-} else {
-    0.0f32
-});
+fn f32_comparison_mask(mask: f32x8) -> f32x8 {
+    mask.blend(f32x8::ONE, f32x8::ZERO)
+}
+
+pub fn eq_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l == r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_eq(b)),
+    )
+}
+
+pub fn ne_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l != r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(!a.cmp_eq(b)),
+    )
+}
+
+pub fn lt_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l < r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_lt(b)),
+    )
+}
+
+pub fn gt_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l > r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_gt(b)),
+    )
+}
+
+pub fn le_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l <= r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_le(b)),
+    )
+}
+
+pub fn ge_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l >= r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_ge(b)),
+    )
+}
 
 // ── Hand-written complex f32 kernels ────────────────────────────────────
 
@@ -32310,7 +32391,9 @@ mod tests {
         let zero = f32x8::splat(0.0f32);
         let one = f32x8::splat(1.0f32);
         // (scalar_op, simd_op) pairs mirroring the live neg/abs/sqrt/reciprocal/relu
-        let sizes = [0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003];
+        let sizes = [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003,
+        ];
         for &numel in &sizes {
             let mut w: Vec<f32> = (0..numel)
                 .map(|i| ((i % 4099) as f32 - 2049.5) * 0.013)
@@ -32325,8 +32408,7 @@ mod tests {
             }
             let pos: Vec<f32> = w.iter().map(|&x| x.abs() + 1e-6).collect();
             let bits_eq = |a: &[f32], b: &[f32]| {
-                a.len() == b.len()
-                    && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
             };
             // neg
             assert!(
@@ -32432,6 +32514,81 @@ mod tests {
                     &super::simd_binary_f32_parallel(&l, &r, |x, y| x / y, |a, b| a / b),
                 ),
                 "div numel={numel}"
+            );
+        }
+    }
+
+    #[test]
+    fn simd_comparison_f32_matches_scalar_masks() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        let sizes = [0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003];
+        for &numel in &sizes {
+            let mut l: Vec<f32> = (0..numel)
+                .map(|i| ((i % 4099) as f32 - 2049.5) * 0.013)
+                .collect();
+            let mut r: Vec<f32> = (0..numel)
+                .map(|i| ((i % 3001) as f32 - 1500.5) * 0.017)
+                .collect();
+            if numel >= 6 {
+                let t = numel - 6;
+                l[t] = f32::NAN;
+                r[t] = f32::NAN;
+                l[t + 1] = f32::NAN;
+                r[t + 1] = 1.0;
+                l[t + 2] = -0.0;
+                r[t + 2] = 0.0;
+                l[t + 3] = f32::INFINITY;
+                r[t + 3] = 3.0;
+                l[t + 4] = f32::NEG_INFINITY;
+                r[t + 4] = f32::NEG_INFINITY;
+                l[t + 5] = 2.0;
+                r[t + 5] = 3.0;
+            }
+            let meta = TensorMeta::from_shape(vec![numel], DType::F32, Device::Cpu);
+            let reference = |op: fn(f32, f32) -> bool| {
+                l.iter()
+                    .zip(r.iter())
+                    .map(|(&left, &right)| if op(left, right) { 1.0f32 } else { 0.0f32 })
+                    .collect::<Vec<_>>()
+            };
+            let bits_eq = |a: &[f32], b: &[f32]| {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            let assert_matches = |name: &str, got: Vec<f32>, want: Vec<f32>| {
+                assert!(bits_eq(&got, &want), "{name} numel={numel}");
+            };
+
+            assert_matches(
+                "eq",
+                super::eq_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left == right),
+            );
+            assert_matches(
+                "ne",
+                super::ne_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left != right),
+            );
+            assert_matches(
+                "lt",
+                super::lt_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left < right),
+            );
+            assert_matches(
+                "gt",
+                super::gt_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left > right),
+            );
+            assert_matches(
+                "le",
+                super::le_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left <= right),
+            );
+            assert_matches(
+                "ge",
+                super::ge_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left >= right),
             );
         }
     }

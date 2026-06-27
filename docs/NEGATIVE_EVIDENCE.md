@@ -42,6 +42,32 @@ other typed f32 dispatch arms that `.map(f64::from)` a native f32 kernel result 
 but norm returns a SCALAR so the round-trip is 1 value = harmless). Finder = examples/survey_f32_wide_h2h.rs +
 clamp_f32_parity.rs. AGENT BlackThrush.
 
+## 2026-06-27 - WIN (landed): SIMD f32 comparison masks — gt 8.09x SLOWER -> 3.16x SLOWER vs torch
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. This is the follow-up lever explicitly routed by the
+prior f32 comparison clone-elision entry: after `tensor_comparison` stopped cloning f32 operands, the hot
+`eq`/`gt` gap was no longer API setup but the kernel itself. ROOT: `eq/ne/lt/gt/le/ge_tensor_contiguous_f32`
+still expanded through `elementwise_contiguous_f32`, a parallel scalar closure with branchy
+`if predicate { 1.0 } else { 0.0 }` per element. The existing f32 add/sub/mul/div path already had
+`simd_elementwise_f32` -> `simd_binary_f32_parallel`; comparisons simply were not using it. FIX: route all six
+f32 comparison kernels through the same parallel-SIMD binary helper and use `wide::f32x8` ordered comparisons +
+`mask.blend(ONE, ZERO)` to materialize the f32 0/1 mask. `ne` uses `!cmp_eq` rather than ordered `cmp_ne` so
+NaN follows Rust/PyTorch (`NaN != x` true). Broadcast/non-contiguous/API gates unchanged.
+
+Evidence: kernel parity `simd_comparison_f32_matches_scalar_masks` covers all six ops across 0/1/7/8/9/15/16/17,
+chunk-boundary, and 1,000,003-element sizes with NaN/±inf/±0 tails; it passed. PyTorch bit parity
+`cmp_f32_parity` (eq/ne/lt/gt/le/ge over 100003 incl NaN/±inf/±0/ties) stayed **0 mismatches each**. Local H2H
+after the prior borrow-only path in this same session had `eq` FT `10.688 ms`, torch `2.276 ms` =
+**4.70x SLOWER** and `gt` FT `17.624 ms`, torch `2.178 ms` = **8.09x SLOWER**. After SIMD compare+blend:
+`eq` FT `7.188 ms`, torch `1.842 ms` = **3.90x SLOWER**; `gt` FT `6.938 ms`, torch `2.198 ms` =
+**3.16x SLOWER**. Valid per-crate Criterion bench
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b rch exec -- cargo bench -p ft-kernel-cpu --bench elementwise_bench comparison_f32`
+measured raw kernels `eq_4000x4000` `[12.816 ms 12.894 ms 13.023 ms]` and `gt_4000x4000`
+`[13.487 ms 13.933 ms 14.173 ms]`. Literal requested bench form with `--release` was run and still fails because
+this Cargo rejects `cargo bench --release`. Residual wall: FrankenTorch still writes a 64MB f32 mask while torch
+writes a 16MB bool mask; closing the last ~3-4x needs real bool/int TensorStorage or a packed mask path, not more
+scalar closure tuning. AGENT BlackThrush.
+
 ## 2026-06-27 - WIN (landed): f32 comparison no-grad BORROW fast path — eq/gt 40x SLOWER -> ~6-8x (clone elimination)
 
 Bead/thread `frankentorch-kgs4.169`, agent `BlackThrush`. survey_f32_wide_h2h flagged f32 `eq`/`gt` at **~40x
