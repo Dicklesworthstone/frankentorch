@@ -4,6 +4,23 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): AVX2 8×8 register-blocked F32 transpose (2.7x SLOWER -> 1.6x FASTER vs torch)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. f32 sibling of the f64 AVX2 transpose (prev entry) —
+f32 is the dominant ML dtype. `ft_kernel_cpu::transpose_2d_f32` = AVX2 **8×8** in-register transpose (8 f32 per
+`__m256`: load 8 contiguous src rows → `_mm256_unpacklo/unpackhi_ps` → `_mm256_shuffle_ps::<0x44/0xEE>` →
+`_mm256_permute2f128_ps::<0x20/0x31>` = the `_MM_TRANSPOSE8_PS` sequence → store 8 contiguous dst rows), so
+both loads+stores are vectorized+contiguous; parallel over disjoint 8-output-row blocks; avx2 runtime gate +
+scalar fallback + non-multiple-of-8 tail/partial-chunk cleanup. Wired into ft-autograd `permute_typed_storage`
+F32 arm for the pure 2-D perm==[1,0] case (covers movedim/transpose/swapaxes/.mT on f32). Bit-exact:
+transpose_2d_f32_matches_scalar_reference_all_sizes (edges + non-mult-of-8) + 52/0 ft-autograd + 23/0 ft-api
+transpose tests; ft-kernel-cpu 552/0 + ft-autograd 476/0 + ft-api 2388/0 + conformance 39/0. MEASURED
+(examples/movedim_f32_h2h.rs, [4000,4000] f32, torch set_num_threads(8) vs FT-64t; OLD baseline by in-worktree
+revert): movedim **33.1ms (2.66-2.78x SLOWER) -> 7.5ms (1.5-1.76x FASTER)** = ~4.4x internal (3-run). NOTE: the
+f32 cat_anchor in that harness reads slow (f32 `cat` itself is a separate unfixed gap — ~250ms — NOT
+contention; FT movedim 7.5ms matches the f64 SIMD transpose, confirming a healthy box). NEXT: f32 cat path
+(slow, likely operand clone). AGENT BlackThrush.
+
 ## 2026-06-27 - WIN (landed): AVX2 register-blocked 2-D transpose (2.5x SLOWER -> 2.8x FASTER vs torch; closes the top gap)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. CLOSES the biggest measured gap (named in the prev entry):

@@ -10089,13 +10089,22 @@ impl TensorTape {
         // fraction of memory bandwidth). Same values written ⇒ transparent to autograd (the tape
         // Permute node owns the backward). frankentorch-kgs4.
         if perm.len() == 2 && perm[0] == 1 && perm[1] == 0 {
-            if let TensorStorage::F64(values) = tensor.typed_storage() {
-                let rows = meta.shape()[0];
-                let cols = meta.shape()[1];
-                let slice = Self::checked_storage_slice(values, start, end)?;
-                return Ok(TensorStorage::F64(Arc::new(ft_kernel_cpu::transpose_2d_f64(
-                    slice, rows, cols,
-                ))));
+            let rows = meta.shape()[0];
+            let cols = meta.shape()[1];
+            match tensor.typed_storage() {
+                TensorStorage::F64(values) => {
+                    let slice = Self::checked_storage_slice(values, start, end)?;
+                    return Ok(TensorStorage::F64(Arc::new(ft_kernel_cpu::transpose_2d_f64(
+                        slice, rows, cols,
+                    ))));
+                }
+                TensorStorage::F32(values) => {
+                    let slice = Self::checked_storage_slice(values, start, end)?;
+                    return Ok(TensorStorage::F32(Arc::new(ft_kernel_cpu::transpose_2d_f32(
+                        slice, rows, cols,
+                    ))));
+                }
+                _ => {}
             }
         }
         Ok(match tensor.typed_storage() {
