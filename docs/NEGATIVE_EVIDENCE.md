@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - BUGFIX + WIN (landed): f32 floor_divide was naive+slow — now correct (div_floor_floating) + 3.89x FASTER
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. f32 survey-d (cat_anchor 3.8x FASTER healthy): floor_div
+1.86x SLOWER, sinc 15.9x / normalize 13.9x SLOWER (sinc/normalize PARITY-RISK: f32 sin via simd_unary_f32 may
+not match Rust f32::sin; normalize = sum-reduction — both deferred). FIXED floor_divide: aten `div_floor_floating`
+(the correct algorithm: `b==0→a/b`; `m=a%b; div=(a-m)/b; if m!=0 && sign(b)!=sign(m) div-=1; round-half-up
+correction; sign-of-zero preserved) only ran when an operand was F64 — so BOTH-f32 floor_divide fell to the
+composed `tensor_div`+`tensor_floor` = NAIVE floor(a/b), which is BOTH ~1.9x SLOWER and INCORRECT for non-finite
+/ sign-of-zero / just-below-integer edges. Added an f32 fast path (equal-shape contiguous, no-grad — grad
+already errors) borrowing both + running `div_floor_floating_f32` in one parallel pass. ★ BIT-EXACT vs torch:
+parity probe (incl 0-divisors) = **0/4096 mismatches, maxulp=0** (deterministic f32 arithmetic, `%`=fmod).
+3/0 floor_divide tests, ft-api lib 2388/0 + conformance 39/0. MEASURED ([4000,4000] f32, torch set_num_threads(8)
+vs FT-64t): **48ms (1.86x SLOWER) -> 6.5ms = 3.89x FASTER** + CORRECTNESS fixed. NOTE: broadcast / non-contiguous
+f32 floor_divide still uses the naive composed path (rare; pre-existing edge-incorrectness). f32-AUDIT update:
+cross_entropy/nll_loss f32 are NOT broken (work with standard int/f64 target — the earlier ERROR was passing an
+f32 target, non-standard); amplitude_to_db returns F64 for f32 input (minor dtype quirk); bitwise_* erroring on
+f32 is CORRECT (torch rejects float bitwise). AGENT BlackThrush.
+
 ## 2026-06-27 - BUGFIX + WIN (landed): f32 unique_dim was BROKEN (errored) — now works + 10.06x FASTER
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Second f32-error-audit fix (after unique). `tensor_unique_dim`
