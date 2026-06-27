@@ -4,6 +4,26 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f32 amax dim0 row-stream morsel floor (ORIG 8.89x -> 3.54x SLOWER vs torch; crate bench 1.19x faster)
+
+Agent `BlackThrush`. Biggest measured f32 wide H2H gap was `amax_dim0` on 4000x4000 f32:
+ORIG survey row `FT 6.261 ms / PyTorch 0.705 ms = 8.89x SLOWER`. The prior rejected gxpb2
+row-SIMD family was not retried. New lever from the graveyard/optimization pass: keep the existing
+row-streaming strided reduction, but stop Rayon from splitting wide dim0 reductions into tiny column
+morsels on high-core hosts. The f32 extremum single-output-row path now floors wide column chunks at
+`SIMD_WIDTH_F32 * 16` only when `inner_size` is large enough, preserving the old behavior for small
+inner sizes while restoring cache/vector-friendly morsel size for wide reductions.
+
+Measured after (same H2H survey): `amax_dim0 FT 3.972 ms / PyTorch 1.121 ms = 3.54x SLOWER`,
+FT wall time `6.261 -> 3.972 ms` (1.58x faster) and PyTorch-gap ratio improved `8.89x -> 3.54x`
+(2.51x gap reduction). Per-crate Criterion bench, run via `rch exec -- cargo bench -p ft-kernel-cpu
+--bench elementwise_bench amax_dim0_f32_4000x4000 -- --warm-up-time 1 --measurement-time 3
+--sample-size 10 --noplot` with `CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b`:
+ORIG median `5.3026 ms`, candidate median `4.4716 ms` (1.19x faster). The literal requested
+`cargo bench --release` form was attempted through `rch` and rejected by Cargo as an unsupported
+bench argument, so the valid bench-profile cargo form is the measured per-crate proof. Conformance:
+`rch exec -- cargo test -p ft-conformance` on `hz2`, green.
+
 ## 2026-06-27 - WIN+FIX (landed): f32 nanmin/nanmax enablement (was ERRORING) + fused fast path, bit-exact
 
 Agent `CrimsonForge`. f32 nanmin/nanmax were BROKEN: the composed path builds an F64 full(±inf) and

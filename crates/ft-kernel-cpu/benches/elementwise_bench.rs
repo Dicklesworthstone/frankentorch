@@ -6,9 +6,9 @@
 use criterion::{Criterion, Throughput, black_box, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{
-    eq_tensor_contiguous_f32, gt_tensor_contiguous_f32, lerp_tensor_contiguous_f32,
-    mean_tensor_contiguous_f32, pow_tensor_contiguous_f32, pow_tensor_contiguous_f64,
-    prod_dim_tensor_contiguous_f32, sum_tensor_contiguous_f32,
+    eq_tensor_contiguous_f32, extremum_dim_values_contiguous_f32, gt_tensor_contiguous_f32,
+    lerp_tensor_contiguous_f32, mean_tensor_contiguous_f32, pow_tensor_contiguous_f32,
+    pow_tensor_contiguous_f64, prod_dim_tensor_contiguous_f32, sum_tensor_contiguous_f32,
 };
 use std::time::Duration;
 
@@ -132,6 +132,19 @@ fn bench_f32_full_reduction(c: &mut Criterion) {
             black_box(
                 prod_dim_tensor_contiguous_f32(black_box(&data), black_box(&flat_meta), 0)
                     .expect("valid f32 prod benchmark input"),
+            )
+        })
+    });
+    c.bench_function("amax_dim0_f32_4000x4000", |b| {
+        b.iter(|| {
+            black_box(
+                extremum_dim_values_contiguous_f32(
+                    black_box(&data),
+                    black_box(&meta),
+                    black_box(0),
+                    black_box(true),
+                )
+                .expect("valid f32 amax dim0 benchmark input"),
             )
         })
     });

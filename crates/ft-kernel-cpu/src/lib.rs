@@ -12766,6 +12766,8 @@ fn extremum_lastdim_value_simd_f32(row: &[f32], is_max: bool) -> f32 {
     best
 }
 
+const EXTREMUM_F32_STREAM_MIN_COL_BLOCK: usize = SIMD_WIDTH_F32 * 16;
+
 pub fn extremum_dim_values_contiguous_f32(
     input: &[f32],
     meta: &TensorMeta,
@@ -12842,9 +12844,14 @@ pub fn extremum_dim_values_contiguous_f32(
         if outer_size == 1 {
             // Single output row: parallelise over column blocks (each streams all rows).
             if parallel {
-                let col_block = inner_size
+                let tiny_morsel = inner_size
                     .div_ceil(rayon::current_num_threads().saturating_mul(4))
                     .max(1);
+                let col_block = if inner_size >= EXTREMUM_F32_STREAM_MIN_COL_BLOCK * 2 {
+                    tiny_morsel.max(EXTREMUM_F32_STREAM_MIN_COL_BLOCK)
+                } else {
+                    tiny_morsel
+                };
                 values
                     .par_chunks_mut(col_block)
                     .enumerate()
