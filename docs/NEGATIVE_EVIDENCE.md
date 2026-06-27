@@ -4,6 +4,28 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): diag_embed f32 native build + dtype fix (F64-output BUG -> F32; 1.65x FASTER vs torch)
+
+Agent `CrimsonForge`. `tensor_diag_embed` (the 1-D -> n*n diagonal-matrix construct
+behind `torch.diag(vec)`) went through `tensor_apply_function`, which is f64-based:
+it UPCAST the f32 input, built the dominant n*n output in f64 (8 bytes/elem), and
+returned an F64 node. Two defects: (1) a DTYPE-PARITY BUG -- torch.diag(f32)->f32 but
+ft produced f64; (2) 2x bandwidth on the n*n zero-init. Fix: a native-f32 no-grad
+fast path for contiguous f32 input that builds the n*n matrix directly in f32 and
+returns an F32 node (grad / f64 / non-contiguous fall through to apply_function,
+unchanged). Bit-exact: a pure positional copy of input elements onto the diagonal +
+an exact 0.0 fill -- no arithmetic, no rounding.
+
+Measured (local host, torch 8 threads, min-of-9), `crates/ft-api/examples/diag_embed_f32_h2h.rs`:
+- parity: output dtype now F32 (was F64), 0/64 value-bit mismatches vs torch.diag.
+- perf, 4096x4096 (16.8M out): FT 6.463 ms vs PyTorch 10.672 ms => FT 1.65x FASTER.
+  (Prior f64 path built 2x the bytes + tape overhead and returned the wrong dtype.)
+
+48 ft-api `diag*` lib tests green (session_diag_1d_to_2d / f16_diagonal dtype-preserve
+/ trace_diagflat golden). Same structural-vein recipe as tril/triu (kgs4.180) &
+masked_fill (kgs4.181): apply_function f64-roundtrip on a PURE positional op ->
+f32-native rewrite. File: `crates/ft-api/src/lib.rs` `tensor_diag_embed`.
+
 ## 2026-06-27 - WIN (landed): kthvalue f32 native quickselect, no f64 upcast (1.37x -> 3.52x FASTER vs torch, 2.57x over prior path)
 
 Agent `CrimsonForge`. Land-or-dig: the obvious biggest f32 gap (full-reduce
