@@ -4522,36 +4522,38 @@ pub fn add_layer_norm_forward_f32(
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * norm_size];
     let inv_n = 1.0 / norm_size as f32;
-    out.par_chunks_mut(norm_size).enumerate().for_each(|(r, orow)| {
-        let base = r * norm_size;
-        let arow = &a[base..base + norm_size];
-        let brow = &b[base..base + norm_size];
-        // Materialize a+b ONCE into the output row (also accumulating the mean
-        // sum), then normalize in place — no 3× recompute, no separate sum tensor.
-        let mut sum = 0.0f32;
-        for j in 0..norm_size {
-            let s = arow[j] + brow[j];
-            orow[j] = s;
-            sum += s;
-        }
-        let mean = sum * inv_n;
-        let mut vsum = 0.0f32;
-        for &s in orow.iter() {
-            let d = s - mean;
-            vsum += d * d;
-        }
-        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-        for j in 0..norm_size {
-            let mut y = (orow[j] - mean) * rstd;
-            if let Some(w) = weight {
-                y *= w[j];
+    out.par_chunks_mut(norm_size)
+        .enumerate()
+        .for_each(|(r, orow)| {
+            let base = r * norm_size;
+            let arow = &a[base..base + norm_size];
+            let brow = &b[base..base + norm_size];
+            // Materialize a+b ONCE into the output row (also accumulating the mean
+            // sum), then normalize in place — no 3× recompute, no separate sum tensor.
+            let mut sum = 0.0f32;
+            for j in 0..norm_size {
+                let s = arow[j] + brow[j];
+                orow[j] = s;
+                sum += s;
             }
-            if let Some(bb) = bias {
-                y += bb[j];
+            let mean = sum * inv_n;
+            let mut vsum = 0.0f32;
+            for &s in orow.iter() {
+                let d = s - mean;
+                vsum += d * d;
             }
-            orow[j] = y;
-        }
-    });
+            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+            for j in 0..norm_size {
+                let mut y = (orow[j] - mean) * rstd;
+                if let Some(w) = weight {
+                    y *= w[j];
+                }
+                if let Some(bb) = bias {
+                    y += bb[j];
+                }
+                orow[j] = y;
+            }
+        });
     out
 }
 
@@ -27726,7 +27728,11 @@ pub fn pack_int8_weights_nr4(w_i8: &[i8], n: usize, k: usize) -> Vec<i8> {
 /// par_iter), so each forward fans out across all cores safely. Additive
 /// inference-only kernel — independent of the f32/f64 GEMM dispatch.
 #[must_use]
-#[allow(unsafe_code, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    unsafe_code,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
 pub fn linear_int8_dynamic_f32(
     x: &[f32],
     m: usize,
@@ -27762,17 +27768,19 @@ pub fn linear_int8_dynamic_f32(
     {
         if k >= 16 && std::arch::is_aarch64_feature_detected!("dotprod") {
             const MR: usize = 4;
-            out.par_chunks_mut(MR * n).enumerate().for_each(|(blk, out_blk)| {
-                let sp = blk * MR;
-                let rows = out_blk.len() / n;
-                // SAFETY: dotprod + k>=16 confirmed at runtime; rows<=MR and
-                // x-rows sp..sp+rows match out_blk (which is rows*n long).
-                unsafe {
-                    gemm_block4_sdot(
-                        &x_i8, &a_scales, sp, rows, k, w_i8, w_scales, n, bias, out_blk,
-                    );
-                }
-            });
+            out.par_chunks_mut(MR * n)
+                .enumerate()
+                .for_each(|(blk, out_blk)| {
+                    let sp = blk * MR;
+                    let rows = out_blk.len() / n;
+                    // SAFETY: dotprod + k>=16 confirmed at runtime; rows<=MR and
+                    // x-rows sp..sp+rows match out_blk (which is rows*n long).
+                    unsafe {
+                        gemm_block4_sdot(
+                            &x_i8, &a_scales, sp, rows, k, w_i8, w_scales, n, bias, out_blk,
+                        );
+                    }
+                });
             return out;
         }
     }
@@ -27891,7 +27899,11 @@ unsafe fn gemm_block4_sdot(
 /// correct (the reranker only opts into packing on aarch64, where SDOT is
 /// universal, so the fallback is a safety net rather than a hot path).
 #[must_use]
-#[allow(unsafe_code, clippy::cast_precision_loss, clippy::cast_possible_truncation)]
+#[allow(
+    unsafe_code,
+    clippy::cast_precision_loss,
+    clippy::cast_possible_truncation
+)]
 pub fn linear_int8_dynamic_prepacked_f32(
     x: &[f32],
     m: usize,
@@ -27916,17 +27928,19 @@ pub fn linear_int8_dynamic_prepacked_f32(
     {
         if std::arch::is_aarch64_feature_detected!("dotprod") {
             const MR: usize = 4;
-            out.par_chunks_mut(MR * n).enumerate().for_each(|(blk, out_blk)| {
-                let sp = blk * MR;
-                let rows = out_blk.len() / n;
-                // SAFETY: dotprod confirmed; n%4==0, k%16==0; rows<=MR; w_packed is
-                // the NR=4-packed [n,k] from pack_int8_weights_nr4.
-                unsafe {
-                    gemm_block4_sdot_packed(
-                        &x_i8, &a_scales, sp, rows, k, w_packed, w_scales, n, bias, out_blk,
-                    );
-                }
-            });
+            out.par_chunks_mut(MR * n)
+                .enumerate()
+                .for_each(|(blk, out_blk)| {
+                    let sp = blk * MR;
+                    let rows = out_blk.len() / n;
+                    // SAFETY: dotprod confirmed; n%4==0, k%16==0; rows<=MR; w_packed is
+                    // the NR=4-packed [n,k] from pack_int8_weights_nr4.
+                    unsafe {
+                        gemm_block4_sdot_packed(
+                            &x_i8, &a_scales, sp, rows, k, w_packed, w_scales, n, bias, out_blk,
+                        );
+                    }
+                });
             return out;
         }
     }
@@ -31482,18 +31496,30 @@ mod tests {
         // The NR=4 pre-packed kernel only reorders the weight bytes, so it must
         // produce byte-identical output to the row-major kernel — the contract the
         // reranker's load-time weight packing relies on.
-        for (m, k, n) in [(7usize, 384usize, 384usize), (32, 384, 1536), (33, 1536, 384)] {
+        for (m, k, n) in [
+            (7usize, 384usize, 384usize),
+            (32, 384, 1536),
+            (33, 1536, 384),
+        ] {
             let x: Vec<f32> = (0..m * k).map(|i| ((i % 17) as f32 - 8.0) * 0.1).collect();
             let w: Vec<f32> = (0..n * k).map(|i| ((i % 13) as f32 - 6.0) * 0.05).collect();
             let bias: Vec<f32> = (0..n).map(|i| (i as f32) * 0.001 - 0.5).collect();
             let (w_i8, w_scales) = super::quantize_per_output_channel_i8(&w, n, k);
             let packed = super::pack_int8_weights_nr4(&w_i8, n, k);
-            let row =
-                super::linear_int8_dynamic_f32(&x, m, k, &w_i8, &w_scales, n, Some(&bias));
+            let row = super::linear_int8_dynamic_f32(&x, m, k, &w_i8, &w_scales, n, Some(&bias));
             let pre = super::linear_int8_dynamic_prepacked_f32(
-                &x, m, k, &packed, &w_scales, n, Some(&bias),
+                &x,
+                m,
+                k,
+                &packed,
+                &w_scales,
+                n,
+                Some(&bias),
             );
-            assert_eq!(row, pre, "prepacked must equal row-major for m={m} k={k} n={n}");
+            assert_eq!(
+                row, pre,
+                "prepacked must equal row-major for m={m} k={k} n={n}"
+            );
         }
     }
 
@@ -33038,9 +33064,8 @@ mod tests {
         argmin_dim_tensor_contiguous_f64, asin_scalar, asin_tensor_contiguous_f64, atan_scalar,
         atan_tensor_contiguous_f64, bmm_tensor_contiguous_f32, bmm_tensor_contiguous_f32_into,
         bmm_tensor_contiguous_f64, cat_tensor_contiguous_f32, cat_tensor_contiguous_f64,
-        ceil_scalar,
-        ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64, cos_scalar,
-        cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64, div_scalar,
+        ceil_scalar, ceil_tensor_contiguous_f64, clamp_scalar, clamp_tensor_contiguous_f64,
+        cos_scalar, cos_tensor_contiguous_f64, cosh_scalar, cosh_tensor_contiguous_f64, div_scalar,
         div_tensor_contiguous_f64, dot_tensor_contiguous_f64, eq_scalar, eq_tensor_contiguous_f64,
         exp_scalar, exp_tensor_contiguous_f64, expand_tensor_contiguous_f64, expm1_scalar,
         expm1_tensor_contiguous_f64, floor_scalar, floor_tensor_contiguous_f64,
@@ -34083,7 +34108,11 @@ mod tests {
             // Oversized scratch pre-poisoned with NaN to prove every element is rewritten.
             let mut scratch = vec![f32::NAN; batch * m * n + 37];
             bmm_tensor_contiguous_f32_into(&lhs, &rhs, &lhs_meta, &rhs_meta, &mut scratch).unwrap();
-            assert_eq!(&scratch[..batch * m * n], want.as_slice(), "shape {batch}x{m}x{k}x{n}");
+            assert_eq!(
+                &scratch[..batch * m * n],
+                want.as_slice(),
+                "shape {batch}x{m}x{k}x{n}"
+            );
             // Reuse the same scratch for a second, smaller matmul — must not leak prior data.
             let lm2 = TensorMeta::from_shape(vec![2, 2, 2], DType::F32, Device::Cpu);
             let rm2 = TensorMeta::from_shape(vec![2, 2, 2], DType::F32, Device::Cpu);
