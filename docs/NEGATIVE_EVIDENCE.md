@@ -4,6 +4,31 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f32 relu6 + hardshrink no-grad fast path (15.3x / 23.1x SLOWER -> torch parity, bit-exact)
+
+Bead/thread `frankentorch-x9yuq`/`frankentorch-t503`, agent `BlackThrush`. act_f32_h2h survey (4000x4000 f32,
+torch set_num_threads(8) vs FT-64t) flagged two activations catastrophically slow on f32: **relu6 15.27x
+SLOWER** (168ms) and **hardshrink 23.12x SLOWER** (281ms). ROOT: both took the f64 roundtrip on non-f64 input.
+relu6 did `f32->f64 to_dtype clone + clamp in f64 apply_function + f64->f32 to_dtype clone` (3 passes + 2 full
+64MB allocs); hardshrink fell to the composed tape path (`const_tensor_like x2` [F64 `full`, upcasting the
+inputs] + abs + gt + where = ~5 passes + several allocs). FIX: no-grad contiguous-f32 fast path that BORROWS
+`contiguous_values_f32()` and computes in ONE parallel pass, in-dtype:
+  relu6      -> `x.clamp(0.0, 6.0)` (pure min/max compare, no rounding)
+  hardshrink -> `(x >= -λ && x <= λ) ? 0 : x`  (torch's CPU kernel zeros the INSIDE [-λ,λ], NOT `|x|>λ?x:0`)
+grad / non-contiguous / non-f32 fall through to the unchanged paths. PARITY: bit-exact vs torch verified by an
+exact-bits probe (act_parity.rs: u32 bits -> torch -> u32 bits over 4015 values incl boundaries ±λ/0/6,
+±inf, NaN, subnormals, ±1e30): relu6 **0/4015**, hardshrink **0/4015**. KEY CATCH: the naive `|x|>λ?x:0`
+hardshrink formula was 1/4015 off — torch KEEPS NaN (NaN is not inside [-λ,λ] since both compares are false),
+whereas `|NaN|>λ` is false -> would zero it; the inside-region formula matches torch at NaN. MEASURED
+(act_f32_h2h, cat path healthy): relu6 168ms -> 16.3ms now **1.02x FASTER** (was 15.27x SLOWER); hardshrink
+281ms -> 18.1ms now **1.09x SLOWER** = bandwidth parity (was 23.12x SLOWER). Both now ~bandwidth-bound, ~13-15x
+faster than the prior path. ft-api relu6 2/0 + hardshrink 2/0 + conformance smoke 39/0 GREEN, bit-exact.
+NOTE (fresh lever, NOT fixed): act_f32_h2h relu_anchor itself = **3.0x SLOWER** (41ms vs 13ms) — tensor_relu
+routes through the typed tape but is ~3x off torch (likely an unconditional save-for-backward clone in the relu
+tape op even in no-grad); ft-autograd lane. selu 10.2x / celu 17.1x / tanhshrink 1.8x SLOWER on f32 too but
+they involve exp/tanh (transcendental f32-rounding parity risk — deferred, needs numpy-enabled torch to pin).
+AGENT BlackThrush.
+
 ## 2026-06-27 - PARTIAL KEEP: f32 addcmul/addcdiv weak-scalar dtype fix (21.7x -> 18.89x SLOWER vs torch)
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Land-or-dig scan found the bounded-median bench worktree
