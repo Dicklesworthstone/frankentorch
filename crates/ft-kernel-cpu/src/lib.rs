@@ -27797,20 +27797,62 @@ macro_rules! define_binary_f32 {
     };
 }
 
-define_binary_f32!(min_tensor_contiguous_f32, |l: f32, r: f32| {
-    if l.is_nan() || r.is_nan() {
-        f32::NAN
-    } else {
-        l.min(r)
-    }
-});
-define_binary_f32!(max_tensor_contiguous_f32, |l: f32, r: f32| {
-    if l.is_nan() || r.is_nan() {
-        f32::NAN
-    } else {
-        l.max(r)
-    }
-});
+// min/max f32: SIMD-accelerated via simd_elementwise_f32 (same parallel-SIMD path as
+// add/sub/mul/div, kgs4.167) instead of the scalar elementwise loop (was ~1.3-1.6x SLOWER
+// than torch). The scalar op is unchanged (NaN-propagating fmax/fmin); the SIMD op computes
+// the SAME result lanewise: f32x8::max/min for the non-NaN value, then any lane where either
+// operand is NaN is forced to NaN (torch + the scalar path propagate NaN). The simd<->scalar
+// boundary lane is bit-identical because both forms compute the same per-lane value. An
+// exhaustive ±0/±inf/NaN/subnormal parity test (min_max_f32_simd_matches_scalar_bit_for_bit)
+// guards the bit-exactness (incl. the IEEE sign-of-zero on ±0 ties).
+pub fn min_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l: f32, r: f32| {
+            if l.is_nan() || r.is_nan() {
+                f32::NAN
+            } else {
+                l.min(r)
+            }
+        },
+        |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+        },
+    )
+}
+pub fn max_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l: f32, r: f32| {
+            if l.is_nan() || r.is_nan() {
+                f32::NAN
+            } else {
+                l.max(r)
+            }
+        },
+        |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+        },
+    )
+}
 define_binary_f32!(
     atan2_tensor_contiguous_f32,
     |y: f32, x: f32| y.atan2(x),
@@ -32508,6 +32550,76 @@ mod tests {
                 ),
                 "reciprocal numel={numel}"
             );
+        }
+    }
+
+    // The SIMD f32 max/min ops must be BIT-IDENTICAL to the NaN-propagating scalar
+    // fmax/fmin (the prior kernel + the simd<->scalar boundary lane). Exhaustively cover
+    // EVERY ordered pair of IEEE edge values (±0, ±inf, NaN, ±subnormal, normals) so the
+    // sign-of-zero on ±0 ties and NaN propagation are checked in both operand positions.
+    #[test]
+    fn min_max_f32_simd_matches_scalar_bit_for_bit() {
+        use wide::{CmpEq, f32x8};
+        let edge = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            2.5,
+            -2.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1), // smallest positive subnormal
+            f32::from_bits(0x8000_0001), // smallest negative subnormal
+            1.0e30,
+            -1.0e30,
+            3.0,
+        ];
+        let n = edge.len();
+        // Cartesian product -> all ordered pairs, length n*n (a multiple of 8 here, so
+        // every pair is evaluated through the f32x8 SIMD lanes), plus 5 extra pairs to
+        // also exercise the scalar tail at the simd<->scalar boundary.
+        let mut l: Vec<f32> = Vec::new();
+        let mut r: Vec<f32> = Vec::new();
+        for &a in &edge {
+            for &b in &edge {
+                l.push(a);
+                r.push(b);
+            }
+        }
+        for k in 0..5 {
+            l.push(edge[k]);
+            r.push(edge[(k + 7) % n]);
+        }
+        let max_scalar = |x: f32, y: f32| if x.is_nan() || y.is_nan() { f32::NAN } else { x.max(y) };
+        let min_scalar = |x: f32, y: f32| if x.is_nan() || y.is_nan() { f32::NAN } else { x.min(y) };
+        let max_simd = |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+        };
+        let min_simd = |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+        };
+        for (name, got, scalar) in [
+            ("max", super::simd_binary_f32(&l, &r, max_scalar, max_simd), max_scalar as fn(f32, f32) -> f32),
+            ("min", super::simd_binary_f32(&l, &r, min_scalar, min_simd), min_scalar as fn(f32, f32) -> f32),
+        ] {
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(l[k], r[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} simd diverged from scalar at pair ({}, {}): got {g} ({:08x}) want {want} ({:08x})",
+                    l[k],
+                    r[k],
+                    g.to_bits(),
+                    want.to_bits()
+                );
+            }
         }
     }
 

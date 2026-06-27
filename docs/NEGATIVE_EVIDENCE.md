@@ -4,6 +4,28 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f32 maximum/minimum SIMD (1.47x/1.12x SLOWER -> 1.68x/2.10x FASTER vs torch, bit-exact)
+
+Agent `CrimsonForge`. max_tensor_contiguous_f32 / min_tensor_contiguous_f32 (behind
+torch.maximum/minimum) used the scalar parallel elementwise loop while add/sub/mul/div already
+had the parallel-SIMD path (kgs4.167) — the biggest UNWALLED gap left in survey_f32_wide_h2h.
+Routed both through simd_elementwise_f32 with a bit-exact NaN-propagating SIMD op:
+(!b.cmp_eq(b)).blend(NAN, (!a.cmp_eq(a)).blend(NAN, a.max(b))). wide f32x8::max/min is
+fmax/fmin-faithful (incl. IEEE sign-of-zero on ±0 ties); the blends force NaN where either
+operand is NaN, matching the scalar `if l.is_nan()||r.is_nan(){NAN}else{l.max(r)}`.
+
+Bit-exact: EXHAUSTIVE cartesian test over every ordered pair of IEEE edge values (±0, ±inf, NaN,
+±subnormal, normals) — min_max_f32_simd_matches_scalar_bit_for_bit — confirms SIMD lanes are
+bit-identical to the scalar reference (boundary lane + ±0 sign covered).
+
+Measured (local, torch 8t, min-of-9, 4000x4000 f32, survey_f32_wide_h2h; add_anchor=2.16x FASTER
+confirms low contention):
+- maximum: FT 7.527 ms vs PyTorch 12.658 ms => FT 1.68x FASTER (was ~1.47x SLOWER).
+- minimum: FT 6.371 ms vs PyTorch 13.389 ms => FT 2.10x FASTER (was ~1.12x SLOWER).
+
+ft-kernel-cpu max/min kernel tests + 11 ft-api maximum/minimum golden/backward/inplace tests green.
+File: crates/ft-kernel-cpu/src/lib.rs (max_tensor_contiguous_f32 / min_tensor_contiguous_f32).
+
 ## 2026-06-27 - WIN (landed): diag_embed f32 native build + dtype fix (F64-output BUG -> F32; 1.65x FASTER vs torch)
 
 Agent `CrimsonForge`. `tensor_diag_embed` (the 1-D -> n*n diagonal-matrix construct
