@@ -4,6 +4,19 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): where_scalar no-grad fast path (full+full+where composed -> 2.4-2.8x FASTER vs torch, bit-exact)
+
+Agent `CrimsonForge`. tensor_where_scalar composed full(x) + full(y) [2× F64 numel allocs] + tensor_where
+(3 passes). Added a no-grad fast path: for a contiguous f32/f64 condition, select in ONE parallel pass
+`c != 0 ? x : y` — the SAME predicate as the where kernel (`c != 0.0`); output stays F64 (matching full()'s
+dtype), x/y are the f64 args -> BIT-EXACT. Grad / non-contiguous / other-dtype condition fall through.
+
+Measured (local, torch 8t, min-of-9, 16M f64 cond, where_scalar_h2h, relu_anchor 3.32-4.60x FASTER = low
+contention, 3 runs): where_scalar 2.42-2.80x FASTER; parity 0/8 vs torch (value bits).
+File: crates/ft-api/src/lib.rs (tensor_where_scalar). NOTE: this is the LAST clean non-transcendental op of
+the composed-path (full+where) sibling-sweep — remaining composers are transcendental (pow_tensor/angle/
+xlog1py/entr/rel_entr = SLEEF-walled) or grad-heavy losses (smooth_l1/hinge/cosine_embedding).
+
 ## 2026-06-27 - WIN (landed): f64 nanmin/nanmax fused no-grad fast path (composed -> 4.6-8x FASTER vs torch, bit-exact)
 
 Agent `CrimsonForge`. tensor_nanmin/nanmax composed full(±inf) [numel alloc] + isnan + where + amin/amax
