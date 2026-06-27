@@ -4,6 +4,22 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f32 masked_fill single-pass fast path (3.51x SLOWER -> 2.00x FASTER vs torch, bit-exact)
+
+Bead/thread `frankentorch-kgs4.181`, agent `BlackThrush`. struct_fill_h2h flagged f32 `masked_fill` (4000x4000)
+at **3.51x SLOWER** than torch (51ms vs 14.5ms). ROOT: `tensor_masked_fill` = `tensor_where(mask, full(shape,
+value), input)` and `full` is ALWAYS F64 -> a 128MB F64 fill tensor + the f64 `tensor_where` composition. FIX:
+f32 no-grad fast path for equal-shape contiguous f32 input + f32 mask — fill in ONE parallel pass `mask != 0 ?
+value_f32 : input` (the SAME predicate as where_tensor_contiguous_f32's `c != 0.0`, value cast to f32). ★BIT-EXACT
++ correct dtype: pure select, no rounding; output dtype F32 (== torch; the composed path's f64 `full` made it
+heavier and dtype-murky); torch parity (masked_fill_f32_parity, 100003 vals incl NaN/inf/-0) **0/100003**,
+dtype F32. Broadcast-mask / non-f32 / grad / non-contiguous fall through. ft-api masked_fill 5/0, conformance
+smoke 39/0. MEASURED: 51ms -> 6.7ms (~7.6x internal) now **2.00x FASTER** than torch. masked_fill is HOT (attention
+mask, padding masks). struct_fill_h2h verdicts: rot90 already 1.23x FASTER; ★pad **2.06x SLOWER** (next, same
+family); diag_embed ERRORS on the call (artifact). The apply_function/compose-with-F64-full STRUCTURAL vein
+(tril/triu kgs4.180 + masked_fill here) keeps paying — grep ops composing `self.full(` (always F64) or
+apply_function for pure select/copy. Finder = struct_fill_h2h.rs + masked_fill_f32_parity.rs. AGENT BlackThrush.
+
 ## 2026-06-27 - WIN (landed): f32 tril/triu no-upcast per-row fast path (~11x SLOWER -> ~4x FASTER vs torch, bit-exact)
 
 Bead/thread `frankentorch-kgs4.180`, agent `BlackThrush`. NEW family (movement/structural, off the lossy_f64
