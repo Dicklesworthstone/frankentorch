@@ -11,6 +11,12 @@ fn deterministic_values(n: usize, shift: f64) -> Vec<f64> {
         .collect()
 }
 
+fn patterned_f32_values(n: usize, scale: f32, shift: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| (((i as f32) * scale + shift).sin()) * 0.25)
+        .collect()
+}
+
 fn bench_matmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("matmul");
 
@@ -633,6 +639,42 @@ fn bench_add(c: &mut Criterion) {
             b.iter(|| black_box(session.tensor_add(x, y).unwrap()));
         });
     }
+    group.finish();
+}
+
+fn bench_addcmul(c: &mut Criterion) {
+    let mut group = c.benchmark_group("addcmul");
+    let rows = 4000usize;
+    let cols = 4000usize;
+    let n = rows * cols;
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(12));
+    group.throughput(Throughput::Elements(n as u64));
+    let input_values = patterned_f32_values(n, 0.000_017, 0.13);
+    let t1_values = patterned_f32_values(n, 0.000_019, 0.29);
+    let t2_values = patterned_f32_values(n, 0.000_023, 0.47);
+
+    group.bench_function("f32_4000x4000_nograd", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let input = session
+                    .tensor_variable_f32(input_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                let t1 = session
+                    .tensor_variable_f32(t1_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                let t2 = session
+                    .tensor_variable_f32(t2_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                (session, input, t1, t2)
+            },
+            |(mut session, input, t1, t2)| {
+                black_box(session.tensor_addcmul(input, t1, t2, 0.5).unwrap())
+            },
+            BatchSize::LargeInput,
+        );
+    });
     group.finish();
 }
 
@@ -2298,6 +2340,7 @@ criterion_group!(
     bench_sigmoid,
     bench_pow,
     bench_add,
+    bench_addcmul,
     bench_backward_matmul,
     bench_linear_train,
     bench_recurrent_forward,

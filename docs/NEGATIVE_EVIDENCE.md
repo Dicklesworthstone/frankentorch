@@ -4,6 +4,30 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - PARTIAL KEEP: f32 addcmul/addcdiv weak-scalar dtype fix (21.7x -> 18.89x SLOWER vs torch)
+
+Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. Land-or-dig scan found the bounded-median bench worktree
+win already landed on `origin/main` (`7a7e0444`), so this pass dug the largest current measured non-walled f32
+gap. The ledger named f32 `addcmul` at **21.7x SLOWER** and documented that prior fused f32 fast-path attempts
+had to be reverted because neither pure-f32 nor f64-internal arithmetic matched PyTorch rounding. The safe lever
+was the recorded dtype bug: `scale_by_constant` built an F64 `full(shape, value)` constant, so f32
+`addcmul`/`addcdiv` composed through f64 scaling and returned F64. Fix: build the scalar via
+`const_tensor_like(node, shape, value)`, preserving weak-scalar dtype while keeping the existing arithmetic order.
+
+Evidence: focused regression `AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a
+RUSTFLAGS='-Cmetadata=cod_a_ce9954c0c' rch exec -- cargo test -p ft-api f32_addcmul_addcdiv_preserve_f32_dtype --lib
+-- --nocapture` passed. Literal requested bench
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-a rch exec -- cargo bench
+--release -p ft-api --bench ops_bench addcmul` failed because this Cargo rejects `--release` for `cargo bench`;
+the valid per-crate Criterion command with the same target dir,
+`RUSTFLAGS='-Cmetadata=cod_a_ce9954c0c' rch exec -- cargo bench -p ft-api --bench ops_bench addcmul`, measured
+`addcmul/f32_4000x4000_nograd` at `[252.20 ms 258.93 ms 268.81 ms]`. H2H sidecar after the patch: f32
+`addcmul` FT `219.941 ms`, PyTorch `11.645 ms` = **18.89x SLOWER**; controls were healthy (`cat_anchor`
+**3.52x FASTER**, `where` **2.08x FASTER**, `maximum` **1.65x FASTER**, `mul_scalar` **1.61x FASTER**).
+Score vs PyTorch: `0W / 1L / 0N`, but not zero-gain: the dtype bug is closed and the recorded ratio improves from
+**21.7x** to **18.89x SLOWER**. Do not retry a fused f32 `addcmul` path until PyTorch's exact rounding sequence is
+pinned; current sidecar also shows f32 `lerp` at **8.96x SLOWER**, a separate open gap.
+
 ## 2026-06-27 - BUGFIX + WIN (landed): f32 floor_divide was naive+slow — now correct (div_floor_floating) + 3.89x FASTER
 
 Bead/thread `frankentorch-kgs4`, agent `BlackThrush`. f32 survey-d (cat_anchor 3.8x FASTER healthy): floor_div
