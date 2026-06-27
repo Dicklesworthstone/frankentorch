@@ -4,6 +4,31 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): parallel-SIMD f32 unary kernel — relu/neg/abs/sqrt/reciprocal 2.3-3.0x FASTER than torch
+
+Bead/thread `frankentorch-kgs4.166`, agent `BlackThrush`. act_f32_h2h flagged `relu` (the survey ANCHOR!) at
+**3.0x SLOWER** (41ms vs torch 13ms on 16M f32). ROOT: `relu_tensor_contiguous_f32` (and neg/abs/sqrt/reciprocal)
+call `simd_unary_f32_kernel` -> `simd_unary_f32`, which is SERIAL single-core SIMD (f32x8) — unlike the
+transcendental f32 unaries which route through `unary_contiguous_f32` (rayon-parallel above PARALLEL_THRESHOLD,
+kgs4.90). One core's DRAM bandwidth caps these cheap bandwidth-bound ops ~3x below torch's threaded kernels. FIX:
+added `simd_unary_f32_parallel` (fan SIMD-width-aligned chunks of `CHUNK=1<<14` across rayon, each running the
+SAME f32x8 op) and gated `simd_unary_f32_kernel` to it above `SCALAR_UNARY_PARALLEL_THRESHOLD` (524288). Wins
+ALL 5 shared callers at once (neg/abs/sqrt/reciprocal/relu). MEASURED (simd_unary_f32_h2h, torch
+set_num_threads(8) vs FT-64t): relu 41->5.4ms **2.31x FASTER** (was 3.0x SLOWER), neg **2.39x**, abs **2.73x**,
+sqrt **2.78x**, reciprocal **2.95x** FASTER. ★ZERO REGRESSION proven: `CHUNK % SIMD_WIDTH_F32 == 0` -> the
+parallel path partitions the window into the SAME SIMD groups + trailing scalar tail as the serial path, so
+output is BIT-IDENTICAL. Direct test `simd_unary_f32_parallel_matches_serial_bit_for_bit` (sizes 0/1/7/8/9/15/16/
+17/16383/16384/16385/32768/1000003, ±inf/NaN/±0 seeded into the tail) = bit-equal for all 5 ops. ft-kernel-cpu
+551/0, ft-api relu 22/0, conformance smoke 39/0. BIT-EXACT vs torch (simd_unary_parity, n=1000003 awkward size):
+neg **0/1M**, abs **0/1M**, reciprocal **0/1M**, relu **0/1M for finite+±inf**. ⚠️ TWO PRE-EXISTING torch gaps
+SURFACED (UNCHANGED by this commit — bit-identical to the prior kernel, separate correctness beads): (1)
+`relu(NaN)=0` because `f32::max(NaN,0)` returns the non-NaN operand; torch propagates NaN (relu=clamp_min). Also
+a ±0 sign edge. (2) `sqrt` is **1 ULP off torch for ~16%** of values — `wide::f32x8::sqrt` is not correctly
+rounded (scalar `f32::sqrt`/SQRTSS is; the SIMD SQRTPS path used by ALL the serial+parallel SIMD lanes diverges).
+The sqrt SPEEDUP is real (2.78x, bit-identical to prior) but its value-parity vs torch is a pre-existing
+SIMD-rounding issue — fixing it means routing sqrt through scalar `f32::sqrt` (a correctness change, not perf).
+AGENT BlackThrush.
+
 ## 2026-06-27 - WIN (landed): f32 relu6 + hardshrink no-grad fast path (15.3x / 23.1x SLOWER -> torch parity, bit-exact)
 
 Bead/thread `frankentorch-x9yuq`/`frankentorch-t503`, agent `BlackThrush`. act_f32_h2h survey (4000x4000 f32,

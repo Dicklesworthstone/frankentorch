@@ -26732,6 +26732,56 @@ where
     output
 }
 
+/// Parallel companion to `simd_unary_f32`: fan SIMD-width-aligned chunks across
+/// the rayon pool, each running the same `f32x8` op. The single-core serial SIMD
+/// path is DRAM-bandwidth-capped (~3x below a threaded relu); spreading chunks
+/// across cores approaches the aggregate-bandwidth wall.
+///
+/// Bit-identical to `simd_unary_f32`: the per-element op is order-independent, and
+/// the chunk size is a multiple of `SIMD_WIDTH_F32` so every chunk but the last is
+/// fully SIMD (the last chunk's scalar tail covers exactly the same trailing
+/// `numel % SIMD_WIDTH_F32` lanes the serial path handles scalar). For the current
+/// callers (neg/abs/sqrt/reciprocal/relu) the scalar and SIMD forms agree exactly,
+/// so even a boundary lane that flips SIMD<->scalar is bit-for-bit unchanged.
+fn simd_unary_f32_parallel<F, S>(window: &[f32], scalar_op: F, simd_op: S) -> Vec<f32>
+where
+    F: Fn(f32) -> f32 + Sync,
+    S: Fn(f32x8) -> f32x8 + Sync,
+{
+    // 16384 elems (64 KiB) per chunk: large enough to amortise rayon dispatch on a
+    // bandwidth-bound map, small enough to load-balance 16M elems across the pool.
+    const CHUNK: usize = 1 << 14;
+    let numel = window.len();
+    let mut output = vec![0.0f32; numel];
+    output
+        .par_chunks_mut(CHUNK)
+        .zip(window.par_chunks(CHUNK))
+        .for_each(|(out_chunk, in_chunk)| {
+            let n = in_chunk.len();
+            let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+            let mut i = 0;
+            while i < simd_len {
+                let a = f32x8::new([
+                    in_chunk[i],
+                    in_chunk[i + 1],
+                    in_chunk[i + 2],
+                    in_chunk[i + 3],
+                    in_chunk[i + 4],
+                    in_chunk[i + 5],
+                    in_chunk[i + 6],
+                    in_chunk[i + 7],
+                ]);
+                let result = simd_op(a);
+                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array_ref());
+                i += SIMD_WIDTH_F32;
+            }
+            for j in simd_len..n {
+                out_chunk[j] = scalar_op(in_chunk[j]);
+            }
+        });
+    output
+}
+
 fn simd_binary_f32<F, S>(
     lhs_window: &[f32],
     rhs_window: &[f32],
@@ -26811,8 +26861,8 @@ fn simd_unary_f32_kernel<F, S>(
     simd_op: S,
 ) -> Result<Vec<f32>, KernelError>
 where
-    F: Fn(f32) -> f32,
-    S: Fn(f32x8) -> f32x8,
+    F: Fn(f32) -> f32 + Sync,
+    S: Fn(f32x8) -> f32x8 + Sync,
 {
     ensure_unary_layout_and_storage_f32(input, meta)?;
     let numel = meta.numel();
@@ -26821,7 +26871,16 @@ where
     }
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
-    Ok(simd_unary_f32(window, scalar_op, simd_op))
+    // Bandwidth-bound SIMD unaries (neg/abs/sqrt/reciprocal/relu) ran serial
+    // single-core SIMD — one core's DRAM bandwidth caps them ~3x below torch's
+    // threaded relu (act_f32_h2h: relu 41ms vs torch 13ms). Above the cheap-op gate
+    // (524288), fan SIMD-width-aligned chunks across rayon. Bit-identical to the
+    // serial SIMD path (per-element, order-independent). frankentorch-kgs4.166.
+    if numel >= SCALAR_UNARY_PARALLEL_THRESHOLD {
+        Ok(simd_unary_f32_parallel(window, scalar_op, simd_op))
+    } else {
+        Ok(simd_unary_f32(window, scalar_op, simd_op))
+    }
 }
 
 fn elementwise_contiguous_f32<F>(
@@ -31971,6 +32030,78 @@ unsafe fn transpose_block_8x8_avx2_f32(
 #[cfg(test)]
 mod tests {
     use std::fmt::Write as _;
+
+    // The parallel-SIMD f32 unary kernel must be BIT-IDENTICAL to the serial-SIMD
+    // path it replaces above the threshold (CHUNK is a multiple of SIMD_WIDTH_F32,
+    // so both partition the window into the same SIMD groups + trailing scalar
+    // tail). Covers sizes that straddle the SIMD width, the chunk size, and the
+    // multi-chunk regime, with specials (±inf/NaN/±0) seeded into the tail.
+    #[test]
+    fn simd_unary_f32_parallel_matches_serial_bit_for_bit() {
+        use wide::f32x8;
+        let zero = f32x8::splat(0.0f32);
+        let one = f32x8::splat(1.0f32);
+        // (scalar_op, simd_op) pairs mirroring the live neg/abs/sqrt/reciprocal/relu
+        let sizes = [0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003];
+        for &numel in &sizes {
+            let mut w: Vec<f32> = (0..numel)
+                .map(|i| ((i % 4099) as f32 - 2049.5) * 0.013)
+                .collect();
+            if numel >= 5 {
+                let t = numel - 5;
+                w[t] = f32::INFINITY;
+                w[t + 1] = f32::NEG_INFINITY;
+                w[t + 2] = f32::NAN;
+                w[t + 3] = -0.0;
+                w[t + 4] = 0.0;
+            }
+            let pos: Vec<f32> = w.iter().map(|&x| x.abs() + 1e-6).collect();
+            let bits_eq = |a: &[f32], b: &[f32]| {
+                a.len() == b.len()
+                    && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            // neg
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&w, |v| -v, |a| -a),
+                    &super::simd_unary_f32_parallel(&w, |v| -v, |a| -a),
+                ),
+                "neg numel={numel}"
+            );
+            // abs
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&w, |v| v.abs(), |a| a.abs()),
+                    &super::simd_unary_f32_parallel(&w, |v| v.abs(), |a| a.abs()),
+                ),
+                "abs numel={numel}"
+            );
+            // relu (max with 0)
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&w, |v| v.max(0.0f32), move |a| a.max(zero)),
+                    &super::simd_unary_f32_parallel(&w, |v| v.max(0.0f32), move |a| a.max(zero)),
+                ),
+                "relu numel={numel}"
+            );
+            // sqrt (positive domain; wide f32x8::sqrt vs scalar must agree serial==parallel)
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&pos, |v| v.sqrt(), |a| a.sqrt()),
+                    &super::simd_unary_f32_parallel(&pos, |v| v.sqrt(), |a| a.sqrt()),
+                ),
+                "sqrt numel={numel}"
+            );
+            // reciprocal
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&pos, |v| 1.0f32 / v, move |a| one / a),
+                    &super::simd_unary_f32_parallel(&pos, |v| 1.0f32 / v, move |a| one / a),
+                ),
+                "reciprocal numel={numel}"
+            );
+        }
+    }
 
     #[test]
     fn transpose_2d_f64_matches_scalar_reference_all_sizes() {
