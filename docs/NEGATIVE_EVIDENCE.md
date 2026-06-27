@@ -4,6 +4,18 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f64 threshold no-grad fast path (composed -> 1.8-2.1x FASTER vs torch, bit-exact)
+
+Agent `CrimsonForge`. Sibling-gap (same as f64 hardshrink): tensor_threshold had an f32 one-pass fast
+path but f64 FELL THROUGH to the composed path (const_tensor_like x3 [full-size F64 allocs] + isnan + gt
++ where x2 = ~6 passes). Added the f64 mirror: borrow contiguous_values(), one parallel pass
+`NaN -> NaN ; x>threshold -> x ; else value`. Bit-exact with the composed form (same positional select +
+canonical NaN propagation; current torch.threshold propagates NaN).
+
+Measured (local, torch 8t, min-of-9, 16M f64, threshold_f64_h2h, anchor-validated: relu_anchor 1.96-2.04x
+FASTER across 3 runs): threshold 1.78-2.11x FASTER; parity 0/11 vs torch (dtype F64, value bits).
+File: crates/ft-api/src/lib.rs (tensor_threshold).
+
 ## 2026-06-27 - WIN (landed): f64 hardshrink no-grad fast path (composed ~23x SLOWER -> 1.6-2.6x FASTER vs torch, bit-exact)
 
 Agent `CrimsonForge`. Sibling-gap: tensor_hardshrink had an f32 no-grad fast path (frankentorch-t503)
