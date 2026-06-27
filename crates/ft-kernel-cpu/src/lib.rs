@@ -2953,25 +2953,52 @@ pub fn erfc_tensor_contiguous_f64(
     unary_f64_compute_bound(input, meta, erfc_value)
 }
 
+// f64 siblings of the f32 hard* SIMD kernels: route through simd_unary_f64_kernel (the f64x4
+// path relu_f64 uses) instead of the scalar unary_f64 loop. PIECEWISE-LINEAR so the SIMD op
+// reproduces the scalar value fn's EXACT f64 arithmetic + clamp branches lanewise; NaN flows to
+// the mid/clamp branch (-> NaN). wide f64x4::max/min are fmax/fmin-faithful (verified by the f64
+// max/min kernel). Bit-exactness guarded by hard_activation_f64_simd_matches_scalar.
 pub fn hardswish_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, hardswish_value)
+    let three = f64x4::splat(3.0);
+    let six = f64x4::splat(6.0);
+    let zero = f64x4::splat(0.0);
+    let neg3 = f64x4::splat(-3.0);
+    simd_unary_f64_kernel(input, meta, hardswish_value, move |a| {
+        let mid = (a * (a + three)) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(a, r)
+    })
 }
 
 pub fn hardsigmoid_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, hardsigmoid_value)
+    let three = f64x4::splat(3.0);
+    let six = f64x4::splat(6.0);
+    let zero = f64x4::splat(0.0);
+    let one = f64x4::splat(1.0);
+    let neg3 = f64x4::splat(-3.0);
+    simd_unary_f64_kernel(input, meta, hardsigmoid_value, move |a| {
+        let mid = (a + three) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(one, r)
+    })
 }
 
 pub fn hardtanh_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, hardtanh_value)
+    let neg1 = f64x4::splat(-1.0);
+    let one = f64x4::splat(1.0);
+    let nan = f64x4::splat(f64::NAN);
+    simd_unary_f64_kernel(input, meta, hardtanh_value, move |a| {
+        (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+    })
 }
 
 pub fn softplus_tensor_contiguous_f64(
@@ -32754,6 +32781,70 @@ mod tests {
                     r[k],
                     g.to_bits(),
                     want.to_bits()
+                );
+            }
+        }
+    }
+
+    // f64 sibling of hard_activation_f32_simd_matches_scalar: the SIMD f64x4 hard* ops must be
+    // BIT-IDENTICAL to their scalar value fns across every IEEE f64 edge value + breakpoints.
+    #[test]
+    fn hard_activation_f64_simd_matches_scalar() {
+        use wide::{CmpEq, CmpGe, CmpLe, f64x4};
+        let mut xs: Vec<f64> = vec![
+            0.0, -0.0, f64::INFINITY, f64::NEG_INFINITY, f64::NAN, f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE, f64::from_bits(1), f64::from_bits(0x8000_0000_0000_0001),
+            3.0, -3.0, 1.0, -1.0, 2.999_999_999, 3.000_000_001, -2.999_999_999, -3.000_000_001,
+            1.0e300, -1.0e300,
+        ];
+        for i in 0..200 {
+            xs.push((i as f64 - 100.0) * 0.07);
+        }
+        let cases: [(&str, fn(f64) -> f64, fn(f64x4) -> f64x4); 3] = [
+            ("hardswish", super::hardswish_value, {
+                fn s(a: f64x4) -> f64x4 {
+                    let three = f64x4::splat(3.0);
+                    let six = f64x4::splat(6.0);
+                    let zero = f64x4::splat(0.0);
+                    let neg3 = f64x4::splat(-3.0);
+                    let mid = (a * (a + three)) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(a, r)
+                }
+                s
+            }),
+            ("hardsigmoid", super::hardsigmoid_value, {
+                fn s(a: f64x4) -> f64x4 {
+                    let three = f64x4::splat(3.0);
+                    let six = f64x4::splat(6.0);
+                    let zero = f64x4::splat(0.0);
+                    let one = f64x4::splat(1.0);
+                    let neg3 = f64x4::splat(-3.0);
+                    let mid = (a + three) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(one, r)
+                }
+                s
+            }),
+            ("hardtanh", super::hardtanh_value, {
+                fn s(a: f64x4) -> f64x4 {
+                    let neg1 = f64x4::splat(-1.0);
+                    let one = f64x4::splat(1.0);
+                    let nan = f64x4::splat(f64::NAN);
+                    (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+                }
+                s
+            }),
+        ];
+        for (name, scalar, simd) in cases {
+            let got = super::simd_unary_f64(&xs, scalar, simd);
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(xs[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} f64 simd diverged from scalar at x={}: got {g} want {want}",
+                    xs[k]
                 );
             }
         }

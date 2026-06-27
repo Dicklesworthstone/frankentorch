@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f64 hardswish/hardsigmoid/hardtanh SIMD (scalar -> 3.5-3.8x FASTER vs torch, bit-exact)
+
+Agent `CrimsonForge`. The f64 sibling of the f32 hard* SIMD win (4c698ca3). relu_f64 already used
+simd_unary_f64_kernel (f64x4) but hardswish/hardsigmoid/hardtanh_tensor_contiguous_f64 were still on
+the scalar unary_f64 loop (their clamp branches + arithmetic are compute-bound, so scalar lost to
+torch). Routed all three through simd_unary_f64_kernel with a bit-exact f64x4 op reproducing the
+scalar value fn's EXACT arithmetic + clamp branches (identical to the f32 construction, f64x4):
+  hardtanh    = (!a.cmp_eq(a)).blend(NAN, a.max(-1).min(1))
+  hardsigmoid = cmp_le(-3)?0 : cmp_ge(3)?1 : (a+3)/6
+  hardswish   = cmp_le(-3)?0 : cmp_ge(3)?a : (a*(a+3))/6
+
+Bit-exact: EXHAUSTIVE edge-value test hard_activation_f64_simd_matches_scalar (±0/±inf/NaN/±subnormal
++ breakpoints ±3/±1 + 200-pt dense sweep) confirms SIMD lanes == scalar value fns.
+
+Measured (local, torch 8t, min-of-9, 16M f64, hard_f64_h2h, anchor-validated: relu_anchor ~3.75x
+FASTER = low contention, 2 consistent runs): hardswish 3.6-3.7x, hardsigmoid 3.7-3.8x, hardtanh 3.5-3.6x
+FASTER (torch f64 hard* ~24ms vs FT ~6.6ms). File: crates/ft-kernel-cpu/src/lib.rs.
+
 ## 2026-06-27 - WIN (landed): f64 maximum/minimum SIMD (scalar -> 1.5-2.25x FASTER vs torch, bit-exact)
 
 Agent `CrimsonForge`. The f64 sibling of the f32 max/min SIMD win (c5570161). add/sub/mul/div_f64
