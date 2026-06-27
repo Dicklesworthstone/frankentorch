@@ -3790,6 +3790,15 @@ pub struct TensorClampDispatchOutcome {
     pub decision: ClampDispatchDecision,
 }
 
+/// Native-f32 clamp outcome: keeps the f32 kernel result as `Vec<f32>` instead of
+/// the f64 round-trip the f64-typed `TensorClampDispatchOutcome` forces. Used by the
+/// typed F32/F16/BF16 clamp arms to avoid an f32->f64->f32 churn. frankentorch-kgs4.170.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorClampDispatchOutcomeF32 {
+    pub values: Vec<f32>,
+    pub decision: ClampDispatchDecision,
+}
+
 pub fn dispatch_scalar_clamp(
     mode: ExecutionMode,
     input: &ScalarTensor,
@@ -4719,6 +4728,56 @@ pub fn dispatch_tensor_clamp_contiguous_f32(
     })
 }
 
+/// Native-f32 clamp: identical to `dispatch_tensor_clamp_contiguous_f32` but returns
+/// the f32 kernel result directly (no `.map(f64::from)` upcast). The f64-typed variant
+/// forced f32 clamp through an f32->f64->f32 round-trip (the typed wrapper downcast it
+/// back) = 2 extra full passes over numel + ~3x the allocation, measured ~11x SLOWER
+/// than torch at [4000,4000]. Bit-identical: f32->f64->f32 round-trips an f32 value
+/// exactly, so the dropped conversions change no bits. frankentorch-kgs4.170.
+pub fn dispatch_tensor_clamp_contiguous_f32_native(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    min_val: f64,
+    max_val: f64,
+    requires_grad: bool,
+) -> Result<TensorClampDispatchOutcomeF32, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            clamp_tensor_contiguous_f32(input, meta, min_val as f32, max_val as f32)?,
+            "autograd_cpu::clamp_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            clamp_tensor_contiguous_f32(input, meta, min_val as f32, max_val as f32)?,
+            "cpu::clamp_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor clamp f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorClampDispatchOutcomeF32 {
+        values,
+        decision: ClampDispatchDecision {
+            mode,
+            kernel,
+            min_val,
+            max_val,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
 pub fn dispatch_tensor_norm_contiguous_f32(
     mode: ExecutionMode,
     input: &[f32],
@@ -5553,7 +5612,8 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome = dispatch_tensor_clamp_contiguous_f32(
+            // Native f32: no f32->f64->f32 round-trip (was ~11x SLOWER). frankentorch-kgs4.170.
+            let outcome = dispatch_tensor_clamp_contiguous_f32_native(
                 mode,
                 data,
                 meta,
@@ -5562,17 +5622,14 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedClampOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_clamp_contiguous_f32(
+            let outcome = dispatch_tensor_clamp_contiguous_f32_native(
                 mode,
                 &promoted,
                 &promoted_meta,
@@ -5581,10 +5638,7 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedClampOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }

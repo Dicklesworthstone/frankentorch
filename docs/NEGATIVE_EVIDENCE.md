@@ -4,6 +4,26 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): native-f32 clamp dispatch — kill the f32->f64->f32 round-trip (11x SLOWER -> ~2x FASTER)
+
+Bead/thread `frankentorch-kgs4.170`, agent `BlackThrush`. survey_f32_wide_h2h flagged f32 `clamp` at **11x
+SLOWER** than torch (140ms vs 12.6ms on [4000,4000]). ROOT: the native f32 clamp kernel
+(`clamp_tensor_contiguous_f32`, already parallel) computed correctly, but `dispatch_tensor_clamp_contiguous_f32`
+then `.map(f64::from)` UPCAST the whole f32 result to `Vec<f64>` (the shared f64-typed outcome struct), and the
+typed wrapper `dispatch_tensor_clamp_contiguous_typed` F32 arm immediately DOWNCAST it back (`v as f32`) — a
+pointless f32->f64->f32 round-trip = 2 extra full passes over numel + ~3x the allocation (64->128->64 MB).
+FIX: added `TensorClampDispatchOutcomeF32` + `dispatch_tensor_clamp_contiguous_f32_native` (returns the kernel's
+`Vec<f32>` directly, no conversion); routed the typed F32 + F16/BF16 arms through it (half still narrows via
+narrow_f32_to_storage_dtype). ★BIT-IDENTICAL: f32->f64->f32 round-trips an f32 value EXACTLY, so dropping the
+conversions changes no bits. Parity vs torch (clamp_f32_parity, 100003 incl NaN/±inf/±0/boundaries): **0/100003
+mismatches**. ft-dispatch 110/0 (clamp 4/0), conformance smoke 39/0. MEASURED (add_anchor 2.7-3x healthy): clamp
+140ms -> ~5.7ms min (**~2x FASTER** than torch in clean windows; ~parity under contention), ~20x internal. CLEAN
+win — clamp is f32->f32 (NO bool-output wall like eq/gt), so it BEATS torch. Same anti-pattern likely lurks in
+other typed f32 dispatch arms that `.map(f64::from)` a native f32 kernel result then downcast — grep
+`dispatch_*_f32` for `.map(f64::from)` (norm already does it: dispatch_tensor_norm_contiguous_f32 line ~4735,
+but norm returns a SCALAR so the round-trip is 1 value = harmless). Finder = examples/survey_f32_wide_h2h.rs +
+clamp_f32_parity.rs. AGENT BlackThrush.
+
 ## 2026-06-27 - WIN (landed): f32 comparison no-grad BORROW fast path — eq/gt 40x SLOWER -> ~6-8x (clone elimination)
 
 Bead/thread `frankentorch-kgs4.169`, agent `BlackThrush`. survey_f32_wide_h2h flagged f32 `eq`/`gt` at **~40x
