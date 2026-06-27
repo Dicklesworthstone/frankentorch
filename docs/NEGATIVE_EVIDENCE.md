@@ -4,6 +4,38 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): kthvalue f32 native quickselect, no f64 upcast (1.37x -> 3.52x FASTER vs torch, 2.57x over prior path)
+
+Agent `CrimsonForge`. Land-or-dig: the obvious biggest f32 gap (full-reduce
+sum/mean, ~6x SLOWER) was independently landed by a peer (`68f7b205`,
+`pairwise_sum_f32_par`) ~30 min before I could commit, and is parity-walled anyway
+(still 1.3-4.9x SLOWER than torch — the bit-exact pairwise tree cannot beat torch's
+order-changing SIMD reduction). Reverted that duplicate and dug a fresh, unclaimed
+lever instead.
+
+Root cause: `tensor_kthvalue` read `tensor_values_lossy_f64`, which UPCASTS the whole
+f32 buffer into a fresh f64 Vec (8·numel bytes) and then quickselects on a SECOND
+f64 clone — two full-numel allocations + an upcast pass before any selection work,
+for an op whose output is a single element. Fix: a native-f32 fast path for
+contiguous f32 input that borrows the f32 buffer and runs the IDENTICAL quickselect
++ stable index resolution in f32 (one f32 scratch = half the bytes, no upcast).
+
+Bit-exact: the f32 branch runs the exact same index-resolution code as the f64
+branch, and `f32::total_cmp` induces the same total order as `f64::total_cmp` on the
+losslessly-widened values, so the rank-k element and the stable ascending-index
+tie-break (frankentorch-kgs4.57) are unchanged. `crates/ft-api/examples/kthvalue_f32_h2h.rs`
+shows 12/12 distinct-value k match `torch.kthvalue` exactly (value bits + index).
+
+Measured (local host, torch 8 threads, min-of-7, 1-D f32 numel=16e6, k=37th pct),
+`crates/ft-api/examples/kthvalue_f32_h2h.rs`:
+- old (f32->f64 upcast):  192.070 ms  => FT 1.37x FASTER vs torch
+- new (native f32):        74.671 ms  => FT 3.52x FASTER vs torch
+- PyTorch:                262.807 ms;  speedup new/old = 2.57x
+
+ft-api `kthvalue_*` lib tests + the conformance `fuzz_metamorphic_kthvalue_contract`
+remain green (f64 path and gradient routing unchanged). Existing kthvalue file:
+`crates/ft-api/src/lib.rs` `tensor_kthvalue`.
+
 ## 2026-06-27 - WIN (landed): f32 constant pad parallel nonzero row-fill (2.17x SLOWER -> 2.81x FASTER vs torch)
 
 Bead/thread `frankentorch-kgs4.182`, agent `BlackThrush`. Land-or-dig scan found no clean unlanded measured
