@@ -27746,9 +27746,57 @@ define_unary_f32!(
     erfc_value_f32,
     PARALLEL_THRESHOLD
 );
-define_unary_f32!(hardswish_tensor_contiguous_f32, hardswish_value_f32);
-define_unary_f32!(hardsigmoid_tensor_contiguous_f32, hardsigmoid_value_f32);
-define_unary_f32!(hardtanh_tensor_contiguous_f32, hardtanh_value_f32);
+// hardswish/hardsigmoid/hardtanh f32: SIMD-accelerated via simd_unary_f32_kernel (the same
+// path relu/neg/abs/sqrt use, 633cb51e) instead of the scalar define_unary loop. These are
+// PIECEWISE-LINEAR (no transcendental, no reduction) so the SIMD op reproduces the scalar
+// value fn's EXACT f32 arithmetic lanewise (same add/mul/div order + clamp), and NaN is forced
+// where the input is NaN (the scalar piecewise falls into the `else`/clamp branch, which yields
+// NaN). wide f32x8::max/min are fmax/fmin-faithful (incl. ±0 sign, see the max/min kernel).
+// Bit-exactness (incl. ±0/±inf/NaN/subnormal) is guarded by hard_activation_f32_simd_matches_scalar.
+pub fn hardswish_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    let three = f32x8::splat(3.0f32);
+    let six = f32x8::splat(6.0f32);
+    let zero = f32x8::splat(0.0f32);
+    let neg3 = f32x8::splat(-3.0f32);
+    simd_unary_f32_kernel(input, meta, hardswish_value_f32, move |a| {
+        // x<=-3 -> 0 ; x>=3 -> x ; else x*(x+3)/6 (NaN flows to the mid branch -> NaN).
+        let mid = (a * (a + three)) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(a, r)
+    })
+}
+pub fn hardsigmoid_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    let three = f32x8::splat(3.0f32);
+    let six = f32x8::splat(6.0f32);
+    let zero = f32x8::splat(0.0f32);
+    let one = f32x8::splat(1.0f32);
+    let neg3 = f32x8::splat(-3.0f32);
+    simd_unary_f32_kernel(input, meta, hardsigmoid_value_f32, move |a| {
+        // x<=-3 -> 0 ; x>=3 -> 1 ; else (x+3)/6 (NaN flows to the mid branch -> NaN).
+        let mid = (a + three) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(one, r)
+    })
+}
+pub fn hardtanh_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    let neg1 = f32x8::splat(-1.0f32);
+    let one = f32x8::splat(1.0f32);
+    let nan = f32x8::splat(f32::NAN);
+    simd_unary_f32_kernel(input, meta, hardtanh_value_f32, move |a| {
+        // clamp(a, -1, 1): min(max(a,-1),1) is bit-exact for non-NaN; clamp propagates NaN,
+        // so force NaN where a is NaN.
+        (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+    })
+}
 define_unary_f32!(
     softplus_tensor_contiguous_f32,
     softplus_value_f32,
@@ -32616,6 +32664,91 @@ mod tests {
                     "{name} simd diverged from scalar at pair ({}, {}): got {g} ({:08x}) want {want} ({:08x})",
                     l[k],
                     r[k],
+                    g.to_bits(),
+                    want.to_bits()
+                );
+            }
+        }
+    }
+
+    // The SIMD hardswish/hardsigmoid/hardtanh ops must be BIT-IDENTICAL to their scalar
+    // value fns (the prior define_unary_f32 kernels). Exhaustively cover every IEEE edge value
+    // (±0, ±inf, NaN, ±subnormal) plus the piecewise breakpoints (±3, ±1) and dense normals so
+    // the affine/quadratic arithmetic, the clamp branches, and NaN propagation are all checked.
+    #[test]
+    fn hard_activation_f32_simd_matches_scalar() {
+        use wide::{CmpEq, CmpGe, CmpLe, f32x8};
+        let mut xs: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            3.0,
+            -3.0,
+            1.0,
+            -1.0,
+            2.999_999_5,
+            3.000_001,
+            -2.999_999_5,
+            -3.000_001,
+            1.0e30,
+            -1.0e30,
+        ];
+        // dense sweep across the piecewise regions, length chosen so SIMD lanes + a scalar tail
+        // are both exercised.
+        for i in 0..200 {
+            xs.push((i as f32 - 100.0) * 0.07);
+        }
+        let cases: [(&str, fn(f32) -> f32, fn(f32x8) -> f32x8); 3] = [
+            ("hardswish", super::hardswish_value_f32, {
+                fn s(a: f32x8) -> f32x8 {
+                    let three = f32x8::splat(3.0f32);
+                    let six = f32x8::splat(6.0f32);
+                    let zero = f32x8::splat(0.0f32);
+                    let neg3 = f32x8::splat(-3.0f32);
+                    let mid = (a * (a + three)) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(a, r)
+                }
+                s
+            }),
+            ("hardsigmoid", super::hardsigmoid_value_f32, {
+                fn s(a: f32x8) -> f32x8 {
+                    let three = f32x8::splat(3.0f32);
+                    let six = f32x8::splat(6.0f32);
+                    let zero = f32x8::splat(0.0f32);
+                    let one = f32x8::splat(1.0f32);
+                    let neg3 = f32x8::splat(-3.0f32);
+                    let mid = (a + three) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(one, r)
+                }
+                s
+            }),
+            ("hardtanh", super::hardtanh_value_f32, {
+                fn s(a: f32x8) -> f32x8 {
+                    let neg1 = f32x8::splat(-1.0f32);
+                    let one = f32x8::splat(1.0f32);
+                    let nan = f32x8::splat(f32::NAN);
+                    (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+                }
+                s
+            }),
+        ];
+        for (name, scalar, simd) in cases {
+            let got = super::simd_unary_f32(&xs, scalar, simd);
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(xs[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} simd diverged from scalar at x={}: got {g} ({:08x}) want {want} ({:08x})",
+                    xs[k],
                     g.to_bits(),
                     want.to_bits()
                 );

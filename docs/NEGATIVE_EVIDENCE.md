@@ -4,6 +4,28 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): f32 hardswish/hardsigmoid/hardtanh SIMD (scalar -> 1.7-2.1x FASTER vs torch, bit-exact)
+
+Agent `CrimsonForge`. hardswish/hardsigmoid/hardtanh f32 used the SCALAR define_unary_f32 macro
+while relu/neg/abs/sqrt/reciprocal already used the SIMD unary path (633cb51e). Routed all three
+through simd_unary_f32_kernel with a bit-exact SIMD op that reproduces the scalar value fn's EXACT
+f32 arithmetic + clamp branches lanewise:
+- hardtanh = clamp(x,-1,1): (!a.cmp_eq(a)).blend(NAN, a.max(neg1).min(one)) — min(max) is exact
+  for non-NaN, NaN forced (clamp propagates).
+- hardsigmoid = x<=-3?0 : x>=3?1 : (x+3)/6 — mid=(a+three)/six; cmp_le/cmp_ge blends; NaN flows to mid.
+- hardswish = x<=-3?0 : x>=3?x : x*(x+3)/6 — mid=(a*(a+three))/six; same blends.
+
+Bit-exact: EXHAUSTIVE edge-value test hard_activation_f32_simd_matches_scalar (±0/±inf/NaN/±subnormal
++ breakpoints ±3/±1 + 200-pt dense sweep) confirms SIMD lanes == scalar value fns. All three are
+PIECEWISE-LINEAR (no transcendental/reduction) so bit-exactness holds (unlike selu/celu/elu/silu/mish/
+softplus which are exp/SLEEF-walled).
+
+Measured (local, torch 8t, min-of-9, 16M f32, act_f32_h2h, anchor-validated run: relu_anchor=2.11x
+FASTER ≈ its true value): hardswish 2.13x, hardtanh 1.76x, hardsigmoid 1.72x FASTER (all were SLOWER
+than torch on the scalar path). hardtanh's flip is independently corroborated by the clamp win (57b556f0,
+1.98x FASTER) since hardtanh IS clamp(-1,1). ⚠️Earlier contended runs (8-27 peer benches, anchor ~1x)
+falsely read these 2-5x SLOWER — gate trust on the relu anchor. File: crates/ft-kernel-cpu/src/lib.rs.
+
 ## 2026-06-27 - WIN (landed): f32 maximum/minimum SIMD (1.47x/1.12x SLOWER -> 1.68x/2.10x FASTER vs torch, bit-exact)
 
 Agent `CrimsonForge`. max_tensor_contiguous_f32 / min_tensor_contiguous_f32 (behind
