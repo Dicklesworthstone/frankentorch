@@ -4,6 +4,30 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - WIN (landed): native f32 amax/amin-over-dim kernel — ~122x SLOWER -> ~19x internal speedup, bit-exact
+
+Bead/thread `frankentorch-kgs4.168`, agent `BlackThrush`. survey_f32_wide_h2h (4000x4000 f32, add_anchor
+2.0-3.0x FASTER = healthy) flagged f32 `amax`/`amin` over a dim as the BIGGEST measured gap: **dim0 121.9x
+SLOWER** (97.7ms vs 0.8ms), **dim1 124.5x SLOWER** (78.9ms vs 0.6ms). ROOT: f32 `tensor_amax_amin_split` had a
+native fast path ONLY for F64 (`extremum_dim_values_contiguous_f64`, SIMD+parallel); F32 fell to `to_dtype`
+upcast (f32->f64 64MB clone) + an apply_function SERIAL scalar triple loop (no SIMD, no rayon). FIX: ported the
+f64 kernel to f32 — `extremum_dim_values_contiguous_f32` + `extremum_lastdim_value_simd_f32` (f32x8 SIMD last-dim,
+inner=1) + `extremum_dim_value_scalar_f32` (strided, inner>1), same par_iter_mut parallelism, NaN propagation +
+±0 tie repair — and wired a no-grad contiguous-f32 fast path in tensor_amax_amin_split (strided f32 still falls
+through to the upcast path). ★BIT-EXACT: the extremum is one input element, so f32-native == f64-upcast-then-round.
+Kernel test `extremum_dim_values_contiguous_f32_matches_serial_bits` (SIMD + strided paths, NaN/±0/inf) == serial
+f32 reference; torch parity (amax_f32_parity, [337,251] incl NaN/±0/inf/ties): amax0/amax1/amin0/amin1 **0
+mismatches each**. ft-kernel-cpu 556/0, conformance smoke 39/0. MEASURED: dim0 97.7ms -> ~5.2ms, dim1 78.9ms ->
+~3.1ms (~19x / ~25x internal). Now **~3-6x SLOWER than torch** (was 122x): the RESIDUAL gap is the per-element
+`is_nan` check in the hot reduction loop + the strided-column cache pattern for dim0 — both SHARED with the f64
+native kernel (this port brings f32 amax to f64-path parity; it does NOT yet beat torch). FRESH FOLLOW-UP LEVER
+(applies to BOTH dtypes): NaN-propagating SIMD max via comparison masks (avoid the per-lane is_nan branch) +
+row-streaming SIMD reduction for the strided inner>1 case (out[i]=max(out[i],row[i]) cache-friendly, bit-identical
+since per-output r-order is preserved) — that's what closes the last 3-6x vs torch's vectorized reduction.
+Finder = examples/survey_f32_wide_h2h.rs. OTHER big f32 gaps it surfaced (next targets): eq/gt **~40x SLOWER**
+(comparison, trivially bit-exact), clamp **11x** (pure clamp like relu6), pow2 11.6x (parity-risk), sum/mean 13x
+(pairwise-locked). AGENT BlackThrush.
+
 ## 2026-06-27 - WIN (landed): parallel-SIMD f32 BINARY kernel — add/sub/mul/div ~1.6-2.5x FASTER than torch
 
 Bead/thread `frankentorch-kgs4.167`, agent `BlackThrush`. Direct sibling of kgs4.166 (parallel-SIMD f32
