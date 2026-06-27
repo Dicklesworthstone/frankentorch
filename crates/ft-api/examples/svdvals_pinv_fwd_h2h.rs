@@ -26,7 +26,9 @@ fn run_ft(op: &str, batch: usize, n: usize) -> Result<f64, Box<dyn Error>> {
     for _ in 0..4 {
         let data = fill(batch, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, n, n], false).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, n, n], false)
+            .map_err(boxed)?;
         let start = Instant::now();
         if op == "svdvals" {
             let _ = s.tensor_linalg_svdvals(a).map_err(boxed)?;
@@ -34,14 +36,20 @@ fn run_ft(op: &str, batch: usize, n: usize) -> Result<f64, Box<dyn Error>> {
             let _ = s.tensor_linalg_pinv(a).map_err(boxed)?;
         }
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     for op in ["svdvals", "pinv"] {
-        for (batch, n) in [(2000usize, 32usize), (2000usize, 64usize), (1000usize, 96usize)] {
+        for (batch, n) in [
+            (2000usize, 32usize),
+            (2000usize, 64usize),
+            (1000usize, 96usize),
+        ] {
             let ft_ms = run_ft(op, batch, n)?;
             println!("{op} B={batch} n={n}: FT {ft_ms:.1} ms");
         }

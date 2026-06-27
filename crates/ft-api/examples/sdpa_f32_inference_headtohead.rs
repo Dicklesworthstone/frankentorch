@@ -19,7 +19,9 @@ const SEQ: usize = 512;
 const D: usize = 64;
 
 fn seq_f32(n: usize, shift: f32) -> Vec<f32> {
-    (0..n).map(|i| (((i as f32) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f32) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 // Full no-grad f32 SDPA through the public session API (requires_grad=false -> no tape,
@@ -29,12 +31,22 @@ fn seq_f32(n: usize, shift: f32) -> Vec<f32> {
 fn bench_ft(qb: &[f32], kb: &[f32], vb: &[f32], causal: bool, iters: usize) -> (f64, f64) {
     let shape = vec![BH, SEQ, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let q = s.tensor_variable_f32(qb.to_vec(), shape.clone(), false).unwrap();
-    let k = s.tensor_variable_f32(kb.to_vec(), shape.clone(), false).unwrap();
+    let q = s
+        .tensor_variable_f32(qb.to_vec(), shape.clone(), false)
+        .unwrap();
+    let k = s
+        .tensor_variable_f32(kb.to_vec(), shape.clone(), false)
+        .unwrap();
     let v = s.tensor_variable_f32(vb.to_vec(), shape, false).unwrap();
     let op = |s: &mut FrankenTorchSession| -> f64 {
-        let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, causal).unwrap();
-        s.tensor_values_f32(out).unwrap().iter().map(|x| x.abs() as f64).sum()
+        let out = s
+            .scaled_dot_product_attention(q, k, v, None, 0.0, causal)
+            .unwrap();
+        s.tensor_values_f32(out)
+            .unwrap()
+            .iter()
+            .map(|x| x.abs() as f64)
+            .sum()
     };
     for _ in 0..3 {
         let _ = op(&mut s);
@@ -79,17 +91,25 @@ print("CHECKSUM", chk)
 fn py(causal: bool, iters: usize) -> Option<(f64, f64)> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let out = Command::new(&python)
-        .arg("-c").arg(PY)
+        .arg("-c")
+        .arg(PY)
         .env("FT_GAUNTLET_ITERS", iters.to_string())
         .env("FT_CAUSAL", if causal { "1" } else { "0" })
-        .output().ok()?;
+        .output()
+        .ok()?;
     if !out.status.success() {
         eprintln!("pytorch failed: {}", String::from_utf8_lossy(&out.stderr));
         return None;
     }
     let s = String::from_utf8_lossy(&out.stdout);
-    let ms = s.lines().find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse().ok()))?;
-    let chk = s.lines().find_map(|l| l.strip_prefix("CHECKSUM ").and_then(|v| v.trim().parse().ok()))?;
+    let ms = s.lines().find_map(|l| {
+        l.strip_prefix("ELAPSED_MS ")
+            .and_then(|v| v.trim().parse().ok())
+    })?;
+    let chk = s.lines().find_map(|l| {
+        l.strip_prefix("CHECKSUM ")
+            .and_then(|v| v.trim().parse().ok())
+    })?;
     Some((ms, chk))
 }
 
@@ -100,16 +120,25 @@ fn report(qb: &[f32], kb: &[f32], vb: &[f32], label: &str, causal: bool, iters: 
         Some((p, ps)) => {
             let rel = (ft_sum - ps).abs() / (ps.abs() + 1e-9);
             let r = p / ft;
-            let verdict = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x slower", 1.0 / r) };
-            println!("   PyTorch {p:8.3} ms  => {verdict}  (rel-diff {rel:.2e} {})",
-                if rel < 1e-4 { "MATCH" } else { "MISMATCH!" });
+            let verdict = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x slower", 1.0 / r)
+            };
+            println!(
+                "   PyTorch {p:8.3} ms  => {verdict}  (rel-diff {rel:.2e} {})",
+                if rel < 1e-4 { "MATCH" } else { "MISMATCH!" }
+            );
         }
         None => println!("   PyTorch (unavailable)"),
     }
 }
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     println!("f32 SDPA INFERENCE (no-grad, through-session) [{BH},{SEQ},{D}], {iters} iters MIN:");
     let total = BH * SEQ * D;
     let q = seq_f32(total, 0.0);

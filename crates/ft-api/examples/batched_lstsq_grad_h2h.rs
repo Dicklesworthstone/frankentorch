@@ -17,8 +17,12 @@ fn fill(batch: usize, m: usize, n: usize, nrhs: usize) -> (Vec<f64>, Vec<f64>) {
         for r in 0..m {
             for c in 0..n {
                 let noise = ((((plane + 1) * (r + 3) * (c + 5)) % 23) as f64 - 11.0) * 0.01;
-                a[plane * m * n + r * n + c] =
-                    noise + if r == c { 2.0 + (plane % 7) as f64 * 0.001 } else { 0.0 };
+                a[plane * m * n + r * n + c] = noise
+                    + if r == c {
+                        2.0 + (plane % 7) as f64 * 0.001
+                    } else {
+                        0.0
+                    };
             }
             for c in 0..nrhs {
                 b[plane * m * nrhs + r * nrhs + c] =
@@ -35,8 +39,12 @@ fn run_ft(batch: usize, m: usize, n: usize, nrhs: usize) -> Result<(f64, f64), B
     for _ in 0..5 {
         let (ad, bd) = fill(batch, m, n, nrhs);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(ad, vec![batch, m, n], true).map_err(boxed)?;
-        let b = s.tensor_variable(bd, vec![batch, m, nrhs], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(ad, vec![batch, m, n], true)
+            .map_err(boxed)?;
+        let b = s
+            .tensor_variable(bd, vec![batch, m, nrhs], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let x = s.tensor_linalg_lstsq(a, b).map_err(boxed)?;
         let sq = s.tensor_mul(x, x).map_err(boxed)?;

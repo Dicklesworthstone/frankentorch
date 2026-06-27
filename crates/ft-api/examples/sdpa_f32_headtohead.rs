@@ -16,17 +16,27 @@ const SEQ: usize = 512;
 const D: usize = 64;
 
 fn seq_f32(n: usize, shift: f32) -> Vec<f32> {
-    (0..n).map(|i| (((i as f32) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f32) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 fn ft_f32_sdpa_step(causal: bool) -> f64 {
     let total = BH * SEQ * D;
     let shape = vec![BH, SEQ, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let q = s.tensor_variable_f32(seq_f32(total, 0.0), shape.clone(), true).unwrap();
-    let k = s.tensor_variable_f32(seq_f32(total, 1.0), shape.clone(), true).unwrap();
-    let v = s.tensor_variable_f32(seq_f32(total, 2.0), shape, true).unwrap();
-    let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, causal).unwrap();
+    let q = s
+        .tensor_variable_f32(seq_f32(total, 0.0), shape.clone(), true)
+        .unwrap();
+    let k = s
+        .tensor_variable_f32(seq_f32(total, 1.0), shape.clone(), true)
+        .unwrap();
+    let v = s
+        .tensor_variable_f32(seq_f32(total, 2.0), shape, true)
+        .unwrap();
+    let out = s
+        .scaled_dot_product_attention(q, k, v, None, 0.0, causal)
+        .unwrap();
     let loss = s.tensor_sum(out).unwrap();
     let report = s.tensor_backward(loss).unwrap();
     report.gradient(q).unwrap().iter().map(|x| x.abs()).sum()
@@ -84,9 +94,10 @@ fn py_ms(causal: bool, iters: usize) -> Option<f64> {
         eprintln!("pytorch failed: {}", String::from_utf8_lossy(&out.stderr));
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse::<f64>().ok()))
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        l.strip_prefix("ELAPSED_MS ")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    })
 }
 
 fn report(label: &str, causal: bool, iters: usize) {
@@ -106,7 +117,10 @@ fn report(label: &str, causal: bool, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     println!("f32 SDPA [{BH},{SEQ},{D}] train step, {iters} iters median:");
     report("non-causal", false, iters);
     report("causal", true, iters);

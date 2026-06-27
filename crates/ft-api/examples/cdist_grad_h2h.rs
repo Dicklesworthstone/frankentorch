@@ -23,8 +23,12 @@ fn run_ft(p: usize, d: usize, p_dim: usize, r_dim: usize) -> Result<(f64, f64), 
         let x1d = fill(p_dim, d, 1);
         let x2d = fill(r_dim, d, 2);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x1 = s.tensor_variable(x1d, vec![p_dim, d], true).map_err(boxed)?;
-        let x2 = s.tensor_variable(x2d, vec![r_dim, d], false).map_err(boxed)?;
+        let x1 = s
+            .tensor_variable(x1d, vec![p_dim, d], true)
+            .map_err(boxed)?;
+        let x2 = s
+            .tensor_variable(x2d, vec![r_dim, d], false)
+            .map_err(boxed)?;
         let start = Instant::now();
         let dist = s.tensor_cdist(x1, x2, p as f64).map_err(boxed)?;
         let loss = s.tensor_sum(dist).map_err(boxed)?;
@@ -61,8 +65,12 @@ print("MS", min(s)); print("SUM", g.sum().item())
 "#
     );
     let mut child = Command::new(&python)
-        .arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().ok()?;
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
     child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -70,7 +78,12 @@ print("MS", min(s)); print("SUM", g.sum().item())
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let get = |pre: &str| stdout.lines().find_map(|l| l.strip_prefix(pre)).and_then(|v| v.trim().parse::<f64>().ok());
+    let get = |pre: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(pre))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    };
     Some((get("MS ")?, get("SUM ")?))
 }
 
@@ -83,7 +96,9 @@ fn main() -> Result<(), Box<dyn Error>> {
                 let rel = (ft_sum - tsum).abs() / (tsum.abs() + 1e-12);
                 let ratio = tms / ft_ms;
                 let tag = if ratio >= 1.0 { "FASTER" } else { "SLOWER" };
-                println!(" | PyTorch {tms:.3} ms gradsum {tsum:.6e} rel {rel:.3e} | FT {ratio:.2}x {tag}");
+                println!(
+                    " | PyTorch {tms:.3} ms gradsum {tsum:.6e} rel {rel:.3e} | FT {ratio:.2}x {tag}"
+                );
             } else {
                 println!(" | PyTorch unavailable");
             }

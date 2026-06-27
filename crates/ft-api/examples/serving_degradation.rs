@@ -16,11 +16,16 @@ const SEQ: usize = 512;
 const D: usize = 64;
 
 fn vals(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 fn main() {
-    let n: usize = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(150);
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(150);
     let total = BH * SEQ * D;
     let q = vals(total, 0.0);
     let k = vals(total, 1.0);
@@ -36,7 +41,9 @@ fn main() {
         let qn = s.tensor_variable(q.clone(), shape.clone(), false).unwrap();
         let kn = s.tensor_variable(k.clone(), shape.clone(), false).unwrap();
         let vn = s.tensor_variable(v.clone(), shape.clone(), false).unwrap();
-        let out = s.scaled_dot_product_attention(qn, kn, vn, None, 0.0, false).unwrap();
+        let out = s
+            .scaled_dot_product_attention(qn, kn, vn, None, 0.0, false)
+            .unwrap();
         let _: f64 = s.tensor_values(out).unwrap().iter().sum();
         per_iter.push(t.elapsed().as_secs_f64() * 1e3);
     }
@@ -46,13 +53,26 @@ fn main() {
     let last10 = avg(&per_iter[n.saturating_sub(10)..]);
     println!("reused-session SDPA serving [{BH},{SEQ},{D}], {n} inferences in ONE session:");
     println!("  iter[0..10] avg   : {first10:8.3} ms");
-    println!("  iter[{}..{}] avg : {:8.3} ms", n.saturating_sub(10), n, last10);
+    println!(
+        "  iter[{}..{}] avg : {:8.3} ms",
+        n.saturating_sub(10),
+        n,
+        last10
+    );
     println!("  retained heap est : ~{} MB ({n} x ~16MB)", n * 16);
-    println!("  degradation       : {:.2}x (last10/first10)", last10 / first10);
+    println!(
+        "  degradation       : {:.2}x (last10/first10)",
+        last10 / first10
+    );
     if last10 > 1.5 * first10 {
         println!("  => SERVING DEGRADATION confirmed (gmuml tape-retention). PyTorch stays flat.");
-        println!("     Mitigation: compact the no-grad tape between inferences (compact_nograd_tensor_since / truncate_graph_to), or RAII handles.");
+        println!(
+            "     Mitigation: compact the no-grad tape between inferences (compact_nograd_tensor_since / truncate_graph_to), or RAII handles."
+        );
     } else {
-        println!("  => flat at this scale (~{} MB retained); gmuml threshold not reached.", n * 16);
+        println!(
+            "  => flat at this scale (~{} MB retained); gmuml threshold not reached.",
+            n * 16
+        );
     }
 }

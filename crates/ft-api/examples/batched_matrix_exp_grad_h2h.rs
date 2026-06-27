@@ -30,7 +30,9 @@ fn run_ft(batch: usize, n: usize) -> Result<(f64, f64), Box<dyn Error>> {
     for _ in 0..5 {
         let data = fill_input(batch, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, n, n], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, n, n], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let y = s.tensor_matrix_exp(a).map_err(boxed)?;
         let sq = s.tensor_mul(y, y).map_err(boxed)?;

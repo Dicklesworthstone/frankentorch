@@ -19,12 +19,16 @@ fn ft_cumsum(shape: &[usize], dim: usize, iters: usize) -> (f64, f64) {
     let mut chk = 0.0;
     for _ in 0..iters + 3 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable(data.clone(), shape.to_vec(), false).unwrap();
+        let x = s
+            .tensor_variable(data.clone(), shape.to_vec(), false)
+            .unwrap();
         let t = Instant::now();
         let out = s.tensor_cumsum(x, dim).unwrap();
         let el = t.elapsed().as_secs_f64() * 1e3;
         chk = s.tensor_values(out).unwrap().iter().sum();
-        if el < best { best = el; }
+        if el < best {
+            best = el;
+        }
     }
     (chk, best)
 }
@@ -47,12 +51,24 @@ print("MS", sorted(ts)[0]); print("CHK", chk)
 
 fn py(shape: &[usize], dim: usize) -> (Option<f64>, Option<f64>) {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let shp = shape.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
-    let o = Command::new(&python).arg("-c").arg(PY).env("SHAPE", shp).env("DIM", dim.to_string()).output();
+    let shp = shape
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let o = Command::new(&python)
+        .arg("-c")
+        .arg(PY)
+        .env("SHAPE", shp)
+        .env("DIM", dim.to_string())
+        .output();
     match o {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let g = |p: &str| s.lines().find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()));
+            let g = |p: &str| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()))
+            };
             (g("MS "), g("CHK "))
         }
         _ => (None, None),
@@ -75,7 +91,11 @@ fn main() {
             (Some(p), Some(ps)) => {
                 let rel = (ft_sum - ps).abs() / (ps.abs() + 1e-12);
                 let r = p / ft_ms;
-                let verdict = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x slower", 1.0 / r) };
+                let verdict = if r >= 1.0 {
+                    format!("FT {r:.2}x FASTER")
+                } else {
+                    format!("FT {:.2}x slower", 1.0 / r)
+                };
                 let corr = if rel < 1e-9 { "MATCH" } else { "MISMATCH!" };
                 println!("  | PyTorch {p:8.3} ms  => {verdict}  ({corr} {rel:.1e})");
             }

@@ -9,7 +9,9 @@ fn boxed<E: std::fmt::Debug>(err: E) -> std::io::Error {
 }
 
 fn fill(n: usize, salt: usize) -> Vec<f64> {
-    (0..n).map(|i| (((i + salt) % 17) as f64 - 8.0) * 0.05).collect()
+    (0..n)
+        .map(|i| (((i + salt) % 17) as f64 - 8.0) * 0.05)
+        .collect()
 }
 
 fn run_ft(b: usize, n: usize) -> Result<f64, Box<dyn Error>> {
@@ -23,13 +25,19 @@ fn run_ft(b: usize, n: usize) -> Result<f64, Box<dyn Error>> {
         let start = Instant::now();
         let _q = s.tensor_householder_product(a, tau).map_err(boxed)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (b, n) in [(200usize, 64usize), (500usize, 64usize), (2000usize, 64usize)] {
+    for (b, n) in [
+        (200usize, 64usize),
+        (500usize, 64usize),
+        (2000usize, 64usize),
+    ] {
         let ft_ms = run_ft(b, n)?;
         println!("B={b} n={n}: FT {ft_ms:.1} ms");
     }

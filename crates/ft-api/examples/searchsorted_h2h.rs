@@ -19,8 +19,12 @@ fn run_ft(seq_len: usize, n_q: usize) -> Result<(f64, f64), Box<dyn Error>> {
     let mut checksum = 0.0_f64;
     for _ in 0..5 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let seq_t = s.tensor_variable(seq.clone(), vec![seq_len], false).map_err(boxed)?;
-        let q_t = s.tensor_variable(q.clone(), vec![n_q], false).map_err(boxed)?;
+        let seq_t = s
+            .tensor_variable(seq.clone(), vec![seq_len], false)
+            .map_err(boxed)?;
+        let q_t = s
+            .tensor_variable(q.clone(), vec![n_q], false)
+            .map_err(boxed)?;
         let start = Instant::now();
         let out = s.tensor_searchsorted(seq_t, q_t, false).map_err(boxed)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
@@ -50,8 +54,12 @@ print("MS", min(s)); print("SUM", float(step().sum().item()))
 "#
     );
     let mut child = Command::new(&python)
-        .arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().ok()?;
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
     child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -59,12 +67,21 @@ print("MS", min(s)); print("SUM", float(step().sum().item()))
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let get = |pre: &str| stdout.lines().find_map(|l| l.strip_prefix(pre)).and_then(|v| v.trim().parse::<f64>().ok());
+    let get = |pre: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(pre))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    };
     Some((get("MS ")?, get("SUM ")?))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (sl, nq) in [(10_000usize, 50_000_000usize), (1_000, 20_000_000), (100_000, 10_000_000)] {
+    for (sl, nq) in [
+        (10_000usize, 50_000_000usize),
+        (1_000, 20_000_000),
+        (100_000, 10_000_000),
+    ] {
         let (ft_ms, ft_sum) = run_ft(sl, nq)?;
         print!("seq={sl} nq={nq}: FT {ft_ms:.3} ms sum {ft_sum:.6e}");
         if let Some((tms, tsum)) = run_pytorch(sl, nq) {

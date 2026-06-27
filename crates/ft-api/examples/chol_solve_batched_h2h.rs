@@ -33,11 +33,15 @@ fn run_ft(b: usize, n: usize) -> Result<f64, Box<dyn Error>> {
     for _ in 0..3 {
         let ltri = lower_tri_batch(b, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let l = s.tensor_variable(ltri, vec![b, n, n], false).map_err(boxed)?;
+        let l = s
+            .tensor_variable(ltri, vec![b, n, n], false)
+            .map_err(boxed)?;
         let start = Instant::now();
         let _inv = s.tensor_cholesky_inverse(l, false).map_err(boxed)?; // batched API
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }
@@ -46,12 +50,18 @@ fn run_ft(b: usize, n: usize) -> Result<f64, Box<dyn Error>> {
 fn verify(b: usize, n: usize) -> Result<(), Box<dyn Error>> {
     let ltri = lower_tri_batch(b, n);
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let l = s.tensor_variable(ltri.clone(), vec![b, n, n], false).map_err(boxed)?;
+    let l = s
+        .tensor_variable(ltri.clone(), vec![b, n, n], false)
+        .map_err(boxed)?;
     let inv = s.tensor_cholesky_inverse(l, false).map_err(boxed)?;
     let got = s.tensor_values(inv).map_err(boxed)?;
     for bi in 0..b {
         let l2 = s
-            .tensor_variable(ltri[bi * n * n..(bi + 1) * n * n].to_vec(), vec![n, n], false)
+            .tensor_variable(
+                ltri[bi * n * n..(bi + 1) * n * n].to_vec(),
+                vec![n, n],
+                false,
+            )
             .map_err(boxed)?;
         let inv2 = s.tensor_cholesky_inverse(l2, false).map_err(boxed)?;
         let want = s.tensor_values(inv2).map_err(boxed)?;
