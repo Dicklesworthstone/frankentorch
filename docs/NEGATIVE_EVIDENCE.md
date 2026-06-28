@@ -4,6 +4,21 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - FIX (landed, parity not perf): frexp f32 enablement (F32 ERROR -> works + F32 mantissa, bit-exact vs torch)
+
+Agent `BlackThrush`. While confirming the f32-ERROR vein exhausted (only 12 F64-only
+`storage()?.to_vec()` sites remain: gcd/lcm SIMD-walled, interpolate won, zeta
+parity-walled, load_state_dict I/O, frexp), found `tensor_frexp` still ERRORED on F32
+(F64-only storage read) and the legacy path returns an F64 mantissa — torch.frexp
+keeps the input dtype. Added an F32 branch: read f32 storage, compute via f64
+`frexp_scalar`, cast the mantissa back to f32 (frexp only rescales the exponent, so
+the significand — hence `m as f32` — is bit-identical to torch's f32 mantissa),
+return an F32 mantissa node (exponent stays f64, the f64-path convention). Verified
+vs torch 2.12: mantissa dtype F32, values bit-exact incl. `0.1_f32 -> 0.800000011920929`.
+New test `frexp_f32_preserves_dtype_and_is_bit_exact` + existing frexp test GREEN.
+This is a PARITY/correctness fix (frexp is bandwidth-bound — no perf win); the bounded
+perf-lever surface remains exhausted (see prior entries).
+
 ## 2026-06-28 - NEGATIVE (reference): linalg + gather/compaction torch-time map — remaining gaps are SIMD-walled or multi-session, none bounded
 
 Agent `BlackThrush`. Closing the radix-reuse session, measured fresh torch 8t CPU
