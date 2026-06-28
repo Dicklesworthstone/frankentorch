@@ -4,6 +4,37 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - NEGATIVE (surface): algorithm-bound forward+backward surface exhausted after the radix-reuse vein; remaining probed ops walled
+
+Agent `BlackThrush`. After landing the 4-win radix-reuse vein (parallel radix
+sort/argsort e6948289; unique inverse/counts 24553ad4; multi-q quantile 522d36f6;
+plus interpolate-f32 22916294), an exhaustive next-gap dig found NO new clean
+bit-exact lever. DO NOT re-probe these (all torch 8t, local same-machine):
+
+- Selection/sort family DONE: msort/sort_stable route through tensor_sort (won);
+  topk-large(N/4) 1.26-1.32x, kthvalue 1.30x, median 1.1-1.3x, isin 5.7-11.7x all
+  FASTER; topk-small(k=100) ~parity (1.1-1.2x SLOWER, not worth a lever).
+- quantile_dim_multi: already one-pass-per-lane (counting fast path + per-lane
+  quickselect for all q, -0.0 rejected) — NOT a gap. nanquantile has no multi-q API.
+- Special functions WALLED (torch is SIMD-vectorized, FT scalar-parallel + bit-exact
+  can't catch up): polygamma/erfinv/digamma/lgamma already parallel (test
+  `polygamma_erfinv_erfcx_parallel_match_serial_bit_exact`) but parity/LOSS vs torch.
+- cross f64 already WON (2.2-2.64x fused no-grad); cross f32 WALLED (torch f32 SIMD).
+- Reductions: dim var/std/std_mean parallel/fine; global prod/var/std gap already
+  FIXED (11165). torch std_mean_dim 339ms is torch-slow, FT already parallel-over-lanes.
+- Scans (cumsum/cumprod/logcumsumexp/cumulative_trapezoid) FP-associativity-walled for
+  bit-exact parallel; nn softmax/log_softmax/cross_entropy exp-parity-walled.
+- BACKWARD probe (torch fwd-vs-fwd+bwd): torch grads are FAST (sigmoid/gelu/tanh/prod/
+  var/norm/median/cumprod bwd all 1-13ms = efficient); only logcumsumexp bwd is slow
+  (~190ms) and FT already shipped a 30x parallel win there.
+
+Next levers likely require a DIFFERENT class (deep linalg band-packed kernels per the
+dense-linalg notes, or a multi-session rewrite) — not a single-op fast path. Recipe
+that DID work this session, for future ops: "torch sorts once, FT does N selects/
+clones" → sort once via tensor_sort (parallel radix), derive all outputs from the
+sorted array + permutation; gate out NaN and -0.0 (radix canonicalizes ±0.0 vs the
+loop's total_cmp).
+
 ## 2026-06-28 - WIN (landed): multi-q quantile sort-once fast path — flips 1.79x LOSS to 2.54x WIN vs torch
 
 Agent `BlackThrush`. `tensor_quantile_multi` looped `tensor_quantile_interpolation`
