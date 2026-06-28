@@ -4,6 +4,42 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - WIN (landed): unique return_inverse/return_counts sorted-dedup fast path — flips ~3.9x LOSS to 1.8-2.0x WIN vs torch
+
+Agent `BlackThrush`. `tensor_unique` had a sorted fast path ONLY for
+`sorted && !return_inverse && !return_counts`; with `return_inverse` or
+`return_counts` it fell to a SERIAL splitmix64 HashMap dedup. MEASURED
+(`crates/ft-api/examples/selection_1d_h2h.rs`, LOCAL same-machine, torch 8t, N=16M
+f64, min-of-5): unique_inv FT 6770ms vs PT 1747ms = **3.88x SLOWER**; unique_counts
+**3.76x SLOWER**; unique_both **3.91x SLOWER**.
+
+LEVER: a sorted-dedup fast path gated `sorted && (return_inverse||return_counts) &&
+len>=8192 && NaN-free`. Sort ONCE via the parallel-radix `sort_tensor_contiguous_f64`
+(the lever shipped in e6948289) → `(sorted_vals, perm)`; a single O(n) pass derives
+bucket ids (new unique on `!=`, +0.0/-0.0 merge), counts = run lengths, and inverse
+via `inv[perm[j]] = bucket_id[j]` (perm is a permutation → disjoint scatter). The
+zero bucket's stored value is fixed to the first-occurrence 0.0 (sign-preserving),
+matching the serial path. All integer-exact → byte-for-byte identical to the
+hash-map output. NaN (each NaN its own unique, first-occurrence order) + small
+inputs fall through unchanged.
+
+Bit-exact PROOF: new `unique_large_inverse_counts_fast_path_matches_reference`
+(n=20000, hits the fast path, incl a -0.0 first-occurrence zero) cross-checks
+unique+inverse+counts against an independent sort/hash reference (= torch.unique
+semantics) and the round-trip `unique[inverse[i]]==data[i]`. `cargo test -p ft-api
+--lib unique` = 15 passed, 0 failed.
+
+FINAL H2H (same harness, N=16M, min-of-5; the dominant cost is now the parallel
+sort, ~600ms, vs the serial HashMap ~6.7s):
+- FT default cores (64): unique_inv FT 976 vs PT 1759 = **1.80x FASTER**; unique_counts
+  FT 857 vs PT 1727 = **2.01x FASTER**; unique_both FT 995 vs PT 1754 = **1.76x FASTER**.
+- FT @ RAYON_NUM_THREADS=8 (same-thread A/B): unique_inv **1.44x**, counts **1.47x**,
+  both **1.34x FASTER** — wins at matched threads (was a ~4x loss).
+
+Rollback: delete the fast-path `if` block in `tensor_unique`; the serial HashMap path
+is untouched. Build via rch on a torch-less worker; H2H from a LOCAL build vs
+`.venv-oracle` torch (same machine).
+
 ## 2026-06-28 - WIN (landed): parallel LSD radix for the single large 1-D lane — flips sort/argsort 1.9-2.1x LOSS to 2.6-2.8x WIN vs torch (f64+f32)
 
 Agent `BlackThrush`. Found via /alien-graveyard (parallel radix primitive). FT's radix sort
