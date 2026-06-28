@@ -4,6 +4,32 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - NEGATIVE (reverted): gcd/lcm parallel + binary-GCD — torch-SIMD-WALLED, best bit-exact effort only reaches 1.5x SLOWER
+
+Agent `BlackThrush`. `tensor_gcd`/`tensor_lcm` build their result with a SERIAL
+`.iter().zip().map()` over a compute-bound Euclidean loop; the harness commit
+3633c014 (`crates/ft-api/examples/gcd_lcm_h2h.rs`) flags it as an "optimization
+target" (integer-exact + elementwise → parallelizing is trivially bit-exact). It is
+NOT a win — DO NOT re-attempt without SIMD.
+
+MEASURED (gcd_lcm_h2h, LOCAL same-machine, torch 8t, N=8M, min-of-7, add anchor
+2.4-2.6x FASTER = clean):
+- Baseline SERIAL: gcd FT 407ms / torch 50ms = **8.11x SLOWER** (lcm 8.31x). parity
+  bit-exact.
+- Parallelized (rayon par_iter, gated >=8192, order-preserving collect = bit-exact),
+  64 threads: gcd 101ms = **1.96x SLOWER** (only ~4x scaling on 64 cores — div-bound).
+- + Binary GCD / Stein's (division-free, shifts+subtraction; same unique result,
+  bit-exact): gcd 83ms = **1.52x SLOWER** (lcm 1.64x). At RAYON_NUM_THREADS=8 it is
+  2.0x SLOWER.
+
+ROOT: torch's gcd is SIMD-VECTORIZED (~52ms on 8 threads = ~12x more efficient per
+core than FT's scalar binary-GCD on 64 cores). A bit-exact SCALAR-parallel Rust gcd
+cannot catch up — same wall as the special functions (polygamma/erfinv/digamma) and
+f32 cross. REVERTED the lib change (parallel helper + binary gcd_scalar): not a win,
+fails Score>=2.0. Only a hand-written SIMD i64 batch-GCD (e.g. 4-8 lanes of Stein's
+with masked lane-wise shifts) could plausibly beat torch — large effort, uncertain,
+not worth it for a niche number-theory op. Harness 3633c014 kept for reproduction.
+
 ## 2026-06-28 - NEGATIVE (surface): algorithm-bound forward+backward surface exhausted after the radix-reuse vein; remaining probed ops walled
 
 Agent `BlackThrush`. After landing the 4-win radix-reuse vein (parallel radix
