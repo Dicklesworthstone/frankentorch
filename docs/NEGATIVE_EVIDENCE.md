@@ -4,6 +4,34 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - ★★★WIN (landed): f32 softmax/log_softmax 9-10x SLOWER -> 3.3-3.5x FASTER vs torch (eliminate the f32->f64->f32 dispatch round-trip)
+
+Agent `BlackThrush`. RESOLVES the LEAD below. The round-trip hypothesis was CORRECT all
+along — last cycle's "0 effect" was a STALE BINARY false-negative (the incremental example
+relink didn't pick up the ft-dispatch change). Confirmed by direct instrumentation of
+`ft_autograd::softmax`: typed_storage 0.0ms, node-push 0.0ms, but **dispatch+kernel 297ms**
+while the native f32 kernel alone is ~24ms — so ~273ms was the f32->f64->f32 round-trip
+(268MB f64 widen via `dispatch_tensor_normalize_dim_contiguous_f32`'s f64-valued outcome +
+134MB f32 narrow in the typed dispatcher, both cold-allocated per call).
+
+FIX: `dispatch_tensor_normalize_dim_contiguous_f32_native` returns the kernel's f32 output
+DIRECTLY; the typed-dispatcher F32 and F16/BF16 normalize-dim branches use it instead of the
+f64 round-trip. BIT-IDENTICAL: old output was `(kernel_f32 as f64) as f32` which equals
+`kernel_f32` for every finite/NaN/inf/±0 f32 (f32->f64 lossless, f64->f32 of a representable
+f32 is the identity) — so ZERO behavioral change, pure overhead elimination.
+
+MEASURED (`crates/ft-api/examples/softmax_simd_h2h.rs`, LOCAL, [8192,4096] f32 dim=1, torch
+8t, min-of-7, add anchor 1.9-3.0x FASTER = clean):
+- FT default cores: softmax 236ms -> **7.8ms = 3.32x FASTER** (was 10.5x SLOWER); log_softmax
+  **3.51x FASTER** (was 9.6x SLOWER). Instrumented dispatch 297ms -> 8.46ms.
+- FT @ RAYON_NUM_THREADS=8 (same-thread): softmax 1.02x FASTER (parity), log_softmax 1.21x.
+
+Tests GREEN: ft-dispatch 110/0, ft-api `softmax` 16/0, ft-api `cross_entropy` 17/0. Conformance
+unchanged by construction (FT softmax output byte-identical); the 8-ULP oracle gate (and all
+softmax/cross_entropy/attention dependents) see the SAME values as before. The same round-trip
+also hit F16/BF16 softmax (fixed) and is the template for any other f32-native typed dispatch
+that widens to a f64-valued outcome struct then narrows back.
+
 ## 2026-06-28 - ★LEAD (open, NOT walled): f32 softmax/log_softmax 9-10x SLOWER is a PERF/routing bug, not the SIMD-exp policy wall — round-trip hypothesis REFUTED
 
 Agent `BlackThrush`. IMPORTANT correction to the "exp-precision-walled" framing (entry
