@@ -4,6 +4,35 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - ★DECISION EVIDENCE: SIMD exp is ~10x faster at 1 ULP — the policy lever to unlock the whole exp-bound nn surface
+
+Agent `BlackThrush`. The bounded bit-exact perf surface is mined out (4 wins shipped:
+radix sort/argsort, unique inverse/counts, multi-q quantile, interpolate-f32; the rest
+SIMD-walled or multi-session — see prior entries). The single biggest remaining win is
+BLOCKED on a parity-POLICY decision, not on engineering. This entry quantifies it so the
+decision can be made on data instead of hand-waving.
+
+FT's softmax / log_softmax / cross_entropy / sigmoid / gelu / elu / ... lose to torch
+because torch vectorizes `exp`; FT uses scalar libm `exp` (bit-exact, parallel) which is
+at the per-core scalar ceiling. MEASURED (`crates/ft-api/examples/simd_exp_evidence.rs`,
+LOCAL, N=8M f32, min-of-7):
+- scalar libm exp (FT today): 18.14 ms (1 core)
+- SIMD exp (wide::f32x8):     10.79 ms = 1.68x (1 core)
+- SIMD exp + rayon:            1.84 ms = **9.87x faster than scalar libm**
+- parity vs scalar libm: max_abs 5.96e-8, max_rel **1.19e-7** (= f32 machine eps),
+  **max 1 ULP**.
+
+torch f32 softmax[8192,4096] = 26.6 ms / log_softmax = 29.1 ms — FT loses today purely on
+the scalar-exp ceiling; a SIMD exp removes it.
+
+THE CALL (campaign/owner decision, NOT a unilateral elementwise-tolerance change):
+ratifying a transcendental-TOLERANCE policy of ~1-2 ULP for SIMD exp/log/etc. — strictly
+TIGHTER than the already-ratified eigen/SVD-vector tolerance (1e-9, bead qgce4) and the
+interpolate goldens (<1e-5) — unlocks a ~10x exp speedup across the ENTIRE exp-bound nn
+surface (the largest single perf class still losing to torch). Without that ratification
+the path stays blocked ("parity absolute" for elementwise). This is the highest-EV next
+step for the campaign; the SIMD path is intentionally NOT wired into the default (policy).
+
 ## 2026-06-28 - FIX (landed, parity not perf): unique_consecutive exact-equality (NaN + epsilon merge bug vs torch)
 
 Agent `BlackThrush`. Found while sweeping the "FT loops an op N times" anti-pattern
