@@ -29908,30 +29908,48 @@ pub fn norm_dim_tensor_contiguous_f32(
             }
         }
     } else if p == 1.0f32 {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum = 0.0f32;
-                for r in 0..reduce_size {
-                    sum += data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
-                }
-                output.push(sum);
+        // Per-output index o = outer*inner_size + inner (same order as the serial
+        // push); each output sums its own lane independently, so par_iter().collect()
+        // is bit-for-bit identical to the serial loop. The p=1/p=2 branches were
+        // SERIAL — for a large output (reducing a small dim of a big tensor) that is
+        // millions of independent lane-reductions left on one core (~39ms vs ~6ms).
+        let compute = |o: usize| -> f32 {
+            let outer = o / inner_size;
+            let inner = o % inner_size;
+            let mut sum = 0.0f32;
+            for r in 0..reduce_size {
+                sum += data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
             }
+            sum
+        };
+        if checked_mul(out_numel, reduce_size, "norm_dim_f32 work").unwrap_or(usize::MAX)
+            >= PARALLEL_THRESHOLD
+        {
+            output = (0..out_numel).into_par_iter().map(compute).collect();
+        } else {
+            output.extend((0..out_numel).map(compute));
         }
     } else if p == 2.0f32 {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum_sq = 0.0f32;
-                for r in 0..reduce_size {
-                    let v = data[outer * reduce_size * inner_size + r * inner_size + inner];
-                    sum_sq += v * v;
-                }
-                output.push(sum_sq.sqrt());
+        let compute = |o: usize| -> f32 {
+            let outer = o / inner_size;
+            let inner = o % inner_size;
+            let mut sum_sq = 0.0f32;
+            for r in 0..reduce_size {
+                let v = data[outer * reduce_size * inner_size + r * inner_size + inner];
+                sum_sq += v * v;
             }
+            sum_sq.sqrt()
+        };
+        if checked_mul(out_numel, reduce_size, "norm_dim_f32 work").unwrap_or(usize::MAX)
+            >= PARALLEL_THRESHOLD
+        {
+            output = (0..out_numel).into_par_iter().map(compute).collect();
+        } else {
+            output.extend((0..out_numel).map(compute));
         }
     } else {
         // General fractional p is COMPUTE-bound (powf per element); parallelise
-        // over independent output rows, bit-exact (see the f64 twin). The cheap
-        // p=1/2/inf branches stay serial (bandwidth-bound).
+        // over independent output rows, bit-exact (see the f64 twin).
         let compute = |o: usize| -> f32 {
             let outer = o / inner_size;
             let inner = o % inner_size;

@@ -4,6 +4,30 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - ★★WIN (landed): f32 norm_dim 8.8x SLOWER -> 2.36x FASTER (round-trip removal + p=1/p=2 kernel parallelization)
+
+Agent `BlackThrush`. Continued the round-trip vein into norm_dim — but it needed TWO fixes
+(the round-trip removal alone wasn't enough). MEASURED (`crates/ft-api/examples/norm_dim_h2h.rs`,
+LOCAL, [4096,2048,2] f32 reduce dim=2 -> 8.4M output, torch 8t, min-of-7, add anchor 2.7x FASTER):
+- norm2 (L2) baseline FT **95.3ms = 8.80x SLOWER**. Two compounding causes:
+  1. ROUND-TRIP (same as softmax/reduction_dim): `dispatch_tensor_norm_dim_contiguous_f32` widens
+     the kernel f32 output to f64, the typed dispatcher narrows back — ~56ms of the 95ms.
+     Removing it (new `dispatch_tensor_norm_dim_contiguous_f32_native`) -> 39ms, BUT still 3.82x
+     SLOWER because:
+  2. KERNEL: `norm_dim_tensor_contiguous_f32` ran the p=1 AND p=2 branches SERIALLY (`for outer
+     in 0..outer_size`) — a stale "p=1/2 are bandwidth-bound" assumption that is FALSE for large
+     output (millions of independent lane-reductions + sqrt on one core = ~39ms). Parallelized
+     both with the per-output `compute(o)` closure + `into_par_iter().collect()` (the pattern the
+     general-p branch already used), bit-for-bit identical to the serial push order.
+- FINAL: norm2 **95.3 -> 4.45ms = 2.36x FASTER vs torch** (8t 1.46x FASTER); norm1 (L1) 87.6 ->
+  5.2ms = 138x FASTER (torch's own L1-norm-over-small-dim is pathological ~722ms).
+
+BIT-EXACT both fixes (round-trip identity + per-output independent parallel == serial). Tests
+GREEN: ft-kernel-cpu norm 20/0, ft-dispatch 118/0, ft-api norm 4/0; conformance unchanged.
+LESSON: a round-trip-only fix is NOT enough when the underlying kernel is ALSO serial/slow —
+check the kernel (here p=1/2 were left serial). reduction_dim's kernels were already parallel so
+the round-trip removal alone won; norm needed both.
+
 ## 2026-06-28 - ★★WIN (landed): f32 dim-reduction round-trip removal — mean_dim 5.46x SLOWER -> 1.72x FASTER, var_dim 13x -> 161x (same anti-pattern as softmax)
 
 Agent `BlackThrush`. Generalized the softmax round-trip fix (56765cdd). Grepped ft-dispatch

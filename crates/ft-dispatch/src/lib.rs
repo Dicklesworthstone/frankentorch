@@ -5009,6 +5009,52 @@ pub fn dispatch_tensor_norm_dim_contiguous_f32(
     })
 }
 
+/// F32-native norm-dim dispatch: returns the kernel f32 output DIRECTLY (no
+/// f32->f64->f32 round-trip; same softmax-class fix, 56765cdd/92b423fd). Paired
+/// with the p=1/p=2 kernel parallelization, large-output norm-dim flips to a win.
+/// Bit-identical (`(x as f64) as f32 == x`), zero parity risk.
+fn dispatch_tensor_norm_dim_contiguous_f32_native(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    p: f64,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<(Vec<f32>, NormDispatchDecision), DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            norm_dim_tensor_contiguous_f32(input, meta, p as f32, dim)?,
+            "autograd_cpu::norm_dim_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            norm_dim_tensor_contiguous_f32(input, meta, p as f32, dim)?,
+            "cpu::norm_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason:
+                    "resolved dispatch key is unsupported for contiguous tensor norm dim f32 op",
+            }
+            .into());
+        }
+    };
+    Ok((
+        values,
+        NormDispatchDecision {
+            mode,
+            kernel,
+            p,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    ))
+}
+
 pub fn dispatch_tensor_scan_dim_contiguous_f32(
     op: ScanOp,
     mode: ExecutionMode,
@@ -5942,20 +5988,19 @@ pub fn dispatch_tensor_norm_dim_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome =
-                dispatch_tensor_norm_dim_contiguous_f32(mode, data, meta, p, dim, requires_grad)?;
+            // f32-native (no f32->f64->f32 round-trip); bit-identical kernel output.
+            let (values, decision) = dispatch_tensor_norm_dim_contiguous_f32_native(
+                mode, data, meta, p, dim, requires_grad,
+            )?;
             Ok(TypedNormDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_norm_dim_contiguous_f32(
+            let (values, decision) = dispatch_tensor_norm_dim_contiguous_f32_native(
                 mode,
                 &promoted,
                 &promoted_meta,
@@ -5964,11 +6009,8 @@ pub fn dispatch_tensor_norm_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedNormDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
