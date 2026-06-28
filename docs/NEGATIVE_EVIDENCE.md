@@ -4,6 +4,54 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - NEGATIVE (reverted): no-grad full-reduction shortcut and f32 SIMD-binary morsel retunes lost vs ORIG
+
+Agent `BlackThrush`. Land-or-dig worktree scan found no unlanded measured win:
+the addcmul FMA worktree is already represented on `origin/main`, and the only
+other non-ancestor bench worktree was the explicit gxpb2 row-SIMD rejection.
+Dug the current f32 wide H2H surface. The biggest measured gaps on current main
+were still full reductions (`sum_all`, `mean_all`) and amax; amax is already
+covered by the landed row-stream/morsel work above, while reductions are guarded
+by the bit-identical pairwise tree. Two fresh levers were tested and reverted:
+
+1. No-grad full `sum`/`mean` API shortcut. Candidate bypassed the tape reduction
+   and directly called `ft_kernel_cpu::sum_tensor_contiguous_f32` /
+   `mean_tensor_contiguous_f32`, then built a scalar leaf. Focused API sum/mean
+   tests passed, but H2H regressed. ORIG local PyTorch-venv survey:
+   `sum_all` FT `1.670 ms`, PyTorch `0.186 ms` = **8.99x SLOWER**;
+   `mean_all` FT `1.651 ms`, PyTorch `0.149 ms` = **11.10x SLOWER**.
+   Candidate: `sum_all` FT `5.665 ms`, PyTorch `0.197 ms` =
+   **28.70x SLOWER** (`5.665/1.670 = 3.39x` FT regression) and
+   `mean_all` FT `2.192 ms`, PyTorch `0.188 ms` = **11.64x SLOWER**
+   (`2.192/1.651 = 1.33x` FT regression). Root cause: the shortcut skipped the
+   faster optimized tape reduction route; do not retry unless the direct kernel
+   itself beats the tape path on the same H2H.
+
+2. f32 SIMD binary/comparison morsel retunes. Graveyard/optimization hypothesis:
+   the `simd_binary_f32_parallel` chunk size (`1 << 14`) might be too fine.
+   Per-crate ORIG Criterion via
+   `AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+   rch exec -- cargo bench -p ft-kernel-cpu --bench elementwise_bench comparison_f32 -- --warm-up-time 1 --measurement-time 3 --sample-size 10 --noplot`
+   measured `eq_4000x4000` `[16.331 ms 25.399 ms 45.659 ms]` and
+   `gt_4000x4000` `[16.011 ms 19.201 ms 27.443 ms]`.
+   Candidate `1 << 18`: `eq` `[65.185 ms 92.308 ms 126.81 ms]`
+   (`92.308/25.399 = 3.63x` slower), `gt` `[24.144 ms 28.180 ms 38.265 ms]`
+   (`1.47x` slower). Candidate `1 << 15`: `eq` `[36.229 ms 38.088 ms 41.460 ms]`
+   (`1.50x` slower), `gt` `[23.592 ms 25.922 ms 31.539 ms]` (`1.35x` slower).
+   Both were reverted; the existing 16K morsel remains the best measured choice
+   on this target. The literal `cargo bench --release` form is still invalid for
+   Cargo bench; the valid bench-profile form above is the measured per-crate
+   evidence.
+
+Final source diff after reverts is docs-only. Conformance:
+`AGENT_NAME=BlackThrush CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod-b
+rch exec -- cargo test -p ft-conformance` on `ovh-a`, green. Mapped lesson:
+for reductions, do not bypass the proven tape path; for f32 SIMD binary maps,
+larger Rayon morsels lose locality/load-balance on the 16M-element comparison
+bench. Next viable lever needs a new storage/semantic surface (for example real
+bool mask storage) or an explicitly tolerance-accepted reduction kernel; both
+are beyond a same-contract micro-tune. AGENT_NAME=BlackThrush.
+
 ## 2026-06-27 - FIX (landed): f32 smooth_l1_loss enablement (was ERRORING -> works, bit-exact 0/10 vs torch; mean ~parity)
 
 Agent `CrimsonForge`. CORRECTNESS fix (a real functional gap vs torch): f32 smooth_l1_loss ERRORED ("tensor
