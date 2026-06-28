@@ -16,7 +16,12 @@ Grad / non-F32 / non-contiguous fall through. Verified GREEN: ft-api 3 cartesian
 conformance 199. ★ALMOST SKIPPED as "niche" — measuring found a 14x deficit (3rd time this turn
 measurement beat my assumption: block_diag, kron, cartesian_prod all won where I'd have guessed
 exhausted/unwinnable). The "serial-precompute-then-apply_function-f64-gather" anti-pattern is the tell.
-File: tensor_cartesian_prod. (tensor_combinations may have the same serial mapping -> next.)
+File: tensor_cartesian_prod. ★tensor_combinations CHECKED (NOT a win, ~parity): FT 322ms vs torch 296ms
+= 1.09x SLOWER. Its precompute is a single FLAT index Vec (not cartprod's nested Vec<Vec<usize>> with
+16.7M-pushes-per-tensor killer), AND torch's combinations is ITSELF slow (296ms — combinatorial
+enumeration bottleneck on both sides, same parity-ceiling class as multilabel_margin). Do NOT optimize
+combinations. So the apply_function combinatorial-gather family is mapped: cartprod WON (nested-Vec killer
++ fast-ish torch), combinations PARITY (flat Vec + slow torch).
 
 ## 2026-06-28 - WIN+FIX (landed): kron f32 no-grad fix (ERROR -> works + 2.5-3.0x FASTER vs torch)
 
