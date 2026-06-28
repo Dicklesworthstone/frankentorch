@@ -4,6 +4,46 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - WIN (landed): parallel LSD radix for the single large 1-D lane — flips sort/argsort 1.9-2.1x LOSS to 2.6-2.8x WIN vs torch (f64+f32)
+
+Agent `BlackThrush`. Found via /alien-graveyard (parallel radix primitive). FT's radix sort
+parallelizes over OUTER blocks and (dim=0) over columns via the transpose trick, but a single large
+contiguous lane (a 1-D `torch.sort`/`argsort`, outer_size==1 && inner_size==1) had NO parallelism — it
+ran the SERIAL `sort_radix_perm`. torch's 1-D sort is itself serial O(n log n), but FT's serial radix
+was even slower at scale.
+
+MEASURED gap (`crates/ft-api/examples/sort_1d_h2h.rs`, LOCAL same-machine, torch 8t, N=16M f64, min-of-5,
+add-anchor 3.1-3.9x FASTER = clean worker): sort FT 3263ms vs PT 1586ms = **2.06x SLOWER**; argsort FT
+2937ms vs PT 1578ms = **1.86x SLOWER**. (unique 2.9x / median 1.1x already FASTER — untouched.)
+
+LEVER: `sort_radix_perm_parallel` — a parallel stable LSD radix that returns the SAME permutation as
+`sort_radix_perm` bit-for-bit. Splits the current `perm` into EQUAL input chunks (perfect load balance,
+distribution-independent), histograms them in parallel, derives chunk-major per-bucket offsets (so within
+a bucket the chunk order == the current `perm` order, exactly as the serial scatter), then scatters all
+chunks concurrently into disjoint output slots (one tightly-scoped `#[allow(unsafe_code)]` `RadixScatterPtr`
+— each output index produced exactly once). Same single-bucket skip rule, so f32 keys (high 32 bits zero)
+still run in 4 effective passes. Wired as a `outer_size==1 && inner_size==1 && numel>=65536` single-lane
+fast path into `sort/argsort_tensor_contiguous_f64/f32`; NaN lanes return None and fall through to the
+comparison sort (torch's "NaN is greatest"). Non-1-D and short lanes are byte-unchanged.
+
+Bit-exact PROOF (kernel tests, 564 passed + 2 new): `parallel_radix_perm_matches_serial_bit_for_bit`
+asserts the parallel perm == serial perm across sizes {0..300k} × threads {1,2,4,8,17} with heavy ties
+and f32-style keys; `parallel_radix_1d_lane_sort_argsort_correct_and_matches_reference` sorts a 200_003
+lane (hits the parallel path) for f64+f32 asc/desc and matches a reference stable sort + valid permutation.
+`cargo test -p ft-api --lib sort` 33 passed. f64 path is the same kernel both dtypes share — conformance
+goldens use small lanes (serial path, unchanged).
+
+FINAL H2H (same harness, N=16M, min-of-5):
+- FT default cores (64): sort f64 FT 603 vs PT 1581 = **2.62x FASTER**; argsort f64 FT 569 vs PT 1602 =
+  **2.82x FASTER**; sort f32 **2.65x**; argsort f32 **3.77x FASTER**.
+- FT @ RAYON_NUM_THREADS=8 (same-thread A/B): sort f64 **1.81x**, argsort f64 **1.90x**, sort f32 **2.07x**,
+  argsort f32 **2.56x FASTER** — wins even at matched threads (the parallel radix beats both torch's serial
+  comparison sort AND FT's own serial radix ~5x internally).
+
+Rollback: delete the single-lane `if` blocks in the four `*_tensor_contiguous_*` fns + the parallel helpers;
+the serial radix path is untouched. Build via rch on a torch-less worker; H2H from a LOCAL build against
+`.venv-oracle` torch (same machine).
+
 ## 2026-06-28 - WIN+FIX (landed): interpolate native f32 fast path (F32 ERROR -> works + 1.20-2.07x FASTER vs torch; F64-output dtype bug -> F32)
 
 Agent `BlackThrush`. `tensor_interpolate` read `tensor.storage()?.to_vec()` (F64-only) BEFORE mode

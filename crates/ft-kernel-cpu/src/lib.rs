@@ -15075,6 +15075,272 @@ fn sort_radix_perm(keys: &[u64], perm: &mut Vec<u32>, scratch: &mut Vec<u32>) {
     }
 }
 
+/// A lane shorter than this keeps the SERIAL [`sort_radix_perm`]: the parallel
+/// radix's per-pass histogram-merge + offset bookkeeping only pays off on a long
+/// single lane (the multi-lane case is already parallel over lanes).
+const PARALLEL_RADIX_LANE_MIN: usize = 1 << 16;
+
+/// `*mut u32` carrier so the parallel-radix scatter can write a shared output
+/// buffer from several Rayon workers. Safe because each worker writes a DISJOINT
+/// set of slots (every output index is produced exactly once across all chunks).
+#[derive(Clone, Copy)]
+struct RadixScatterPtr(*mut u32);
+impl RadixScatterPtr {
+    /// By-value accessor so a closure captures the whole (Send+Sync) wrapper
+    /// rather than disjointly capturing the bare `*mut u32` field.
+    #[inline]
+    fn ptr(self) -> *mut u32 {
+        self.0
+    }
+}
+// SAFETY: shared only for provably-disjoint index writes (see `sort_radix_perm_parallel`).
+#[allow(unsafe_code)]
+unsafe impl Sync for RadixScatterPtr {}
+// SAFETY: the raw pointer is only used for disjoint per-slot writes across workers.
+#[allow(unsafe_code)]
+unsafe impl Send for RadixScatterPtr {}
+
+/// Parallel stable LSD radix that returns the SAME permutation as the serial
+/// [`sort_radix_perm`] bit-for-bit. Splits the current `perm` into equal input
+/// chunks (perfect load balance, distribution-independent), histograms them in
+/// parallel, derives chunk-major per-bucket offsets (so within a bucket the
+/// chunk order — i.e. the current `perm` order — is preserved, exactly as the
+/// serial scatter does), then scatters all chunks concurrently into disjoint
+/// output slots. Same single-bucket skip rule, so f32 keys (high 32 bits zero)
+/// still run in 4 effective passes.
+fn sort_radix_perm_parallel(keys: &[u64], threads: usize) -> Vec<u32> {
+    use rayon::prelude::*;
+    let n = keys.len();
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    if n < 2 {
+        return perm;
+    }
+    let mut scratch: Vec<u32> = vec![0u32; n];
+    let p = threads.max(1).min(n);
+    let chunk = n.div_ceil(p);
+    for pass in 0..8 {
+        let shift = pass * 8;
+        // Per-chunk local histograms of the current ordering.
+        let hists: Vec<[usize; 256]> = perm
+            .par_chunks(chunk)
+            .map(|ch| {
+                let mut h = [0usize; 256];
+                for &pp in ch {
+                    h[((keys[pp as usize] >> shift) & 0xFF) as usize] += 1;
+                }
+                h
+            })
+            .collect();
+        let nch = hists.len();
+        let mut total = [0usize; 256];
+        for h in &hists {
+            for (b, &c) in h.iter().enumerate() {
+                total[b] += c;
+            }
+        }
+        // Single-bucket pass contributes no ordering — skip (matches serial).
+        if total.contains(&n) {
+            continue;
+        }
+        // Exclusive prefix over buckets, then chunk-major running offsets so that
+        // chunk 0's bucket-b elements land before chunk 1's, etc. (stable).
+        let mut run = [0usize; 256];
+        let mut sum = 0usize;
+        for b in 0..256 {
+            run[b] = sum;
+            sum += total[b];
+        }
+        let mut offs = vec![[0usize; 256]; nch];
+        for (c, off) in offs.iter_mut().enumerate() {
+            for b in 0..256 {
+                off[b] = run[b];
+                run[b] += hists[c][b];
+            }
+        }
+        // Concurrent scatter into disjoint slots.
+        let sptr = RadixScatterPtr(scratch.as_mut_ptr());
+        perm.par_chunks(chunk)
+            .zip(offs.par_iter())
+            .for_each(|(ch, off)| {
+                let base = sptr.ptr();
+                let mut local = *off;
+                for &pp in ch {
+                    let b = ((keys[pp as usize] >> shift) & 0xFF) as usize;
+                    // SAFETY: `local[b]` is unique across all chunks for this pass
+                    // (chunk-major offsets partition 0..n), so no two workers write
+                    // the same slot. `base` is valid for `n` u32 (scratch len == n).
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        *base.add(local[b]) = pp;
+                    }
+                    local[b] += 1;
+                }
+            });
+        std::mem::swap(&mut perm, &mut scratch);
+    }
+    perm
+}
+
+/// Parallel-radix fast path for a single large contiguous f64 lane. Returns
+/// `None` (caller falls back to the comparison sort) when the lane contains NaN —
+/// the radix keys can't reproduce PyTorch's "NaN is greatest" placement. On
+/// success fills `out_vals`/`out_idx` with the ascending stable sort, bit-for-bit
+/// identical to the serial radix path.
+fn try_parallel_radix_sort_lane_f64(
+    data: &[f64],
+    n: usize,
+    descending: bool,
+    out_vals: &mut [f64],
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f64(x);
+            if descending {
+                !k
+            } else {
+                k
+            }
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_vals
+        .par_iter_mut()
+        .zip(out_idx.par_iter_mut())
+        .zip(perm.par_iter())
+        .for_each(|((v, idx), &pp)| {
+            *v = data[pp as usize];
+            *idx = pp as usize;
+        });
+    Some(())
+}
+
+/// Indices-only sibling of [`try_parallel_radix_sort_lane_f64`] for argsort.
+fn try_parallel_radix_argsort_lane_f64(
+    data: &[f64],
+    n: usize,
+    descending: bool,
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f64(x);
+            if descending {
+                !k
+            } else {
+                k
+            }
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_idx
+        .par_iter_mut()
+        .zip(perm.par_iter())
+        .for_each(|(idx, &pp)| *idx = pp as usize);
+    Some(())
+}
+
+/// f32 analogue of [`try_parallel_radix_sort_lane_f64`]. Keys are built exactly
+/// as the serial f32 path (`u64::from(if descending { !k } else { k })`, k from
+/// [`sort_radix_key_f32`]) so the high 32 bits stay zero (4 effective passes).
+fn try_parallel_radix_sort_lane_f32(
+    data: &[f32],
+    n: usize,
+    descending: bool,
+    out_vals: &mut [f32],
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f32(x);
+            u64::from(if descending { !k } else { k })
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_vals
+        .par_iter_mut()
+        .zip(out_idx.par_iter_mut())
+        .zip(perm.par_iter())
+        .for_each(|((v, idx), &pp)| {
+            *v = data[pp as usize];
+            *idx = pp as usize;
+        });
+    Some(())
+}
+
+/// Indices-only sibling of [`try_parallel_radix_sort_lane_f32`] for argsort.
+fn try_parallel_radix_argsort_lane_f32(
+    data: &[f32],
+    n: usize,
+    descending: bool,
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f32(x);
+            u64::from(if descending { !k } else { k })
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_idx
+        .par_iter_mut()
+        .zip(perm.par_iter())
+        .for_each(|(idx, &pp)| *idx = pp as usize);
+    Some(())
+}
+
 /// Sort transpose trick for a leading sort dim (small outer, large inner): the plain block sorts
 /// its `inner_size` columns serially. Here each column sorts on its own rayon lane — gather the
 /// strided column, run the SAME radix-or-comparison sort as
@@ -15213,6 +15479,28 @@ pub fn sort_tensor_contiguous_f64(
                 use_radix,
             );
         }
+        return Ok((sorted_values, indices));
+    }
+    // Single large contiguous lane (the sort dim is the whole tensor, e.g. a 1-D
+    // sort): the outer-block fan-out can't parallelize a lone lane, so it would
+    // run a SERIAL radix (measured ~2x slower than torch at 16M). Sort it with a
+    // PARALLEL radix that yields the bit-identical stable permutation; NaN lanes
+    // return None and fall through to the comparison path.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_sort_lane_f64(
+            data,
+            numel,
+            descending,
+            &mut sorted_values,
+            &mut indices,
+            threads,
+        )
+        .is_some()
+    {
         return Ok((sorted_values, indices));
     }
     sorted_values
@@ -15383,6 +15671,18 @@ pub fn argsort_tensor_contiguous_f64(
                 use_radix,
             );
         }
+        return Ok(indices);
+    }
+    // Single large contiguous lane (e.g. a 1-D argsort): parallel radix for the
+    // bit-identical stable permutation (NaN lanes fall through). See sort f64.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_argsort_lane_f64(data, numel, descending, &mut indices, threads)
+            .is_some()
+    {
         return Ok(indices);
     }
     indices
@@ -31459,6 +31759,25 @@ pub fn sort_tensor_contiguous_f32(
         }
         return Ok((sorted_values, indices));
     }
+    // Single large contiguous lane (e.g. a 1-D sort): parallel radix for the
+    // bit-identical stable permutation (NaN lanes fall through). See sort f64.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_sort_lane_f32(
+            data,
+            numel,
+            descending,
+            &mut sorted_values,
+            &mut indices,
+            threads,
+        )
+        .is_some()
+    {
+        return Ok((sorted_values, indices));
+    }
     sorted_values
         .par_chunks_mut(block)
         .zip(indices.par_chunks_mut(block))
@@ -31558,6 +31877,18 @@ pub fn argsort_tensor_contiguous_f32(
                 use_radix,
             );
         }
+        return Ok(indices);
+    }
+    // Single large contiguous lane (e.g. a 1-D argsort): parallel radix for the
+    // bit-identical stable permutation (NaN lanes fall through). See sort f64.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_argsort_lane_f32(data, numel, descending, &mut indices, threads)
+            .is_some()
+    {
         return Ok(indices);
     }
     indices
@@ -32619,6 +32950,94 @@ unsafe fn transpose_block_8x8_avx2_f32(
 mod tests {
     use rayon::prelude::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn parallel_radix_perm_matches_serial_bit_for_bit() {
+        // The parallel radix must return EXACTLY the serial stable permutation,
+        // including tie order, across thread counts and sizes (incl. > lane min).
+        for &n in &[0usize, 1, 2, 3, 255, 256, 1000, 65_536, 100_001, 300_000] {
+            let mut keys = vec![0u64; n];
+            let mut z = 0x1234_5678_9abc_def0u64;
+            for k in keys.iter_mut() {
+                z = z.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1_442_695_040_888_963_407);
+                *k = z >> 1;
+            }
+            // Inject heavy ties so stability is exercised.
+            for i in (0..n).step_by(11) {
+                keys[i] = 0xABCD;
+            }
+            for i in (0..n).step_by(13) {
+                keys[i] = 0;
+            }
+            let mut serial = Vec::new();
+            let mut scratch = Vec::new();
+            super::sort_radix_perm(&keys, &mut serial, &mut scratch);
+            for &threads in &[1usize, 2, 4, 8, 17] {
+                let parallel = super::sort_radix_perm_parallel(&keys, threads);
+                assert_eq!(serial, parallel, "n={n} threads={threads}");
+            }
+            // f32-style keys (high 32 bits zero) must also match (4 effective passes).
+            let keys32: Vec<u64> = keys.iter().map(|k| k & 0xFFFF_FFFF).collect();
+            let mut serial32 = Vec::new();
+            let mut scratch32 = Vec::new();
+            super::sort_radix_perm(&keys32, &mut serial32, &mut scratch32);
+            let parallel32 = super::sort_radix_perm_parallel(&keys32, 8);
+            assert_eq!(serial32, parallel32, "f32-keys n={n}");
+        }
+    }
+
+    #[test]
+    fn parallel_radix_1d_lane_sort_argsort_correct_and_matches_reference() {
+        use ft_core::{DType, Device, TensorMeta};
+        // n > PARALLEL_RADIX_LANE_MIN so the single-lane parallel-radix path fires.
+        let n = 200_003usize;
+        let data: Vec<f64> = (0..n)
+            .map(|i| {
+                let z = (i as u64)
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((z >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 2.0
+            })
+            .collect();
+        let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
+        let data32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        let meta32 = TensorMeta::from_shape(vec![n], DType::F32, Device::Cpu);
+
+        for &desc in &[false, true] {
+            // reference stable sort
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| {
+                let c = data[a].partial_cmp(&data[b]).unwrap();
+                if desc { c.reverse() } else { c }
+            });
+            let ref_vals: Vec<f64> = order.iter().map(|&i| data[i]).collect();
+
+            let (sv, si) = super::sort_tensor_contiguous_f64(&data, &meta, 0, desc).unwrap();
+            assert_eq!(sv, ref_vals, "f64 sort values desc={desc}");
+            // indices must reproduce the sorted values from the input
+            for (k, &ix) in si.iter().enumerate() {
+                assert_eq!(data[ix], sv[k], "f64 sort idx[{k}] desc={desc}");
+            }
+            let ai = super::argsort_tensor_contiguous_f64(&data, &meta, 0, desc).unwrap();
+            assert_eq!(ai, si, "f64 argsort == sort indices desc={desc}");
+
+            let (sv32, si32) =
+                super::sort_tensor_contiguous_f32(&data32, &meta32, 0, desc).unwrap();
+            // f32 values are non-decreasing (ascending) / non-increasing (desc)
+            for w in sv32.windows(2) {
+                if desc {
+                    assert!(w[0] >= w[1], "f32 sort not descending desc={desc}");
+                } else {
+                    assert!(w[0] <= w[1], "f32 sort not ascending desc={desc}");
+                }
+            }
+            for (k, &ix) in si32.iter().enumerate() {
+                assert_eq!(data32[ix], sv32[k], "f32 sort idx[{k}] desc={desc}");
+            }
+            let ai32 = super::argsort_tensor_contiguous_f32(&data32, &meta32, 0, desc).unwrap();
+            assert_eq!(ai32, si32, "f32 argsort == sort indices desc={desc}");
+        }
+    }
 
     #[test]
     fn product_f32_simd_contiguous_matches_existing_parallel_product_for_finite_rows() {
