@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - WIN+FIX (landed): nanquantile f32 native quickselect (ERROR -> works + 8.3-9.5x FASTER vs torch)
+
+Agent `CrimsonForge`. tensor_nanquantile (and _interpolation) no-grad path read `tensor_values` (F64-only)
+-> f32 nanquantile ERRORED (UnsupportedDType(F32)); torch.nanquantile is itself pathologically slow (full
+sort + NaN handling, ~674-727ms at 16M; FT's f64 quickselect path is ~127ms). Added an F32-gated no-grad
+native path: borrow contiguous_values_f32, filter NaN, quickselect the needed order statistic(s) via
+select_nth_unstable_by(total_cmp) + the SAME idx math and all 5 interpolation modes (linear/lower/higher/
+nearest/midpoint) as the f64 path, output F32. Non-contiguous f32 falls through (pre-existing, rare).
+
+Measured (local, torch 8t, min-of-7, 16M f32 ~1% NaN q=0.5, nanquantile_f32_h2h, add_anchor 2.15-2.38x
+FASTER = clean): nanquantile 8.29-9.46x FASTER (FT 74-81ms vs torch 674-727ms). Parity within tol: q=0.5/0.25
+EXACT (rel 0), q=0.9 rel 1.44e-7 (f32-precision interp). dtype now F32. ★Bit-exact-class: order statistics are
+exact f32 values; interp is the same f32 arithmetic as torch. The F32-gating leaves the f64 path
+bit-identical (conformance/goldens use f64 -> untouched). torch's nanquantile being a full O(n log n) sort
+(vs FT O(n) quickselect) is why even the f64 path beat it 5.5x; the native f32 path skips the 128MB upcast.
+File: tensor_nanquantile_interpolation. ★Committed via scratch-HEAD patch + git apply --cached to dodge a
+transient peer cargo-fmt churn on the shared tree (8707-line lib.rs reformat that came+went mid-turn).
+
 ## 2026-06-28 - NEGATIVE (reverted): affine_grid f32 parallel grid fill — ~parity vs torch (matmul+transpose tuned)
 
 Agent `CrimsonForge`. affine_grid no-grad f32 reads f32 natively but fills the grid via a SERIAL nested
