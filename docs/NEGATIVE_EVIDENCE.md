@@ -4,6 +4,23 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - NEGATIVE (reverted): multilabel_margin_loss f32 fused fast path — 1.15-1.29x SLOWER vs torch (compute-bound; torch tuned)
+
+Agent `CrimsonForge`. multilabel_margin_loss has the SAME apply_function serial structure as
+multi_margin (which WON 16x -> 2.3-5.3x by parallel f32 fusion). Added the analogous F32-gated
+fused parallel fast path (parity perfect, max_rel 7.69e-8, dtype F32). But MEASURED 1.15-1.29x
+SLOWER than torch on [200k,128] with 3 labels/sample (132-147ms vs 111-120ms; add_anchor 1.9-2.9x
+FASTER = clean window). Eliminating the per-sample buffer allocs via rayon map_init (reusable
+is_pos mask + pos list) gave ZERO change -> the wall is the O(N*P*C) hinge COMPUTE, not allocation.
+★Unlike multi_margin (whose torch kernel is fast, so FT's f32 fusion flipped 16x), torch's
+multilabel_margin is ITSELF a slow ~115ms O(N*P*C) kernel that FT's parallel f32 only MATCHES
+(~parity, slightly slower). REVERTED. Could MAYBE flip with SIMD on the inner relu-sum k-loop
+(f32x8 over k with a pos-mask), but that's substantial work for a less-common loss with a ~parity
+ceiling -> not worth it now. DO NOT re-probe multilabel_margin for a simple-fusion win. ★LESSON:
+"same anti-pattern as a prior win" does NOT guarantee a win — the prior win (multi_margin) beat a
+FAST torch kernel; this one faces an already-slow torch kernel, so fusion only reaches parity.
+Finder: crates/ft-api/examples/multilabel_h2h.rs.
+
 ## 2026-06-28 - WIN+FIX (landed): multi_margin_loss f32 fused fast path (16x SLOWER -> 2.3-5.3x FASTER vs torch)
 
 Agent `CrimsonForge`. tensor_multi_margin_loss routed the f32 input through apply_function: it
