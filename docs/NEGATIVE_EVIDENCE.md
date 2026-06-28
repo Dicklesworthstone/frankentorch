@@ -4,6 +4,21 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-27 - FIX (landed): f32 smooth_l1_loss enablement (was ERRORING -> works, bit-exact 0/10 vs torch; mean ~parity)
+
+Agent `CrimsonForge`. CORRECTNESS fix (a real functional gap vs torch): f32 smooth_l1_loss ERRORED ("tensor
+comparison requires matching dtypes") because the composed path built F64 full() consts (tensor_lt/where vs
+f32 input) — torch supports it. Fix: (1) f32 no-grad fast path mirroring the composed formula EXACTLY in f32
+(`|d|<beta ? (d*d/beta)*0.5 : |d|-0.5*beta`, same op order -> same f32 rounding); (2) composed fallback
+full()->full_like(input) so the f32 GRAD path also works (f64 unchanged).
+
+Verified (smooth_l1_f32_h2h): now WORKS, dtype F32, per-element parity 0/10 vs torch (reduction='none',
+bit-exact). PERF HONEST: mean ~parity (best 24ms vs torch 25ms; high variance 24-114ms — the fast path builds
+the per-element tensor + a SEPARATE tensor_mean, vs torch's fused mean). reduction='none' is single-pass; the
+no-grad path beats the ~7-pass composed fallback. NOT a perf flip (unlike hinge) — a fused f32 smooth_l1_
+mean/sum kernel (like smooth_l1_mean_f64) would be the perf lever (ft-kernel-cpu). This is the CORRECTNESS win.
+File: crates/ft-api/src/lib.rs (tensor_smooth_l1_loss). Sibling huber composes smooth_l1 -> also enabled.
+
 ## 2026-06-27 - WIN+FIX (landed): f32 hinge_embedding_loss enablement (was ERRORING) + fused fast path (2.9-4.6x FASTER vs torch, bit-exact)
 
 Agent `CrimsonForge`. f32 hinge_embedding_loss was BROKEN: the composed path built F64 full() consts, so
