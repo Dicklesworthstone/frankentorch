@@ -4,6 +4,47 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - ★★WIN (landed): cat (concat) dim=0 3.05x SLOWER -> 3.32x FASTER (parallelize the single-row outer_size==1 block-copy)
+
+Agent `BlackThrush`. The "fast-path-left-serial" anti-pattern again, but the gate was on the
+WRONG axis: the no-grad cat/stack copy parallelized over OUTER slices (`par_chunks_mut(out_row_len)`
+in the ft-api fast path; `outer_size > 1 && ...` gate in the ft-kernel-cpu kernels). For the
+DOMINANT case — `cat`/`stack` along `dim=0` (or any 1-D concat) — `outer_size == 1`, so the whole
+64MB output is ONE chunk = a SINGLE serial `copy_from_slice`. That ran at ~2 GB/s (NOT a bandwidth
+wall — it's single-threaded first-touch PAGE-FAULTING on the fresh 64MB output), 2-3x SLOWER than
+torch's parallel cat. Splitting the output into fixed 64K-elem global chunks across cores
+distributes the faults+copy and hits ~15.7 GB/s, BEATING torch's ~8.5 GB/s.
+
+MEASURED (`crates/ft-api/examples/redux_roundtrip_h2h.rs`, LOCAL, cat of two 8M f32 -> 16M/64MB
+along dim=0, torch 8t, min-of-7, add anchor 2.9x FASTER):
+- cat BASELINE FT **34-37ms = 3.05x SLOWER** -> **3.54ms = 3.32x FASTER** (FT default cores);
+  **5.74ms = 2.04x FASTER** at RAYON_NUM_THREADS=8 (same-thread A/B).
+- Isolated kernel probe (`crates/ft-kernel-cpu/examples/cat_parallel_probe.rs`, serial vs
+  parallel-split in ONE process, asserts bit-identical): serial 33.98ms (1.9 GB/s) -> parallel
+  4.07ms (15.7 GB/s) = **8.35x** at 64t; 5.46x at 8t. The serial path's slowness is first-touch
+  faults, confirmed by the >>memcpy-bandwidth ratio improvement.
+
+ROOT CAUSE was NOT the f32->f64->f32 round-trip (removed it too in a `dispatch_tensor_join_
+contiguous_f32_native`, but that only moved 37->34ms): the benchmark hits the ft-api no-grad
+fast path (`tensor_cat`), which never reaches dispatch. The real wall was the single-chunk
+serial copy in that fast path. Prior ledger framing of cat as "bandwidth-bound, ~parity after
+round-trip removal" was WRONG — it assumed the parallel path was active; it wasn't for dim=0.
+
+FIX (one lever, 3 sites, all bit-identical — same source bytes to same output offsets):
+1. ft-api `tensor_cat` f32+f64 no-grad fast paths: replace `par_chunks_mut(out_row_len)` with a
+   flat global-chunk (64K) fill that resolves each chunk's source block via `cum_off.binary_search`
+   (skips zero-size cat inputs so no duplicate offsets / infinite loop).
+2. ft-kernel-cpu `cat_tensor_contiguous_f32/f64`: drop the `outer_size > 1` gate, same flat-chunk
+   fill (covers the grad / non-fast-path cat).
+3. ft-kernel-cpu `stack_tensor_contiguous_f32/f64`: same (f32 stack has no ft-api fast path so it
+   routes through the kernel; f64 stack's ft-api fast path was ALREADY grain-parallel — left as-is).
+
+Tests GREEN: ft-kernel-cpu/ft-dispatch/ft-api cat 17/0. LESSON: when a copy is "parallel but slow",
+check WHICH axis the chunking is on — parallelizing over `outer_size` silently degrades to serial
+for the `outer_size==1` (dim=0 / 1-D) case that dominates real concat/stack usage. Flat global-chunk
+fill is axis-agnostic. Also: a single-threaded fill of a FRESH large buffer is page-fault-bound, not
+bandwidth-bound — parallelizing wins far more than the raw memcpy ratio suggests.
+
 ## 2026-06-28 - ★★WIN (landed): f64 norm_dim 3.18x SLOWER -> 3.30x FASTER (parallelize the serial p=1/p=2 kernel branches)
 
 Agent `BlackThrush`. The f64 sibling of d248f167. `norm_dim_tensor_contiguous_f64` had the

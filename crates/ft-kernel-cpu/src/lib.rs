@@ -12972,27 +12972,44 @@ pub fn cat_tensor_contiguous_f64(
         blocks.push((&data[offset..], block_len));
     }
     let mut output = vec![0.0_f64; out_numel];
-    let fill_row = |outer: usize, orow: &mut [f64]| {
-        let mut w = 0usize;
-        for &(window, block_len) in &blocks {
-            if block_len == 0 {
-                continue;
-            }
-            let base = outer * block_len;
-            orow[w..w + block_len].copy_from_slice(&window[base..base + block_len]);
-            w += block_len;
+    // Cumulative start offset of each (non-empty) block within a row.
+    let mut cum: Vec<usize> = Vec::with_capacity(blocks.len());
+    let mut acc = 0usize;
+    for &(_, block_len) in &blocks {
+        cum.push(acc);
+        acc += block_len;
+    }
+    // Fill a flat global output range by walking block segments — bit-identical to the
+    // serial nested copy but parallel for ANY outer_size (the old `outer_size > 1` gate
+    // left the common dim=0 / 1-D cat single-threaded at first-touch-fault speed).
+    let fill_range = |g0: usize, oc: &mut [f64]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let b = match cum.binary_search(&w) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            let (window, block_len) = blocks[b];
+            let within = w - cum[b];
+            let copy = (block_len - within).min(end - g);
+            let src_base = outer * block_len + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&window[src_base..src_base + copy]);
+            g += copy;
         }
     };
-    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems: good load balance
         output
-            .par_chunks_mut(out_row_len)
+            .par_chunks_mut(CHUNK)
             .enumerate()
-            .for_each(|(outer, orow)| fill_row(outer, orow));
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
     } else {
-        for (outer, orow) in output.chunks_mut(out_row_len).enumerate() {
-            fill_row(outer, orow);
-        }
+        fill_range(0, &mut output);
     }
 
     Ok(output)
@@ -13054,23 +13071,33 @@ pub fn stack_tensor_contiguous_f64(
         .map(|(data, meta)| &data[meta.storage_offset()..])
         .collect();
     let mut output = vec![0.0_f64; out_numel];
-    let fill_row = |outer: usize, orow: &mut [f64]| {
-        let base = outer * inner_size;
-        for (k, &window) in windows.iter().enumerate() {
-            orow[k * inner_size..(k + 1) * inner_size]
-                .copy_from_slice(&window[base..base + inner_size]);
+    // Flat-chunk parallel fill (uniform block_len == inner_size). Bit-identical to the
+    // serial nested copy but parallel for ANY outer_size — the old `outer_size > 1` gate
+    // left stack(dim=0) (outer_size==1) single-threaded at first-touch-fault speed.
+    let fill_range = |g0: usize, oc: &mut [f64]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let k = w / inner_size;
+            let within = w - k * inner_size;
+            let copy = (inner_size - within).min(end - g);
+            let src_base = outer * inner_size + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&windows[k][src_base..src_base + copy]);
+            g += copy;
         }
     };
-    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems: good load balance
         output
-            .par_chunks_mut(out_row_len)
+            .par_chunks_mut(CHUNK)
             .enumerate()
-            .for_each(|(outer, orow)| fill_row(outer, orow));
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
     } else {
-        for (outer, orow) in output.chunks_mut(out_row_len).enumerate() {
-            fill_row(outer, orow);
-        }
+        fill_range(0, &mut output);
     }
 
     Ok(output)
@@ -30534,27 +30561,48 @@ pub fn cat_tensor_contiguous_f32(
         blocks.push((&data[offset..], block_len));
     }
     let mut output = vec![0.0_f32; out_numel];
-    let fill_row = |outer: usize, orow: &mut [f32]| {
-        let mut w = 0usize;
-        for &(window, block_len) in &blocks {
-            if block_len == 0 {
-                continue;
-            }
-            let base = outer * block_len;
-            orow[w..w + block_len].copy_from_slice(&window[base..base + block_len]);
-            w += block_len;
+    // Cumulative start offset of each (non-empty) block within a row.
+    let mut cum: Vec<usize> = Vec::with_capacity(blocks.len());
+    let mut acc = 0usize;
+    for &(_, block_len) in &blocks {
+        cum.push(acc);
+        acc += block_len;
+    }
+    // Fill a flat global output range [g0, g0+oc.len()) by walking block segments.
+    // Bit-identical to the serial nested (outer, block) copy: same source bytes at
+    // the same output offsets. Crucially this parallelizes for ANY outer_size — the
+    // old `outer_size > 1` gate left the dominant dim=0 / 1-D case (outer_size==1,
+    // one huge row) SERIAL, so a 64MB cat ran single-threaded at ~2 GB/s (first-touch
+    // page faults), 2.3x SLOWER than torch. Splitting the output across cores
+    // distributes the faults+copy and beats torch.
+    let fill_range = |g0: usize, oc: &mut [f32]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let b = match cum.binary_search(&w) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            let (window, block_len) = blocks[b];
+            let within = w - cum[b];
+            let copy = (block_len - within).min(end - g);
+            let src_base = outer * block_len + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&window[src_base..src_base + copy]);
+            g += copy;
         }
     };
-    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems = 256KB per task: good load balance
         output
-            .par_chunks_mut(out_row_len)
+            .par_chunks_mut(CHUNK)
             .enumerate()
-            .for_each(|(outer, orow)| fill_row(outer, orow));
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
     } else {
-        for (outer, orow) in output.chunks_mut(out_row_len).enumerate() {
-            fill_row(outer, orow);
-        }
+        fill_range(0, &mut output);
     }
 
     Ok(output)
@@ -30607,23 +30655,33 @@ pub fn stack_tensor_contiguous_f32(
         .map(|(data, meta)| &data[meta.storage_offset()..])
         .collect();
     let mut output = vec![0.0_f32; out_numel];
-    let fill_row = |outer: usize, orow: &mut [f32]| {
-        let base = outer * inner_size;
-        for (k, &window) in windows.iter().enumerate() {
-            orow[k * inner_size..(k + 1) * inner_size]
-                .copy_from_slice(&window[base..base + inner_size]);
+    // Flat-chunk parallel fill (uniform block_len == inner_size). Bit-identical to the
+    // serial nested copy but parallel for ANY outer_size — the old `outer_size > 1` gate
+    // left stack(dim=0) (outer_size==1) single-threaded at first-touch-fault speed.
+    let fill_range = |g0: usize, oc: &mut [f32]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let k = w / inner_size;
+            let within = w - k * inner_size;
+            let copy = (inner_size - within).min(end - g);
+            let src_base = outer * inner_size + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&windows[k][src_base..src_base + copy]);
+            g += copy;
         }
     };
-    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems: good load balance
         output
-            .par_chunks_mut(out_row_len)
+            .par_chunks_mut(CHUNK)
             .enumerate()
-            .for_each(|(outer, orow)| fill_row(outer, orow));
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
     } else {
-        for (outer, orow) in output.chunks_mut(out_row_len).enumerate() {
-            fill_row(outer, orow);
-        }
+        fill_range(0, &mut output);
     }
 
     Ok(output)

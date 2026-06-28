@@ -5393,6 +5393,70 @@ pub fn dispatch_tensor_join_contiguous_f32(
     })
 }
 
+/// F32-native join (cat/stack) dispatch: returns the kernel f32 output DIRECTLY
+/// (no f32->f64->f32 round-trip; same softmax-class fix). join is a pure copy, so
+/// the output is bit-identical; this only removes the f64 widen+narrow of the FULL
+/// concatenated output (~3x the data movement for a large cat).
+fn dispatch_tensor_join_contiguous_f32_native(
+    op: JoinOp,
+    mode: ExecutionMode,
+    inputs: &[(&[f32], &TensorMeta)],
+    dim: usize,
+    requires_grad: bool,
+) -> Result<(Vec<f32>, JoinDispatchDecision), DispatchError> {
+    if inputs.is_empty() {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "join op requires at least one input",
+        }
+        .into());
+    }
+    let first_meta = inputs[0].1;
+    for &(_, meta) in &inputs[1..] {
+        ensure_tensor_meta_compatible(first_meta, meta)?;
+    }
+    let keyset = dispatch_keyset_for_single_tensor_meta(first_meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, JoinOp::Cat) => (
+            cat_tensor_contiguous_f32(inputs, dim)?,
+            "autograd_cpu::cat_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, JoinOp::Stack) => (
+            stack_tensor_contiguous_f32(inputs, dim)?,
+            "autograd_cpu::stack_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, JoinOp::Cat) => (
+            cat_tensor_contiguous_f32(inputs, dim)?,
+            "cpu::cat_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, JoinOp::Stack) => (
+            stack_tensor_contiguous_f32(inputs, dim)?,
+            "cpu::stack_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor join f32 ops",
+            }
+            .into());
+        }
+    };
+    Ok((
+        values,
+        JoinDispatchDecision {
+            op,
+            dim,
+            num_inputs: inputs.len(),
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    ))
+}
+
 pub fn dispatch_tensor_lerp_contiguous_f32(
     mode: ExecutionMode,
     start: &[f32],
@@ -6429,8 +6493,8 @@ pub fn dispatch_tensor_join_contiguous_typed(
             .collect();
         let refs: Vec<(&[f32], &TensorMeta)> =
             f32_inputs.iter().map(|(d, m)| (d.as_slice(), *m)).collect();
-        let outcome = dispatch_tensor_join_contiguous_f32(op, mode, &refs, dim, requires_grad)?;
-        let values: Vec<f32> = outcome.values.iter().map(|&v| v as f32).collect();
+        let (values, decision) =
+            dispatch_tensor_join_contiguous_f32_native(op, mode, &refs, dim, requires_grad)?;
         // Preserve a shared half dtype: cat/stack of all-f16 (or all-bf16) inputs
         // stays f16/bf16 (torch parity), matching the binary/lerp half-narrowing.
         // join is a pure copy, so the f16->f32->f16 round-trip is lossless. Mixed
@@ -6448,7 +6512,7 @@ pub fn dispatch_tensor_join_contiguous_typed(
         };
         Ok(TypedJoinOutcome {
             storage,
-            decision: outcome.decision,
+            decision,
         })
     }
 }
