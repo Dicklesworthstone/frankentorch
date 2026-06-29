@@ -13293,3 +13293,22 @@ Tests: `cargo test -p ft-kernel-cpu product_f32_simd_contiguous_matches_existing
 => 1 passed (was FAILED). ★Both pre-existing reds on main (cdist/pdist 0f314d72 + this) are now
 GREEN. LESSON: a FIXED absolute/relative tolerance comparing two float REDUCTION ORDERS must scale
 with the reduction length (N·u) — a constant tolerance gives false failures at large N. AGENT CoralDrift.
+
+## 2026-06-29 - FIX (dtype parity): unique_consecutive returned F64 for f32 input -> preserves dtype
+
+Agent `CoralDrift`. Contention-robust dig (load ~24, perf unreliable) — hunted a dtype-PARITY bug
+(verifiable by dtype-check, timing-independent) instead. Scanned for no-grad ops that read input
+via lossy-f64 (so f32 doesn't crash) but rebuild via the F64 `tensor_variable` without narrowing
+back. ONE hit: `tensor_unique_consecutive` — for f32 input it read values as f64 and returned an
+F64 unique tensor, but torch.unique_consecutive PRESERVES the input dtype (its sibling
+`tensor_unique` already narrows via tensor_to_dtype; unique_consecutive was missed).
+
+Fix: for f32 input, narrow the (pure-selection, so exact) unique values back to f32 and return F32.
+F64 + other dtypes unchanged. inverse/counts are index/count outputs (FT f64 convention, separate).
+
+Verify (`examples/unique_consec_dtype_check.rs`): f32 -> dtype=F32 + values [1,2,3,1] CORRECT;
+f64 -> F64 (no regression). Tests: `cargo test -p ft-api --lib unique_consecutive` => 5 passed.
+
+★The wrong-dtype-for-f32 parity vein (read f32 via lossy/apply_function but BUILD F64 without
+narrowing) is now also harvested — scan: `values_lossy_f64(input)` + `tensor_variable(` + no
+`tensor_dtype`/narrow. AGENT CoralDrift.
