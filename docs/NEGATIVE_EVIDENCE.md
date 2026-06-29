@@ -4,6 +4,26 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): f32 log_ndtr 3.87x + mvlgamma/multigammaln 4.99x FASTER vs torch (apply_function -> f32 fast path)
+
+Agent `cc`. Continuation of the special-fn f32 vein. `tensor_special_log_ndtr` and
+`tensor_multigammaln` (which backs `tensor_mvlgamma`) ran `tensor_apply_function` UNCONDITIONALLY
+— even in no-grad they paid the f32->f64 upcast, an input clone, AND two `save_for_backward`
+clones (all dead with no grad). Added the f32 fast path at the top of each
+(`try_f32_unary_native(input, scalar_fn)`, reusing the exact `log_ndtr_scalar` /
+`constant + sum_i lgamma_approx(x - i/2)` the forward used) — bit-identical to the prior f64
+compute, output F32 (matches torch).
+
+MEASURED (FT default, torch 8t, min-of-7, ~16M f32, `examples/specfn3_sweep_h2h.rs`): log_ndtr
+**3.87x** FASTER (FT 10.5ms vs torch 40.6ms), mvlgamma p=3 **4.99x** FASTER (FT 22.0ms vs torch
+109.5ms — the p lgamma calls/elem make torch's pass heavy, so killing the upcast+dead-clones pays
+big). CORRECTNESS vs torch f32 (same example): both dtype=F32; log_ndtr max_rel 3.33e-7,
+mvlgamma max_rel 1.19e-7 (one f32 ULP) / 2902-of-4096 bit-exact. Full `-p ft-api` suite: 2400
+passed; only the 2 pre-existing unrelated `cdist/pdist_p_neq2_fused_nograd` 1-ULP failures remain
+(reproduce on the clean tree). ★Note: the unconditional-apply_function pattern is the same
+no-grad-save-skip waste flagged in the optimizer/logcumsumexp work — the f32 fast path collapses
+upcast + input-clone + 2x save-clone into one parallel narrowed pass.
+
 ## 2026-06-29 - ★★★WIN (landed): f32 orthogonal-polynomial family (chebyshev/hermite/laguerre/legendre) 2.7-3.1x FASTER + latent F64-output dtype bug fixed, via ONE shared-helper fix
 
 Agent `cc`. SAME shared-helper lever as the bessel batch, one helper deeper. The whole
