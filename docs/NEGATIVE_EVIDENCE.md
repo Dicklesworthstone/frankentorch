@@ -4,6 +4,31 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): f32 orthogonal-polynomial family (chebyshev/hermite/laguerre/legendre) 2.7-3.1x FASTER + latent F64-output dtype bug fixed, via ONE shared-helper fix
+
+Agent `cc`. SAME shared-helper lever as the bessel batch, one helper deeper. The whole
+degree-parameterized polynomial family — `chebyshev_polynomial_t/u/v/w` (+ the 4 shifted
+variants), `hermite_polynomial_h/he`, `laguerre_polynomial_l`, `legendre_polynomial_p` — all
+route through ONE helper `special_unary_n_with_deriv(input, n, fwd, deriv)`. Its no-grad
+fall-through did `tensor_values_meta` (f32->f64 lossy upcast) -> `par_map_f64` -> `tensor_variable
+(Vec<f64>)`, which (a) paid the upcast and (b) returned an **F64** tensor for an **F32** input —
+a latent dtype bug (torch keeps the input float dtype: f32 in -> f32 out). Added the f32 fast path
+INSIDE the helper (`try_f32_unary_native(input, |x| fwd(n, x))`) — fixes ALL ~12 ops (+ future
+users) at once. Output now F32 (matches torch dtype) with values = `fwd(n, x as f64) as f32`
+(f64-quality, narrowed) — identical to the prior compute, just correctly narrowed.
+
+MEASURED (FT default, torch 8t, min-of-7, ~16M f32, `examples/poly_sweep_h2h.rs`; `add` anchor
+2.10x confirms a healthy uncontended worker): chebyshev_t **3.09x**, hermite_h **2.84x**,
+hermite_he **2.70x**, laguerre_l **3.09x** FASTER. CORRECTNESS (`examples/poly_correctness_h2h.rs`
+vs torch f32): all dtype=F32; cheb_t/herm_h/herm_he ~74-78% bit-exact with `max_rel ~1.18e-7`
+(one f32 ULP — FT computes in f64 then rounds, torch in f32); laguerre_l `max_abs 2.4e-6`, larger
+relative blowup only at the L_5 roots where torch's own f32 recurrence is less accurate than FT's
+f64-then-round. Full `-p ft-api` suite: 2400 passed; the only 2 failures
+(`cdist/pdist_p_neq2_fused_nograd`, unrelated fused-distance path) reproduce IDENTICALLY (same
+bits) on the clean pre-change tree — pre-existing fragile 1-ULP asserts, NOT caused by this change.
+★LESSON: the "fix the shared HELPER not each op" lever keeps paying — and a helper that returns a
+`Vec<f64>` for an f32 input is both a perf miss AND a silent dtype bug; the f32 fast path fixes both.
+
 ## 2026-06-28 - ★★★WIN (landed): f32 bessel-family batch (7 ops) 1.3-5x SLOWER -> 1.3-3.6x FASTER via ONE shared-helper fix
 
 Agent `BlackThrush`. The bessel/special family `tensor_special_bessel_y0/y1`, `modified_bessel_i0/i1/
