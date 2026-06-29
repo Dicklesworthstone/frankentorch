@@ -13206,3 +13206,24 @@ f64 round-trip). Tests: `cargo test -p ft-api --lib ::put` => 1 passed.
 
 ★GOTCHA: `tensor_values_len` is NOT a metadata accessor — it calls `contiguous_values()` (F64-only)
 and CRASHES on f32. Use shape-numel for element counts on possibly-f32 tensors. AGENT CoralDrift.
+
+## 2026-06-29 - FIX: no-grad f32 diagonal_scatter errored (UnsupportedDType) -> works bit-exact (parity)
+
+Agent `CoralDrift`. `tensor_diagonal_scatter` (copy input, overwrite the offset-diagonal with src)
+read input + src via F64-only `tensor_values` in the no-grad path, so no-grad f32 crashed with
+UnsupportedDType(F32). torch.diagonal_scatter keeps f32. Contention-robust dig (load ~14) —
+verified by bit-exactness (timing-independent), not perf.
+
+Fix: no-grad F32 arm reads input + src natively (`values_f32`), copies the diagonal, returns F32.
+Pure movement => bit-identical. F64 + grad (apply_function, upcasts) paths unchanged.
+
+Bench `examples/diagonal_scatter_f32_h2h.rs` [4096x4096] offset 0 f32: was Err(UnsupportedDType)
+-> now OK, dtype=F32, bit_exact=8192/8192. FT ~35ms vs torch ~12ms (perf secondary — it was a
+crash; the residual is the 67MB input clone+construct, and the native f32 also avoids the f64
+round-trip the dead path would have paid). Tests: `cargo test -p ft-api --lib diagonal_scatter`
+=> 4 passed.
+
+6th f32-crash fix this session (prelu/index_reduce/masked_scatter/put/diagonal_scatter + embedding
+earlier) — all "no-grad hand-rolled path reads user input via F64-only tensor_values". Remaining
+crashers are IN-PLACE ops (logaddexp_ etc., tape-bound) — out-of-place ones route through
+apply_function (upcast, no crash). AGENT CoralDrift.
