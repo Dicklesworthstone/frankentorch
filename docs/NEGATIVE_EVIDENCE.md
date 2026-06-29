@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - ★★WIN (landed): f32 asinh 11.8x SLOWER -> 4.2x FASTER, acosh 6.5x SLOWER -> 3.4x FASTER, atanh (inverse-hyperbolic, elide the 6-7 op compose)
+
+Agent `BlackThrush`. The reduction sweep's elementwise leftovers: asinh/acosh/atanh. asinh COMPOSED
+6 tape ops (`full+mul+add+sqrt+add+log`), atanh 7 (`full x2+add+sub+div+log+mul`), acosh upcast f32->
+f64 via apply_function. Wired `try_f32_unary_native`: asinh `ln(x+sqrt(x*x+1))`, atanh
+`0.5*ln((1+x)/(1-x))`, acosh `x.acosh()` (f64::acosh == torch.acosh bit-for-bit per the existing
+doc). Tolerance ops (conformance-verified within tol); acosh bit-identical to the f64-narrow.
+
+MEASURED (`reduction_sweep_h2h`, 16M f32, torch 8t, min-of-7): asinh **251ms -> 5.2ms = 4.15x FASTER**
+(1.34x @8t — even beats torch at equal threads), acosh **129ms -> 6.6ms = 3.40x FASTER** (1.01x @8t).
+★KEY: these are "transcendental" (log/sqrt) yet got a CLEAN 3-4x because the real overhead was the
+6-7-OP MULTI-PASS COMPOSE, not the libm transcendental — eliding the compose into one f64 pass wins
+big at default cores. atanh same lever (7-op compose -> 1 pass); ratio not separately benched (its
+(-1,1) domain differs from the sweep data) but conformance-verified. Tests GREEN: asinh/acosh/atanh
+5/0. So composed-multi-op elementwise (not just single-scalar-upcast) is a rich sub-vein of the
+elementwise work — grep ft-api elementwise fns that chain `full`/`tensor_add`/`tensor_mul`/
+`tensor_log` etc. instead of one closure.
+
 ## 2026-06-28 - ★★★WIN (landed): aminmax 31.6x SLOWER -> 2.3x FASTER (fuse the two dim-reductions into one min+max scan) — NEW VEIN
 
 Agent `BlackThrush`. A reduction sweep (`crates/ft-api/examples/reduction_sweep_h2h.rs`) found
