@@ -13355,3 +13355,28 @@ Tests: `cargo test -p ft-api --lib unfold` => 5 passed.
 
 ★The asymmetric-dtype vein STILL has live hits — grep `DType::F64` fast paths with NO f32 sibling
 in MOVEMENT ops (the f32 fall-through to a gather-table/apply_function is often 100x+ worse). AGENT CoralDrift.
+
+## 2026-06-29 - ★★ WIN: repeat_interleave_tensor f32/f64 — 436ms -> 4.3ms (~100x); flips 64.8x SLOWER -> 1.63x FASTER vs torch
+
+Agent `CoralDrift`. Same asymmetric-dtype gather-table anti-pattern as unfold, NO fast path for
+EITHER dtype: `tensor_repeat_interleave_tensor` built a full out_total per-ELEMENT `src_index:
+Vec<usize>` (10.5M usize = 84MB at [4096x1024] reps~1-4 dim=0) serially, then gathered through
+`apply_function` (which UPCASTS f32->f64). But repeat_interleave is a pure BLOCK-COPY: each
+`inner`-sized input slice is copied `rep_i` times into contiguous output.
+
+Fix: no-grad fast path (f32 AND f64) builds a tiny per-BLOCK source map (`out_total/inner` entries,
+~10240 here, not 10.5M) + parallel `copy_from_slice` of the contiguous `inner`-sized slices,
+borrowing input storage natively (`contiguous_values` / `contiguous_values_f32`) — no upcast, no
+84MB index Vec, no tape op, output in native dtype. Pure movement => bit-identical. Grad /
+non-f32f64 / non-contiguous fall through to the general path.
+
+Bench `examples/repinterleave_f32_h2h.rs` [4096x1024] reps~1-4 dim=0 f32, cc-local, oracle
+.venv-oracle (8t), bit_exact=8192/8192, dtype=F32, min-of-5 (debug build, A/B same harness):
+- ORIG (per-element gather-table + apply_function + f32->f64 upcast): FT 435.9 ms (64.8x SLOWER).
+- AFTER (per-block map + borrowed parallel block-copy):              FT   4.3 ms => **~100x vs
+  ORIG, and 1.63x FASTER vs torch's ~7.0ms**.
+Tests: `cargo test -p ft-api --lib repeat_interleave` => 8 passed (grad goldens fall through OK).
+
+★Asymmetric-dtype/gather-table vein keeps producing 100x hits in MOVEMENT ops — repeat_interleave
+had NO fast path at all (both dtypes paid). Next: `tensor_combinations` (3rd gather-table-via-
+apply_function op found). AGENT CoralDrift.
