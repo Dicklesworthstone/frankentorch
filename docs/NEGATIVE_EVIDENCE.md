@@ -4,7 +4,32 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
-## 2026-06-29 - ⚠️BLOCKER + CANDIDATE LEAD: shared-host contention makes local FT-vs-torch timing untrustworthy; nansum/nanmean flagged as a real structural gap to measure on a CLEAN worker
+## 2026-06-29 - ★★WIN (landed): nansum 107.75x SLOWER -> ~9x SLOWER vs torch (54.3ms -> 5.5ms, ~10x internal); CORRECTS the prior "contention blocker" (was mostly a BENCH BUG)
+
+Agent `cc`. ★FIRST, a correction to the entry below: the prior turn's "shared-host contention
+blocker" was MOSTLY A BENCH BUG, not (only) contention. `stat_gapfind_h2h.rs` created its 16M input
+(`tensor_variable_f32(b.clone(), ...)`, ~34ms) INSIDE the timed region, so every op's reading was
+dwarfed by input materialization (the `add` anchor showed 3.4x SLOWER / 38ms). Moving input
+creation OUTSIDE the timed loop (mirroring the other gap-finders) restored a clean read: `add` 3.05x
+FASTER, `diff` 1.94x FASTER (already-fused, no gap), `dist` 1.23x FASTER. LESSON: in a hand-rolled
+FT bench, materialise inputs BEFORE `Instant::now()` — the session-tensor build is a 16M copy that
+swamps the op; an anchor that reads SLOWER is as likely a bench bug as contention.
+
+With that fixed, `tensor_nansum` was confirmed **107.75x SLOWER** (FT 54.3ms vs torch 0.504ms). Root
+cause: the compose `zeros_like + isnan + where + sum` materialises THREE full tensors and routes f32
+through f64 per op. Replaced the cleaning with ONE parallel pass (NaN->0 on the borrowed contiguous
+f32/f64 storage) and reused the SAME `tensor_sum` — bit-identical to the compose (cleaned values are
+byte-for-byte `where(isnan,0,x)`; same reduction). MEASURED (clean window, add anchor 2.85-2.97x
+FASTER, min-of-7, ~16M f32, `examples/stat_gapfind_h2h.rs`): **54.3ms -> 5.5ms (~10x internal)**,
+taking nansum from **107.75x SLOWER to ~9x SLOWER** vs torch. All 5 nansum lib tests + full `-p
+ft-api` suite green (2400 pass; only the 2 pre-existing unrelated cdist/pdist failures). RESIDUAL:
+still ~9x slower than torch's single fused pass — the remainder is `tensor_sum`'s f32->f64
+upcast/materialisation; closing to parity needs a TRUE single-pass fused nan-aware reduction (sum
+the cleaned values directly without materialising), which changes reduction order so it must be
+verified within tolerance vs torch (nansum tests are 1e-12 tolerance, no bit-exact conformance pin).
+`tensor_nanmean` (still 1.9x SLOWER) builds on nansum + a separate count compose — next.
+
+## 2026-06-29 - ⚠️BLOCKER + CANDIDATE LEAD (SUPERSEDED, see above): shared-host contention makes local FT-vs-torch timing untrustworthy; nansum/nanmean flagged as a real structural gap to measure on a CLEAN worker
 
 Agent `cc`. DIG into statistical/composite ops (`examples/stat_gapfind_h2h.rs`: nansum, nanmean,
 diff, dist, corrcoef). RESULT INVALID — the shared host was saturated by ~6 peer agent swarms

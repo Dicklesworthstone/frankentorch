@@ -15,14 +15,20 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            // Create inputs OUTSIDE the timed region (mirror act_gapfind) — otherwise the 16M
+            // clone + tensor_variable materialization (~34ms) dwarfs the op being measured.
+            let shape = if w == 5 { vec![rows, cols] } else { vec![n] };
+            let src = if matches!(w, 1 | 2) { a.clone() } else { b.clone() };
+            let x = s.tensor_variable_f32(src, shape, false).unwrap();
+            let y = if w == 4 { Some(s.tensor_variable_f32(b.clone(), vec![n], false).unwrap()) } else { None };
             let t = Instant::now();
             match w {
-                0 => { let x = s.tensor_variable_f32(b.clone(), vec![n], false).unwrap(); let _ = s.tensor_add(x, x); }
-                1 => { let x = s.tensor_variable_f32(a.clone(), vec![n], false).unwrap(); let _ = s.tensor_nansum(x); }
-                2 => { let x = s.tensor_variable_f32(a.clone(), vec![n], false).unwrap(); let _ = s.tensor_nanmean(x); }
-                3 => { let x = s.tensor_variable_f32(b.clone(), vec![n], false).unwrap(); let _ = s.tensor_diff(x, 1); }
-                4 => { let x = s.tensor_variable_f32(b.clone(), vec![n], false).unwrap(); let y = s.tensor_variable_f32(b.clone(), vec![n], false).unwrap(); let _ = s.tensor_dist(x, y, 2.0); }
-                _ => { let x = s.tensor_variable_f32(b.clone(), vec![rows, cols], false).unwrap(); let _ = s.tensor_corrcoef(x); }
+                0 => { let _ = s.tensor_add(x, x); }
+                1 => { let _ = s.tensor_nansum(x); }
+                2 => { let _ = s.tensor_nanmean(x); }
+                3 => { let _ = s.tensor_diff(x, 1); }
+                4 => { let _ = s.tensor_dist(x, y.unwrap(), 2.0); }
+                _ => { let _ = s.tensor_corrcoef(x); }
             }
             let e = t.elapsed().as_secs_f64() * 1e3;
             if e < best { best = e; }
