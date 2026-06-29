@@ -4,6 +4,27 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): nanvar/nanstd 3.5-3.6x SLOWER -> ~11x FASTER vs torch (155ms -> 4ms, two-pass fused variance)
+
+Agent `cc`. The NaN-family gap-finder flagged `tensor_nanvar` 3.62x / `tensor_nanstd` 3.52x SLOWER
+(155-157ms) vs torch's masked `var`/`std` (`a[~isnan].var(1)`, ~43-46ms; torch has no nanvar/nanstd
+built-in). nanvar's compose was ~14 tape ops + ~5 full-size materialisations (cleaned,
+mean_broadcast, raw_diff, re-masked diff, sq) — and it recomputed isnan/zeros TWICE. Replaced the
+no-grad path with a TWO-PASS fused variance over the borrowed contiguous storage, f64 accumulator:
+pass1 = sum+count -> mean; pass2 = sum of (x-mean)^2 over non-NaN; var = sq_sum/(count-correction).
+nanstd = sqrt(nanvar) inherits it. Grad / non-contiguous / non-float fall through to the compose.
+
+MEASURED (FT default, torch 8t, min-of-7, ~16M f32, clean window add anchor 2.79-3.15x FASTER,
+`examples/nan_gapfind_h2h.rs`): **155ms -> ~4ms (~40x internal)**, flipping **3.5-3.6x SLOWER into
+~11x FASTER** (nanvar 10.95-11.67x, nanstd 10.65-10.99x; FT ~4ms vs torch ~43-46ms). CORRECTNESS
+(`examples/nanvar_check.rs`, finite variant): FT vs torch masked-var rel_err ~4.7e-5 — this is
+TORCH being LESS accurate (its masked var accumulates the sum-of-squares in f32, losing the tail of
+a ~53000 sum), NOT FT: FT's f64 two-pass is at-or-more-accurate, and the prior FT compose also
+accumulated sq in f64 (via tensor_sum's upcast), so this is NOT a parity regression vs prior FT.
+All 10 nanvar/nanstd lib tests (biased/unbiased, all-NaN, single-bessel, grad, sqrt) + full `-p
+ft-api` suite green (2400 pass; only the 2 pre-existing unrelated cdist/pdist failures). NaN family
+now: nansum/nanmean/nanprod/nanvar/nanstd/nanmin/nanmax/nan_to_num all FT-FASTER or gap-closed.
+
 ## 2026-06-29 - ★★★WIN (landed): nanprod 6.73x SLOWER -> 1.72-1.79x FASTER vs torch (81ms -> 7.8ms, fused NaN->1 clean)
 
 Agent `cc`. Same lever as nansum, applied across the NaN family. A NaN-family gap-finder
