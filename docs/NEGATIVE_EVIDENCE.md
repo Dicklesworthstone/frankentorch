@@ -13012,3 +13012,29 @@ Tests: `cargo test -p ft-api --lib index_add` => 14 passed (incl. grad/backward 
 Pattern: borrowed-read + bucket-parallel, the 3rd op in the family (after scatter_reduce
 17d03467 + index_reduce 77ab1b63). NEXT: index_copy / scatter (plain) / gather / take. AGENT
 CoralDrift.
+
+## 2026-06-29 - ★ WIN: index_copy no-grad fast path — 123ms -> 11ms (~11x); was 57-67x SLOWER vs torch
+
+Agent `CoralDrift`. Identical pathology to index_add (11301445): index_copy composed through
+tensor_scatter for autograd, materializing a full [outer, src_dim, inner] EXPANDED index +
+apply_function. No-grad FT 123ms vs torch 2ms = 57-67x SLOWER.
+
+index_copy OVERWRITES along dim (out[.., idx[r], ..] = src[.., r, ..], last-write-wins on
+duplicates) = index_reduce_apply with a new "copy" mode (`*slot = sv`, last source in ascending
+r order wins — bit-identical to tensor_scatter's flat last-write-wins). No-grad fast path
+(f32/f64) borrows src zero-copy + reads input into result + bucket-parallel over disjoint output
+rows; positions with no source keep the input value. Half dtypes + grad fall through to the
+scatter compose unchanged.
+
+Bench `examples/index_copy_f32_h2h.rs` [4096x1024] nsrc=4096 dim=0 f32 (UNIQUE indices via the
+(i*7919)%4096 permutation — torch index_copy on DUPLICATES is unspecified), cc-local, oracle
+.venv-oracle (8t), bit_exact=8192/8192, dtype=F32:
+- ORIG (expanded-idx + tensor_scatter): FT 123-131 ms (57-67x SLOWER vs torch).
+- AFTER (no-grad fast path):             FT ~11 ms => **~11x vs ORIG** (7-11x SLOWER vs torch's
+  fused ~1-2ms — gap dropped from ~60x).
+Tests: `cargo test -p ft-api --lib index_copy` => 14 passed (incl. grad/backward + duplicate-idx
+last-write-wins cases).
+
+4th op in the borrowed-read + bucket-parallel family (scatter_reduce / index_reduce / index_add
+/ index_copy), all via `index_reduce_apply<T>` (now copy/sum/prod/mean/amax/amin). NEXT: plain
+scatter, gather, take. AGENT CoralDrift.
