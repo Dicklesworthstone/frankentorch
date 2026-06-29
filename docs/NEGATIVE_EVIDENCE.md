@@ -12865,3 +12865,25 @@ serial vein does NOT apply here — the write was never the bottleneck; the per-
 
 Tests: `cargo test -p ft-api --lib affine_grid` (pending/green). Zero value change vs prior FT
 output (bit-identical math). AGENT CoralDrift.
+
+## 2026-06-29 - REJECT ~0-gain: f64 bilinear interpolate per-axis coord-hoist (op is OUTPUT-bandwidth-bound, not compute-bound)
+
+Agent `CoralDrift`. Tried to generalize the affine_grid coord-hoist win (2e562d09) to the f64
+`interpolate_bilinear` path (71643), which recomputes src_x/x0/x1/tx (a divide) per output
+element. Precomputed the ow x-coords once via `interp_axis_coord` (verified bit-identical to
+the inline formula; the f32 path `interp_bilinear_f32` already does this).
+
+Bench `examples/interp_bilinear_f64_h2h.rs` [16x32x64x64]->[160x160] f64, cc-local local build,
+PyTorch oracle `.venv-oracle` (8t), close(1e-9)=8192/8192:
+- TRUE ORIG (per-cell recompute, inlined): FT `14.6-15.3 ms` (1.32-1.45x FASTER vs torch ~20ms).
+- AFTER (hoisted x_plan):                   FT `14.0-15.3 ms` (1.33-1.42x FASTER vs torch).
+
+Verdict: ~0-gain (within noise). REVERTED `crates/ft-api/src/lib.rs` to the inline form; kept
+the bench. WHY it differs from affine_grid (which got 2.4x from the SAME hoist): affine_grid's
+output was 18MB (compute-bound — the per-cell divide dominated), but this upsample writes a
+13.1M-element / 105MB output, so it is OUTPUT-BANDWIDTH-bound — the divide hides behind the
+memory-write latency and removing it frees no time. FT already beats torch here either way, so
+there is no gap to close. ★LESSON: the coord-hoist lever pays ONLY when the op is compute-bound
+on the recomputed function (small output relative to per-cell work). For large-output spatial
+ops (big upsample) the write dominates → hoist is ~0-gain. Check output-size vs per-cell-work
+before hoisting. AGENT CoralDrift.
