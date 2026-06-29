@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★WIN (landed, gap-closing) + a REJECTED sub-lever: renorm f32 9.6x SLOWER -> 3.1x SLOWER (120ms -> 44ms, asymmetric-dtype mirror); powf-elision REJECTED (~0-gain)
+
+Agent `cc`. The misc gap-finder flagged `tensor_renorm` 9.6x SLOWER (FT 120ms vs torch 12.6ms @
+[4096,4096] f32, dim=0). Root: `tensor_renorm` had a no-grad fused fast path gated on **F64 + dim==0
+only** — f32 fell through to the ~10-op compose. Mirrored it for f32 (per dim-0 contiguous slice:
+L_p norm in f64, scale the f32 slice in place). MEASURED: **120ms -> 44ms (~2.7x internal)**, taking
+renorm f32 from 9.6x SLOWER to **3.1x SLOWER** (now matching the f64 fast path; both ~3x slower than
+torch's vectorized renorm). 7 renorm tests (incl. matches_torch_epsilon, clips, idempotent, grad) +
+full `-p ft-api` suite green (2400 pass; only the 2 pre-existing cdist/pdist failures).
+
+⛔REJECTED sub-lever (reverted): eliding the per-element `x.abs().powf(p)` for p∈{1,2} (powf-elision
+vein: `pow(x,2)==x*x`, bit-exact on glibc). Measured **~0-gain** (44ms -> ~44-52ms, within noise) —
+glibc's `powf(x, 2.0)` already fast-paths integer exponents, so powf was NOT renorm's bottleneck;
+the residual ~3x is structural (16M-element `tensor_values` read + `tensor_variable` materialisation
+for the full-size output, plus the scalar non-SIMD scale loop). Reverted from BOTH the f32 and the
+(untouched) f64 paths. LESSON: `pow(x,2)` elision only pays where libm's pow is actually called per
+element without its own fast-path AND dominates — verify with a measurement, don't assume.
+
 ## 2026-06-29 - ★★WIN (landed, gap-closing): trapezoid 297x SLOWER -> 3-5x SLOWER vs torch (142ms -> 3ms, fused single-pass reduction)
 
 Agent `cc`. A misc-op gap-finder (`examples/misc_gapfind_h2h.rs`, anchor 2.0-3.0x FASTER) found
