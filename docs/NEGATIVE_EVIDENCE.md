@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ⛔REJECTED (reverted, REGRESSION): multilabel_margin_loss "parallelise the serial forward" — 26ms -> 39ms (WORSE)
+
+Agent `cc`. Last loss without a fast path. Its no-grad forward runs inside apply_function looping
+over N rows SERIALLY; I added a rayon par-over-rows fast path (compute in f64, bit-identical;
+verified value vs torch rel_err 1.18e-7). MEASURED a REGRESSION: serial apply_function 26.26ms ->
+parallel 39.43ms (WORSE) @ [50000,64] f32 (torch 10.8-11.8ms). Root cause: the op is SMALL —
+multilabel-margin has only P positive labels/row (P=2 here), so the real work is ~N·P·C ≈ 6.4M
+margin checks, not N·C². At that size the parallel path's overhead (a 25.6MB owned Vec<f64> copy of
+the input + a per-row `positive_indices` Vec allocation ×N + thread dispatch) EXCEEDS the serial
+loop, which reads the f64 input directly with no copy. REVERTED. The residual 2.23x-SLOWER gap is
+torch's vectorised hinge kernel, not serialness — parallelism doesn't pay for this small/branchy op.
+LESSON: parallelising a SERIAL loop only wins if the per-element work ≫ the copy+alloc+dispatch
+overhead; for a small/sparse op the serial in-place version can be faster. (Also: target is read via
+f64 `tensor_values` — multilabel_margin's target dtype is f64 label-indices, not f32.) ★The loss-fn
+vein is now HARVESTED: bce_logits/poisson/bce_pw/gaussian_nll flipped; multilabel_soft_margin/
+soft_margin/cosine_embedding/multi_margin/margin_ranking/hinge/kl_div/huber/smooth_l1 already fast;
+multilabel_margin = this rejection.
+
 ## 2026-06-29 - ★★★WIN (landed): gaussian_nll_loss f32 2.17x SLOWER -> 2.05-2.19x FASTER vs torch (198ms -> 42ms, asymmetric-dtype f32 mirror)
 
 Agent `cc`. 4th loss flip. `tensor_gaussian_nll_loss` had a fused fast path gated on F64 (via the
