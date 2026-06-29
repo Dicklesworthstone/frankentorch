@@ -13227,3 +13227,27 @@ round-trip the dead path would have paid). Tests: `cargo test -p ft-api --lib di
 earlier) — all "no-grad hand-rolled path reads user input via F64-only tensor_values". Remaining
 crashers are IN-PLACE ops (logaddexp_ etc., tape-bound) — out-of-place ones route through
 apply_function (upcast, no crash). AGENT CoralDrift.
+
+## 2026-06-29 - FIX: ~20 no-grad/in-place f32 ops errored (UnsupportedDType) -> work — broaden F64-only operand reads to lossy_f64
+
+Agent `CoralDrift`. Swept in-place ops + found ~23 that read their operands via the F64-only
+`tensor_values` => f32 in-place CRASHED (UnsupportedDType(F32)). The writeback
+(`update_tensor_values_for_float`) is ALREADY dtype-aware (narrows f64->f32 for an f32 target),
+so the crash is purely the READ. `tensor_values_lossy_f64` (= `contiguous_values_as_f64`) is a
+drop-in: IDENTICAL to `tensor_values` for contiguous f64 (so no f64 regression), and reads f32 as
+f64 (fixes the crash). Computation stays f64; movement ops (maximum_/minimum_/masked_fill_/
+where_/fmax_/fmin_/fill_diagonal_/tril_/triu_) are bit-exact, arithmetic ops (addcmul_/addcdiv_/
+atan2_/logaddexp_/xlogy_/fmod_/remainder_/...) match FT's f64-compute out-of-place behavior.
+
+Broadened 69 sites: `self.tensor_values({target,other,tensor1,tensor2,mask,condition,end})?` ->
+`values_lossy_f64(..)?` (these operand names are in-place-specific + loss `target` reads — also
+F64-only-crash on f32 targets, now accepted; `weight` left alone as it is shared with conv ops).
+
+Verify: `examples/inplace_f32_check.rs` => maximum_/masked_fill_/addcmul_ on f32: all OK + CORRECT
+(were crashes). Full suite: `cargo test -p ft-api --lib` => 2400 passed, 2 failed. ⚠️The 2 fails
+(cdist/pdist `p_neq2_fused_nograd_matches_broadcast_bit_exact`, 1-ULP) are PRE-EXISTING — verified
+by stashing this change and re-running on clean main: they fail there too (NOT caused by this
+change; orthogonal). f64-only reads => zero f64 regression by construction.
+
+★This retires the in-place f32-crash sub-vein in one uniform pass (the writeback was already
+dtype-aware — only the read needed broadening). AGENT CoralDrift.
