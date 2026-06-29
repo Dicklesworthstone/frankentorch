@@ -4,6 +4,27 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): nanmean 1.9x SLOWER -> 3.3-3.5x FASTER vs torch (51ms -> 8ms; reuse fused nansum + fused NaN count)
+
+Agent `cc`. Follow-up to the nansum fix. `tensor_nanmean` did NOT reuse the now-fast `tensor_nansum`
+— it re-composed `zeros_like + isnan + where + sum` inline for the numerator AND used a second
+`tensor_sum(isnan(x))` for the count = 7 tape ops + f32->f64 upcasts, ~51ms (1.9x SLOWER than
+torch's ~27ms). Two changes, both BIT-IDENTICAL to the old output: (1) numerator = `self.tensor_
+nansum(input)` (its no-grad fast path produces the same cleaned data + same tensor_sum; its grad
+path is the same compose); (2) the NaN COUNT is non-differentiable and ORDER-INDEPENDENT (exact
+integer), so replace `tensor_sum(isnan(x))` with ONE fused parallel NaN count on the borrowed f32/
+f64 storage (usize->f64 equals the old sum-of-mask exactly for numel <= 2^53). Non-contiguous /
+non-float fall back to the compose.
+
+MEASURED (FT default, torch 8t, min-of-7, ~16M f32, clean window add anchor 2.48-2.91x FASTER,
+`examples/stat_gapfind_h2h.rs`): **51ms -> ~8ms (~6x internal)**, flipping **1.9x SLOWER into
+3.3-3.5x FASTER** (FT 7.7-8.7ms vs torch 26.7-28.7ms). torch.nanmean is ~27ms — 50x its own
+nansum (0.5ms) — so the fused FT path beats it comfortably. All 5 nanmean lib tests (incl. grad
+scaled-by-1/count, all-NaN) + full `-p ft-api` suite green (2400 pass; only the 2 pre-existing
+unrelated cdist/pdist failures). nansum residual ~9-12x SLOWER (torch's nansum is at the 0.5ms
+bandwidth ceiling) remains open — needs a true single-pass fused reduction matching the tape's
+sum-output construction; lower priority now that nanmean (the heavier real-world op) is FASTER.
+
 ## 2026-06-29 - ★★WIN (landed): nansum 107.75x SLOWER -> ~9x SLOWER vs torch (54.3ms -> 5.5ms, ~10x internal); CORRECTS the prior "contention blocker" (was mostly a BENCH BUG)
 
 Agent `cc`. ★FIRST, a correction to the entry below: the prior turn's "shared-host contention
