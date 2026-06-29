@@ -4,6 +4,23 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): gaussian_nll_loss f32 2.17x SLOWER -> 2.05-2.19x FASTER vs torch (198ms -> 42ms, asymmetric-dtype f32 mirror)
+
+Agent `cc`. 4th loss flip. `tensor_gaussian_nll_loss` had a fused fast path gated on F64 (via the
+`gaussian_nll_forward_f64` kernel) but f32 fell through to a compose whose F64 `full()` consts
+upcast f32->f64 (returning F64 — a latent dtype bug; torch keeps f32). There is no f32 kernel, so I
+computed the same per-element formula `0.5·(log(var) + (target-input)²/var + c)` INLINE in f32
+(f32-native lnf), then reduce via tensor_mean/tensor_sum. Grad / broadcast / non-contiguous /
+non-float fall through.
+
+MEASURED (FT default, torch 8t, min-of-7, 16M f32, mean, full=false, clean anchor 2.7-2.8x FASTER;
+original measured by disabling the fast path = 198.254ms = 2.17x SLOWER): **198ms -> ~42ms (~4.7x
+internal)**, flipping **2.17x SLOWER into 2.05-2.19x FASTER** (FT 42ms vs torch 90ms) AND fixing the
+f32->f64 dtype bug. 3 gaussian_nll tests (basic, grad, fused_matches_op_graph_and_finite_diff) + full
+`-p ft-api` suite green (2400 pass; 2 pre-existing cdist/pdist failures). LOSS-FN vein: 4 flips now
+(bce_logits, poisson, bce_pw, gaussian_nll). multilabel_soft_margin + soft_margin already had f32+f64
+fused paths (don't re-probe).
+
 ## 2026-06-29 - ★★★WIN (landed): bce_with_logits_pos_weight 13.52x SLOWER -> 7.4-7.8x FASTER vs torch (830ms -> 8ms, fused f32-native pass)
 
 Agent `cc`. Same fused-loss + f32-native recipe (3rd loss flip). `tensor_bce_with_logits_pos_weight`
