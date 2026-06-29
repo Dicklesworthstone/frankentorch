@@ -4,6 +4,22 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-28 - ★★★WIN (landed): f32 special-function batch — erfinv/erfcx/bessel_j0/j1/airy_ai/k0/polygamma all 1.9-16x SLOWER -> 1.2-3.4x FASTER
+
+Agent `BlackThrush`. (Vindicating last turn's "PROBE don't assume" correction.) A special-function
+sweep (`crates/ft-api/examples/specfn_sweep_h2h.rs`) found the WHOLE batch SLOWER (all upcast f32->f64
+via apply_function): erfinv 16.3x, erfcx 9.5x, polygamma 8.6x, bessel_j1 5.5x, bessel_j0 5.0x,
+airy_ai 2.7x, modified_bessel_k0 1.9x SLOWER @16M f32. Wired `try_f32_unary_native` with each op's
+existing scalar fn (erfinv_approx/erfcx_approx/bessel_j0_scalar/bessel_j1_scalar/airy_ai_scalar/
+bessel_k0_scalar/`|x| polygamma_approx(n,x)`). BIT-IDENTICAL (same scalar in f64, narrowed). Tests
+GREEN: 18/0 + conformance 2/0.
+
+MEASURED (FT default, torch 8t, min-of-7): erfinv 216ms->7.7ms **2.01x**, polygamma 217ms->8.5ms
+**2.92x**, airy 223ms->39.6ms **2.13x**, k0 135ms->19.6ms **3.44x FASTER**; bessel_j0 1.51x, bessel_j1
+1.40x, erfcx 1.17x FASTER (erfcx_approx is heavy per-element so even parallel it only edges torch).
+7 ops, all flipped from LOSS to WIN. multigammaln (2.75x SLOWER) COMPOSES (no scalar fn) — left.
+The apply_function-upcast special-fn vein yielded 9 wins this+last turn (digamma/lgamma/+7).
+
 ## 2026-06-28 - ★★WIN (landed): f32 digamma 7.6x SLOWER -> 2.5x FASTER, lgamma/gammaln 5.0x SLOWER -> 2.4x FASTER
 
 Agent `BlackThrush`. (Corrects last turn's premature "vein is dead" call.) An elementwise-math sweep
