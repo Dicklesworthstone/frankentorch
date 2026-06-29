@@ -13086,3 +13086,30 @@ purely removing the f32 upcast + tape overhead). scatter conflicts run ALONG `di
 same-shape scatter can't parallelize over disjoint output rows without per-cell buckets
 (memory-heavy) / atomics / sort — torch uses those. dim>=1 scatter_add DOES parallelize here.
 The f32->f64 src upcast removal generalizes to scatter (plain). AGENT CoralDrift.
+
+## 2026-06-29 - WIN: scatter (plain overwrite) no-grad fast path — 131ms -> 63ms (~2.1x); was 24x SLOWER vs torch
+
+Agent `CoralDrift`. Plain scatter (the base op index_copy/index_fill compose through) had the
+same pathology as scatter_add: cloned index, UPCAST f32 src -> f64, ran the tape kernel. No-grad
+f32 FT 131ms vs torch 5.5ms = 24x SLOWER.
+
+scatter == scatter_reduce reduce="copy" (overwrite, last-write-wins). Added "copy" to
+`scatter_reduce_apply` (`out_chunk[local] = sv` — last source in ascending flat order wins,
+bit-identical to the tape kernel) and a no-grad fast path (f32/f64, gated on index shape ==
+input except `dim`): borrow src zero-copy (no upcast), read input into result, reduce-copy.
+Half / grad / non-matching-shape fall through.
+
+⚠️BUG CAUGHT BY THE BENCH: first attempt routed reduce="copy" through scatter_reduce_apply, but
+that helper had NO "copy" arm — it hit `_ => {}` (no-op), so the bench showed exact=0/8192
+(output == input, unscattered). The ORIG (gate off) showed exact=8192, isolating it as my bug,
+not an FT/torch semantic diff. Added the "copy" arm -> exact=8192. ALWAYS verify a fast path's
+VALUES vs torch, not just that it compiles/runs.
+
+Bench `examples/scatter_f32_h2h.rs` [4096x1024] nsrc=4096 dim=0 f32 (unique per-column
+permutation so each cell is written once), bit_exact=8192/8192, dtype=F32:
+- ORIG (tape kernel + f32->f64 upcast): FT ~131 ms (24x SLOWER vs torch).
+- AFTER (no-grad fast path):            FT ~63 ms => **~2.1x vs ORIG** (12x SLOWER vs torch).
+Tests: `cargo test -p ft-api --lib scatter` => 68 passed (scatter/scatter_add/scatter_reduce/
+masked/diagonal/slice). HONEST: 2.1x (dim=0 serial, same limit as scatter_add 0ad9d906) — the
+win is removing the f32 upcast + tape overhead. The "copy" arm only affects this path
+(scatter_reduce passes sum/prod/mean/amax/amin). AGENT CoralDrift.
