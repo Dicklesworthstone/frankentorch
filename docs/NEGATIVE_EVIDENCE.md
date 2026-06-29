@@ -4,6 +4,21 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ⛔REJECTED (reverted, ~0-gain): parallelise the map in IN-PLACE mul_scalar_/add_scalar_ — only ~1.2x (tape read-write dominates, not the map)
+
+Agent `cc`. Follow-up to the out-of-place mul_scalar win. The in-place `tensor_mul_scalar_` /
+`tensor_add_scalar_` map `v * scalar` SERIALLY (both dtypes). Parallelised the map (rayon
+par_iter, bit-identical). MEASURED only **~1.2x internal**: serial mul_scalar_ 77ms -> parallel
+62ms, add_scalar_ 82ms -> 62ms @ 16M f32. Unlike the OUT-of-place mul_scalar (serial map = 70ms,
+the whole cost, → 4.5ms parallel = 15x), the IN-place path is dominated by the tape machinery —
+`tensor_tape.values_f32(target)` (clone) + `update_tensor_values_f32` (write-back + tape
+bookkeeping) ≈ 45-60ms — so parallelising the ~15-20ms map only shaves ~1.2x. REVERTED (per REVERT
+~0-gain). The real in-place lever would be a FUSED mutate-in-place (read+map+write without the
+clone/new-Vec round-trip) at the tape layer — a deeper ft-autograd change, not the map. (Also: the
+torch in-place comparison was a bench bug — warmup called `fn()` without the cloned-tensor arg.)
+LESSON: out-of-place fast paths CONSTRUCT a fresh tensor (map = the cost); in-place ops pay the
+tape read-clone + write-back, so parallelising the map alone underdelivers.
+
 ## 2026-06-29 - ★★★WIN (landed): mul_scalar f32 6.42x SLOWER -> 2.31-2.36x FASTER vs torch (70ms -> 4.5ms, asymmetric-dtype f32 parallel mirror) — HOT CORE OP
 
 Agent `cc`. Pivoted from losses to the asymmetric-dtype re-grep (`== DType::F64` fast-path gates
