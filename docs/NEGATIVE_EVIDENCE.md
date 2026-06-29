@@ -4,6 +4,24 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): bce_with_logits_loss 5.42x SLOWER -> ~parity-to-1.9x FASTER vs torch (1157ms -> ~100ms, fused f32-native single pass)
+
+Agent `cc`. A loss gap-finder (`examples/loss_gapfind_h2h.rs`) found `tensor_bce_with_logits_loss`
+**5.42x SLOWER** (FT 1157ms vs torch 213ms @ 16M f32, mean) — an 11-elementwise-op + 2-full()-alloc
+compose (~13 full-size materialisations). Added a no-grad fused fast path: compute the stable
+per-element loss `max(x,0) - x·z + log(1+exp(-|x|))` in ONE parallel pass, then reduce via the
+existing tensor_mean/tensor_sum (reduction output identical). KEY: compute NATIVELY in f32 for f32
+input (f32 `expf`/`lnf`), NOT f64 — an initial f64 version only reached ~2.3-3.3x SLOWER because f64
+exp/ln is ~2x slower per element; f32-native also matches the f32 compose's per-op rounding. Grad /
+"none" / shape-mismatch / non-contiguous / non-float fall through.
+
+MEASURED (FT default, torch 8t, min-of-7, 16M f32): **1157ms -> ~90-142ms (~10x internal)**, flipping
+**5.42x SLOWER into ~1.0-1.9x FASTER** (anchor was contention-inflated ~5x, so absolute ratios are
+noisy, but the flip from a 5.4x loss to a win is robust — the 13-op compose + f64 exp/ln were the
+cost). All 8 bce_with_logits tests (known_value, extreme_logits_finite, matches_sigmoid_then_bce,
+backward, pos_weight) green; reduction reuses tensor_mean so the scalar output is unchanged. STILL
+OPEN from the sweep: poisson_nll_loss 2.61x SLOWER (14-op compose).
+
 ## 2026-06-29 - ⛔REJECTED (reverted, ~0-gain): bucketize/searchsorted f32 uniform-interpolation search; gap is I/O-bound not search-bound. (unique/quantile confirmed FT-FASTER)
 
 Agent `cc`. A selection/search gap-finder (`examples/sel_gapfind_h2h.rs`, anchor 3.0x FASTER, 16M
