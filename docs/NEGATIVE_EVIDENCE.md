@@ -13137,3 +13137,29 @@ the random side is already L3-resident. torch's ~5ms dim=0 scatter uses a differ
 for scatter/scatter_add) is the achievable ceiling for the rayon-bucket approach; closing to
 torch needs SIMD/tiling in ft-kernel-cpu (peer scope), not an ft-api rayon rewrite. AGENT
 CoralDrift.
+
+## 2026-06-29 - ★ WIN+FIX: masked_scatter f32 CRASH fixed + no-grad 146ms -> 32ms (~4.6x); was 34x SLOWER vs torch
+
+Agent `CoralDrift`. Two issues: (1) masked_scatter read the mask via F64-only `tensor_values`,
+so any f32 mask (FT requires mask dtype == input dtype, so f32 input => f32 mask) ERRORED with
+UnsupportedDType(F32) — f32 masked_scatter was BROKEN (both grad and no-grad). (2) It composed
+through a prefix-index leaf + reshape + gather + reshape + where (3+ tape ops + a 33MB prefix +
+two full output materializations) — 34x SLOWER than torch even where it worked.
+
+Fix 1 (both paths): read the 0/1 mask via `values_lossy_f64` (exact for 0/1) — fixes the crash.
+Fix 2 (no-grad fast path, f32/f64): masked_scatter copies the first n_true source values into the
+mask's True positions in row-major order. Do it DIRECTLY in ONE pass — read input into result,
+borrow source zero-copy, walk the mask copying source[count++] into each True slot. Bit-identical
+(same row-major source order). Grad / non-f32f64 fall through to the (now-f32-correct) compose.
+
+Bench `examples/masked_scatter_probe_h2h.rs` [4096x1024] ~50% mask f32, cc-local, oracle
+.venv-oracle (8t), bit_exact=8192/8192, dtype=F32:
+- f32 was: Err(UnsupportedDType(F32)) — crash.
+- ORIG compose (with the mask-read fix, so f32 runs): FT ~146-153 ms (34x SLOWER vs torch).
+- AFTER (no-grad direct single pass):                 FT ~32 ms => **~4.6x vs compose** (9x
+  SLOWER vs torch's ~3.6ms — the residual is the serial prefix-dependent copy + tape clone+
+  construct; the copy is inherently serial via the running True-count).
+Tests: `cargo test -p ft-api --lib masked_scatter` => 8 passed.
+
+Same family pattern (compose-through-autograd-with-materialization + F64-only read crash on
+f32), now also covering the mask-driven scatter. AGENT CoralDrift.
