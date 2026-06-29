@@ -4,6 +4,27 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): nextafter f32 9.97x SLOWER -> 2.10x FASTER vs torch (asymmetric-dtype gap: f32 fell through to a SERIAL upcast path)
+
+Agent `cc`. DIG into binary-composite ops. A gap-finder sweep (`examples/binop_gapfind_h2h.rs`)
+found `nextafter` 9.97x SLOWER (FT 142.4ms vs torch 14.3ms) — by far the biggest gap of the
+session — while hypot/copysign/xlogy/logaddexp/heaviside/float_power were all FT-FASTER. Root
+cause was the asymmetric-dtype anti-pattern: `tensor_nextafter` already had an equal-shape
+contiguous F64 parallel borrow-and-step fast path, but **F32 fell through** to the generic
+broadcast path — `tensor_broadcast_to` both, `tensor_values` (upcast f32->f64, two clones),
+downcast back to f32 (two more Vecs), then step SERIALLY. Added the mirror F32 fast path
+(equal-shape contiguous: borrow both via `contiguous_values_f32`, parallel-step with the SAME
+`f32::next_up`/`next_down` predicate the serial path uses, build f32). Broadcast / non-contiguous
+keep the serial path.
+
+MEASURED (FT default, torch 8t, min-of-7, ~16M f32, `examples/nextafter_h2h.rs`): **142.4ms ->
+5.5ms** internally, flipping **9.97x SLOWER into 2.10x FASTER** (FT 5.5ms vs torch 11.6ms).
+CORRECTNESS vs torch f32: dtype=F32, **bit_exact 4096/4096** incl. signed-zero / negative / equal
+/ x<y / x>y edges (torch uses libm `nextafterf`; Rust `f32::next_up/next_down` matches). All 6
+nextafter lib tests + full `-p ft-api` suite green (2400 pass; only the 2 pre-existing unrelated
+cdist/pdist_p_neq2_fused 1-ULP failures remain). ★LESSON (recurring): when an op has a fast path
+gated on ONE dtype (F64 here), the OTHER dtype silently rides the slow generic path — mirror it.
+
 ## 2026-06-29 - ★★★WIN (landed): softsign 1.39x SLOWER -> 7.10x FASTER vs torch (4-op compose -> fused f32 pass, BIT-EXACT)
 
 Agent `cc`. DIG into a DIFFERENT primitive class (activations). A 13-op gap-finder sweep
