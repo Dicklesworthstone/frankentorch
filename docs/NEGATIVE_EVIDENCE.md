@@ -4,6 +4,22 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-06-29 - ★★★WIN (landed): bce_with_logits_pos_weight 13.52x SLOWER -> 7.4-7.8x FASTER vs torch (830ms -> 8ms, fused f32-native pass)
+
+Agent `cc`. Same fused-loss + f32-native recipe (3rd loss flip). `tensor_bce_with_logits_pos_weight`
+(the pos_weight≠1 variant) was a 13-elementwise-op + 2-full()-alloc compose. Added a no-grad fused
+fast path: per-element `loss = (1-z)·x + (1+(pw-1)·z)·(max(-x,0) + log(1+exp(-|x|)))` in ONE
+parallel pass (f32-native expf/lnf for f32), then reduce via tensor_mean/tensor_sum. Grad / "none" /
+shape-mismatch / non-contiguous / non-float fall through.
+
+MEASURED (FT default, torch 8t, min-of-7, 16M f32, mean, pos_weight=2.5, clean window anchor
+2.6-2.8x FASTER; original measured by disabling the fast path = 829.862ms = 13.52x SLOWER): **830ms
+-> ~8ms (~104x internal)**, flipping **13.52x SLOWER into 7.4-7.8x FASTER** (FT 8ms vs torch 60-63ms).
+`bce_with_logits_pos_weight_matches_torch` + full `-p ft-api` suite green (2400 pass; only the 2
+pre-existing cdist/pdist failures). LOSS-FN vein now: bce_with_logits + poisson_nll + bce_pos_weight
+all flipped SLOWER->FASTER via the fused f32-native recipe. Remaining loss leads:
+multilabel_soft_margin_loss (self=4), gaussian_nll (partial fast path).
+
 ## 2026-06-29 - ★★★WIN (landed): poisson_nll_loss 2.61x SLOWER -> 3.45-5.05x FASTER vs torch (292ms -> 8ms, fused f32-native pass)
 
 Agent `cc`. Same fused-loss + f32-native recipe as bce_with_logits. `tensor_poisson_nll_loss` was a

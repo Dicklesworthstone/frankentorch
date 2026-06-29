@@ -20,7 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             match w {
                 0 => { let _ = s.tensor_add(x, t); }
                 1 => { let _ = s.tensor_bce_with_logits_loss(x, t, "mean"); }
-                _ => { let _ = s.tensor_poisson_nll_loss(x, t, true, false, 1e-8, "mean"); }
+                2 => { let _ = s.tensor_poisson_nll_loss(x, t, true, false, 1e-8, "mean"); }
+                _ => { let _ = s.tensor_bce_with_logits_pos_weight(x, t, 2.5, "mean"); }
             }
             let e = ti.elapsed().as_secs_f64() * 1e3;
             if e < best { best = e; }
@@ -46,6 +47,7 @@ def safe(name,fn):
 safe("add", lambda:inp+t01)
 safe("bce_logits", lambda:F.binary_cross_entropy_with_logits(inp,t01,reduction='mean'))
 safe("poisson", lambda:F.poisson_nll_loss(inp,tpos,log_input=True,full=False,eps=1e-8,reduction='mean'))
+safe("bce_pw", lambda:F.binary_cross_entropy_with_logits(inp,t01,pos_weight=torch.tensor(2.5),reduction='mean'))
 "#);
     let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
@@ -53,7 +55,7 @@ safe("poisson", lambda:F.poisson_nll_loss(inp,tpos,log_input=True,full=False,eps
     let g = |k: &str| out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
     let vrb = |ft: f64, pp: f64| if pp >= ft { format!("FT {:.2}x FASTER", pp / ft) } else { format!("FT {:.2}x SLOWER", ft / pp) };
     println!("loss_gapfind ~16M f32 (torch 8t / FT default), min-of-7:");
-    for (lbl, w, key) in [("add", 0u8, "add"), ("bce_logits", 1, "bce_logits"), ("poisson", 2, "poisson")] {
+    for (lbl, w, key) in [("add", 0u8, "add"), ("bce_logits", 1, "bce_logits"), ("poisson", 2, "poisson"), ("bce_pw", 3, "bce_pw")] {
         let ft = bench(w);
         println!("  {lbl:<11} FT {ft:8.3}  PT {:8.3}  => {}", g(key), vrb(ft, g(key)));
     }
