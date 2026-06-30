@@ -11854,28 +11854,33 @@ pub fn norm_tensor_contiguous_f64(
     let data = &input[offset..offset + numel];
 
     if p == f64::INFINITY {
-        // norm(inf) = max(|x|). f64::max silently drops NaN, but PyTorch's
-        // max reduction propagates it, so fold with explicit NaN checks.
-        Ok(data.iter().fold(0.0_f64, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
-                f64::NAN
-            } else {
-                acc.max(a)
-            }
-        }))
+        // norm(inf) = max(|x|). f64::max silently drops NaN, but PyTorch's max
+        // reduction propagates it, so combine with explicit NaN checks. Parallel
+        // reduce for large N: max is associative/commutative and 0.0 is its identity
+        // over non-negative |x|, so the result is BIT-IDENTICAL to the serial fold.
+        let combine = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.max(b) };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().map(|&x| x.abs()).reduce(|| 0.0_f64, combine))
+        } else {
+            Ok(data.iter().fold(0.0_f64, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == f64::NEG_INFINITY {
-        Ok(data.iter().fold(f64::INFINITY, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
-                f64::NAN
-            } else {
-                acc.min(a)
-            }
-        }))
+        let combine = |a: f64, b: f64| if a.is_nan() || b.is_nan() { f64::NAN } else { a.min(b) };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().map(|&x| x.abs()).reduce(|| f64::INFINITY, combine))
+        } else {
+            Ok(data.iter().fold(f64::INFINITY, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == 0.0 {
         // L0 "norm": count of non-zero elements
-        Ok(data.iter().filter(|&&x| x != 0.0).count() as f64)
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().filter(|&&x| x != 0.0).count() as f64)
+        } else {
+            Ok(data.iter().filter(|&&x| x != 0.0).count() as f64)
+        }
     } else if p == 1.0 {
         Ok(pairwise_sum_map_f64_maybe_par(data, |x| x.abs()))
     } else if p == 2.0 {
@@ -30096,27 +30101,32 @@ pub fn norm_tensor_contiguous_f32(
     }
     let data = &input[offset..offset + numel];
     if p == f32::INFINITY {
-        // norm(inf) = max(|x|). f32::max silently drops NaN, but PyTorch's
-        // max reduction propagates it, so fold with explicit NaN checks.
-        Ok(data.iter().fold(0.0f32, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
-                f32::NAN
-            } else {
-                acc.max(a)
-            }
-        }))
+        // norm(inf) = max(|x|). f32::max silently drops NaN, but PyTorch's max
+        // reduction propagates it, so combine with explicit NaN checks. Parallel
+        // reduce for large N: max is associative/commutative and 0.0 is its identity
+        // over non-negative |x|, so the result is BIT-IDENTICAL to the serial fold.
+        let combine = |a: f32, b: f32| if a.is_nan() || b.is_nan() { f32::NAN } else { a.max(b) };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().map(|&x| x.abs()).reduce(|| 0.0f32, combine))
+        } else {
+            Ok(data.iter().fold(0.0f32, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == f32::NEG_INFINITY {
-        Ok(data.iter().fold(f32::INFINITY, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
-                f32::NAN
-            } else {
-                acc.min(a)
-            }
-        }))
+        let combine = |a: f32, b: f32| if a.is_nan() || b.is_nan() { f32::NAN } else { a.min(b) };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().map(|&x| x.abs()).reduce(|| f32::INFINITY, combine))
+        } else {
+            Ok(data.iter().fold(f32::INFINITY, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == 0.0f32 {
-        Ok(data.iter().filter(|&&x| x != 0.0f32).count() as f32)
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().filter(|&&x| x != 0.0f32).count() as f32)
+        } else {
+            Ok(data.iter().filter(|&&x| x != 0.0f32).count() as f32)
+        }
     } else if p == 1.0f32 {
         Ok(pairwise_sum_map_f32_maybe_par(data, |x| x.abs()))
     } else if p == 2.0f32 {

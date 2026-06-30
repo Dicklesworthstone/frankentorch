@@ -13582,3 +13582,26 @@ SUM_PARALLEL_THRESHOLD, reuse the bit-identical _par tree. FOLLOW-UP: norm inf/-
 serial `data.iter().fold/filter` in BOTH dtypes (max/min/count are order-invariant → a parallel
 reduce is bit-exact; separate symmetric lever). gapfind4 (lerp/addcmul/addcdiv/hypot/xlogy 1.4-2.8x)
 found NO lever — all already fused single-pass (debug-vs-release SIMD residual). AGENT CoralDrift.
+
+## 2026-06-30 - ★ WIN: norm inf/-inf/p=0 f32+f64 (RELEASE-measured) — norminf 4.64x SLOWER -> 1.86x FASTER (9.3x)
+
+Agent `CoralDrift`. Follow-up to bd28a434. norm's p=inf/-inf/0 branches used a SERIAL
+`data.iter().fold(max/min)` / `filter().count()` over the FULL tensor in BOTH dtypes (the p=1/2/Lp
+asymmetric fix last commit didn't touch these). max/min/count are ORDER-INVARIANT, so a parallel
+`par_iter().reduce` with the SAME NaN-propagating combiner (`if a.is_nan()||b.is_nan() {NAN} else
+{a.max(b)}`, identity 0.0/INF) is BIT-EXACT. Gated on numel>=SUM_PARALLEL_THRESHOLD; small norms keep
+the serial fold verbatim.
+
+★RELEASE bench (per directive) `examples/norm_f32_h2h.rs` [16M] f32, cc-local --release, oracle
+.venv-oracle (8t), min-of-7:
+- norminf: ORIG 24.86ms (4.64x SLOWER) -> AFTER 2.67ms => **9.3x vs ORIG, 1.86x FASTER vs torch**.
+- norm0  : ORIG  4.05ms (2.56x SLOWER) -> AFTER 2.92ms => 1.4x vs ORIG, 1.88x SLOWER (residual:
+  scalar parallel count vs torch SIMD — bandwidth-bound; bit-exact).
+ftval bit-identical (norminf 5.0, norm0 16775534 — rel=0.0 vs torch, exact). ★The p=1/2/Lp fix from
+bd28a434 also confirmed FT-FASTER in RELEASE (norm1 1.06-1.35x, norm2 2.57-3.00x, norm3 2.60-2.75x —
+the prior debug ratios overstated the gap). Tests: norm (incl norm_inf_propagates_nan) + full
+ft-kernel-cpu lib => 564 passed, 0 failed.
+
+★LESSON: DEBUG benches overstate vs-torch ratios for bandwidth/compute ops (debug FT scalar vs
+release torch SIMD) — use --release for honest vs-torch numbers; the ORIG-vs-AFTER internal ratio is
+valid in either. Whole vector_norm f32 surface now FT-faster or bit-exact-gap-closed. AGENT CoralDrift.

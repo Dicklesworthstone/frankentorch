@@ -24,6 +24,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let (l1, v1) = bench(1.0);
     let (l2, v2) = bench(2.0);
     let (l3, v3) = bench(3.0);
+    let (linf, vinf) = bench(f64::INFINITY);
+    let (l0, v0) = bench(0.0);
     let py = format!(r#"
 import time,torch
 torch.set_num_threads(8)
@@ -36,6 +38,9 @@ def tm(fn,reps=7):
     return min(ts)
 for p in (1.0,2.0,3.0):
     print("PT norm%d %.4f %.6f"%(int(p),tm(lambda:torch.linalg.vector_norm(x,p)),float(torch.linalg.vector_norm(x,p))))
+import math
+print("PT norminf %.4f %.6f"%(tm(lambda:torch.linalg.vector_norm(x,math.inf)),float(torch.linalg.vector_norm(x,math.inf))))
+print("PT norm0 %.4f %.6f"%(tm(lambda:torch.linalg.vector_norm(x,0.0)),float(torch.linalg.vector_norm(x,0.0))))
 "#);
     let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
@@ -46,7 +51,7 @@ for p in (1.0,2.0,3.0):
             if it.next()? == tag { Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?)) } else { None }
         }).unwrap_or((f64::NAN, f64::NAN))
     };
-    for (tag, ft, fv) in [("norm1", l1, v1), ("norm2", l2, v2), ("norm3", l3, v3)] {
+    for (tag, ft, fv) in [("norm1", l1, v1), ("norm2", l2, v2), ("norm3", l3, v3), ("norminf", linf, vinf), ("norm0", l0, v0)] {
         let (pt, pv) = get(tag);
         let vrb = if pt >= ft { format!("FT {:.2}x FASTER", pt / ft) } else { format!("FT {:.2}x SLOWER", ft / pt) };
         let rel = ((fv - pv) / pv.abs().max(1e-30)).abs();
