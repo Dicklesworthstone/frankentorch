@@ -13430,3 +13430,30 @@ later via combinatorial-number-system unranking). Grad / non-contiguous fall thr
 F64-gated/apply_function-gather family as unfold (107x), repeat_interleave (100x), pad (crash fix).
 f32_crash_probe.rs swept take_along_dim/flip/roll/tensordot/cartesian_prod/block_diag/trace/diag —
 all f32-clean (no more crashes in that batch). AGENT CoralDrift.
+
+## 2026-06-30 - ★★ WIN: cross f32 — 435ms -> 2.9ms (~150x); flips 293x SLOWER -> 2.8x SLOWER vs torch
+
+Agent `CoralDrift`. Asymmetric-dtype: `tensor_cross` had a no-grad per-row parallel fast path
+(borrow both contiguous 3-vectors, compute a_i*b_j - a_j*b_i in one pass) GATED ON DType::F64. f32
+fell through to `cross_along_dim` — the composed narrow/mul/sub/cat multi-pass path (the comment
+already noted "17x SLOWER"; measured 293x at [1M,3]).
+
+Fix in two parts: (1) mirror the f64 fast path for f32 (borrow contiguous_values_f32, native f32
+mul-then-sub = bit-identical to the composed f32 path). (2) the f64 path used par_chunks_mut(3) —
+ONE rayon task per 3-vector = ~1M tiny tasks, scheduling-bound (f32 mirror first measured 6.18x
+SLOWER from this alone). Batch ROWS_PER_TASK=8192 rows per task with an inner row loop: 7.6 -> 2.9ms.
+
+Bench `examples/cross_f32_mirror_h2h.rs` [1M x 3] f32, cc-local, oracle .venv-oracle (8t), min-of-5,
+pgrep-clean:
+- ORIG (composed narrow/mul/sub/cat f32 path): FT 435 ms (293x SLOWER).
+- AFTER (f32 per-row fast path, coarse-grain):  FT ~2.9 ms => **~150x vs ORIG, ~2.8x SLOWER vs
+  torch's ~1.1ms**. Residual is torch's SIMD-vectorized cross (1.1ms = 33GB/s pure bandwidth) vs
+  FT's scalar-rayon mul/sub (~12GB/s) — structural, not a fast-path gap.
+exact=75/8192 vs torch on BOTH ORIG and AFTER (pre-existing FMA/rounding parity gap in FT cross —
+NOT introduced here; my fast path is bit-identical to the composed path's f32 arithmetic).
+Tests: `cargo test -p ft-api --lib cross` => 28 passed (cross_known_values / cross_batched_matches_
+torch / standard_basis / anti_commutativity / diff_golden all green).
+
+Found via `examples/gapfind_batch_h2h.rs` sweep — also surfaced count_nonzero 208x SLOWER + cumprod
+115x SLOWER (next targets); meshgrid 10007x is torch returning lazy views (not a fair target).
+Same DType::F64-gated fast-path family as unfold/repeat_interleave/pad/combinations. AGENT CoralDrift.
