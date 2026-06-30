@@ -13554,3 +13554,31 @@ Tests: dot precision (pairwise_at_large_n) + full ft-kernel-cpu lib => 564 passe
 Residual ~25x is debug-vs-release + BLAS sdot (FMA SIMD) vs FT's bit-exact scalar pairwise tree
 (in release ~5-10x, the bit-exact-pairwise floor). The fused helpers are reusable for any future
 dot-shaped reduction. AGENT CoralDrift.
+
+## 2026-06-30 - ★★ WIN: norm (vector_norm) f32 — 158-273ms -> 7-13ms (~22x); flips 27-84x SLOWER -> 1.2-4.6x vs torch
+
+Agent `CoralDrift`. Asymmetric-dtype + serial-reduction: `norm_tensor_contiguous_f64` reduces the
+FULL tensor via `pairwise_sum_map_f64_maybe_par` (PARALLEL via rayon::join for n>=524288), but
+`norm_tensor_contiguous_f32` used the SERIAL `pairwise_sum_map_f32` — so f32 full-tensor vector norm
+(torch.linalg.vector_norm / torch.norm, p=1/2/Lp) ran a serial 16M reduce while f64 was parallel.
+
+Fix: added `pairwise_sum_map_f32_par` + `_maybe_par` (exact mirror of the f64 versions — same
+mid=len/2 tree via rayon::join down to PAR_BLOCK=1<<14, BIT-FOR-BIT identical to the serial map sum)
+and switched norm_f32's p=1/2/Lp branches to `_maybe_par`. The f32 norm VALUE is unchanged (the
+parallel tree preserves the exact f32 result — verified ftval identical before/after).
+
+Bench `examples/norm_f32_h2h.rs` [16M] f32 (input OUTSIDE timer), cc-local, oracle .venv-oracle (8t),
+min-of-7:
+- ORIG (serial): norm1 157.8ms (84.5x SLOWER), norm2 159.1ms (41.5x), norm3 273.0ms (27.0x).
+- AFTER (parallel): norm1 7.15ms (4.62x), norm2 6.75ms (1.94x), norm3 12.6ms (1.19x) => **~22x vs
+  ORIG**, near-parity for p=2/3.
+ftval bit-identical to ORIG (e.g. norm2 11793.00293 unchanged); the ~5e-4 rel-diff vs torch is
+PRE-EXISTING (FT accumulates the f32 norm in f32; torch differs) — NOT changed here. Tests:
+`cargo test -p ft-kernel-cpu --lib norm` (incl norm_tensor_contiguous_l2_pairwise_correctness_at_
+large_n) + full ft-kernel-cpu lib => 564 passed, 0 failed.
+
+Same serial-reduce recipe as the dot win (d9dd16b1/fe954a6c): full reduction → gate parallel at
+SUM_PARALLEL_THRESHOLD, reuse the bit-identical _par tree. FOLLOW-UP: norm inf/-inf/p=0 still use a
+serial `data.iter().fold/filter` in BOTH dtypes (max/min/count are order-invariant → a parallel
+reduce is bit-exact; separate symmetric lever). gapfind4 (lerp/addcmul/addcdiv/hypot/xlogy 1.4-2.8x)
+found NO lever — all already fused single-pass (debug-vs-release SIMD residual). AGENT CoralDrift.

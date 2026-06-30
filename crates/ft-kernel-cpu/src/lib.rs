@@ -28782,6 +28782,38 @@ where
     pairwise_sum_map_f32(&values[..mid], f) + pairwise_sum_map_f32(&values[mid..], f)
 }
 
+/// Parallel `pairwise_sum_map_f32` (mirror of `pairwise_sum_map_f64_par`): same
+/// midpoint tree via `rayon::join` down to PAR_BLOCK, so BIT-FOR-BIT identical to
+/// the serial map sum while spreading large FULL reductions across the pool.
+fn pairwise_sum_map_f32_par<F>(values: &[f32], f: F) -> f32
+where
+    F: Fn(f32) -> f32 + Copy + Sync,
+{
+    const PAR_BLOCK: usize = 1 << 14;
+    if values.len() <= PAR_BLOCK {
+        return pairwise_sum_map_f32(values, f);
+    }
+    let mid = values.len() / 2;
+    let (left, right) = values.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_sum_map_f32_par(left, f),
+        || pairwise_sum_map_f32_par(right, f),
+    );
+    ls + rs
+}
+
+#[inline]
+fn pairwise_sum_map_f32_maybe_par<F>(values: &[f32], f: F) -> f32
+where
+    F: Fn(f32) -> f32 + Copy + Sync,
+{
+    if values.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_sum_map_f32_par(values, f)
+    } else {
+        pairwise_sum_map_f32(values, f)
+    }
+}
+
 pub fn sum_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f32, KernelError> {
     ensure_unary_layout_and_storage_f32(input, meta)?;
     let numel = meta.numel();
@@ -30086,12 +30118,12 @@ pub fn norm_tensor_contiguous_f32(
     } else if p == 0.0f32 {
         Ok(data.iter().filter(|&&x| x != 0.0f32).count() as f32)
     } else if p == 1.0f32 {
-        Ok(pairwise_sum_map_f32(data, |x| x.abs()))
+        Ok(pairwise_sum_map_f32_maybe_par(data, |x| x.abs()))
     } else if p == 2.0f32 {
-        let sum_sq = pairwise_sum_map_f32(data, |x| x * x);
+        let sum_sq = pairwise_sum_map_f32_maybe_par(data, |x| x * x);
         Ok(sum_sq.sqrt())
     } else {
-        let sum_pow = pairwise_sum_map_f32(data, |x| x.abs().powf(p));
+        let sum_pow = pairwise_sum_map_f32_maybe_par(data, |x| x.abs().powf(p));
         Ok(sum_pow.powf(1.0f32 / p))
     }
 }
