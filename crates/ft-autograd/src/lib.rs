@@ -19363,57 +19363,61 @@ impl TensorTape {
         let dim_size = shape[dim];
         let dim_size_i = isize::try_from(dim_size)
             .map_err(|_| Self::shape_overflow_error("roll dimension size exceeds isize range"))?;
+        // dim_size > 0 is guaranteed here: `numel == 0` already returned above, and `numel` is a
+        // product that includes `shape[dim] = dim_size`, so `numel > 0` implies `dim_size > 0`.
+        let shift_mod = Self::normalized_roll_shift(
+            shift,
+            dim_size_i,
+            "roll shift normalization overflow",
+        )?;
+        // Output-driven parallel gather: dst_coord[dim] = (src + shift) mod n,
+        // so src_coord[dim] = (dst + n - shift) mod n. Each output written once
+        // → bit-for-bit identical to the serial scatter. frankentorch-permpar.
+        const PAR_MIN: usize = 1 << 16;
+        if numel >= PAR_MIN {
+            use rayon::prelude::*;
+            let inv_shift = (dim_size - shift_mod) % dim_size;
+            let result = (0..numel)
+                .into_par_iter()
+                .map(|flat_out| {
+                    let mut rem = flat_out;
+                    let mut src_flat = 0usize;
+                    for (d, &stride) in strides.iter().enumerate() {
+                        let oc = rem / stride;
+                        rem %= stride;
+                        let sc = if d == dim {
+                            Self::add_normalized_roll_shift(oc, inv_shift, dim_size)
+                        } else {
+                            oc
+                        };
+                        src_flat += sc * stride;
+                    }
+                    values[src_flat].clone()
+                })
+                .collect();
+            return Ok(result);
+        }
+        // Serial scatter for SMALL rolls only: allocate the destination HERE. The parallel path
+        // above builds + returns its OWN buffer, so a top-level `vec![values[0]; numel]` was DEAD
+        // WEIGHT for every large roll — a wasted serial first-touch of the whole output (~30ms at
+        // 64MB) that was immediately shadowed. (Large rolls reach roll_slice via tensor_roll's grad
+        // / non-f32-f64 fallback; the no-grad float roll has its own parallel fast path in ft-api.)
         let mut result = vec![values[0].clone(); numel];
-
-        if dim_size > 0 {
-            let shift_mod = Self::normalized_roll_shift(
-                shift,
-                dim_size_i,
-                "roll shift normalization overflow",
-            )?;
-            // Output-driven parallel gather: dst_coord[dim] = (src + shift) mod n,
-            // so src_coord[dim] = (dst + n - shift) mod n. Each output written once
-            // → bit-for-bit identical to the serial scatter. frankentorch-permpar.
-            const PAR_MIN: usize = 1 << 16;
-            if numel >= PAR_MIN {
-                use rayon::prelude::*;
-                let inv_shift = (dim_size - shift_mod) % dim_size;
-                let result = (0..numel)
-                    .into_par_iter()
-                    .map(|flat_out| {
-                        let mut rem = flat_out;
-                        let mut src_flat = 0usize;
-                        for (d, &stride) in strides.iter().enumerate() {
-                            let oc = rem / stride;
-                            rem %= stride;
-                            let sc = if d == dim {
-                                Self::add_normalized_roll_shift(oc, inv_shift, dim_size)
-                            } else {
-                                oc
-                            };
-                            src_flat += sc * stride;
-                        }
-                        values[src_flat].clone()
-                    })
-                    .collect();
-                return Ok(result);
+        for (flat, value) in values.iter().enumerate().take(numel) {
+            let mut remaining = flat;
+            let mut coords = vec![0usize; ndim];
+            for d in 0..ndim {
+                coords[d] = remaining / strides[d];
+                remaining %= strides[d];
             }
-            for (flat, value) in values.iter().enumerate().take(numel) {
-                let mut remaining = flat;
-                let mut coords = vec![0usize; ndim];
-                for d in 0..ndim {
-                    coords[d] = remaining / strides[d];
-                    remaining %= strides[d];
-                }
 
-                coords[dim] = Self::add_normalized_roll_shift(coords[dim], shift_mod, dim_size);
+            coords[dim] = Self::add_normalized_roll_shift(coords[dim], shift_mod, dim_size);
 
-                let mut dst_flat = 0;
-                for d in 0..ndim {
-                    dst_flat += coords[d] * strides[d];
-                }
-                result[dst_flat] = value.clone();
+            let mut dst_flat = 0;
+            for d in 0..ndim {
+                dst_flat += coords[d] * strides[d];
             }
+            result[dst_flat] = value.clone();
         }
         Ok(result)
     }

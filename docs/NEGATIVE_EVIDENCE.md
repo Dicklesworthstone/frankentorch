@@ -13838,3 +13838,24 @@ cache-blocked transpose itself, 64MB strided). Correct bit-exact (positional che
 path (transpose/.mT/conv-layout/attention-reshape/movedim) — hot ops. ★This is the same serial-first-
 touch anti-pattern as kron (bfaba050) — the par_zeroed lesson generalized to a `vec![clone; n]`
 overwritten by a parallel pass. vs-torch stays a view-floor (materialization vs lazy stride-view). AGENT SlateTern.
+
+## 2026-07-01 - ★ WIN: roll_slice dead serial-fill removed — grad roll 47ms -> 6ms (~7-8x)
+
+Agent `SlateTern`. The grep-for-`vec![...; numel]`-then-parallel-overwrite sweep (permute lesson) found
+`TensorTape::roll_slice` allocated `let mut result = vec![values[0].clone(); numel]` at the TOP, but
+its parallel path (numel >= 1<<16) builds a FRESH `result` via `(0..numel).into_par_iter().map(gather)
+.collect()` and RETURNS that — so the top-level alloc was DEAD WEIGHT for every large roll: a wasted
+serial first-touch of the whole output (~40ms at 64MB under load), allocated then immediately shadowed.
+Only the small-roll serial scatter (numel < 1<<16) actually uses it. (roll_slice is reached via
+tensor_roll's grad / non-f32-f64 fallback; the no-grad float roll has its own ft-api parallel fast path.
+`flip_slice` was checked and is fine — its alloc is already inside the serial branch.)
+
+★FIX = move the `vec![values[0].clone(); numel]` alloc INTO the serial branch (where it's used and
+small); the parallel branch never touches it. Bit-IDENTICAL (parallel + serial logic unchanged). Also
+dropped the always-true `if dim_size > 0` guard (numel==0 returns early; numel includes dim_size).
+
+★MEASURE (grad roll [16M]=64MB f32 forward, inputs OUTSIDE timer, min-of-7, load ~32; ORIG measured by
+file-swap to HEAD, same session): **47ms -> ~6ms = ~7-8x**, correct bit-exact. Tests: ft-autograd 476 +
+ft-api 2403 + ft-conformance 276 all 0 failed. ★LESSON (refines the permute one): a `vec![x; numel]`
+before a branch where the PARALLEL arm builds+returns its own buffer is not just a slow fill — it's DEAD
+work; move the alloc into the arm that uses it. AGENT SlateTern.
