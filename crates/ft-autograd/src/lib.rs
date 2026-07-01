@@ -9552,7 +9552,7 @@ impl TensorTape {
         input: TensorNodeId,
         new_shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, original_shape, dtype, device) = {
+        let (requires_grad, tensor, original_shape) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let input_numel = meta.numel();
@@ -9566,21 +9566,14 @@ impl TensorTape {
                     },
                 )));
             }
-            let storage = Self::compact_typed_storage(&input_node.tensor)?;
-            let dtype = storage.dtype();
-            (
-                input_node.requires_grad,
-                storage,
-                meta.shape().to_vec(),
-                dtype,
-                meta.device(),
-            )
+            let original_shape = meta.shape().to_vec();
+            let tensor = Self::view_reshaped_sharing_storage(&input_node.tensor, new_shape)?;
+            (input_node.requires_grad, tensor, original_shape)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Reshape {
                 input,
@@ -9595,7 +9588,7 @@ impl TensorTape {
         input: TensorNodeId,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, new_shape, dtype, device) = {
+        let (requires_grad, tensor) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let shape = meta.shape();
@@ -9614,21 +9607,13 @@ impl TensorTape {
                     new_shape.push(1);
                 }
             }
-            let storage = Self::compact_typed_storage(&input_node.tensor)?;
-            let dtype = storage.dtype();
-            (
-                input_node.requires_grad,
-                storage,
-                new_shape,
-                dtype,
-                meta.device(),
-            )
+            let tensor = Self::view_reshaped_sharing_storage(&input_node.tensor, new_shape)?;
+            (input_node.requires_grad, tensor)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Squeeze { input, dim },
         });
@@ -9640,7 +9625,7 @@ impl TensorTape {
         input: TensorNodeId,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, new_shape, dtype, device) = {
+        let (requires_grad, tensor) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let shape = meta.shape();
@@ -9654,21 +9639,13 @@ impl TensorTape {
             }
             let mut new_shape = shape.to_vec();
             new_shape.insert(dim, 1);
-            let storage = Self::compact_typed_storage(&input_node.tensor)?;
-            let dtype = storage.dtype();
-            (
-                input_node.requires_grad,
-                storage,
-                new_shape,
-                dtype,
-                meta.device(),
-            )
+            let tensor = Self::view_reshaped_sharing_storage(&input_node.tensor, new_shape)?;
+            (input_node.requires_grad, tensor)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Unsqueeze { input, dim },
         });
@@ -19751,6 +19728,31 @@ impl TensorTape {
     /// through `Arc::make_mut` (copy-on-write): a later write to either the input
     /// or the reshaped view clones then, so the storages never alias destructively.
     /// This matches torch, where these ops return a view over the same storage.
+    /// Build a reshaped/squeezed/unsqueezed tensor that SHARES the input's storage Arc and
+    /// PRESERVES its `storage_offset`. These ops only add/remove size-1 dims or relayout a
+    /// contiguous buffer — a pure metadata change, no data movement — so compacting to a fresh
+    /// offset-0 buffer (the old `compact_typed_storage` path) needlessly copies whenever the input
+    /// is itself an offset-view (e.g. a dim-0 `narrow` result). Sharing keeps such views zero-copy
+    /// (the last copy in `unbind` = narrow + squeeze). Caller must preserve numel. Contiguous input
+    /// required. COW (`Arc::make_mut`) preserves value semantics on any later in-place write.
+    fn view_reshaped_sharing_storage(
+        tensor: &DenseTensor,
+        new_shape: Vec<usize>,
+    ) -> Result<DenseTensor, AutogradError> {
+        let meta = tensor.meta();
+        if !meta.is_contiguous() {
+            return Err(AutogradError::DenseTensor(
+                DenseTensorError::UnsupportedLayout,
+            ));
+        }
+        let new_meta = ft_core::TensorMeta::from_shape(new_shape, meta.dtype(), meta.device())
+            .with_storage_offset(meta.storage_offset());
+        Ok(DenseTensor::from_typed_storage(
+            new_meta,
+            tensor.typed_storage().clone(),
+        )?)
+    }
+
     fn slice_or_share_arc<T: Clone>(
         values: &Arc<Vec<T>>,
         start: usize,
@@ -28615,11 +28617,16 @@ mod tests {
         }
 
         let parts = tape.split(a, &[1, 1], 0).unwrap();
-        let storage = tape.node(parts[0]).unwrap().tensor.typed_storage();
+        let node = tape.node(parts[0]).unwrap();
+        let off = node.tensor.meta().storage_offset();
+        let numel = node.tensor.meta().numel();
+        let storage = node.tensor.typed_storage();
         assert!(matches!(storage, TensorStorage::Complex64(_)));
         if let TensorStorage::Complex64(values) = storage {
+            // split now returns an O(1) offset-view sharing the source storage, so the raw
+            // buffer spans the whole input; assert the LOGICAL slice [offset, offset+numel).
             assert_eq!(
-                values.as_slice(),
+                &values.as_slice()[off..off + numel],
                 &[Complex64::new(1.0, -1.0), Complex64::new(2.0, -2.0)]
             );
         }

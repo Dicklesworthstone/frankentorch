@@ -13790,3 +13790,28 @@ the identical proven offset-view + local split/chunk/narrow/unbind tests green).
 tape's view ops copied where an Arc-share (offset 0 for reshape/clone, offset>0 for narrow/split) +
 the existing make_mut COW gives identical value semantics at O(1). NEXT: select (small, low value),
 movedim/permute (materializes a transpose — needs stride-view support, bigger). AGENT SlateTern.
+
+## 2026-07-01 - ★ WIN: squeeze/unsqueeze/reshape preserve offset (zero-copy) — unbind flips to 1.65x FASTER
+
+Agent `SlateTern`. Follow-up to the narrow/split offset-view (4ac5aeff): `unbind` = `narrow` (now O(1)
+offset-view) + `squeeze`, but squeeze/unsqueeze/reshape went through `compact_typed_storage` which
+COPIED whenever the input was an offset-view (offset>0) — so unbind still copied every slice (64MB).
+These ops are PURE METADATA (add/remove size-1 dims / relayout contiguous) and never move data, so they
+should SHARE the storage Arc and PRESERVE the offset. Added `view_reshaped_sharing_storage(tensor,
+new_shape)` (share Arc + `with_storage_offset(meta.storage_offset())`, contiguous-gated) and wired it
+into squeeze/unsqueeze/reshape. COW (make_mut) preserves value semantics.
+
+★MEASURE (unbind_probe_h2h [1024,16384]=64MB, inputs OUTSIDE timer, min-of-7): unbind (was narrow +
+squeeze copy of 64MB ~30-48ms, cf. narrow/chunk before) -> **0.2422ms vs torch 0.401ms = 1.65x
+FASTER** (torch unbind builds 1024 view objects; FT now builds 1024 offset-view tape nodes faster),
+correct row-500 bit-exact. Tests: ft-autograd 476 + ft-api 2403 + ft-conformance 276, all 0 failed.
+
+⚠️FIXED a latent test from 4ac5aeff: `complex_permutation_shape_ops_preserve_imaginary_values`
+inspected RAW storage (`typed_storage().as_slice()`) and asserted split produced a COMPACTED 2-elem
+buffer — but offset-views legitimately share the full storage (len > numel), so the raw buffer now
+spans the whole input. The LOGICAL values (`[offset..offset+numel]`) are correct (ft-api 2403 +
+conformance 276 confirm); updated the assertion to check the logical slice. ★LESSON: offset-views
+break the implicit "storage.len() == numel" (compact-storage) invariant — tests that read RAW storage
+(not via offset-honoring accessors) must assert the logical `[offset, offset+numel)` slice. All
+float/complex/quantized readers (dispatch_values / contiguous_values_f32) honor storage_offset, so
+LOGICAL correctness holds. AGENT SlateTern.
