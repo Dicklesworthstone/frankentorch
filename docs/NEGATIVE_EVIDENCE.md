@@ -13815,3 +13815,26 @@ break the implicit "storage.len() == numel" (compact-storage) invariant — test
 (not via offset-honoring accessors) must assert the logical `[offset, offset+numel)` slice. All
 float/complex/quantized readers (dispatch_values / contiguous_values_f32) honor storage_offset, so
 LOGICAL correctness holds. AGENT SlateTern.
+
+## 2026-07-01 - ★ WIN: permute/movedim/transpose rotation-path parallel first-touch — 38ms -> 7-8ms (~5x)
+
+Agent `SlateTern`. movedim/permute/transpose can't be VIEWS in FT's contiguous model (torch's are
+stride-views — that's the ~34000x floor, needs stride-view support = big architectural change). But the
+MATERIALIZATION was pathologically slow: `permute_slice`'s cache-blocked "block-rotation" fast path
+(which serves the 2-D transpose [1,0], batched matrix .mT, NCHW<->NHWC conv permutes, MHA
+[B,S,H,D]<->[B,H,S,D], AND movedim) allocated its destination via `let mut dst = vec![src[0].clone();
+numel]` — a SERIAL first-touch of the whole output (~30ms at 64MB, ~1.7GB/s) BEFORE the parallel
+transpose overwrites every element. The serial fill dominated (movedim(0,2) [512,512,64] = 38ms).
+
+★FIX = parallel first-touch (gated numel >= 1<<16): `(0..numel).into_par_iter().map(|_|
+src[0].clone()).collect()` distributes the page faults across the pool. Bit-IDENTICAL (the transpose
+writes every element, so the fill value is irrelevant). The generic (non-rotation) permute path already
+parallel-collects via `gather` — no change needed there.
+
+★MEASURE (movedim_probe_h2h [512,512,64] f32, inputs OUTSIDE timer, min-of-7, load ~12): 38ms ->
+**7.2-8.6ms = ~5x** (the eliminated serial fill was contention-inflated; residual ~7ms = the parallel
+cache-blocked transpose itself, 64MB strided). Correct bit-exact (positional check). Tests: ft-autograd
+476 + ft-api 2403 + ft-conformance 276 all 0 failed. Serves EVERY large permute hitting the rotation
+path (transpose/.mT/conv-layout/attention-reshape/movedim) — hot ops. ★This is the same serial-first-
+touch anti-pattern as kron (bfaba050) — the par_zeroed lesson generalized to a `vec![clone; n]`
+overwritten by a parallel pass. vs-torch stays a view-floor (materialization vs lazy stride-view). AGENT SlateTern.

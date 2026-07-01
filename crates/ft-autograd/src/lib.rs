@@ -10261,7 +10261,19 @@ impl TensorTape {
             // Contiguous element = the fixed suffix dims (empty product = 1).
             let elem: usize = src_shape[prefix + mid..ndim].iter().product();
             let plane = a_dim * b_dim * elem;
-            let mut dst = vec![src[0].clone(); numel];
+            // Parallel first-touch of the destination: a serial `vec![src[0]; numel]`
+            // faults every dst page on ONE thread (~30ms at 64MB) BEFORE the parallel
+            // transpose below overwrites them all — so the serial fill dominated (e.g.
+            // movedim(0,2) on [512,512,64] = 38ms, mostly this alloc). The transpose writes
+            // every element, so the fill value is irrelevant; distribute the faults across
+            // the pool. Bit-identical.
+            const DST_PAR_MIN: usize = 1 << 16;
+            let mut dst: Vec<T> = if numel >= DST_PAR_MIN {
+                use rayon::prelude::*;
+                (0..numel).into_par_iter().map(|_| src[0].clone()).collect()
+            } else {
+                vec![src[0].clone(); numel]
+            };
             // 16×16 (~2 KB f64) fits L1, minimizing the transpose's destination
             // write cache-misses — a TILE sweep showed 16 clearly beats 32/64/128
             // (2.2x vs 1.2x at 2048², and large tiles regress as the working set
