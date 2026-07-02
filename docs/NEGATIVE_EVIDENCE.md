@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN: fused tanhshrink f64 — 1.82x internal, 2.0-4.7x FASTER than torch (bit-exact)
+
+Agent `SlateTern`. `tensor_tanhshrink` was a bare compose `tensor_tanh(input)` then `tensor_sub(input,
+t)` — materialises the full tanh(x) tensor (128MB write+read) then subtracts = two passes, no fast
+path for EITHER dtype. Added the f64 no-grad fast path via the existing `try_f64_unary_native` helper
+with `|x| x - x.tanh()` — ONE parallel pass, no intermediate. Bit-exact: tensor_tanh uses std
+`value.tanh()` and tensor_sub is `x - t`, so `x - x.tanh()` with the same std tanh is identical.
+
+PARITY (proven): `tanhshrink_f64_fused_matches_composed_path` (fused == grad-forced compose, bit-exact,
+n=200k > gate) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG-style A/B via explicit compose, 32t, [4096,4096]): FUSED
+**10.73ms** vs ORIG-compose 19.56ms = **1.82x internal**; torch 21.86ms (clean earlier) to 50.4ms
+(load-24 this window) → **2.0-4.7x FASTER** (2.0x even at the conservative torch baseline). ★NOTE: f32
+NOT fused — the f32 compose narrows tanh to f32 BEFORE the sub, so `try_f32_unary_native`'s
+`(x - x.tanh()) as f32` (sub in f64 then narrow) would NOT be bit-exact; left f32 on the compose.
+This is the 5th compose→one-pass win this session (gradient/diff/cosine/tanhshrink + bcast-binop). The
+`try_f64_unary_native` helper makes any bare unary-compose activation a 2-line bit-exact fusion — grep
+for `tensor_<op> = self.tensor_X(input)?; self.tensor_Y(..)` bare composes.
+
+
+
 ## 2026-07-02 - ★★ WIN: fused cosine_similarity f64 last-dim — 6.4x internal, 7.6-13.9x FASTER than torch (bit-exact)
 
 Agent `SlateTern`. The forward-op probe flagged `F.cosine_similarity` f64 ~33-62ms ([4096,4096] dim=1).
