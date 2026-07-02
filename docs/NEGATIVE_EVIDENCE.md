@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: try_f64_unary_native helper — asinh/atanh f64 fused — 13x/20x internal, both flip to FT-FASTER
+
+Agent `SlateTern`. ★NEW SHARED-HELPER VEIN: many transcendental unary ops added a `try_f32_unary_native`
+fast path (f32) but left F64 riding a MULTI-OP autograd compose — a REVERSE asymmetric-dtype gap (f32
+fast, f64 slow). Added `try_f64_unary_native` (mirror of the f32 helper: `f(x)` in ONE f64 pass, no
+narrowing) and wired it into asinh (~6-pass compose) + atanh (~7-pass compose) with their EXISTING f32
+closures. Because that closure IS the compose's f64 formula op-for-op (the f32 fast path is
+conformance-verified bit-identical to the f32 compose = f64-compute-narrow), `f(x)` in f64 is BIT-EXACT
+to the f64 compose — just fused (lock test confirms).
+
+★MEASURE (16M f64 no-grad, min-of-7, load ~28): asinh FUSED **7.81ms vs FT_ORIG(compose) 102ms = ~13.1x
+internal**, 2.50x SLOWER -> **5.35x FASTER** vs torch; atanh FUSED **7.95ms vs 158ms = ~19.9x internal**,
+4.68x SLOWER -> **4.19x FASTER**. Both FLIP from SLOWER to FASTER. Lock test `asinh_atanh_f64_fused_match
+_compose` (fused == grad-forced compose, f64). ★RECIPE: grep for `try_f32_unary_native(` calls whose op
+still has a MULTI-op f64 compose fallthrough (NOT the ones whose f64 path is apply_function/a single
+kernel like acosh) -> add a parallel `try_f64_unary_native(input, <same closure>)`. FOLLOW-UPS: other
+`try_f32_unary_native` ops with heavy f64 composes (grep + check each has a compose, not a tape op).
+AGENT SlateTern.
+
 ## 2026-07-02 - ★★ WIN + DTYPE-PARITY-FIX: tensor_gelu_tanh f32 — returns F32 (was F64) + fused f32 path — compose 70.6ms -> 5.7ms (~12x)
 
 Agent `SlateTern`. Follow-up to 3cde1d96 (f64 gelu_tanh fusion). Two fixes in one: (1) PARITY: the
