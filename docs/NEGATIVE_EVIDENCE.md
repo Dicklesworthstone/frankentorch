@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×7, RNG class): parallel inverse-CDF for all per-element distributions — 3.6-4.7x FASTER vs torch, bit-exact
+
+Agent `SlateTern`. Extended the randn split-transform recipe to the whole per-element inverse-CDF
+distribution family. `tensor_{exponential,geometric,cauchy,gumbel,laplace,weibull,logistic}` each did
+`(0..numel).map(|_| { u=next_f64(); heavy_transform(u) })` — SERIAL, 1 draw per output, NO rejection
+loop (cleaner than randn). Added ONE shared RNG helper `next_uniform_transformed(len, f)`: SERIAL raw-u64
+draw (cheap xoshiro) + PARALLEL transform (the expensive ln/tan/powf/exp), and routed all 7 ops through
+it. Bit-for-bit identical (same draws/order, `u=(g>>11)/2^53`==next_f64, same f).
+
+Measured ([16.7M] f64, 64c; torch 2.12.1+cpu; examples/dist_time.rs; A/B via FT_SERIAL_UNIFORM gate):
+  - exponential (ln):  SERIAL 157.3 -> **PAR 91.3ms**; vs torch 328.6 = **3.60x FASTER**
+  - cauchy (tan):      SERIAL 349.6 -> **PAR 92.8ms**; vs torch 436.0 = **4.70x FASTER**
+  - weibull (powf):    SERIAL 407.7 -> **PAR 94.3ms** (4.32x internal; torch has no direct .weibull_)
+BIT-EXACT: PAR fingerprint == SERIAL for all (exp 0xccf5…, cauchy 0x9c4d…, weibull 0x41b0…). The heavier
+the transform, the bigger the flip (tan/powf >> ln); the ~91-94ms PAR floor is the serial raw-u64 draw
+(same as randn — the jump-polynomial would lift it). ★RNG per-element-transform vein now HARVESTED
+(randn + 7 dists). Remaining random ops: rand/dropout/bernoulli (CHEAP transform = RNG-draw-bound, need
+jump-polynomial), gamma/log_normal (rejection loop / uses next_normal — non-trivial). torch's random ops
+are all single-threaded, so any FT parallelization wins.
+
 ## 2026-07-02 - ★★ WIN (NEW class: RNG/random-tensor gen): parallel Box-Muller for randn — 3.01x FASTER vs torch, bit-exact
 
 Agent `SlateTern`. NEW class found by the "partially-harvested vein" method. FT's random ops
