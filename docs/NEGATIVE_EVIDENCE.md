@@ -4,6 +4,29 @@ This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
 
+## 2026-07-01 - ★WIN: fused where(mask_tile, a_full, b_full) — SELECT between two tensors w/ broadcast mask
+
+Agent `SlateTern`. Completes the follow-up flagged by the where-scalar/masked_fill tile wins
+(4af96c05/a5a0d90a): those fused `where(mask,x,-inf)` (one scalar branch); this fuses the TWO-full-tensor
+case `where(mask[1,1,S,S], a[B,H,S,S], b[B,H,S,S])` — select between two full score tensors with an
+attention-style broadcast mask. On HEAD it fell through to `broadcast_to(mask)` (materializes the
+65536->8.4M tile clone) + `tensor_tape.tensor_where` (clones a/b/cb + builds nodes even no-grad). New
+`try_where_cond_tile_two` (sibling of `try_where_one_scalar`): when both branches are the SAME full shape
+and `cond` broadcasts in as a TRAILING TILE (strip leading 1s, remainder an exact suffix — [1,1,S,S]/
+[S,S]/[1,S,S]; a MIDDLE-1 cond [B,1,S,S] falls through), select in ONE pass per tile (`out[k] =
+cond[k%cinner] != 0 ? a[k] : b[k]`, mask cache-resident, reused each tile), no expand. Bit-identical to
+the same-shape fast path (truthy == nonzero). f32/f64, contiguous, no-grad.
+
+★MEASURE (`examples/where_condtile_two_h2h.rs`, mask[1,1,256,256] into a/b[16,8,256,256]=8.4M f64
+no-grad, inputs OUTSIDE timer, min-of-9, torch 8-thread, load ~37 heavily contended): FT_FUSED
+**19.9ms vs torch 24.4ms = 1.23x FASTER**, parity **0/150 value-bit mismatches** (bit-exact). Both
+absolutes inflated by load 37 (torch normally ~12ms); ratio honest (same-process contention). This is
+a bandwidth op (2×67MB read + 67MB write = 200MB), so the flip is modest vs the scalar sibling's ~4.6x
+(1 full buffer). Lock test `where_cond_tile_two_full_matches_broadcast_path` (f32+f64, all tile shapes
++ MIDDLE-1 fallthrough == grad-forced broadcast reference). Tests: ft-api where lock suite green (3/3).
+The full attention-masking `where` family — `where(mask,x,scalar)` (4af96c05) and `where(mask,a,b)`
+(this) — now fuses the broadcast mask. AGENT SlateTern.
+
 ## 2026-06-29 - ★★WIN (landed, gap-closing): grid_sample f32 9.63x SLOWER -> 4.05-4.85x SLOWER vs torch (71.6ms -> 35ms, native-f32 gather)
 
 Agent `cc`. Landed lever (1) from the lead below. Made `grid_sample_f64` GENERIC over the input
