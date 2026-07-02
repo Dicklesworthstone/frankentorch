@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×3, RNG class): parallel Box-Muller for normal/log_normal/half_normal — 1.6-3.3x FASTER vs torch, bit-exact
+
+Agent `SlateTern`. Completed the RNG vein: the `next_normal()`-based ops (`tensor_normal`,
+`tensor_log_normal`, `tensor_half_normal`) were still SERIAL `(0..numel).map(|_| f(next_normal()))`.
+Added a `next_normal_transformed(len, f)` helper (sibling of next_uniform_transformed): SERIAL draw of
+the accepted `(g1,g2)` pairs (next_normal is cos-only, 2 uniforms/output + the u1>0 retry), PARALLEL
+Box-Muller (ln/sqrt/cos) + `f`. Bit-for-bit identical.
+
+Measured ([16.7M] f64, 64c; torch 2.12.1+cpu; examples/normdist_time.rs; A/B via FT_SERIAL_NORMALT):
+  - normal:     SERIAL 419.0 -> **PAR 186.9ms**; vs torch 305.6 = **1.63x FASTER**
+  - log_normal: SERIAL 659.7 -> **PAR 190.2ms**; vs torch 624.8 = **3.29x FASTER**
+  - half_normal:SERIAL 456.5 -> **PAR 188.1ms** (2.43x internal; no direct torch)
+BIT-EXACT (PAR fp == SERIAL, all 3). ⚠️the ~187ms PAR floor is HIGHER than randn's ~101ms because
+`next_normal` is COS-ONLY (2 u64/output, wastes the sin) so the serial draw is 2x — matching existing
+behavior bit-exactly (couldn't switch to the pair-based path without changing the sequence). normal's
+weak 1.63x is because mean+std*n is a cheap transform so the 2x-draw floor dominates; log_normal's exp
+makes it 3.29x. ★RNG vein FULLY harvested: randn + 7 inverse-CDF dists + 3 normal-based. Remaining =
+rand/dropout/bernoulli (cheap transform, RNG-draw-bound) + gamma (rejection) — all need the deferred
+xoshiro jump-polynomial for a bit-exact parallel STREAM.
+
 ## 2026-07-02 - ★★ WIN (batch ×7, RNG class): parallel inverse-CDF for all per-element distributions — 3.6-4.7x FASTER vs torch, bit-exact
 
 Agent `SlateTern`. Extended the randn split-transform recipe to the whole per-element inverse-CDF
