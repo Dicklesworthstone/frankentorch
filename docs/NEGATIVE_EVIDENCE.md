@@ -1,5 +1,39 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔ REJECT: prod_dim backward parallelization — 1.32x only (clone+accumulate bound), FT stays 4.3x SLOWER than torch
+
+Agent `SlateTern`. A torch fwd-vs-fwd+bwd probe (the winnable-gradient method from memory that found
+lstsq-bwd) flagged the reduction family: prod_dim bwd/fwd **143x** (fwd 0.08ms / fwd+bwd 11.24ms),
+cumprod 58x, cumsum 48x, pdist 21x, softmax 30x — the highest bwd/fwd ratios. prod_dim looked like the
+prize. FT's ProdDim backward (ft-autograd) was a SERIAL `for outer { for inner { 2 passes over reduce }}`
+computing the zero-aware grad (g*prod/x_i). I parallelized it over the independent `outer` lanes via
+`par_chunks_mut(lane_stride)` + a `compute(outer, block)` closure — the exact proven sibling pattern of
+the log_softmax backward fan-out, bit-exact (per-lane arithmetic identical, disjoint writes). 9 prod
+lib tests green.
+
+MEASURED (cc-local LOCAL release, FT_ORIG same-binary A/B, RAYON_NUM_THREADS=32, min-of-9,
+prod_dim(x,1).sum().backward() on [2048,2048] f64):
+  - PAR   46.76ms  vs  ORIG serial 61.73ms = **1.32x** internal only
+  - torch (same window) 10.77ms → FT stays **~4.3x SLOWER**.
+
+REJECTED + reverted. Root cause: the divide-loop I parallelized was NOT the bottleneck — it was only
+~15ms of a ~46ms backward. The rest is FT's tape-backward OVERHEAD that torch fuses away: the input
+`contiguous_values_as_f64()` (32MB clone of the 4M input) + `accumulate_tensor_gradient` (another full
+4M read-add-write pass) + graph traversal. Light per-element compute (one divide) makes the loop a
+small fraction, so parallelizing it barely moves the needle.
+
+★LESSON: backward-closure parallelization wins BIG only when per-element work is HEAVY (transcendental
+exp: logcumsumexp bwd 30x, logsumexp bwd 5-6x SHIPPED) OR the loop genuinely dominates. LIGHT-compute
+reduction backwards (prod=divide, sum/cumsum=add) are CLONE+ACCUMULATE bound → ~1.3x ceiling and stay
+torch-SLOWER. This applies to the WHOLE reduction-bwd family the probe flagged (cumprod/cumsum bwd also
+clone input + accumulate) — DON'T re-probe them the same way. ⚠️ the probe's high bwd/fwd RATIO (prod
+143x) is torch's ULTRA-FAST forward (0.08ms), NOT an absolutely-slow torch backward — torch's 10.77ms
+prod-bwd is still 4.3x FASTER than FT's 46ms. Real blocker to beat torch here = remove the input clone
+(borrow) + parallelize `accumulate_tensor_gradient`, but that's shared infra (multi-op blast radius)
+and even then ~2x slower (torch fuses grad+accumulate). Peer/deferred, not a one-lever ft-api win.
+
+
+
 ## 2026-07-02 - ★ SHIPPED (bit-exact): fused broadcast-tile binop — additive attention-bias `scores + bias[1,1,S,S]` — 6.9-8.8x internal, flips ~10-14x SLOWER → ~1.2-1.9x SLOWER (bandwidth-parity)
 
 Agent `SlateTern`. Extends the where/masked_fill attention-fusion vein to the ARITHMETIC binops
