@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN (gap-close): no-grad f64 argmax/argmin borrow — 11.8x internal, flips ~87x SLOWER → 7.4x SLOWER (SIMD-kernel wall residual)
+
+Agent `SlateTern`. The input-read-clone lever applied to a REDUCTION: `tensor_argmax`/`tensor_argmin`
+had an f32 borrow fast path (`argextremum_f32_fast`) but f64 fell to `tensor_tape.argmax`, which reads
+`contiguous_values_as_f64()` — an F64-branch `.to_vec()` CLONE (128MB serial copy) — before the SAME
+`argmax_dim_tensor_contiguous_f64` kernel. Added `argextremum_f64_fast` (mirror of the f32 helper:
+borrow `contiguous_values()` + the identical kernel). Bit-exact indices (same kernel, same values).
+
+PARITY (proven): `argmax_argmin_f64_borrow_indices_correct` (indices == manual per-row argmax/argmin,
+parallel path) GREEN; all 14 argmax/argmin tests pass.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096] f64 dim=1): FUSED-borrow **8.47ms** vs
+ORIG-clone **99.92ms = 11.8x internal**; torch 1.15ms → **7.4x SLOWER**. ⚠️HONEST: this is a GAP-CLOSE
+(flips ~87x SLOWER → 7.4x SLOWER), NOT torch-parity. The ~90ms clone is removed (the big win), but the
+residual 7.4x is the FT argmax KERNEL itself — it's ALREADY parallel (par_iter_mut over lanes) but its
+scalar max-value+index scan (~8ms = 15GB/s) is ~7x slower than torch's SIMD argmax (1.15ms, bandwidth-
+optimal). That SIMD-reduction kernel gap is a DEEP ft-kernel-cpu lever (peer-reserved, like the other
+SIMD walls), NOT an ft-api fix. ★Still landed: an 11.8x improvement to a real op (f64 argmax was
+catastrophically clone-bound at ~87x SLOWER; now 7.4x). ★This closes the input-read-clone lever's
+REDUCTION extension — argmax/argmin were the last common ops with the f32-borrow/f64-clone split.
+FOLLOW-UP: SIMD argmax f64 kernel (ft-kernel-cpu, deep) to close the residual 7.4x.
+
+
+
 ## 2026-07-02 - ⛔ REJECT + KEY MECHANISM: apply_function NODE overhead is negligible — only the UNCONDITIONAL save-clone costs
 
 Agent `SlateTern`. Tested the hypothesis that `apply_function_with_create_graph`'s node/dispatch
