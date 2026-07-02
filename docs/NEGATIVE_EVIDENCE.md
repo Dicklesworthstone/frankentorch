@@ -86,6 +86,14 @@ have a fused fast path. DON'T re-probe:
   layer_norm, group_norm (functional_group_norm_sum specialization) all have fused fast paths.
 - **binary/unary transcendentals** (atan2/hypot/copysign/frac/hardswish/mish/softplus/hardsigmoid/
   remainder) all 2x+ FT-FASTER (earlier probes). RoPE/rotary DOESN'T EXIST in ft; chunk/unbind are views.
+- **affine_grid f32 1.84-1.91x FASTER** (`examples/affine_grid_f32_h2h.rs` [64,3,192,192], close(1e-5)=
+  8192/8192) — the grid_sample STN companion is already faster. So the whole spatial-transformer path is
+  FT-faster EXCEPT grid_sample itself.
+- ⚠️grid_sample nuance: for SMALL input planes (e.g. [.,.,64,64] = 16KB, L1-resident) it's COMPUTE-bound
+  (not cache-miss), so native-f32/SIMD WOULD help those shapes (~1.3-2x); for LARGE planes it's
+  cache-miss-bound (needs input-tile blocking). BUT the machine is contended (FT rayon variance ~27%
+  under load 20-48; torch 8-thread stable) so a marginal ~1.3x grid_sample change CANNOT be cleanly
+  measured right now — needs a low-contention window + the full SIMD rewrite to be worth it.
 
 ★REMAINING PERF is DEEP (multi-session, NOT single-turn): (1) grid_sample lever-2 — cache-blocked/SIMD
 bilinear gather (biggest single gap ~4.05-4.85x SLOWER f32, per [[project_gemm_bandwidth_vein]] style);
