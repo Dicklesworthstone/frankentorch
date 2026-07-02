@@ -48,6 +48,19 @@ native-f32) rejected with reasons; the ONLY real lever = block-output-by-input-t
 channels (needs unsafe disjoint-position writes or an output transpose) = a DEDICATED multi-session
 kernel rewrite. This is the last op still SLOWER than torch; everything else is FT-faster/fused.
 
+★FRESH MEASUREMENT (2026-07-02, corrects the stale "4x" note): `examples/grid_sample_f32_h2h.rs`,
+[8,32,64,64]->128x128 bilinear f32: FT ~15ms vs torch ~1.4ms = **9.6-11x SLOWER** (torch's grid_sample
+CPU kernel is ~0.33ns/output = heavily SIMD + cache-blocked; FT ~3.5ns/output = scalar + cache-miss).
+The gap is BIGGER than the old 4x note. IMPORTANT: the probe reports **close=8192/8192, exact=5797/8192**
+-> grid_sample is a TOLERANCE op (NOT bit-exact) — so native-f32 IS acceptable per tolerance (my earlier
+"breaks f32==f64-narrowed contract" worry was moot). BUT native-f32 alone is ~1.3x (gather is cache-miss
+bound) -> 11x -> ~8.5x SLOWER, gap-closing not domination, NOT worth the 140-line multi-mode duplication
+standalone. The 11x gap only closes with the full SIMD-4-tap + cache-block-by-input-tile rewrite (of
+which native-f32 is one piece). ★CONCLUSION: grid_sample lever-2 is a DEDICATED MULTI-SESSION effort;
+approach = native-f32 storage + f32x8 SIMD over channels + block output positions by input tile for
+locality + parallel over position-blocks (unsafe disjoint writes or transpose). Tolerance budget:
+existing tests use ~1e-6 (f32) / 1e-9 (f64) abs; stay within.
+
 ## 2026-07-02 - ⛔ HARVESTED: SCAN ops (cumsum/cumprod/logcumsumexp) all FT-FASTER — don't re-probe
 
 Agent `SlateTern`. `examples/scan_gapfind_h2h.rs` (16M f64 [4096,4096] no-grad, vs torch 8-thread):
