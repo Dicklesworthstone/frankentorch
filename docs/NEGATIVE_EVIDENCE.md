@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: fused tensor_gelu_tanh (GPT-2/BERT GELU) one-pass — compose 125.7ms -> 9.45ms (~13x), 4.00x SLOWER -> 3.46x FASTER vs torch
+
+Agent `SlateTern`. Applied the logsigmoid recipe to the tanh-approx GELU (`F.gelu(x,
+approximate='tanh')`, the GPT-2/BERT form — VERY hot in transformers). `tensor_gelu` (exact/erf) is
+already a fused tape kernel, but `tensor_gelu_tanh` COMPOSED ~9 passes (mul, mul, mul_scalar, add,
+mul_scalar, tanh, full+add, mul_scalar, mul) = the heaviest compose found this session. Fused the F64
+no-grad path into ONE pass `0.5*x*(1+tanh(beta*(x+kappa*x^3)))`, replicating the EXACT op order/groupings
+(`x3=(x*x)*x`; commutative scalar muls; `1.0+tanh`; Rust f64::tanh == kernel/libm tanh) -> BIT-EXACT to
+the compose (lock test).
+
+★MEASURE (16M f64 no-grad, min-of-7, load ~30): FUSED **9.45ms vs FT_ORIG(compose) 125.7ms = ~13.3x
+internal** (the compose was ~9 passes + tape-node overhead per op), now at the exp-anchor floor. vs torch
+**4.00x SLOWER -> 3.46x FASTER** (torch fuses it). parity vs torch 1/9 bit (max_abs 5.55e-17 = ~1 ULP) —
+PRE-EXISTING compose-vs-torch on this APPROX activation (fused == compose, so unchanged); gelu_tanh is a
+tolerance op, negligible. Lock test `gelu_tanh_fused_matches_compose` (f64). ⚠️F32 FALLS THROUGH: the f32
+gelu_tanh compose promotes 1.0 via a F64 `full()` const so `gelu_tanh(f32)` RETURNS F64 — a pre-existing
+dtype quirk (like the masked_fill f32 bug); FOLLOW-UP: fix the f32 compose to full_like (f32) + add the
+f32 fused path (would then also flip f32). AGENT SlateTern.
+
 ## 2026-07-02 - ★★ WIN: fused tensor_logsigmoid one-pass — compose 32.6ms -> 10.8ms (~3x), 1.59x -> 5.06x FASTER vs torch
 
 Agent `SlateTern`. Data-driven gapfind (`examples/unary2_gapfind_h2h.rs`, 16M f64 no-grad, exp/add
