@@ -1,5 +1,30 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (NEW class: ft-optim): parallelize SGD step — flips 4.08x SLOWER → 1.47x FASTER vs torch (6.02x internal)
+
+Agent `SlateTern`. NEW crate/class (ft-optim, distinct from all the ft-autograd backward work). The
+optimizer-parallelization vein was PARTIALLY harvested (examples exist for adadelta/adagrad/adamax/
+nadam/radam/rmsprop/muon) but **SGD — the single most fundamental optimizer — was MISSED**: its `step`
+(both momentum and no-momentum paths) + the shared `apply_param_update` helper (`p -= update`, routed
+through by SGD/RMSprop/Adagrad/Adadelta/Adamax/NAdam/RAdam) were fully SERIAL. Each `vel[i]` depends only
+on `vel[i]` (no cross-index coupling) so parallelized all three over Rayon above `SGD_STEP_PAR_MIN`
+(1<<15), serial fallback below — bit-for-bit identical.
+
+Measured (SGD momentum, 16.7M params f64; 64c; torch 2.12.1+cpu; examples/sgd_par_ab.rs same-process
+1t-vs-Nt pool A/B + torch script):
+  - serial 128.93ms -> **parallel(64t) 21.43ms = 6.02x internal**
+  - vs torch **31.56ms**: was 4.08x SLOWER -> **1.47x FASTER**
+Bit-exact (per-index-independent + serial-below-threshold; ft-optim suite). ⚠️ALSO fixed a PRE-EXISTING
+compile breakage on main: the `trial!` test macro used `{name}` format captures without binding the
+literal (undefined local) — ft-optim's whole test module failed to compile on HEAD; bound `let name =
+$name;`. That fix UNBLOCKED 253 ft-optim tests (all SGD + torch-goldens PASS = SGD change verified
+bit-exact) and EXPOSED one PRE-EXISTING, UNRELATED failure that had been hidden by the compile error:
+`cyclic_lr_saturates_loaded_max_iteration_counter` (loads iteration=usize::MAX then steps → expects the
+counter to saturate to 1.0, gets ~2^64; a CyclicLR cycle-wrap/overflow bug, NOT touched by this change).
+Flagged as a SEPARATE scheduler-logic lever for a future turn. ★The `apply_param_update` parallelization
+silently speeds the OTHER helper-routed optimizers' final apply too. NEXT ft-optim: fix the CyclicLR
+saturation bug; check LBFGS@2171 (0 par_iter but a line-search/history optimizer, different shape).
+
 ## 2026-07-02 - ⛔ STRUCTURAL BLOCKER (broadcast/expand): FT MATERIALIZES broadcasts, torch VIEWS them — ~2x gap is a view-floor, not a single lever. (+ bit-exact parallel Expand-backward reduction landed)
 
 Agent `SlateTern`. Dug the next flagged lever — broadcast-backward (the reduction half of broadcasting;
