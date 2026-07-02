@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: fused where with GENERAL broadcast cond (KEY-PADDING attention) — 17.67x SLOWER -> 3.4x FASTER
+
+Agent `SlateTern`. Generalizes BOTH fused `where` fast paths (`try_where_one_scalar` = `where(mask,
+scores, -inf)`, and `try_where_cond_tile_two` = `where(mask, a, b)`) from TRAILING tiles ([1,1,S,S])
+to ANY broadcast cond — the KEY-PADDING attention mask `where(mask[B,1,1,S], scores, -inf)` /
+`mask[B,1,S,S]` (batch varies, heads/query broadcast — MIDDLE/leading size-1, NOT a trailing tile).
+Extracted the proven mbase scheme from `try_masked_fill_broadcast` into a shared `broadcast_offset_plan`
+helper (right-align cond, require each dim 1-or-equal, trailing non-broadcast run = `inner`, per-row
+cond offset = sum of outer non-broadcast index contributions; block ~32K elems decouples parallel
+granularity from a small inner). Both where paths now call it; the causal tile [1,1,S,S] is the special
+case (all outer contribs 0 -> mbase 0 -> single S×S plane reused, identical to the prior shipped path).
+On HEAD the key-padding cond fell through to `broadcast_to` x3 (materialize 65536->8.4M) + tape `where`
+(clones + nodes). Bit-identical (truthy == nonzero).
+
+★MEASURE (`examples/where_keypad_h2h.rs`, mask[16,1,1,256] into scores[16,8,256,256]=8.4M f64 no-grad,
+inputs OUTSIDE timer, min-of-9, torch 8-thread, load ~20): FT_FUSED **3.7ms vs torch 12.5ms = ~3.4x
+FASTER** (3.16-3.56x across runs), parity **0/150 value-bit mismatches** (bit-exact). FT_ORIG(fallthrough)
+**222ms = 17.67x SLOWER** vs torch -> FLIP 17.67x SLOWER -> ~3.4x FASTER (internal ~57x). Lock tests
+`where_cond_tile_fused_matches_broadcast_path` + `where_cond_tile_two_full_matches_broadcast_path` extended
+with [B,1,1,S]/[B,1,S,S] (f32+f64, == grad-forced broadcast reference). Tests: ft-api where suite green
+(3/3). ★The full attention-masking `where`+`masked_fill` family — causal tile [1,1,S,S] AND key-padding
+[B,1,1,S], scalar-branch + two-full + masked_fill — now all fuse the broadcast mask. AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: fused masked_fill with GENERAL broadcast mask (KEY-PADDING attention) — 19x SLOWER -> 3.89x FASTER
 
 Agent `SlateTern`. Generalizes the masked_fill tile win (a5a0d90a, TRAILING tiles only) to ANY broadcast
