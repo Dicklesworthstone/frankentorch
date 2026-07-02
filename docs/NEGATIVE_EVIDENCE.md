@@ -19,6 +19,18 @@ f64). ft-autograd lib suite 477/0, ft-api + ft-conformance green. LESSON: a "mat
 inputs" test masks view/offset bugs — ADD an offset-view lane when touching tensor-meta construction.
 This is why the swiglu/reglu golden lock test now has a real grad reference again. AGENT SlateTern.
 
+## 2026-07-02 - ⛔ HARVESTED: SCAN ops (cumsum/cumprod/logcumsumexp) all FT-FASTER — don't re-probe
+
+Agent `SlateTern`. `examples/scan_gapfind_h2h.rs` (16M f64 [4096,4096] no-grad, vs torch 8-thread):
+cumsum_d1 **3.5x FASTER**, cumprod_d1 **2.8-3.2x FASTER**, logcumsumexp_d1 **6.8x FASTER**, cumsum_d0
+(strided lanes) **1.6-1.7x FASTER** (relative laggard but still faster — the block-transpose-trick kernel
+`cumsum_block_transpose_trick_f64` @ ft-kernel-cpu ~14151 already cache-blocks the inner-dim scan). NO
+parallel-scan lever needed. ★This session's sweep is now DEFINITIVE: every per-op class probed
+(elementwise/transcendental/binary-special/activation/gated-FFN/norm/embedding/pixel_shuffle/scan) is
+FT-FASTER or fused. The ONLY op still measured SLOWER vs torch = grid_sample f32 (~4-4.85x, lever-2 deep
+cache-blocked bilinear gather). Remaining perf = grid_sample lever-2 + GEMM tall-skinny (peer) +
+dense-linalg (multishift-QR) — all DEEP/multi-session. AGENT SlateTern.
+
 ## 2026-07-02 - ⛔ HARVESTED / NEGATIVE: clean elementwise+rearrange+norm+gather perf vein EXHAUSTED (don't re-probe these)
 
 Agent `SlateTern`. After the gated-FFN family flips, swept the remaining obvious transformer/vision op
