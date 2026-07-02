@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: fused swiglu/reglu (LLaMA/PaLM gated FFN) — ~20x internal, ~3.5x SLOWER -> ~6x FASTER (+ pre-existing grad-dim0 bug found)
+
+Agent `SlateTern`. Follow-up to the glu fusion (dd49b525): swiglu (a*silu(b)) and reglu (a*relu(b)) have
+the IDENTICAL strided-split compose (narrow+narrow+act+mul over views ~180ms). Factored a shared helper
+`try_glu_variant_fused(input, dim, dim_size, half, act64, act32)` (one-pass `a*act(b)` over outer/half/
+inner strides) and wired swiglu (act = silu = the kernel's `x/(1+exp(-x))`) + reglu (act = relu =
+`x.max(0)`). Bit-exact to the op definition.
+
+★MEASURE (transformer [64,512,1024] no-grad, min-of-7, load ~28): swiglu FUSED **8.6ms vs FT_ORIG(compose)
+181.7ms = ~21x internal**, 3.25x SLOWER -> **6.20x FASTER**; reglu **9.0ms vs 178.7ms = ~20x**, 3.61x
+SLOWER -> **5.92x FASTER**. Lock test `swiglu_reglu_fused_match_golden` (hand-golden of a*act(b), NaN
+seeded, last/middle/first split dims, f32+f64 — golden computed DTYPE-NATIVE so f32 matches the f32-native
+fused arithmetic, not f64-narrow).
+
+⚠️FOUND (pre-existing, NOT from this change): swiglu/reglu GRAD compose ERRORS for dim=0 split
+(`InsufficientStorage{needed:24,actual:12}` — tensor_silu/tensor_relu grad on a dim=0 narrow view). glu's
+grad (sigmoid) works at dim=0 but silu/relu don't. My fast path is no-grad only so grad is unchanged; the
+lock test therefore compares vs a hand-golden (not the grad compose). FOLLOW-UP (separate bug): fix
+silu/relu grad on offset/dim=0 narrow views. geglu (a*gelu(b)) also fuses but gelu is the erf tape kernel
+(needs the exact erf formula inline) — deferred. AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: fused tensor_glu (GLU, transformer gated-linear-unit) — 6.87x SLOWER -> 2.85x FASTER (17x internal)
 
 Agent `SlateTern`. Data-driven gapfind (`examples/glu_softmin_h2h.rs`, transformer shape [64,512,1024]
