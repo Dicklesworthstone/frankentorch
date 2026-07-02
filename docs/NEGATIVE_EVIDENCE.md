@@ -1,5 +1,42 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: fused tensor_gradient_dim (torch.gradient) last-dim — 24.8-30.5x internal, ~6-14x FASTER than torch
+
+Agent `SlateTern`. A torch FORWARD-op probe (no build, torch-only) flagged `torch.gradient` at ~46ms
+([4096,4096] f64) — a slow Python-level composite. FT's `tensor_gradient_dim` (the torch.gradient
+central-difference equivalent) also COMPOSED it: narrow(views) + sub + mul_scalar for interior + first
++ last, then a 3-way `cat` — ~6 intermediate 16M tensors and every value written TWICE (into an
+intermediate, then by cat).
+
+Fix `frankentorch-gradient-fused`: no-grad LAST-DIM (inner==1) path fuses the whole thing into ONE
+pass per contiguous `outer` row — g[0]/g[interior]/g[len-1] written straight into the output, no
+intermediates, no cat, parallel over `outer`. Bit-IDENTICAL to the compose: interior is
+`(x[j+1]-x[j-1])*inv_2h` (== `(upper-lower)` then `*inv_2h`) and the edges replicate the exact
+`mul_scalar`/`add`/`sub` operation order of the composed edge_order 1 & 2 chains.
+
+PARITY (proven): `gradient_dim_fused_matches_composed_path` (fused == grad-forced compose, bit-exact,
+f32/f64, dim 0 & 1, edge_order 1 & 2, parallel path) AND the pre-existing
+`gradient_dim_matches_torch_finite_differences` (fused == torch golden) both GREEN.
+
+PERF (MEASURED, cc-local LOCAL release, FT_ORIG same-binary A/B, RAYON_NUM_THREADS=32, min-of-9,
+[4096,4096]): internal FUSED vs ORIG-compose —
+  - f64 dim=1 eo=1: **7.69ms vs 190.4ms = 24.8x**
+  - f32 dim=1 eo=1: **3.60ms vs 109.8ms = 30.5x**
+vs torch (f64 dim=1 ~46ms clean earlier / 101ms under load-38 this window; f32 ~50ms): FT **6-13x
+FASTER** (f64) / **~14x FASTER** (f32) — dominates even at the conservative 46ms torch baseline.
+⚠️GOTCHA (found + fixed pre-commit): the FIRST version fused ALL dims → dim=0 ([4096,4096], inner=4096,
+outer=1) REGRESSED 11x (283ms vs 25ms) — a non-last dim strides by `inner` per step (cache/TLB thrash)
+AND has outer==1 => serial. Gated to `inner==1 && outer>=2` (LAST dim, contiguous rows). Non-last dims
+keep the composed narrow+sub+cat path, which walks contiguous sub-blocks and ALREADY beats torch
+(dim=0 f64: FT compose 23.85ms vs torch ~88ms). ★LESSON: fuse a strided-reduction/scan op only where
+the fused access is CONTIGUOUS (inner==1); a non-last axis needs the compose's contiguous-block layout,
+not a per-element strided gather. This is the trapezoid/cumulative_trapezoid fusion recipe applied to
+gradient. FOLLOW-UP: a non-last-dim fused path could iterate the axis OUTER and vectorize the
+contiguous inner block (out[.,s,:]=(x[.,s+1,:]-x[.,s-1,:])*inv_2h) — but compose already wins there,
+low priority.
+
+
+
 ## 2026-07-02 - ⛔ REJECT: prod_dim backward parallelization — 1.32x only (clone+accumulate bound), FT stays 4.3x SLOWER than torch
 
 Agent `SlateTern`. A torch fwd-vs-fwd+bwd probe (the winnable-gradient method from memory that found
