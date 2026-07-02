@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: fused masked_fill with GENERAL broadcast mask (KEY-PADDING attention) — 19x SLOWER -> 3.89x FASTER
+
+Agent `SlateTern`. Generalizes the masked_fill tile win (a5a0d90a, TRAILING tiles only) to ANY broadcast
+mask — the KEY-PADDING attention mask `scores.masked_fill(mask[B,1,1,S], -inf)` / `mask[B,1,S,S]`, where
+the BATCH dim varies but heads/query broadcast (a MIDDLE/leading size-1 dim, NOT a pure trailing tile,
+so `try_masked_fill_tile`'s suffix check fails). On HEAD it fell through to `full(shape,value)` (8.4M
+const materialize) + broadcast mask/fill/input + `where` (clones x3 + nodes) = ~268ms; f32 additionally
+CRASHED (`full(value)` is F64 -> `where(f32 mask, f64 fill, f32 input)` dtype mismatch, same bug the tile
+commit noted). New `try_masked_fill_broadcast`: right-align mask to input, require every dim to be 1 or
+equal (else fall through non-broadcastable), find the longest TRAILING non-broadcast run (`inner`,
+contiguous in both), then per output row select `inner` mask elems from block offset = sum of outer
+NON-broadcast index contributions (broadcast dims contribute 0). Parallel granularity DECOUPLED from
+`inner` (blocked ~32K elems/task, iterate rows within) so a small inner (key-padding inner=S) is not a
+par-dispatch storm. Bit-exact to torch (value cast to input dtype).
+
+★MEASURE (`examples/maskedfill_keypad_h2h.rs`, mask[16,1,1,256] into scores[16,8,256,256]=8.4M f64
+no-grad, inputs OUTSIDE timer, min-of-9, torch 8-thread, load ~48 heavily contended): FT_FUSED **3.9ms
+vs torch 15ms = 3.89x FASTER**, parity **0/150 value-bit mismatches** (bit-exact). FT_ORIG(fallthrough)
+**268ms = 19.05x SLOWER** vs torch -> FLIP 19x SLOWER -> 3.89x FASTER (internal ~68x, contention-robust:
+both paths same process). ALSO a f32 CRASH-FIX (f32 key-padding masked_fill errored on HEAD). Lock test
+`masked_fill_broadcast_matches_expanded_sameshape` (f32+f64, [B,1,1,S]/[B,1,S,S]/[B,H,1,S] == manually
+right-align-expanded same-shape reference). Tests: ft-api masked_fill suite green (7/7). ★Both canonical
+attention masks now fuse: the CAUSAL mask [1,1,S,S] (a5a0d90a, trailing tile) AND the KEY-PADDING mask
+[B,1,1,S] (this, general broadcast). Follow-up: apply the same general-broadcast offset scheme to
+`where(mask,x,scalar)` / `where(mask,a,b)` (currently trailing-tile only, [B,1,1,S] cond still composes).
+AGENT SlateTern.
+
 This ledger records optimization attempts that failed, regressed, or did not
 clear the benchmark bar. Do not retry a rejected lever unless the retry condition
 is explicitly satisfied.
