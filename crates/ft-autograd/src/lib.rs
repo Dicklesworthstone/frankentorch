@@ -11601,8 +11601,21 @@ impl TensorTape {
                     }
                 }
                 TensorNodeOp::Add { lhs, rhs } => {
-                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
-                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &incoming)?;
+                    // d(a+b)/da = d(a+b)/db = 1: add `incoming` to both operand grad slots.
+                    // Parallel per-index accumulate (bit-identical to the serial borrowed
+                    // accumulate; universal binary-op hot path). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
+                        lhs,
+                        &mut grads[lhs.0],
+                        incoming.len(),
+                        |index| incoming[index],
+                    )?;
+                    Self::accumulate_tensor_gradient_par_with(
+                        rhs,
+                        &mut grads[rhs.0],
+                        incoming.len(),
+                        |index| incoming[index],
+                    )?;
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
                     Self::complete_dependency(&mut pending, rhs, &mut queue)?;
@@ -11614,9 +11627,15 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sub { lhs, rhs } => {
-                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
-                    // rhs grad = -incoming, accumulated inline (no scratch Vec).
-                    Self::accumulate_tensor_gradient_with(
+                    // d(a-b)/da = 1 ; d(a-b)/db = -1. Parallel per-index accumulate
+                    // (bit-identical to the serial form). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
+                        lhs,
+                        &mut grads[lhs.0],
+                        incoming.len(),
+                        |index| incoming[index],
+                    )?;
+                    Self::accumulate_tensor_gradient_par_with(
                         rhs,
                         &mut grads[rhs.0],
                         incoming.len(),
@@ -11640,14 +11659,15 @@ impl TensorTape {
 
                     // d(a/b)/da = 1/b ; d(a/b)/db = -a/b^2. Same per-element f64
                     // expressions and ascending order as before, accumulated inline
-                    // (no lhs/rhs contrib Vecs; operands borrowed zero-copy for f64).
-                    Self::accumulate_tensor_gradient_with(
+                    // (no lhs/rhs contrib Vecs; operands borrowed zero-copy for f64) and
+                    // fanned over Rayon (bit-identical). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
                         lhs,
                         &mut grads[lhs.0],
                         incoming.len(),
                         |index| incoming[index] / rhs_values[index],
                     )?;
-                    Self::accumulate_tensor_gradient_with(
+                    Self::accumulate_tensor_gradient_par_with(
                         rhs,
                         &mut grads[rhs.0],
                         incoming.len(),
@@ -11674,14 +11694,15 @@ impl TensorTape {
 
                     // d(a*b)/da = b ; d(a*b)/db = a. Same per-element f64 products
                     // and ascending order as before, accumulated inline (no lhs/rhs
-                    // contrib Vecs; operands borrowed zero-copy for f64).
-                    Self::accumulate_tensor_gradient_with(
+                    // contrib Vecs; operands borrowed zero-copy for f64) and fanned over
+                    // Rayon (bit-identical). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
                         lhs,
                         &mut grads[lhs.0],
                         incoming.len(),
                         |index| incoming[index] * rhs_values[index],
                     )?;
-                    Self::accumulate_tensor_gradient_with(
+                    Self::accumulate_tensor_gradient_par_with(
                         rhs,
                         &mut grads[rhs.0],
                         incoming.len(),
@@ -20550,45 +20571,16 @@ impl TensorTape {
         Ok(())
     }
 
-    /// Accumulate a per-element gradient contribution computed lazily, without
-    /// materialising it into an intermediate `Vec`. `contribution(i)` yields the
-    /// i-th contribution; the running sum `target[i] += contribution(i)` is the
-    /// bit-for-bit identical operation to the prior
-    /// `accumulate_tensor_gradient(node, target, &collected)` form (same ascending
-    /// index order, same f64 arithmetic), it just skips the allocation + the
-    /// write-then-read round trip through the scratch buffer.
-    fn accumulate_tensor_gradient_with<F: FnMut(usize) -> f64>(
-        node: TensorNodeId,
-        target: &mut TensorGradientSlot,
-        contribution_len: usize,
-        mut contribution: F,
-    ) -> Result<(), AutogradError> {
-        Self::ensure_tensor_len(node, target.expected_len, contribution_len)?;
-        if target.values.is_empty() {
-            target.values.reserve(contribution_len);
-            for index in 0..contribution_len {
-                target.values.push(0.0 + contribution(index));
-            }
-            return Ok(());
-        }
-        Self::ensure_tensor_len(node, target.values.len(), contribution_len)?;
-        for (index, target_value) in target.values.iter_mut().enumerate() {
-            *target_value += contribution(index);
-        }
-        Ok(())
-    }
-
-    /// Parallel sibling of [`Self::accumulate_tensor_gradient_with`]. Fuses a
-    /// per-index gradient contribution `contribution(i)` directly into the target
-    /// slot in ONE Rayon pass — no intermediate `Vec`, no zero-init, no separate
-    /// accumulate loop. Bit-for-bit identical to the serial `_with` form: the
-    /// empty-slot arm collects `0.0 + contribution(i)` in ascending index order,
-    /// the accumulate arm indexes `target[i] += contribution(i)` (per-index
-    /// independent, order-preserving), and both fall back to the serial body below
-    /// the threshold so small-shape callers stay deterministic. The contribution
-    /// closure must be pure (each `i` depends only on read-only captured state);
-    /// callers whose per-element gradient couples across indices must NOT use this.
-    /// frankentorch-normp-bwd-fused.
+    /// Accumulate a per-index gradient contribution `contribution(i)` directly into
+    /// the target slot in ONE Rayon pass — no intermediate `Vec`, no zero-init, no
+    /// separate accumulate loop. The empty-slot arm collects `0.0 + contribution(i)`
+    /// in ascending index order, the accumulate arm indexes `target[i] +=
+    /// contribution(i)` (per-index independent, order-preserving), and both fall back
+    /// to a serial body below the threshold so small-shape callers stay deterministic
+    /// — so the result is bit-for-bit identical to the equivalent serial fill +
+    /// `accumulate_tensor_gradient`. The contribution closure must be pure (each `i`
+    /// depends only on read-only captured state); callers whose per-element gradient
+    /// couples across indices must NOT use this. frankentorch-normp-bwd-fused.
     fn accumulate_tensor_gradient_par_with<F: Fn(usize) -> f64 + Sync + Send>(
         node: TensorNodeId,
         target: &mut TensorGradientSlot,

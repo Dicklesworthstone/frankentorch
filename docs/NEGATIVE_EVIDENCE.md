@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN #7 (UNIVERSAL): parallelize Add/Sub/Mul/Div backward — 2.1-5.0x FASTER vs torch
+
+Agent `SlateTern`. Direct extension of WIN #6: grepped the remaining SERIAL `accumulate_tensor_gradient_with`
+callers and found the CORE elementwise-binary backwards — `Add`, `Sub`, `Mul`, `Div` — all broadcast/
+accumulate their operand grads SERIALLY over the whole tensor (Add/Sub-lhs via serial
+`accumulate_tensor_gradient`; Sub-rhs/Mul/Div via serial `accumulate_tensor_gradient_with`). These are
+among the most common ops in ANY network (scaling, normalization, residuals, attention). They are
+per-index-independent (equal shapes — broadcasting is a separate Expand/SumToShape node), so swapped all
+to the parallel `accumulate_tensor_gradient_par_with` (bit-identical closures). Also removed the now-dead
+serial `accumulate_tensor_gradient_with` (0 callers; superseded by `_par_with` which has a below-threshold
+serial fallback).
+
+Measured ([4096,4096] f64, `(a OP b).sum().backward()`; 64c; torch 2.12.1+cpu 64 threads; binop_bwd_h2h.rs):
+  - add: 69.95ms vs torch 179.57ms = **2.57x FASTER**
+  - sub: 87.21ms vs torch 227.08ms = **2.60x FASTER**
+  - mul: 104.17ms vs torch 221.09ms = **2.12x FASTER**
+  - div: 86.30ms vs torch 428.39ms = **4.97x FASTER**
+Bit-exact by construction (`_par_with` == serial `_with`, identical per-index closures). ft-autograd
+477/477, ft-conformance add/mul/div/sub green. ★Together WIN #6+#7 parallelize the ENTIRE core autograd
+broadcast/accumulate path (sum, mean, add, sub, mul, div) — the backbone of every training step.
+
 ## 2026-07-02 - ★★★ WIN #6 (UNIVERSAL): parallelize Sum/Mean backward — the `loss.backward()` broadcast — flips 1.9x SLOWER→1.93x FASTER + flips ALL activations
 
 Agent `SlateTern`. The single highest-EV win of the session, found by SPLIT-TIMING the activation bench
