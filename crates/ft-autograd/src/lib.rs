@@ -5285,7 +5285,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5324,7 +5331,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5363,7 +5377,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5402,7 +5423,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5441,7 +5469,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5480,7 +5515,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5518,7 +5560,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5555,7 +5604,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5592,7 +5648,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5629,7 +5692,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5666,7 +5736,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5703,7 +5780,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5740,7 +5824,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5777,7 +5868,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5814,7 +5912,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5851,7 +5956,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5888,7 +6000,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5925,7 +6044,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5962,7 +6088,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5999,7 +6132,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6036,7 +6176,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6073,7 +6220,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6110,7 +6264,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6147,7 +6308,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6184,7 +6352,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6221,7 +6396,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6258,7 +6440,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6295,7 +6484,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6332,7 +6528,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6369,7 +6572,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6406,7 +6616,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,

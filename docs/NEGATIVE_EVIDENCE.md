@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ CORRECTNESS FIX: 31 ft-autograd unary ops broke on NARROW/slice (storage-offset) views — output built from view meta
+
+Agent `SlateTern`. Root-caused + FIXED the swiglu/reglu grad-dim0 error surfaced by the gated-FFN work.
+31 ft-autograd scalar unary tape ops (silu/relu/elu/mish/softplus/leaky_relu/hardswish/... — everything
+using `dispatch_tensor_unary_contiguous_typed`) built their OUTPUT tensor from a CLONE of the INPUT's
+meta: `DenseTensor::from_typed_storage(input_meta, outcome.storage)`. For a NARROW/slice (storage-OFFSET)
+view the input meta carries the offset + base-size, but `outcome.storage` is FRESH CONTIGUOUS view-numel
+storage -> mismatch: `InsufficientStorage{needed:24,actual:12}` (or wrong strides). sigmoid/tanh already
+did it RIGHT (`TensorMeta::from_shape(shape, dtype, device)` = clean contiguous). Fixed all 31 to build
+the output meta via from_shape (identical for contiguous inputs; correct for offset views). Since the
+INPUT was fine, this is a VALUE/crash bug on ANY unary act applied to a narrow/slice — broader than the
+dim=0 gate that surfaced it (e.g. `silu(x[:, k:k+n])`).
+
+★VERIFY: regression test `unary_on_offset_narrow_view_matches_contiguous` (silu/relu/elu/mish/softplus/
+leaky_relu on `narrow(x[4,3,2], dim0, off 2, len 2)` == on the contiguous slice, no-grad AND backward,
+f64). ft-autograd lib suite 477/0, ft-api + ft-conformance green. LESSON: a "matches for contiguous
+inputs" test masks view/offset bugs — ADD an offset-view lane when touching tensor-meta construction.
+This is why the swiglu/reglu golden lock test now has a real grad reference again. AGENT SlateTern.
+
 ## 2026-07-02 - ⛔ HARVESTED / NEGATIVE: clean elementwise+rearrange+norm+gather perf vein EXHAUSTED (don't re-probe these)
 
 Agent `SlateTern`. After the gated-FFN family flips, swept the remaining obvious transformer/vision op
