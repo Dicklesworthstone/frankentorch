@@ -37,6 +37,19 @@ one-turn hoist. Bit-exactness caveat: pre-COMBINING weights (w00=wx0*wy0) change
 (`(v*wx0)*wy0` vs `v*(wx0*wy0)`) -> breaks the bit-exact grid_sample goldens; keep the 4 separate weights.
 DON'T attempt the naive hoist. AGENT SlateTern.
 
+★UPDATE (IMPLEMENTED + BENCHED, then reverted): I built the bilinear corner-hoist properly (precompute
+(x0,y0,wx1,wy1) per position in a batch*out_plane array — SMALL, L3-resident for the measured shape, NOT
+the 8M-position array I mis-sized before; Pass 2 reads it instead of recomputing floor/frac per channel)
+with an FT_ORIG A/B gate. 13 grid_sample tests passed BIT-EXACT (impl correct). MEASURED same-process A/B
+(contention-robust, min-of-3, [8,32,64,64]->128x128): hoist **10.67ms vs recompute 11.42ms = ~1.07x,
+WITHIN the ~10% contention noise** = a WASH. ⛔REJECTED. WHY: the Pass-2 floor/frac recompute is CHEAP —
+padding-mode (reflect/border/clamp) is already applied to (ix,iy) in Pass 1, so Pass 2 only does
+floor×2 + 4 subs (~6 cheap ops); hoisting them saves ~7%, lost in noise. The REAL cost is the 4-tap
+GATHER per (pos,chan): bounds-check + index-compute + read + f64::from + the 7-mul/3-add weighted sum.
+That's ~24 ops the hoist doesn't touch. ★CONFIRMS: grid_sample's gap is the SCALAR 4-TAP GATHER+INTERP,
+not redundant coord compute — the ONLY fix is SIMD-vectorising the 4-tap over channels (f32x8) +
+input-tile cache-blocking. Corner-hoist is a DEAD micro-lever; don't rebuild it. AGENT SlateTern.
+
 ★ADDENDUM (native-f32 sub-lever also REJECTED, analysis): the f32 path runs grid_sample_f64 (generic-T)
 on f32 storage — MATH IN F64, then `v as f32` (bit-identical-to-f64-narrowed contract, lever-1). A
 native-f32 gather+interp (f32 weights/sum, no per-tap f32->f64 convert) would (a) give only a MARGINAL
