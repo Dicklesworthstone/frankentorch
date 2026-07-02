@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN: no-grad f64 zeta borrow fast path — 2.43x internal, 1.31x FASTER than torch (binary sub-vein COMPLETE)
+
+Agent `SlateTern`. Followed the igamma binary sub-vein to its last member: `tensor_zeta` (Hurwitz ζ)
+cloned both inputs via `storage()?.to_vec()` (2× full-numel) before par_zip_map in its no-grad f64
+path. Added `try_f64_binary_native(s, a, zeta_approx)` (borrow, zero-copy). Bit-exact.
+
+PARITY (proven): `zeta_f64_borrow_match_apply_function` (fused == grad-forced apply_function) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096] f64): FUSED **118.71ms** vs ORIG-clone
+288.24ms = **2.43x internal**; torch special.zeta 156.06ms → **1.31x FASTER**. Modest torch margin —
+zeta_approx's Cephes Euler-Maclaurin is a heavy per-element compute floor (~118ms parallel), so removing
+the clones (2.43x) can't push much past torch. ★BINARY-SPECIAL sub-vein COMPLETE: comprehensive scan of
+all `try_f32_binary_native` sites — igamma/igammac (done, 2.9-3.1x), zeta (done, 1.31x) all had the
+tensor_values/storage-clone f64 no-grad path; hypot ALREADY borrows; xlogy has NO clones (0); rel_entr/
+xlog1py already have f64 binary fast paths. DON'T re-probe binary special ops. ★LESSON: `storage()?.to_
+vec()` and `tensor_values(...)` in a no-grad f64 path = a full-numel CLONE that try_f64_binary_native
+(borrow via contiguous_values) eliminates — a distinct lever from the apply_function-save vein (here
+there's no apply_function at all, just the input-read clone).
+
+
+
 ## 2026-07-02 - ★★ WIN (batch ×2): no-grad f64 igamma/igammac borrow fast path — 3.2-3.3x internal, 2.9-3.1x FASTER than torch
 
 Agent `SlateTern`. A BINARY sibling of the specfn no-grad vein: `tensor_igamma`/`tensor_igammac` had an
