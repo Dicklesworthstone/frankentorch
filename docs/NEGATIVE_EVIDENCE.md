@@ -1,5 +1,30 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⚠️ BLOCKER (reverted unmeasured): gather/take_along_dim 5.5x SLOWER — tape plumbing over a parallel kernel, ceiling ~parity
+
+Agent `SlateTern`. Forward probe flagged take_along_dim (136ms — later found CONTENTION-inflated; clean
+torch = **47ms** take_along_dim / 27ms gather, [4096,4096] f64 dim=1). MEASURED FT take_along_dim =
+**261ms = ~5.5x SLOWER**. The gather KERNEL (`gather_tensor_contiguous_f64`) is ALREADY parallel
+(par_chunks_mut over outer) and cache-friendly for dim=1 (within-row reads) — so the 5.5x is TAPE
+PLUMBING, not the kernel: `tensor_gather` extracts the index (`tensor_tape.values` = 128MB f64 clone),
+`validate_index_tensor_values` walks 16M, then the tape `gather` clones the input
+(`contiguous_values_as_f64`) + builds a node saving the index for the scatter-add backward.
+`tensor_scatter` HAS a no-grad fast path (borrow + kernel + leaf); `gather` did NOT.
+
+ATTEMPTED a no-grad gather fast path mirroring scatter's (borrow input + `gather_tensor_contiguous_*`
+directly + leaf, skip node/backward-save). Hit dtype/meta bugs (`UnsupportedDType(F32)` in the value
+read — the fast path's output dtype handling didn't cleanly match) across two debug rounds; REVERTED
+UNMEASURED (time-boxed). ⚠️ HONEST CEILING: even a WORKING no-grad path likely only reaches ~PARITY,
+NOT domination — the index extraction (128MB f64) + 16M validation are INHERENT (needed regardless of
+grad), and torch's int64-index gather at 47ms is the floor. This is a representation/memory wall
+(FT's f64 index vs torch int64 + multiple 128MB passes), not a clean compose→fuse lever. FOLLOW-UP
+(next-session, needs clean same-session debug + FT_ORIG A/B to decide GO/NO-GO): add the gather no-grad
+fast path correctly (match scatter's exact dtype branches — the F32 branch must build an F32 leaf via
+`tensor_variable_f32`), measure; if it flips 261ms→<80ms it's a gap-close win (like bcast-binop), if
+the index-extraction dominates it stays ~parity and stays REJECTED. Not landed this cycle.
+
+
+
 ## 2026-07-02 - ★ WIN: fused tanhshrink f64 — 1.82x internal, 2.0-4.7x FASTER than torch (bit-exact)
 
 Agent `SlateTern`. `tensor_tanhshrink` was a bare compose `tensor_tanh(input)` then `tensor_sub(input,
