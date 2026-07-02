@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN + PARITY-FIX: fused tensor_lerp_weighted (tensor-weight torch.lerp) — 1.16x SLOWER -> 1.68x FASTER, torch-exact FMA
+
+Agent `SlateTern`. `tensor_lerp_weighted` (tensor-weight `torch.lerp(start,end,weight)`, used in
+EMA/diffusion interpolation) had NO no-grad fast path — pure sub+mul+add compose — while scalar-weight
+lerp has f32+f64 fast paths (asymmetric-dtype/coverage vein). Added a no-grad equal-shape contiguous
+fused path (f32+f64).
+
+⚠️PARITY LANDMINE (differential-testing win): torch.lerp is NOT `start + w*(end-start)`. Its vectorized
+kernel (aten LerpKernel.cpp) is a SINGLE-ROUNDING FMA: `fmadd(coeff, end-start, base)` where |w|<0.5 =>
+(coeff=w, base=start) else (coeff=w-1, base=end). The plain compose (two roundings + only the first
+branch) is ~1 ULP off for |w|>=0.5 — MEASURED parity 1/7 on the first (non-FMA) attempt. Fixed the fused
+path to `coeff.mul_add(end-start, base)` (Rust mul_add = hardware FMA): VERIFIED **0/11 bit-match vs real
+torch, f32 AND f64** (empirical reverse-engineering probe against /tmp/torchvenv). So the no-grad path is
+now torch-EXACT (a parity FIX, not just perf). The grad/broadcast FALLTHROUGH keeps the plain compose
+(autograd ops can't FMA) so it retains the pre-existing ~1ULP |w|>=0.5 gap — the fused path is
+INTENTIONALLY not bit-equal to the fallthrough (lock test asserts fused == torch-FMA golden, NOT ==
+compose). NOTE: scalar tensor_lerp f64 no-grad path (`sv + weight*(ev-sv)`) has the SAME pre-existing
+FMA gap — follow-up: FMA-ify scalar lerp f64 + add an FMA tensor primitive for the grad paths.
+
+★MEASURE (`examples/lerp_weighted_h2h.rs`, 16M f64 no-grad, min-of-9, load ~38 heavily contended):
+FT_FUSED ~15ms vs torch ~25ms = **1.68x FASTER**, parity **0/7 bit-exact** (FMA). FT_ORIG(simple compose,
+= HEAD) 41.8ms = 1.16x SLOWER vs torch -> FLIP (internal ~2.8x; modest + noisy under load). Lock test
+`lerp_weighted_fused_matches_torch_fma` (f32+f64, weights span |w| </>= 0.5). LESSON: before fusing an
+interp/blend op, VERIFY the reference formula against REAL torch bit-for-bit — torch uses FMA + a 2-branch
+select for lerp; a "matches the compose" lock test passes while still being wrong vs torch (the first
+attempt measured 1/7 mismatch and the lock test was GREEN). AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: fused where with GENERAL broadcast cond (KEY-PADDING attention) — 17.67x SLOWER -> 3.4x FASTER
 
 Agent `SlateTern`. Generalizes BOTH fused `where` fast paths (`try_where_one_scalar` = `where(mask,
