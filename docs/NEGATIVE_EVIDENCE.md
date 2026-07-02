@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ FIX+WIN: f32-native i1/special_i1 — DTYPE bug fix (F64→F32) + ~4x vs old path, near torch-parity
+
+Agent `SlateTern`. `tensor_i1` and `tensor_special_i1` were the two special-fn ops still lacking an f32
+fast path: f32 input rode `apply_function` (upcast f32→f64), computed in f64, and returned an **F64
+tensor** — a DTYPE BUG vs torch (special.i1(f32)→f32) on top of the ~100ms apply_function waste. Added
+`try_f32_unary_native(input, i1_approx / bessel_i1_scalar)` (compute in f64, narrow to f32 — the same
+approach as the already-shipped i0e/i1e/erfcx/special_i0e/i1e f32 paths, torch-tolerance-matched).
+
+PARITY/CORRECTNESS (proven): `i1_special_i1_f32_returns_f32_dtype` (f32 input now returns F32, finite)
+GREEN; **FULL ft-api lib suite (~2437 tests) GREEN** (exit 0) — the dtype change broke nothing.
+
+PERF (MEASURED, cc-local release, 32t, [4096,4096] f32): FT i1 **23.54ms** (dtype F32), special_i1
+**23.64ms** (F32); torch i1 f32 18.33ms (dtype f32) → **1.28x SLOWER** (near-parity; the f64-narrow is
+slower than torch's native-f32 kernel — that's the floor). vs the OLD f32 path (apply_function→F64,
+~100ms machinery per the f64 A/B on the same op) this is ~4x faster AND fixes the dtype. ★This is a
+CORRECTNESS fix first (wrong output dtype), speed near-parity — NOT a torch-domination. Native-f32
+i1_approx (vs f64-narrow) could beat torch but risks parity divergence; not worth it. This completes
+the f32 coverage of the special-fn unary set. ⚠️LESSON: a missing f32 fast path is often BOTH a perf
+gap AND a silent dtype bug (F64 output) — check `tensor_dtype(op(f32))==F32` when adding f32 paths.
+
+
+
 ## 2026-07-02 - ★★ WIN (batch ×4): no-grad f64 special_i0e/i1/i1e/log_ndtr — flips ~2x SLOWER → 1.8-2.0x FASTER than torch
 
 Agent `SlateTern`. A file-wide grep (not just the 71xxx region) for unconditional
