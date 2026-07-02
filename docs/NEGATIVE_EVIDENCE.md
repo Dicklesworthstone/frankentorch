@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×4): no-grad f64 special_i0e/i1/i1e/log_ndtr — flips ~2x SLOWER → 1.8-2.0x FASTER than torch
+
+Agent `SlateTern`. A file-wide grep (not just the 71xxx region) for unconditional
+`save_for_backward(vals.to_vec())` in unary ops surfaced DUPLICATE `torch.special.*` alias
+implementations — `tensor_special_i0e/i1/i1e/log_ndtr` (@20407/20467/20500/20985) — SEPARATE from the
+`tensor_i0e/i1e` fixed earlier (@71xxx), each using plain `tensor_apply_function` with its own
+unconditional save-clone and DIFFERENT scalar fns (bessel_i0e_scalar / bessel_i1_scalar /
+bessel_i1e_scalar / log_ndtr_scalar). Added `try_f64_unary_native(input, <scalar>)` before each. Bit-exact.
+
+PARITY (proven): `special_bessel_lndtr_f64_nograd_match_apply_function` (all 4 == grad-forced
+apply_function, bit-exact, [-4,4)) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096]):
+  - special_i0e:     FUSED **20.25ms** vs ORIG 106.92ms = **5.28x**; torch 40.05ms → **1.98x FASTER**
+  - special_i1:      FUSED **24.41ms** vs ORIG 109.72ms = **4.49x**; torch 47.42ms → **1.94x FASTER**
+  - special_i1e:     FUSED **20.53ms** vs ORIG 103.36ms = **5.03x**; torch 39.21ms → **1.91x FASTER**
+  - special_log_ndtr:FUSED **17.96ms** vs ORIG 100.08ms = **5.57x**; torch 32.38ms → **1.80x FASTER**
+★NOTE: these use plain `tensor_apply_function` (NOT _with_create_graph) yet ORIG is still ~100-110ms —
+so the ~85ms overhead is the unconditional save-clone + apply_function NODE machinery, present in BOTH
+apply_function variants. ★LESSON: the unconditional-save vein has DUPLICATE alias impls (torch.special.*
+vs the bare name) — grep the WHOLE file, not one region; the aliases had their own copies. Total this
+vein: 10 ops flipped SLOWER→FASTER (erfinv/i0e/i1e/erfcx/digamma/i1 + special_i0e/i1/i1e/log_ndtr).
+f32-native for the no-f32 ones (special_i1) = separate dtype concern.
+
+
+
 ## 2026-07-02 - ★★ WIN (batch ×2): no-grad f64 digamma/i1 fast paths — flips ~3.6-3.7x SLOWER → 1.4-2.1x FASTER than torch
 
 Agent `SlateTern`. Continued the apply_function-unconditional-save harvest (systematic grep of the
