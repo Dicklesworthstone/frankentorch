@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔ STRUCTURAL BLOCKER (broadcast/expand): FT MATERIALIZES broadcasts, torch VIEWS them — ~2x gap is a view-floor, not a single lever. (+ bit-exact parallel Expand-backward reduction landed)
+
+Agent `SlateTern`. Dug the next flagged lever — broadcast-backward (the reduction half of broadcasting;
+every bias-gradient in training). Confirmed a real ~2x gap: `(a[R,C]+b[bcast]).sum().backward()` FT ~200ms
+vs torch ~72-80ms; pure `expand(b).sum().backward()` FT 147-189ms vs torch 67-71ms. LANDED a genuine
+improvement: `TensorNodeOp::Expand` backward was a SERIAL scatter-add reduction
+(`contrib[orig_idx] += incoming[k]` over all out_numel outputs). Replaced with a BIT-EXACT PARALLEL
+gather — each `contrib[o]` sums its contributing elements independently in ascending output-flat order (a
+mixed-radix odometer over the broadcast dims, leftmost/largest-stride dim most-significant = the serial
+visit order, so the f64 sum is identical; no write contention; parallelized over `o`, gated on out_numel
+not orig_numel). Verified: grad matches torch to ~1 ULP (gb[0] bit-identical, gb[-1] 1 ULP = reduction
+order), ft-autograd 477/477, ft-conformance expand/broadcast green.
+
+★★BUT it does NOT flip the benchmark (still ~2x SLOWER) — split-timing shows fwd ~73-88ms AND bwd
+~73-100ms, both slow. ROOT CAUSE (structural, not a bug): FT **materializes** a broadcast into a full
+16.7M-element tensor (`expand_row_structured`, already parallel), then Add/Mul/backward all process the
+full 128MB intermediate + allocate 128MB grads for it. torch's `expand` is a **zero-copy strided VIEW** —
+no materialization, ops run strided, backward reduces without a materialized intermediate. This is the
+same VIEW-FLOOR as diagonal/transpose (see [[project_...]]): FT can gap-close but CANNOT dominate an op
+torch implements as a view. ★The Expand-backward parallelization is still correct+useful (real
+broadcast-backprop reduces a materialized grad faster), but the broadcast OP FAMILY as a whole is
+view-floor-capped. NEXT real win must avoid this class — broadcasting is not a single-lever perf target;
+it would need FT to adopt strided broadcast VIEWS end-to-end (deep architectural change, not in-lane).
+
 ## 2026-07-02 - ★ WIN #9 (gap-close to parity): fuse exp/log/sigmoid/tanh/relu backward — serial-SLOWER → parity/1.02-1.13x FASTER (torch at bandwidth ceiling)
 
 Agent `SlateTern`. Completed the core activation-backward fusion: `Exp`, `Log`, `Sigmoid`, `Tanh`, `Relu`

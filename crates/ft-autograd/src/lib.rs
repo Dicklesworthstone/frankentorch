@@ -14173,34 +14173,67 @@ impl TensorTape {
                         "expand backward output shape volume overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, out_numel, incoming.len())?;
-                    let mut contrib = vec![0.0; orig_numel];
-
+                    // Bit-exact PARALLEL broadcast-reduction. Instead of the serial
+                    // scatter-add `contrib[orig_idx] += incoming[k]` over all out_numel
+                    // outputs, compute each contrib[o] INDEPENDENTLY by gathering its
+                    // contributing incoming elements in ascending output-flat order — a
+                    // mixed-radix odometer over the broadcast dims with the leftmost
+                    // (most-significant / largest-stride) dim first. Ascending flat order
+                    // == the serial visit order for a fixed reduced index, so the f64 sum
+                    // is bit-for-bit identical; parallelizing over `o` has no write
+                    // contention. Gated on out_numel (the work), not orig_numel (lane
+                    // count, often small e.g. a bias vector). frankentorch-expand-bwd-par.
                     let grad_strides = ft_core::contiguous_strides(&output_shape);
                     let orig_strides = ft_core::contiguous_strides(original_shape);
-                    let mut coords = vec![0usize; ndim];
-
-                    for _ in 0..out_numel {
-                        let mut orig_idx = 0usize;
-                        let mut grad_idx = 0usize;
-                        for d in 0..ndim {
-                            grad_idx += coords[d] * grad_strides[d];
-                            if d >= prefix {
-                                let input_dim = d - prefix;
-                                if original_shape[input_dim] != 1 {
-                                    orig_idx += coords[d] * orig_strides[input_dim];
-                                }
+                    // Split the output dims into KEPT (coord taken from o) and BROADCAST
+                    // (summed over). A dim is broadcast if it is a leading prefix dim, or
+                    // the corresponding input dim has extent 1.
+                    let mut kept: Vec<(usize, usize)> = Vec::new(); // (input_dim, grad_stride)
+                    let mut bcast: Vec<(usize, usize)> = Vec::new(); // (extent, grad_stride), ascending d
+                    for d in 0..ndim {
+                        if d >= prefix {
+                            let input_dim = d - prefix;
+                            if original_shape[input_dim] != 1 {
+                                kept.push((input_dim, grad_strides[d]));
+                                continue;
                             }
                         }
-                        contrib[orig_idx] += incoming[grad_idx];
-
-                        for d in (0..ndim).rev() {
-                            coords[d] += 1;
-                            if coords[d] < output_shape[d] {
-                                break;
-                            }
-                            coords[d] = 0;
-                        }
+                        bcast.push((output_shape[d], grad_strides[d]));
                     }
+                    // Suffix products so the flat combo index j decodes with the first
+                    // (leftmost) broadcast dim most-significant -> incrementing j walks the
+                    // gathered offsets in ascending output-flat order.
+                    let mut bcast_suffix = vec![1usize; bcast.len()];
+                    for i in (0..bcast.len().saturating_sub(1)).rev() {
+                        bcast_suffix[i] = bcast_suffix[i + 1] * bcast[i + 1].0;
+                    }
+                    // 1 for no broadcast dims; 0 if any output dim has extent 0 (=> no
+                    // contributions, matching the serial loop's zero iterations).
+                    let bcast_count: usize = bcast.iter().map(|&(e, _)| e).product();
+                    let incoming_ref: &[f64] = &incoming;
+                    let compute = |o: usize| -> f64 {
+                        let mut base = 0usize;
+                        for &(input_dim, gstride) in &kept {
+                            let c = (o / orig_strides[input_dim]) % original_shape[input_dim];
+                            base += c * gstride;
+                        }
+                        let mut sum = 0.0;
+                        for j in 0..bcast_count {
+                            let mut off = base;
+                            for (bi, &(_, gstride)) in bcast.iter().enumerate() {
+                                let coord = (j / bcast_suffix[bi]) % bcast[bi].0;
+                                off += coord * gstride;
+                            }
+                            sum += incoming_ref[off];
+                        }
+                        sum
+                    };
+                    let contrib: Vec<f64> = if out_numel >= (1 << 15) {
+                        use rayon::prelude::*;
+                        (0..orig_numel).into_par_iter().map(compute).collect()
+                    } else {
+                        (0..orig_numel).map(compute).collect()
+                    };
 
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
