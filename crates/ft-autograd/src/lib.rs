@@ -12450,14 +12450,22 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Silu { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fuse the parallel derivative map straight into the grad slot (no scratch
+                    // Vec, no serial accumulate) and borrow the input zero-copy. Bit-for-bit
+                    // identical to the prior tensor_backward_zip_map + accumulate_tensor_gradient.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| {
                             let s = 1.0 / (1.0 + (-x).exp());
                             g * s * (1.0 + x * (1.0 - s))
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        },
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12482,14 +12490,20 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Elu { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| {
                             let derivative = if x <= 0.0 { x.exp() } else { 1.0 };
                             g * derivative
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        },
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12498,14 +12512,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Rsqrt { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map (was a fully SERIAL map + serial accumulate) into the
+                    // grad slot; output borrowed zero-copy. frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(g, y)| g * (-0.5 * y * y * y))
-                        .collect();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |g, y| g * (-0.5 * y * y * y),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12514,14 +12531,18 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Erf { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
                     let coeff = 2.0 / std::f64::consts::PI.sqrt();
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g * coeff * (-x * x).exp()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g * coeff * (-x * x).exp(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12608,18 +12629,24 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Softplus { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| {
                             let grad = if x > 20.0 {
                                 1.0
                             } else {
                                 1.0 / (1.0 + (-x).exp())
                             };
                             g * grad
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        },
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,

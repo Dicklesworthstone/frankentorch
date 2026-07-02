@@ -1,5 +1,36 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN #5 (NEW class: activation/unary backward): fused derivative-map into grad slot — rsqrt/erf FLIP to FASTER, silu/elu/softplus gap-close 3.5x→1.3x
+
+Agent `SlateTern`. Different op CLASS from the reduction backwards: elementwise-unary/activation
+backward arms. Found via act_bwd_h2h.rs: FT was 1.4-3.7x SLOWER than torch. Root cause = the SAME
+serial-accumulate waste — these arms compute the derivative with a parallel `tensor_backward_zip_map`
+(or a FULLY serial `.iter().zip().map().collect()`) into a scratch `Vec`, then a **serial**
+`accumulate_tensor_gradient` copy into the grad slot, plus a 128MB input clone. Fix (5 arms: Rsqrt,
+Silu, Erf, Elu, Softplus): swap to the fused `accumulate_tensor_gradient_zip_map` (parallel map
+straight into the slot, no scratch, no serial accumulate) + borrow input/output zero-copy via
+`operand_values_cow`. Bit-for-bit identical (grad rolling-hash fingerprint IDENTICAL FUSED vs ORIG for
+all 5).
+
+Measured ([4096,4096] f64, `sum().backward()`; 64c; torch 2.12.1+cpu 64 threads; act_bwd_h2h.rs):
+  - rsqrt:    ORIG 322.6 → FUSED 100.2ms (3.2x internal); vs torch 113.1ms = **1.13x FASTER** (was 2.85x SLOWER)
+  - erf:      ORIG 261.6 → FUSED 101.0ms (2.6x internal); vs torch 181.3ms = **1.80x FASTER** (was 1.44x SLOWER)
+  - silu:     ORIG 251.0 → FUSED  97.6ms (2.6x internal); vs torch  73.4ms = 1.33x SLOWER (was 3.42x)
+  - elu:      ORIG 263.5 → FUSED 101.4ms (2.6x internal); vs torch  71.8ms = 1.42x SLOWER (was 3.67x)
+  - softplus: ORIG 269.9 → FUSED 105.5ms (2.6x internal); vs torch  75.2ms = 1.40x SLOWER (was 3.59x)
+ft-autograd 477/477 green.
+
+★KEY: after the backward fix all 5 land at a UNIFORM ~100ms floor regardless of op cost (rsqrt cheap,
+erf/silu heavy exp) → the remaining floor is the FORWARD apply_function's unconditional
+`save_for_backward(to_vec)` 128MB clone + forward map, NOT the backward. That's why rsqrt/erf (whose
+torch backward is slow, 113/181ms) FLIP but silu/elu/softplus (torch ~72-75ms) only gap-close. ★NEXT
+LEVER (to flip the rest): since backward now reads input via `operand_values_cow` (borrows the tape
+node directly), the forward's separate saved-input clone is REDUNDANT for these ops — eliminating it
+would drop the ~100ms floor and flip silu/elu/softplus too (deeper: decouple save_for_backward, shared
+infra, higher risk). ★REMAINING ARMS this class (~22 more): 12 use `tensor_backward_zip_map`+accumulate,
+15 use serial `.iter().zip().map().collect()`+accumulate — all convertible to `accumulate_tensor_gradient_zip_map`
+(mechanical, bit-exact); do in batches, bench the heavy-exp ones.
+
 ## 2026-07-02 - ★★ WIN #4 (backward-fusion vein): fused prod_dim backward — flips fully-serial SLOWER → 6.2x FASTER
 
 Agent `SlateTern`. Fourth harvest of the ft-autograd backward-fusion vein. `TensorNodeOp::ProdDim`
