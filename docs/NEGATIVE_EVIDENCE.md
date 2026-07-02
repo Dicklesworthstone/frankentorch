@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: try_f64_binary_native helper — rel_entr f64 fused — ~20x internal, 2.88x SLOWER -> 7.04x FASTER (+ xlog1py REJECTED)
+
+Agent `SlateTern`. BINARY analog of the try_f64_unary_native vein: added `try_f64_binary_native` (mirror
+of try_f32_binary_native, F64, `f(x,y)` one pass, no narrowing). rel_entr f64 was a ~13-tape-op compose
+(2 full + lt/le/gt/and/eq/div/log/mul + 3 where). Fused with a closure matching the compose's
+where-precedence. ⚠️PARITY LANDMINE (differential-testing catch): my first closure gave `inf` for
+x=NaN,y<=0, but the compose's inf-arm is `y_invalid = (y<=0) AND (x>0)` — NaN>0 is false, so the compose
+gives NaN. Fixed the closure to `if x==0 {0} else if y<=0 && x>0 {inf} else if x<0 {inf} else x*ln(x/y)`
+(x>0 guard) -> bit-exact to the compose (lock test with x=NaN,y<=0 seeded). The f32 closure elides the
+x>0 guard (its edge isn't conformance-covered; left as-is).
+
+★MEASURE (16M f64 no-grad, min-of-7, load ~28): rel_entr FUSED **10.3ms vs FT_ORIG(compose) 204ms =
+~20x internal**; vs torch baseline `x*log(x/y)` (72ms, torch has no special.rel_entr in this build):
+**2.88x SLOWER -> 7.04x FASTER**. Lock test `rel_entr_f64_fused_matches_compose` (NaN/x<0/y<=0 edges).
+
+⛔xlog1py REJECTED-lever: its f64 compose is only ~4 SIMD ops (log1p+mul+eq+where) MEASURED ~24.8ms; the
+scalar fused path (28.97ms, is_nan branch) is SLOWER — DON'T fuse. LESSON (mirrors bucketize/multilabel):
+a compose fuses profitably only when it's MANY tape passes; a ~4-op SIMD-kernel compose already beats a
+scalar single pass. Check the ORIG compose time BEFORE assuming a compose is slow. REMAINING try_f64_binary
+candidates: igamma/igammac (7-op composes but heavy series closures — verify), zeta (Cephes, skip).
+AGENT SlateTern.
+
 ## 2026-07-02 - ★★ WIN: try_f64_unary_native batch 2 — softsign/deg2rad/rad2deg f64 fused — 5-6x internal, all flip to FT-FASTER
 
 Agent `SlateTern`. Continued the try_f64_unary_native vein (helper from 27462952). Grepped
