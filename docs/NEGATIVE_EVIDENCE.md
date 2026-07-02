@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×2): no-grad f64 igamma/igammac borrow fast path — 3.2-3.3x internal, 2.9-3.1x FASTER than torch
+
+Agent `SlateTern`. A BINARY sibling of the specfn no-grad vein: `tensor_igamma`/`tensor_igammac` had an
+f32 binary fast path but their no-grad f64 path CLONED both inputs via `tensor_values(input)` +
+`tensor_values_lossy_f64(other)` (2× full-numel copies) before `par_zip_map`. Added
+`try_f64_binary_native(input, other, igamma_approx / igammac_approx)` (BORROWS both contiguous buffers
+zero-copy + par_iter.zip) before the clone path. Bit-exact (same *_approx, index-order zip).
+
+PARITY (proven): `igamma_igammac_f64_borrow_match_apply_function` (fused == grad-forced apply_function,
+bit-exact) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096] f64):
+  - igamma:  FUSED **75.27ms** vs ORIG-clone 250.16ms = **3.32x** internal; torch 216.82ms → **2.88x FASTER**
+  - igammac: FUSED **75.77ms** vs ORIG-clone 238.54ms = **3.15x** internal; torch 236.81ms → **3.13x FASTER**
+The ORIG "clones" were ~175ms (not a mere memcpy) — `tensor_values`/`tensor_values_lossy_f64` are far
+heavier than a borrow (likely serial copies + the lossy path's conversion loop). FUSED at ~75ms is the
+igamma_approx COMPUTE floor (heavy incomplete-gamma per element, 16M/32cores); torch's scalar igamma at
+~217-237ms is genuinely slow, so FT parallel dominates ~3x. ★NEW SUB-VEIN: BINARY special ops with an
+f32 binary fast path but a tensor_values-CLONE f64 no-grad path — grep `try_f32_binary_native` then
+check the f64 path for `tensor_values(` + `par_zip_map`; add try_f64_binary_native. FOLLOW-UP LEADS:
+hypot/zeta have f32 binary paths (bin32=1, bin64=0) — verify their f64 no-grad path clones, mirror.
+
+
+
 ## 2026-07-02 - ★ FIX+WIN: f32-native i1/special_i1 — DTYPE bug fix (F64→F32) + ~4x vs old path, near torch-parity
 
 Agent `SlateTern`. `tensor_i1` and `tensor_special_i1` were the two special-fn ops still lacking an f32
