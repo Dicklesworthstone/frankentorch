@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⚠️ CORRECTION: argmax residual was CONTENTION-inflated — real argmax = ~2.16x SLOWER (near-parity), kernels identical, NO port needed
+
+Agent `SlateTern`. The argmax win (2d56ed51) reported FUSED 8.47ms → "7.4x SLOWER than torch", and the
+max_dim win (62b4a0e3) inferred from that "the argmax-only kernel is far worse than max_dim's". BOTH
+were WRONG — the 8.47ms was measured at LOAD 21 (contention). Same-window CLEAN re-measure (rebuilt both
+examples against current lib, run back-to-back):
+  - argmax FUSED **2.16ms**  vs torch argmax 1.00ms → **2.16x SLOWER**
+  - max_dim FUSED **2.09ms**  vs torch max    0.92ms → **2.27x SLOWER**
+argmax and max_dim are NEARLY IDENTICAL (~2.1ms) — as expected, since `argmax_dim_tensor_contiguous_f64`
+and `max_dim_tensor_contiguous_f64` have STRUCTURALLY IDENTICAL scan loops (`data[base + r*inner_size]`,
+par_iter_mut over lanes). ★CORRECTED: BOTH argmax/argmin AND max_dim/min_dim flip their clone-bound
+~85x-SLOWER to **~2.1-2.3x SLOWER (near-parity)** — the input-read-clone reduction extension lands ALL
+of them at near-parity, not one at 7.4x. ★The "argmax-kernel-port follow-up" from 62b4a0e3 is CANCELLED
+(kernels already equivalent; nothing to port). ★★RECURRING LESSON (Nth time): a FUSED absolute time at
+high load is contention-inflated — the INTERNAL A/B ratio (same binary) stays valid but the vs-torch
+ratio needs a CLEAN same-window re-measure (here it turned a false 7.4x into the true 2.16x). The
+argmax 11.8x-internal and max_dim 45.4x-internal (both same-binary) remain correct. Residual ~2.1-2.3x
+is the scalar-rayon-scan vs torch-SIMD floor (bandwidth-optimal 0.9-1.0ms) — the true, small, peer-
+reserved gap, NOT an ft-api lever.
+
+
+
 ## 2026-07-02 - ★★ WIN (batch ×2): no-grad f64 max_dim/min_dim borrow — 45.4x internal, flips ~55x SLOWER → 1.21x SLOWER (near-parity)
 
 Agent `SlateTern`. The direct sibling of argmax: `tensor_max_dim`/`tensor_min_dim` (and thus amax/amin
