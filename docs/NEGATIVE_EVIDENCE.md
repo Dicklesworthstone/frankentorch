@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔ REJECT + KEY MECHANISM: apply_function NODE overhead is negligible — only the UNCONDITIONAL save-clone costs
+
+Agent `SlateTern`. Tested the hypothesis that `apply_function_with_create_graph`'s node/dispatch
+machinery (independent of the save-clone) is a per-op tax worth bypassing. Probed `selu` — its no-grad
+f64 path goes through apply_function but BORROWS the input (`vals` provided by apply_function, not
+cloned) and its save is CONDITIONAL (`if needs_input_grad`, skipped for no-grad). Added a
+`try_f64_unary_native` bypass (same closure) behind an FT_ORIG gate.
+
+MEASURED (cc-local release, A/B, 32t, [4096,4096] f64): FUSED-bypass **7.88ms** vs ORIG-apply_function
+**7.71ms** = WITHIN NOISE (ORIG slightly FASTER). REJECTED + reverted. ★★KEY MECHANISM (resolves the
+whole vein): apply_function's node/dispatch overhead is NEGLIGIBLE (~0). The ~85-105ms overhead that
+made erfinv/i0e/i1e/erfcx/special_* levers was ENTIRELY the UNCONDITIONAL `save_for_backward(vals.to_
+vec())` full-numel serial clone (and for the clone-lever ops, the `contiguous_values_as_f64().to_vec()`
+input clone). Once the save is CONDITIONAL (skipped for no-grad) OR the input is BORROWED, apply_function
+is already fast. selu is already 2.7x FASTER than torch (21.39ms) either way. ★THEREFORE the conditional-
+save apply_function ops — ndtr / log_ndtr / ndtri / exp2 / acosh / cbrt / selu — are NOT levers (already
+optimal); DON'T probe them. The ONLY apply_function levers are UNCONDITIONAL-save (harvested) + input-
+read-CLONE (harvested). Both veins are now provably exhausted with the mechanism understood.
+
+
+
 ## 2026-07-02 - ★★ WIN (batch ×3): no-grad f64 gammaln/i0/airy_ai borrow — flips ~3x SLOWER → 1.7-4.1x FASTER (input-read-clone lever)
 
 Agent `SlateTern`. The GENERAL input-read-clone lever (broader than specfn): grep for
