@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN + DTYPE-PARITY-FIX: tensor_gelu_tanh f32 — returns F32 (was F64) + fused f32 path — compose 70.6ms -> 5.7ms (~12x)
+
+Agent `SlateTern`. Follow-up to 3cde1d96 (f64 gelu_tanh fusion). Two fixes in one: (1) PARITY: the
+gelu_tanh compose built its `1.0` const via `full(shape, 1.0)` = always F64, so `1 + tanh(..)` promoted
+an f32 input through F64 and `gelu_tanh(f32)` WRONGLY RETURNED F64 (torch preserves dtype). Changed to
+`full_like(input, 1.0)` -> f32 in / f32 out (f64 unchanged: full_like(f64)=F64). (2) PERF: enabled the
+f32 no-grad fused path (native f32, `0.5*x*(1+tanh(beta*(x+kappa*x^3)))`) — the f32 compose after the
+dtype fix is bit-exact to native-f32 (f32::tanh == the compose's f32 tanh, lock-verified).
+
+★MEASURE (16M no-grad, min-of-7, load ~30): f32 FUSED **5.7ms vs FT_ORIG(compose) 70.6ms = ~12.4x
+internal** (f32 = half the bytes -> faster than f64's 10.9ms); f64 11.6x. Lock test extended to f32+f64
+with an F32-dtype regression guard (`gelu_tanh(f32) must return F32`). Full ft-conformance GREEN after
+the dtype change (no golden captured the buggy F64). ★LESSON: `full(shape, v)` is always F64 — in a
+dtype-preserving compose use `full_like(input, v)`; grep composes for `full(` consts feeding f32 ops
+(same class as the masked_fill f32 crash + gaussian_nll f32 bug). AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: fused tensor_gelu_tanh (GPT-2/BERT GELU) one-pass — compose 125.7ms -> 9.45ms (~13x), 4.00x SLOWER -> 3.46x FASTER vs torch
 
 Agent `SlateTern`. Applied the logsigmoid recipe to the tanh-approx GELU (`F.gelu(x,

@@ -33,11 +33,13 @@ print("VALS"," ".join("%.17g"%v for v in o.tolist()))
     let mm = fv.iter().zip(&pv).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
     println!("parity: {mm}/{} bit-mismatch, max_abs_diff={maxad:.2e}", pv.len());
 
-    // perf: 16M f64 no-grad
+    // perf: 16M no-grad, f64 and f32
     let n = 16_000_000usize;
     let xd: Vec<f64> = (0..n).map(|i| ((i % 4000) as f64) * 0.005 - 10.0).collect();
+    let xf32: Vec<f32> = xd.iter().map(|&v| v as f32).collect();
     let orig = std::env::var("FT_ORIG").is_ok();
     let mut best = f64::INFINITY;
+    let mut best32 = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = s.tensor_variable(xd.clone(), vec![n], false).unwrap();
@@ -45,8 +47,15 @@ print("VALS"," ".join("%.17g"%v for v in o.tolist()))
         let _ = s.tensor_gelu_tanh(x).unwrap();
         let e = t.elapsed().as_secs_f64() * 1e3;
         if e < best { best = e; }
+        let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x2 = s2.tensor_variable_f32(xf32.clone(), vec![n], false).unwrap();
+        let t2 = Instant::now();
+        let _ = s2.tensor_gelu_tanh(x2).unwrap();
+        let e2 = t2.elapsed().as_secs_f64() * 1e3;
+        if e2 < best32 { best32 = e2; }
     }
     let label = if orig { "FT_ORIG(compose)" } else { "FT_FUSED" };
+    println!("  gelu_tanh(16M,f32) {label} {best32:.3}ms", );
     let py_b = format!(
         r#"
 import time,torch,torch.nn.functional as F
