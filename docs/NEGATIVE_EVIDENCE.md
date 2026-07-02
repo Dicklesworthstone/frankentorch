@@ -14011,3 +14011,22 @@ file-swap to HEAD, min-of-9, load ~22-89, contention-invariant): sub/div **~36ms
 win); ~2.2x FASTER vs torch's ~12ms fused scalar broadcast. Tests: ft-api 2404 + ft-conformance 276,
 all 0 failed. ★BROADCAST-FUSION VEIN NOW COVERS ALL 3 SHAPES × 4 OPS: last-dim vector, row scalar, and
 full scalar, for add/sub/mul/div — the whole common broadcast surface fuses (no expand), 2-6.5x. AGENT SlateTern.
+
+## 2026-07-01 - ★★ WIN: no-grad fused maximum/minimum broadcast — ~12-15x internal (65ms->4ms), 5x SLOWER -> 2.9x FASTER
+
+Agent `SlateTern`. Extended the fused-broadcast enum with Max/Min (NaN-propagating, matching the
+`max_tensor_contiguous` kernel: `if a.is_nan()||b.is_nan() {NAN} else {a.max(b)}` — commutative). Wired
+into tensor_maximum/tensor_minimum's broadcast fallthrough (last-dim / row-scalar / full-scalar).
+⚠️maximum/minimum's ORIG broadcast path was FAR worse than add/mul's: `broadcast_to(lhs, out) +
+broadcast_to(rhs, out) + tensor_max` — TWO full materializations (including a redundant clone of the
+already-full `[N,M]` operand) + a separate max pass, vs add/mul's more-optimized tape binary broadcast.
+
+★MEASURE (bcast_maxmin_ng [4096,4096] f32 NO-GRAD, inputs OUTSIDE timer, min-of-9, ORIG via file-swap
+to HEAD, same session, load ~33): last-dim [M] **65.4ms -> 4.2ms = ~15.5x**; full-scalar [1] **68.6ms ->
+5.5ms = ~12.5x** — the BIGGEST broadcast win (the fallthrough's double-materialize was ~5x SLOWER than
+torch's ~12ms; fused ~4-5ms = ~2.9x FASTER vs torch). Bit-identical INCLUDING NaN (lock test
+maxmin_bcast_fused_matches_expand_path_with_nan: fused == expand for max/min × all 3 shapes × both
+orders, with NaN seeded in both operands). Tests: ft-api 2404 + ft-conformance 276, all 0 failed.
+★LESSON: an op whose broadcast fallthrough calls `broadcast_to` on BOTH operands (even the already-
+full one) pays a redundant clone + double pass — much worse than a tape binary broadcast; the fused
+per-row/scalar path is a ~12-15x win there (vs ~2-6x for the already-optimized add/mul). AGENT SlateTern.
