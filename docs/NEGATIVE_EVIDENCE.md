@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×3): no-grad f64 i0e/i1e/erfcx fast paths — ~5x internal, flips ~2.5x SLOWER → 1.4-2.15x FASTER than torch
+
+Agent `SlateTern`. Harvested the vein erfinv (1e11d63f) exposed: `tensor_i0e`/`tensor_i1e`/`tensor_erfcx`
+all rode `apply_function_with_create_graph` for f64 with an UNCONDITIONAL `save_for_backward(vals.to_
+vec())` (128MB no-grad clone) + a create_graph node. Added `try_f64_unary_native(input, <approx>)`
+before each apply_function call (i0e_approx / i1e_approx / erfcx_approx) — same par_map, leaf, no node,
+no save-clone. Bit-exact (identical approx fn; par_map == par_iter map, index-order).
+
+PARITY (proven): `i0e_i1e_erfcx_f64_nograd_match_apply_function` (all 3 fast paths == grad-forced
+apply_function, bit-exact, [-4,4)) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096]):
+  - i0e:   FUSED **20.41ms** vs ORIG 105.83ms = **5.19x** internal; torch 40.74ms → **2.00x FASTER**
+  - i1e:   FUSED **19.71ms** vs ORIG 101.01ms = **5.12x** internal; torch 42.31ms → **2.15x FASTER**
+  - erfcx: FUSED **22.38ms** vs ORIG 104.97ms = **4.69x** internal; torch 31.28ms → **1.40x FASTER**
+ORIG apply_function is ~101-106ms for ALL three (matches erfinv's 105ms) — CONFIRMS the overhead is the
+create_graph node + unconditional save-clone, ~85ms independent of the op. Each flips ~2.5x SLOWER →
+torch-FASTER. ★NOTE: left f32 alone — for i0e/i1e the current f32 path upcasts via apply_function and
+returns F64 (a separate dtype concern); adding an f32-native path would CHANGE the output dtype, out of
+scope for this bit-exact-f64 batch. REMAINING VEIN LEADS: ndtr/ndtri already have CONDITIONAL saves
+(skip the clone for no-grad → only node overhead, marginal); erf/erfc go through the tape (not
+apply_function). So the create_graph-unconditional-save sub-vein is now HARVESTED (erfinv+i0e+i1e+erfcx);
+grep `save_for_backward(vals.to_vec()` / `.clone()` NOT guarded by `needs_input_grad` for any stragglers.
+
+
+
 ## 2026-07-02 - ★★ WIN: no-grad f64 erfinv fast path — 7.64x internal, flips ~5x SLOWER → 1.62x FASTER than torch (bit-exact) + RICH VEIN
 
 Agent `SlateTern`. `tensor_erfinv` had a `try_f32_unary_native` f32 fast path but f64 went through
