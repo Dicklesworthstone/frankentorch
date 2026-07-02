@@ -37,6 +37,17 @@ one-turn hoist. Bit-exactness caveat: pre-COMBINING weights (w00=wx0*wy0) change
 (`(v*wx0)*wy0` vs `v*(wx0*wy0)`) -> breaks the bit-exact grid_sample goldens; keep the 4 separate weights.
 DON'T attempt the naive hoist. AGENT SlateTern.
 
+★ADDENDUM (native-f32 sub-lever also REJECTED, analysis): the f32 path runs grid_sample_f64 (generic-T)
+on f32 storage — MATH IN F64, then `v as f32` (bit-identical-to-f64-narrowed contract, lever-1). A
+native-f32 gather+interp (f32 weights/sum, no per-tap f32->f64 convert) would (a) give only a MARGINAL
+speedup — the 4-tap gather is CACHE-MISS bound, not arithmetic-width bound, and the f32->f64 converts are
+cheap; and (b) BREAK the f32==f64-narrowed self-consistency contract (f32-native rounds differently than
+f64-then-narrow — the current path is actually MORE accurate than torch's f32). Not worth the parity-risk
+for a marginal gain. ★grid_sample is now FULLY characterized: both one-turn sub-levers (compute-hoist,
+native-f32) rejected with reasons; the ONLY real lever = block-output-by-input-tile + SIMD-4-tap-over-
+channels (needs unsafe disjoint-position writes or an output transpose) = a DEDICATED multi-session
+kernel rewrite. This is the last op still SLOWER than torch; everything else is FT-faster/fused.
+
 ## 2026-07-02 - ⛔ HARVESTED: SCAN ops (cumsum/cumprod/logcumsumexp) all FT-FASTER — don't re-probe
 
 Agent `SlateTern`. `examples/scan_gapfind_h2h.rs` (16M f64 [4096,4096] no-grad, vs torch 8-thread):
