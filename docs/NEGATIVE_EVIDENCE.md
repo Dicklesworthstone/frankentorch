@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (NEW class: RNG/random-tensor gen): parallel Box-Muller for randn — 3.01x FASTER vs torch, bit-exact
+
+Agent `SlateTern`. NEW class found by the "partially-harvested vein" method. FT's random ops
+(`self.rng`, Xoshiro256PlusPlus, 97 uses: randn/rand/dropout/bernoulli/init) were FULLY SERIAL. KEY
+INSIGHT: torch's randn is ALSO single-threaded (its default CPU generator is sequential) — measured
+torch randn f64 [16.7M] = 304ms, FT serial = 287ms (near-parity). So FT can WIN by parallelizing where
+torch doesn't. The RNG stream itself is sequential (can't parallelize xoshiro cheaply without a
+jump-polynomial), BUT for `randn` the expensive ~90% is the per-pair Box-Muller TRANSFORM (ln/sqrt/cos/
+sin), NOT the RNG stepping. Split it: SERIAL pass draws the accepted raw-u64 pairs (cheap xoshiro +
+the exact `u1>0` retry, preserved as `(g>>11)!=0`), PARALLEL pass does the division + Box-Muller into
+the output. Bit-for-bit identical (same draws, same order, same formula, same [a,b]/trailing-cos layout).
+
+Measured ([16.7M] f64, 64c; torch 2.12.1+cpu; examples/randn_time.rs; A/B via FT_SERIAL_NORMAL gate):
+  - SERIAL 286.9ms -> **PAR 100.97ms = 2.84x internal**; vs torch 304.16ms = **3.01x FASTER**
+BIT-EXACT: PAR grad fingerprint == SERIAL fingerprint (0xd724af4654d13d31), both p. randn = weight-init,
+used in every model. ★FLOOR: the ~101ms PAR is now dominated by the SERIAL raw-u64 draw (+128MB raws/out
+allocs) — parallelizing THAT needs the xoshiro arbitrary-skip jump-polynomial (GF(2) char-poly, complex/
+risky, deferred). ★GENERALIZES: same split applies to other transform-heavy random ops (gamma via
+next_gamma, etc.); rand (uniform) has a CHEAP transform so its cost is the RNG draw = not helped by this
+split (needs jump-polynomial). frankentorch-randn-par.
+
 ## 2026-07-02 - ⛔ TWO BLOCKERS surfaced: (1) CyclicLR test is an IRRECONCILABLE contradiction, (2) in-lane clean-perf frontier is thinning
 
 Agent `SlateTern`. Dug for the next win; both leads are blockers, surfaced (no code landed — reverted an
