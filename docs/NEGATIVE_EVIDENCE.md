@@ -1,6 +1,6 @@
 # FrankenTorch Negative-Evidence Ledger
 
-## 2026-07-02 - ★ SHIPPED (bit-exact): fused broadcast-tile binop — additive attention-bias `scores + bias[1,1,S,S]`
+## 2026-07-02 - ★ SHIPPED (bit-exact): fused broadcast-tile binop — additive attention-bias `scores + bias[1,1,S,S]` — 6.9-8.8x internal, flips ~10-14x SLOWER → ~1.2-1.9x SLOWER (bandwidth-parity)
 
 Agent `SlateTern`. Extends the where/masked_fill attention-fusion vein to the ARITHMETIC binops
 (add/sub/mul/div). The additive attention-bias pattern `scores[B,H,S,S] + bias[1,1,S,S]` (ALiBi /
@@ -23,15 +23,23 @@ PARITY (absolute, PROVEN): bit-identical to the tape broadcast op — same opera
 [B,1,1,S], [b,1,s,s]) × 2 operand orders × 2 dtypes = 80 combos, all bit-exact vs the grad-forced
 broadcast fallthrough (rch hz1, `cargo test -p ft-api --lib bcast_tile_binop`, 1 passed 0 failed).
 
-PERF: torch baseline (local, 32 threads) add [16,16,128,128]+[1,1,128,128] f64 4.46ms / f32 0.85ms /
-keypad f32 0.82ms. ⚠️ HONEST GAP: the FT-fused FT_ORIG A/B timing was NOT captured this session — the
-release example built (`Finished release in 36.31s`) but the run hit the rch artifact-retrieval binary-
-path bug (`./target/release/examples/... No such file` — the known cc-local/CARGO_TARGET_DIR gotcha),
-and I was time-boxed to ship. The speedup is INFERRED (not independently measured here) from the
-byte-identical mechanism of the already-measured where/masked_fill siblings (both ~44-79x internal by
-removing the same 128MB broadcast clone). FOLLOW-UP: capture the FT_ORIG A/B via the cc-local LOCAL
-build (`CARGO_TARGET_DIR=...-cc-local cargo build --release --example bcast_tile_add_h2h`) to confirm
-the ratio and flip the ★ to ★★. The CODE is real + bit-exact + tested; only the ratio is deferred.
+PERF (MEASURED, cc-local LOCAL release build, RAYON_NUM_THREADS=32, min-of-9, [16,16,128,128] +
+[1,1,128,128] tile = 4.2M elems): FT_ORIG same-binary A/B (contention-robust) —
+  - add f64:   FUSED 2.01ms vs ORIG 17.61ms = **8.76x** internal
+  - add f32:   FUSED 1.09ms vs ORIG  9.44ms = **8.66x** internal
+  - keypad f32:FUSED 1.29ms vs ORIG  8.90ms = **6.90x** internal
+The internal ratio is the ROCK-SOLID number (same binary, back-to-back, immune to the load ~18
+contention this window). vs torch (same window, min-of-9, 32t): f64 1.68ms / f32 0.65ms / keypad
+0.69ms. So the fusion flips ~**10.5-14.5x SLOWER → ~1.2-1.9x SLOWER** (f64 2.01/1.68=1.20x, f32
+1.09/0.65=1.68x, keypad 1.29/0.69=1.87x). ⚠️ HONEST: this is GAP-CLOSE-TO-PARITY, NOT torch-
+domination — torch's f32/f64 broadcast-add is bandwidth-optimal (~32-64MB traffic at bandwidth
+ceiling), and FT's scalar-rayon one-pass lands just above it. My prior "inferred ~44-79x from the
+where/masked_fill siblings" was an OVERESTIMATE (those ORIG paths build THREE 128MB const tensors +
+full where; add's ORIG builds ONE 128MB broadcast clone + add = lighter) — measuring corrected it to
+6.9-8.8x internal. ⚠️ my FIRST torch baseline (f64 4.46ms) was CONTENTION-INFLATED (peer-bench trap
+from memory); the same-window re-measure (1.68ms) is the honest torch number. Bottom line: bit-exact
+fusion, 6.9-8.8x internal, removes the 128MB broadcast clone, flips a ~10-14x SLOWER op to near
+bandwidth-ceiling parity. Stays ★ (parity-class gap-close), not ★★ (no torch-domination).
 
 ## 2026-07-02 - ★★ WIN: rfft2/irfft2 single-plane (batch=1) row/col phase parallelized — 1.65x internal (433ms->262ms)
 
