@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN: fused tensor_clamp_tensor (tensor-bounds clamp) one-pass — compose 16.3ms -> 10.6ms (~1.53x), flips to FT-FASTER
+
+Agent `SlateTern`. Data-driven gapfind (`examples/binop2_gapfind_h2h.rs`, 16M f64 no-grad, `add` anchor)
+found tensor_clamp_tensor was the only binary-op laggard: atan2 2.77x / hypot 3.57x / copysign 3.05x
+already FT-FASTER, but clamp_tensor only 1.78x (contention-inflated torch; ~parity honest). Cause: it
+composes `tensor_maximum(x, lo)` THEN `tensor_minimum(., hi)` = TWO passes, MATERIALIZING a full-size
+intermediate (write 128MB + read it back). Added a no-grad equal-shape contiguous fused path: one pass
+`min(max(x, lo), hi)`, no intermediate. Bit-exact to the compose — each step is the SAME per-element
+rule as the max/min kernels (NaN if either operand NaN, else f64::max / f64::min). f32/f64.
+
+★MEASURE (16M f64 no-grad, min-of-7, load ~38): FUSED **10.6ms vs FT_ORIG(compose) 16.3ms = ~1.53x
+internal** (the saved intermediate write+read = 256MB traffic). vs torch: 1.78x -> **2.56x FASTER**
+(honest ~1.3x after de-contending; flips clamp_tensor from ~parity/slightly-SLOWER to FT-FASTER). Lock
+test `clamp_tensor_fused_matches_compose_with_nan` (fused == grad-forced maximum-then-minimum, NaN seeded
+in x/lo/hi, f32+f64). NOTE: below the 2.0 "domination" bar but a real bandwidth win closing a genuine
+vs-torch gap; broadcast bounds (per-channel clamp) still compose (follow-up: apply the same 1-pass fusion
+under broadcast). ⛔binary-op class otherwise HARVESTED — atan2/hypot/copysign already FT-faster, don't
+re-probe. AGENT SlateTern.
+
 ## 2026-07-02 - PARITY-FIX: scalar tensor_lerp f64 no-grad path — torch-exact FMA (was 2/5 wrong for |w|>=0.5)
 
 Agent `SlateTern`. The follow-up flagged by the lerp_weighted commit (23ca42e0): scalar-weight
