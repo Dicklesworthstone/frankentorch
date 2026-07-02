@@ -14067,3 +14067,23 @@ torch's ~12ms. This is the HOT attention-masking op. Lock test where_one_scalar_
 `broadcast_to` even on a SAME-shape operand routes through the slow generic expand — an op that
 broadcast_to's all N operands (where=3, maximum=2) before its kernel is a huge latent gap; a fused
 select/op with no expand is 2 orders faster. AGENT SlateTern.
+
+## 2026-07-01 - ★★★ WIN: fused where with BROADCAST cond-tile (attention masking) — 207ms->2.6ms (~79x), 17x SLOWER -> 4.6x FASTER
+
+Agent `SlateTern`. Generalized try_where_one_scalar (75e7a34d handled cond==full only) so `cond` may
+BROADCAST into the full operand as a TRAILING TILE — the canonical attention mask
+`where(mask[1,1,S,S], scores[B,H,S,S], -inf)`: mask repeats over batch/heads. Detection: strip cond's
+leading 1s, require the remainder to be an EXACT suffix of the full shape (so cond tiles every
+`cinner=cond.numel` elements — covers [1,1,S,S]/[S,S]/[1,S,S]; a MIDDLE-1 cond [B,1,S,S] is NOT a pure
+tile → falls through). Fused fill is per-tile (par_chunks_mut(cinner), cond cache-resident, reused
+each tile), no expand. Exact-cond still works (cinner==n, 1 tile). f32/f64, no-grad, y scalar.
+
+★MEASURE (where_condtile_ng, mask[1,1,256,256] into scores[16,8,256,256]=8.4M f32 NO-GRAD, inputs
+OUTSIDE timer, min-of-9, ORIG via file-swap to HEAD, load ~42): **206.7ms -> 2.63ms = ~79x** — the
+broadcast fallthrough TILED mask 65536->8.4M + cloned scores + expanded the scalar + where (~207ms);
+fused tiles cond with no expand (2.6ms). Flips ~17x SLOWER -> ~4.6x FASTER vs torch's ~12ms. This is
+THE hot transformer op (attention softmax mask). Lock test where_cond_tile_fused_matches_broadcast_path
+([1,1,S,S]/[S,S]/[1,S,S]/[B,H,S,S] all == broadcast fallthrough). Tests: ft-api + ft-conformance green.
+★The elementwise-fusion campaign's biggest single win — attention masking was ~17x SLOWER than torch,
+now ~4.6x FASTER. Follow-up: where(cond_tile, x_full, y_full) (select between two tensors w/ broadcast
+mask); cond MIDDLE-broadcast [B,1,S,S] still composes. AGENT SlateTern.
