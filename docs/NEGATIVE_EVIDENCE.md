@@ -19,6 +19,24 @@ f64). ft-autograd lib suite 477/0, ft-api + ft-conformance green. LESSON: a "mat
 inputs" test masks view/offset bugs — ADD an offset-view lane when touching tensor-meta construction.
 This is why the swiglu/reglu golden lock test now has a real grad reference again. AGENT SlateTern.
 
+## 2026-07-02 - ⛔ REJECTED-LEVER (analysis, not built): grid_sample lever-2 naive "hoist corner/weights to PASS 1" REGRESSES
+
+Agent `SlateTern`. grid_sample_f64 (ft-api ~41600) is the ONE op still SLOWER than torch (~4-4.85x f32,
+post lever-1). Its PASS 2 gathers per (n,c) plane and RE-computes the bilinear corners (floor) + weights
+(wx0/wx1/wy0/wy1) + bounds per (position, CHANNEL) — i.e. C× redundant per-position compute (memory says
+it's compute-bound after lever-1). OBVIOUS lever: hoist that into PASS 1 (compute once/position, store).
+⛔ANALYSIS SHOWS IT REGRESSES: to hoist you must widen the per-position `coords` array from 2 f64 to
+~8-10 (4 corner offsets + 4 weights + validity). PASS 2 iterates planes (c outer, positions inner) for
+CONTIGUOUS output writes, so it re-reads coords[all positions] ONCE PER PLANE = C× — and the widened
+array (8M pos × 80B = 640MB) evicts between planes, so each of the C reads is a fresh DRAM read. That
+trades cheap CPU (floor/mul) for C× bandwidth on a fat struct = NET LOSS for large C. (Re-iterating as
+(n,pos) outer / c inner would hoist compute but STRIDE the output writes across channels = cache-hostile
+writes — also bad.) ★So lever-2 genuinely needs torch's approach: BLOCK output positions by input TILE
+(cache-resident input block) + SIMD the 4-tap over channels — a real multi-session kernel rewrite, NOT a
+one-turn hoist. Bit-exactness caveat: pre-COMBINING weights (w00=wx0*wy0) changes the mul association
+(`(v*wx0)*wy0` vs `v*(wx0*wy0)`) -> breaks the bit-exact grid_sample goldens; keep the 4 separate weights.
+DON'T attempt the naive hoist. AGENT SlateTern.
+
 ## 2026-07-02 - ⛔ HARVESTED: SCAN ops (cumsum/cumprod/logcumsumexp) all FT-FASTER — don't re-probe
 
 Agent `SlateTern`. `examples/scan_gapfind_h2h.rs` (16M f64 [4096,4096] no-grad, vs torch 8-thread):
