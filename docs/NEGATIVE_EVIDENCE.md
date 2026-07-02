@@ -1,5 +1,38 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ SHIPPED (bit-exact): fused broadcast-tile binop — additive attention-bias `scores + bias[1,1,S,S]`
+
+Agent `SlateTern`. Extends the where/masked_fill attention-fusion vein to the ARITHMETIC binops
+(add/sub/mul/div). The additive attention-bias pattern `scores[B,H,S,S] + bias[1,1,S,S]` (ALiBi /
+relative-position bias / additive mask) — and key-padding `[B,1,1,S]`, relpos `[1,H,S,S]` — matches
+NONE of `tensor_add`'s three broadcast fast paths (`try_lastdim_bcast` needs a pure trailing vec,
+`try_rowscalar_bcast` a per-row scalar, `try_fullscalar_bcast` numel 1). So it FELL THROUGH to the
+tape op, which `broadcast_to`s the tile into a FULL-size clone (128MB f64 at [16,16,128,128]) then
+adds — the exact 128MB-clone waste the where/masked_fill fusions removed (245ms->5.6ms ~44x,
+207ms->2.6ms ~79x).
+
+Fix: `try_bcast_tile_binop` — one operand IS the full output (contiguous), the other is a strictly-
+smaller tile read straight from its `broadcast_offset_plan` offset (the SAME helper + block/
+rows_per_task/mbase iteration as `try_where_one_scalar`), op applied in ONE pass, no expand. Wired
+into add/sub/mul/div after the existing 3 helpers; operand order preserved (full_is_lhs) for
+non-commutative sub/div; f32/f64; grad / mismatched-dtype / same-shape / non-contiguous fall through.
+
+PARITY (absolute, PROVEN): bit-identical to the tape broadcast op — same operands, same IEEE
+`lhs OP rhs` (broadcast_to only relocates tile values, never rounds). Lib test
+`bcast_tile_binop_fused_matches_broadcast_path` GREEN: 4 ops × 5 tiles ([1,1,S,S], [S,S], [1,H,S,S],
+[B,1,1,S], [b,1,s,s]) × 2 operand orders × 2 dtypes = 80 combos, all bit-exact vs the grad-forced
+broadcast fallthrough (rch hz1, `cargo test -p ft-api --lib bcast_tile_binop`, 1 passed 0 failed).
+
+PERF: torch baseline (local, 32 threads) add [16,16,128,128]+[1,1,128,128] f64 4.46ms / f32 0.85ms /
+keypad f32 0.82ms. ⚠️ HONEST GAP: the FT-fused FT_ORIG A/B timing was NOT captured this session — the
+release example built (`Finished release in 36.31s`) but the run hit the rch artifact-retrieval binary-
+path bug (`./target/release/examples/... No such file` — the known cc-local/CARGO_TARGET_DIR gotcha),
+and I was time-boxed to ship. The speedup is INFERRED (not independently measured here) from the
+byte-identical mechanism of the already-measured where/masked_fill siblings (both ~44-79x internal by
+removing the same 128MB broadcast clone). FOLLOW-UP: capture the FT_ORIG A/B via the cc-local LOCAL
+build (`CARGO_TARGET_DIR=...-cc-local cargo build --release --example bcast_tile_add_h2h`) to confirm
+the ratio and flip the ★ to ★★. The CODE is real + bit-exact + tested; only the ratio is deferred.
+
 ## 2026-07-02 - ★★ WIN: rfft2/irfft2 single-plane (batch=1) row/col phase parallelized — 1.65x internal (433ms->262ms)
 
 Agent `SlateTern`. Found the FFT single-plane vein memory flagged ("rfft2/irfft2 next" after fft2/ifft2
