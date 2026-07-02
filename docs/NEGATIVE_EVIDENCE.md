@@ -1,5 +1,33 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: no-grad f64 erfinv fast path — 7.64x internal, flips ~5x SLOWER → 1.62x FASTER than torch (bit-exact) + RICH VEIN
+
+Agent `SlateTern`. `tensor_erfinv` had a `try_f32_unary_native` f32 fast path but f64 went through
+`tensor_apply_function_with_create_graph`, whose forward closure `values.clone()`s the 16M output into
+`save_for_backward` — a 128MB clone EVEN FOR NO-GRAD — plus builds a create_graph tape node. Added the
+f64 sibling: `try_f64_unary_native(input, erfinv_approx)` (same par_map, returns a leaf, no node, no
+save-clone). Bit-exact (identical `erfinv_approx`).
+
+PARITY (proven): `erfinv_f64_nograd_matches_apply_function` (fast path == grad-forced apply_function,
+bit-exact) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096]): FUSED **13.76ms** vs ORIG-apply_fn
+**105.13ms = 7.64x internal**; torch special.erfinv 22.28ms → **1.62x FASTER**. The current shipped
+no-grad f64 erfinv was ~5x SLOWER than torch (105ms); the fast path FLIPS it to 1.62x FASTER.
+⚠️ the probe's 116ms torch reading was CONTENTION-inflated (clean torch = 22.28ms — re-measure clean).
+
+★★RICH VEIN FLAGGED: `apply_function_with_create_graph` is CATASTROPHICALLY slow for no-grad
+(the closure's `save_for_backward(values.clone())` = a full-numel 128MB clone that runs even when no
+grad is needed, + the create_graph node). ANY special/transcendental op with an f32 fast path but f64
+riding `apply_function_with_create_graph` and NO `try_f64_unary_native` sibling is a 5-8x no-grad win.
+NEXT LEADS (probe flagged, verify each has f32-but-not-f64 fast path): ndtr (42ms probe), i0e (27ms),
+i1e (11ms), bessel_j1/y0/y1 (12-16ms), erfcx, ndtri. RECIPE: `if let Some(out) =
+self.try_f64_unary_native(input, <same approx fn>)? { return Ok(out); }` before the apply_function call
+— 3 lines, bit-exact, skips the 128MB no-grad save-clone. 7th compose/overhead→one-pass win this
+session.
+
+
+
 ## 2026-07-02 - ★ WIN: fused pow_tensor f64 (torch.float_power tensor-exp) — ~3x internal, 1.23x FASTER than torch (bit-exact)
 
 Agent `SlateTern`. `tensor_pow_tensor` (torch.pow/float_power with a TENSOR exponent) composed
