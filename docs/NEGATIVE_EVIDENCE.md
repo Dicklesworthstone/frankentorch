@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: rfft2/irfft2 single-plane (batch=1) row/col phase parallelized — 1.65x internal (433ms->262ms)
+
+Agent `SlateTern`. Found the FFT single-plane vein memory flagged ("rfft2/irfft2 next" after fft2/ifft2
+kgs4.86). rfft2's ROW phase and irfft2's COLUMN phase parallelize over BATCH PLANES (`batch_size >= 2`)
+but for a SINGLE 2D transform (batch=1) fall to a SERIAL loop over the `out_cols` independent
+column-FFTs — while fft2 already has the single-plane column-parallel branch. Added the SAME
+`(0..out_cols).into_par_iter().map(gather strided col -> owned scratch -> SAME dft_inplace_1d -> return)
+then serial scatter-back to disjoint indices` branch (gated `parallel && rows>=2 && batch_size==1`) to
+both rfft2 (row phase) and irfft2 (col phase). BIT-FOR-BIT identical to the serial loop (same dft, same
+gather/scatter).
+
+★MEASURE (`examples/rfft2_singleplane_h2h.rs`, single [4096,4096] rfft2 no-grad, same-process A/B =
+CONTENTION-ROBUST ratio, min-of-3): PARALLEL **262ms vs FT_ORIG(serial-row) 433ms = ~1.65x FASTER**;
+vs torch 11.3x SLOWER -> 6.8x SLOWER (the residual 6.8x = torch's split-radix FFT algorithm, a separate
+bandwidth/algorithm wall — NOT the ft-api parallelization). rfft2 lib tests 7/0 (bit-exact). Same fix
+applied to irfft2. NOTE: fftn/rfftn are N-D (may have their own single-axis serial tails — follow-up).
+LESSON: grep sibling ops (fft2 parallel vs rfft2 serial) for the SAME phase left un-parallelized. AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ CORRECTNESS FIX: 31 ft-autograd unary ops broke on NARROW/slice (storage-offset) views — output built from view meta
 
 Agent `SlateTern`. Root-caused + FIXED the swiglu/reglu grad-dim0 error surfaced by the gated-FFN work.
