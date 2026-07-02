@@ -14030,3 +14030,21 @@ orders, with NaN seeded in both operands). Tests: ft-api 2404 + ft-conformance 2
 ★LESSON: an op whose broadcast fallthrough calls `broadcast_to` on BOTH operands (even the already-
 full one) pays a redundant clone + double pass — much worse than a tape binary broadcast; the fused
 per-row/scalar path is a ~12-15x win there (vs ~2-6x for the already-optimized add/mul). AGENT SlateTern.
+
+## 2026-07-01 - ★★ WIN: fused same-shape fmax/fmin — 174ms->7.6ms (~23x), 14x SLOWER -> 1.6x FASTER
+
+Agent `SlateTern`. `tensor_fmax`/`tensor_fmin` had NO fast path at all — EVERY call (even same-shape)
+composed `broadcast_to(lhs) + broadcast_to(rhs) + max + isnan(lhs) + isnan(rhs) + where + where` (~7
+full-tensor passes + tape nodes). For a [4096,4096] f32 same-shape fmax that was **174ms** (a 16M-elem
+NaN-tolerant max!). Added `try_fmaxmin_sameshape`: a no-grad same-shape fused single pass with the
+NaN-TOLERANT rule `a.is_nan() ? b : b.is_nan() ? a : (max? a.max(b) : a.min(b))` (fmax IGNORES NaN,
+opposite of maximum — verified to match the compose exactly). f32/f64, contiguous, no-grad; broadcast /
+grad fall through to the compose (grad backward unchanged).
+
+★MEASURE (fmax_ng [4096,4096] f32 same-shape NO-GRAD, inputs OUTSIDE timer, min-of-9, ORIG via
+file-swap to HEAD, same session, load ~31): **174.4ms -> 7.6ms = ~23x** — flips ~14x SLOWER -> ~1.6x
+FASTER vs torch's ~12ms. Bit-identical INCLUDING NaN (lock test seeds NaN in both operands, fused ==
+compose for fmax+fmin). Tests: ft-api + ft-conformance green. ★LESSON: an op with NO fast path that
+composes 5+ tape ops for its base case (not just broadcast) is a catastrophic per-call gap — the fully
+fused single pass is ~20x+. fmax/fmin are less common than max/min but were ~14x SLOWER on every call.
+Follow-up: fmax/fmin BROADCAST still composes (rarer); where(cond, x, scalar) still expands the scalar. AGENT SlateTern.
