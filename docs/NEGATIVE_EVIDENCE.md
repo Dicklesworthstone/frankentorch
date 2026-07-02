@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×3): no-grad f64 gammaln/i0/airy_ai borrow — flips ~3x SLOWER → 1.7-4.1x FASTER (input-read-clone lever)
+
+Agent `SlateTern`. The GENERAL input-read-clone lever (broader than specfn): grep for
+`par_map_f64(&...)` (input materialized into a Vec) with no `try_f64_unary_native` found gammaln, i0,
+airy_ai — each read the input via `contiguous_values_as_f64()?.to_vec()` (F64 branch is a `.to_vec()`
+CLONE) or `tensor_values_meta` before par_map. Added `try_f64_unary_native(input, <approx>)` (borrow
+via contiguous_values) before each no-grad path. Bit-exact (same lgamma_approx/i0_approx/airy_ai_scalar).
+
+PARITY (proven): `gammaln_i0_airy_f64_borrow_match_original` (all 3 == grad-forced original path,
+bit-exact) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096] f64):
+  - gammaln: FUSED **10.98ms** vs ORIG-clone 97.12ms  = **8.85x**; torch lgamma 31.98ms → **2.91x FASTER**
+  - i0:      FUSED **25.71ms** vs ORIG-clone 107.89ms = **4.20x**; torch i0     44.28ms → **1.72x FASTER**
+  - airy_ai: FUSED **17.62ms** vs ORIG-clone 105.26ms = **5.97x**; torch airy   72.02ms → **4.09x FASTER**
+★KEY: the ORIG clone (`contiguous_values_as_f64().to_vec()` for F64 = a SERIAL 128MB copy) is ~85-90ms
+of overhead — the SAME magnitude as the apply_function-save vein, because it's the same full-numel
+serial clone. try_f64_unary_native's `contiguous_values()` BORROWS (zero-copy). ★★THE INPUT-READ-CLONE
+LEVER IS BROAD (beyond specfn): ANY no-grad elementwise op reading its input via
+`contiguous_values_as_f64().to_vec()` / `tensor_values(` / `tensor_values_meta` + par_map is a 4-9x
+no-grad win. RECIPE: grep `par_map_f64(&` / `par_zip_map_f64(&` (the `&` = materialized Vec) with no
+try_f64_*_native → add the borrow fast path. ⚠️`contiguous_values_as_f64()` CLONES even for F64
+(ft-core lib.rs:1468 `v[start..end].to_vec()`) — use `contiguous_values()` (F64-only borrow) via the
+helper. NEXT: re-scan `par_map_f64(&`/`par_zip_map_f64(&` after this for any remaining.
+
+
+
 ## 2026-07-02 - ★ WIN: no-grad f64 zeta borrow fast path — 2.43x internal, 1.31x FASTER than torch (binary sub-vein COMPLETE)
 
 Agent `SlateTern`. Followed the igamma binary sub-vein to its last member: `tensor_zeta` (Hurwitz ζ)
