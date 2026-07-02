@@ -1,5 +1,36 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN + NEW VEIN: fused p-norm backward (single Rayon pass) — 21-24x internal, flips 2.7x/1.7x SLOWER → 6.6x/4.6x FASTER
+
+Agent `SlateTern`. NEW vein, distinct from the (now-dry) ft-api forward clone/borrow loop: this is
+ft-autograd **backward** fusion. `tensor_norm` fwd+bwd read SLOWER than torch not from the forward
+(already parallel via `pairwise_sum_map_f64_maybe_par`) but from the BACKWARD's redundant full-tensor
+memory traffic. The original `TensorNodeOp::Norm` backward: (1) cloned the 128MB input via
+`contiguous_values_as_f64()` (`.to_vec()`), (2) `vec![0.0; numel]` zero-init scratch, (3) filled a
+`norm_contrib` map (an in-flight partial change had parallelized ONLY this step — insufficient), then
+(4) a **serial** `accumulate_tensor_gradient` add-loop into the grad slot. On [4096,4096] f64 (16.7M
+elem) that is ~4 full-tensor passes, most serial. Fused all four into ONE Rayon pass: new
+`accumulate_tensor_gradient_par_with` (parallel sibling of `accumulate_tensor_gradient_with`) computes
+each dx_i and writes it straight into the grad slot (empty-slot arm par-collects `0.0 + c`, accumulate
+arm `par_iter_mut += c`), with input borrowed zero-copy via `operand_values_cow` — no input clone, no
+scratch `Vec`, no separate accumulate loop.
+
+Measured (local glibc-2.42 build, 64c; torch 2.12.1+cpu, `set_num_threads(64)`; examples/normp_bwd_h2h.rs):
+  - p=2: ORIG 231.6ms → **FUSED 9.82ms** = **23.6x internal**; vs torch 64.8ms = 2.7x SLOWER → **6.6x FASTER**
+  - p=3: ORIG 424.2ms → **FUSED 19.94ms** = **21.3x internal**; vs torch 91.9ms = 1.7x SLOWER → **4.6x FASTER**
+BIT-EXACT to the prior FT path: grad rolling-hash fingerprint + sampled `to_bits()` + `grad_sum`
+IDENTICAL between FUSED and the ORIG serial path (FT_ORIG A/B, both p). vs torch differs only ~1e-12
+(norm forward reduction-order, PRE-EXISTING; the change alters memory/parallelism, not the formula).
+ft-autograd suite 477/477 green.
+
+★MECHANISM (reusable, ~40 candidate sites): a scalar/reduced-output op whose backward is a pure
+per-element function of the input but materializes a `vec![0.0; numel]` scratch + serial
+`accumulate_tensor_gradient(&scratch)` re-pays 3-4 full-tensor passes. Fuse: borrow input via
+`operand_values_cow`, push the per-index gradient closure into `accumulate_tensor_gradient_par_with`.
+Grep backward arms for `contiguous_values_as_f64()? … vec![0.0; …numel] … accumulate_tensor_gradient(…
+&contrib)` where the contribution has NO cross-element coupling (norm, and likely siblings). NEXT:
+enumerate the per-index-independent siblings and fuse them one at a time.
+
 ## 2026-07-02 - ⛔ EXHAUSTION CONFIRMED (broad cross-class grep): ft-api elementwise clone/fusion vein is dry
 
 Agent `SlateTern`. To confirm the clone-lever is truly harvested BEYOND special functions, ran a broad

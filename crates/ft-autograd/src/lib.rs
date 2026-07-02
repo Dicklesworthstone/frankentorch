@@ -13281,47 +13281,91 @@ impl TensorTape {
                     input_numel,
                 } => {
                     let grad_scalar = incoming[0];
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     let norm_val = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?[0];
-                    let mut norm_contrib = vec![0.0; input_numel];
 
+                    // Backward of a full-tensor p-norm: each dx_i depends only on x_i,
+                    // grad_scalar and the scalar norm_val (no cross-element coupling), so the
+                    // whole contribution fuses into the gradient slot in ONE Rayon pass — no
+                    // 128MB input clone (borrow via operand_values_cow), no zero-init scratch
+                    // `Vec`, no separate serial accumulate loop. Bit-for-bit identical to the
+                    // prior clone+scratch+serial-accumulate path: same per-element formula,
+                    // ascending index order, and IEEE-commutative `0.0 + c` / `+= c` writes.
+                    // frankentorch-normp-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     if p == 2.0 {
                         // d/dx_i = x_i / norm
                         if norm_val != 0.0 {
-                            for i in 0..input_numel {
-                                norm_contrib[i] = grad_scalar * input_values[i] / norm_val;
-                            }
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |i| grad_scalar * iv[i] / norm_val,
+                            )?;
+                        } else {
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |_| 0.0,
+                            )?;
                         }
                     } else if p == 1.0 {
                         // d/dx_i = sign(x_i)
-                        for i in 0..input_numel {
-                            norm_contrib[i] = grad_scalar * Self::torch_sign(input_values[i]);
-                        }
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |i| grad_scalar * Self::torch_sign(iv[i]),
+                        )?;
                     } else if p.is_infinite() {
-                        // Gradient flows to the element(s) achieving the extremum
-                        // For inf-norm: the element with max |x_i|
-                        // For -inf-norm: the element with min |x_i|
+                        // Gradient flows to the element(s) achieving the extremum:
+                        // inf-norm -> max |x_i|, -inf-norm -> min |x_i|.
                         if norm_val != 0.0 {
-                            for i in 0..input_numel {
-                                if input_values[i].abs() == norm_val {
-                                    norm_contrib[i] =
-                                        grad_scalar * Self::torch_sign(input_values[i]);
-                                }
-                            }
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |i| {
+                                    if iv[i].abs() == norm_val {
+                                        grad_scalar * Self::torch_sign(iv[i])
+                                    } else {
+                                        0.0
+                                    }
+                                },
+                            )?;
+                        } else {
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |_| 0.0,
+                            )?;
                         }
                     } else if p != 0.0 && norm_val != 0.0 {
                         // General p-norm: d/dx_i = sign(x_i) * |x_i|^(p-1) / norm^(p-1)
                         let norm_pow = norm_val.powf(p - 1.0);
-                        for i in 0..input_numel {
-                            norm_contrib[i] = grad_scalar
-                                * Self::torch_sign(input_values[i])
-                                * input_values[i].abs().powf(p - 1.0)
-                                / norm_pow;
-                        }
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |i| {
+                                grad_scalar
+                                    * Self::torch_sign(iv[i])
+                                    * iv[i].abs().powf(p - 1.0)
+                                    / norm_pow
+                            },
+                        )?;
+                    } else {
+                        // p == 0 (non-differentiable) or degenerate norm: zero gradient,
+                        // matching the original all-zero `norm_contrib` accumulate.
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |_| 0.0,
+                        )?;
                     }
-                    // p == 0: gradient is zero (non-differentiable)
-
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &norm_contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -20427,6 +20471,58 @@ impl TensorTape {
         Self::ensure_tensor_len(node, target.values.len(), contribution_len)?;
         for (index, target_value) in target.values.iter_mut().enumerate() {
             *target_value += contribution(index);
+        }
+        Ok(())
+    }
+
+    /// Parallel sibling of [`Self::accumulate_tensor_gradient_with`]. Fuses a
+    /// per-index gradient contribution `contribution(i)` directly into the target
+    /// slot in ONE Rayon pass — no intermediate `Vec`, no zero-init, no separate
+    /// accumulate loop. Bit-for-bit identical to the serial `_with` form: the
+    /// empty-slot arm collects `0.0 + contribution(i)` in ascending index order,
+    /// the accumulate arm indexes `target[i] += contribution(i)` (per-index
+    /// independent, order-preserving), and both fall back to the serial body below
+    /// the threshold so small-shape callers stay deterministic. The contribution
+    /// closure must be pure (each `i` depends only on read-only captured state);
+    /// callers whose per-element gradient couples across indices must NOT use this.
+    /// frankentorch-normp-bwd-fused.
+    fn accumulate_tensor_gradient_par_with<F: Fn(usize) -> f64 + Sync + Send>(
+        node: TensorNodeId,
+        target: &mut TensorGradientSlot,
+        contribution_len: usize,
+        contribution: F,
+    ) -> Result<(), AutogradError> {
+        const PAR_MIN: usize = 1 << 15;
+        Self::ensure_tensor_len(node, target.expected_len, contribution_len)?;
+        if target.values.is_empty() {
+            if contribution_len >= PAR_MIN {
+                use rayon::prelude::*;
+                target.values = (0..contribution_len)
+                    .into_par_iter()
+                    .map(|index| 0.0 + contribution(index))
+                    .collect();
+            } else {
+                target.values.reserve(contribution_len);
+                for index in 0..contribution_len {
+                    target.values.push(0.0 + contribution(index));
+                }
+            }
+            return Ok(());
+        }
+        Self::ensure_tensor_len(node, target.values.len(), contribution_len)?;
+        if contribution_len >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .values
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(index, target_value)| {
+                    *target_value += contribution(index);
+                });
+        } else {
+            for (index, target_value) in target.values.iter_mut().enumerate() {
+                *target_value += contribution(index);
+            }
         }
         Ok(())
     }
