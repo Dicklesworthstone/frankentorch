@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: fused tensor_logsigmoid one-pass — compose 32.6ms -> 10.8ms (~3x), 1.59x -> 5.06x FASTER vs torch
+
+Agent `SlateTern`. Data-driven gapfind (`examples/unary2_gapfind_h2h.rs`, 16M f64 no-grad, exp/add
+anchors) found logsigmoid the standout laggard (33-44ms ≈ 3-4x the exp anchor; frac/hardswish/mish/
+softplus/hardsigmoid/remainder all already 2x+ FT-FASTER). Cause: logsigmoid COMPOSED `neg(x) ->
+softplus(-x) -> neg` = THREE full passes over numel. Fused into ONE pass `logsigmoid(x) = -softplus(-x)`,
+inlining the softplus KERNEL formula exactly (`if y>20 {y} else {y.exp().ln_1p()}`, beta=1/threshold=20)
+so bit-exact to the compose (neg = exact IEEE negation; same per-element softplus math; same libm
+exp/ln_1p). f32 uses the f32 softplus formula (identical structure). no-grad/contiguous; grad/non-contig
+fall through.
+
+★MEASURE (16M f64 no-grad, min-of-7, load ~30): FUSED **10.8ms vs FT_ORIG(compose) 32.6ms = ~3.0x
+internal** (collapsed 3 passes -> 1, now near the exp anchor 9.2ms); vs torch **1.59x -> 5.06x FASTER**
+(torch's logsigmoid is itself slow ~52ms). Lock test `logsigmoid_fused_matches_compose` (fused ==
+grad-forced neg->softplus->neg, values span the >20/<-20 threshold branches, f32+f64). ★RECIPE: an
+activation that COMPOSES neg/softplus/neg (or similar multi-pass wrappers around a tape op) collapses to
+ONE pass by inlining the inner kernel's exact per-element formula (grep ft-kernel-cpu for `*_value`).
+Other laggard = fmod ~1.6x (follow-up). AGENT SlateTern.
+
 ## 2026-07-02 - ★ WIN: fused tensor_clamp_tensor (tensor-bounds clamp) one-pass — compose 16.3ms -> 10.6ms (~1.53x), flips to FT-FASTER
 
 Agent `SlateTern`. Data-driven gapfind (`examples/binop2_gapfind_h2h.rs`, 16M f64 no-grad, `add` anchor)
