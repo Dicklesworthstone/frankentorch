@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN #9 (gap-close to parity): fuse exp/log/sigmoid/tanh/relu backward — serial-SLOWER → parity/1.02-1.13x FASTER (torch at bandwidth ceiling)
+
+Agent `SlateTern`. Completed the core activation-backward fusion: `Exp`, `Log`, `Sigmoid`, `Tanh`, `Relu`
+backward all used a SERIAL `.iter().zip().map().collect()` derivative map + `accumulate_tensor_gradient`
++ 128MB input/output clone. Swapped to `operand_values_cow` borrow + `accumulate_tensor_gradient_zip_map`
+(parallel map straight into the slot). Bit-for-bit identical.
+
+Measured ([4096,4096] f64, `op(x).sum().backward()`; 64c; torch 2.12.1+cpu 64 threads; coreact_bwd_h2h.rs):
+  - exp 41.25 vs 42.89 = 1.04x; log 39.23 vs 39.89 = 1.02x; sigmoid 40.73 vs 43.01 = 1.06x;
+    tanh 43.55 vs 45.89 = 1.05x; **relu 39.88 vs 45.15 = 1.13x FASTER**
+★UNLIKE the trig ops (torch 70-97ms → FT flipped to 1.4-2.3x FASTER), torch's exp/log/sigmoid/tanh/relu
+fwd+bwd is at the ~40ms MEMORY-BANDWIDTH CEILING (well-vectorized). FT now MATCHES it (~40ms) — so this is a
+gap-close from serial-SLOWER (the old serial map+accumulate+clone was ~3-6x slower) to PARITY, not a big
+flip. Bit-exact (relu grad = all-ones on positive data). ft-autograd 477/477.
+
+★★VEIN CEILING REACHED: the autograd-backward parallelization vein (WIN #5-#9) has now parallelized the
+ENTIRE common backward surface (sum/mean/add/sub/mul/div/95-caller-accumulator/all activations/trig). The
+remaining transcendental activations are at torch's bandwidth ceiling → only parity is achievable (the
+transcendental itself is bit-exact-walled). NEXT real win needs a genuinely different lever class (not more
+elementwise backward fusion).
+
 ## 2026-07-02 - ★★★ WIN #8: parallelize the universal `accumulate_tensor_gradient` (95 callers) + fully-fuse trig backward — sin/cos/sinh/cosh flip ~2x SLOWER → 1.4-2.3x FASTER
 
 Agent `SlateTern`. TWO bundled bit-exact wins on the core autograd path:

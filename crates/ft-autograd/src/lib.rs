@@ -12095,15 +12095,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Exp { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; output borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-
-                    let exp_contrib = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(grad, out_val)| grad * out_val)
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &exp_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |grad, out_val| grad * out_val,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12114,15 +12116,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Log { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let log_contrib = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(grad, val)| grad / val)
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &log_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, val| grad / val,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12133,23 +12137,25 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Relu { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let relu_contrib = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(grad, val)| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, val| {
                             if val.is_nan() {
                                 f64::NAN
-                            } else if *val > 0.0 {
-                                *grad
+                            } else if val > 0.0 {
+                                grad
                             } else {
                                 0.0
                             }
-                        })
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &relu_contrib)?;
+                        },
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12160,15 +12166,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sigmoid { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; output borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-
-                    let sigmoid_contrib = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(grad, s)| grad * s * (1.0 - s))
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sigmoid_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |grad, s| grad * s * (1.0 - s),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12179,15 +12187,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Tanh { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; output borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-
-                    let tanh_contrib = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(grad, t)| grad * (1.0 - t * t))
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &tanh_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |grad, t| grad * (1.0 - t * t),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
