@@ -1,0 +1,14 @@
+[package]
+name = "ft-kernel-metal"
+version = "0.1.0"
+edition = "2024"
+license-file = "../../LICENSE"
+description = "Metal GPU compute kernels for FrankenTorch (macOS / Apple Silicon). Safe API; all unsafe Metal FFI is contained here. No-op stub on non-macOS targets."
+
+# Metal is macOS-only. Target-gating the dep keeps this crate compilable in the
+# workspace on Linux/Windows (where it degrades to an always-unavailable stub),
+# so adding it to the workspace never breaks non-macOS builds.
+[target.'cfg(target_os = "macos")'.dependencies]
+metal = "0.33"
+
+[dev-dependencies]

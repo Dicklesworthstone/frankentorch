@@ -4,6 +4,7 @@ members = [
   "crates/ft-core",
   "crates/ft-dispatch",
   "crates/ft-kernel-cpu",
+  "crates/ft-kernel-metal",
   "crates/ft-autograd",
   "crates/ft-device",
   "crates/ft-serialize",
