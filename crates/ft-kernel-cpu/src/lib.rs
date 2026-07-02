@@ -3331,7 +3331,13 @@ pub fn ge_tensor_contiguous_f64(
 /// already well within ULP precision and avoids the recursion
 /// overhead.
 #[inline]
-fn pairwise_sum_f64(values: &[f64]) -> f64 {
+/// Pairwise (cascade) summation of a contiguous slice: recursively split at the
+/// midpoint down to a 128-element sequential leaf. This is the EXACT reduction
+/// `sum_dim_tensor_contiguous_f64` applies to each output lane, so callers that
+/// want a per-lane sum bit-for-bit identical to `sum_dim` (e.g. the fused
+/// cosine_similarity f64 path in ft-api) reduce their materialized lane through
+/// this same function. Exposed for that cross-crate bit-exact reuse.
+pub fn pairwise_sum_f64(values: &[f64]) -> f64 {
     const BLOCK: usize = 128;
     if values.len() <= BLOCK {
         // Sequential is fine at small N (block fits in L1 cache).

@@ -1,5 +1,38 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: fused cosine_similarity f64 last-dim — 6.4x internal, 7.6-13.9x FASTER than torch (bit-exact)
+
+Agent `SlateTern`. The forward-op probe flagged `F.cosine_similarity` f64 ~33-62ms ([4096,4096] dim=1).
+FT's `tensor_cosine_similarity` had a NATIVE-f32 fast path but f64 fell through to the compose:
+`mul + sum_dim + mul + sum_dim + sqrt + mul + sum_dim + sqrt + mul + full + max + div` (~10 tape ops,
+THREE full-size product tensors materialized then reduced). This is the asymmetric-dtype pattern (f32
+optimized, f64 left on the slow path).
+
+Fix `frankentorch-cossim-f64`: no-grad LAST-DIM f64 path computes `dot`/‖x1‖/‖x2‖ per row in ONE
+parallel pass (`map_init` per-thread scratch). BIT-EXACT to the compose — the key was reducing each
+product lane through the SAME `pairwise_sum_f64` that `sum_dim` uses: exposed `pairwise_sum_f64` as
+`pub` in ft-kernel-cpu and call it on the materialized product row, so `dot==sum_dim(mul(x1,x2))`,
+`s1==sum_dim(mul(x1,x1))`, `s2==sum_dim(mul(x2,x2))` bit-for-bit; `.sqrt()` is the identical IEEE sqrt
+and `denom` replicates `tensor_maximum(norm_prod, eps)` (NaN-propagating). A NAIVE serial sum would
+NOT have matched — `sum_dim` uses pairwise/cascade summation, so reusing the exact function was
+required for parity.
+
+PARITY (proven): `cosine_similarity_f64_fused_matches_composed_path` (fused == grad-forced compose,
+bit-exact, d=4096 and d=257 to exercise the pairwise recursion) GREEN; existing cosine value +
+metamorphic tests unaffected.
+
+PERF (MEASURED, cc-local LOCAL release, FT_ORIG A/B, RAYON_NUM_THREADS=32, min-of-9, [4096,4096] dim=1):
+FUSED **4.44ms** vs ORIG-compose **28.57ms = 6.4x internal**; torch 33-62ms (window-dependent) →
+**7.6-13.9x FASTER**. The compose materialized 3×128MB products (bandwidth); the fused path reads x1,x2
+ONCE and reduces per row in-cache. ★LESSON: to fuse a reduction-composite bit-exact, you MUST reuse the
+kernel's EXACT reduction (pairwise_sum_f64 here) — a naive serial accumulation diverges by ULPs from
+sum_dim's cascade sum. Exposing the private kernel helper `pub` is the clean way (single source of
+truth) vs replicating the algorithm. This is the asymmetric-dtype vein (f32-fast/f64-slow) crossed with
+the compose→one-pass recipe. FOLLOW-UP: pairwise_distance / other norm-composites may have the same
+f32-fast/f64-compose split.
+
+
+
 ## 2026-07-02 - ★ WIN: fused diff n>=2 last-dim — 10-12x internal, flips ~9x SLOWER → ~1.35x FASTER than torch (bit-exact)
 
 Agent `SlateTern`. The forward-op probe flagged `torch.diff(n=3)` ~32-64ms ([4096,4096] f64) — slow
