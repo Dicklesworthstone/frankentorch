@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔ HARVESTED / NEGATIVE: clean elementwise+rearrange+norm+gather perf vein EXHAUSTED (don't re-probe these)
+
+Agent `SlateTern`. After the gated-FFN family flips, swept the remaining obvious transformer/vision op
+classes with per-op probes (16M-ish, no-grad, vs torch 8-thread) — ALL already FT-FASTER or already
+have a fused fast path. DON'T re-probe:
+- **pixel_shuffle 2.55x FASTER, pixel_unshuffle 2.6-3.0x FASTER** (`examples/pixelshuffle_h2h.rs`,
+  [16,256,64,64] r=2): ft's reshape+permute+reshape (tape) BEATS torch's pixel_shuffle (torch ~25ms vs
+  ft ~10ms) — the permute-materialize is already fast; NOT a strided-view gap like glu was.
+- **embedding**: already has an f32 no-grad direct-gather fast path (lib.rs ~12360) + f64 (~12396); the
+  old "no-f32-fast-path" memory note is STALE. rms_norm (rms_norm_forward_f64/f32 kernels ~33267),
+  layer_norm, group_norm (functional_group_norm_sum specialization) all have fused fast paths.
+- **binary/unary transcendentals** (atan2/hypot/copysign/frac/hardswish/mish/softplus/hardsigmoid/
+  remainder) all 2x+ FT-FASTER (earlier probes). RoPE/rotary DOESN'T EXIST in ft; chunk/unbind are views.
+
+★REMAINING PERF is DEEP (multi-session, NOT single-turn): (1) grid_sample lever-2 — cache-blocked/SIMD
+bilinear gather (biggest single gap ~4.05-4.85x SLOWER f32, per [[project_gemm_bandwidth_vein]] style);
+(2) GEMM tall-skinny (corrcoef) = peer-reserved ft-kernel-cpu; (3) dense-linalg (multishift-QR, blocked
+dsytrd) under the tolerance-parity policy. ⚠️CORRECTNESS FOLLOW-UP (ft-autograd, not perf): unary act on
+a dim=0 NARROW (storage-offset) view errors `InsufficientStorage{needed:24,actual:12}` — swiglu/reglu
+GRAD compose at dim=0 split. `dispatch_tensor_unary_contiguous_typed` (silu/sigmoid/relu @ ft-autograd
+5983/5174/5127) reads `typed_storage()` (full base) while meta describes the offset view; the output
+retains base-size meta but allocates view-size storage. Subtle offset/meta fix; rare config (dim=0 gate).
+LESSON: probe-before-fuse SAVED wasted work here (all these read FASTER, so no fusion attempted). AGENT SlateTern.
+
 ## 2026-07-02 - ★★ WIN: fused geglu (GEGLU gated FFN) — 3.35x SLOWER -> 3.46x FASTER (11x internal) — GATED-FFN FAMILY COMPLETE
 
 Agent `SlateTern`. Completes the gated-FFN family: geglu (a*gelu(b)) via the shared
