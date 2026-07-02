@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔ EXHAUSTION CONFIRMED (broad cross-class grep): ft-api elementwise clone/fusion vein is dry
+
+Agent `SlateTern`. To confirm the clone-lever is truly harvested BEYOND special functions, ran a broad
+grep across ALL op classes: every `self.tensor_values(input)?` / `tensor_values_lossy_f64(input)?` in a
+unary-signature op followed by `par_iter`/`.iter().map`/`par_map`, filtered to no `try_f64_unary_native`.
+Only THREE candidates, all NON-LEVERS:
+- `tensor_bitwise_not` — INTEGER/bool op (try_f64_unary_native gates on F64; N/A).
+- `tensor_pad_mode` (reflect/replicate/circular) — ALREADY parallel (contiguous f64 col_map fast path +
+  f32 mirror, both par_iter borrowed-gather); the `tensor_values` clone is ONLY the non-contiguous
+  fallback (rare, and itself parallel). Not a lever.
+- `tensor_quantile_interpolation` — SELECTION op, already done (radix-select 2.58x FASTER per memory).
+Plus the earlier exhaustive scans (par_map_f64(&), contiguous_values_as_f64, try_f32_binary_native) all
+returned dry. ★CONCLUSION: the ft-api elementwise clone/fusion + apply_function-save veins are FULLY
+HARVESTED (~19 ops flipped this session, all near-parity-to-FASTER). No ft-api elementwise clone lever
+remains. ★FRONTIER (honest blocker): the remaining vs-torch gaps are (1) the ~2.1x reduction residual =
+scalar-rayon-scan vs torch-SIMD (deep ft-kernel-cpu SIMD max-with-index reduction — peer-reserved, tie-
+break/NaN-semantics risk, only ~2x), (2) GEMM tall-skinny (corrcoef), (3) grid_sample SIMD, (4) other
+already-walled/done classes (conv/attention/complex/sparse). The easy ft-api fusion era is over; next
+real wins are DEEP kernels (ft-kernel-cpu, peer) or a not-yet-existing op.
+
+
+
 ## 2026-07-02 - ⚠️ CORRECTION: argmax residual was CONTENTION-inflated — real argmax = ~2.16x SLOWER (near-parity), kernels identical, NO port needed
 
 Agent `SlateTern`. The argmax win (2d56ed51) reported FUSED 8.47ms → "7.4x SLOWER than torch", and the
