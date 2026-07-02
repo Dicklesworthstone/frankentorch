@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN #2 (backward-fusion vein): fused norm_dim backward — flips fully-serial SLOWER → 5.4x/4.5x FASTER
+
+Agent `SlateTern`. Second harvest of the ft-autograd backward-fusion vein (see WIN #1 below). The
+`TensorNodeOp::NormDim` backward (norm reduced over one dim) was EVEN heavier than the full-norm case:
+128MB input clone (`contiguous_values_as_f64()`), `vec![0.0; input_numel]` scratch, then a **fully
+serial** triple-nested fill (`for outer { for inner { for r … }}`, per-element `powf` for general p),
+then a **serial** `accumulate_tensor_gradient`. Fused all into ONE Rayon pass via
+`accumulate_tensor_gradient_par_with`: each flat input index `idx` recovers its reduction lane
+`oi = (idx / inner_size / reduce_size) * inner_size + (idx % inner_size)`, reads the lane's grad/norm,
+and writes the gradient straight into the slot; input borrowed zero-copy via `operand_values_cow`.
+General-p precomputes per-lane `norm^(p-1)` once (bit-for-bit == the serial `norm_pow`).
+
+Measured ([4096,4096] f64, reduce dim=1, `sum().backward()`; 64c; torch 2.12.1+cpu, 64 threads;
+examples/norm_dim_bwd_h2h.rs):
+  - p=2: **FUSED 12.20ms** vs torch 66.31ms = **5.4x FASTER**
+  - p=3: **FUSED 22.28ms** vs torch 99.68ms = **4.5x FASTER**
+Prior path was fully serial (input clone + nested serial fill + serial accumulate over 16.7M elem;
+p=3 = serial `powf` ×16.7M ≈ hundreds of ms) → unambiguous SLOWER→FASTER flip. Bit-for-bit identical
+to the prior FT backward by construction (same per-lane norm^(p-1), same formula, ascending order);
+vs torch differs only ~1e-13 (forward reduction-order, PRE-EXISTING — p=3 sampled bits matched torch
+exactly). ft-autograd 477/477 green. The mechanism generalizes to the remaining ~38 `vec![0.0; numel]`
+backward arms whose contribution is per-index-independent (sum_dim/mean_dim/std_dim next; scans SKIP).
+
 ## 2026-07-02 - ★★ WIN + NEW VEIN: fused p-norm backward (single Rayon pass) — 21-24x internal, flips 2.7x/1.7x SLOWER → 6.6x/4.6x FASTER
 
 Agent `SlateTern`. NEW vein, distinct from the (now-dry) ft-api forward clone/borrow loop: this is

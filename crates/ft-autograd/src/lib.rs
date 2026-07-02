@@ -13392,63 +13392,97 @@ impl TensorTape {
                         "norm_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
-                    let mut norm_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let out_idx = outer * inner_size + inner;
-                            let grad_val = incoming[out_idx];
-                            let norm_val = output_values[out_idx];
-
-                            if p == 2.0 {
+                    // Fused single Rayon pass: each input index `idx` maps to its reduction
+                    // lane `oi = outer*inner_size + inner` (inner = idx % inner_size,
+                    // outer = idx / inner_size / reduce_size). The per-element gradient is a
+                    // pure fn of iv[idx] and the lane's norm_val/grad_val — no cross-element
+                    // coupling — so it writes straight into the grad slot with no scratch
+                    // `Vec` and no separate serial accumulate. Bit-for-bit identical to the
+                    // prior nested-serial-fill + accumulate path (same per-lane norm^(p-1),
+                    // same formula, ascending index order). frankentorch-normp-bwd-fused.
+                    if p == 2.0 {
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                let norm_val = output_values[oi];
                                 if norm_val != 0.0 {
-                                    for r in 0..reduce_size {
-                                        let idx = outer * reduce_size * inner_size
-                                            + r * inner_size
-                                            + inner;
-                                        norm_dim_contrib[idx] =
-                                            grad_val * input_values[idx] / norm_val;
-                                    }
+                                    incoming[oi] * iv[idx] / norm_val
+                                } else {
+                                    0.0
                                 }
-                            } else if p == 1.0 {
-                                for r in 0..reduce_size {
-                                    let idx =
-                                        outer * reduce_size * inner_size + r * inner_size + inner;
-                                    norm_dim_contrib[idx] =
-                                        grad_val * Self::torch_sign(input_values[idx]);
+                            },
+                        )?;
+                    } else if p == 1.0 {
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                incoming[oi] * Self::torch_sign(iv[idx])
+                            },
+                        )?;
+                    } else if p.is_infinite() {
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                let norm_val = output_values[oi];
+                                if norm_val != 0.0 && iv[idx].abs() == norm_val {
+                                    incoming[oi] * Self::torch_sign(iv[idx])
+                                } else {
+                                    0.0
                                 }
-                            } else if p.is_infinite() {
+                            },
+                        )?;
+                    } else if p != 0.0 {
+                        // General p: precompute per-lane norm^(p-1) exactly once (matches the
+                        // serial `norm_pow` bit-for-bit); the 0.0 placeholder for zero lanes is
+                        // never divided by (guarded on norm_val != 0.0 in the closure).
+                        let norm_pow: Vec<f64> = output_values
+                            .iter()
+                            .map(|&nv| if nv != 0.0 { nv.powf(p - 1.0) } else { 0.0 })
+                            .collect();
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                let norm_val = output_values[oi];
                                 if norm_val != 0.0 {
-                                    for r in 0..reduce_size {
-                                        let idx = outer * reduce_size * inner_size
-                                            + r * inner_size
-                                            + inner;
-                                        if input_values[idx].abs() == norm_val {
-                                            norm_dim_contrib[idx] =
-                                                grad_val * Self::torch_sign(input_values[idx]);
-                                        }
-                                    }
+                                    incoming[oi]
+                                        * Self::torch_sign(iv[idx])
+                                        * iv[idx].abs().powf(p - 1.0)
+                                        / norm_pow[oi]
+                                } else {
+                                    0.0
                                 }
-                            } else if p != 0.0 && norm_val != 0.0 {
-                                let norm_pow = norm_val.powf(p - 1.0);
-                                for r in 0..reduce_size {
-                                    let idx =
-                                        outer * reduce_size * inner_size + r * inner_size + inner;
-                                    norm_dim_contrib[idx] = grad_val
-                                        * Self::torch_sign(input_values[idx])
-                                        * input_values[idx].abs().powf(p - 1.0)
-                                        / norm_pow;
-                                }
-                            }
-                        }
+                            },
+                        )?;
+                    } else {
+                        // p == 0: gradient is zero (non-differentiable), matching the original
+                        // all-zero `norm_dim_contrib` accumulate.
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |_| 0.0,
+                        )?;
                     }
-                    Self::accumulate_tensor_gradient(
-                        input,
-                        &mut grads[input.0],
-                        &norm_dim_contrib,
-                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
