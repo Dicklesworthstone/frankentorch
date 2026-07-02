@@ -13972,3 +13972,21 @@ through. Bit-identical (lock test extended to cover `[N,1]` alongside `[M]`/`[1,
 + ft-conformance 276, all 0 failed. ★Both broadcast axes (last-dim vector + row scalar) for the two
 commutative elementwise ops (add/mul) are now fused; sub/div (non-commutative — order tracking) remain
 the follow-up. AGENT SlateTern.
+
+## 2026-07-01 - ★ WIN: fused broadcast extended to SUB/DIV (non-commutative) — ~parity/1.1x SLOWER -> ~2.4x FASTER
+
+Agent `SlateTern`. Completes the fused-broadcast vein: generalized `try_lastdim_bcast` /
+`try_rowscalar_bcast` from add/mul to a `BcastBinOp{Add,Sub,Mul,Div}` enum, tracking `big_is_lhs` so
+the non-commutative sub/div apply in the correct operand order (`b op v` when the full tensor is lhs,
+else `v op b`). Wired into tensor_sub/tensor_div (no-grad, contiguous, f32/f64); grad / other shapes
+fall through to the tape's expand path (which handles axis-reduction for backward). Bit-identical: the
+lock test now covers all 4 ops × both broadcast axes × both operand orders × f32/f64 (with per-order
+references since sub/div differ by order).
+
+★MEASURE (bcast_subdiv_h2h [4096,4096] f32, inputs OUTSIDE timer, min-of-7): sub_row ~5.3-6.3ms /
+div_row ~4.9-5.7ms / sub_col ~4.8-5.0ms / div_col ~5.2-5.5ms vs torch ~11-12.8ms = **2.0-2.4x FASTER**
+(were ~parity-to-1.1x-SLOWER on the expand path, ~12-13ms — same mechanism as add/mul ORIG). Tests:
+ft-api 2404 + ft-conformance 276, all 0 failed. ★VEIN COMPLETE: all four basic elementwise ops
+(add/sub/mul/div) × both common broadcast shapes (last-dim vector [M]/[1,M] + row scalar [N,1]) now
+fuse the broadcast (no expand materialization), ~2-3x FASTER than torch instead of ~parity/slower.
+Div-by-zero → IEEE inf/nan, identical to expand+div (verified). AGENT SlateTern.
