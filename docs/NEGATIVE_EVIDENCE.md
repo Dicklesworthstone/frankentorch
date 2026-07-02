@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×2): no-grad f64 digamma/i1 fast paths — flips ~3.6-3.7x SLOWER → 1.4-2.1x FASTER than torch
+
+Agent `SlateTern`. Continued the apply_function-unconditional-save harvest (systematic grep of the
+special-fn region for `save_for_backward(vals.to_vec())` NOT guarded by `needs_input_grad`). Found two
+more: `tensor_digamma` (had an f32 fast path, f64 on apply_function w/ unconditional save) and
+`tensor_i1` (no fast path at all). Added `try_f64_unary_native(input, digamma_approx / i1_approx)`
+before each apply_function. Bit-exact.
+
+PARITY (proven): `digamma_i1_f64_nograd_match_apply_function` (both == grad-forced apply_function,
+bit-exact; digamma domain (0,9], i1 [-4,4)) GREEN.
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096]):
+  - digamma: FUSED **14.00ms** vs ORIG 108.09ms = **7.72x** internal; torch 29.97ms → **2.14x FASTER**
+  - i1:      FUSED **33.00ms** vs ORIG 124.55ms = **3.77x** internal; torch 46.66ms → **1.41x FASTER**
+(i1 FUSED higher because i1_approx is a heavier per-element fn; ORIG correspondingly 124ms.) Both flip
+SLOWER→FASTER. ★VEIN CHECK: grep confirmed the remaining special-fn saves are CONDITIONAL (ndtr/
+log_ndtr/ndtri: `if needs_input_grad` guard → marginal) or use a different helper (i0: no save). So the
+apply_function-unconditional-save sub-vein is now FULLY HARVESTED across erfinv/i0e/i1e/erfcx/digamma/i1
+(6 ops, all flipped SLOWER→FASTER). f32-native paths for the no-f32 ones (i1/i1e/i0e) = separate dtype
+concern (they upcast f32→F64 output via apply_function; adding f32-native CHANGES dtype), own commit.
+
+
+
 ## 2026-07-02 - ★★ WIN (batch ×3): no-grad f64 i0e/i1e/erfcx fast paths — ~5x internal, flips ~2.5x SLOWER → 1.4-2.15x FASTER than torch
 
 Agent `SlateTern`. Harvested the vein erfinv (1e11d63f) exposed: `tensor_i0e`/`tensor_i1e`/`tensor_erfcx`
