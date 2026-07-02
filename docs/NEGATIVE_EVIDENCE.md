@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: fused tensor_glu (GLU, transformer gated-linear-unit) — 6.87x SLOWER -> 2.85x FASTER (17x internal)
+
+Agent `SlateTern`. Data-driven gapfind (`examples/glu_softmin_h2h.rs`, transformer shape [64,512,1024]
+no-grad) found glu **6.87x SLOWER** than torch (FT ~190ms vs PT ~28ms); softmin already 3.3x FASTER
+(skip). Cause: glu = `narrow(a) + narrow(b) + sigmoid(b) + mul(a,b)` — the two narrows are STRIDED views
+and sigmoid/mul ride them through the tape (~190ms!). Fused the no-grad path into ONE pass over the
+output: `out[.,ok,j] = a * sigmoid(b)` where a/b are the two halves along `dim`, read via
+outer/half/inner strides (handles last/middle/first split dims). Bit-exact to the compose (sigmoid ==
+the kernel's `1/(1+exp(-b))`; `a*sig` order matches mul(a,sigmoid(b))). f32/f64, contiguous.
+
+★MEASURE (16M-out f64 no-grad, min-of-7, load ~28): glu FUSED **10.9ms vs FT_ORIG(compose) 189.9ms =
+~17.4x internal**; vs torch **6.87x SLOWER -> 2.85x FASTER**. Lock test `glu_fused_matches_compose`
+(last/middle/first split dims, f32+f64). ★LESSON: a compose over STRIDED VIEWS (narrow/chunk/split then
+elementwise) is FAR slower than its op-count suggests (strided reads + intermediate materialization +
+tape) — a big hidden gap. GLU is hot in transformers. FOLLOW-UP: swiglu (a*swish(b)) + reglu (a*relu(b))
+have the SAME narrow-narrow-act-mul compose -> same fusion applies. AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: try_f64_binary_native helper — rel_entr f64 fused — ~20x internal, 2.88x SLOWER -> 7.04x FASTER (+ xlog1py REJECTED)
 
 Agent `SlateTern`. BINARY analog of the try_f64_unary_native vein: added `try_f64_binary_native` (mirror
