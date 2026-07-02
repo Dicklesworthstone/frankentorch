@@ -16,30 +16,39 @@ fn main() {
     let n = rows * cols;
     // positive range so rsqrt/softplus are well-defined
     let data: Vec<f64> = (0..n).map(|i| 0.5 + ((i % 971) as f64) * 0.01).collect();
-    for op in ["rsqrt", "silu", "erf", "elu", "softplus"] {
+    for op in ["sumonly", "rsqrt", "silu", "erf", "elu", "softplus"] {
         let mut best = f64::INFINITY;
+        let mut best_fwd = f64::INFINITY;
+        let mut best_bwd = f64::INFINITY;
         let mut fp = 0u64;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
             let a = s.tensor_variable(data.clone(), vec![rows, cols], true).unwrap();
             let t0 = Instant::now();
             let y = match op {
+                "sumonly" => a,
                 "rsqrt" => s.tensor_rsqrt(a).unwrap(),
                 "silu" => s.tensor_silu(a).unwrap(),
                 "erf" => s.tensor_erf(a).unwrap(),
                 "elu" => s.tensor_elu(a).unwrap(),
                 _ => s.tensor_softplus(a).unwrap(),
             };
+            let t1 = Instant::now();
             let loss = s.tensor_sum(y).unwrap();
             s.tensor_backward(loss).unwrap();
-            let ms = t0.elapsed().as_secs_f64() * 1e3;
+            let t2 = Instant::now();
+            let ms = (t2 - t0).as_secs_f64() * 1e3;
+            let fwd = (t1 - t0).as_secs_f64() * 1e3;
+            let bwd = (t2 - t1).as_secs_f64() * 1e3;
             if ms < best {
                 best = ms;
+                best_fwd = fwd;
+                best_bwd = bwd;
                 let g = s.tensor_grad(a).unwrap().unwrap();
                 fp = fingerprint(&g);
             }
             std::hint::black_box(&s);
         }
-        println!("[{tag}] {op} fwd+bwd f64 [4096,4096]: {best:.2} ms | grad_fp=0x{fp:016x}");
+        println!("[{tag}] {op} f64 [4096,4096]: total {best:.2} ms (fwd {best_fwd:.2} + sum/bwd {best_bwd:.2}) | grad_fp=0x{fp:016x}");
     }
 }

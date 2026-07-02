@@ -12994,9 +12994,12 @@ impl TensorTape {
                     // contribution only to read it back once — that buffer is pure
                     // alloc+fill+read traffic on the universal `loss.backward()`
                     // reduction. Bit-identical to the prior form: same ascending
-                    // index order, same `target[i] += grad_scalar` f64 op.
-                    // frankentorch-96e5d.
-                    Self::accumulate_tensor_gradient_with(
+                    // index order, same `target[i] += grad_scalar` f64 op. Parallelized:
+                    // the broadcast fill/accumulate fans over Rayon (bit-identical to the
+                    // serial form — constant contribution, ascending order, below-threshold
+                    // fallback stays serial). This is the universal `loss.backward()` hot
+                    // path, so the serial 16.7M fill dominated it. frankentorch-96e5d.
+                    Self::accumulate_tensor_gradient_par_with(
                         input,
                         &mut grads[input.0],
                         input_numel,
@@ -13022,9 +13025,10 @@ impl TensorTape {
                     // `grad_scalar * scale` lazily rather than materializing a full
                     // `mean_contrib` Vec. `contrib_val` is computed once so the f64
                     // product is bit-identical to the prior per-slot fill, then added
-                    // in the same ascending index order. frankentorch-96e5d.
+                    // in the same ascending index order (Rayon-parallel, below-threshold
+                    // fallback stays serial). frankentorch-96e5d.
                     let contrib_val = grad_scalar * scale;
-                    Self::accumulate_tensor_gradient_with(
+                    Self::accumulate_tensor_gradient_par_with(
                         input,
                         &mut grads[input.0],
                         input_numel,

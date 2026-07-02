@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN #6 (UNIVERSAL): parallelize Sum/Mean backward — the `loss.backward()` broadcast — flips 1.9x SLOWER→1.93x FASTER + flips ALL activations
+
+Agent `SlateTern`. The single highest-EV win of the session, found by SPLIT-TIMING the activation bench
+(fwd vs bwd): the forward was only ~8-15ms; the ~90ms floor was in `sum().backward()`. Root cause:
+`TensorNodeOp::Sum` (and `Mean`) backward broadcast the upstream scalar grad across all input elements
+via the **serial** `accumulate_tensor_gradient_with` — a serial 16.7M fill on the MOST COMMON pattern in
+all of deep learning (scalar `loss.backward()`). Swapped to the parallel `accumulate_tensor_gradient_par_with`
+(created earlier this session for norm); `|_| grad_scalar` is a constant closure, so bit-for-bit identical
+(same ascending order, below-threshold serial fallback).
+
+Measured ([4096,4096] f64, 64c; torch 2.12.1+cpu 64 threads; act_bwd_h2h.rs, split fwd/bwd):
+  - **sum().backward()** (pure): 9.65ms vs torch 18.63ms = **1.93x FASTER** (the serial fill was ~60ms of the old ~90ms)
+  - downstream, this ALSO flips the WIN-#5 activations that were still SLOWER (their bwd = sum-bwd + act-bwd):
+    rsqrt 38.5ms=**2.93x**, silu 40.2ms=**1.83x** (was 1.33x SLOWER), erf 42.0ms=**4.32x**,
+    elu 37.8ms=**1.90x** (was 1.42x SLOWER), softplus 43.2ms=**1.74x FASTER** (was 1.40x SLOWER) — all vs torch
+BIT-EXACT: every activation grad fingerprint IDENTICAL to the prior serial-Sum-backward run (all 5) +
+sumonly grad = all-ones. ft-autograd 477/477 green. ★This lever touches EVERY reduction-seeded backward
+(the standard training loop), not just these ops — broad, universal speedup. Grep for other backward arms
+still on the serial `accumulate_tensor_gradient_with`; upgrade constant/independent ones to `_par_with`.
+
 ## 2026-07-02 - ★ WIN #5 (NEW class: activation/unary backward): fused derivative-map into grad slot — rsqrt/erf FLIP to FASTER, silu/elu/softplus gap-close 3.5x→1.3x
 
 Agent `SlateTern`. Different op CLASS from the reduction backwards: elementwise-unary/activation
