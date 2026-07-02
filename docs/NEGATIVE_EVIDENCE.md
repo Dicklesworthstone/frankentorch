@@ -14048,3 +14048,22 @@ compose for fmax+fmin). Tests: ft-api + ft-conformance green. ★LESSON: an op w
 composes 5+ tape ops for its base case (not just broadcast) is a catastrophic per-call gap — the fully
 fused single pass is ~20x+. fmax/fmin are less common than max/min but were ~14x SLOWER on every call.
 Follow-up: fmax/fmin BROADCAST still composes (rarer); where(cond, x, scalar) still expands the scalar. AGENT SlateTern.
+
+## 2026-07-01 - ★★ WIN: no-grad fused where(cond, x, scalar) — 434ms->6.6ms (~65x), 36x SLOWER -> 1.8x FASTER
+
+Agent `SlateTern`. `tensor_where`'s broadcast fallthrough `broadcast_to`s ALL THREE operands to the
+common shape then selects — for the ATTENTION-MASKING pattern `where(mask, scores, -inf)` (cond & x
+both [N,M], y a scalar [1]) that's `broadcast_to(cond) + broadcast_to(x) + broadcast_to(scalar->[N,M])
++ where`. broadcast_to on a same-shape tensor still routes through the generic expand (slow), so a
+16M-elem where was **434ms**. Added `try_where_one_scalar`: when cond matches the ONE full-size operand
+and the OTHER is a scalar, select in ONE parallel pass (`out[i] = (cond[i]!=0)==x_is_full ? full[i] :
+scalar`), no expand. f32/f64, contiguous, no-grad, all-same-dtype; both scalar-branch positions; grad /
+cond-broadcast fall through. Bit-identical (truthy==nonzero, matching the same-shape fast path).
+
+★MEASURE (where_scalar_ng [4096,4096] f32 NO-GRAD, inputs OUTSIDE timer, min-of-9, ORIG via file-swap
+to HEAD, same session, load ~17): **434ms -> 6.6ms = ~65x** — flips ~36x SLOWER -> ~1.8x FASTER vs
+torch's ~12ms. This is the HOT attention-masking op. Lock test where_one_scalar_fused_matches_broadcast_path
+(fused == broadcast, both scalar positions, f32/f64). Tests: ft-api + ft-conformance green. ★LESSON:
+`broadcast_to` even on a SAME-shape operand routes through the slow generic expand — an op that
+broadcast_to's all N operands (where=3, maximum=2) before its kernel is a huge latent gap; a fused
+select/op with no expand is 2 orders faster. AGENT SlateTern.
