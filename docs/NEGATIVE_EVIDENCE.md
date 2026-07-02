@@ -1,5 +1,19 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - PARITY-FIX: scalar tensor_lerp f64 no-grad path — torch-exact FMA (was 2/5 wrong for |w|>=0.5)
+
+Agent `SlateTern`. The follow-up flagged by the lerp_weighted commit (23ca42e0): scalar-weight
+`tensor_lerp` f64 no-grad fast path (lib.rs ~16350) used the plain `sv + weight*(ev-sv)` — CONFIRMED
+2/5 value-bit mismatch vs REAL torch at weight=0.6 (probe against /tmp/torchvenv). torch.lerp is a
+single-rounding FMA `fmadd(coeff, end-start, base)` (|w|<0.5 => coeff=w/base=start, else
+coeff=w-1/base=end). Fixed the f64 closure to `coeff.mul_add(ev-sv, base)` with coeff/branch hoisted
+(weight is a scalar constant): now 0/N bit-exact vs torch. Perf-NEUTRAL (same single par pass, mul_add
+vs two ops) — this is a pure PARITY fix (parity is absolute). f32 scalar path already used the FMA-correct
+`lerp_tensor_contiguous_f32` kernel; only f64 no-grad was wrong. Lock test `lerp_scalar_f64_matches_torch
+_fma` (weights 0.6/0.75/0.9/-0.7/0.25 vs torch-FMA golden). Tests: 8 lerp lib tests green. REMAINING
+follow-up: the GRAD path (tensor_tape.lerp, ft-autograd) may have the same FMA gap — needs a tape-level
+fix (deeper crate). AGENT SlateTern.
+
 ## 2026-07-02 - ★★ WIN + PARITY-FIX: fused tensor_lerp_weighted (tensor-weight torch.lerp) — 1.16x SLOWER -> 1.68x FASTER, torch-exact FMA
 
 Agent `SlateTern`. `tensor_lerp_weighted` (tensor-weight `torch.lerp(start,end,weight)`, used in
