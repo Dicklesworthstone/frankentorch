@@ -1,5 +1,30 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN: fused pow_tensor f64 (torch.float_power tensor-exp) — ~3x internal, 1.23x FASTER than torch (bit-exact)
+
+Agent `SlateTern`. `tensor_pow_tensor` (torch.pow/float_power with a TENSOR exponent) composed
+`x^e = exp(e·ln x)` PLUS a 0^0→1 where-mask: `log + mul + exp + eq + eq + full×2 + mul + where` =
+~7 tape passes, several full-size intermediates. Added a no-grad f64 equal-shape fast path fusing it
+into ONE parallel pass: `if x==0 && e==0 {1.0} else {(e * x.ln()).exp()}`. Bit-exact: tensor_log is
+`x.ln()`, tensor_mul(exponent, log_x) is `e·lnx` (that operand order), tensor_exp is `.exp()`, and the
+where maps `x==0 && e==0` to 1.0 exactly as the composed `both_zero` mask (negative base → NaN in both,
+bits match).
+
+PARITY (proven): `pow_tensor_f64_fused_matches_composed_path` (fused == grad-forced compose, bit-exact,
+covering x>0, x==0 with e==0→1 and e>0→0, and x<0→NaN) GREEN.
+
+PERF (MEASURED, cc-local release, A/B, 32t, [4096,4096]): FUSED **18.28ms** vs ORIG-compose (measured
+as just log+mul+exp = 46.65ms; the REAL compose adds eq+full+mul+where ≈ +2 passes so ~60ms) =
+**~2.5-3x internal**; torch float_power/pow(tensor-exp) 22.4ms → **1.23x FASTER** (and FT was under
+HIGHER load [25] than the torch run [14], so conservative). ⚠️NOTE: modest torch margin because both are
+compute-bound on the SAME ln+exp transcendentals — the win is removing the FT compose's extra passes +
+the 0^0 where-machinery, not out-computing torch. ⚠️ the forward-probe's 73ms torch reading was
+CONTENTION-inflated; clean torch = 22.4ms (re-measure torch clean before trusting a probe number). f32
+left on the compose (would need f32-native ln/exp matching the f32 compose's rounding). 6th compose→
+one-pass win this session.
+
+
+
 ## 2026-07-02 - ⚠️ BLOCKER (reverted unmeasured): gather/take_along_dim 5.5x SLOWER — tape plumbing over a parallel kernel, ceiling ~parity
 
 Agent `SlateTern`. Forward probe flagged take_along_dim (136ms — later found CONTENTION-inflated; clean
