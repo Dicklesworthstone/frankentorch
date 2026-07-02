@@ -1,5 +1,30 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN #4 (backward-fusion vein): fused prod_dim backward — flips fully-serial SLOWER → 6.2x FASTER
+
+Agent `SlateTern`. Fourth harvest of the ft-autograd backward-fusion vein. `TensorNodeOp::ProdDim`
+backward: 128MB input clone, `vec![0.0]` scratch, **fully serial** triple-nested loop that per lane
+(1) counts zeros + accumulates `prod_no_zero` (serial product) then (2) fills `dx_i = grad*prod/x_i`
+(with the torch 1-zero / ≥2-zero special cases), then serial `accumulate_tensor_gradient`. Fused into
+a parallel per-lane `(zero_count, prod_no_zero)` precompute (serial within-lane product order kept =
+bit-identical) + ONE parallel write of the contribution into the grad slot via
+`accumulate_tensor_gradient_par_with`; input borrowed zero-copy via `operand_values_cow`.
+
+Measured ([4096,4096] f64, reduce dim=1, values≈1.0 to avoid length-4096 product overflow,
+`sum().backward()`; 64c; torch 2.12.1+cpu, 64 threads; examples/prod_dim_bwd_h2h.rs):
+  - prod_dim: **FUSED 15.20ms** vs torch 94.78ms = **6.2x FASTER**
+Prior path fully serial over 16.7M → unambiguous SLOWER→FASTER flip. Bit-for-bit identical to the
+prior FT backward by construction; vs torch ~1 ULP (pre-existing prod-forward accumulation-order — FT
+`prod_val/x_i` vs torch's dual-cumprod backward). ft-autograd 477/477 green.
+
+★VEIN STATUS after 4 flips (norm, norm_dim, var_dim/std_dim, prod_dim): the per-element-COMPUTE
+reduction backwards are HARVESTED. Remaining `vec![0.0;numel]` backward arms are (a) BANDWIDTH-bound
+broadcasts — sum_dim/mean_dim bwd = `grad` (or `grad/n`) broadcast, NO per-elem compute → likely
+PARITY not a flip (profile before claiming); (b) MOVEMENT ops (cat/stack/reshape/transpose/narrow/
+expand/split/index_select/gather/scatter/flip/repeat/roll/pad) = gather/scatter/copy, many already
+parallel (see outer_gate_serial); (c) SCANS (cumsum/cumprod) + softmax/logsoftmax = cross-element
+COUPLED, not per-index-independent → SKIP. Next real wins likely need a DIFFERENT lever class.
+
 ## 2026-07-02 - ★★ WIN #3 (batch ×2, backward-fusion vein): fused var_dim + std_dim backward — flips fully-serial SLOWER → 4.1x/5.2x FASTER
 
 Agent `SlateTern`. Third harvest of the ft-autograd backward-fusion vein. `TensorNodeOp::VarDim` and

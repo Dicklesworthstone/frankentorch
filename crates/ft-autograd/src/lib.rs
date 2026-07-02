@@ -13116,44 +13116,55 @@ impl TensorTape {
                         "prod_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
-                    let mut prod_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let out_idx = outer * inner_size + inner;
-                            let grad_val = incoming[out_idx];
-                            let prod_val = output_values[out_idx];
-                            // Count zeros in this slice
-                            let mut zero_count = 0;
-                            let mut prod_no_zero = 1.0;
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let v = input_values[idx];
-                                if v == 0.0 {
-                                    zero_count += 1;
-                                } else {
-                                    prod_no_zero *= v;
+                    // Fused single Rayon pass. Precompute each lane's (zero_count,
+                    // prod_no_zero) once — parallel across lanes, but the within-lane product
+                    // keeps the original serial r-order so `prod_no_zero` is bit-for-bit
+                    // identical — then write each dx_i straight into the grad slot. No scratch
+                    // Vec, no serial accumulate, input borrowed zero-copy. Bit-for-bit
+                    // identical to the prior serial path. frankentorch-normp-bwd-fused.
+                    let lane_info: Vec<(usize, f64)> = {
+                        use rayon::prelude::*;
+                        (0..expected_incoming)
+                            .into_par_iter()
+                            .map(|oi| {
+                                let outer = oi / inner_size;
+                                let inner = oi % inner_size;
+                                let base = outer * reduce_size * inner_size + inner;
+                                let mut zero_count = 0usize;
+                                let mut prod_no_zero = 1.0;
+                                for r in 0..reduce_size {
+                                    let v = iv[base + r * inner_size];
+                                    if v == 0.0 {
+                                        zero_count += 1;
+                                    } else {
+                                        prod_no_zero *= v;
+                                    }
                                 }
-                            }
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let v = input_values[idx];
-                                prod_dim_contrib[idx] = if zero_count == 0 {
-                                    grad_val * prod_val / v
-                                } else if zero_count == 1 && v == 0.0 {
-                                    grad_val * prod_no_zero
-                                } else {
-                                    0.0
-                                };
-                            }
-                        }
-                    }
-                    Self::accumulate_tensor_gradient(
+                                (zero_count, prod_no_zero)
+                            })
+                            .collect()
+                    };
+                    Self::accumulate_tensor_gradient_par_with(
                         input,
                         &mut grads[input.0],
-                        &prod_dim_contrib,
+                        input_numel,
+                        |idx| {
+                            let inner = idx % inner_size;
+                            let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                            let (zero_count, prod_no_zero) = lane_info[oi];
+                            let v = iv[idx];
+                            if zero_count == 0 {
+                                incoming[oi] * output_values[oi] / v
+                            } else if zero_count == 1 && v == 0.0 {
+                                incoming[oi] * prod_no_zero
+                            } else {
+                                0.0
+                            }
+                        },
                     )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
