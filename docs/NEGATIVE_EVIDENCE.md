@@ -1,5 +1,36 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔ TWO BLOCKERS surfaced: (1) CyclicLR test is an IRRECONCILABLE contradiction, (2) in-lane clean-perf frontier is thinning
+
+Agent `SlateTern`. Dug for the next win; both leads are blockers, surfaced (no code landed — reverted an
+attempted fix that made things worse).
+
+⛔ **(1) CyclicLR "bug" = irreconcilable test contradiction (needs an OWNER design decision, NOT a
+unilateral fix).** Last turn's macro fix exposed `cyclic_lr_saturates_loaded_max_iteration_counter`
+failing. Root: it loads `iteration = usize::MAX as f64` (which rounds to 2^64) and asserts the state
+round-trips to `Some(usize::MAX as f64)` — i.e. decode should ACCEPT/saturate the 2^64 boundary. BUT a
+sibling test `exact_usize_state_field_rejects_saturating_cast_boundary` asserts
+`decode_exact_usize_field((usize::MAX as f64)+1.0, 0) == None` — and `(usize::MAX as f64)+1.0` COLLAPSES
+to 2^64 under f64 rounding, so it asserts decode must REJECT the SAME 2^64 value. (Same for the i64
+pair.) The two tests demand OPPOSITE behavior for the identical input. Relaxing `decode_exact_*_field`
+to accept the boundary (rely on the `decoded as f64 != value` round-trip) makes cyclic_lr pass but breaks
+BOTH exact_* reject tests (net 1 fail -> 2). The `decode_EXACT` naming + the dedicated reject-boundary
+tests argue the REJECT design is intentional and the cyclic_lr assertion is the outlier — but that's a
+peer/owner call (changing a test named "saturates..." to expect rejection is ambiguous). REVERTED my
+decode change; left main at its pre-existing state (253 pass / 1 fail = cyclic_lr). ★ACTION FOR OWNER:
+pick one — either (a) change cyclic_lr's assertion to `Some(1.0)` (reject design: load rejected ->
+iteration stays 0 -> step -> 1), or (b) delete the exact_* reject-boundary tests and relax the decoders.
+
+⛔ **(2) in-lane clean vs-PyTorch perf frontier is THINNING.** This session landed ~12 wins across the
+whole autograd backward surface (sum/mean/add/sub/mul/div/95-caller-accumulator/all activations/trig) +
+SGD. Remaining optimizer steps with 0 par_iter: LBFGS (its `vector_dot` is a REDUCTION -> parallelizing
+changes summation order -> not bit-exact + niche two-loop-recursion optimizer), SparseAdam (dense path is
+per-index-parallelizable BUT torch's SparseAdam only accepts SPARSE grads -> no vs-torch comparison,
+niche), Muon (matrix/Newton-Schulz = GEMM, peer-reserved). Broadcast=view-floor, transcendentals=
+bandwidth-ceiling (both prior entries). ★NEXT real wins need either peer-reserved DEEP kernels
+(GEMM-packing / SIMD reductions / Muon) or a FRESH deep gap-find on an op class not yet swept this
+campaign — the cheap parallelize-a-serial-loop wins are largely harvested.
+
 ## 2026-07-02 - ★★ WIN (NEW class: ft-optim): parallelize SGD step — flips 4.08x SLOWER → 1.47x FASTER vs torch (6.02x internal)
 
 Agent `SlateTern`. NEW crate/class (ft-optim, distinct from all the ft-autograd backward work). The
