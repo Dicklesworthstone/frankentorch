@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: try_f64_unary_native batch 2 — softsign/deg2rad/rad2deg f64 fused — 5-6x internal, all flip to FT-FASTER
+
+Agent `SlateTern`. Continued the try_f64_unary_native vein (helper from 27462952). Grepped
+`try_f32_unary_native(` sites; softsign/deg2rad/rad2deg have genuine MULTI-op f64 composes (NOT
+apply_function — selu/celu/entr use apply_function or already have a f64 fast path, SKIP those). Added
+try_f64_unary_native to each: softsign `x/(1.0+x.abs())` (OWN f64 closure — the f32 one is f32-inside for
+torch-f32 bit-exactness, can't reuse); deg2rad/rad2deg reuse their f64-native `x*(PI/180)` / `x*(180/PI)`
+closures. Bit-exact to each compose (lock test).
+
+★MEASURE (16M f64 no-grad, min-of-7, load ~28): softsign FUSED **14.0ms vs FT_ORIG(compose) 80.4ms =
+~5.75x internal**, 1.09x SLOWER -> **5.69x FASTER**; deg2rad **12.4ms vs 61.4ms = ~4.95x**, 2.91x SLOWER
+-> **2.06x FASTER**; rad2deg **9.9ms vs 63.1ms = ~6.35x**, 2.64x SLOWER -> **2.54x FASTER**. All FLIP
+SLOWER -> FASTER (deg/rad composes were slow because full() materializes a 128MB const + mul + tape
+overhead). Lock test `softsign_deg_rad_f64_fused_match_compose` (fused == grad-forced compose, NaN seeded,
+f64). ⛔SKIP (already fast / not a real compose): selu/celu/entr (apply_function or existing f64 path),
+acosh/erfinv/digamma/gammaln/i0e/i1e/bessel/ndtr/log_ndtr (apply_function/tape single-pass). REMAINING
+try_f64 candidates: angle (8-op compose but a select w/ -0.0 subtlety), special_spherical_bessel_j0 /
+airy_ai / logit (verify closure vs compose first). AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: try_f64_unary_native helper — asinh/atanh f64 fused — 13x/20x internal, both flip to FT-FASTER
 
 Agent `SlateTern`. ★NEW SHARED-HELPER VEIN: many transcendental unary ops added a `try_f32_unary_native`
