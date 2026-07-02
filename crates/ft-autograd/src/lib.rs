@@ -12198,14 +12198,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sin { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let sin_contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |grad, x| {
-                            grad * x.cos()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sin_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, x| grad * x.cos(),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12216,14 +12219,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Cos { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let cos_contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |grad, x| {
-                            grad * (-x.sin())
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &cos_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, x| grad * (-x.sin()),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12366,14 +12372,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Asin { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx asin(x) = 1/sqrt(1-x^2)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g / (1.0 - x * x).sqrt()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx asin(x) = 1/sqrt(1-x^2). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g / (1.0 - x * x).sqrt(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12382,14 +12390,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Acos { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx acos(x) = -1/sqrt(1-x^2)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            -g / (1.0 - x * x).sqrt()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx acos(x) = -1/sqrt(1-x^2). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| -g / (1.0 - x * x).sqrt(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12398,15 +12408,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Atan { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx atan(x) = 1/(1+x^2)
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| g / (1.0 + x * x))
-                        .collect();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx atan(x) = 1/(1+x^2). Fused parallel map (was a serial map +
+                    // serial accumulate) into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g / (1.0 + x * x),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12415,14 +12427,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sinh { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx sinh(x) = cosh(x)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g * x.cosh()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx sinh(x) = cosh(x). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g * x.cosh(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12431,14 +12445,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Cosh { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx cosh(x) = sinh(x)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g * x.sinh()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx cosh(x) = sinh(x). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g * x.sinh(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -20435,17 +20451,39 @@ impl TensorTape {
         target: &mut TensorGradientSlot,
         contribution: &[f64],
     ) -> Result<(), AutogradError> {
+        // The single most-called gradient accumulator (~95 backward arms). Fan the
+        // fill/accumulate over Rayon above a threshold — bit-for-bit identical to the
+        // serial form (empty slot: ordered `0.0 + value` collect; non-empty:
+        // index-aligned `target[i] += contribution[i]`; below-threshold serial
+        // fallback keeps small-shape callers deterministic). frankentorch-accum-par.
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
-            target.values.reserve(contribution.len());
-            for &value in contribution {
-                target.values.push(0.0 + value);
+            if contribution.len() >= PAR_MIN {
+                use rayon::prelude::*;
+                target.values = contribution.par_iter().map(|&value| 0.0 + value).collect();
+            } else {
+                target.values.reserve(contribution.len());
+                for &value in contribution {
+                    target.values.push(0.0 + value);
+                }
             }
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution.len())?;
-        for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
-            *target_value += value;
+        if contribution.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .values
+                .par_iter_mut()
+                .zip(contribution.par_iter())
+                .for_each(|(target_value, &value)| {
+                    *target_value += value;
+                });
+        } else {
+            for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
+                *target_value += value;
+            }
         }
         Ok(())
     }
@@ -20465,20 +20503,35 @@ impl TensorTape {
         target: &mut TensorGradientSlot,
         mut contribution: Vec<f64>,
     ) -> Result<(), AutogradError> {
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
             // Canonicalize -0.0 -> +0.0 in place to match the borrowed path's
             // `0.0 + value` bit-for-bit (`x += 0.0` == `0.0 + x` by IEEE add
             // commutativity), then move the buffer in with no fresh allocation.
-            for value in contribution.iter_mut() {
-                *value += 0.0;
+            if contribution.len() >= PAR_MIN {
+                use rayon::prelude::*;
+                contribution.par_iter_mut().for_each(|value| *value += 0.0);
+            } else {
+                for value in contribution.iter_mut() {
+                    *value += 0.0;
+                }
             }
             target.values = contribution;
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution.len())?;
-        for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
-            *target_value += value;
+        if contribution.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .values
+                .par_iter_mut()
+                .zip(contribution.par_iter())
+                .for_each(|(target_value, &value)| *target_value += value);
+        } else {
+            for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
+                *target_value += value;
+            }
         }
         Ok(())
     }
@@ -20488,9 +20541,18 @@ impl TensorTape {
         target: &mut [f64],
         contribution: &[f64],
     ) -> Result<(), AutogradError> {
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.len(), contribution.len())?;
-        for (target_value, value) in target.iter_mut().zip(contribution.iter()) {
-            *target_value += value;
+        if contribution.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .par_iter_mut()
+                .zip(contribution.par_iter())
+                .for_each(|(target_value, &value)| *target_value += value);
+        } else {
+            for (target_value, value) in target.iter_mut().zip(contribution.iter()) {
+                *target_value += value;
+            }
         }
         Ok(())
     }

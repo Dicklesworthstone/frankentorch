@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN #8: parallelize the universal `accumulate_tensor_gradient` (95 callers) + fully-fuse trig backward — sin/cos/sinh/cosh flip ~2x SLOWER → 1.4-2.3x FASTER
+
+Agent `SlateTern`. TWO bundled bit-exact wins on the core autograd path:
+(1) **Universal accumulator**: `accumulate_tensor_gradient` (the single most-called gradient accumulator,
+~95 backward arms) + `_owned` + `accumulate_existing_tensor_gradient` broadcast/accumulated SERIALLY over
+the whole tensor. Parallelized all three (empty slot: ordered `0.0+v` par-collect; non-empty: index-aligned
+`par_iter_mut().zip()`; below-threshold serial fallback) — bit-for-bit identical, validated by the full
+ft-autograd suite (477/477, all 95 callers exercised).
+(2) **Fully-fuse trig backward** (Sin/Cos/Asin/Acos/Atan/Sinh/Cosh): these cloned the 128MB input
+(`contiguous_values_as_f64`) + `tensor_backward_zip_map` into a scratch Vec + separate accumulate. Swapped
+to `operand_values_cow` borrow + `accumulate_tensor_gradient_zip_map` (parallel map straight into slot).
+
+★DIAGNOSIS (why the accumulator win alone wasn't enough): first benched the trig ops with ONLY the
+accumulator parallelized → still ~160ms = 2x SLOWER than torch, because the input clone + scratch Vec +
+serial derivative map remained. SPLIT-TIMING showed fwd ~10ms, bwd ~150ms → the backward's clone+scratch
+was the floor, not the accumulate. Fully fusing dropped it to ~44ms.
+
+Measured ([4096,4096] f64, `op(x).sum().backward()`; 64c; torch 2.12.1+cpu 64 threads; trig_bwd_h2h.rs):
+  - sin:  160→ **43.69ms** (fwd 10.2 + bwd 33.5); vs torch 73.89ms = **1.69x FASTER** (was 2.2x SLOWER)
+  - cos:  159→ **42.07ms**; vs torch 97.30ms = **2.31x FASTER**
+  - sinh: 168→ **43.98ms**; vs torch 69.98ms = **1.59x FASTER**
+  - cosh: 170→ **50.01ms**; vs torch 69.10ms = **1.38x FASTER**
+BIT-EXACT (grad fingerprints identical before/after the fusion). ft-autograd 477/477, ft-conformance
+sin/cos/tan green. ★The accumulator parallelization also silently speeds the ~88 OTHER arms that compute a
+contrib + `accumulate_tensor_gradient` (test-validated broad win). Remaining: Sigmoid/Tanh/Erfc still use a
+serial derivative map + accumulate → convert to `accumulate_tensor_gradient_zip_map` next.
+
 ## 2026-07-02 - ★★★ WIN #7 (UNIVERSAL): parallelize Add/Sub/Mul/Div backward — 2.1-5.0x FASTER vs torch
 
 Agent `SlateTern`. Direct extension of WIN #6: grepped the remaining SERIAL `accumulate_tensor_gradient_with`
