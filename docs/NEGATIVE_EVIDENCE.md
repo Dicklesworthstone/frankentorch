@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN (batch ×2): no-grad f64 max_dim/min_dim borrow — 45.4x internal, flips ~55x SLOWER → 1.21x SLOWER (near-parity)
+
+Agent `SlateTern`. The direct sibling of argmax: `tensor_max_dim`/`tensor_min_dim` (and thus amax/amin
+which wrap them) had an f32 borrow fast path (`extremum_dim_f32_fast`, returns values+indices) but f64
+fell to `tensor_tape.max_dim`, which CLONES via `contiguous_values_as_f64()` (`.to_vec()`) before the
+SAME `max_dim_tensor_contiguous_f64` kernel. Added `extremum_dim_f64_fast` (borrow `contiguous_values()`
++ the identical one-pass values+indices kernel). Bit-exact; no-grad only (values output is
+differentiable via the argmax-routed gradient → grad falls through to the tape).
+
+PARITY (proven): `max_min_dim_f64_borrow_values_indices_correct` (values + indices == manual per-row
+reduction, parallel path) GREEN; 96 `max`-tests + 12 `amin`-tests pass (amax/amin/max_dim unaffected).
+
+PERF (MEASURED, cc-local release, FT_ORIG A/B, 32t, [4096,4096] f64 dim=1): FUSED-borrow **1.89ms** vs
+ORIG-clone **85.83ms = 45.4x internal**; torch max(dim=1) 1.56ms → **1.21x SLOWER (near-parity!)**.
+★NOTE: max_dim lands at NEAR-PARITY (1.89ms), MUCH better than argmax's 8.47ms/7.4x-slower even though
+both remove the same ~85ms clone — the `max_dim_tensor_contiguous_f64` (values+indices, one pass) kernel
+is far better optimized than `argmax_dim_tensor_contiguous_f64` (indices-only). So the argmax residual
+(7.4x) is specifically the ARGMAX-only kernel; max_dim's kernel is already near-SIMD-competitive. Flips
+~55x SLOWER → 1.21x SLOWER. ★The input-read-clone REDUCTION extension is now COMPLETE: argmax/argmin
+(gap-close to 7.4x) + max_dim/min_dim/amax/amin (near-parity 1.21x) — all the common
+extremum-with-indices reductions had the f32-borrow/f64-clone split, now all borrow. FOLLOW-UP: the
+argmax-only kernel could adopt max_dim's better scan (both do a max-with-index pass; argmax just
+discards the value) — a small ft-kernel-cpu win to close argmax's residual.
+
+
+
 ## 2026-07-02 - ★ WIN (gap-close): no-grad f64 argmax/argmin borrow — 11.8x internal, flips ~87x SLOWER → 7.4x SLOWER (SIMD-kernel wall residual)
 
 Agent `SlateTern`. The input-read-clone lever applied to a REDUCTION: `tensor_argmax`/`tensor_argmin`
