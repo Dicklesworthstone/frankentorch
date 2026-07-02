@@ -1,5 +1,37 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN: fused diff n>=2 last-dim — 10-12x internal, flips ~9x SLOWER → ~1.35x FASTER than torch (bit-exact)
+
+Agent `SlateTern`. The forward-op probe flagged `torch.diff(n=3)` ~32-64ms ([4096,4096] f64) — slow
+because torch materializes each iterated order. FT's `tensor_diff_full` had a fast path ONLY for n==1;
+for n>=2 it ran the general loop: `n` tape `sub` nodes, each subtracting two NON-CONTIGUOUS narrow
+views (strided reads + a tape node per order) => ORIG measured **342-498ms** (~9x SLOWER than torch).
+
+Fix `frankentorch-diff-n-fused`: no-grad LAST-DIM (inner==1) path iterates the adjacent-difference
+kernel `n` times on CONTIGUOUS buffers — each pass fans over `outer` lanes via `par_chunks_mut`
+(contiguous rows, NO per-element div/mod), first-touching the fresh buffer in parallel; pass 1 reads
+the borrowed input, later passes read the owned running Vec. `src[i+1]-src[i]` == the composed
+`tensor_sub(narrow(_,1,..),narrow(_,0,..))` in the same order, and each intermediate Vec equals the
+composed intermediate tensor, so it is bit-for-bit identical.
+
+PARITY (proven): `diff_n_fused_matches_composed_path` (fused == grad-forced composed loop, bit-exact,
+n=2/3/4, dim 0 & 1, f32/f64) GREEN.
+
+PERF (MEASURED, cc-local LOCAL release, FT_ORIG A/B, RAYON_NUM_THREADS=32, min-of-9, [4096,4096] dim=1):
+  - f64 n=2: FUSED **28.43ms** vs ORIG 342.4ms = **12.0x** internal; torch 39.9ms → **1.40x FASTER**
+  - f64 n=3: FUSED **46.95ms** vs ORIG 497.7ms = **10.6x** internal; torch 63.6ms → **1.35x FASTER**
+  - f32 n=3: FUSED **23.31ms** vs ORIG 297.8ms = **12.8x** internal; torch 30.7ms → **1.32x FASTER**
+Consistently ~1.35x FASTER than torch across all cases (both bandwidth-bound: diff n is inherently `n`
+memory sweeps; FT's edge = cleaner par passes vs torch's materialized intermediates). ⚠️ INITIAL
+version used `into_par_iter` + per-element unravel (4 int div/mod per elem) → only parity (n=2 f64
+28.76ms); switching to lane-based `par_chunks_mut` (the gradient-fusion pattern) removed the div/mod →
+consistent 1.3-1.4x. ★LESSON (re-confirmed from gradient): a fused dim-op must use lane-based
+par_chunks_mut over CONTIGUOUS rows (inner==1), NOT into_par_iter with per-element unravel (the div/mod
+dominates); and gate to the last dim (non-last strides badly, keeps the compose). This is the same
+recipe as gradient (7c5fc454) and trapezoid.
+
+
+
 ## 2026-07-02 - ★★ WIN: fused tensor_gradient_dim (torch.gradient) last-dim — 24.8-30.5x internal, ~6-14x FASTER than torch
 
 Agent `SlateTern`. A torch FORWARD-op probe (no build, torch-only) flagged `torch.gradient` at ~46ms
