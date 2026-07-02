@@ -1,5 +1,17 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: fused geglu (GEGLU gated FFN) — 3.35x SLOWER -> 3.46x FASTER (11x internal) — GATED-FFN FAMILY COMPLETE
+
+Agent `SlateTern`. Completes the gated-FFN family: geglu (a*gelu(b)) via the shared
+`try_glu_variant_fused` helper. act = the EXACT erf gelu `0.5*x*(1+erf(x*FRAC_1_SQRT_2))` inlined with
+`libm::erf` (f64) / `libm::erff` (f32) — matching gelu_value/gelu_value_f32 kernels bit-for-bit (ft-api
+already deps libm). ★MEASURE (transformer [64,512,1024] no-grad, min-of-7, load ~28): geglu FUSED
+**17.7ms vs FT_ORIG(compose) 197.9ms = ~11x internal**, 3.35x SLOWER -> **3.46x FASTER** (slower than
+swiglu's 8.6ms because erf > exp per elem). Lock test `swiglu_reglu_fused_match_golden` extended to a
+3-way (swiglu/reglu/geglu). ★GATED-FFN FAMILY (glu/swiglu/reglu/geglu) NOW ALL FUSED — 3.5-8x flips on
+the hot transformer gate ops; the strided-narrow-split-then-act-mul compose class is HARVESTED for these.
+AGENT SlateTern.
+
 ## 2026-07-02 - ★★★ WIN: fused swiglu/reglu (LLaMA/PaLM gated FFN) — ~20x internal, ~3.5x SLOWER -> ~6x FASTER (+ pre-existing grad-dim0 bug found)
 
 Agent `SlateTern`. Follow-up to the glu fusion (dd49b525): swiglu (a*silu(b)) and reglu (a*relu(b)) have

@@ -17,13 +17,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
             let x = sess.tensor_variable(xd.clone(), vec![b, s, 2 * d], false).unwrap();
             let t = Instant::now();
-            let _ = if which == "swiglu" { sess.tensor_swiglu(x, 2).unwrap() } else { sess.tensor_reglu(x, 2).unwrap() };
+            let _ = match which { "swiglu" => sess.tensor_swiglu(x, 2).unwrap(), "reglu" => sess.tensor_reglu(x, 2).unwrap(), _ => sess.tensor_geglu(x, 2).unwrap() };
             let e = t.elapsed().as_secs_f64() * 1e3;
             if e < best { best = e; }
         }
         best
     };
-    let (fsg, frg) = (run("swiglu"), run("reglu"));
+    let (fsg, frg, fgg) = (run("swiglu"), run("reglu"), run("geglu"));
     let label = if std::env::var("FT_ORIG").is_ok() { "FT_ORIG(compose)" } else { "FT_FUSED" };
     let py = format!(
         r#"
@@ -40,8 +40,11 @@ def swiglu(x):
     a,bb=x.chunk(2,dim=2); return a*F.silu(bb)
 def reglu(x):
     a,bb=x.chunk(2,dim=2); return a*F.relu(bb)
+def geglu(x):
+    a,bb=x.chunk(2,dim=2); return a*F.gelu(bb)
 print("PT swiglu %.4f"%t(lambda:swiglu(x)))
 print("PT reglu %.4f"%t(lambda:reglu(x)))
+print("PT geglu %.4f"%t(lambda:geglu(x)))
 "#
     );
     let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
@@ -51,5 +54,6 @@ print("PT reglu %.4f"%t(lambda:reglu(x)))
     let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
     println!("  swiglu {label} {fsg:.3}ms  PT {:.3}ms => {}", g("swiglu"), v(fsg, g("swiglu")));
     println!("  reglu  {label} {frg:.3}ms  PT {:.3}ms => {}", g("reglu"), v(frg, g("reglu")));
+    println!("  geglu  {label} {fgg:.3}ms  PT {:.3}ms => {}", g("geglu"), v(fgg, g("geglu")));
     Ok(())
 }
