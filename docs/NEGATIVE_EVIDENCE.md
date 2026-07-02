@@ -14087,3 +14087,23 @@ THE hot transformer op (attention softmax mask). Lock test where_cond_tile_fused
 ★The elementwise-fusion campaign's biggest single win — attention masking was ~17x SLOWER than torch,
 now ~4.6x FASTER. Follow-up: where(cond_tile, x_full, y_full) (select between two tensors w/ broadcast
 mask); cond MIDDLE-broadcast [B,1,S,S] still composes. AGENT SlateTern.
+
+## 2026-07-01 - ★★★ WIN: fused masked_fill with BROADCAST mask-tile (attention) — 245ms->5.6ms (~44x) + f32 fix
+
+Agent `SlateTern`. `masked_fill` is THE attention masking primitive (`scores.masked_fill(mask[1,1,S,S],
+-inf)`). It had same-shape f32+f64 fast paths, but a BROADCAST mask fell through to `full(shape, value)`
+(a full-size const materialize) + `tensor_where(mask_broadcast, fill_full, input_full)` — and since both
+where branches are FULL, the where-scalar fix (75e7a34d) doesn't fire → broadcast_to x3 + where. Added
+`try_masked_fill_tile`: when the mask TILES into input (strip leading 1s, remainder an exact suffix of
+input.shape — [1,1,S,S]/[S,S]/[1,S,S]; middle-1 [B,1,S,S] falls through) fill in ONE pass per tile
+(`out[k] = mask[k%cinner]!=0 ? (value as dtype) : input[k]`, mask cache-resident, reused each tile), no
+full()/expand. Bit-identical to torch (value cast to input dtype, same as the same-shape fast paths).
+
+★MEASURE (mfill [16,8,256,256]=8.4M, mask [1,1,256,256], NO-GRAD, min, ORIG via file-swap to HEAD, load
+~43): f64 **245.2ms -> 5.58ms = ~44x** (flips ~20x SLOWER -> ~2.2x FASTER vs torch's ~12ms); f32 **3.23ms**
+(and f32 broadcast masked_fill was BROKEN on HEAD — the `full(value)` const is F64 so `where(f32 mask,
+f64 fill, f32 input)` mismatched → errored; the tile path is a CRASH-FIX too). Bit-exact lock test
+masked_fill_tile_matches_expanded_sameshape (tile == manually-tiled same-shape masked_fill, f32+f64,
+[1,1,S,S]/[S,S]/[1,S,S]). Tests: ft-api + ft-conformance green. ★Both attention masking primitives —
+where(mask,x,-inf) (4af96c05) and scores.masked_fill(mask,-inf) — now fuse the broadcast mask, ~40-80x
+faster + several x faster than torch. AGENT SlateTern.
