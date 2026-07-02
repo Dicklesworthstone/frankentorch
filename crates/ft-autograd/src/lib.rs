@@ -13181,32 +13181,47 @@ impl TensorTape {
                         "var_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let correction = if reduce_size > 1 {
                         (reduce_size - 1) as f64
                     } else {
                         1.0
                     };
-                    let mut var_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let grad_val = incoming[outer * inner_size + inner];
-                            // Compute mean along dim
-                            let mut sum = 0.0;
-                            for r in 0..reduce_size {
-                                sum += input_values
-                                    [outer * reduce_size * inner_size + r * inner_size + inner];
-                            }
-                            let mean = sum / reduce_size as f64;
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let diff = input_values[idx] - mean;
-                                var_dim_contrib[idx] = grad_val * 2.0 * diff / correction;
-                            }
-                        }
-                    }
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &var_dim_contrib)?;
+                    // Fused single Rayon pass. Precompute each reduction lane's mean once
+                    // (parallel over lanes; the within-lane sum keeps the original serial
+                    // r-order so the mean is bit-for-bit identical), then write each
+                    // dx_i = grad * 2 * (x_i - mean_lane) / correction straight into the grad
+                    // slot — no scratch Vec, no serial accumulate, input borrowed zero-copy.
+                    // Bit-for-bit identical to the prior serial fill + accumulate.
+                    // frankentorch-normp-bwd-fused.
+                    let means: Vec<f64> = {
+                        use rayon::prelude::*;
+                        (0..expected_incoming)
+                            .into_par_iter()
+                            .map(|oi| {
+                                let outer = oi / inner_size;
+                                let inner = oi % inner_size;
+                                let base = outer * reduce_size * inner_size + inner;
+                                let mut sum = 0.0;
+                                for r in 0..reduce_size {
+                                    sum += iv[base + r * inner_size];
+                                }
+                                sum / reduce_size as f64
+                            })
+                            .collect()
+                    };
+                    Self::accumulate_tensor_gradient_par_with(
+                        input,
+                        &mut grads[input.0],
+                        input_numel,
+                        |idx| {
+                            let inner = idx % inner_size;
+                            let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                            incoming[oi] * 2.0 * (iv[idx] - means[oi]) / correction
+                        },
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -13233,39 +13248,51 @@ impl TensorTape {
                         "std_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
                     let correction = if reduce_size > 1 {
                         (reduce_size - 1) as f64
                     } else {
                         1.0
                     };
-                    let mut std_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let out_idx = outer * inner_size + inner;
-                            let grad_val = incoming[out_idx];
-                            let std_val = output_values[out_idx];
-                            // Compute mean along dim
-                            let mut sum = 0.0;
-                            for r in 0..reduce_size {
-                                sum += input_values
-                                    [outer * reduce_size * inner_size + r * inner_size + inner];
+                    // Fused single Rayon pass (see VarDim above). Per-lane mean precomputed
+                    // once with the original serial within-lane sum order (bit-identical),
+                    // then dx_i = grad * (x_i - mean_lane) / (correction * std_lane) written
+                    // straight into the grad slot; std_lane == 0 yields 0 exactly as before.
+                    // frankentorch-normp-bwd-fused.
+                    let means: Vec<f64> = {
+                        use rayon::prelude::*;
+                        (0..expected_incoming)
+                            .into_par_iter()
+                            .map(|oi| {
+                                let outer = oi / inner_size;
+                                let inner = oi % inner_size;
+                                let base = outer * reduce_size * inner_size + inner;
+                                let mut sum = 0.0;
+                                for r in 0..reduce_size {
+                                    sum += iv[base + r * inner_size];
+                                }
+                                sum / reduce_size as f64
+                            })
+                            .collect()
+                    };
+                    Self::accumulate_tensor_gradient_par_with(
+                        input,
+                        &mut grads[input.0],
+                        input_numel,
+                        |idx| {
+                            let inner = idx % inner_size;
+                            let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                            let std_val = output_values[oi];
+                            if std_val != 0.0 {
+                                incoming[oi] * (iv[idx] - means[oi]) / (correction * std_val)
+                            } else {
+                                0.0
                             }
-                            let mean = sum / reduce_size as f64;
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let diff = input_values[idx] - mean;
-                                std_dim_contrib[idx] = if std_val != 0.0 {
-                                    grad_val * diff / (correction * std_val)
-                                } else {
-                                    0.0
-                                };
-                            }
-                        }
-                    }
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &std_dim_contrib)?;
+                        },
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 

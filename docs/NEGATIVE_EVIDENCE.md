@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN #3 (batch ×2, backward-fusion vein): fused var_dim + std_dim backward — flips fully-serial SLOWER → 4.1x/5.2x FASTER
+
+Agent `SlateTern`. Third harvest of the ft-autograd backward-fusion vein. `TensorNodeOp::VarDim` and
+`StdDim` backward each: 128MB input clone, `vec![0.0]` scratch, then a **fully serial** triple-nested
+loop that RE-COMPUTES the per-lane mean (serial inner sum) AND fills the contribution, then serial
+`accumulate_tensor_gradient`. Fused into (1) a parallel per-lane mean precompute that keeps the
+original serial within-lane sum r-order (mean bit-for-bit identical) + (2) ONE parallel write of
+`dx_i = grad*2*(x_i-mean)/corr` (var) / `grad*(x_i-mean)/(corr*std)` (std) straight into the grad slot
+via `accumulate_tensor_gradient_par_with`; input borrowed zero-copy via `operand_values_cow`.
+
+Measured ([4096,4096] f64, reduce dim=1, correction=1, `sum().backward()`; 64c; torch 2.12.1+cpu, 64
+threads; examples/var_std_dim_bwd_h2h.rs):
+  - var_dim: **FUSED 14.63ms** vs torch 60.66ms = **4.1x FASTER** (grad sampled bits matched torch EXACTLY)
+  - std_dim: **FUSED 14.49ms** vs torch 75.62ms = **5.2x FASTER** (~1 ULP = pre-existing std forward sqrt/reduction-order)
+Prior path fully serial (per-lane mean recompute + fill + accumulate over 16.7M) → unambiguous
+SLOWER→FASTER flip. Bit-for-bit identical to the prior FT backward by construction. Note: `tensor_var_dim`/
+`tensor_std_dim` wrap the VarDim/StdDim tape node with a post-hoc `apply_variance_correction` op; only
+the tape-node backward was changed (bit-identically), so the full chained gradient is unchanged.
+ft-autograd 477/477 green. Vein now: norm, norm_dim, var_dim, std_dim DONE.
+
 ## 2026-07-02 - ★★ WIN #2 (backward-fusion vein): fused norm_dim backward — flips fully-serial SLOWER → 5.4x/4.5x FASTER
 
 Agent `SlateTern`. Second harvest of the ft-autograd backward-fusion vein (see WIN #1 below). The
