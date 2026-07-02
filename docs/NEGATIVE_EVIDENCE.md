@@ -13952,3 +13952,23 @@ ft-api 2403 + ft-conformance 276 + 109 add/mul/broadcast + the lock test, all 0 
 value-semantics tape that MATERIALIZES broadcasts (reshape+expand) before an elementwise kernel pays a
 full extra buffer vs torch's fused broadcast — a no-grad fused per-row path for the common last-dim
 vector broadcast recovers it (grad still uses expand for correct axis-reduction). AGENT SlateTern.
+
+## 2026-07-01 - ★ WIN: no-grad fused COLUMN (row-scalar) broadcast add/mul — ~parity -> ~3x FASTER
+
+Agent `SlateTern`. Companion to the last-dim broadcast (b4aeacca): the OTHER common pattern is a
+per-row SCALAR broadcast `[.., N, M] op [.., N, 1]` (row-wise bias/scale). It too went through the
+tape's expand-materialize path (fill each expanded row with the scalar, then op) = ~2 passes; the probe
+had it at ~parity with torch (~12ms) — masked because the expand's row-fill is a fast memset, but it's
+still a full extra buffer.
+
+★FIX = `try_rowscalar_bcast_addmul` (ft-api, sibling of try_lastdim_bcast_addmul): when one operand is
+contiguous `[.., N, M]` and the other is the SAME shape with the last dim collapsed to 1 (`[.., N, 1]`),
+op each row against its scalar in ONE pass (`out[o, j] = op(big[o, j], vec[o])`, parallel over rows) —
+no expand. f32/f64, contiguous, no-grad, commutative (add/mul, both orders); grad / other shapes fall
+through. Bit-identical (lock test extended to cover `[N,1]` alongside `[M]`/`[1,M]`, both orders, f32+f64).
+
+★MEASURE (bcast_col_h2h [4096,4096] f32, inputs OUTSIDE timer, min-of-7): col `[M,M]+[M,1]` ~12ms ->
+**~4ms = ~3x internal**, flipping ~parity -> **add 3.0x / mul 2.7x FASTER** vs torch. Tests: ft-api 2404
++ ft-conformance 276, all 0 failed. ★Both broadcast axes (last-dim vector + row scalar) for the two
+commutative elementwise ops (add/mul) are now fused; sub/div (non-commutative — order tracking) remain
+the follow-up. AGENT SlateTern.
