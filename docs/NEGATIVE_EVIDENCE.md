@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): roi_align/roi_pool/ps_roi_pool on f32 features (detection)
+
+Agent `GammaFork`. Continued the vision f32-crash vein with the MAINSTREAM detection ops (Mask R-CNN /
+Faster R-CNN heads). `roi_align`/`roi_pool`/`ps_roi_pool` read `features` + `boxes` via the F64-only
+`tensor_values` → ERRORED UnsupportedDType(F32) on f32 features (the native detection dtype) AND rebuilt
+an F64 pooled output. Same reduction-op recipe as scatter: `tensor_values → tensor_values_lossy_f64`
+(features/box-coords read as f64, exact for the bilinear/max pooling) + narrow the pooled output leaf to
+`features` dtype. f32: ERROR → works, returns F32, roi_align(f32)==roi_align(f64) within 1e-5. Test
+`roi_family_f32_no_crash_returns_f32`.
+
+VISION/GRAPH/SEQUENCE f32-crash vein PROGRESS: nms family (5) + scatter (3) + roi family (3) = 11 ops
+DONE this session via the lossy_f64(±output-narrow) drop-in. Remaining: patch_embed/window_partition/
+window_reverse (ViT), farthest_point_sampling/ball_query/group_points (point cloud), degree/
+add_self_loops/edge_index_to_adj (graph), pack/pad_packed_sequence + gru/lstm/rnn cells (sequence,
+heavier — read the whole input, likely need output narrow + care with the recurrent tape). All same
+recipe. ★META: these torchvision/geometric/RNN ops are f32-native but were hand-rolled with F64-only
+reads; CoralDrift's earlier sweep covered core tensor ops, not this application-layer surface.
+
 ## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): scatter_sum/mean/max (GNN aggregation) on f32 src
 
 Agent `GammaFork`. Continued the vision/graph f32-crash vein. The torch_geometric-style GNN aggregators
