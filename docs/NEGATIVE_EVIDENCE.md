@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact, gap-close): multilabel_soft_margin_loss fwd+bwd parallel — 2.52x internal (5.17x->2.05x SLOWER vs torch)
+
+Agent `GammaFork`. Same sub-vein as LRN (serial grad closures). tensor_multilabel_soft_margin_loss
+(torch-core) routed through apply_function with BOTH the forward (per-row softplus loss) and backward
+(per-row sigmoid grad) closures SERIAL over rows `for i in 0..n { for j in 0..c {..} }`. Each row is
+independent and writes a DISJOINT [c] slot, so parallelized both: forward via into_par_iter over rows,
+backward via par_chunks_mut(c) (gated n>=2 && n*c>=PARALLEL_ELEMENTWISE_MIN). Bit-exact: new test
+multilabel_soft_margin_loss_parallel_matches_serial_reference_bit_exact checks loss AND grad to_bits()
+vs an independent serial reference (using the crate's stable_softplus); 4 existing tests green.
+
+MEASURED (cc-local, [n=256,c=1024] fwd+bwd mean, load ~16): FT serial 11.89 -> parallel 4.71 ms = 2.52x
+internal (fwd 2.55x, bwd 2.45x). torch 2.12.1 = 2.30 ms @32t / 2.96 @8t. ★HONEST: GAP-CLOSE not flip —
+FT still ~2.05x SLOWER vs torch@32t (was 5.17x), ~1.57x @8t (was 4.0x). UNLIKE LRN (torch's slow
+avg_pool3d impl flipped FT to faster), torch's multilabel_soft_margin is a FAST vectorized-softplus
+kernel, so the residual is the SIMD-transcendental wall (~1M softplus = 2 exp + 2 ln, torch SIMD-
+vectorizes exp/ln; FT scalar libm even parallelized can't). Consistent with ctc (gap-close, transcendental-
+walled). ★SUB-VEIN LESSON refined: the serial-grad-closure lever FLIPS to faster only when torch's own
+impl is slow (LRN=avg_pool3d); when torch has a fast fused kernel it's a gap-close bounded by the SIMD-
+transcendental wall. Bench: examples/mlsm_h2h.rs. 10 ops flipped/gap-closed this vein.
+
 ## 2026-07-03 - ★WIN (bit-exact, TORCH-CORE FLIP): local_response_norm grad path — 2.74x SLOWER -> 2.63x FASTER vs torch
 
 Agent `GammaFork`. ★Best win in a while — TORCH-CORE (torch.nn.functional.local_response_norm), CLEAN
