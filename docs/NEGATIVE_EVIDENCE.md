@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★★WIN: lower GEMM parallel gate 1<<27 -> 1<<24 — every medium GEMM library-wide 1.5-8x, bit-exact
+
+Agent `BlackThrush`. THE highest-leverage win of the run — corrects the parallelization threshold on the
+HOTTEST kernel (GEMM), so it hits every matmul/conv-im2col/attention-proj/linear/einsum/single-matrix-
+linalg. `should_parallelize` gated row-block GEMM parallelism at PAR_MIN_FLOPS = 1<<27 (m·k·n >= 134M =
+512³). But the gate's OWN comment stated the intent was "keep ≤256×256 (16.7M) serial" — the VALUE was
+set to 512³ instead of 256³, an intent/value mismatch that left the entire 256..512 range (and many
+rectangular medium GEMMs) SINGLE-THREADED on the 64-core workers. Corrected to 1<<24 (16.7M = 256³) to
+match the stated intent.
+
+★MEASURE — standalone A/B (matrixmultiply, 64t, min-11, f32 AND f64), ALL previously SERIAL under 1<<27:
+256³ (17M) f64 1.49x/f32 1.68x; 320³ (33M) 2.63x/2.31x; 384³ (57M) 3.17x/3.86x; 1024×512×128 (67M)
+4.63x/8.00x. The 128³ (4M) regressed 0.84x and 192³ (7M) was ~parity — correctly kept SERIAL by 1<<24
+(crossover is right at 256³). Bench scratchpad/gemmthr. ★BIT-EXACT: the row/col/2D-split paths are
+proven bit-for-bit identical to the single call regardless of block count (gemm_row_split_matches_single_
+bit_exact + gemm_col_split + tile_iso 2D/col — 11 GEMM locks all green); the gate only changes WHEN they
+engage. 572 ft-kernel-cpu tests green. Shipped 34976477. ★This is the PARALLEL-THRESHOLD vein applied to
+the GEMM gate: read the gate's stated intent vs its actual value — an anchoring bug (author fixed 1<<29->
+1<<27 targeting "512² should parallelize" but their own "≤256² serial" intent needed 1<<24) left an 8x-
+too-high gate. ★Downstream (ft-api/ft-autograd/linalg matmul goldens) get IDENTICAL numerics (bit-exact),
+just faster — no correctness risk, only more parallelism. FT-internal (torch's medium GEMM is MKL; this
+closes FT's own serial-gate gap, not a vs-torch flip — but medium GEMMs are pervasive).
+
 ## 2026-07-03 - ★WIN (niche, gated): conv2d col2im per-plane for small batch — 5.2x @ batch=1, bit-exact + ft-kernel-cpu HARVEST-STATE map
 
 Agent `BlackThrush`. `conv2d_col2im_f32/f64` (conv2d input-grad) parallelized ONLY over batch, so batch=1
