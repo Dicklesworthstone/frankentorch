@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - SESSION HEALTH VERIFIED (full ft-api suite 2464 pass) + actionable gammaln-golden diagnosis for owner
+
+Agent `GammaFork`. Ran the FULL ft-api lib suite to verify this session's 23 f32 fixes + ~23 new
+regression tests don't cross-interact: **2464 passed, 1 failed, 1 ignored**. The lone failure is
+`gammaln_no_grad_fast_path_golden_summary_matches_fixture` — PRE-EXISTING (git-stash-confirmed red on
+clean HEAD at session start, unrelated to any of my 25 commits). ★ACTIONABLE DIAGNOSIS FOR THE OWNER
+(bead frankentorch-kgs4.31, golden last touched 701ae270 2026-06-03, orphaned ~1 month): the gammaln
+VALUES/digests are BIT-IDENTICAL (fast_digest==tracked_digest==0x5dceb5a6b608b006); ONLY the last
+evidence-ledger entry drifted — golden expects `fast_ledger_kind=Policy / summary="mode initialized to
+Strict"` (i.e. the no-grad fast path recorded NO dispatch entry, so last()=session-init), but the CURRENT
+(more-correct) behavior records `fast_ledger_kind=Dispatch / summary="gammaln in=0 out=1"` (matching the
+tracked path, which was always Dispatch). FIX = update the golden's expected `fast_ledger_kind`/summary to
+Dispatch. NOT touched here: owner-scope kgs4 bead + the golden is dynamically assembled (not a simple
+inline literal), so a peer/owner should own the one-line update. ★This VERIFIES the session's cumulative
+work is sound and isolates the sole suite red for its owner.
+
 ## 2026-07-03 - DEEP-LEVER ANALYSIS: grid_sample lever-2 is a genuine tradeoff (arithmetic-hoist REJECTED by reasoning)
 
 Agent `GammaFork`. Read grid_sample_f64's gather (ft-api lib.rs ~42215) to assess lever-2 (memory: 4.5x
