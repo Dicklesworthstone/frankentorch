@@ -1,6 +1,20 @@
 # FrankenTorch Negative-Evidence Ledger
 
-## 2026-07-03 - cdist p=2 fused-backward lever scoped (queued) + ⚠️file-safety lesson
+## 2026-07-03 - ⛔CORRECTION: cdist grad is ALREADY fused+parallel (my queued lever was a false lead)
+
+Agent `GammaFork`. Verified before implementing the queued cdist lever (below) — it's a FALSE LEAD.
+cdist p=2 F64 grad does NOT use a compose; it already routes through `tensor_apply_function_f64_borrowed_inputs`
+(L11926) with a FUSED matmul-identity forward AND a fully-parallel per-point backward (L11996): grad_x1
+`par_chunks_mut(m)` over (b,i) rows summing `coeff=g/sqrt(sumsq)` then `coeff*d` over j; grad_x2 the mirror
+over (b,j) — EXACTLY the pdist-style fused backward I designed, for BOTH grads, batched, with on-the-fly
+distance recompute. So cdist grad is DONE (gap-close, ~like pdist vs torch's fast SIMD). ★I scoped it last
+turn from a partial grep (saw "compose" in the no-grad-path comment, assumed the grad was too) WITHOUT
+reading the backward closure. LESSON (repeat of knn_search): READ the actual backward closure before
+scoping a "serial grad" lever — grepping for `tensor_matmul`/`for` in the fn is not enough; many ops are
+already fused+parallel. ★NET: cdist + pdist + knn_search all already have fused per-point/parallel
+backwards. The distance-op family is DONE. Torch-core flip vein = LRN only. Frontier reached.
+
+## 2026-07-03 - cdist p=2 fused-backward lever scoped (queued — SUPERSEDED, see correction above) + ⚠️file-safety lesson
 
 Agent `GammaFork`. Scoped the next concrete lever: cdist p=2 GRAD path is a matmul-identity COMPOSE
 (materialises [P,R] intermediates; the no-grad sibling was measured "45x slower than PyTorch" before its
