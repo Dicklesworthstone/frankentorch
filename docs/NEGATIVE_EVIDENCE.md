@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH ×2): contrastive_loss + quantile_loss(f32) errored -> works via full_like
+
+Agent `GammaFork`. Continued the loss-family f32-crash sweep (focal_loss/cosine_embedding_loss done).
+A python enumeration of `*_loss` fns building `self.full()` constants found ~27; bce/kl_div/smooth_l1/
+huber/gaussian_nll/poisson_nll already have f32 fast paths (route f32 away from the f64-const compose).
+The INPUT-SHAPED-const ones WITHOUT an f32 path crash on f32: `contrastive_loss` (`full(y_shape)[F64]`
+mixed with f32 `y`/`dist` in tensor_sub) and `quantile_loss` (`full(in_shape)[F64]` mixed with f32
+`pos_part` in tensor_mul). Both fixed with `self.full(shape,v)` → `self.full_like(<input operand>,v,
+false)` (native input dtype+shape → native-f32 compose, bit-identical for f64). f32: ERROR → works,
+return F32, match f64 ref within 1e-5. Test `contrastive_and_quantile_loss_f32_no_crash_returns_f32`.
+
+REMAINING loss-family f32 crashers (SCALAR-const variant, follow-up — need `full_like(<the scalar sum/
+reduced operand>, v)` not full_like(input) since the const shape is [1]/reduced): dice_loss, tversky_loss,
+iou_loss, giou/diou/ciou_loss, arcface/cosface_loss, center_loss, n_pair_loss, distillation_loss,
+hinge_loss, l1_reg/l2_reg_loss, barlow_twins/vicreg_loss. Each: probe with a tiny f32 call (Err = crash),
+then replace `self.full(vec![1]/reduced, v)` with `self.full_like(<operand it combines with>, v, false)`.
+Many are FT-custom (no torch dtype ref) but a crash-on-f32 is a real bug regardless. ★The
+`full()`→`full_like(operand)` recipe is the universal fix for this whole f64-const-vs-f32-input crash family.
+
 ## 2026-07-02 - ★FIX (f32 CRASH): focal_loss(f32) errored -> works via full_like native-dtype constants
 
 Agent `GammaFork`. Continued the loss-family f32-crash sweep surfaced in the cosine_embedding entry.
