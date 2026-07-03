@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: pdist f32 general-p fused (cdist sibling) — 330x/5.5x SLOWER -> 12.6x SLOWER/2.46x FASTER vs torch
+
+Agent `GammaFork`. Direct sibling of the cdist f32 fix (72dae1f5) — the follow-up pointer paid off.
+`tensor_pdist` (all-pairs distances within one set) p≠2 had the SAME pattern: a fused parallel no-grad
+kernel (`pdist_forward_f64`) gated on F64 ONLY; f32 fell to the composed path (index_select left/right
+row pairs + sub/abs/pow/sum_dim/pow) which MATERIALISES the [out_len, M] pair-difference (out_len =
+N·(N-1)/2 ≈ 2M rows × M=200 ≈ 1.6GB at N=2000). Same fix: for f32 no-grad general-p, upcast the tiny
+input to f64, run the same parallel `pdist_forward_f64` kernel, narrow the distances to f32. Output
+stays f32; pdist is a TOLERANCE op (approx golden), f64-narrowed ≥ as accurate as torch's f32.
+
+★MEASURE ([2000,200], min-of-5, torch 2.12.1, ORIG via A/B const gate-off same build):
+| op            | FT ORIG | FT after | torch  | ratio                          |
+|---------------|---------|----------|--------|--------------------------------|
+| pdist p=1 f32 | 463 ms  | 18 ms    | 1.4 ms | 330x SLOWER -> 12.6x SLOWER    |
+| pdist p=3 f32 | 446 ms  | 33 ms    | 81 ms  | 5.5x SLOWER -> **2.46x FASTER** |
+(26x/13.6x internal.) p=3 (powf-bound) FLIPS to 2.46x FASTER; p=1 improves 26x but stays 12.6x
+SLOWER — torch's f32 SIMD Manhattan is 1.4ms (33GB/s, no powf) and FT computes the p=1 sum in f64,
+a structural floor (true win needs an f32 pdist kernel in ft-kernel-cpu = PEER). f64 already fine
+(p=1 4.3x SLOWER — same Manhattan floor; p=3 4.53x FASTER). No regression anywhere. Lock test
+`pdist_f32_fused_general_p_matches_f64_kernel_narrowed` (p=1/3/∞, f32 == f64-kernel narrowed +
+dtype f32). 10/10 pdist tests green. Bench `crates/ft-api/examples/pdist_h2h.rs`. ★cdist + pdist f32
+general-p now BOTH fused (the "upcast-small-inputs + reuse-f64-kernel + narrow-output" recipe swept
+the distance-op family). AGENT GammaFork.
+
 ## 2026-07-02 - ★★★ WIN: cdist f32 general-p fused — 129x SLOWER -> near-parity/3.4x FASTER vs torch (asymmetric-dtype)
 
 Agent `GammaFork`. NEW op class (retrieval/clustering distances). `tensor_cdist` p≠2 had a fused
