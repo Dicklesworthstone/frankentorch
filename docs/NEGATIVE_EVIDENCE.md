@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): patch_embed/window_partition/window_reverse on f32 (ViT/Swin)
+
+Agent `GammaFork`. Continued the vision f32-crash vein with the ViT/Swin-Transformer movement ops.
+`patch_embed` (image→patches), `window_partition`/`window_reverse` (Swin windowing) read images/x/windows
+via the F64-only `tensor_values` → ERRORED UnsupportedDType(F32) on f32 inputs (ViT native dtype) AND
+rebuilt an F64 output. These are PURE REARRANGE (movement) ops, so: `tensor_values → tensor_values_lossy_f64`
++ narrow the rearranged output to the input dtype. f32: ERROR → works, returns F32; the window
+partition→reverse round-trip reconstructs the input exactly. Test `vit_movement_ops_f32_no_crash_returns_f32`.
+
+VISION/GRAPH f32-crash vein: nms(5) + scatter(3) + roi(3) + ViT(3) = 14 ops DONE this session via the
+lossy_f64(±output-narrow) drop-in. Remaining: point cloud (farthest_point_sampling/ball_query/group_points),
+graph (degree/add_self_loops/edge_index_to_adj — int edge_index reads), pack/pad_packed_sequence + gru/
+lstm/rnn cells (recurrent — heavier, care with the tape). ★The application-layer (torchvision/geometric/
+ViT/RNN) f32 surface is systematically hand-rolled with F64-only reads; each is a mechanical lossy_f64
+drop-in (+ output narrow for value-returning ops). NOTE: movement ops could go native-f32 (contiguous_values_f32
++ rearrange, no f64 round-trip) for a perf edge, but the crash fix is the priority and the round-trip is exact.
+
 ## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): roi_align/roi_pool/ps_roi_pool on f32 features (detection)
 
 Agent `GammaFork`. Continued the vision f32-crash vein with the MAINSTREAM detection ops (Mask R-CNN /
