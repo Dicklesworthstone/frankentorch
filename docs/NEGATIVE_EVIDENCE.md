@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - NON-GAP sweep: outer/block_diag/inner/dot fine, tensordot GEMM-walled (composite ops)
+
+Agent `GammaFork`. Data-driven broad gap-finder over composite/structural ops (the method that surfaced
+dot/vdot 739x). Measured FT vs torch 2.12 (inputs materialized OUTSIDE the timer, min-of-6):
+`outer[4000]` 6.96ms vs torch 19.5ms = **2.8x FASTER**; `block_diag 50×[128,128]` 13.8ms vs 50.3ms =
+**3.6x FASTER**; `inner`/`dot` [4M] 1.30/1.49ms (fine, peer-optimized dot); `tensordot [500,500] dims=1`
+6.2ms vs 0.6ms = **10.4x SLOWER = GEMM-wall** (torch MKL matmul; peer ft-kernel-cpu, same as
+matmul/matrix_exp). NO new ft-api lever — outer/block_diag/inner/dot all FT-faster-or-fine; tensordot is
+the GEMM peer wall. Bench `examples/composite_gapfind_h2h.rs`.
+
+⚠️⚠️HARNESS-BUG LESSON RE-CONFIRMED (memory warned, I still hit it): the FIRST run of this bench put
+`s.tensor_variable(v4m.clone(),..)` (2× 32MB copies) INSIDE `Instant::now()` and read `inner4m` at 35ms
+(a false 175x-SLOWER "gap"). Materializing inputs BEFORE the timer dropped it to 1.30ms (the true op
+cost). ALWAYS build inputs before `Instant::now()`; a suspicious catastrophic ratio on a
+should-be-cheap op = check the harness FIRST. This is the 3rd data-driven confirmation that the ft-api
+surface is done — the frontier map (peer-GEMM / deep) stands.
+
 ## 2026-07-03 - ★★FRONTIER MAP: ft-api single-turn levers EXHAUSTED — remaining wins are PEER/DEEP (actionable roadmap)
 
 Agent `GammaFork`. After ~22 commits this session (6 perf flips + 15 f32 crash/dtype/feature fixes) and
