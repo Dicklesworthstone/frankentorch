@@ -113,6 +113,34 @@ kernel void softmax(device const float* X [[buffer(0)]], device float* Y [[buffe
     for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]+=red[lid+o]; threadgroup_barrier(mem_flags::mem_threadgroup);}
     float inv=1.0f/red[0]; for (uint c=lid;c<cols;c+=tgsz) y[c]*=inv;
 }
+
+// Attention scores: S[h*seq+i, j] = scale * dot(Q[i, h*hd:h*hd+hd], K[j, h*hd:h*hd+hd]).
+// dims = (seq, d_model, n_heads, head_dim). grid = (j, i, h).
+kernel void attn_scores(
+    device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
+    device float* S [[buffer(2)]], constant uint4& dims [[buffer(3)]],
+    constant float& scale [[buffer(4)]], uint3 gid [[thread_position_in_grid]])
+{
+    uint seq=dims.x,d=dims.y,nh=dims.z,hd=dims.w; uint j=gid.x,i=gid.y,h=gid.z;
+    if (i>=seq||j>=seq||h>=nh) return;
+    float acc=0.0f; uint qo=i*d+h*hd, ko=j*d+h*hd;
+    for (uint e=0;e<hd;e++) acc+=Q[qo+e]*K[ko+e];
+    S[(h*seq+i)*seq+j]=acc*scale;
+}
+
+// Attention context: O[i, h*hd+e] = sum_j S[h*seq+i, j] * V[j, h*hd+e].
+// dims = (seq, d_model, n_heads, head_dim). grid = (e, i, h).
+kernel void attn_context(
+    device const float* S [[buffer(0)]], device const float* V [[buffer(1)]],
+    device float* O [[buffer(2)]], constant uint4& dims [[buffer(3)]],
+    uint3 gid [[thread_position_in_grid]])
+{
+    uint seq=dims.x,d=dims.y,nh=dims.z,hd=dims.w; uint e=gid.x,i=gid.y,h=gid.z;
+    if (e>=hd||i>=seq||h>=nh) return;
+    float acc=0.0f; uint so=(h*seq+i)*seq;
+    for (uint jj=0;jj<seq;jj++) acc+=S[so+jj]*V[jj*d+h*hd+e];
+    O[i*d+h*hd+e]=acc;
+}
 "#;
 
 struct Pipes {
@@ -123,6 +151,8 @@ struct Pipes {
     gelu: ComputePipelineState,
     addv: ComputePipelineState,
     softmax: ComputePipelineState,
+    attn_scores: ComputePipelineState,
+    attn_context: ComputePipelineState,
 }
 unsafe impl Send for Pipes {}
 unsafe impl Sync for Pipes {}
@@ -150,6 +180,8 @@ fn pipes() -> Option<&'static Pipes> {
                 gelu: p("gelu")?,
                 addv: p("addv")?,
                 softmax: p("softmax")?,
+                attn_scores: p("attn_scores")?,
+                attn_context: p("attn_context")?,
                 queue: device.new_command_queue(),
                 device,
             })
@@ -315,11 +347,180 @@ impl<'a> Batch<'a> {
         out
     }
 
+    /// Multi-head self-attention: per-token `q`/`k`/`v` `[seq, d_model]` →
+    /// `concat_h( softmax(q_h·k_hᵀ / √head_dim) · v_h )` → `[seq, d_model]`.
+    pub fn mha(&self, q: &GpuTensor, k: &GpuTensor, v: &GpuTensor, n_heads: usize) -> GpuTensor {
+        let (seq, d) = (q.rows, q.cols);
+        let hd = d / n_heads;
+        let scale = 1.0f32 / (hd as f32).sqrt();
+        let dims = self.u32buf(&[seq as u32, d as u32, n_heads as u32, hd as u32]);
+        let scaleb = self
+            .p
+            .device
+            .new_buffer_with_data((&scale as *const f32) as *const _, 4, SHARED);
+        let scores = GpuTensor::new_uninit(&self.p.device, n_heads * seq, seq);
+        {
+            let enc = self.cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.p.attn_scores);
+            enc.set_buffer(0, Some(&q.buf), 0);
+            enc.set_buffer(1, Some(&k.buf), 0);
+            enc.set_buffer(2, Some(&scores.buf), 0);
+            enc.set_buffer(3, Some(&dims), 0);
+            enc.set_buffer(4, Some(&scaleb), 0);
+            enc.dispatch_threads(
+                MTLSize::new(seq as u64, seq as u64, n_heads as u64),
+                MTLSize::new(8, 8, 1),
+            );
+            enc.end_encoding();
+        }
+        let sm = self.softmax(&scores); // per (h,i) row over j
+        let out = GpuTensor::new_uninit(&self.p.device, seq, d);
+        {
+            let enc = self.cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.p.attn_context);
+            enc.set_buffer(0, Some(&sm.buf), 0);
+            enc.set_buffer(1, Some(&v.buf), 0);
+            enc.set_buffer(2, Some(&out.buf), 0);
+            enc.set_buffer(3, Some(&dims), 0);
+            enc.dispatch_threads(
+                MTLSize::new(hd as u64, seq as u64, n_heads as u64),
+                MTLSize::new(8, 8, 1),
+            );
+            enc.end_encoding();
+        }
+        out
+    }
+
     /// Commit the command buffer and block until the GPU finishes — the single
     /// CPU↔GPU sync for every op encoded since [`new`](Batch::new).
     pub fn finish(self) {
         self.cmd.commit();
         self.cmd.wait_until_completed();
+    }
+}
+
+/// Layer-norm epsilon (matches franken_whisper / whisper.cpp `hparams.eps`).
+pub const LN_EPS: f32 = 1e-5;
+
+/// One encoder layer's weights, resident on the GPU. Attention weights `wq/wk/wv/wo`
+/// and MLP `w1/w2` are `[in, out]` row-major (pre-transposed, ready for `x @ w`).
+struct LayerWeightsGpu {
+    ln1_g: GpuTensor,
+    ln1_b: GpuTensor,
+    wq: GpuTensor,
+    bq: GpuTensor,
+    wk: GpuTensor,
+    wv: GpuTensor,
+    bv: GpuTensor,
+    wo: GpuTensor,
+    bo: GpuTensor,
+    ln2_g: GpuTensor,
+    ln2_b: GpuTensor,
+    w1: GpuTensor,
+    b1: GpuTensor,
+    w2: GpuTensor,
+    b2: GpuTensor,
+}
+
+/// Borrowed weights for one encoder layer (row-major; `wk` has no key bias, per
+/// whisper). Weights are `[in, out]` (pre-transposed); biases are length `out`.
+pub struct LayerWeightsRef<'a> {
+    pub ln1_g: &'a [f32],
+    pub ln1_b: &'a [f32],
+    pub wq: &'a [f32],
+    pub bq: &'a [f32],
+    pub wk: &'a [f32],
+    pub wv: &'a [f32],
+    pub bv: &'a [f32],
+    pub wo: &'a [f32],
+    pub bo: &'a [f32],
+    pub ln2_g: &'a [f32],
+    pub ln2_b: &'a [f32],
+    pub w1: &'a [f32],
+    pub b1: &'a [f32],
+    pub w2: &'a [f32],
+    pub b2: &'a [f32],
+}
+
+/// A GPU-resident transformer encoder: layer weights are uploaded **once**, and
+/// [`forward`](EncoderGpu::forward) runs every layer on the GPU with the
+/// activations resident between layers — one command buffer (one sync) per layer,
+/// replacing the CPU↔GPU ping-pong of the GEMM-only path.
+pub struct EncoderGpu {
+    layers: Vec<LayerWeightsGpu>,
+    d_model: usize,
+    n_heads: usize,
+}
+
+impl EncoderGpu {
+    /// Upload all layer weights to the GPU. `d_ff` is the MLP hidden width
+    /// (`4*d_model` for whisper). Returns [`Error::Unavailable`] with no GPU.
+    pub fn new(
+        d_model: usize,
+        n_heads: usize,
+        d_ff: usize,
+        layers: &[LayerWeightsRef],
+    ) -> Result<EncoderGpu, Error> {
+        if !is_available() {
+            return Err(Error::Unavailable);
+        }
+        let mut gl = Vec::with_capacity(layers.len());
+        for l in layers {
+            gl.push(LayerWeightsGpu {
+                ln1_g: GpuTensor::upload(l.ln1_g, 1, d_model)?,
+                ln1_b: GpuTensor::upload(l.ln1_b, 1, d_model)?,
+                wq: GpuTensor::upload(l.wq, d_model, d_model)?,
+                bq: GpuTensor::upload(l.bq, 1, d_model)?,
+                wk: GpuTensor::upload(l.wk, d_model, d_model)?,
+                wv: GpuTensor::upload(l.wv, d_model, d_model)?,
+                bv: GpuTensor::upload(l.bv, 1, d_model)?,
+                wo: GpuTensor::upload(l.wo, d_model, d_model)?,
+                bo: GpuTensor::upload(l.bo, 1, d_model)?,
+                ln2_g: GpuTensor::upload(l.ln2_g, 1, d_model)?,
+                ln2_b: GpuTensor::upload(l.ln2_b, 1, d_model)?,
+                w1: GpuTensor::upload(l.w1, d_model, d_ff)?,
+                b1: GpuTensor::upload(l.b1, 1, d_ff)?,
+                w2: GpuTensor::upload(l.w2, d_ff, d_model)?,
+                b2: GpuTensor::upload(l.b2, 1, d_model)?,
+            });
+        }
+        Ok(EncoderGpu {
+            layers: gl,
+            d_model,
+            n_heads,
+        })
+    }
+
+    /// Run every layer on the GPU. `input` is `[seq, d_model]` row-major; returns
+    /// the encoder-stack output `[seq, d_model]` (pre-`ln_post`).
+    pub fn forward(&self, input: &[f32], seq: usize) -> Result<Vec<f32>, Error> {
+        if input.len() != seq * self.d_model {
+            return Err(Error::Kernel(format!(
+                "forward input {} != {seq}x{}",
+                input.len(),
+                self.d_model
+            )));
+        }
+        let mut x = GpuTensor::upload(input, seq, self.d_model)?;
+        for l in &self.layers {
+            // One command buffer per layer: all ops chain GPU-resident, one sync.
+            let b = Batch::new()?;
+            let n1 = b.layernorm(&x, &l.ln1_g, &l.ln1_b, LN_EPS);
+            let q = b.matmul_bias(&n1, &l.wq, Some(&l.bq));
+            let k = b.matmul_bias(&n1, &l.wk, None);
+            let v = b.matmul_bias(&n1, &l.wv, Some(&l.bv));
+            let attn = b.mha(&q, &k, &v, self.n_heads);
+            let ao = b.matmul_bias(&attn, &l.wo, Some(&l.bo));
+            let x1 = b.add(&x, &ao);
+            let n2 = b.layernorm(&x1, &l.ln2_g, &l.ln2_b, LN_EPS);
+            let fc = b.matmul_bias(&n2, &l.w1, Some(&l.b1));
+            let g = b.gelu(&fc);
+            let proj = b.matmul_bias(&g, &l.w2, Some(&l.b2));
+            let x2 = b.add(&x1, &proj);
+            b.finish();
+            x = x2; // resident output carried to the next layer
+        }
+        Ok(x.download())
     }
 }
 
@@ -387,5 +588,136 @@ mod tests {
             for j in 0..n { csm[i * n + j] = (row[j] - mx).exp() / s; }
         }
         approx(&sm_o, &csm, 1e-3, "softmax");
+    }
+
+    fn cpu_mha(q: &[f32], k: &[f32], v: &[f32], seq: usize, d: usize, nh: usize) -> Vec<f32> {
+        let hd = d / nh;
+        let scale = 1.0 / (hd as f32).sqrt();
+        let mut out = vec![0.0f32; seq * d];
+        for h in 0..nh {
+            for i in 0..seq {
+                let mut sc = vec![0.0f32; seq];
+                for j in 0..seq {
+                    let mut acc = 0.0f32;
+                    for e in 0..hd {
+                        acc += q[i * d + h * hd + e] * k[j * d + h * hd + e];
+                    }
+                    sc[j] = acc * scale;
+                }
+                let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
+                let s: f32 = sc.iter().map(|x| (x - mx).exp()).sum();
+                for j in 0..seq {
+                    sc[j] = (sc[j] - mx).exp() / s;
+                }
+                for e in 0..hd {
+                    let mut acc = 0.0f32;
+                    for j in 0..seq {
+                        acc += sc[j] * v[j * d + h * hd + e];
+                    }
+                    out[i * d + h * hd + e] = acc;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn mha_matches_cpu_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let (seq, d, nh) = (12usize, 16usize, 4usize);
+        let q: Vec<f32> = (0..seq * d).map(|i| ((i % 7) as f32) * 0.2 - 0.6).collect();
+        let k: Vec<f32> = (0..seq * d).map(|i| ((i % 5) as f32) * 0.15 - 0.3).collect();
+        let v: Vec<f32> = (0..seq * d).map(|i| ((i % 9) as f32) * 0.1 - 0.4).collect();
+        let gq = GpuTensor::upload(&q, seq, d).unwrap();
+        let gk = GpuTensor::upload(&k, seq, d).unwrap();
+        let gv = GpuTensor::upload(&v, seq, d).unwrap();
+        let b = Batch::new().unwrap();
+        let o = b.mha(&gq, &gk, &gv, nh);
+        b.finish();
+        approx(&o.download(), &cpu_mha(&q, &k, &v, seq, d, nh), 1e-3, "mha");
+    }
+
+    fn cpu_ln(x: &[f32], g: &[f32], be: &[f32], seq: usize, d: usize) -> Vec<f32> {
+        let mut o = vec![0.0f32; seq * d];
+        for i in 0..seq {
+            let row = &x[i * d..(i + 1) * d];
+            let mean: f32 = row.iter().sum::<f32>() / d as f32;
+            let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / d as f32;
+            let inv = 1.0 / (var + LN_EPS).sqrt();
+            for j in 0..d {
+                o[i * d + j] = (row[j] - mean) * inv * g[j] + be[j];
+            }
+        }
+        o
+    }
+    fn cpu_mmb(x: &[f32], w: &[f32], bias: Option<&[f32]>, m: usize, k: usize, n: usize) -> Vec<f32> {
+        let mut o = vec![0.0f32; m * n];
+        for i in 0..m {
+            for jn in 0..n {
+                let mut acc = bias.map_or(0.0, |b| b[jn]);
+                for e in 0..k {
+                    acc += x[i * k + e] * w[e * n + jn];
+                }
+                o[i * n + jn] = acc;
+            }
+        }
+        o
+    }
+    fn cpu_gelu(x: &[f32]) -> Vec<f32> {
+        let c = 0.7978845608028654f32;
+        x.iter().map(|&v| 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh())).collect()
+    }
+    fn cpu_add(a: &[f32], b: &[f32]) -> Vec<f32> {
+        a.iter().zip(b).map(|(x, y)| x + y).collect()
+    }
+
+    #[test]
+    fn encoder_layer_matches_cpu_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let (seq, d, nh, dff) = (10usize, 16usize, 4usize, 32usize);
+        let mk = |n: usize, s: f32, o: f32| -> Vec<f32> {
+            (0..n).map(|i| ((i % 13) as f32) * s - o).collect()
+        };
+        let (ln1_g, ln1_b) = (vec![1.0f32; d], vec![0.0f32; d]);
+        let (ln2_g, ln2_b) = (vec![1.0f32; d], vec![0.0f32; d]);
+        let wq = mk(d * d, 0.03, 0.2);
+        let bq = mk(d, 0.01, 0.05);
+        let wk = mk(d * d, 0.02, 0.15);
+        let wv = mk(d * d, 0.025, 0.18);
+        let bv = mk(d, 0.01, 0.04);
+        let wo = mk(d * d, 0.02, 0.16);
+        let bo = mk(d, 0.01, 0.03);
+        let w1 = mk(d * dff, 0.02, 0.15);
+        let b1 = mk(dff, 0.005, 0.02);
+        let w2 = mk(dff * d, 0.02, 0.15);
+        let b2 = mk(d, 0.01, 0.03);
+        let lref = LayerWeightsRef {
+            ln1_g: &ln1_g, ln1_b: &ln1_b, wq: &wq, bq: &bq, wk: &wk, wv: &wv, bv: &bv,
+            wo: &wo, bo: &bo, ln2_g: &ln2_g, ln2_b: &ln2_b, w1: &w1, b1: &b1, w2: &w2, b2: &b2,
+        };
+        let x = mk(seq * d, 0.04, 0.6);
+
+        let enc = EncoderGpu::new(d, nh, dff, std::slice::from_ref(&lref)).unwrap();
+        let got = enc.forward(&x, seq).unwrap();
+
+        // CPU reference layer (same op order as EncoderGpu::forward).
+        let n1 = cpu_ln(&x, &ln1_g, &ln1_b, seq, d);
+        let q = cpu_mmb(&n1, &wq, Some(&bq), seq, d, d);
+        let k = cpu_mmb(&n1, &wk, None, seq, d, d);
+        let v = cpu_mmb(&n1, &wv, Some(&bv), seq, d, d);
+        let attn = cpu_mha(&q, &k, &v, seq, d, nh);
+        let ao = cpu_mmb(&attn, &wo, Some(&bo), seq, d, d);
+        let x1 = cpu_add(&x, &ao);
+        let n2 = cpu_ln(&x1, &ln2_g, &ln2_b, seq, d);
+        let fc = cpu_mmb(&n2, &w1, Some(&b1), seq, d, dff);
+        let g = cpu_gelu(&fc);
+        let proj = cpu_mmb(&g, &w2, Some(&b2), seq, dff, d);
+        let want = cpu_add(&x1, &proj);
+
+        approx(&got, &want, 2e-2, "encoder_layer");
     }
 }
