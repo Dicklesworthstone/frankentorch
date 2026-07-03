@@ -10786,27 +10786,46 @@ pub fn batch_norm_apply_f64(
         shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
     }
     let mut out = vec![0.0f64; x.len()];
+    // Pure fma-copy (out = x*scale + shift, stats precomputed): BANDWIDTH-bound like
+    // a scaled copy, so parallel only pays above the fault-parallelism crossover
+    // (~4M); below it (the common CNN train shapes [b8..64, C, HW]) rayon overhead
+    // regresses it 0.1-0.8x. Gate at the copy tier, not the compute default. Bit-exact.
+    let parallel = x.len() >= COPY_MATERIALIZE_PARALLEL_MIN;
     if spatial == 1 {
-        out.par_chunks_mut(channels)
-            .enumerate()
-            .for_each(|(n, row)| {
-                let base = n * channels;
-                for c in 0..channels {
-                    row[c] = x[base + c] * scale[c] + shift[c];
-                }
-            });
+        let row_fn = |n: usize, row: &mut [f64]| {
+            let base = n * channels;
+            for c in 0..channels {
+                row[c] = x[base + c] * scale[c] + shift[c];
+            }
+        };
+        if parallel {
+            out.par_chunks_mut(channels)
+                .enumerate()
+                .for_each(|(n, row)| row_fn(n, row));
+        } else {
+            out.chunks_mut(channels)
+                .enumerate()
+                .for_each(|(n, row)| row_fn(n, row));
+        }
     } else {
-        out.par_chunks_mut(spatial)
-            .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
-            .enumerate()
-            .for_each(|(idx, orow)| {
-                let c = idx % channels;
-                let base = idx * spatial;
-                let (sc, sh) = (scale[c], shift[c]);
-                for s in 0..spatial {
-                    orow[s] = x[base + s] * sc + sh;
-                }
-            });
+        let row_fn = |idx: usize, orow: &mut [f64]| {
+            let c = idx % channels;
+            let base = idx * spatial;
+            let (sc, sh) = (scale[c], shift[c]);
+            for s in 0..spatial {
+                orow[s] = x[base + s] * sc + sh;
+            }
+        };
+        if parallel {
+            out.par_chunks_mut(spatial)
+                .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+                .enumerate()
+                .for_each(|(idx, orow)| row_fn(idx, orow));
+        } else {
+            out.chunks_mut(spatial)
+                .enumerate()
+                .for_each(|(idx, orow)| row_fn(idx, orow));
+        }
     }
     out
 }
@@ -10910,17 +10929,26 @@ pub fn batch_norm_apply_f32(
         shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
     }
     let mut out = vec![0.0f32; x.len()];
-    out.par_chunks_mut(spatial)
-        .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
-        .enumerate()
-        .for_each(|(idx, orow)| {
-            let c = idx % channels;
-            let base = idx * spatial;
-            let (sc, sh) = (scale[c], shift[c]);
-            for s in 0..spatial {
-                orow[s] = x[base + s] * sc + sh;
-            }
-        });
+    // Pure fma-copy: gate at the copy tier (COPY_MATERIALIZE_PARALLEL_MIN), not the
+    // compute default — small-batch CNN train regresses parallel 0.1-0.8x. Bit-exact.
+    let row_fn = |idx: usize, orow: &mut [f32]| {
+        let c = idx % channels;
+        let base = idx * spatial;
+        let (sc, sh) = (scale[c], shift[c]);
+        for s in 0..spatial {
+            orow[s] = x[base + s] * sc + sh;
+        }
+    };
+    if x.len() >= COPY_MATERIALIZE_PARALLEL_MIN {
+        out.par_chunks_mut(spatial)
+            .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+            .enumerate()
+            .for_each(|(idx, orow)| row_fn(idx, orow));
+    } else {
+        out.chunks_mut(spatial)
+            .enumerate()
+            .for_each(|(idx, orow)| row_fn(idx, orow));
+    }
     out
 }
 
