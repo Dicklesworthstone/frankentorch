@@ -1,5 +1,33 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN: row-parallel addmv/GEMV f64+f32 — 6-7.5x internal, FLIPS ~3-4x SLOWER -> 2.1-3.7x FASTER vs torch
+
+Agent `BlackThrush`. GammaFork's frontier map said "remaining GEMM wins are peer/deep" — but that's
+about GEMM (matmul). GEMV (`addmv_tensor_contiguous_f{64,32}`, ft-kernel-cpu, the kernel behind
+torch.mv/addmv/matmul-with-a-1D-operand) was a SEPARATE, fully SERIAL `for row in 0..m` — missed by the
+GEMM audit. Each output row is an INDEPENDENT dot and GEMV is bandwidth-bound (streams the whole matrix
+once, O(mn) reads / O(m) compute), so one thread saturates ~one memory channel; torch's own addmv is
+likewise bandwidth-starved (~24 GB/s single-channel here). Row-parallel spreads rows over the pool =
+more channels.
+
+★FIX: `(0..m).into_par_iter().map(|row| beta*input[row] + alpha*pairwise_dot_f{64,32}(mat_row, vec))`.
+`pairwise_dot_f64(a,b)` is BIT-FOR-BIT `pairwise_sum_f64(&[a[i]*b[i]])` — the exact tree (mid=len/2,
+128-elem serial leaf) the old scratch loop used — so row-parallel == serial bit-for-bit (rows
+independent, indexed collect preserves order, no per-row scratch). Gated `m*k >= 1<<18 (262144)`, the
+measured crossover (below it par regresses: m=256 k=256 = 0.89x; at/above, 2.5-15x). Lock test
+addmv_row_parallel_matches_serial_reference_bit_exact (f64+f32, to_bits() vs independent serial ref).
+Shipped c5b98422; 565 ft-kernel-cpu tests green.
+
+★MEASURE — standalone same-process A/B (f64, 64t, min-of-9, maxdiff=0) using the exact pairwise_dot tree
++ REAL torch.addmv 2.12.1 (best of 8/32/64t): m4096·k4096 serial 13.7 -> par 2.27ms (6.0x); torch 4.84
+=> **2.14x FASTER**. m32000·k4096 (LM head) 106->14.6ms (7.3x); torch 42.6 => **2.93x FASTER**.
+m8192·k8192 53.4->7.81 (6.8x); torch 20.5 => **2.62x**. m65536·k2048 107->14.9 (7.2x); torch 48.0 =>
+**3.23x**. m128000·k1024 106->14.1 (7.5x); torch 52.5 => **3.73x FASTER**. Bench
+scratchpad/gemvab (rayon standalone). ★LESSON: a "GEMM is peer/deep" frontier verdict does NOT cover
+GEMV — mat·vec is a distinct, EMBARRASSINGLY-parallel-over-rows, bandwidth-bound kernel that torch does
+NOT parallelize well; row-parallel is a clean bit-exact flip. Follow-up: grep ft-kernel-cpu for other
+SERIAL `for row in 0..m` reductions over independent rows (addmm/addr/bmm-1d/mv-variants).
+
 ## 2026-07-03 - WIN (small, gap-close): cross f64 no-grad granularity harmonized with f32 (2.2x@1M) + GEMM blocker restated
 
 Agent `BlackThrush`. Re-confirmed GammaFork's frontier map (ft-api single-turn levers exhausted) and
