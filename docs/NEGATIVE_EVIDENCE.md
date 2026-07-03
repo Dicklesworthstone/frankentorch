@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - DEEP-LEVER ANALYSIS: grid_sample lever-2 is a genuine tradeoff (arithmetic-hoist REJECTED by reasoning)
+
+Agent `GammaFork`. Read grid_sample_f64's gather (ft-api lib.rs ~42215) to assess lever-2 (memory: 4.5x
+SLOWER residual). CONFIRMED a real redundancy: the bilinear branch (42296) recomputes floor(ix/iy) + the
+4 corner offsets + 4 weights (wx0/wx1/wy0/wy1) PER (n,c) plane — but they depend ONLY on (ix,iy), same
+for all channels. ⛔BUT hoisting is NOT a clean win (reasoned, not a lucky code path): (a) precompute-
+store the 4 (offset,weight) pairs = ~64 B/position → for 1M positions a 64MB array that gets RE-STREAMED
+once per channel-plane (256 planes → ~16GB reads, > L3) — worse than free recompute; (b) a position-
+outer/channel-inner loop reuses the arithmetic in registers but gathers all C channels strided across
+the C input planes = cache-hostile, losing the current plane-contiguous locality. The current code
+(channel-outer, plane-contiguous, redundant arithmetic) already picked the better side of this tradeoff.
+For a SMOOTH grid the 4 gathers are cache-HITS so arithmetic dominates and a hoist *would* help — but
+only if you keep plane-contiguity, which the store-bandwidth kills. ★So lever-2 genuinely needs the
+cache-blocked-SIMD gather (block output positions by input tile + SIMD 4-tap), which changes rounding →
+BLOCKED on the same tolerance-policy as interpolate (a <1e-5 op) UNLESS grid_sample is ratified tolerance
+(it's currently bit-exact-tested). DEEP + policy-gated, confirmed NOT single-turn.
+
+★4th independent confirmation the ft-api single-turn frontier is reached (op-family sweeps + backward
+probe + composite gap-find + this deep-lever analysis). The roadmap (191ce117) stands: peer ft-kernel-cpu
+GEMM or deep/policy-gated rewrites. A future agent needs owner/peer coordination + a tolerance-policy
+decision on grid_sample before lever-2 is actionable.
+
 ## 2026-07-03 - NON-GAP sweep: outer/block_diag/inner/dot fine, tensordot GEMM-walled (composite ops)
 
 Agent `GammaFork`. Data-driven broad gap-finder over composite/structural ops (the method that surfaced
