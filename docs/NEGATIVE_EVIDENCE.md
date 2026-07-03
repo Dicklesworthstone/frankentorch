@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★WIN + SURFACE: no-gate COMPUTE ops — gelu_tanh gated (SHIPPED); ~30 more ft-api ops flagged (narrower EV)
+
+Agent `BlackThrush`. After harvesting the copy/fill no-gate vein (both crates), extended the finder to
+COMPUTE bodies: `grep par_chunks_mut/par_iter/into_par_iter whose closure has transcendental/arithmetic
+(exp/ln/tanh/sqrt/powf/mul_add) + NO >= size gate above`. Found ~30 ft-api ops (losses: bce /
+bce_with_logits / kl_div / soft_margin / gaussian_nll / poisson_nll / cosine_embedding / triplet_margin;
+elementwise: sinc / logsigmoid / gelu_tanh / xlogy / logit / entr / addcmul / pow_tensor / glu / renorm;
++ cdist/pdist/normalize/pairwise_distance). These parallelize a per-element compute UNCONDITIONALLY.
+
+★SHIPPED 1caac4a1: gelu_tanh (the clearest + hottest — per-layer, single-token DECODE = [1,hidden<8192]).
+Gated at PARALLEL_ELEMENTWISE_MIN (8192) with serial iter() fallback. Bit-identical. 7 tests green (rch,
+under local load 105). Only gelu_tanh had an inline ungated fast path among activations (silu/mish/etc.
+route through the already-gated ft-kernel-cpu compute-bound path).
+
+★KEY DIFFERENCE from the copy vein (why the rest is SURFACED not shipped): COMPUTE ops have a MUCH
+NARROWER regression window — their crossover is ~8192 (compute-bound, ft-kernel-cpu evidence) or ~0.5M
+(single-transcendental like scalar exp), NOT ~4M. So a no-gate compute op regresses only BELOW its
+crossover (tiny/small tensors), and the EXACT crossover VARIES per op (heavy tanh/exp pay at 8192; a
+whole-loss reduce differs; collect()-alloc paths differ). Setting each gate correctly needs a per-op
+bench at CLEAN load — can't under load 105. So: gelu shipped (documented 8192 crossover, hot), the rest
+QUEUED for a clean-load pass (bench each op's crossover, gate at it). Lower priority than copy (narrow
+window, and losses are once-per-batch not per-layer). ★FINDER: the compute-body variant of the no-gate
+grep (filter FOR arithmetic instead of against it).
+
 ## 2026-07-03 - ★★WIN (SHIPPED): ft-api flip/roll/repeat had NO size gate → 2-14x SLOWER on small/medium; gated, bit-exact
 
 Agent `BlackThrush`. Followed the copy-op gate lesson into ft-api movement ops. `tensor_flip`
