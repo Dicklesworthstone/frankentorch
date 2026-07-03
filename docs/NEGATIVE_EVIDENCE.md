@@ -41,6 +41,16 @@ idiom (7 sites) — ALL now gated (flip/roll/repeat/repeat_interleave×2/ft-api-
 copy_from_slice/fill (no per-element math) into fresh vec![0.0;n] → gate at ~1<<22, NOT the compute
 default; transpose/compute movement stays at the lower gate.
 
+★★BROADER no-gate audit d18d09a9: a SECOND grep (`par_chunks_mut`/`par_iter` + copy/fill body + no `>=`
+gate above, ANY idiom — not just grain/(threads*4)) found tensor_pad (f64+f32) parallelizing a pure
+fill+copy UNCONDITIONALLY (no gate). pad is COMMON (conv/sequence padding). Gated both at
+MOVEMENT_COPY_PARALLEL_MIN; 48 pad tests green (rch). Same 2-14x small/medium regression fixed. (Also
+flagged linear_backward_all_ones_dy_f64 — niche Linear-bwd fast path, low priority.) ★THE no-gate
+pure-copy pattern spans idioms — the reusable finder is: `par_chunks_mut`/`par_iter` whose body is only
+copy_from_slice/fill (grep out arithmetic) with NO `>=` size gate in the ~10 lines above. Copy/fill
+parallel-gate vein now HARVESTED across ft-kernel-cpu (narrow/expand/cat/stack) + ft-api
+(flip/roll/repeat/repeat_interleave/stack/pad).
+
 ## 2026-07-03 - SURFACE: threshold-calibration sweep — binary/unary CALIBRATED, medium-GEMM 2D REALIZED, copy-op grain = scoped lead
 
 Agent `BlackThrush`. Applied the GEMM-gate "intent-vs-value" finder to the rest of the ft-kernel-cpu
