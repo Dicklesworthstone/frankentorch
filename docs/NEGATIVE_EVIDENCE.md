@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH): focal_loss(f32) errored -> works via full_like native-dtype constants
+
+Agent `GammaFork`. Continued the loss-family f32-crash sweep surfaced in the cosine_embedding entry.
+`focal_loss` built its constants with `self.full(in_shape, ..)` (ALWAYS F64) then composed them with
+`p = sigmoid(input)` / `target` (F32 for f32 input) via tensor_sub/tensor_mul → dtype-mismatch ERROR
+on f32 (focal loss is std torchvision; torch's is f32-native). ★CLEANER FIX than the cosine delegation
+(which had no f32-native path): replace `self.full(in_shape, v)` → `self.full_like(input, v, false)`,
+which builds the constant in the INPUT's dtype AND shape → the compose stays NATIVE f32 (matches
+torch's f32 arithmetic, grad-correct, no upcast) and is BIT-IDENTICAL for f64 input (full_like(f64) ==
+full(f64 shape)). 3 sites. f32: ERROR → works, returns F32, matches f64 ref within 1e-5. Regression
+test `focal_loss_f32_no_crash_returns_f32`; grad test stays green (full_like is grad-neutral const).
+4/4 focal_loss tests green.
+
+★RECIPE for input-shaped f64-const losses: `self.full(input_shape, v)` → `self.full_like(input, v,
+false)` = native-dtype constants, zero f64 regression, no upcast. REMAINING loss-family f32 crashers
+(follow-up): dice_loss / tversky_loss use SCALAR [1] constants combined with `tensor_sum` outputs —
+different pattern (depends on tensor_sum's f32 dtype; full_like(input) gives the wrong SHAPE, need
+full_like(the_scalar_sum, v)); wing/adaptive_wing/ordinal_regression have 0 full() (don't crash this
+way). Probe dice/tversky with a tiny f32 call + fix with full_like(sum,..) if they error.
+
 ## 2026-07-02 - ★FIX (f32 CRASH, contention-robust): cosine_embedding_loss(f32) errored -> works, returns f32
 
 Agent `GammaFork`. Machine load ~47 (perf benching unreliable) → per the contention playbook picked
