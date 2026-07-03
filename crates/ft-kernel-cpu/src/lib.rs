@@ -6122,17 +6122,13 @@ pub fn conv2d_backward_f32(
             }
         });
     let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
-    let mut dout_t = vec![0.0f32; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel. sgemm_tb reads dout_flat [flat,out_ch] AS its
+    // transpose via strides — no [out_ch,flat] dout_t materialisation — with a
+    // K-traversal matching transpose-then-sgemm per output element, so dweight is
+    // BIT-IDENTICAL (bench maxdiff=0). Eliminates the dout_t alloc + the strided
+    // transpose pass (~110ms of a 322ms weight-grad => 1.5x). kgs4-convtb.
     let mut dweight = vec![0.0f32; out_ch * patch_width];
-    gemm::sgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     let mut dpanel = vec![0.0f32; flat * patch_width];
     gemm::sgemm(
         flat,
@@ -6858,20 +6854,13 @@ pub fn conv2d_backward_f64(
         });
     let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     // dweight_flat [out_ch, patch_width] = dout_flat^T @ panel.
-    // Transpose dout_flat [flat, out_ch] -> dout_t [out_ch, flat] in parallel over
-    // out_ch (each row is an independent strided gather — pure copy, so the result
-    // is identical; this was a serial O(flat*out_ch) pass). frankentorch-convbwd.
-    let mut dout_t = vec![0.0f64; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel via dgemm_tb (reads dout_flat [flat,out_ch] AS
+    // its transpose through strides) — no [out_ch,flat] dout_t materialisation, its
+    // K-traversal matches transpose-then-dgemm per output => BIT-IDENTICAL. Kills the
+    // dout_t alloc + strided transpose pass (was a serial O(flat*out_ch) pass a prior
+    // fix parallelized; now eliminated). frankentorch-convbwd / kgs4-convtb.
     let mut dweight = vec![0.0f64; out_ch * patch_width];
-    gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     // dpanel [flat, patch_width] = dout_flat @ weight_flat.
     let mut dpanel = vec![0.0f64; flat * patch_width];
     gemm::dgemm(
@@ -9953,17 +9942,10 @@ pub fn conv3d_backward_f32(
     let panel = conv3d_im2col_f32(
         padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
-    let mut dout_t = vec![0.0f32; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel via sgemm_tb (strided-transpose read of
+    // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     let mut dweight = vec![0.0f32; out_ch * patch_width];
-    gemm::sgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     let mut dpanel = vec![0.0f32; flat * patch_width];
     gemm::sgemm(
         flat,
@@ -10176,20 +10158,10 @@ fn conv3d_backward_generic_f64(
     let panel = conv3d_im2col_f64(
         padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
-    // Transpose dout_flat [flat, out_ch] -> dout_t [out_ch, flat] in parallel over
-    // out_ch (independent strided gather — pure copy, bit-identical; was a serial
-    // O(flat*out_ch) pass). Mirrors the conv2d fix. frankentorch-convbwd.
-    let mut dout_t = vec![0.0f64; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel via dgemm_tb (strided-transpose read of
+    // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     let mut dweight = vec![0.0f64; out_ch * patch_width];
-    gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     let mut dpanel = vec![0.0f64; flat * patch_width];
     gemm::dgemm(
         flat,
@@ -34358,6 +34330,33 @@ mod tests {
             }
         }
         assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
+    }
+
+    #[test]
+    fn sgemm_tb_matches_materialized_transpose_bit_exact() {
+        // conv2d/3d_backward_f32 now compute dweight = dout_flat^T @ panel via
+        // sgemm_tb (strided-transpose read of dout_flat), replacing a materialize-
+        // transpose + sgemm. Lock the substitution bit-for-bit on a conv-like
+        // [out_ch, flat] @ [flat, patch_width] shape (out_ch != flat != patch_width).
+        let (out_ch, flat, pw) = (72usize, 96usize, 40usize);
+        let dout_flat: Vec<f32> = (0..flat * out_ch).map(|i| ((i % 101) as f32) * 0.01 - 0.5).collect();
+        let panel: Vec<f32> = (0..flat * pw).map(|i| ((i % 89) as f32) * 0.02 - 0.7).collect();
+
+        let mut got = vec![0.0f32; out_ch * pw];
+        super::gemm::sgemm_tb(out_ch, flat, pw, &dout_flat, &panel, &mut got);
+
+        // Reference: materialise dout_t [out_ch, flat] then sgemm.
+        let mut dout_t = vec![0.0f32; out_ch * flat];
+        for oc in 0..out_ch {
+            for r in 0..flat {
+                dout_t[oc * flat + r] = dout_flat[r * out_ch + oc];
+            }
+        }
+        let mut want = vec![0.0f32; out_ch * pw];
+        super::gemm::sgemm(out_ch, flat, pw, &dout_t, &panel, &mut want);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.to_bits(), w.to_bits(), "sgemm_tb must be bit-exact vs transpose+sgemm");
+        }
     }
 
     #[test]
