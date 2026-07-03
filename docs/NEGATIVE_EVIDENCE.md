@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN (SHIPPED): ft-api flip/roll/repeat had NO size gate → 2-14x SLOWER on small/medium; gated, bit-exact
+
+Agent `BlackThrush`. Followed the copy-op gate lesson into ft-api movement ops. `tensor_flip`
+(lib.rs ~4940 `flip_fill!` macro), `tensor_roll` (~5174), `tensor_repeat` (~5081 `general_repeat!`)
+all build a fresh `vec![0.0;numel]` then `out.par_chunks_mut(grain).enumerate().for_each(...)` with
+`grain = numel/(threads*4)` and **NO size gate** — only structural (rank/validity) guards. So they
+ALWAYS parallelize a bandwidth-bound decode+copy, even for tiny outputs.
+
+★MEASURE (CLEAN, before the load spiked to 68; standalone pattern-identical bench: per-row index-decode
++ run-copy, run=256, fresh vec + par_chunks_mut(numel/(4T)), 64t, min-21): parallel vs serial —
+16384(128KB) **0.07x (14x SLOWER)**, 65536 0.15x, 262144 0.24x, 1M 0.36x — regresses EVERYTHING <4M;
+only wins >=4M (6.8x) / 16M (9.7x) / 64M (10.3x) via parallel FIRST-TOUCH (same fault-parallelism crossover
+as narrow/cat, ~4M/32MB). So the shipped "outer-gate serial vein" wins (flip/roll/repeat 3x) were all
+measured at LARGE sizes; small/medium tensors (the common case) are 2-14x SLOWER than serial.
+
+★FIX SHIPPED: added ft-api `MOVEMENT_COPY_PARALLEL_MIN = 1<<22` (mirrors ft-kernel-cpu's
+COPY_MATERIALIZE_PARALLEL_MIN, 3f5cfccd) and gated all 3 closures `if size >= gate { par_chunks_mut }
+else { chunks_mut }` (extracted the closure to `let fill = |ci, chunk: &mut [_]| {..}`, called in both
+branches — same closure, serial `chunks_mut` below the gate; NOT the 1-chunk grain trick which kept
+~0.68x overhead). Preserves the large-1D win (>=4M stays parallel, matching the flip/roll comments'
+"16M reversal 9x SLOWER" motivation), fixes the small/medium regression. Bit-identical (serial==parallel
+output). Verified via rch remote build (dodged local load 68): flip 13 + repeat 22 + roll 9 tests green,
+incl. flip_roll_golden_matches_torch. Shipped [this commit]. ★rch `exec cargo test` offloads the
+150k-line compile to remote workers (~2min) even under local load 68 — the way to ship ft-api changes
+when the local box is contended. FOLLOW-UP: tile / repeat_interleave / rot90 (same outer-gate vein —
+grep ft-api for `par_chunks_mut(grain)` + `copy_from_slice`/reverse-read with no `>=` size gate).
+
 ## 2026-07-03 - SURFACE: threshold-calibration sweep — binary/unary CALIBRATED, medium-GEMM 2D REALIZED, copy-op grain = scoped lead
 
 Agent `BlackThrush`. Applied the GEMM-gate "intent-vs-value" finder to the rest of the ft-kernel-cpu
