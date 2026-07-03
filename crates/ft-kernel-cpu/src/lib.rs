@@ -2295,6 +2295,16 @@ const PARALLEL_THRESHOLD: usize = 8192;
 // every medium copy. frankentorch-kgs4-copygate.
 const COPY_MATERIALIZE_PARALLEL_MIN: usize = 1 << 22; // ~4.19M elems (~32MB f64)
 
+// Pooling forwards (avg/max_pool2d) fan out over planes with `par_chunks_mut(oh*ow)`
+// but had NO size gate — so small CNN feature maps (e.g. ResNet 512ch x 28x28, which
+// is a REAL training shape) ran 0.32-0.81x SLOWER than serial: rayon fork/join over
+// tiny cache-resident planes costs more than the window reduces save. The per-output
+// work is a `kh*kw`-wide reduce, so the crossover tracks TOTAL INPUT READS
+// (out.len() * kh * kw), not output numel — larger kernels do more work per output and
+// parallelise sooner. Measured crossover ~2.1M reads (1.6M reads = 0.81x SLOW,
+// 3.2M reads = 1.36-2.63x FAST). Gate on `out.len() * kh * kw >= this`.
+const POOL_FWD_PARALLEL_MIN: usize = 1 << 21; // ~2.1M input reads
+
 // The SIMD unary ops (relu/sqrt/reciprocal/...) were SERIAL while the scalar-map
 // unary path (exp/tanh/...) parallelises — so relu was ~36-59x slower than torch
 // at large N purely from single-threading. Parallelise above this gate (cheap
@@ -8155,34 +8165,41 @@ pub fn avg_pool2d_forward_f64(
         return avg_pool2d_forward_2x2s2_f64(padded, batch, ch, ih, iw, oh, ow);
     }
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let pbase = plane * ph * pw;
-            for oy in 0..oh {
-                let rs = oy * sh;
-                let re = (rs + kh).min(ph);
-                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-                for ox in 0..ow {
-                    let cs = ox * sw;
-                    let ce = (cs + kw).min(pw);
-                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                    let mut sum = 0.0f64;
-                    for r in rs..re {
-                        let irow = pbase + r * pw;
-                        for c in cs..ce {
-                            sum += padded[irow + c];
-                        }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let pbase = plane * ph * pw;
+        for oy in 0..oh {
+            let rs = oy * sh;
+            let re = (rs + kh).min(ph);
+            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+            for ox in 0..ow {
+                let cs = ox * sw;
+                let ce = (cs + kw).min(pw);
+                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                let mut sum = 0.0f64;
+                for r in rs..re {
+                    let irow = pbase + r * pw;
+                    for c in cs..ce {
+                        sum += padded[irow + c];
                     }
-                    let div = if count_include_pad {
-                        ((re - rs) * (ce - cs)) as f64
-                    } else {
-                        (vrlen * vclen) as f64
-                    };
-                    orow[oy * ow + ox] = sum / div;
                 }
+                let div = if count_include_pad {
+                    ((re - rs) * (ce - cs)) as f64
+                } else {
+                    (vrlen * vclen) as f64
+                };
+                orow[oy * ow + ox] = sum / div;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8196,23 +8213,31 @@ fn avg_pool2d_forward_2x2s2_f64(
     ow: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let r0 = (oy * 2) * iw;
-                let r1 = r0 + iw;
-                for ox in 0..ow {
-                    let c0 = ox * 2;
-                    let v00 = input[ibase + r0 + c0];
-                    let v01 = input[ibase + r0 + c0 + 1];
-                    let v10 = input[ibase + r1 + c0];
-                    let v11 = input[ibase + r1 + c0 + 1];
-                    orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
-                }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let r0 = (oy * 2) * iw;
+            let r1 = r0 + iw;
+            for ox in 0..ow {
+                let c0 = ox * 2;
+                let v00 = input[ibase + r0 + c0];
+                let v01 = input[ibase + r0 + c0 + 1];
+                let v10 = input[ibase + r1 + c0];
+                let v11 = input[ibase + r1 + c0 + 1];
+                orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
             }
-        });
+        }
+    };
+    // 2x2 window => 4 input reads per output.
+    if out.len() * 4 >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8254,34 +8279,41 @@ pub fn avg_pool2d_forward_f32(
         return avg_pool2d_forward_2x2s2_f32(padded, batch, ch, ih, iw, oh, ow);
     }
     let mut out = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let pbase = plane * ph * pw;
-            for oy in 0..oh {
-                let rs = oy * sh;
-                let re = (rs + kh).min(ph);
-                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-                for ox in 0..ow {
-                    let cs = ox * sw;
-                    let ce = (cs + kw).min(pw);
-                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                    let mut sum = 0.0f32;
-                    for r in rs..re {
-                        let irow = pbase + r * pw;
-                        for c in cs..ce {
-                            sum += padded[irow + c];
-                        }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let pbase = plane * ph * pw;
+        for oy in 0..oh {
+            let rs = oy * sh;
+            let re = (rs + kh).min(ph);
+            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+            for ox in 0..ow {
+                let cs = ox * sw;
+                let ce = (cs + kw).min(pw);
+                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                let mut sum = 0.0f32;
+                for r in rs..re {
+                    let irow = pbase + r * pw;
+                    for c in cs..ce {
+                        sum += padded[irow + c];
                     }
-                    let div = if count_include_pad {
-                        ((re - rs) * (ce - cs)) as f32
-                    } else {
-                        (vrlen * vclen) as f32
-                    };
-                    orow[oy * ow + ox] = sum / div;
                 }
+                let div = if count_include_pad {
+                    ((re - rs) * (ce - cs)) as f32
+                } else {
+                    (vrlen * vclen) as f32
+                };
+                orow[oy * ow + ox] = sum / div;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8295,23 +8327,31 @@ fn avg_pool2d_forward_2x2s2_f32(
     ow: usize,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let r0 = (oy * 2) * iw;
-                let r1 = r0 + iw;
-                for ox in 0..ow {
-                    let c0 = ox * 2;
-                    let v00 = input[ibase + r0 + c0];
-                    let v01 = input[ibase + r0 + c0 + 1];
-                    let v10 = input[ibase + r1 + c0];
-                    let v11 = input[ibase + r1 + c0 + 1];
-                    orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
-                }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let r0 = (oy * 2) * iw;
+            let r1 = r0 + iw;
+            for ox in 0..ow {
+                let c0 = ox * 2;
+                let v00 = input[ibase + r0 + c0];
+                let v01 = input[ibase + r0 + c0 + 1];
+                let v10 = input[ibase + r1 + c0];
+                let v11 = input[ibase + r1 + c0 + 1];
+                orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
             }
-        });
+        }
+    };
+    // 2x2 window => 4 input reads per output.
+    if out.len() * 4 >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8878,28 +8918,35 @@ pub fn max_pool2d_forward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f64::NEG_INFINITY;
-                    for kr in 0..kh {
-                        let irow = ibase + (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[irow + kc];
-                            if v > m {
-                                m = v;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f64::NEG_INFINITY;
+                for kr in 0..kh {
+                    let irow = ibase + (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[irow + kc];
+                        if v > m {
+                            m = v;
                         }
                     }
-                    orow[oy * ow + ox] = m;
                 }
+                orow[oy * ow + ox] = m;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8923,33 +8970,41 @@ pub fn max_pool2d_forward_with_indices_f64(
 ) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
     let mut arg_offsets = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .zip(arg_offsets.par_chunks_mut(oh * ow))
-        .enumerate()
-        .for_each(|(plane, (orow, arow))| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f64::NEG_INFINITY;
-                    let mut arg = 0usize;
-                    for kr in 0..kh {
-                        let loc = (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[ibase + loc + kc];
-                            if v > m {
-                                m = v;
-                                arg = loc + kc;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f64::NEG_INFINITY;
+                let mut arg = 0usize;
+                for kr in 0..kh {
+                    let loc = (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[ibase + loc + kc];
+                        if v > m {
+                            m = v;
+                            arg = loc + kc;
                         }
                     }
-                    let oidx = oy * ow + ox;
-                    orow[oidx] = m;
-                    arow[oidx] = arg as f64;
                 }
+                let oidx = oy * ow + ox;
+                orow[oidx] = m;
+                arow[oidx] = arg as f64;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .zip(arg_offsets.par_chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .zip(arg_offsets.chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    }
     (out, arg_offsets)
 }
 
@@ -8973,33 +9028,41 @@ pub fn max_pool2d_forward_with_indices_f32(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut out = vec![0.0f32; batch * ch * oh * ow];
     let mut arg_offsets = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .zip(arg_offsets.par_chunks_mut(oh * ow))
-        .enumerate()
-        .for_each(|(plane, (orow, arow))| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f32::NEG_INFINITY;
-                    let mut arg = 0usize;
-                    for kr in 0..kh {
-                        let loc = (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[ibase + loc + kc];
-                            if v > m {
-                                m = v;
-                                arg = loc + kc;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f32], arow: &mut [f32]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f32::NEG_INFINITY;
+                let mut arg = 0usize;
+                for kr in 0..kh {
+                    let loc = (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[ibase + loc + kc];
+                        if v > m {
+                            m = v;
+                            arg = loc + kc;
                         }
                     }
-                    let oidx = oy * ow + ox;
-                    orow[oidx] = m;
-                    arow[oidx] = arg as f32;
                 }
+                let oidx = oy * ow + ox;
+                orow[oidx] = m;
+                arow[oidx] = arg as f32;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .zip(arg_offsets.par_chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .zip(arg_offsets.chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    }
     (out, arg_offsets)
 }
 
@@ -9052,28 +9115,35 @@ pub fn max_pool2d_forward_f32(
     sw: usize,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f32::NEG_INFINITY;
-                    for kr in 0..kh {
-                        let irow = ibase + (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[irow + kc];
-                            if v > m {
-                                m = v;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f32::NEG_INFINITY;
+                for kr in 0..kh {
+                    let irow = ibase + (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[irow + kc];
+                        if v > m {
+                            m = v;
                         }
                     }
-                    orow[oy * ow + ox] = m;
                 }
+                orow[oy * ow + ox] = m;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 

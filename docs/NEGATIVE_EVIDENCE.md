@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: avg/max_pool2d FORWARDS had NO size gate → 0.32-0.81x SLOWER on real CNN feature maps; gated on total-reads, bit-exact
+
+Agent `BlackThrush`. Continuing the no-gate class from norms into CNN **pooling**. `avg_pool2d_forward_f{64,32}`
+(general + the 2x2-stride-2 fast path) and `max_pool2d_forward_f{64,32}` (+ the `with_indices` variants that
+feed the grad path) all fan out `out.par_chunks_mut(oh*ow)` over `(batch,ch)` planes with NO size gate. Each
+output is a `kh*kw`-wide window reduce (avg=sum, max=compare) — cheap, bandwidth-bound — so parallelising over
+tiny cache-resident planes costs more fork/join than it saves.
+
+★MEASURE (avg_pool2d 2x2s2 pattern, par over planes, 64t, min-21, serial==parallel bit-exact): **[512ch 28x28]
+0.65x, [512ch 56x56] 0.81x, [64ch 56x56] 0.32x** — all SLOWER, and 512x28x28 / 512x56x56 are REAL ResNet-50
+layer shapes hit every CNN training step. Wins only appear from ~3.2M input reads: [64ch 224x224] 2.63x,
+[4096ch 28x28] 1.36x, [8192ch 56x56] 5.03x, [2048ch 112x112] 5.86x.
+
+★The crossover tracks TOTAL INPUT READS (`out.len() * kh * kw`), NOT output numel — a larger kernel does more
+reads per output and so parallelises at a smaller output. Both 3.2M-read cases won regardless of plane
+count/size (2.63x big-plane vs 1.36x many-small-plane), while all <2M-read cases lost. Added
+`POOL_FWD_PARALLEL_MIN = 1 << 21` (~2.1M reads) + serial `chunks_mut` fallback; gate `out.len()*kh*kw >= MIN`
+(general) / `out.len()*4 >= MIN` (2x2 fast path). Bit-identical (each plane is independent → serial and
+parallel produce the same bits; the 2x2-vs-generic + first-tie-argmax lock tests still pass on the now-serial
+small path). 572 ft-kernel-cpu tests green (rch). 8 sites gated (avg/max × f64/f32 × general/2x2/with_indices).
+
+★This is a FOURTH data point confirming the tier model — pooling sits between copy and reduce-scale: it has a
+per-element reduce (like norm) but the reduce is a tiny FIXED window (like copy), so its crossover (~2.1M
+reads) lands between COPY (1<<22) and NORM (1<<19). ★REMAINING pool follow-ups (lower priority, less common):
+avg/max_pool1d + 3d forwards, adaptive pools — same pattern if they lack a gate; separate bench each.
+
 ## 2026-07-03 - ★★★WIN: layer_norm + rms_norm forward had NO size gate → 2-11x SLOWER small-batch training; gated, bit-exact
 
 Agent `BlackThrush`. The refined bandwidth-vs-compute rule (from normalize) pointed at the HIGHEST-EV
