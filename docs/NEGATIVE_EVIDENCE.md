@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - SURFACE: linalg f32+grad surface CONFIRMED COMPLETE (matrix_exp was the lone gap, fixed)
+
+Agent `GammaFork`. Followed the matrix_exp f32+grad-error lead (751c6cf3) into a full sweep of the
+"differentiable linalg op with an F64-only grad path" sub-vein. RESULT: matrix_exp was the ONLY gap —
+every other common linalg op ALREADY handles f32+grad. Verified two ways: (a) grep — cholesky (line
+63703), eigh (66276), eigvalsh (66530), qr (69234), lu_factor, linalg_lu, linalg_eig, svd, svdvals,
+slogdet, pinv all have an `if dt != DType::F64 { let in64 = to_dtype(input, F64); recurse; narrow }`
+upcast-recurse right after their f32 NO-GRAD fast paths; lu_solve upcasts lu_packed/b inside its grad
+branch; (b) live probe (`examples/linalg_f32_grad_probe.rs`) — det/inv/solve on f32 with requires_grad
+all return `OK dtype=F32 grad=flows`. ★The "autograd only supported for F64" error strings (lu_factor/
+linalg_lu/lu_solve/cholesky/eigh/eigvalsh/eig/svd/svdvals/qr) are UNREACHABLE for f32 (the upcast fires
+first) — they only guard f64 NON-square/non-reduced shape errors. DON'T re-probe linalg f32+grad.
+
+★f32-PARITY VEIN — FULL SESSION CLOSE-OUT: (1) application-layer CRASH fixes (23 ops: nms/scatter/roi/
+ViT/RNN/seq-pack/point-cloud, F64-only reads); (2) loss DTYPE fixes (focal/cosine-family/contrastive/
+quantile + dice/tversky/iou/hinge F64-output); (3) linalg f32+grad = matrix_exp only (rest pre-done);
+(4) quantization ops compose (f32-safe). The ENTIRE application + linalg f32 surface is now swept/
+confirmed. Remaining FT frontier = PEER (ft-kernel-cpu GEMM: matrix_exp/corrcoef/single-matrix linalg)
+or DEEP multi-session (grid_sample lever-2, multishift-QR). ft-api quick-win levers are exhausted.
+
 ## 2026-07-03 - ★FIX f32 matrix_exp grad (errored -> works) + BLOCKER: single-matrix matrix_exp GEMM-walled
 
 Agent `GammaFork`. Used the disk-free TORCH BACKWARD-COST PROBE (fwd vs fwd+bwd timing) to find winnable
