@@ -24,8 +24,19 @@ branches — same closure, serial `chunks_mut` below the gate; NOT the 1-chunk g
 output). Verified via rch remote build (dodged local load 68): flip 13 + repeat 22 + roll 9 tests green,
 incl. flip_roll_golden_matches_torch. Shipped [this commit]. ★rch `exec cargo test` offloads the
 150k-line compile to remote workers (~2min) even under local load 68 — the way to ship ft-api changes
-when the local box is contended. FOLLOW-UP: tile / repeat_interleave / rot90 (same outer-gate vein —
-grep ft-api for `par_chunks_mut(grain)` + `copy_from_slice`/reverse-read with no `>=` size gate).
+when the local box is contended.
+
+★FOLLOW-UP DONE d6f56b7f: repeat_interleave's two forward FILL paths were gated at 8192
+(PARALLEL_ELEMENTWISE_MIN) not no-gate — but 8192 is still too low for pure write-only fill: measured
+(fill, repeats=8, min-21, bit-exact) parallel 0.06x@128KB (16x SLOWER), 0.18x@512KB, 0.20x@2MB, 0.37x@8MB,
+wins only >=4M (6.7x). Raised both to MOVEMENT_COPY_PARALLEL_MIN; the BACKWARD (sum reduction = compute)
+correctly stays at 8192. Verified rch: 8 tests green. ★rot90 NOT changed: it's a cache-blocked TRANSPOSE
+(strided/cache-latency-bound, not a straight copy) — transpose parallelism pays at medium (permute vein),
+different regime from pure copy/fill. ★tile: no inline par copy found (delegates). ★So the ft-api
+MOVEMENT pure-copy/fill set is now COMPLETE: flip/roll/repeat (0730b168) + repeat_interleave (d6f56b7f);
+rot90/kron excluded (transpose / has multiply = compute). RULE HOLDS: pure copy_from_slice/fill (no
+per-element math) into fresh vec![0.0;n] → gate at ~1<<22, NOT the compute default; transpose/compute
+movement stays at the lower gate.
 
 ## 2026-07-03 - SURFACE: threshold-calibration sweep — binary/unary CALIBRATED, medium-GEMM 2D REALIZED, copy-op grain = scoped lead
 
