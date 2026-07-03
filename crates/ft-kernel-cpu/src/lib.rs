@@ -5997,10 +5997,18 @@ pub fn conv2d_im2col_f64(
     panel
 }
 
+/// Below this batch count, `conv2d_col2im_*` parallelizes per (batch, channel)
+/// plane instead of per batch — otherwise a small batch yields too few rayon
+/// tasks (batch=1 is fully serial). Per-plane loses dpanel cache locality, so at
+/// or above this it regresses (measured 0.6-0.8x at batch>=16); gate keeps the
+/// win (5.2x @ batch=1, 1.5x @ batch=4) with zero regression. kgs4-col2im-plane.
+const COL2IM_PLANE_MAX_BATCH: usize = 8;
+
 /// col2im scatter: the transpose of [`conv2d_im2col_f64`]. Accumulates the
 /// `dpanel` columns back to a `dpadded [batch, in_ch, ph, pw]` (overlapping
 /// patches sum). Parallel over batch (disjoint regions), deterministic serial
-/// accumulation within each batch.
+/// accumulation within each batch; per-plane for small batch (see
+/// `COL2IM_PLANE_MAX_BATCH`).
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv2d_col2im_f64(
@@ -6019,6 +6027,28 @@ pub fn conv2d_col2im_f64(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
+    // Small batch: parallelize per (batch, channel) plane (bit-identical scatter
+    // order per channel) so batch=1 isn't serial. See conv2d_col2im_f32. kgs4-col2im-plane.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded.par_chunks_mut(ph * pw).enumerate().for_each(|(bc, dpc)| {
+            let b = bc / in_ch;
+            let c = bc % in_ch;
+            let pch = c * kh * kw;
+            for pc in 0..patch_count {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow_off = (b * patch_count + pc) * patch_width + pch;
+                for kr in 0..kh {
+                    let irow = (base_h + kr) * pw + base_w;
+                    let prow_k = prow_off + kr * kw;
+                    for kc in 0..kw {
+                        dpc[irow + kc] += dpanel[prow_k + kc];
+                    }
+                }
+            }
+        });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
@@ -6062,6 +6092,33 @@ pub fn conv2d_col2im_f32(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let mut dpadded = vec![0.0f32; batch * in_ch * ph * pw];
+    // Per-batch parallelism gives only `batch` rayon tasks (fully SERIAL at
+    // batch=1). For small batch, parallelize per (batch, channel) PLANE instead:
+    // each plane dpadded[(b*in_ch+c)*ph*pw..] is disjoint and its pc-outer
+    // scatter-accumulation order is IDENTICAL to the per-batch loop restricted to
+    // channel c -> bit-for-bit identical. Wins for small batch (5.2x @ batch=1,
+    // 1.5x @ batch=4); per-batch keeps better dpanel locality at batch>=8 (per-plane
+    // regressed 0.6-0.8x there, so it's gated). kgs4-col2im-plane.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded.par_chunks_mut(ph * pw).enumerate().for_each(|(bc, dpc)| {
+            let b = bc / in_ch;
+            let c = bc % in_ch;
+            let pch = c * kh * kw;
+            for pc in 0..patch_count {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow_off = (b * patch_count + pc) * patch_width + pch;
+                for kr in 0..kh {
+                    let irow = (base_h + kr) * pw + base_w;
+                    let prow_k = prow_off + kr * kw;
+                    for kc in 0..kw {
+                        dpc[irow + kc] += dpanel[prow_k + kc];
+                    }
+                }
+            }
+        });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
@@ -34356,6 +34413,71 @@ mod tests {
         super::gemm::sgemm(out_ch, flat, pw, &dout_t, &panel, &mut want);
         for (g, w) in got.iter().zip(want.iter()) {
             assert_eq!(g.to_bits(), w.to_bits(), "sgemm_tb must be bit-exact vs transpose+sgemm");
+        }
+    }
+
+    #[test]
+    fn conv2d_col2im_small_batch_per_plane_matches_per_batch_bit_exact() {
+        // batch=2 < COL2IM_PLANE_MAX_BATCH -> the per-(batch,channel)-plane path
+        // fires. Lock it byte-for-byte against a serial per-batch reference (the
+        // pre-gate loop) for f32 and f64. Overlapping patches (stride 1, k=3)
+        // exercise the scatter-accumulation order.
+        let (batch, in_ch, kh, kw, sh, sw) = (2usize, 5usize, 3usize, 3usize, 1usize, 1usize);
+        let (oh, ow) = (7usize, 6usize);
+        let (ph, pw) = (oh + 2, ow + 2);
+        let patch_width = in_ch * kh * kw;
+        let dpanel: Vec<f64> = (0..batch * oh * ow * patch_width)
+            .map(|i| ((i % 97) as f64) * 0.013 - 0.5)
+            .collect();
+
+        // Serial per-batch reference.
+        let mut want = vec![0.0f64; batch * in_ch * ph * pw];
+        for b in 0..batch {
+            let dpb = &mut want[b * in_ch * ph * pw..(b + 1) * in_ch * ph * pw];
+            for pc in 0..oh * ow {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow = (b * (oh * ow) + pc) * patch_width;
+                for c in 0..in_ch {
+                    for kr in 0..kh {
+                        let irow = c * ph * pw + (base_h + kr) * pw + base_w;
+                        let prow_off = prow + c * kh * kw + kr * kw;
+                        for kc in 0..kw {
+                            dpb[irow + kc] += dpanel[prow_off + kc];
+                        }
+                    }
+                }
+            }
+        }
+
+        let got64 = super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        assert_eq!(got64.len(), want.len());
+        for (g, w) in got64.iter().zip(want.iter()) {
+            assert_eq!(g.to_bits(), w.to_bits(), "conv2d_col2im_f64 per-plane must match per-batch");
+        }
+        let dpanel_f: Vec<f32> = dpanel.iter().map(|&v| v as f32).collect();
+        let got32 = super::conv2d_col2im_f32(&dpanel_f, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        // f32 reference from the same serial per-batch loop.
+        let mut want_f = vec![0.0f32; batch * in_ch * ph * pw];
+        for b in 0..batch {
+            let dpb = &mut want_f[b * in_ch * ph * pw..(b + 1) * in_ch * ph * pw];
+            for pc in 0..oh * ow {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow = (b * (oh * ow) + pc) * patch_width;
+                for c in 0..in_ch {
+                    for kr in 0..kh {
+                        let irow = c * ph * pw + (base_h + kr) * pw + base_w;
+                        let prow_off = prow + c * kh * kw + kr * kw;
+                        for kc in 0..kw {
+                            dpb[irow + kc] += dpanel_f[prow_off + kc];
+                        }
+                    }
+                }
+            }
+        }
+        for (g, w) in got32.iter().zip(want_f.iter()) {
+            assert_eq!(g.to_bits(), w.to_bits(), "conv2d_col2im_f32 per-plane must match per-batch");
         }
     }
 
