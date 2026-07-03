@@ -34,9 +34,15 @@ group_norm now fully fwd+bwd. ★REMAINING norm follow-ups (all lower priority):
 backward path (rarer, several kernels), batch_norm/instance_norm (reduce ACROSS batch = different axis,
 needs own bench), with_stats backward. The transformer+GN norm family (layer_norm/rms_norm/group_norm,
 fwd AND bwd) is now fully gated. ★★NO-GATE VEIN STATUS: the whole per-row/per-group reduce-then-scale +
-movement-copy no-gate class is HARVESTED for the hot ops. Remaining ungated ops are either batch-axis
-norms (batch_norm/instance_norm, separate analysis) or the ~30 per-element compute ops (narrow window,
-per-op crossover — low priority). Next fresh perf work should look OUTSIDE this vein.
+movement-copy no-gate class is HARVESTED for the hot ops. ★batch_norm_apply GATED 251e1fb2: benched it
+= COPY tier (~4M crossover), NOT reduce-scale — because the apply has NO per-element reduce (stats
+precomputed), it's a pure fma-copy (out=x*scale+shift). Common CNN train shapes regress 0.1-0.8x
+([b32,c256,196]=0.37x); gated at COPY_MATERIALIZE_PARALLEL_MIN(1<<22). ★REFINED TIER RULE: batch_norm
+apply = copy tier (1<<22) since the reduce (stats) is a SEPARATE precomputed pass; layer/rms/group_norm
+apply = reduce-scale tier (1<<19) since the reduce is IN the per-row body. So: gate tier = does the
+PARALLELIZED body itself contain the per-row reduce (→512K) or is it a pure scaled copy (→4M)?
+Remaining ungated: batch_norm_stats (reduce over channels = good axis, likely fine), instance_norm,
+dy-all-ones special paths, ~30 per-elem compute ops. Next fresh perf work should look OUTSIDE this vein.
 
 ## 2026-07-03 - ★WIN + SURFACE: no-gate COMPUTE ops — gelu_tanh gated (SHIPPED); ~30 more ft-api ops flagged (narrower EV)
 
