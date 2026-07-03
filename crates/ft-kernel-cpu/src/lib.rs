@@ -13333,7 +13333,11 @@ pub fn cat_tensor_contiguous_f64(
             g += copy;
         }
     };
-    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
         const CHUNK: usize = 1 << 16; // 64K elems: good load balance
         output
@@ -13421,7 +13425,11 @@ pub fn stack_tensor_contiguous_f64(
             g += copy;
         }
     };
-    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
         const CHUNK: usize = 1 << 16; // 64K elems: good load balance
         output
@@ -31019,7 +31027,11 @@ pub fn cat_tensor_contiguous_f32(
             g += copy;
         }
     };
-    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
         const CHUNK: usize = 1 << 16; // 64K elems = 256KB per task: good load balance
         output
@@ -31098,7 +31110,11 @@ pub fn stack_tensor_contiguous_f32(
             g += copy;
         }
     };
-    if out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
         use rayon::prelude::*;
         const CHUNK: usize = 1 << 16; // 64K elems: good load balance
         output
