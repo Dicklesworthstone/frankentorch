@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★WIN (bit-exact, TORCH-CORE FLIP): local_response_norm grad path — 2.74x SLOWER -> 2.63x FASTER vs torch
+
+Agent `GammaFork`. ★Best win in a while — TORCH-CORE (torch.nn.functional.local_response_norm), CLEAN
+head-to-head ratio (not internal-A/B). LRN's NO-GRAD path was already parallel, but the GRAD path (the
+fwd + bwd apply_function closures, run during TRAINING) was FULLY SERIAL: `for b { for c { for s {window
+sum-of-squares + powf} } }` forward + a serial per-(b,s)-channel-column backward. Both parallelize
+cleanly (each output/grad position independent): forward over (b,c) rows via par_chunks_mut(spatial)
+(reusing the no-grad path's fill_row); backward over BATCH via par_chunks_mut(channels*spatial) (each b
+owns a contiguous grad block; the per-(b,s) column math is unchanged). Bit-exact: new test
+local_response_norm_grad_parallel_matches_serial_reference_bit_exact runs the grad path at a
+parallel-triggering size and asserts to_bits() equality vs an INDEPENDENT serial reference of the LRN
+backward formula; existing finite-difference + value-parity tests still green.
+
+MEASURED (cc-local, [N=16,C=96,55x55,size=5] fwd+bwd, load ~17):
+- FT serial 374.29 ms -> FT parallel **52.05 ms = 7.19x internal** (fwd 4.97x, bwd 9.62x)
+- torch 2.12.1: **136.74 ms @32t** / 175.75 ms @8t (fwd+bwd)
+- ⇒ FT flips **2.74x SLOWER (serial) -> 2.63x FASTER vs torch@32t** (3.38x FASTER @8t). Backward alone: FT
+  25.6 ms vs torch 99.3 ms @32t = **3.88x FASTER**. torch implements LRN via avg_pool3d (slow ~99ms
+  backward); FT's fused parallel grad beats it. Clean torch-core head-to-head (venv /tmp/torchvenv).
+
+★LESSON: an op with a parallel NO-GRAD path can still have a SERIAL GRAD path (fwd+bwd closures inside
+apply_function) — grep apply_function forward/backward closures for serial `for b`/nested loops even when
+the top-level no-grad path is already parallel. The GRAD path runs at training time = high-value. Bench:
+examples/lrn_grad_h2h.rs. 9 ops flipped this vein (ctc + 3 ROI + ball_query + group_points + FPS +
+color_jitter + LRN-grad), LRN being the first clean TORCH-CORE flip-to-faster since ctc.
+
 ## 2026-07-03 - WIN (bit-exact): color_jitter batch-parallel 2.34x + scan rejects (STFT/mfcc/fft/rrcrop)
 
 Agent `GammaFork`. Scanned a fresh op family (audio/image-aug) for the application-level serial-op vein.
