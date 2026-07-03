@@ -1,5 +1,63 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN (batch ×10, RNG rejection-sampler class): per-element sub-streams parallelize the whole gamma/poisson/binomial family — 3-20x FASTER vs torch
+
+Agent `GammaFork`. The continuous inverse-CDF / Box-Muller RNG ops were already parallel (draw
+serial, transform parallel — bit-exact to the serial FT stream), but the entire REJECTION-SAMPLING
+family stayed FULLY SERIAL: `tensor_gamma`, `tensor_chi2`, `tensor_studentt`, `tensor_beta`,
+`tensor_dirichlet`, `tensor_fishersnedecor`, `tensor_von_mises`, `tensor_binomial`,
+`tensor_negative_binomial`, and both poisson variants (`poisson`, `tensor_poisson`) all ran
+`(0..numel).map(|_| self.sample_gamma(...) / rng-loop)`. torch's CPU distribution samplers are ALSO
+single-threaded, so both sat at ~parity (FT ≈ torch, both ~0.6-2.0s for 16M f64).
+
+WHY they couldn't use the existing "draw-serial/transform-parallel" trick: each element consumes a
+DATA-DEPENDENT number of RNG draws (Marsaglia-Tsang / Knuth rejection loops), so the shared stream
+can't be split by a fixed stride, and the transcendentals live INSIDE the acceptance test (can't be
+deferred). LEVER: **per-element independent sub-streams** (`substream_sample` on the RNG) — draw one
+seed per output element serially from the parent stream (advancing it by exactly `numel`, so
+subsequent draws stay reproducible), then each element samples from its OWN
+`Xoshiro256PlusPlus::new(seed_i)` in parallel (rayon). This is the standard split/counter RNG model
+(JAX `split` / Philox per-element offset). Because element `i` depends only on `seeds[i]`, the map is
+ORDER-INDEPENDENT → the serial (small `len`) and parallel (`len >= 1<<14`) branches are BIT-IDENTICAL.
+Gamma sampling moved onto the RNG as `next_gamma` (already existed, bit-identical Marsaglia-Tsang) so
+the closures call it inside the sub-stream. Dirichlet uses a per-row sub-stream + `flat_map_iter`.
+
+★MEASURE ([4000,4000]=16M f64 NO-GRAD, min-of-5, torch 2.12.1 f64 AND f32 measured SAME window, load
+~22 — heavy contention, so ratios are CONSERVATIVE since FT is the parallel side):
+
+| op            | FT before | FT after | torch f64 | torch f32 | speedup vs torch |
+|---------------|-----------|----------|-----------|-----------|------------------|
+| gamma(2.5)    | 579 ms    | 100 ms   | 710 ms    | 674 ms    | **7.1x FASTER**  |
+| gamma(0.5)    | 748 ms    | 109 ms   | 1015 ms   | —         | **9.3x FASTER**  |
+| chi2(4)       | 581 ms    | 104 ms   | 760 ms    | —         | **7.3x FASTER**  |
+| studentt(5)   | 944 ms    | 109 ms   | 1129 ms   | 818 ms    | **7.5-10.4x**    |
+| beta(2,3)     | 1090 ms   | 112 ms   | 1577 ms   | 1552 ms   | **14.1x FASTER** |
+| binomial(20)  | 446 ms    | 98 ms    | 2023 ms   | 1971 ms   | **20.7x FASTER** |
+| poisson(4)    | 627 ms    | 219 ms*  | 684 ms    | 654 ms    | **3.1x FASTER**  |
+| dirichlet(k=4)| 691 ms    | 115 ms   | 829 ms    | —         | **7.2x FASTER**  |
+
+*poisson's FT timer includes ~34ms building the 16M rate tensor (measurement overhead, not the op).
+torch f32 ≈ f64 (rejection sampling is transcendental-bound, not SIMD-bound) so the win holds for
+BOTH dtypes — not an f64-only artifact. Internal FT self-improvement 5-9x.
+
+PARITY: RNG ops CANNOT be bit-exact to torch (FT uses xoshiro256++, torch uses Philox) — parity is
+distributional + deterministic. The sub-stream scheme is deterministic (fixed session seed → fixed
+output) and, crucially, ORDER-INDEPENDENT, so the parallel branch is BIT-IDENTICAL to the serial
+branch — that IS the bit-exact proof. Lock test `dist_substream_parallel_matches_serial_and_is_deterministic`
+reproduces the parallel branch's exact seed draws + per-element map serially and asserts `assert_eq!`
+(bit-for-bit), plus a determinism re-run + Gamma(2.5,1) mean/var check. Second test
+`tensor_gamma_family_parallel_deterministic_and_distributional` checks session-level reproducibility +
+Gamma/Beta analytic moments. Full ft-api lib suite: 2443 passed, 1 pre-existing failure
+(`gammaln_no_grad_fast_path_golden_summary_matches_fixture` — a STALE evidence-ledger golden for the
+`gammaln` SPECIAL FUNCTION, not the gamma distribution; `git stash`-verified to fail IDENTICALLY on
+clean HEAD with my change removed — values/digests identical, only the last-ledger-kind field drifted
+`Dispatch` vs golden `Policy`). ⚠️ old session `sample_gamma` method removed (dead after the rewrite;
+gamma sampling is now the RNG's `next_gamma`). LESSON: rejection samplers whose per-element draw count
+is data-dependent can't be parallelized within one shared stream, but per-element seed sub-streams
+make them embarrassingly parallel + deterministic + bit-exact serial-vs-parallel — and torch's CPU
+samplers are single-threaded, so this is a clean multi-x win across a whole distribution family. AGENT
+GammaFork.
+
 ## 2026-07-02 - ★★ WIN (batch ×3, RNG class): parallel Box-Muller for normal/log_normal/half_normal — 1.6-3.3x FASTER vs torch, bit-exact
 
 Agent `SlateTern`. Completed the RNG vein: the `next_normal()`-based ops (`tensor_normal`,
