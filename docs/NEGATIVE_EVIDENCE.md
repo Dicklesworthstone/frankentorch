@@ -24,6 +24,18 @@ QUEUED for a clean-load pass (bench each op's crossover, gate at it). Lower prio
 window, and losses are once-per-batch not per-layer). ★FINDER: the compute-body variant of the no-gate
 grep (filter FOR arithmetic instead of against it).
 
+★★SHIPPED from the queue 74f0d6d9: tensor_normalize (f64+f32) — and it TURNED OUT to be BANDWIDTH-bound,
+not compute! Despite the sqrt, the per-lane work is 2·dim_size reads + dim_size writes + ONE sqrt (sqrt
+amortized over dim_size), so single-thread saturates bandwidth → crossover ~4M (WIDE window, like copy),
+NOT ~8192. Measured: 0.03x@4KB (33x SLOWER), 0.20x@32KB, 0.82x@2MB, wins only >=4M. normalize is COMMON
+(cosine_similarity/info_nce/embedding/retrieval/SVD-power-iter), so this is HIGHER EV than gelu. Gated both
+at MOVEMENT_COPY_PARALLEL_MIN (1<<22). 12 tests green (rch). ★★REFINED CLASSIFICATION (the real rule): it's
+not copy-vs-compute by whether arithmetic APPEARS — it's what DOMINATES the per-element cost. If memory
+traffic dominates (copy/fill, OR a reduce+scale like normalize where the transcendental is 1-per-row) →
+BANDWIDTH-bound → gate ~4M. If a transcendental fires PER ELEMENT (gelu tanh, exp, 2 logs in bce) →
+COMPUTE-bound → gate ~8192. So re-triage the queued ~30: the losses/xlogy/logit/entr (per-element log/exp)
+= compute (~8192); but any reduce-then-scale (normalize-like) = bandwidth (~4M, wider window, higher EV).
+
 ## 2026-07-03 - ★★WIN (SHIPPED): ft-api flip/roll/repeat had NO size gate → 2-14x SLOWER on small/medium; gated, bit-exact
 
 Agent `BlackThrush`. Followed the copy-op gate lesson into ft-api movement ops. `tensor_flip`
