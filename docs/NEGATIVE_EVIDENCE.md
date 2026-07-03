@@ -1,5 +1,42 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: multinomial per-row sub-streams + CDF — ns=1 (LLM token sampling) 4.0-4.3x FASTER vs torch; ns>1 14x SLOWER -> 4.6x SLOWER
+
+Agent `GammaFork`. `multinomial(input, num_samples, replacement)` ran fully SERIAL over batch rows,
+and (with replacement) recomputed the full O(num_categories) weight sum EVERY sample. Two findings:
+torch's own `multinomial` with `num_samples=1` (THE autoregressive-token-sampling path) is
+pathologically slow/single-threaded (353ms for [4096,4096], **4465ms for [4096,50000]** f64) vs
+~19-216ms for ns=8; and FT was already ~2.5x faster there but 14-16x SLOWER for ns>1.
+
+LEVER (same per-element sub-stream model as the gamma/poisson family, dcbe1afd): seed each row from
+the parent stream (advances by exactly `batch`, reproducible), sample that row's draws from its OWN
+`Xoshiro256PlusPlus::new(seed_i)` in parallel across rows (rayon, gate batch>=8). Rows independent =>
+order-independent => serial and parallel branches BIT-IDENTICAL. Plus two algorithmic fixes for the
+replacement case: (a) drop the per-row `to_vec` copy (weights are constant — scan the source slice),
+(b) for ns>1 build the prefix-sum CDF ONCE and binary-search per draw (O(C + ns·logC) not O(ns·C)) —
+`partition_point(|c| c<=r)` is bit-identical to the linear scan's `r < cumulative` (same left-to-right
+prefix sums, same thresholds). Without replacement stays sequential within a row (weights mutate),
+parallel across rows.
+
+★MEASURE ([B,C] f64 replacement, weights OUTSIDE timer, min-of-5, torch 2.12.1, load ~15):
+| shape           | ns | FT before | FT after | torch  | after ratio       |
+|-----------------|----|-----------|----------|--------|-------------------|
+| [4096,4096]     | 1  | 144 ms    | 87 ms    | 354 ms | **4.08x FASTER**  |
+| [2048,8192]     | 1  | 140 ms    | 88 ms    | 359 ms | **4.10x FASTER**  |
+| [4096,50000]    | 1  | 1748 ms   | 1042 ms  | 4465 ms| **4.28x FASTER**  |
+| [4096,4096]     | 8  | 275 ms    | 89 ms    | 19 ms  | 4.6x SLOWER (was 14x) |
+| [2048,8192]     | 8  | 277 ms    | 86 ms    | 18 ms  | 4.7x SLOWER (was 15x) |
+| [4096,50000]    | 8  | 3572 ms   | 1038 ms  | 216 ms | 4.8x SLOWER (was 16x) |
+
+★ns=1 (the dominant real case — sampling one token per row) is a clean 4x FASTER + no regression
+anywhere; ns>1 improved ~3x internally (14x->4.6x slower). ⚠️REMAINING ns>1 gap: torch's ns>1 path
+is bandwidth/SIMD-efficient (~19ms reading 128MB); FT's CDF build is O(C) read-bound and rayon scalar
+can't hit torch's per-row alias-method bandwidth — a follow-up (block-by-tile SIMD alias, deep). Lock
+test `multinomial_parallel_matches_serial_and_is_distributional`: rows 0..4 of a serial [4,C] run ==
+rows 0..4 of a parallel [16,C] run (shared seeds, bit-exact) + determinism + empirical freq ~ weight
+proportion. 10/10 multinomial tests green. Bench `crates/ft-api/examples/multinomial_h2h.rs`. AGENT
+GammaFork.
+
 ## 2026-07-02 - ★★★ WIN (batch ×10, RNG rejection-sampler class): per-element sub-streams parallelize the whole gamma/poisson/binomial family — 3-20x FASTER vs torch
 
 Agent `GammaFork`. The continuous inverse-CDF / Box-Muller RNG ops were already parallel (draw
