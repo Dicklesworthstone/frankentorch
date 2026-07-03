@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact): roi_pool + ps_roi_pool parallelized — 5.79x / 3.32x internal (completes ROI family)
+
+Agent `GammaFork`. The roi_align follow-up (same application-level serial-op vein): roi_pool (max) and
+ps_roi_pool (position-sensitive average) were the last two serially-nested ROI ops. Each output element
+is independent (roi_pool = max over an integer window; ps_roi_pool = avg over a position-sensitive
+window), so refactored both to one `compute(out_idx)` closure + `par_iter_mut()` over the flat output
+(gated len>=4096; serial below keeps small shapes + tests identical). Bit-exact: roi_pool's max is
+order-independent (returns an exact element), ps_roi_pool keeps the per-output (iy,ix) sum order — only
+the outer iteration parallelizes, disjoint writes. Two new tests
+(roi_pool/ps_roi_pool_parallel_matches_serial_reference_bit_exact) compute independent serial references
+and assert to_bits() equality on every output of a parallel-path run. All 4 roi tests green.
+
+MEASURED (cc-local, same-binary RAYON A/B, K=512, load ~15):
+- roi_pool [C=256,H=50,W=50,out=7x7]: serial 189.88 -> parallel 32.82 ms = **5.79x internal**
+- ps_roi_pool [C=1029,osz=7,ncls=21]: serial 41.85 -> parallel 12.59 ms = **3.32x internal**
+(lower than roi_align's 23.7x because max/avg over small integer windows is much cheaper per output than
+roi_align's sample_pts^2 bilinear taps — less compute to amortize the rayon dispatch.) ★vs-PyTorch: same
+as roi_align — torchvision.ops.{roi_pool,ps_roi_pool} are multithreaded C++; torchvision NOT installed
+(shared /tmp/torchvenv, won't risk peers' torch), so internal-A/B + qualitative. ★ROI FAMILY COMPLETE
+(roi_align 23.7x + roi_pool 5.79x + ps_roi_pool 3.32x, all bit-exact). Application-level serial-op vein
+continues to yield; next follow-ups: point-cloud FPS/ball_query, or scan other vision/detection ops.
+Bench: examples/roi_pool_h2h.rs.
+
 ## 2026-07-03 - WIN (bit-exact): roi_align parallelized over output elements — 23.7x internal (436->18ms)
 
 Agent `GammaFork`. Same vein as ctc (APPLICATION-LEVEL composite ops the core kgs4 campaign didn't
