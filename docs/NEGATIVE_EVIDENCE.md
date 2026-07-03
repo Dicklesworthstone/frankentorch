@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: pool1d + pool3d FORWARDS had the SAME no-gate bug → 0.64-0.69x SLOWER small; gated, bit-exact (pool family complete)
+
+Agent `BlackThrush`. Completing the pool family after the pool2d gate (7b65e078). The fused `avg_pool1d_forward_f64`,
+`max_pool1d_forward_f64` (+ with_indices), `max_pool3d_forward_f{64,32}` (+ with_indices_f64) all fan out
+`par_chunks_mut` over `(batch,ch)` planes with NO size gate — the identical over-parallelization: small 1d/3d
+inputs pay more rayon fork/join than the window reduces save.
+
+★MEASURE (max_pool3d 2x2x2s2 pattern, par over planes, 8-read window, 64t, min-15, serial==parallel bit-exact):
+**[p32 8x28x28]=0.2M reads 0.64x, [p64 8x28x28]=0.4M reads 0.69x** (SLOWER); wins from ~3.2M reads: [p64
+16x56x56] 1.52x, [p512 16x56x56] 1.78x, [p64 32x112x112] 2.37x. Pool3d wins are more modest than pool2d
+(2.6-5.9x) because the deeper window nest is less bandwidth-starved — but the small-size regression is the same
+and is what the gate fixes.
+
+★Gated all 6 forward sites on TOTAL INPUT READS (`out.len() * <window>`: `kd*kh*kw` for 3d, `kernel` for 1d) at
+the existing `POOL_FWD_PARALLEL_MIN = 1 << 21` (~2.1M reads) + serial `chunks_mut` fallback. The 2.1M crossover
+holds across 2d/1d/3d (0.4M-read cases lose, 3.2M-read cases win, both dims). Bit-identical (planes independent;
+the direct-vs-2d-h1 + first-tie-argmax + scatter-rescan lock tests all pass on the now-serial small path). 572
+ft-kernel-cpu tests green (rch). ★FUSED POOL FAMILY now COMPLETE: avg/max_pool 1d+2d+3d forwards all gated at
+POOL_FWD_PARALLEL_MIN. (No avg_pool3d / adaptive-pool fused kernels exist — those route through the ft-api
+op-graph, out of ft-kernel-cpu scope.)
+
 ## 2026-07-03 - WIN: avg/max_pool2d FORWARDS had NO size gate → 0.32-0.81x SLOWER on real CNN feature maps; gated on total-reads, bit-exact
 
 Agent `BlackThrush`. Continuing the no-gate class from norms into CNN **pooling**. `avg_pool2d_forward_f{64,32}`
