@@ -1,5 +1,36 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★ WIN + BLOCKER: in-place transcendental RNG fills 1.6-2.1x FASTER vs torch; cheap fills (uniform_/normal_) WRITEBACK-WALLED
+
+Agent `GammaFork`. The in-place `Tensor.*_` RNG fills built their values with a SERIAL
+`(0..numel).map(|_| ...transcendental...)` then wrote back — while the OUT-OF-PLACE twins already
+used the parallel `next_uniform_transformed` / `next_normal_transformed` primitives. Converted the
+four transcendental fills to those primitives (bit-identical to the serial stream: the primitive
+feeds the same `u=(g>>11)/2^53` / same Box-Muller draw+retry). Lock test
+`inplace_transcendental_rng_matches_out_of_place_bit_exact` asserts each in-place fill == its
+out-of-place tensor bit-for-bit (same seed) + geometric_ integer/mean.
+
+★MEASURE (16M f64, min-of-6, torch 2.12.1 SAME window, load ~24):
+| op            | FT after | torch  | ratio            |
+|---------------|----------|--------|------------------|
+| exponential_  | 163 ms   | 258 ms | **1.58x FASTER** |
+| cauchy_       | 170 ms   | 358 ms | **2.11x FASTER** |
+| log_normal_   | 253 ms   | 538 ms | **2.13x FASTER** |
+| geometric_    | 168 ms   | 285 ms | **1.70x FASTER** |
+
+⛔BLOCKER (REVERTED init_uniform_/init_normal_ back to serial — they LOSE vs torch and parallelizing
+the map gives ~0): the in-place fills are WRITEBACK-BOUND. `update_tensor_values_for_float` costs
+~150-160ms for 16M f64 (~2x torch's ~67ms in-place uniform_ bandwidth), so a fill whose transform is
+CHEAP can't win no matter how the compute is parallelized: uniform_ FT 164ms vs torch 67ms = 2.4x
+SLOWER; normal_ FT 275ms vs torch 242ms = 0.88x (also carries next_normal_transformed's 256MB
+raw-pair buffer). Only fills whose torch-side transform is EXPENSIVE (cauchy/log_normal/exponential/
+geometric, torch 258-538ms) clear the writeback floor and flip FT-faster. The REAL lever for the
+cheap fills is a FUSED mutate-in-place at the ft-autograd tape storage (write parallel-computed values
+straight into the leaf's buffer, skipping the clone/validate/record in update_tensor_values_for_float)
+— a deeper ft-autograd change, surfaced for a follow-up. This matches the standing in-place lesson
+(mul_scalar_/add_scalar_ parallel-map REJECTED, tape read-clone+writeback dominates). Bench
+`crates/ft-api/examples/inplace_rng_h2h.rs`. AGENT GammaFork.
+
 ## 2026-07-02 - ★★ WIN: multinomial per-row sub-streams + CDF — ns=1 (LLM token sampling) 4.0-4.3x FASTER vs torch; ns>1 14x SLOWER -> 4.6x SLOWER
 
 Agent `GammaFork`. `multinomial(input, num_samples, replacement)` ran fully SERIAL over batch rows,
