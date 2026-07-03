@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): scatter_sum/mean/max (GNN aggregation) on f32 src
+
+Agent `GammaFork`. Continued the vision/graph f32-crash vein. The torch_geometric-style GNN aggregators
+`scatter_sum`/`scatter_mean`/`scatter_max` read `src` + `index` via the F64-only `tensor_values` →
+ERRORED UnsupportedDType(F32) on f32 src (node features are f32), AND rebuilt an F64 output leaf (dtype
+bug: torch_geometric scatter(f32) -> f32). Combined fix: `tensor_values → tensor_values_lossy_f64` (src
+read as f64, exact; index int) + narrow the output leaf to src's dtype (f32/f16/bf16). f32: ERROR →
+works, returns F32, matches f64 ref within 1e-5. Test `scatter_gnn_ops_f32_no_crash_returns_f32`.
+★RECIPE for REDUCTION ops (output shape ≠ input) with the F64-only-read crash: lossy_f64 read + narrow
+the value output to the input dtype (unlike nms which returns Vec<usize> and needs no narrow). These
+scatter aggregators are also SERIAL (per-edge scatter) — a perf follow-up, but scatter is conflict-prone
+(dim=0 scatter parallelization REJECTED b30aadd6), so likely near the achievable ceiling.
+
+VISION/GRAPH/SEQUENCE f32-crash vein (running): nms family (5, prev commit) + scatter_sum/mean/max (3,
+this commit) DONE. Remaining: roi_align/roi_pool/ps_roi_pool (boxes+features, output narrow),
+patch_embed/window_partition/window_reverse (ViT), farthest_point_sampling/ball_query/group_points
+(point cloud), degree/add_self_loops/edge_index_to_adj (graph int-index), pack/pad_packed_sequence, RNN
+cells. All same lossy_f64(±output-narrow) drop-in.
+
 ## 2026-07-02 - ★FIX (f32 CRASH ×5): nms family (nms/batched_nms/soft_nms/matrix_nms/remove_small_boxes) on f32 boxes
 
 Agent `GammaFork`. A python scan for `pub fn` reading a user tensor via the F64-only `tensor_values`
