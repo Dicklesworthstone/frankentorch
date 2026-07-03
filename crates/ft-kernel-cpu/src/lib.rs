@@ -11098,18 +11098,16 @@ pub fn linear_backward_f64(
     // dx = dy @ weight : [batch,out] @ [out,in] -> [batch,in].
     let mut dx = vec![0.0f64; batch * in_features];
     gemm::dgemm(batch, out_features, in_features, dy, weight, &mut dx);
-    // dweight = dy^T @ x : materialise dy^T [out,batch] (grad-sized, contiguous
-    // write — far smaller/cheaper than the 8MB strided weight transpose this
-    // whole path exists to avoid), then [out,batch] @ [batch,in] -> [out,in].
-    let mut dyt = vec![0.0f64; out_features * batch];
-    for b in 0..batch {
-        let row = &dy[b * out_features..(b + 1) * out_features];
-        for (o, &v) in row.iter().enumerate() {
-            dyt[o * batch + b] = v;
-        }
-    }
+    // dweight = dy^T @ x. `dgemm_tb` reads dy [batch,out] AS dy^T via strides
+    // (rsa=1, csa=out) — it needs no [out,batch] transpose materialisation, and
+    // its K traversal matches the materialise-transpose-then-`dgemm` path for
+    // every output element, so dweight is BIT-IDENTICAL to the old code. The old
+    // inline transpose was a cache-thrashing strided scatter (`dyt[o*batch+b]`)
+    // that DOMINATED this backward — measured 327ms at [8192,4096], larger than
+    // either GEMM; eliminating it (both the alloc and the copy) is the whole win.
+    // kgs4-linbwd-tb.
     let mut dweight = vec![0.0f64; out_features * in_features];
-    gemm::dgemm(out_features, batch, in_features, &dyt, x, &mut dweight);
+    gemm::dgemm_tb(out_features, batch, in_features, dy, x, &mut dweight);
     // dbias = sum over the batch rows of dy.
     let dbias = if need_bias {
         let mut db = vec![0.0f64; out_features];
@@ -34276,6 +34274,47 @@ mod tests {
         }
         assert_eq!(got_n, want.len() / 2, "num_nonzero must match serial");
         assert_eq!(got, want, "two-pass nonzero must be bit-exact vs serial (row-major order + NaN)");
+    }
+
+    #[test]
+    fn linear_backward_dgemm_tb_dweight_matches_materialized_transpose_bit_exact() {
+        // linear_backward_f64 now computes dweight = dy^T @ x via dgemm_tb (reads
+        // dy as dy^T through strides), replacing a materialize-transpose + dgemm.
+        // Lock dweight byte-for-byte against the OLD path (explicit dy^T + dgemm)
+        // to prove the transpose-elision is bit-exact for a non-square shape.
+        let (batch, in_f, out_f) = (96usize, 40usize, 72usize);
+        let dy: Vec<f64> = (0..batch * out_f).map(|i| ((i % 101) as f64) * 0.01 - 0.5).collect();
+        let x: Vec<f64> = (0..batch * in_f).map(|i| ((i % 89) as f64) * 0.02 - 0.7).collect();
+        let weight: Vec<f64> = (0..out_f * in_f).map(|i| ((i % 53) as f64) * 0.03 - 0.4).collect();
+
+        let (_dx, dweight, dbias) =
+            super::linear_backward_f64(&dy, &x, &weight, batch, in_f, out_f, true);
+
+        // Old reference: materialise dy^T [out,batch] then dgemm [out,batch]@[batch,in].
+        let mut dyt = vec![0.0f64; out_f * batch];
+        for b in 0..batch {
+            for o in 0..out_f {
+                dyt[o * batch + b] = dy[b * out_f + o];
+            }
+        }
+        let mut ref_dweight = vec![0.0f64; out_f * in_f];
+        super::gemm::dgemm(out_f, batch, in_f, &dyt, &x, &mut ref_dweight);
+        assert_eq!(
+            dweight.len(),
+            ref_dweight.len(),
+            "dweight shape must match old path"
+        );
+        for (g, w) in dweight.iter().zip(ref_dweight.iter()) {
+            assert_eq!(g.to_bits(), w.to_bits(), "dgemm_tb dweight must be bit-exact vs transpose+dgemm");
+        }
+        // dbias = Σ over batch rows of dy (unchanged).
+        let mut ref_db = vec![0.0f64; out_f];
+        for b in 0..batch {
+            for o in 0..out_f {
+                ref_db[o] += dy[b * out_f + o];
+            }
+        }
+        assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
     }
 
     #[test]
