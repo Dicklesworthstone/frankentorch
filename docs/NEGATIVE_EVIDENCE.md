@@ -8,7 +8,10 @@ identical to per-batch restricted to channel c → bit-identical). GATED at batc
 cache locality and REGRESSES 0.6-0.8x at batch>=16, so per-batch stays for large batch (zero regression).
 A/B (f32, 64t, min-7, bit-exact): batch=1 11.6->2.22ms **5.22x**, batch=4 1.47x. Helps single-image conv
 grad (Grad-CAM/saliency/adversarial). Bench scratchpad/col2im. Lock test
-conv2d_col2im_small_batch_per_plane_matches_per_batch_bit_exact. Shipped 2eb62af0.
+conv2d_col2im_small_batch_per_plane_matches_per_batch_bit_exact. Shipped 2eb62af0. ★FOLLOW-UP d52d69dd:
+same gated per-plane fix applied to conv3d_col2im_f32/f64 (batch=1 3D-conv grad was also serial) —
+completes the col2im family (conv2d+conv3d × f32+f64); lock test
+conv3d_col2im_small_batch_per_plane_matches_per_batch_bit_exact, 572 green.
 
 ★★ft-kernel-cpu SERIAL-BESIDE-PARALLEL SURFACE HARVESTED (this run = 8 wins: cross, addmv GEMV,
 per-channel int8 quant, nonzero two-pass, linear_backward dgemm_tb, bias-add/addmm-epilogue, conv
