@@ -11064,10 +11064,21 @@ pub fn linear_tensor_f64(
     let mut y = vec![0.0f64; batch * out_features];
     gemm::dgemm_bt(batch, in_features, out_features, x, weight, &mut y);
     if let Some(b) = bias {
-        for row in y.chunks_exact_mut(out_features) {
+        // Row-parallel bias add: each output row is independent and its adds are a
+        // pure per-element `+= b[j]` (order-invariant) -> bit-identical to serial.
+        // This is a bandwidth-bound SERIAL TAIL after the parallel GEMM (measured
+        // ~2.0-2.6x parallel at [batch,out] >= 34M); parallelize large outputs,
+        // keep small ones serial (rayon fan-out > gain). kgs4-linbias.
+        use rayon::prelude::*;
+        let add_row = |row: &mut [f64]| {
             for (yj, bj) in row.iter_mut().zip(b.iter()) {
                 *yj += *bj;
             }
+        };
+        if y.len() >= 1 << 16 {
+            y.par_chunks_exact_mut(out_features).for_each(add_row);
+        } else {
+            y.chunks_exact_mut(out_features).for_each(add_row);
         }
     }
     y
@@ -11137,10 +11148,19 @@ pub fn linear_tensor_f32(
     let mut y = vec![0.0f32; batch * out_features];
     gemm::sgemm_bt(batch, in_features, out_features, x, weight, &mut y);
     if let Some(b) = bias {
-        for row in y.chunks_exact_mut(out_features) {
+        // Row-parallel bias add (f32 mirror of linear_tensor_f64): independent rows,
+        // pure per-element add -> bit-identical to serial; parallelize the
+        // bandwidth-bound serial tail for large outputs. kgs4-linbias.
+        use rayon::prelude::*;
+        let add_row = |row: &mut [f32]| {
             for (yj, bj) in row.iter_mut().zip(b.iter()) {
                 *yj += *bj;
             }
+        };
+        if y.len() >= 1 << 16 {
+            y.par_chunks_exact_mut(out_features).for_each(add_row);
+        } else {
+            y.chunks_exact_mut(out_features).for_each(add_row);
         }
     }
     y
@@ -11377,12 +11397,24 @@ pub fn addmm_tensor_contiguous_f64(
         &mut gemm_out,
     );
 
-    // Apply: out = beta * input + alpha * (mat1 @ mat2)
-    let out: Vec<f64> = gemm_out
-        .iter()
-        .enumerate()
-        .map(|(i, &g)| beta * input_at(i) + alpha * g)
-        .collect();
+    // Apply: out = beta * input + alpha * (mat1 @ mat2). Each element is an
+    // independent `beta*input_at(i) + alpha*gemm_out[i]` -> parallel (indexed
+    // collect preserves order) is bit-identical to the serial map. This is a
+    // bandwidth-bound serial tail after the parallel GEMM; parallelize large
+    // outputs (e.g. an LM-head addmm [batch,vocab]). kgs4-linbias.
+    let out: Vec<f64> = if out_numel >= 1 << 16 {
+        use rayon::prelude::*;
+        (0..gemm_out.len())
+            .into_par_iter()
+            .map(|i| beta * input_at(i) + alpha * gemm_out[i])
+            .collect()
+    } else {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| beta * input_at(i) + alpha * g)
+            .collect()
+    };
 
     Ok(out)
 }
@@ -32511,12 +32543,23 @@ pub fn addmm_tensor_contiguous_f32(
         &mut gemm_out,
     );
 
-    // Apply: out = beta * input + alpha * (mat1 @ mat2)
-    let out: Vec<f32> = gemm_out
-        .iter()
-        .enumerate()
-        .map(|(i, &g)| beta * input_at(i) + alpha * g)
-        .collect();
+    // Apply: out = beta * input + alpha * (mat1 @ mat2). f32 mirror of the f64
+    // addmm epilogue: independent per-element combine -> parallel == serial
+    // bit-identical; parallelize the bandwidth-bound serial tail for large outputs.
+    // kgs4-linbias.
+    let out: Vec<f32> = if out_numel >= 1 << 16 {
+        use rayon::prelude::*;
+        (0..gemm_out.len())
+            .into_par_iter()
+            .map(|i| beta * input_at(i) + alpha * gemm_out[i])
+            .collect()
+    } else {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| beta * input_at(i) + alpha * g)
+            .collect()
+    };
 
     Ok(out)
 }
@@ -34315,6 +34358,43 @@ mod tests {
             }
         }
         assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
+    }
+
+    #[test]
+    fn linear_bias_add_parallel_path_matches_serial_bit_exact() {
+        // batch*out = 256*256 = 65536 == the parallel-bias gate, so the
+        // par_chunks_exact_mut path fires. Lock it vs the same GEMM + a serial
+        // bias add (f64 and f32).
+        let (batch, inf, outf) = (256usize, 40usize, 256usize);
+        let x: Vec<f64> = (0..batch * inf).map(|i| ((i % 89) as f64) * 0.02 - 0.7).collect();
+        let w: Vec<f64> = (0..outf * inf).map(|i| ((i % 53) as f64) * 0.03 - 0.4).collect();
+        let b: Vec<f64> = (0..outf).map(|i| (i as f64) * 1e-3 - 0.5).collect();
+
+        let with_bias = super::linear_tensor_f64(&x, &w, Some(&b), batch, inf, outf);
+        let mut want = super::linear_tensor_f64(&x, &w, None, batch, inf, outf);
+        for row in want.chunks_exact_mut(outf) {
+            for (yj, bj) in row.iter_mut().zip(b.iter()) {
+                *yj += *bj;
+            }
+        }
+        assert_eq!(with_bias.len(), want.len());
+        for (g, wv) in with_bias.iter().zip(want.iter()) {
+            assert_eq!(g.to_bits(), wv.to_bits(), "parallel bias add f64 must be bit-exact");
+        }
+
+        let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let wf: Vec<f32> = w.iter().map(|&v| v as f32).collect();
+        let bf: Vec<f32> = b.iter().map(|&v| v as f32).collect();
+        let with_bias_f = super::linear_tensor_f32(&xf, &wf, Some(&bf), batch, inf, outf);
+        let mut want_f = super::linear_tensor_f32(&xf, &wf, None, batch, inf, outf);
+        for row in want_f.chunks_exact_mut(outf) {
+            for (yj, bj) in row.iter_mut().zip(bf.iter()) {
+                *yj += *bj;
+            }
+        }
+        for (g, wv) in with_bias_f.iter().zip(want_f.iter()) {
+            assert_eq!(g.to_bits(), wv.to_bits(), "parallel bias add f32 must be bit-exact");
+        }
     }
 
     #[test]
