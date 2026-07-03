@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WORKSPACE HEALTH SWEEP COMPLETE (all crates green except 1) + precise gammaln-golden hand-off
+
+Agent `GammaFork`. Finished the cross-crate sweep — remaining infra crates all GREEN: ft-runtime 109/0,
+ft-serialize 11/0, ft-data 110/0, ft-dispatch 18/0, ft-device green (+ their integration tests). ★FULL
+WORKSPACE STATUS: ft-api 2475/1, ft-conformance 39/0, ft-core 194/0, ft-nn 777/0, ft-optim 477/0,
+ft-autograd 564/0, ft-kernel-cpu green, ft-runtime/serialize/data/dispatch/device all green. The ONLY red
+in the entire workspace is the ft-api `gammaln_no_grad_fast_path_golden_summary_matches_fixture`.
+
+★PRECISE gammaln DIAGNOSIS (for the kgs4.31 owner — supersedes my earlier vague "evidence-kind drift"):
+the golden (fixture `ft_api_lgamma_no_grad_fast_path_pass27.txt`) expects the NO-GRAD path's last evidence
+entry = Policy/"mode initialized to Strict" (i.e. the fast path records NO dispatch entry). Current =
+Dispatch/"gammaln in=0 out=1" because `tensor_gammaln` ends with an UNCONDITIONAL
+`self.runtime.ledger_mut().record(EvidenceKind::Dispatch, "gammaln in=...")` at L72257 that runs for BOTH
+grad and no-grad paths. gammaln VALUES/digests are bit-identical (fast==tracked). ★AMBIGUOUS BY DESIGN
+(why I do NOT unilaterally fix it, unlike the 3 clear sweep fixes): two valid resolutions — (A) the
+unconditional dispatch record is intended (both paths log dispatch, consistent with the tracked path) →
+golden is STALE, refresh the fixture's fast_ledger_kind→Dispatch + summary; (B) a lightweight "no-grad
+fast path" should return BEFORE that record (original design, per the golden + test name) → current is a
+REGRESSION, gate the record on grad / early-return. Picking A vs B is a design call for the evidence-
+ledger/kgs4.31 owner. ★NET: cross-crate PIVOT delivered 3 real fixes (RNG goldens + ft-core build + ft-nn
+test) and a fully-swept, green-except-1 workspace. Perf frontier walled; cross-crate health now exhausted.
+
 ## 2026-07-03 - ★FIXED (cross-crate sweep): ft-nn embedding_bag test red 2 weeks — validation-added-after-test regression
 
 Agent `GammaFork`. Continued the workspace test sweep (ft-nn/ft-optim/ft-autograd/ft-kernel-cpu). Found
