@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ⛔REJECTED-lever (~0-gain): ctc_loss alpha/beta Vec<Vec>->flat-Vec flatten (transcendental-walled)
+
+Agent `GammaFork`. Tested the follow-up I queued when shipping the ctc batch-parallel win (a34d085e):
+flatten the alpha/beta DP buffers from `Vec<Vec<f64>>` (per-row heap alloc + pointer-chase) to a single
+flat row-major `Vec<f64>` (`alpha[t*state_len+s]`), hoping to remove ~7700 small allocs/pass. Implemented
+fwd+bwd, bit-exact (all 3 ctc tests incl. the parallel-vs-per-sample bit-exact test stay green).
+MEASURED (same-binary RAYON A/B, [T=120,N=32,C=60,L=24], load ~20): serial 17.99->17.25 ms (~4%, within
+noise), parallel 5.79->5.53-5.97 ms (INDISTINGUISHABLE). ⇒ ~0-GAIN. The hypothesis (allocs are a big
+fraction of the parallel time) was WRONG: the ~1.5M `log_sum_exp` calls (each 1 exp + 1 ln, in the alpha
+recursion + beta recursion, over in_len*state_len per b) genuinely DOMINATE; the Vec<Vec> alloc overhead
+is negligible against them. REVERTED (kept the proven batch-parallel commit). ★CONFIRMS the ctc residual
+(7.7x SLOWER vs torch@32t after batch-parallel) is the TRANSCENDENTAL-SIMD wall — torch vectorizes the
+log_sum_exp across states with SIMD exp/ln; FT's scalar libm exp/ln in a sequential state recursion can't
+be SIMD'd (each state depends on the prior). Same wall class as SIMD-transcendental / grid_sample-gather.
+★LESSON: before flattening buffers for perf, confirm ALLOCS (not the compute) are the bottleneck — a
+transcendental-heavy DP is compute-walled, not alloc-walled. ctc lead now CLOSED: batch-parallel shipped
+(3.1x), flatten rejected (~0), residual = transcendental wall (peer SIMD / deep, not ft-api scalar).
+
 ## 2026-07-03 - WIN (gap-close, bit-exact): ctc_loss batch-parallel — 3.1x internal, 24x->7.7x SLOWER vs torch
 
 Agent `GammaFork`. A FRESH lever (not apply_function/clone/specfn): `tensor_ctc_loss` ran its
