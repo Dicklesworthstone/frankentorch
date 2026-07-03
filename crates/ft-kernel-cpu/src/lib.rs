@@ -4535,6 +4535,15 @@ pub fn sdpa_backward_f32_unit_dout(
     (dq, dk, dv)
 }
 
+/// Gate for the per-row-parallel NORM forwards (layer_norm / rms_norm / ...):
+/// mean+var+normalize per row is BANDWIDTH-bound (the sqrt is 1 per `norm_size`
+/// elems), so parallelizing over rows only pays above the reduction crossover.
+/// Below it — the common SMALL-BATCH TRAINING shapes ([8..32, D]) — rayon fork
+/// overhead REGRESSES it 2-11x (measured: [8,768] 0.09x, [8,4096] 0.41x, [32,4096]
+/// 0.85x; wins from ~[128,4096]=512K up). Decode ([1,D]) is one chunk = already
+/// serial. frankentorch-kgs4-normgate.
+const NORM_FWD_PARALLEL_MIN: usize = 1 << 19; // 524288
+
 /// Fused LayerNorm forward (f64): per row of `[batch, norm_size]`, computes
 /// `y = (x - mean) / sqrt(var + eps) * weight + bias` in two streaming passes,
 /// NEVER materialising the ~14 full-size intermediates (broadcast mean/var, the
@@ -4552,32 +4561,41 @@ pub fn layer_norm_forward_f64(
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * norm_size];
     let inv_n = 1.0 / norm_size as f64;
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f64;
-            for &v in xrow {
-                sum += v;
+    let row_fn = |r: usize, orow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f64;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f64;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = (xrow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f64;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = (xrow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(b) = bias {
-                    y += b[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (see NORM_FWD_PARALLEL_MIN);
+    // small-batch training regresses parallel 2-11x. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -4596,32 +4614,41 @@ pub fn layer_norm_forward_f32(
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * norm_size];
     let inv_n = 1.0 / norm_size as f32;
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f32;
-            for &v in xrow {
-                sum += v;
+    let row_fn = |r: usize, orow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f32;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f32;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = (xrow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f32;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = (xrow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(b) = bias {
-                    y += b[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN),
+    // f32 mirror of layer_norm_forward_f64. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -5048,23 +5075,31 @@ pub fn rms_norm_forward_f64(
 ) -> Vec<f64> {
     let inv_n = 1.0 / norm_size as f64;
     let mut out = vec![0.0f64; batch * norm_size];
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f64;
-            for &v in xrow {
-                ss += v * v;
+    let row_fn = |r: usize, orow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f64;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = xrow[j] * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = xrow[j] * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -5081,23 +5116,31 @@ pub fn rms_norm_forward_f32(
 ) -> Vec<f32> {
     let inv_n = 1.0 / norm_size as f32;
     let mut out = vec![0.0f32; batch * norm_size];
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f32;
-            for &v in xrow {
-                ss += v * v;
+    let row_fn = |r: usize, orow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f32;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = xrow[j] * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = xrow[j] * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
