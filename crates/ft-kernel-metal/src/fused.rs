@@ -147,6 +147,42 @@ kernel void attn_context(
     for (uint jj=0;jj<seq;jj++) acc+=S[so+jj]*V[jj*d+h*hd+e];
     O[i*d+h*hd+e]=acc;
 }
+
+// FlashAttention (whisper head_dim = 64). One threadgroup per (query-block, head);
+// FBQ threads each own one query. Streams K/V in FBK-blocks through threadgroup
+// memory with an online (running max/sum) softmax and register accumulation — the
+// [n_heads*seq, seq] scores matrix is never materialized. dims=(seq,d,n_heads,64).
+#define FBQ 32
+#define FBK 32
+#define FHD 64
+kernel void attn_flash(
+    device const float* Q [[buffer(0)]], device const float* K [[buffer(1)]],
+    device const float* V [[buffer(2)]], device float* O [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]], constant float& scale [[buffer(5)]],
+    uint2 tg [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]])
+{
+    const uint seq=dims.x, d=dims.y; const uint h=tg.y; const uint qi=tg.x*FBQ+lid;
+    float q[FHD]; for (uint e=0;e<FHD;e++) q[e]=(qi<seq)?Q[qi*d+h*FHD+e]:0.0f;
+    float m=-INFINITY, l=0.0f; float acc[FHD]; for (uint e=0;e<FHD;e++) acc[e]=0.0f;
+    threadgroup float Ks[FBK][FHD]; threadgroup float Vs[FBK][FHD];
+    for (uint k0=0;k0<seq;k0+=FBK) {
+        for (uint idx=lid; idx<FBK*FHD; idx+=FBQ) {
+            uint kk=idx/FHD, e=idx%FHD; uint kj=k0+kk;
+            Ks[kk][e]=(kj<seq)?K[kj*d+h*FHD+e]:0.0f;
+            Vs[kk][e]=(kj<seq)?V[kj*d+h*FHD+e]:0.0f;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        uint kmax=min((uint)FBK, seq-k0);
+        for (uint kk=0;kk<kmax;kk++) {
+            float s=0.0f; for (uint e=0;e<FHD;e++) s+=q[e]*Ks[kk][e]; s*=scale;
+            float mn=max(m,s); float p=exp(s-mn); float corr=exp(m-mn);
+            l=l*corr+p; for (uint e=0;e<FHD;e++) acc[e]=acc[e]*corr+p*Vs[kk][e];
+            m=mn;
+        }
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    if (qi<seq){ float inv=(l>0.0f)?1.0f/l:0.0f; for (uint e=0;e<FHD;e++) O[qi*d+h*FHD+e]=acc[e]*inv; }
+}
 "#;
 
 struct Pipes {
@@ -159,6 +195,7 @@ struct Pipes {
     softmax: ComputePipelineState,
     attn_scores: ComputePipelineState,
     attn_context: ComputePipelineState,
+    attn_flash: ComputePipelineState,
 }
 unsafe impl Send for Pipes {}
 unsafe impl Sync for Pipes {}
@@ -188,6 +225,7 @@ fn pipes() -> Option<&'static Pipes> {
                 softmax: p("softmax")?,
                 attn_scores: p("attn_scores")?,
                 attn_context: p("attn_context")?,
+                attn_flash: p("attn_flash")?,
                 queue: device.new_command_queue(),
                 device,
             })
@@ -364,6 +402,23 @@ impl<'a> Batch<'a> {
             .p
             .device
             .new_buffer_with_data((&scale as *const f32) as *const _, 4, SHARED);
+        // FlashAttention fast path (whisper head_dim = 64): one fused dispatch that
+        // streams K/V with an online softmax — the scores matrix is never materialized.
+        if hd == 64 {
+            let out = GpuTensor::new_uninit(&self.p.device, seq, d);
+            let enc = self.cmd.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&self.p.attn_flash);
+            enc.set_buffer(0, Some(&q.buf), 0);
+            enc.set_buffer(1, Some(&k.buf), 0);
+            enc.set_buffer(2, Some(&v.buf), 0);
+            enc.set_buffer(3, Some(&out.buf), 0);
+            enc.set_buffer(4, Some(&dims), 0);
+            enc.set_buffer(5, Some(&scaleb), 0);
+            let tg = MTLSize::new(seq.div_ceil(32) as u64, n_heads as u64, 1);
+            enc.dispatch_thread_groups(tg, MTLSize::new(32, 1, 1));
+            enc.end_encoding();
+            return out;
+        }
         let scores = GpuTensor::new_uninit(&self.p.device, n_heads * seq, seq);
         {
             let enc = self.cmd.new_compute_command_encoder();
@@ -649,6 +704,24 @@ mod tests {
         let o = b.mha(&gq, &gk, &gv, nh);
         b.finish();
         approx(&o.download(), &cpu_mha(&q, &k, &v, seq, d, nh), 1e-3, "mha");
+    }
+
+    #[test]
+    fn mha_flash_matches_cpu_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let (seq, d, nh) = (40usize, 128usize, 2usize); // head_dim = 64 -> flash path
+        let q: Vec<f32> = (0..seq * d).map(|i| ((i % 7) as f32) * 0.2 - 0.6).collect();
+        let k: Vec<f32> = (0..seq * d).map(|i| ((i % 5) as f32) * 0.15 - 0.3).collect();
+        let v: Vec<f32> = (0..seq * d).map(|i| ((i % 9) as f32) * 0.1 - 0.4).collect();
+        let gq = GpuTensor::upload(&q, seq, d).unwrap();
+        let gk = GpuTensor::upload(&k, seq, d).unwrap();
+        let gv = GpuTensor::upload(&v, seq, d).unwrap();
+        let b = Batch::new().unwrap();
+        let o = b.mha(&gq, &gk, &gv, nh);
+        b.finish();
+        approx(&o.download(), &cpu_mha(&q, &k, &v, seq, d, nh), 1e-3, "mha_flash");
     }
 
     fn cpu_ln(x: &[f32], g: &[f32], be: &[f32], seq: usize, d: usize) -> Vec<f32> {
