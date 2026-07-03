@@ -1,5 +1,35 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★★ WIN: cdist f32 general-p fused — 129x SLOWER -> near-parity/3.4x FASTER vs torch (asymmetric-dtype)
+
+Agent `GammaFork`. NEW op class (retrieval/clustering distances). `tensor_cdist` p≠2 had a fused
+no-grad kernel path (`cdist_forward_f64`, parallel per-row) gated on F64 ONLY — f32 inputs fell
+through to the AUTOGRAD COMPOSE path (unsqueeze/expand/sub/abs/pow/sum_dim/pow) which MATERIALISES the
+broadcasted [B,P,R,M] difference. For [2000,200]×[2000,200] that intermediate is P·R·M = 800M elems
+(~3.2GB), so f32 cdist was catastrophically slow. (f64 was already fine: p=1 ~parity, p=3 8.6x FASTER.)
+
+LEVER (asymmetric-dtype mirror): the INPUTS ([B,P,M]+[B,R,M]) are tiny, so for f32 no-grad general-p
+upcast them to f64 (`tensor_values_lossy_f64`), run the SAME parallel `cdist_forward_f64` kernel (no
+O(P·R·M) intermediate), then narrow the distances to f32 (par_iter). Output stays f32 (torch parity).
+cdist is a TOLERANCE op (`approx` golden vs torch; powf is libm-vs-SLEEF) and f64 distances narrowed
+to f32 are AT LEAST as accurate as torch's own f32 path, so it's within tol.
+
+★MEASURE ([2000,200]²=4M distances × D=200, min-of-5, torch 2.12.1 SAME window, load ~17):
+| op            | FT before | FT after | torch  | ratio                       |
+|---------------|-----------|----------|--------|-----------------------------|
+| cdist p=1 f32 | 2102 ms   | 35 ms    | 16 ms  | 129x SLOWER -> 2.1x SLOWER  |
+| cdist p=3 f32 | 2099 ms   | 60 ms    | 204 ms | 9.6x SLOWER -> **3.4x FASTER** |
+| cdist p=∞ f32 | (compose) | (fused)  | 29 ms  | now fused (Chebyshev)       |
+(60-71x internal improvement.) p=1 stays 2.1x slower — torch's f32 SIMD Manhattan (16ms, no powf) is
+the floor and FT computes in f64; a true win there needs an f32 kernel in ft-kernel-cpu (peer-reserved,
+NOT ft-api lane). p=3 (powf-bound) flips to 3.4x FASTER; no regression anywhere (p=1 improved 60x).
+
+Lock test `cdist_f32_fused_general_p_matches_f64_kernel_narrowed` (p=1/3/∞: each f32 output ==
+f64-kernel distance cast to f32 + dtype stays f32). 13/13 cdist tests green. Bench
+`crates/ft-api/examples/cdist_h2h.rs`. ★RECIPE (asymmetric-dtype for COMPOSE-materialising ops): when
+f64 has a fused kernel but f32 falls to a broadcast-materialising compose, upcast the SMALL inputs +
+reuse the f64 kernel + narrow — avoids the O(product) intermediate. AGENT GammaFork.
+
 ## 2026-07-02 - ⛔REJECTED-lever + harvested sweep: nanmedian radix-select (filter-bound); order-stat/histogram surface confirmed done
 
 Agent `GammaFork`. Probed the order-statistic follow-ups after the kthvalue radix-select win.
