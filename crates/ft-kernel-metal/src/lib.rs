@@ -43,6 +43,11 @@ impl fmt::Display for Error {
 
 impl std::error::Error for Error {}
 
+/// GPU-resident fused encoder ops (macOS only): keeps activations on the GPU and
+/// batches a run of ops into one command buffer / one sync. See [`fused::Batch`].
+#[cfg(target_os = "macos")]
+pub mod fused;
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Error;

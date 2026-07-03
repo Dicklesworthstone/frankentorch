@@ -1,0 +1,391 @@
+//! GPU-resident fused compute for transformer encoders (macOS / Apple Silicon).
+//!
+//! The v0.3.0 GEMM-only offload leaves the CPU and GPU ping-ponging: the CPU runs
+//! layernorm/attention/gelu, then blocks on the GPU for each matmul, then reads the
+//! result back. This module removes that by keeping activations **resident on the
+//! GPU** ([`GpuTensor`]) and encoding a whole run of ops into **one command buffer**
+//! ([`Batch`]) with a single CPU↔GPU sync at [`Batch::finish`].
+//!
+//! Ops are encoded as separate compute command encoders; Metal orders encoders
+//! within a command buffer and hazard-tracks the (default-tracked) buffers, so each
+//! op's writes are visible to the next — the activations flow GPU→GPU with no
+//! readback until `finish`.
+//!
+//! Kernels match franken_whisper's CPU encoder: layernorm `eps = 1e-5`, tanh-GELU,
+//! numerically-stable row softmax. All shapes are row-major 2-D `[rows, cols]`.
+
+use super::Error;
+use metal::{
+    Buffer, CommandBufferRef, CompileOptions, ComputePipelineDescriptor, ComputePipelineState,
+    Device, MTLResourceOptions, MTLSize,
+};
+use std::sync::OnceLock;
+
+const SHARED: MTLResourceOptions = MTLResourceOptions::StorageModeShared;
+
+const SRC: &str = r#"
+#include <metal_stdlib>
+using namespace metal;
+
+#define BM 64
+#define BN 64
+#define BK 16
+#define TM 4
+#define TN 4
+
+// C[M,N] = A[M,K] * B[K,N] (+ bias[N] if HAS_BIAS). Tiled, shared-mem + register block.
+kernel void matmul_bias(
+    device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
+    device const float* bias [[buffer(2)]], device float* C [[buffer(3)]],
+    constant uint4& dims [[buffer(4)]],   // M,K,N,has_bias
+    uint2 gid [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]])
+{
+    const uint M=dims.x,K=dims.y,N=dims.z; const uint hb=dims.w;
+    threadgroup float As[BK][BM]; threadgroup float Bs[BK][BN];
+    const uint tRow=lid/(BN/TN), tCol=lid%(BN/TN);
+    const uint rowBase=gid.y*BM, colBase=gid.x*BN;
+    float acc[TM][TN]; for (uint i=0;i<TM;i++) for (uint j=0;j<TN;j++) acc[i][j]=0.0f;
+    for (uint k0=0;k0<K;k0+=BK) {
+        for (uint i=lid;i<BM*BK;i+=256){uint m=i/BK,k=i%BK;uint gr=rowBase+m,gk=k0+k;
+            As[k][m]=(gr<M&&gk<K)?A[gr*K+gk]:0.0f;}
+        for (uint i=lid;i<BK*BN;i+=256){uint k=i/BN,n=i%BN;uint gk=k0+k,gc=colBase+n;
+            Bs[k][n]=(gk<K&&gc<N)?B[gk*N+gc]:0.0f;}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+        for (uint k=0;k<BK;k++){float aReg[TM],bReg[TN];
+            for (uint i=0;i<TM;i++) aReg[i]=As[k][tRow*TM+i];
+            for (uint j=0;j<TN;j++) bReg[j]=Bs[k][tCol*TN+j];
+            for (uint i=0;i<TM;i++) for (uint j=0;j<TN;j++) acc[i][j]+=aReg[i]*bReg[j];}
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+    for (uint i=0;i<TM;i++){uint gr=rowBase+tRow*TM+i; if(gr>=M) continue;
+        for (uint j=0;j<TN;j++){uint gc=colBase+tCol*TN+j; if(gc<N){
+            float v=acc[i][j]; if(hb) v+=bias[gc]; C[gr*N+gc]=v;}}}
+}
+
+// Row layernorm over `cols`, affine: y = (x-mean)/sqrt(var+eps)*gamma + beta. One threadgroup per row.
+kernel void layernorm(
+    device const float* X [[buffer(0)]], device const float* gamma [[buffer(1)]],
+    device const float* beta [[buffer(2)]], device float* Y [[buffer(3)]],
+    constant uint2& dims [[buffer(4)]], constant float& eps [[buffer(5)]],
+    uint row [[threadgroup_position_in_grid]], uint lid [[thread_index_in_threadgroup]],
+    uint tgsz [[threads_per_threadgroup]])
+{
+    const uint cols=dims.y; device const float* x=X+row*cols; device float* y=Y+row*cols;
+    threadgroup float red[256];
+    float s=0.0f; for (uint c=lid;c<cols;c+=tgsz) s+=x[c];
+    red[lid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]+=red[lid+o]; threadgroup_barrier(mem_flags::mem_threadgroup);}
+    float mean=red[0]/float(cols); threadgroup_barrier(mem_flags::mem_threadgroup);
+    float v=0.0f; for (uint c=lid;c<cols;c+=tgsz){float d=x[c]-mean; v+=d*d;}
+    red[lid]=v; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]+=red[lid+o]; threadgroup_barrier(mem_flags::mem_threadgroup);}
+    float inv=rsqrt(red[0]/float(cols)+eps);
+    for (uint c=lid;c<cols;c+=tgsz) y[c]=(x[c]-mean)*inv*gamma[c]+beta[c];
+}
+
+// tanh-GELU, elementwise (matches whisper.cpp GGML_GELU tanh form).
+kernel void gelu(device const float* X [[buffer(0)]], device float* Y [[buffer(1)]],
+    constant uint& n [[buffer(2)]], uint i [[thread_position_in_grid]])
+{
+    if(i>=n) return; float x=X[i];
+    const float c=0.7978845608028654f; // sqrt(2/pi)
+    Y[i]=0.5f*x*(1.0f+tanh(c*(x+0.044715f*x*x*x)));
+}
+
+// Elementwise add (residual): Y = A + B.
+kernel void addv(device const float* A [[buffer(0)]], device const float* B [[buffer(1)]],
+    device float* Y [[buffer(2)]], constant uint& n [[buffer(3)]], uint i [[thread_position_in_grid]])
+{ if(i<n) Y[i]=A[i]+B[i]; }
+
+// Row softmax over `cols`, numerically stable. One threadgroup per row.
+kernel void softmax(device const float* X [[buffer(0)]], device float* Y [[buffer(1)]],
+    constant uint2& dims [[buffer(2)]], uint row [[threadgroup_position_in_grid]],
+    uint lid [[thread_index_in_threadgroup]], uint tgsz [[threads_per_threadgroup]])
+{
+    const uint cols=dims.y; device const float* x=X+row*cols; device float* y=Y+row*cols;
+    threadgroup float red[256];
+    float m=-INFINITY; for (uint c=lid;c<cols;c+=tgsz) m=max(m,x[c]);
+    red[lid]=m; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]=max(red[lid],red[lid+o]); threadgroup_barrier(mem_flags::mem_threadgroup);}
+    float mx=red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
+    float s=0.0f; for (uint c=lid;c<cols;c+=tgsz){float e=exp(x[c]-mx); y[c]=e; s+=e;}
+    red[lid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);
+    for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]+=red[lid+o]; threadgroup_barrier(mem_flags::mem_threadgroup);}
+    float inv=1.0f/red[0]; for (uint c=lid;c<cols;c+=tgsz) y[c]*=inv;
+}
+"#;
+
+struct Pipes {
+    device: Device,
+    queue: metal::CommandQueue,
+    matmul_bias: ComputePipelineState,
+    layernorm: ComputePipelineState,
+    gelu: ComputePipelineState,
+    addv: ComputePipelineState,
+    softmax: ComputePipelineState,
+}
+unsafe impl Send for Pipes {}
+unsafe impl Sync for Pipes {}
+
+static PIPES: OnceLock<Option<Pipes>> = OnceLock::new();
+
+fn pipes() -> Option<&'static Pipes> {
+    PIPES
+        .get_or_init(|| {
+            let device = Device::system_default()?;
+            let lib = device
+                .new_library_with_source(SRC, &CompileOptions::new())
+                .ok()?;
+            let p = |n: &str| -> Option<ComputePipelineState> {
+                let f = lib.get_function(n, None).ok()?;
+                let d = ComputePipelineDescriptor::new();
+                d.set_compute_function(Some(&f));
+                device
+                    .new_compute_pipeline_state_with_function(d.compute_function()?)
+                    .ok()
+            };
+            Some(Pipes {
+                matmul_bias: p("matmul_bias")?,
+                layernorm: p("layernorm")?,
+                gelu: p("gelu")?,
+                addv: p("addv")?,
+                softmax: p("softmax")?,
+                queue: device.new_command_queue(),
+                device,
+            })
+        })
+        .as_ref()
+}
+
+/// A `[rows, cols]` row-major f32 tensor resident in GPU (unified) memory.
+pub struct GpuTensor {
+    buf: Buffer,
+    pub rows: usize,
+    pub cols: usize,
+}
+
+impl GpuTensor {
+    fn new_uninit(dev: &Device, rows: usize, cols: usize) -> GpuTensor {
+        GpuTensor {
+            buf: dev.new_buffer((rows * cols * 4).max(4) as u64, SHARED),
+            rows,
+            cols,
+        }
+    }
+
+    /// Upload a row-major `[rows, cols]` slice to a resident GPU buffer.
+    pub fn upload(data: &[f32], rows: usize, cols: usize) -> Result<GpuTensor, Error> {
+        let p = pipes().ok_or(Error::Unavailable)?;
+        if data.len() != rows * cols {
+            return Err(Error::Kernel(format!(
+                "upload shape: {} != {rows}x{cols}",
+                data.len()
+            )));
+        }
+        Ok(GpuTensor {
+            buf: p
+                .device
+                .new_buffer_with_data(data.as_ptr() as *const _, (data.len() * 4).max(4) as u64, SHARED),
+            rows,
+            cols,
+        })
+    }
+
+    /// Read this tensor back into a `Vec<f32>` (row-major).
+    pub fn download(&self) -> Vec<f32> {
+        let n = self.rows * self.cols;
+        let out = unsafe { std::slice::from_raw_parts(self.buf.contents() as *const f32, n) };
+        out.to_vec()
+    }
+}
+
+/// True iff the fused-op pipelines are available (Apple Silicon macOS).
+pub fn is_available() -> bool {
+    pipes().is_some()
+}
+
+/// A sequence of GPU ops encoded into one command buffer; committed once at
+/// [`finish`](Batch::finish). Each op appends a compute encoder whose output is a
+/// fresh resident [`GpuTensor`] that later ops read — no CPU readback between ops.
+pub struct Batch<'a> {
+    p: &'a Pipes,
+    cmd: &'a CommandBufferRef,
+}
+
+impl<'a> Batch<'a> {
+    /// Begin a batch. Ops encode until [`finish`](Batch::finish).
+    pub fn new() -> Result<Batch<'static>, Error> {
+        let p = pipes().ok_or(Error::Unavailable)?;
+        let cmd = p.queue.new_command_buffer();
+        Ok(Batch { p, cmd })
+    }
+
+    fn u32buf(&self, v: &[u32]) -> Buffer {
+        self.p
+            .device
+            .new_buffer_with_data(v.as_ptr() as *const _, (v.len() * 4) as u64, SHARED)
+    }
+
+    fn dispatch1d(&self, pso: &ComputePipelineState, bufs: &[(&Buffer, u64)], n: usize) {
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(pso);
+        for (i, (b, off)) in bufs.iter().enumerate() {
+            enc.set_buffer(i as u64, Some(b), *off);
+        }
+        let w = pso.thread_execution_width().max(1);
+        let tg = ((n as u64).div_ceil(w) * w).max(w);
+        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg.min(w * 8), 1, 1));
+        enc.end_encoding();
+    }
+
+    /// `out[rows_a, cols_b] = a[rows_a, cols_a] · w[cols_a, cols_b] (+ bias)`.
+    pub fn matmul_bias(&self, a: &GpuTensor, w: &GpuTensor, bias: Option<&GpuTensor>) -> GpuTensor {
+        let (m, k, n) = (a.rows, a.cols, w.cols);
+        let out = GpuTensor::new_uninit(&self.p.device, m, n);
+        let dims = self.u32buf(&[m as u32, k as u32, n as u32, bias.is_some() as u32]);
+        let zero = self.p.device.new_buffer(4, SHARED);
+        let bb = bias.map_or(&zero, |b| &b.buf);
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.p.matmul_bias);
+        enc.set_buffer(0, Some(&a.buf), 0);
+        enc.set_buffer(1, Some(&w.buf), 0);
+        enc.set_buffer(2, Some(bb), 0);
+        enc.set_buffer(3, Some(&out.buf), 0);
+        enc.set_buffer(4, Some(&dims), 0);
+        let tg = MTLSize::new(n.div_ceil(64) as u64, m.div_ceil(64) as u64, 1);
+        enc.dispatch_thread_groups(tg, MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        out
+    }
+
+    /// Row layernorm with affine `gamma`/`beta` (length `cols`), `eps`.
+    pub fn layernorm(&self, x: &GpuTensor, gamma: &GpuTensor, beta: &GpuTensor, eps: f32) -> GpuTensor {
+        let out = GpuTensor::new_uninit(&self.p.device, x.rows, x.cols);
+        let dims = self.u32buf(&[x.rows as u32, x.cols as u32]);
+        let epsb = self
+            .p
+            .device
+            .new_buffer_with_data((&eps as *const f32) as *const _, 4, SHARED);
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.p.layernorm);
+        enc.set_buffer(0, Some(&x.buf), 0);
+        enc.set_buffer(1, Some(&gamma.buf), 0);
+        enc.set_buffer(2, Some(&beta.buf), 0);
+        enc.set_buffer(3, Some(&out.buf), 0);
+        enc.set_buffer(4, Some(&dims), 0);
+        enc.set_buffer(5, Some(&epsb), 0);
+        enc.dispatch_thread_groups(MTLSize::new(x.rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        out
+    }
+
+    /// tanh-GELU, elementwise.
+    pub fn gelu(&self, x: &GpuTensor) -> GpuTensor {
+        let out = GpuTensor::new_uninit(&self.p.device, x.rows, x.cols);
+        let n = (x.rows * x.cols) as u32;
+        let nb = self.u32buf(&[n]);
+        self.dispatch1d(&self.p.gelu, &[(&x.buf, 0), (&out.buf, 0), (&nb, 0)], n as usize);
+        out
+    }
+
+    /// Elementwise residual add `a + b`.
+    pub fn add(&self, a: &GpuTensor, b: &GpuTensor) -> GpuTensor {
+        let out = GpuTensor::new_uninit(&self.p.device, a.rows, a.cols);
+        let n = (a.rows * a.cols) as u32;
+        let nb = self.u32buf(&[n]);
+        self.dispatch1d(
+            &self.p.addv,
+            &[(&a.buf, 0), (&b.buf, 0), (&out.buf, 0), (&nb, 0)],
+            n as usize,
+        );
+        out
+    }
+
+    /// Numerically-stable row softmax over `cols`.
+    pub fn softmax(&self, x: &GpuTensor) -> GpuTensor {
+        let out = GpuTensor::new_uninit(&self.p.device, x.rows, x.cols);
+        let dims = self.u32buf(&[x.rows as u32, x.cols as u32]);
+        let enc = self.cmd.new_compute_command_encoder();
+        enc.set_compute_pipeline_state(&self.p.softmax);
+        enc.set_buffer(0, Some(&x.buf), 0);
+        enc.set_buffer(1, Some(&out.buf), 0);
+        enc.set_buffer(2, Some(&dims), 0);
+        enc.dispatch_thread_groups(MTLSize::new(x.rows as u64, 1, 1), MTLSize::new(256, 1, 1));
+        enc.end_encoding();
+        out
+    }
+
+    /// Commit the command buffer and block until the GPU finishes — the single
+    /// CPU↔GPU sync for every op encoded since [`new`](Batch::new).
+    pub fn finish(self) {
+        self.cmd.commit();
+        self.cmd.wait_until_completed();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn approx(a: &[f32], b: &[f32], tol: f32, what: &str) {
+        assert_eq!(a.len(), b.len(), "{what} len");
+        for (i, (g, w)) in a.iter().zip(b.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= tol * (1.0 + w.abs()),
+                "{what} idx {i}: {g} vs {w}"
+            );
+        }
+    }
+
+    #[test]
+    fn fused_ops_match_cpu_or_unavailable() {
+        if !is_available() {
+            return;
+        }
+        let (m, k, n) = (40usize, 33usize, 48usize);
+        let a: Vec<f32> = (0..m * k).map(|i| ((i % 7) as f32) * 0.3 - 1.0).collect();
+        let w: Vec<f32> = (0..k * n).map(|i| ((i % 5) as f32) * 0.2 - 0.4).collect();
+        let bias: Vec<f32> = (0..n).map(|i| (i as f32) * 0.01).collect();
+        let ga = GpuTensor::upload(&a, m, k).unwrap();
+        let gw = GpuTensor::upload(&w, k, n).unwrap();
+        let gb = GpuTensor::upload(&bias, 1, n).unwrap();
+        let b = Batch::new().unwrap();
+        let mm = b.matmul_bias(&ga, &gw, Some(&gb));
+        let ln = b.layernorm(&mm, &GpuTensor::upload(&vec![1.0; n], 1, n).unwrap(),
+            &GpuTensor::upload(&vec![0.0; n], 1, n).unwrap(), 1e-5);
+        let ge = b.gelu(&mm);
+        let sm = b.softmax(&mm);
+        b.finish(); // commit + wait, THEN read results back
+        let (mm_o, ln_o, ge_o, sm_o) = (mm.download(), ln.download(), ge.download(), sm.download());
+
+        // CPU refs.
+        let mut cmm = vec![0.0f32; m * n];
+        for i in 0..m { for j in 0..n {
+            let mut acc = bias[j];
+            for e in 0..k { acc += a[i * k + e] * w[e * n + j]; }
+            cmm[i * n + j] = acc;
+        }}
+        approx(&mm_o, &cmm, 1e-3, "matmul_bias");
+        // layernorm(gamma=1,beta=0)
+        let mut cln = vec![0.0f32; m * n];
+        for i in 0..m {
+            let row = &cmm[i * n..(i + 1) * n];
+            let mean: f32 = row.iter().sum::<f32>() / n as f32;
+            let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32;
+            let inv = 1.0 / (var + 1e-5).sqrt();
+            for j in 0..n { cln[i * n + j] = (row[j] - mean) * inv; }
+        }
+        approx(&ln_o, &cln, 1e-2, "layernorm");
+        let c = 0.7978845608028654f32;
+        let cge: Vec<f32> = cmm.iter().map(|&x| 0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())).collect();
+        approx(&ge_o, &cge, 1e-3, "gelu");
+        let mut csm = vec![0.0f32; m * n];
+        for i in 0..m {
+            let row = &cmm[i * n..(i + 1) * n];
+            let mx = row.iter().cloned().fold(f32::MIN, f32::max);
+            let s: f32 = row.iter().map(|v| (v - mx).exp()).sum();
+            for j in 0..n { csm[i * n + j] = (row[j] - mx).exp() / s; }
+        }
+        approx(&sm_o, &csm, 1e-3, "softmax");
+    }
+}
