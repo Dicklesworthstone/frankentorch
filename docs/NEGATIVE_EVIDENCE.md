@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★★WIN: layer_norm + rms_norm forward had NO size gate → 2-11x SLOWER small-batch training; gated, bit-exact
+
+Agent `BlackThrush`. The refined bandwidth-vs-compute rule (from normalize) pointed at the HIGHEST-EV
+target: per-layer NORMS. `layer_norm_forward_f{64,32}` and `rms_norm_forward_f{64,32}` (ft-kernel-cpu)
+parallelize over rows (`par_chunks_mut(norm_size)`) with NO size gate. Per-row mean+var+normalize is
+BANDWIDTH-bound (sqrt is 1 per norm_size elems), so parallelizing over rows only pays above the reduction
+crossover — below it, the common SMALL-BATCH TRAINING shapes regress. These run EVERY transformer layer,
+EVERY training step = huge cumulative cost.
+
+★MEASURE (layer_norm pattern, par over batch rows, 64t, min-21, bit-exact): [8,768] **0.09x (11x SLOWER)**,
+[8,4096] 0.41x, [32,768] 0.37x, [32,4096] 0.85x; wins only from ~[128,4096]=512K (1.26x) up to 6.95x at
+[1024,4096]=4M. Decode [1,D] = one chunk = already serial (unaffected). Added NORM_FWD_PARALLEL_MIN=1<<19
+(524288 — REDUCTION-class crossover, higher than pure-copy's ~4M because the per-row reduce amortizes the
+fork earlier, lower than compute's 8192 because it's bandwidth) + serial chunks_mut fallback. Bit-identical
+(serial==parallel per row). 572 ft-kernel-cpu tests green (rch). Shipped ec0cb5af. ★A THIRD threshold tier
+emerges: pure copy/fill → ~4M (1<<22); reduce-then-scale (norm/normalize) → ~512K (1<<19); per-element
+transcendental → ~8192. All bandwidth/compute-crossover-driven. ★FOLLOW-UP (same ungated pattern, lower
+priority — CNN norms not per-transformer-layer): group_norm_forward_f{64,32}, add_layer_norm_forward_f32,
+layer_norm_forward_with_stats_f64, batch_norm/instance_norm — grep ft-kernel-cpu for `par_chunks_mut` in
+*_norm_forward with no `>= NORM_FWD_PARALLEL_MIN`.
+
 ## 2026-07-03 - ★WIN + SURFACE: no-gate COMPUTE ops — gelu_tanh gated (SHIPPED); ~30 more ft-api ops flagged (narrower EV)
 
 Agent `BlackThrush`. After harvesting the copy/fill no-gate vein (both crates), extended the finder to
