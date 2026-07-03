@@ -24,6 +24,15 @@ reduce is a cross-row sum, parallelism axis is channels not rows) → DIFFERENT 
 (their crossover + whether they even over-parallelize needs its own bench). NORM forward gating COMPLETE
 for the per-row/per-group family (layer_norm/rms_norm/add_layer_norm/with_stats/group_norm × f64,f32).
 
+★★BACKWARD gated too bd6a8662: the norm BACKWARD dx computation has the SAME ungated per-row
+par_chunks_mut pattern (recompute mean/var + c1/c2 reduce + scale per row = bandwidth-bound), and backward
+runs EVERY training step per layer — so it over-parallelized small-batch training backward the same 2-11x.
+Gated the general-path dx of layer_norm_backward_f{64,32} + rms_norm_backward_f{64,32} at
+NORM_FWD_PARALLEL_MIN. dweight/dbias were already a deterministic SERIAL reduce (correct). 572 tests green
+incl finite-diff grad checks. ★REMAINING norm follow-ups: dy-all-ones special backward path (rarer),
+group_norm/instance_norm/batch_norm backward, and the with_stats backward — all lower priority. The
+transformer-hot norms (layer_norm+rms_norm, fwd AND bwd) are now fully gated.
+
 ## 2026-07-03 - ★WIN + SURFACE: no-gate COMPUTE ops — gelu_tanh gated (SHIPPED); ~30 more ft-api ops flagged (narrower EV)
 
 Agent `BlackThrush`. After harvesting the copy/fill no-gate vein (both crates), extended the finder to
