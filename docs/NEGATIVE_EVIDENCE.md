@@ -1,5 +1,33 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ⚠️FOUND (health-check pivot): 2 RNG conformance goldens STALE after the substream parallelization
+
+Agent `GammaFork`. Pivoted to bench a different crate (ft-conformance) and FOUND a real broken test:
+`tensor_random_fixture_executes_in_both_modes` FAILS — 8/10 cases pass, 2 fail (Strict AND Hardened).
+Diagnosed the exact failures (uniquely-named diag example, then removed): **multinomial_weighted_no_replacement**
+and **poisson_seeded_rates**, both `output_ok=false shape_ok=true` (values wrong, shape right).
+
+ROOT CAUSE: `dcbe1afd` (MY LINEAGE — "parallelize rejection-sampler distributions via per-element
+sub-streams — 3-20x FASTER") rewrote multinomial/poisson to per-row/per-element seeded Xoshiro
+sub-streams, which CHANGES the deterministic output for a given seed (the sub-stream RNG assignment
+differs from the old serial draw order). The code-first conformance golden in
+`crates/ft-conformance/fixtures/tensor_random_cases.json` was recorded at `e8e72bb6` (fixture creation),
+BEFORE dcbe1afd → STALE. The ft-api substream commit passed ft-api tests but ft-conformance (a separate
+crate) was NOT run, so the stale golden went unnoticed until this health-check.
+
+★NOT blindly refreshing the golden: RNG is distributional-parity (golden = FT's own recorded output), and
+refreshing to the current output would MASK a bug if the substream rewrite is distributionally wrong (not
+just re-ordered). SAFE FIX (RNG owner / next focused turn): (1) verify the current substream
+multinomial(no-replacement)/poisson output is VALID — poisson = non-neg ints matching the seeded rates,
+multinomial-no-replacement = distinct valid indices with correct weights; cross-check the sub-stream draw
+is a legit sample (serial==parallel was tested but that's consistency not distributional validity vs the
+OLD serial); (2) then regenerate the 2 goldens in tensor_random_cases.json (no regen-env-var exists — the
+values are hand-recorded, so recompute + edit the JSON). ★PROCESS LESSON: run ft-conformance (NOT just
+ft-api --lib) after ANY RNG/distribution change — conformance goldens are a SEPARATE crate and cross-crate
+regressions slip through per-crate ft-api testing. Repro: `cargo test -p ft-conformance --test smoke
+tensor_random_fixture`. This is the highest-value finding of the recent turns (a real regression vs the
+walled perf frontier).
+
 ## 2026-07-03 - ⛔CORRECTION: cdist grad is ALREADY fused+parallel (my queued lever was a false lead)
 
 Agent `GammaFork`. Verified before implementing the queued cdist lever (below) — it's a FALSE LEAD.
