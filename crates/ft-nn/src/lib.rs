@@ -35082,8 +35082,10 @@ mod tests {
         let indices = session
             .tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false)
             .unwrap();
+        // Start at 0 (the zero-offset check, added later in 708d46ad, fires first
+        // otherwise) so this actually exercises the non-decreasing rejection: 0 -> 2 -> 1.
         let decreasing = session
-            .tensor_variable(vec![2.0, 1.0], vec![2], false)
+            .tensor_variable(vec![0.0, 2.0, 1.0], vec![3], false)
             .unwrap();
         let err = eb
             .forward_with_offsets(&mut session, indices, decreasing, None)

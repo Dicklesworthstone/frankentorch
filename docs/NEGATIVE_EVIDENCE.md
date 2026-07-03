@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★FIXED (cross-crate sweep): ft-nn embedding_bag test red 2 weeks — validation-added-after-test regression
+
+Agent `GammaFork`. Continued the workspace test sweep (ft-nn/ft-optim/ft-autograd/ft-kernel-cpu). Found
+ft-nn `embedding_bag_rejects_malformed_offsets` FAILING (776/1). Root cause: the test's "decreasing
+offsets" sub-case used offsets `[2.0, 1.0]` and expected a "non-decreasing" error, but a LATER commit
+`708d46ad` (2026-06-18 06:14 "require embeddingbag zero offset start") added a torch-correct "first offset
+must be zero" check that fires FIRST for a nonzero first offset — so [2.0,1.0] now trips "first offset
+must be zero", never reaching the non-decreasing check. The test (`77fa4d68`, 2026-06-18 01:35) predates
+the new check and was never updated; ft-nn tests weren't run since, so it stayed red ~2 weeks. ★FIX: gave
+the decreasing case a first-zero offset `[0.0, 2.0, 1.0]` (shape [3]) so it satisfies zero-start + range,
+then 2->1 exercises the non-decreasing rejection as intended. Test-only 1-input change; ft-nn now 777/0.
+The "first offset must be zero" validation is CORRECT (torch EmbeddingBag requires offsets[0]==0) — kept
+it, fixed the test.
+
+★CROSS-CRATE SWEEP RESULTS this session: ft-api 2475/1 (gammaln pre-existing golden), ft-conformance 39/0
+(fixed 2 stale RNG goldens), ft-core 194/0 (fixed 2-week build break), ft-nn 777/0 (fixed this), ft-optim
+477/0, ft-autograd 564/0, ft-kernel-cpu green. ★3 real fixes from the pivot (RNG goldens + ft-core build +
+ft-nn test) — all cross-crate breakage that per-crate ft-api testing missed. ★PROCESS: a "validation added
+after a test" regression is invisible to the adding commit's own tests — run the WHOLE workspace after any
+validation/error-message change. Remaining red: only ft-api gammaln golden (pre-existing, owner-scope).
+
 ## 2026-07-03 - ★FIXED (cross-crate health sweep): ft-core test build BROKEN 2 weeks — 1-line import fix, 194 tests unblocked
 
 Agent `GammaFork`. Continued the health-check pivot (sweep other crates' tests after the ft-conformance
