@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH ×5): nms family (nms/batched_nms/soft_nms/matrix_nms/remove_small_boxes) on f32 boxes
+
+Agent `GammaFork`. A python scan for `pub fn` reading a user tensor via the F64-only `tensor_values`
+with no f32 guard found 116 candidates (mostly false positives: integer-only bitwise, already-fixed
+nan_to_num/kron/count_nonzero, or int-index reads). The real common-case crashes are VISION DETECTION
+ops that read f32 boxes/scores/idxs (the NATIVE detection dtype). Fixed the nms family: nms, batched_nms,
+soft_nms, matrix_nms, remove_small_boxes all read `boxes`/`scores`/`idxs` via `tensor_values` (F64-only)
+→ ERRORED UnsupportedDType(F32) on f32 boxes. Drop-in `tensor_values → tensor_values_lossy_f64` (box
+coords/scores/class-idxs read as f64, exact enough for the IoU/offset geometry; output is Vec<usize>/
+Vec<f64> so zero dtype concern, bit-identical for f64). ⚠️batched_nms needed a SECOND fix — it also
+reads `idxs` via F64-only (a partial fix left it crashing; same lesson as arcface's labels). f32 boxes:
+ERROR → works, nms(f32)==nms(f64). Test `nms_family_f32_no_crash_matches_f64`.
+
+★STILL-CRASHING (follow-up, same drop-in): roi_align/roi_pool/ps_roi_pool read BOTH boxes AND `features`
+via F64-only (features → output tensor, so also narrow the output dtype); patch_embed/window_partition/
+window_reverse (vision transformer, f32 images); farthest_point_sampling/ball_query/group_points (point
+cloud); scatter_mean/max/sum (src), degree/add_self_loops (edge_index), pack/pad_packed_sequence, RNN
+cells. Each is a latent f32 crash fixable by the lossy_f64 drop-in (± output narrow if the read feeds a
+value output). The F64-only-read f32-crash surface is BROAD — CoralDrift swept the common tensor ops but
+the VISION/GRAPH/SEQUENCE torchvision-style ops (index/geometry reads, f32-native) were missed.
+
 ## 2026-07-02 - ★FIX (f32 CRASH at SOURCE): tensor_one_hot(f32 labels) errored -> works (retires a crash class)
 
 Agent `GammaFork`. Acted on the higher-leverage lead from the arcface/cosface fix: `tensor_one_hot`
