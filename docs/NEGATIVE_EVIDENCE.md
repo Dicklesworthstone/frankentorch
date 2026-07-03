@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN (TORCH-CORE FLIP): pdist p=2 fused backward — ~2x SLOWER -> 3.47x FASTER vs torch
+
+Agent `GammaFork`. Landed the deep lever queued last turn (torch backward-cost probe found pdist bwd
+17.9ms disproportionately slow). FT's p=2 grad path was a matmul-identity COMPOSE materialising FOUR
+[n,n] intermediates (gram/norm_sum/d2/d2_clamped, 8MB each at n=512) + their backward. Replaced the F64
+p=2 path with apply_function: forward = the direct parallel pdist_forward_f64 kernel; backward computes
+grad_x[i] = Σ_{j≠i} (grad_d[pair(i,j)]/d(i,j))·(x[i]-x[j]) PARALLEL over points i (par_chunks_mut(m),
+disjoint rows, distances recomputed on-the-fly — NO [n,n] intermediate, NO scatter conflict). F32 keeps
+the dtype-preserving compose (apply_function outputs F64).
+
+MEASURED (cc-local, [n=512,m=128] p=2 fwd+bwd, load ~15):
+- FT serial 84.00 -> FT parallel **6.24 ms = 13.5x internal** (fwd 19.8x, bwd 9.2x)
+- torch 2.12.1 @32t: **21.64 ms** (fwd 3.70 / bwd 17.94)
+- ⇒ FT **3.47x FASTER vs torch** (fwd+bwd); backward alone FT 3.74 vs torch 17.94 = **4.80x FASTER**;
+  forward FT 2.50 vs 3.70 = 1.48x FASTER. Flips from the compose (~2x SLOWER than torch last turn) to
+  3.47x FASTER. torch's pdist backward is a slow kernel (bwd/fwd 4.9); FT's fused per-point backward wins.
+
+CORRECTNESS: pdist is a TOLERANCE op — forward golden vs torch stays green (1e-9); the fused backward is
+the correct ANALYTIC gradient (existing pdist_l2_propagates_gradient + finite-diff green). New test
+pdist_l2_fused_grad_parallel_matches_serial_reference locks parallel==serial bit-for-bit (independent
+reference matching the impl's coeff=grad_d/d then coeff*diff op order — a `diff/d` reference is a DIFFERENT
+rounding, caught it). All 11 pdist tests green. ★LESSON: the "torch backward-cost probe -> fused
+per-point/per-row backward" method flips torch-core ops where torch composes a slow backward (LRN via
+avg_pool3d, pdist bwd-kernel). 11 ops flipped/gap-closed this vein; pdist + LRN are the clean torch-core
+flips. Bench: examples/pdist_grad_h2h.rs.
+
 ## 2026-07-03 - SYSTEMATIC torch backward-cost probe (maps grad-closure flip candidates) + pdist deep-lever queued
 
 Agent `GammaFork`. Applied the refined LRN lesson (grad-closure levers flip only when torch's OWN
