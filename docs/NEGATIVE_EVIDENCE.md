@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★WIN (niche, gated): conv2d col2im per-plane for small batch — 5.2x @ batch=1, bit-exact + ft-kernel-cpu HARVEST-STATE map
+
+Agent `BlackThrush`. `conv2d_col2im_f32/f64` (conv2d input-grad) parallelized ONLY over batch, so batch=1
+was fully SERIAL. For batch<8, parallelize per (batch,channel) PLANE (disjoint, pc-outer scatter order
+identical to per-batch restricted to channel c → bit-identical). GATED at batch<8: per-plane loses dpanel
+cache locality and REGRESSES 0.6-0.8x at batch>=16, so per-batch stays for large batch (zero regression).
+A/B (f32, 64t, min-7, bit-exact): batch=1 11.6->2.22ms **5.22x**, batch=4 1.47x. Helps single-image conv
+grad (Grad-CAM/saliency/adversarial). Bench scratchpad/col2im. Lock test
+conv2d_col2im_small_batch_per_plane_matches_per_batch_bit_exact. Shipped 2eb62af0.
+
+★★ft-kernel-cpu SERIAL-BESIDE-PARALLEL SURFACE HARVESTED (this run = 8 wins: cross, addmv GEMV,
+per-channel int8 quant, nonzero two-pass, linear_backward dgemm_tb, bias-add/addmm-epilogue, conv
+dout_t ×4, col2im small-batch). SYSTEMATIC PROBE CONFIRMS the rest is DONE/WALLED (don't re-probe):
+- ALL elementwise real (contiguous+strided), unary/binary, norm (layer/group/batch/rms/instance),
+  pool (max/avg 1/2/3d), softmax/log_softmax, conv im2col/col2im/forward, reduce_sum_for_broadcast,
+  sum_dim/mean_dim, extremum_dim — ALL already `par_`. 
+- COMPLEX mul/div/add = probed+REJECTED (kgs4.91, bandwidth-bound, rayon regressed). 
+- SDPA GEMMs = inside parallel flash blocks (softmax-exp-walled). 
+- linalg backward VJPs (svd/qr/cholesky/lu/inv/triangular_solve) = GEMM-walled (serial glue is O(n²) vs
+  O(n³) GEMM). sparse_coo_matmul = scatter-conflict (not bit-exact-parallel).
+★The clean serial→parallel / transpose-elimination / serial-tail ft-kernel-cpu vein is now EXHAUSTED.
+Next perf = ft-api-lane (peer/frontier-mapped) or peer packed-panel GEMM (kgs4.46, tolerance-policy).
+
 ## 2026-07-03 - ★★WIN: eliminate conv2d/3d backward dout_t transpose via gemm_tb — 1.15-1.62x weight-grad, bit-exact (4 sites)
 
 Agent `BlackThrush`. Same transpose-elimination lever as linear_backward (b5e369a7), applied to ALL FOUR
