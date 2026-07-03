@@ -1,5 +1,33 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (gap-close, bit-exact): ctc_loss batch-parallel — 3.1x internal, 24x->7.7x SLOWER vs torch
+
+Agent `GammaFork`. A FRESH lever (not apply_function/clone/specfn): `tensor_ctc_loss` ran its
+forward-backward DP SERIAL over the batch (`for b in 0..batch_size` in both the fwd and bwd
+apply_function closures). Each batch element is an INDEPENDENT CTC problem and writes DISJOINT grad
+columns (the flat index carries `+ b`), so I parallelized over b — bit-exact by construction:
+precompute per-b target offsets (prefix sum) so each b is self-contained, dispatch the SAME per-b
+closure via `into_par_iter()` (gated batch>=CTC_PARALLEL_MIN=4, serial below keeps the lib tests on
+the identical closure); backward computes each b's DENSE [in_len,num_classes] block in parallel then
+scatters to disjoint columns (per-(t,s) accumulation order preserved). New test
+`tensor_ctc_loss_parallel_batch_matches_per_sample_bit_exact` (batch=5 -> parallel) proves the batched
+losses AND gradients bit-match per-sample (batch=1) runs to_bits().
+
+MEASURED (cc-local, same-binary RAYON_NUM_THREADS A/B, [T=120,N=32,C=60,L=24] fwd+bwd, load ~16):
+- serial (1t): fwd 5.80 / bwd 12.20 / **fwd+bwd 17.99 ms**
+- parallel (64t): fwd 1.54 / bwd 3.95 / **fwd+bwd 5.79 ms** = **3.11x internal** (fwd 3.77x, bwd 3.09x)
+- torch 2.12.1: **0.75 ms @32t** / 1.84 ms @8t (fwd+bwd)
+
+★HONEST FRAMING — this is a GAP-CLOSE, NOT a flip: FT is STILL ~7.7x SLOWER than torch@32t (was ~24x)
+and ~3.1x SLOWER than torch@8t (was ~9.8x). torch's CTC is a flat-array vectorized C++ kernel; FT uses
+Vec<Vec<f64>> alpha/beta (alloc + pointer-chase per b) + scalar log_sum_exp (2 exp + 1 ln/call). The
+batch-parallel lever is the clean first win; the residual is torch's kernel quality. ★FOLLOW-UP LEAD
+(bit-exact, deeper): flatten alpha/beta from Vec<Vec<f64>> to a single flat Vec (remove the per-row
+alloc + pointer-chase) and/or a faster log_sum_exp — would close more of the 7.7x. Consistent with the
+many shipped gap-closes (grid_sample 9.63x->4x, argmax 87x->7.4x, nansum 107x->9x) — large internal
+improvement, residual = a structural kernel wall. Bench: examples/ctc_h2h.rs (RAYON A/B) + torch venv
+/tmp/torchvenv (2.12.1+cpu). Full ft-api lib compiles; ctc tests 3/3 green.
+
 ## 2026-07-03 - CORRECTION: grid_sample lever-2 is NOT decision-blocked — it is SIMD-gather-walled (retire it)
 
 Agent `GammaFork`. Empirically resolved a standing claim I (and the ledger) repeated for many turns:
