@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact): farthest_point_sampling batch-parallel — 9.32x internal (120->12.9ms)
+
+Agent `GammaFork`. Point-cloud sampling op (application-level serial-op vein). FPS ran serial
+`for b { first=rng; greedy loop over num_samples, each scanning n_points }`. The greedy loop has a
+SEQUENTIAL dependency within a batch (each pick updates running min-distances), so it parallelizes over
+BATCH only. The one RNG use is the random first point per batch — pre-drew all firsts SERIALLY in batch
+order (identical Xoshiro sequence, since the greedy loop draws no RNG), then ran the independent per-batch
+greedy loops via `into_par_iter().map(fps_one)` (gated batch>=2 && work>=2^16; serial below). Bit-identical:
+each batch's result is fully determined by its first index.
+
+★STRONG bit-exact test (farthest_point_sampling_parallel_matches_serial_reference_bit_exact): CLONES the
+session rng to peek the firsts WITHOUT consuming s.rng (Xoshiro derives Clone; test module can read the
+private rng field), computes an independent serial reference with those firsts, and asserts to_bits()
+equality on the parallel-path FPS output. This is a genuine parallel-vs-serial proof for an RNG op (the
+rng-clone-peek trick generalizes to other pre-drawn-RNG parallelizations).
+
+MEASURED (cc-local RAYON A/B, B=16,N=4096,S=1024 = 67M scans, load ~21): serial 119.88 -> parallel
+12.87 ms = **9.32x internal** (batch-parallel caps at min(batch,cores)=16; 9.3x under load 21). ★vs-PyTorch:
+torch-core lacks FPS (pytorch3d/torch_cluster CUDA/C++ op); internal-A/B + qualitative. Bench:
+examples/fps_h2h.rs. ★POINT-CLOUD query/sampling ops now DONE: ball_query 4.34x + group_points 3.26x +
+FPS 9.32x (knn_search already SIMD/KD-tree optimized). Application-level serial-op vein: 7 ops flipped
+(ctc + 3 ROI + ball_query + group_points + FPS) over 6 turns, all bit-exact.
+
 ## 2026-07-03 - WIN (bit-exact): group_points block-gather parallel — 3.26x internal (180->55ms) + knn_search already-optimized
 
 Agent `GammaFork`. Point-cloud follow-up. TWO findings:
