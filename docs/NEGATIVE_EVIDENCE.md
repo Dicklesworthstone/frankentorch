@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★WIN: row-parallel bias-add / addmm epilogue — 2.0-2.6x on the serial tail after the GEMM, bit-exact
+
+Agent `BlackThrush`. Same finder as the linear_backward transpose (a SERIAL op beside PARALLEL ops):
+`linear_tensor_f64/f32` (Linear forward `x @ W^T + bias`) and `addmm_*_f64/f32` (`beta*input +
+alpha*A@B`) both ran a SERIAL elementwise tail AFTER their already-parallel GEMM — the bias add looped
+`for row in y.chunks_exact_mut(out)` and the addmm epilogue was a serial `.iter().map().collect()`. For
+large outputs (LM head [batch,vocab], hidden layers) that bandwidth-bound serial pass is a real Amdahl
+tail on the hottest op in a transformer. Each row/element is independent + the add is pure per-element →
+row/element-parallel is BIT-IDENTICAL. Parallelized all 4 sites (par_chunks_exact_mut / into_par_iter),
+gated numel>=65536.
+
+★MEASURE — standalone A/B (f64 bias add, 64t, min-9, bit-exact): [8192,4096] 17.1->7.4ms **2.30x**,
+[8192,32000] LM-head 154->58ms **2.64x**, [16384,4096] 33.7->17.1ms **1.98x**. Bench scratchpad/biasab.
+FT-internal (isolated bias-add/addmm-epilogue has no torch single-op baseline; it's the serial-tail
+fraction of the GEMM-dominated Linear forward, ~1.1-1.3x whole-op). Lock test
+linear_bias_add_parallel_path_matches_serial_bit_exact (f64+f32); 569 ft-kernel-cpu green. Shipped
+310ec41a. ★6th serial-kernel win this run. FINDER (recurring, now 6x): a SERIAL loop (bias add, epilogue,
+transpose, reduction) sitting BESIDE/AFTER already-parallel GEMM/kernel code = the Amdahl tail — grep
+`chunks_exact_mut`/`.iter().map().collect()`/`for row in` directly after a `gemm::`/`par_` call.
+
 ## 2026-07-03 - ★★WIN: eliminate linear_backward dy^T transpose via dgemm_tb — kills a 327ms serial scatter, bit-exact
 
 Agent `BlackThrush`. `linear_backward_f64` (Linear-layer backward grad, ft-api:26285) materialized dy^T
