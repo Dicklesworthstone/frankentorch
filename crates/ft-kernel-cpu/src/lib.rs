@@ -29025,18 +29025,35 @@ pub fn matmul_tensor_contiguous_f32_into(
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn quantize_per_output_channel_i8(w: &[f32], out: usize, in_: usize) -> (Vec<i8>, Vec<f32>) {
+    use rayon::prelude::*;
     assert_eq!(w.len(), out * in_, "weight length must equal out*in_");
     let mut w_i8 = vec![0i8; out * in_];
     let mut scales = vec![0f32; out];
-    for o in 0..out {
-        let row = &w[o * in_..(o + 1) * in_];
+    // Each OUTPUT CHANNEL owns a disjoint [in_] weight row + one scale slot and is
+    // computed independently (amax -> scale -> quantize), so serial-vs-parallel is
+    // bit-identical (same amax fold, same round/clamp per element, order-invariant).
+    // Mirrors the parallelized sibling `quantize_rows_i8` (same gate) — the per-row
+    // divide+round is compute-bound, so this parallelizes ~linearly (measured
+    // 10-23x at Linear/LM-head weight shapes: [32000,4096] 322ms -> 14ms). Small
+    // weights stay serial (rayon fan-out > gain). kgs4-qchan-par.
+    let quant_channel = |dst: &mut [i8], scale_slot: &mut f32, row: &[f32]| {
         let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
         let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let dst = &mut w_i8[o * in_..(o + 1) * in_];
-        for i in 0..in_ {
-            dst[i] = round_ties_even_f32(row[i] / scale).clamp(-127.0, 127.0) as i8;
+        for (d, &v) in dst.iter_mut().zip(row.iter()) {
+            *d = round_ties_even_f32(v / scale).clamp(-127.0, 127.0) as i8;
         }
-        scales[o] = scale;
+        *scale_slot = scale;
+    };
+    if out >= 8 && out * in_ >= 8192 && rayon::current_num_threads() > 1 {
+        w_i8.par_chunks_mut(in_)
+            .zip(scales.par_iter_mut())
+            .zip(w.par_chunks(in_))
+            .for_each(|((dst, scale_slot), row)| quant_channel(dst, scale_slot, row));
+    } else {
+        w_i8.chunks_mut(in_)
+            .zip(scales.iter_mut())
+            .zip(w.chunks(in_))
+            .for_each(|((dst, scale_slot), row)| quant_channel(dst, scale_slot, row));
     }
     (w_i8, scales)
 }
@@ -34142,6 +34159,33 @@ mod tests {
             first_i8[(m - 1) * k..m * k].iter().all(|&q| q == 0),
             "all-zero activation row must stay all-zero with finite unit scale"
         );
+    }
+
+    #[test]
+    fn weight_per_channel_quant_parallel_matches_serial_reference_bit_exact() {
+        // out=64, in_=256 => out*in_ = 16384 >= 8192 and out >= 8, so the
+        // parallel per-channel path fires. Lock it byte-for-byte against an
+        // independent inline serial reference (the pre-parallel per-channel loop).
+        let (out, in_) = (64usize, 256usize);
+        let w: Vec<f32> = (0..out * in_)
+            .map(|i| ((i % 2039) as f32) * 1e-3 - 1.0)
+            .collect();
+        let (got_i8, got_scales) = super::quantize_per_output_channel_i8(&w, out, in_);
+
+        let mut want_i8 = vec![0i8; out * in_];
+        let mut want_scales = vec![0f32; out];
+        for o in 0..out {
+            let row = &w[o * in_..(o + 1) * in_];
+            let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            for i in 0..in_ {
+                want_i8[o * in_ + i] =
+                    super::round_ties_even_f32(row[i] / scale).clamp(-127.0, 127.0) as i8;
+            }
+            want_scales[o] = scale;
+        }
+        assert_eq!(got_i8, want_i8, "per-channel quant i8 must be bit-exact serial-vs-parallel");
+        assert_eq!(got_scales, want_scales, "per-channel quant scales must be bit-exact");
     }
 
     #[test]
