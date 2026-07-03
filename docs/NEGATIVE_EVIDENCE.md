@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★FIX (f32 CRASH ×3, MAINSTREAM): tensor_lstm/gru/rnn on f32 — upcast-recurse
+
+Agent `GammaFork`. Highest-value target of the f32-crash vein: the RECURRENT nets (LSTM/GRU/RNN are
+mainstream + f32-native, unlike the niche vision/graph ops). Their raw f64 forward (frankentorch-3k4v,
+returns non-grad leaves) reads `input` + `hx` + ALL `weights` (weight_ih/hh, bias_ih/hh) via the F64-only
+`tensor_values` → ERRORED UnsupportedDType(F32) on f32. Too many reads for per-read drop-ins, so FIX via
+UPCAST-RECURSE: for f32 input, upcast input + hidden state(s) + every weight tuple to f64 (exact), recurse
+into the f64 path (no crash), then narrow the (non-grad) outputs — LSTM (output, (h_n, c_n)), GRU/RNN
+(output, h_n) — back to f32. to_dtype is grad-aware but outputs are non-grad anyway. f32: ERROR → works,
+returns F32, lstm(f32) output == lstm(f64) within 1e-5. Test `rnn_ops_f32_no_crash_returns_f32` (LSTM +
+GRU + RNN). ⚠️tensor_rnn has a 6th `nonlinearity: &str` param — thread it through the recursion. 6
+lstm/gru/rnn tests green.
+
+★VISION/GRAPH/SEQUENCE f32-crash vein: nms(5)+scatter(3)+roi(3)+ViT(3)+RNN(3) = 17 ops fixed this
+session. UPCAST-RECURSE is the recipe when an op reads MANY user tensors (input+hx+weights) — cheaper
+than N per-read drop-ins, grad-safe (CastF64/F32 nodes). Remaining: point cloud (farthest_point_sampling/
+ball_query/group_points), graph (degree/add_self_loops/edge_index_to_adj), pack/pad_packed_sequence.
+
 ## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): patch_embed/window_partition/window_reverse on f32 (ViT/Swin)
 
 Agent `GammaFork`. Continued the vision f32-crash vein with the ViT/Swin-Transformer movement ops.
