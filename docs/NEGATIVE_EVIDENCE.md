@@ -29,9 +29,14 @@ par_chunks_mut pattern (recompute mean/var + c1/c2 reduce + scale per row = band
 runs EVERY training step per layer — so it over-parallelized small-batch training backward the same 2-11x.
 Gated the general-path dx of layer_norm_backward_f{64,32} + rms_norm_backward_f{64,32} at
 NORM_FWD_PARALLEL_MIN. dweight/dbias were already a deterministic SERIAL reduce (correct). 572 tests green
-incl finite-diff grad checks. ★REMAINING norm follow-ups: dy-all-ones special backward path (rarer),
-group_norm/instance_norm/batch_norm backward, and the with_stats backward — all lower priority. The
-transformer-hot norms (layer_norm+rms_norm, fwd AND bwd) are now fully gated.
+incl finite-diff grad checks. ★group_norm BACKWARD also gated 134133c3 (general-path dx f64+f32) —
+group_norm now fully fwd+bwd. ★REMAINING norm follow-ups (all lower priority): dy-all-ones special
+backward path (rarer, several kernels), batch_norm/instance_norm (reduce ACROSS batch = different axis,
+needs own bench), with_stats backward. The transformer+GN norm family (layer_norm/rms_norm/group_norm,
+fwd AND bwd) is now fully gated. ★★NO-GATE VEIN STATUS: the whole per-row/per-group reduce-then-scale +
+movement-copy no-gate class is HARVESTED for the hot ops. Remaining ungated ops are either batch-axis
+norms (batch_norm/instance_norm, separate analysis) or the ~30 per-element compute ops (narrow window,
+per-op crossover — low priority). Next fresh perf work should look OUTSIDE this vein.
 
 ## 2026-07-03 - ★WIN + SURFACE: no-gate COMPUTE ops — gelu_tanh gated (SHIPPED); ~30 more ft-api ops flagged (narrower EV)
 
