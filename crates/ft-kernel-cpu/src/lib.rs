@@ -2284,6 +2284,14 @@ fn checked_dim_loop_sizes(
 
 const PARALLEL_THRESHOLD: usize = 8192;
 
+// A 1-D single-lane (contiguous, inner_size==1) cummax/cummin scan is inherently serial in
+// the naive form, but max/min are EXACTLY associative and the tie-keeps-latest + NaN-freeze
+// rule composes as a serial prefix-fold over per-chunk finals — so a 3-pass chunked scan is
+// BIT-FOR-BIT identical and 2-3.6x faster than serial (torch's 1-D cummax is single-threaded,
+// ~146ms/16M). The 3-pass overhead (2 passes over N + prefix) needs a large lane to pay:
+// measured 128K=0.34x, 256K=1.08x, 512K=2.01x, 1M=3.2x, 16M=3.6x. Gate at 512K.
+const CUM_SCAN_1D_PARALLEL_MIN: usize = 1 << 19; // 524288
+
 // Gate for PURE-COPY / broadcast-fill MATERIALIZATION (narrow, expand): these do
 // NO per-element compute (just `copy_from_slice` / `fill`), so a single thread
 // already saturates memory bandwidth — rayon adds only overhead. Measured
@@ -14722,6 +14730,10 @@ pub fn cummax_dim_tensor_contiguous_f64(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummax): the serial else below runs one scan over the whole
+        // lane. max is exactly associative → chunked parallel scan, bit-exact (see helper).
+        cummaxmin_1d_contiguous_parallel_f64(&data[..dim_size], &mut values[..], &mut indices[..], true);
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -14886,6 +14898,10 @@ pub fn cummin_dim_tensor_contiguous_f64(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummin): min is exactly associative → chunked parallel
+        // scan, bit-exact to the serial lane scan (see helper).
+        cummaxmin_1d_contiguous_parallel_f64(&data[..dim_size], &mut values[..], &mut indices[..], false);
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -14982,6 +14998,165 @@ fn cummin_dim_lane_block_f64(
     }
 }
 
+/// Chunked PARALLEL 1-D (contiguous, `inner_size==1`) cumulative max (`is_max`) / min. `max`/`min`
+/// are EXACTLY associative and the tie-keeps-latest (`>=`/`<=`) + NaN-freeze rule composes as a
+/// serial prefix fold over per-chunk finals, so this is BIT-FOR-BIT identical to the serial
+/// [`cummax_dim_lane_block_f64`]/[`cummin_dim_lane_block_f64`] scan (values AND indices). Three
+/// passes: (1) parallel per-chunk fresh local scan (global indices) recording each chunk's final
+/// state, (2) cheap serial prefix fold of the finals, (3) parallel fold of the prefix into each
+/// chunk's local result. torch's 1-D cummax/cummin is single-threaded (~146ms/16M). (BlackThrush)
+fn cummaxmin_1d_contiguous_parallel_f64(lane: &[f64], vals: &mut [f64], idxs: &mut [f64], is_max: bool) {
+    let n = lane.len();
+    let nthreads = rayon::current_num_threads().max(1);
+    let grain = (n / (nthreads * 4)).max(4096);
+    let nchunks = n.div_ceil(grain);
+    let init = if is_max { f64::NEG_INFINITY } else { f64::INFINITY };
+    // Pass 1: each chunk's fresh local cummax/min (global indices) + its final (extreme, idx).
+    let finals: Vec<(f64, f64)> = vals
+        .par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .map(|(c, (vc, ic))| {
+            let s = c * grain;
+            let mut acc = init;
+            let mut ai = 0.0f64;
+            let mut nan = false;
+            for j in 0..vc.len() {
+                let v = lane[s + j];
+                if !nan {
+                    if v.is_nan() {
+                        nan = true;
+                        acc = v;
+                        ai = (s + j) as f64;
+                    } else if (is_max && v >= acc) || (!is_max && v <= acc) {
+                        acc = v;
+                        ai = (s + j) as f64;
+                    }
+                }
+                vc[j] = acc;
+                ic[j] = ai;
+            }
+            (acc, ai)
+        })
+        .collect();
+    // Pass 2 (serial, nchunks elems): running (extreme, idx) BEFORE each chunk. NaN absorbs
+    // (earliest NaN wins), else `>=`/`<=` keeps the later index (matching the serial scan).
+    let mut prefix = vec![(init, 0.0f64); nchunks];
+    let mut p = (init, 0.0f64);
+    for (c, pf) in prefix.iter_mut().enumerate() {
+        *pf = p;
+        let (cm, ci) = finals[c];
+        p = if p.0.is_nan() {
+            p
+        } else if cm.is_nan() {
+            (cm, ci)
+        } else if (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
+            (cm, ci)
+        } else {
+            p
+        };
+    }
+    // Pass 3: fold the prefix state into each chunk's local result.
+    vals.par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .for_each(|(c, (vc, ic))| {
+            let (pm, pi) = prefix[c];
+            // pm == init (no prior extreme, and not NaN) => local scan is already final for
+            // every position (local extreme always ties-or-beats init, keeping the later idx).
+            if pm == init {
+                return;
+            }
+            for j in 0..vc.len() {
+                let lv = vc[j];
+                if pm.is_nan() {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                } else if lv.is_nan() {
+                    // NaN arose within this chunk at/before j: local already frozen — keep it.
+                } else if (is_max && lv >= pm) || (!is_max && lv <= pm) {
+                    // local extreme wins (>= / <= keeps the later index) — keep local.
+                } else {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                }
+            }
+        });
+}
+
+/// f32 mirror of [`cummaxmin_1d_contiguous_parallel_f64`] — values f32, indices f64. Bit-for-bit
+/// identical to the serial [`cummax_dim_lane_block_f32`]/[`cummin_dim_lane_block_f32`]. (BlackThrush)
+fn cummaxmin_1d_contiguous_parallel_f32(lane: &[f32], vals: &mut [f32], idxs: &mut [f64], is_max: bool) {
+    let n = lane.len();
+    let nthreads = rayon::current_num_threads().max(1);
+    let grain = (n / (nthreads * 4)).max(4096);
+    let nchunks = n.div_ceil(grain);
+    let init = if is_max { f32::NEG_INFINITY } else { f32::INFINITY };
+    let finals: Vec<(f32, f64)> = vals
+        .par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .map(|(c, (vc, ic))| {
+            let s = c * grain;
+            let mut acc = init;
+            let mut ai = 0.0f64;
+            let mut nan = false;
+            for j in 0..vc.len() {
+                let v = lane[s + j];
+                if !nan {
+                    if v.is_nan() {
+                        nan = true;
+                        acc = v;
+                        ai = (s + j) as f64;
+                    } else if (is_max && v >= acc) || (!is_max && v <= acc) {
+                        acc = v;
+                        ai = (s + j) as f64;
+                    }
+                }
+                vc[j] = acc;
+                ic[j] = ai;
+            }
+            (acc, ai)
+        })
+        .collect();
+    let mut prefix = vec![(init, 0.0f64); nchunks];
+    let mut p = (init, 0.0f64);
+    for (c, pf) in prefix.iter_mut().enumerate() {
+        *pf = p;
+        let (cm, ci) = finals[c];
+        p = if p.0.is_nan() {
+            p
+        } else if cm.is_nan() {
+            (cm, ci)
+        } else if (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
+            (cm, ci)
+        } else {
+            p
+        };
+    }
+    vals.par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .for_each(|(c, (vc, ic))| {
+            let (pm, pi) = prefix[c];
+            if pm == init {
+                return;
+            }
+            for j in 0..vc.len() {
+                let lv = vc[j];
+                if pm.is_nan() {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                } else if lv.is_nan() {
+                } else if (is_max && lv >= pm) || (!is_max && lv <= pm) {
+                } else {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                }
+            }
+        });
+}
+
 /// f32 mirror of [`cummax_dim_tensor_contiguous_f64`] — values f32, indices f64. (BlackThrush)
 pub fn cummax_dim_tensor_contiguous_f32(
     input: &[f32],
@@ -15043,6 +15218,9 @@ pub fn cummax_dim_tensor_contiguous_f32(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummax f32): chunked parallel scan, bit-exact (see helper).
+        cummaxmin_1d_contiguous_parallel_f32(&data[..dim_size], &mut values[..], &mut indices[..], true);
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -15197,6 +15375,9 @@ pub fn cummin_dim_tensor_contiguous_f32(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummin f32): chunked parallel scan, bit-exact (see helper).
+        cummaxmin_1d_contiguous_parallel_f32(&data[..dim_size], &mut values[..], &mut indices[..], false);
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -42892,6 +43073,69 @@ mod tests {
             }
         }
         (v, idx)
+    }
+
+    #[test]
+    fn cummax_cummin_1d_large_parallel_bit_exact() {
+        // Exercise the >= CUM_SCAN_1D_PARALLEL_MIN single-lane 1-D chunked parallel scan against
+        // the serial per-lane reference. Values: integer plateaus (ties), ascents and descents,
+        // plus a NaN mid-lane — covers tie-keeps-latest + NaN-freeze on the parallel path. Size is
+        // > threshold and non-power-of-two so chunks (grain = n/(threads*4)) straddle boundaries.
+        let n: usize = super::CUM_SCAN_1D_PARALLEL_MIN + 12345;
+        let mut input: Vec<f64> = (0..n)
+            .map(|k| (((k as u64).wrapping_mul(2654435761)) % 4096) as f64 - 2048.0)
+            .collect();
+        input[n / 2] = f64::NAN;
+        let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
+        for is_max in [true, false] {
+            let (v, i) = if is_max {
+                super::cummax_dim_tensor_contiguous_f64(&input, &meta, 0).unwrap()
+            } else {
+                super::cummin_dim_tensor_contiguous_f64(&input, &meta, 0).unwrap()
+            };
+            let (rv, ri) = cummaxmin_ref_f64(&input, n, 1, is_max);
+            for k in 0..n {
+                assert_eq!(v[k].to_bits(), rv[k].to_bits(), "f64 value bits differ at {k} is_max={is_max}");
+                assert_eq!(i[k], ri[k], "f64 index differs at {k} is_max={is_max}");
+            }
+        }
+        // f32 mirror (values f32, indices f64) against an inline serial reference.
+        let input_f32: Vec<f32> = input.iter().map(|&x| x as f32).collect();
+        let meta_f32 = TensorMeta::from_shape(vec![n], DType::F32, Device::Cpu);
+        let ref_f32 = |data: &[f32], is_max: bool| -> (Vec<f32>, Vec<f64>) {
+            let mut acc = if is_max { f32::NEG_INFINITY } else { f32::INFINITY };
+            let mut ai = 0.0f64;
+            let mut nan = false;
+            let mut v = vec![0.0f32; data.len()];
+            let mut idx = vec![0.0f64; data.len()];
+            for (d, &x) in data.iter().enumerate() {
+                if !nan {
+                    if x.is_nan() {
+                        nan = true;
+                        acc = x;
+                        ai = d as f64;
+                    } else if (is_max && x >= acc) || (!is_max && x <= acc) {
+                        acc = x;
+                        ai = d as f64;
+                    }
+                }
+                v[d] = acc;
+                idx[d] = ai;
+            }
+            (v, idx)
+        };
+        for is_max in [true, false] {
+            let (v, i) = if is_max {
+                super::cummax_dim_tensor_contiguous_f32(&input_f32, &meta_f32, 0).unwrap()
+            } else {
+                super::cummin_dim_tensor_contiguous_f32(&input_f32, &meta_f32, 0).unwrap()
+            };
+            let (rv, ri) = ref_f32(&input_f32, is_max);
+            for k in 0..n {
+                assert_eq!(v[k].to_bits(), rv[k].to_bits(), "f32 value bits differ at {k} is_max={is_max}");
+                assert_eq!(i[k], ri[k], "f32 index differs at {k} is_max={is_max}");
+            }
+        }
     }
 
     #[test]

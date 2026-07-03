@@ -1,5 +1,34 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★WIN: 1-D cummax/cummin PARALLEL SCAN — max/min are EXACTLY associative → chunked scan is bit-exact; 3.6x over serial, ~4.3x vs torch
+
+Agent `BlackThrush`. FLIP from last turn's torch probe: `cummax`/`cummin` 1-D 16M = **146ms in torch (single-
+threaded scan)**. FT's cummax_dim/cummin_dim kernels already parallelize the MULTI-LANE cases (transpose-trick
+for a leading dim, lane fan-out for many lanes) — but the SINGLE contiguous lane (`outer_size==1 &&
+inner_size==1`, i.e. a 1-D tensor) fell to the serial else-branch: one sequential scan over the whole lane.
+
+★KEY INSIGHT: unlike cumsum (FP addition is NON-associative → 1-D parallel scan can't be bit-exact, walled),
+`max`/`min` are EXACTLY associative (no rounding), and FT's tie-keeps-latest (`>=`/`<=`) + NaN-freeze rule
+composes as a serial prefix-fold over per-chunk finals. So a 3-pass chunked scan is BIT-FOR-BIT identical to
+the serial lane scan (values AND indices): (1) parallel per-chunk fresh local scan recording each chunk's final
+(extreme, idx); (2) cheap serial prefix-fold of the nchunks finals (NaN absorbs earliest-wins, else `>=`/`<=`
+keeps the later index); (3) parallel fold of the prefix state into each chunk's local result.
+
+★MEASURE (standalone, 1-D single lane, f64, 64t, min-9, bit-exact vs serial incl NaN+ties): **512K 2.01x, 1M
+3.2x, 4M 3.9x, 16M 3.6x** (128K 0.34x / 256K 1.08x = below crossover → serial). FT-serial 16M ≈122ms ≈ torch's
+146ms; FT-parallel ≈34ms = **~4.3x vs torch** (torch's cummax is ~2.6 GB/s single-threaded, thread-independent).
+cummax parallelizes BETTER than cumsum (1.5x) because the compare+branch+NaN-check per element is more compute
+than a bare add — less bandwidth-starved.
+
+★SHIPPED: `cummaxmin_1d_contiguous_parallel_f{64,32}` helpers (one `is_max` bool covers max+min) + a new
+`outer_size==1 && inner_size==1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN` (1<<19=512K) branch in all 4 kernels
+(cummax/cummin × f64/f32). Serial else unchanged below the gate. New test
+`cummax_cummin_1d_large_parallel_bit_exact` (n=512K+12345, NaN mid-lane, integer plateaus/ties, straddles chunk
+boundaries) proves bit-exactness vs the serial per-lane reference for all 4. 573 ft-kernel-cpu tests green (rch).
+★GENERAL LESSON: a "sequential scan" is only unparallelizable-bit-exactly if its combine is non-associative —
+max/min/and/or/gcd ARE associative (bit-exact parallel scan OK); +/* on floats are NOT (walled). Check the
+operator's exact associativity before declaring a scan serial-only.
+
 ## 2026-07-03 - WIN: masked_select parallel fast path — serial FINAL CONCAT was eating the win; parallel copy-out → +3x at high density, ~10x vs torch, bit-exact
 
 Agent `BlackThrush`. Pivoted OUT of the ft-kernel-cpu no-gate vein into a torch-slow-op hunt. A warmed torch
