@@ -4670,7 +4670,7 @@ pub fn add_layer_norm_forward_f32(
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * norm_size];
     let inv_n = 1.0 / norm_size as f32;
-    out.par_chunks_mut(norm_size).enumerate().for_each(|(r, orow)| {
+    let row_fn = |r: usize, orow: &mut [f32]| {
         let base = r * norm_size;
         let arow = &a[base..base + norm_size];
         let brow = &b[base..base + norm_size];
@@ -4699,7 +4699,17 @@ pub fn add_layer_norm_forward_f32(
             }
             orow[j] = y;
         }
-    });
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -4716,36 +4726,46 @@ pub fn layer_norm_forward_with_stats_f64(
     let mut means = vec![0.0f64; batch];
     let mut rstds = vec![0.0f64; batch];
     let inv_n = 1.0 / norm_size as f64;
-    out.par_chunks_mut(norm_size)
-        .zip(means.par_iter_mut())
-        .zip(rstds.par_iter_mut())
-        .enumerate()
-        .for_each(|(r, ((orow, mean_slot), rstd_slot))| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f64;
-            for &v in xrow {
-                sum += v;
+    let row_fn = |r: usize, orow: &mut [f64], mean_slot: &mut f64, rstd_slot: &mut f64| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f64;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f64;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        *mean_slot = mean;
+        *rstd_slot = rstd;
+        for j in 0..norm_size {
+            let mut y = (xrow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f64;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            *mean_slot = mean;
-            *rstd_slot = rstd;
-            for j in 0..norm_size {
-                let mut y = (xrow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(b) = bias {
-                    y += b[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .zip(means.par_iter_mut())
+            .zip(rstds.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, ((orow, m), s))| row_fn(r, orow, m, s));
+    } else {
+        out.chunks_mut(norm_size)
+            .zip(means.iter_mut())
+            .zip(rstds.iter_mut())
+            .enumerate()
+            .for_each(|(r, ((orow, m), s))| row_fn(r, orow, m, s));
+    }
     (out, means, rstds)
 }
 
@@ -5431,35 +5451,43 @@ pub fn group_norm_forward_f64(
     let group_numel = cpg * spatial;
     let inv_m = 1.0 / group_numel as f64;
     let mut out = vec![0.0f64; batch * num_groups * group_numel];
-    out.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, orow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let mut sum = 0.0f64;
-            for &v in xb {
-                sum += v;
+    let group_fn = |grp: usize, orow: &mut [f64]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let mut sum = 0.0f64;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f64;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let mut y = (xb[i] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[c];
             }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f64;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[c];
             }
-            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let mut y = (xb[i] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[c];
-                }
-                if let Some(b) = bias {
-                    y += b[c];
-                }
-                orow[i] = y;
-            }
-        });
+            orow[i] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    } else {
+        out.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    }
     out
 }
 
@@ -5482,35 +5510,43 @@ pub fn group_norm_forward_f32(
     let group_numel = cpg * spatial;
     let inv_m = 1.0 / group_numel as f32;
     let mut out = vec![0.0f32; batch * num_groups * group_numel];
-    out.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, orow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let mut sum = 0.0f32;
-            for &v in xb {
-                sum += v;
+    let group_fn = |grp: usize, orow: &mut [f32]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let mut sum = 0.0f32;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f32;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let mut y = (xb[i] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[c];
             }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f32;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[c];
             }
-            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let mut y = (xb[i] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[c];
-                }
-                if let Some(b) = bias {
-                    y += b[c];
-                }
-                orow[i] = y;
-            }
-        });
+            orow[i] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    } else {
+        out.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    }
     out
 }
 
