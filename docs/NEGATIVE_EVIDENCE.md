@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN: two-pass parallel nonzero — 6-7x internal, FLIPS ~2-3x SLOWER -> 1.7-2.4x FASTER vs torch
+
+Agent `BlackThrush`. `nonzero_tensor_contiguous_f64` (torch.nonzero, ft-kernel-cpu) ran a SERIAL scan
+that integer-divides each nonzero's flat index into ndim coordinates. torch's own nonzero is poorly
+parallelized (~4.7 GB/s on a dense 8k×8k = 114ms). ★KEY: a naive parallel compaction (per-chunk collect
++ SERIAL concat) only wins SPARSE (concat of the big output caps dense at 1.18x) — so use a TWO-PASS
+counting compaction: (1) par count nonzeros per chunk, (2) exclusive-prefix the counts to carve DISJOINT
+output sub-slices (`split_at_mut` per chunk), (3) each chunk writes its coords into its own slot in
+parallel — NO serial concat. Wins across ALL densities. BIT-IDENTICAL to serial: same predicate
+(v!=0 || NaN, NaN=nonzero), same coord math, ascending flat order preserved within + across chunks →
+row-major. Gated numel>=65536.
+
+★MEASURE — standalone A/B (f64, 64t, min-of-7, bit-exact) + real torch.nonzero 2.12.1 (best 8/32/64t):
+8192² dens=50% serial 329 -> par 47.1ms (7.0x); torch 114 => **2.42x FASTER**. 16384×4096 dens=10%
+102->16.9 (6.0x); torch 37 => **2.19x**. 8192² dens=1% 53->15.1 (3.5x); torch 25 => **1.67x FASTER**.
+Bench scratchpad/nzab. Lock test nonzero_two_pass_parallel_matches_serial_reference_bit_exact (mixed
+density + exact NaN + negatives); 567 ft-kernel-cpu green. Shipped 0c267767. ★LESSON: for a
+DATA-DEPENDENT-size stream compaction (nonzero/masked_select/unique), the two-pass count→prefix→
+parallel-direct-write beats per-chunk-collect+concat because it kills the serial concat tail — the
+concat is what caps the naive parallel compaction on dense inputs. ★FINDER (3rd serial-kernel win this
+run): the `for flat in 0..numel { if nonzero { emit } }` compaction with a per-element integer-divide
+coord decomposition = a compute+bandwidth serial scan torch doesn't parallelize.
+
 ## 2026-07-03 - ★★WIN: parallelize per-output-channel int8 weight quant — 10-23x internal, bit-exact (asymmetric-sibling)
 
 Agent `BlackThrush`. Same finder as the cross f64 fix — a SERIAL loop whose PARALLELIZED SIBLING sits
