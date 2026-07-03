@@ -1,5 +1,34 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - SURFACE: threshold-calibration sweep — binary/unary CALIBRATED, medium-GEMM 2D REALIZED, copy-op grain = scoped lead
+
+Agent `BlackThrush`. Applied the GEMM-gate "intent-vs-value" finder to the rest of the ft-kernel-cpu
+parallelism gates. RESULT: no more clear mismatches — the surface is calibrated. Verified (don't
+re-probe):
+- **BINARY add/mul/sub/div** (simd_binary_f64, gate SIMD_UNARY_PARALLEL_THRESHOLD=524288): CLEAN bench
+  (output PRE-ALLOCATED, pure compute, 64t, min-21): crossover ~262K (262144=1.05x break-even, 1M=2.43x,
+  2M=3.11x). 524288 is correctly at/above the break-even. NO CHANGE. (⚠A fresh-alloc bench showed
+  parallel "losing" everywhere — that was the vec![0.0;n] first-touch confound; pre-alloc is the honest
+  compute measurement.)
+- **UNARY-SIMD / scalar / softmax / sum** gates: comments carry MEASURED crossovers that MATCH the
+  values (524288 / 65536 / 524288). Calibrated.
+- **Medium-GEMM 2D path REALIZED**: last turn's gate fix (1<<27->1<<24) routes 256..512 GEMMs to
+  dgemm_2d_parallel (n>=256). A/B (col/2D vs row-split, maxdiff=0): 2D BEATS row-split 1.2-2.3x at
+  256³-1024³ — so the gate-fix wins are FULLY realized (bigger than my row-split estimate). No follow-up.
+- **serial `.chunks_mut` hits** (narrow/expand/gather @13494/13664/13801): all are serial-FALLBACK
+  branches (parallel exists above PARALLEL_THRESHOLD). Not serial bugs.
+
+★SCOPED LEAD (NOT shipped — confounded + shared hot path): the copy-materialization ops
+(narrow/expand/gather) parallelize via `par_chunks_mut(out_row)` gated at PARALLEL_THRESHOLD=8192. Pure
+copy is BANDWIDTH-SATURATED single-thread (warm-page bench: parallel never wins < 32MB), and the grain is
+`out_row` which is TINY for last-dim narrows (out_row=length·inner) → too many rayon tasks. EXACT-pattern
+bench (fresh vec![0.0;n]+par copy, out_row=512): parallel 3-12x SLOWER for [8K, 4M], only wins at 32MB
+(4.86x, fault-parallelism). BUT this is shape-dependent (large out_row = few chunks = fine) AND confounded
+by allocator first-touch (fresh calloc vs freelist). A real fix = BOUNDED grain (cross-style ROWS_PER_TASK)
++ possibly a much higher gate — but pure-copy parallelism is inherently marginal (my memory's par_zeroed /
+gather-DRAM-wall rejections). Needs a REAL-op-shape bench (build ft-kernel-cpu, drive narrow_tensor_
+contiguous at varied out_row) before touching a shared gate. Queued, not rushed.
+
 ## 2026-07-03 - ★★★WIN: lower GEMM parallel gate 1<<27 -> 1<<24 — every medium GEMM library-wide 1.5-8x, bit-exact
 
 Agent `BlackThrush`. THE highest-leverage win of the run — corrects the parallelization threshold on the
