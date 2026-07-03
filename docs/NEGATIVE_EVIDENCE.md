@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: masked_select parallel fast path — serial FINAL CONCAT was eating the win; parallel copy-out → +3x at high density, ~10x vs torch, bit-exact
+
+Agent `BlackThrush`. Pivoted OUT of the ft-kernel-cpu no-gate vein into a torch-slow-op hunt. A warmed torch
+probe (8t) flagged `masked_select` at **154ms/16M** (torch's compaction is single-threaded). FT's
+`tensor_masked_select` ALREADY had a no-grad parallel stream-compaction fast path (per-chunk collect into
+`Vec<Vec<T>>`) — BUT it finished with a SERIAL `for p in &parts { out.extend_from_slice(p) }` concat. For a
+dense mask (~50%) that concat single-threadedly copies the whole ~8-15M output, eating the parallel-collect
+win: measured the current parA path at only **1.03-1.13x vs serial** at dens 0.5-0.9.
+
+★MEASURE (standalone, 16M f64, 64t, min-9, all variants bit-identical via assert_eq): serial-collect vs the
+parallel approaches — current parA (collect+serial-concat) 1.10x@0.5 / 1.09x@0.9; **parE (collect + PARALLEL
+copy-out to disjoint preallocated slices) 3.02x@0.5 / 3.56x@0.9 / 2.83x@0.1**. parE = **~3x over the current
+shipped fast path** at moderate/high density, and matches parA at low density (small output → the concat is
+cheap, so parE keeps a serial concat there). vs torch's 154ms serial: parE ~15ms = **~10x** (torch's
+masked_select does not parallelize — thread-independent).
+
+★FIX: hybrid on output size — after the parallel per-chunk collect, if `total < MOVEMENT_COPY_PARALLEL_MIN`
+(1<<22, copy-tier fault-parallelism crossover) keep the serial concat (cheap, no regression at low density);
+else split the preallocated output into disjoint `&mut` slices (`split_at_mut` by the parts' prefix-sum
+offsets) and `copy_from_slice` each part across the pool. Order-preserving (parts are row-major chunk order,
+offsets are prefix sums) => BIT-IDENTICAL to the serial concat AND to the index_select gather fallback. f32+f64
+(the `compact!` macro covers both). 7 masked_select tests green incl backward + f16 + broadcast (rch). ★LESSON:
+a "parallel fast path" can still be Amdahl-capped by a SERIAL TAIL (here the final concat) — profile the whole
+op, not just the map. The parallel-collect was correct; the serial gather-up of the results was the wall. The
+same disjoint-slice `split_at_mut` + parallel `copy_from_slice` pattern applies to ANY parallel op that
+collects variable-length per-chunk parts then concatenates (nonzero-family, unique, compaction).
+
 ## 2026-07-03 - WIN: pool1d + pool3d FORWARDS had the SAME no-gate bug → 0.64-0.69x SLOWER small; gated, bit-exact (pool family complete)
 
 Agent `BlackThrush`. Completing the pool family after the pool2d gate (7b65e078). The fused `avg_pool1d_forward_f64`,
