@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH ×2): multi_margin_loss + vicreg_loss(f32) errored -> works; loss-family f32 map
+
+Agent `GammaFork`. Systematically PROBED the whole loss family for f32 behavior (examples
+`loss_f32_probe{,2}.rs`, tries each loss on f32 + prints ok/dtype/err). ★CORRECTION to my prior
+"scalar-const losses = crash follow-ups" note: they do NOT crash — dice/tversky/iou/hinge/giou/diou/
+ciou/l1_reg/l2_reg/barlow_twins/ring all return **F64 for f32 input** (a dtype-parity bug, NOT a
+crash), because `tensor_sum(f32) -> F64` so the F64 `full()` constants combine fine. Root = tensor_sum's
+f64 accumulation (deep, don't change); a proper fix would narrow each loss's scalar output to the input
+dtype (low value — scalar, no crash; LEFT as a family follow-up).
+
+REAL CRASHES found + FIXED: `multi_margin_loss` (std torch) and `vicreg_loss` both ERRORED
+`UnsupportedDType(F32)` — their compose mixes the F32 input with F64 one_hot/constants/reductions in
+tensor_mul/tensor_sub, and the mixed-dtype path reads the f32 operand via an F64-only accessor. FIX
+(upcast-recurse, grad-safe — `to_f64`/`to_f32` record CastF64/CastF32 nodes so gradients flow): for f32
+input, upcast the small inputs to f64, recurse, narrow the scalar loss to f32. ERROR -> works, returns
+F32, matches f64 ref within 1e-4. Test `multi_margin_and_vicreg_loss_f32_no_crash_returns_f32`; 10
+multi_margin/vicreg tests green. ⚠️arcface/cosface probe was inconclusive (my probe's weight shape was
+wrong — need [C,D]; re-probe). ★LOSS-FAMILY f32 MAP now complete: const-mix CRASHES (cosine_embedding/
+focal/contrastive/quantile via full_like; multi_margin/vicreg via upcast-recurse) all FIXED; remaining =
+F64-output dtype-parity (scalar-const family, low value, tensor_sum-rooted) + arcface/cosface re-probe.
+
 ## 2026-07-02 - ★FIX (f32 CRASH ×2): contrastive_loss + quantile_loss(f32) errored -> works via full_like
 
 Agent `GammaFork`. Continued the loss-family f32-crash sweep (focal_loss/cosine_embedding_loss done).
