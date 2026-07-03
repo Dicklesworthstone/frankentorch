@@ -40,6 +40,16 @@ FAULT-parallelism crossover (~4M/32MB, where serial first-touch of lazy-calloc d
 compute default — the compute default regresses every medium copy. (gather NOT touched: random-read,
 different access pattern, memory's DRAM-wall rejection stands.)
 
+★★EXTENDED to cat/stack 9c4d61b3: same bug — cat_tensor_contiguous_f{32,64} + stack_f{32,64} are pure
+copy but gated at 8192. Bench (cat pattern: fresh vec+par_chunks_mut(64K) copy): parallel 0.38-0.75x for
+[131072, 2M] (cat[524288] 328us->124us serial = 2.6x), wins 7.5x only >=4M. Switched all 4 to
+COPY_MATERIALIZE_PARALLEL_MIN. ★The prior "cat/stack dim=0 3.3x" win was necessarily measured at a LARGE
+(>=4M) size (fault-parallelism regime) — PRESERVED (>=4M stays parallel); only medium reverts to serial.
+★ft-kernel-cpu PURE-COPY set now COMPLETE: narrow/expand/cat/stack (f64+f32, 8 gates) at 1<<22; gather
+left (random-read). FOLLOW-UP (ft-api, not ft-kernel-cpu): flip/roll/repeat/tile/repeat_interleave are
+ft-api-level movement ops — if they parallelize a pure copy at a low threshold, same medium-regression;
+their shipped wins were likely measured at large sizes. Check when in ft-api.
+
 ## 2026-07-03 - ★★★WIN: lower GEMM parallel gate 1<<27 -> 1<<24 — every medium GEMM library-wide 1.5-8x, bit-exact
 
 Agent `BlackThrush`. THE highest-leverage win of the run — corrects the parallelization threshold on the
