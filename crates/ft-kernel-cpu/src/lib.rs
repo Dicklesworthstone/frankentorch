@@ -2284,6 +2284,17 @@ fn checked_dim_loop_sizes(
 
 const PARALLEL_THRESHOLD: usize = 8192;
 
+// Gate for PURE-COPY / broadcast-fill MATERIALIZATION (narrow, expand): these do
+// NO per-element compute (just `copy_from_slice` / `fill`), so a single thread
+// already saturates memory bandwidth — rayon adds only overhead. Measured
+// (fresh `vec![0.0;n]` + `par_chunks_mut` copy, 64t, min-21): parallel is 3-12x
+// SLOWER than serial across [8K, 4M] elems, and only WINS at >=~4M (32MB), where
+// the win is parallel FIRST-TOUCH of the lazy-`calloc` output (serial first-touch
+// is the bottleneck, not the copy). So gate these at the fault-parallelism
+// crossover, NOT the compute default `PARALLEL_THRESHOLD` (8192) which regressed
+// every medium copy. frankentorch-kgs4-copygate.
+const COPY_MATERIALIZE_PARALLEL_MIN: usize = 1 << 22; // ~4.19M elems (~32MB f64)
+
 // The SIMD unary ops (relu/sqrt/reciprocal/...) were SERIAL while the scalar-map
 // unary path (exp/tanh/...) parallelises — so relu was ~36-59x slower than torch
 // at large N purely from single-threading. Parallelise above this gate (cheap
@@ -13484,7 +13495,11 @@ pub fn narrow_tensor_contiguous_f64(
         let base = outer * src_stride + src_start;
         orow.copy_from_slice(&data[base..base + out_row]);
     };
-    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Pure-copy materialization: gate at the fault-parallelism crossover, not the
+    // compute default (see COPY_MATERIALIZE_PARALLEL_MIN) — parallel regressed every
+    // medium narrow 3-12x. Bit-identical either way (same elements, same order).
+    if outer_size > 1 && out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1
+    {
         use rayon::prelude::*;
         output
             .par_chunks_mut(out_row)
@@ -13655,7 +13670,10 @@ pub fn expand_tensor_contiguous_f64(
             row.copy_from_slice(&input[base..base + inner]);
         }
     };
-    if out_numel >= PARALLEL_THRESHOLD {
+    // Pure broadcast-fill/copy: gate at the fault-parallelism crossover, not the
+    // compute default (see COPY_MATERIALIZE_PARALLEL_MIN) — same bandwidth-bound
+    // regression as narrow. Bit-identical either way.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         output
             .par_chunks_mut(inner)
             .enumerate()
@@ -31144,7 +31162,10 @@ pub fn narrow_tensor_contiguous_f32(
         let base = outer * src_stride + src_start;
         orow.copy_from_slice(&data[base..base + out_row]);
     };
-    if outer_size > 1 && out_numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+    // Pure-copy: fault-parallelism gate, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN; f32 mirror of narrow_tensor_contiguous_f64).
+    if outer_size > 1 && out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1
+    {
         use rayon::prelude::*;
         output
             .par_chunks_mut(out_row)
@@ -31214,7 +31235,9 @@ pub fn expand_tensor_contiguous_f32(
             row.copy_from_slice(&input[base..base + inner]);
         }
     };
-    if out_numel >= PARALLEL_THRESHOLD {
+    // Pure broadcast-fill/copy: fault-parallelism gate (see COPY_MATERIALIZE_PARALLEL_MIN;
+    // f32 mirror of expand_tensor_contiguous_f64).
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         output
             .par_chunks_mut(inner)
             .enumerate()
