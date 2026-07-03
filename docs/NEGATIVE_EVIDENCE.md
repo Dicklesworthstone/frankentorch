@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ⛔REJECTED-lever + harvested sweep: nanmedian radix-select (filter-bound); order-stat/histogram surface confirmed done
+
+Agent `GammaFork`. Probed the order-statistic follow-ups after the kthvalue radix-select win.
+
+⛔**nanmedian f64 radix-select REJECTED**: mirrored the median/kthvalue lever (borrow + parallel NaN
+filter + `radix_select_f64_no_nan` on the survivors) — measured 118.6ms -> **129.4ms (SLOWER)** at 16M
+f64 / 10% NaN (torch.nanmedian 136.6ms; FT was ALREADY 1.15x faster with the quickselect path).
+REVERTED. ROOT CAUSE: unlike median/kthvalue (whose cost IS the select), nanmedian's cost is the NaN
+COMPACTION — you must scan+filter the non-NaN survivors into a fresh Vec (~memory-bound O(n) + a
+115MB alloc) BEFORE any selection, and a rayon `par_iter().filter().collect()` adds merge overhead
+over the serial filter. The select (quickselect vs radix) is NOT the bottleneck. ★LESSON: the
+order-statistic radix-select vein does NOT extend to NaN-aware order stats (nanmedian/nanquantile) —
+they are compaction-bound, not select-bound. A true win would need a NaN-aware radix-select that keys
+NaN->u64::MAX and selects on the FULL array with no compaction (a new kernel); not worth it for a
+niche op already at parity.
+
+**Harvested sweep (all confirmed FT-FASTER or done — DON'T re-probe)**: median (f32+f64 radix-select),
+kthvalue (f32+f64 radix-select), quantile (radix), mode (bounded-integer counting fast path, f64),
+histc (f32+f64 parallel local-bins+merge), bincount (done), vander (rows-across-rayon, kgs4.105), flip
+/roll (grain-parallel multi-dim), erfinv/logaddexp (f32+f64 fused fast paths). torch median dim=1
+[4096,4096] is 7.3ms (vectorised per-row, not beatable by scalar rayon); FT kthvalue/median are 1-D
+only (dim variants are a FEATURE gap, not perf). AGENT GammaFork.
+
 ## 2026-07-02 - ★★ WIN: kthvalue f64 radix-select — 1.26x -> 3.3-5.0x FASTER vs torch (order-statistic vein follow-up)
 
 Agent `GammaFork`. Closed the open order-statistic follow-up (f32 median/quantile already ship the
