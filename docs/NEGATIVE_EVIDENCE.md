@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact): ball_query parallelized over queries — 4.34x internal (7.33->1.69ms)
+
+Agent `GammaFork`. Point-cloud follow-up (application-level serial-op vein): `ball_query` (PointNet++
+neighborhood op) ran serial `for b { for qi { for pi {scan} } }`. Each (b, qi) query independently scans
+points in order taking the first max_samples within radius, writing a DISJOINT max_samples-sized output
+slot. Refactored to a per-chunk `fill(chunk_idx, slot)` closure + `par_chunks_mut(max_samples)` (one
+chunk per query; gated batch*queries*points >= 2^16; serial below keeps small shapes + tests identical).
+Bit-exact: every query's scan order and result unchanged; only the outer (b,qi) iteration parallelizes,
+disjoint writes. New test `ball_query_parallel_matches_serial_reference_bit_exact` (B=4,N=400,M=64 ->
+parallel path, asserts non-vacuous) computes an independent serial reference and asserts to_bits()
+equality on all outputs.
+
+MEASURED (cc-local, same-binary RAYON A/B, B=16,N=4096,M=1024,max_samples=32,r=0.1, ~67M dist scans,
+load ~18): serial 7.33 -> parallel 1.69 ms = **4.34x internal**. Modest vs roi_align's 23.7x because the
+inner distance scan (3 sub/3 mul/2 add/1 cmp per point) AUTO-VECTORIZES well and the per-batch points
+(~98KB) stay L2-resident, so ball_query is partly cache/bandwidth-bound — less pure compute to amortize.
+★vs-PyTorch: torch_cluster.ball_query is multithreaded/CUDA; torch-core equivalent is cdist+threshold
+(different work profile). Not installing torch_cluster (shared venv). Internal-A/B + qualitative.
+★FOLLOW-UP (same recipe, NEXT): knn_search (right after ball_query, per-query k-nearest selection —
+parallelize over queries) + farthest_point_sampling (needs pre-drawn RNG for the random first point).
+Bench: examples/ball_query_h2h.rs.
+
 ## 2026-07-03 - WIN (bit-exact): roi_pool + ps_roi_pool parallelized — 5.79x / 3.32x internal (completes ROI family)
 
 Agent `GammaFork`. The roi_align follow-up (same application-level serial-op vein): roi_pool (max) and
