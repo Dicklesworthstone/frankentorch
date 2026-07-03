@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH ×2): arcface_loss + cosface_loss(f32) errored -> works (upcast-recurse)
+
+Agent `GammaFork`. Completed the loss-family f32-crash sweep. `arcface_loss` + `cosface_loss` (std
+face-recognition losses) ERRORED on f32: `cos_theta = matmul(features, weightᵀ)` is F32, mixed with
+F64 `self.full()` constants (margin/scale) in tensor_add/sub/mul. FIX: upcast-recurse (features +
+weight to f64, recurse, narrow scalar loss to f32; to_dtype grad-aware). ⚠️KEY GOTCHA: the first fix
+(upcast features+weight only) STILL crashed — `tensor_one_hot(labels)` ALSO reads labels via an
+F64-only accessor, so f32 labels crash independently. Must upcast LABELS too (integer indices,
+f32→f64 exact). ERROR → works, returns F32, matches f64 ref within 1e-4. Test
+`arcface_cosface_loss_f32_no_crash_returns_f32` (correct shapes: features [N,D], weight [C,D],
+labels [N]). ★LESSON: for a compose-crash fix, upcast EVERY user tensor the compose touches
+(features/weight AND labels via one_hot) — a partial upcast leaves a secondary F64-only read.
+
+★LOSS-FAMILY f32 CRASH SWEEP COMPLETE (6 losses fixed across 4 commits): cosine_embedding/focal/
+contrastive/quantile (full_like native-dtype consts) + multi_margin/vicreg/arcface/cosface
+(upcast-recurse). Remaining loss-family f32 = F64-OUTPUT dtype-parity ONLY (dice/tversky/iou/hinge/
+giou/diou/ciou/l1_reg/l2_reg/barlow_twins/ring return F64 for f32 — no crash, tensor_sum(f32)->f64
+rooted, low value). ★TAKEAWAY: `tensor_one_hot` reads labels via an F64-only accessor → any op doing
+one_hot(f32_labels) crashes; a broader `tensor_one_hot` f32-labels fix would retire that whole
+sub-crash-class (follow-up).
+
 ## 2026-07-02 - ★FIX (f32 CRASH ×2): multi_margin_loss + vicreg_loss(f32) errored -> works; loss-family f32 map
 
 Agent `GammaFork`. Systematically PROBED the whole loss family for f32 behavior (examples
