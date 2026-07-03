@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact): roi_align parallelized over output elements — 23.7x internal (436->18ms)
+
+Agent `GammaFork`. Same vein as ctc (APPLICATION-LEVEL composite ops the core kgs4 campaign didn't
+cover): `roi_align` (torchvision op) ran a FULLY SERIAL 6-deep nested loop
+(roi_idx x ch x out_h x out_w x sample_pts^2), NO parallelism — 436ms for a realistic Faster-R-CNN
+shape. Every output element [roi_idx,ch,ph,pw] is an INDEPENDENT bilinear-sampled average, so
+refactored to one `compute(out_idx)` closure (unravel flat index -> roi/ch/ph/pw; box params
+recomputed per-output, cheap vs the sample_pts^2 taps) and parallelized `output.par_iter_mut()` over
+the flat output (gated output.len()>=4096; serial below keeps small shapes + lib tests on the identical
+closure). Bit-exact: per-output (iy,ix) accumulation order unchanged, disjoint writes; only the OUTER
+iteration order changes. New test `roi_align_parallel_matches_serial_reference_bit_exact` (K=16,C=8,
+8x8 out = 8192 outputs -> parallel path) computes an INDEPENDENT serial reference (the original nested
+loop) and asserts to_bits() equality on all 8192 outputs. Existing f32 test green.
+
+MEASURED (cc-local, same-binary RAYON A/B, [N=1,C=256,H=50,W=50,K=512,out=7x7,sr=2] ~25.7M bilinear
+taps, load ~30): serial 436.42 ms -> parallel 18.43 ms = **23.7x internal** (scales ~linearly; would be
+higher on a clean host — this was under load 30). ★vs-PyTorch note: torchvision.ops.roi_align is a
+MULTITHREADED C++ op, so FT-serial (436ms) was catastrophically behind and FT-parallel (18ms) is now in
+its ballpark (torchvision's SIMD 4-tap gather may still edge it — the same gather-SIMD wall as
+grid_sample). Did NOT install torchvision for a direct ratio: /tmp/torchvenv is a SHARED peer resource
+and installing torchvision could upgrade/break torch for other agents. ★FOLLOW-UP (same recipe, next):
+roi_pool (max instead of avg) + ps_roi_pool (position-sensitive) are siblings with the same serial
+nested loop — parallelize over outputs identically. Bench: examples/roi_align_h2h.rs.
+
 ## 2026-07-03 - ⛔REJECTED-lever (~0-gain): ctc_loss alpha/beta Vec<Vec>->flat-Vec flatten (transcendental-walled)
 
 Agent `GammaFork`. Tested the follow-up I queued when shipping the ctc batch-parallel win (a34d085e):
