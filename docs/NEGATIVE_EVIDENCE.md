@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★FIX f32 matrix_exp grad (errored -> works) + BLOCKER: single-matrix matrix_exp GEMM-walled
+
+Agent `GammaFork`. Used the disk-free TORCH BACKWARD-COST PROBE (fwd vs fwd+bwd timing) to find winnable
+backward levers: only `matrix_exp` stood out (torch bwd 41ms vs fwd 5ms, ratio ~5.4x — the Fréchet
+derivative). ⛔BLOCKER (measured, not a lever): FT's SINGLE 2-D matrix_exp is GEMM-walled — [400,400]
+f64 fwd 50.2ms vs torch 5.1ms (9.8x SLOWER), bwd 109ms vs 41ms (2.7x SLOWER). FT's block-2n Fréchet
+backward reuses the SAME (correct) `matrix_exp_contiguous_f64` kernel as the forward, so both inherit
+FT's scalar `matrixmultiply` GEMM (~52 GF/s/core) vs torch's MKL. Memory's "matrix_exp 3.7-10.5x FASTER"
+is the BATCHED path (parallelize over planes, beat torch's serial per-plane loop) — a SINGLE large
+matrix has no batch parallelism and loses on raw GEMM. This is PEER ft-kernel-cpu GEMM scope (see
+[[project_gemm_bandwidth_vein]] packed-panel lever), NOT ft-api. Bench `examples/matrix_exp_bwd_h2h.rs`.
+
+★WIN found alongside: f32/f16/bf16 matrix_exp WITH grad previously ERRORED ("autograd only supported
+for a square F64 matrix" — the block-2n grad path is F64-only). Fixed via upcast-recurse (upcast to f64,
+run the f64 grad path, narrow output; to_dtype grad-aware so the f32 input gets f32 grads). f32+grad:
+ERROR -> works, returns F32, gradient flows, values match f64 within 1e-5. Test
+`matrix_exp_f32_grad_no_crash_returns_f32`. ★The backward-probe also cleared cumprod(2.4x)/sort(0.1x)/
+softmax(0.8x)/logsumexp(1.0x) backward as non-levers. ★PERF FRONTIER: the ft-api-lane perf surface is
+harvested — remaining gaps are PEER (GEMM/ft-kernel-cpu: matrix_exp, corrcoef, single-matrix linalg) or
+DEEP multi-session (grid_sample LEVER-2, multishift-QR). ft-api levers now = correctness/dtype (f32
+parity), not raw perf.
+
 ## 2026-07-03 - ★FIX (f32 CRASH ×3): farthest_point_sampling/ball_query/group_points on f32 points + 2 perf non-gaps
 
 Agent `GammaFork`. Point-cloud ops (PointNet/DGCNN) read `points`/`queries`/`indices` via the F64-only
