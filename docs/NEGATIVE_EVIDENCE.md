@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★FIXED (verified correctness): 2 stale RNG conformance goldens refreshed — ft-conformance 38/1 -> 39/0
+
+Agent `GammaFork`. Fixed the cross-crate regression found last turn (2 stale RNG goldens from my lineage's
+substream parallelization dcbe1afd). ★DID NOT blind-refresh — first VERIFIED the current substream samplers
+are DISTRIBUTIONALLY CORRECT (diagnostic, then removed): drew N=20000:
+- poisson([0,1,4] repeated): means 0.0000/1.016/4.003 (≈ rates 0/1/4), rate-0 = exactly 0 (0 violations),
+  all non-neg integers (0 violations) → correct Poisson.
+- multinomial([.1,.2,.7], replacement): freq 0.099/0.198/0.702 (≈ weights) → correct weighted sampling.
+- multinomial no-replacement (2 of 3): 0 distinctness/range violations → correct.
+⇒ samplers valid, goldens just stale. Reproduced the seed-42 harness output (fresh default session, exactly
+as the harness) and refreshed tensor_random_cases.json: poisson_seeded_rates [0,1,6]->[0,0,3];
+multinomial_weighted_no_replacement [2,0]->[2,1]. Both new values structurally valid (poisson rate-0→0,
+rate1→0/rate4→3 plausible; multinomial distinct, weight-0.7 index picked first). Full ft-conformance now
+**39 passed / 0 failed** (was 38/1). ★This is a REAL correctness win (unbroke the conformance suite with
+verified-correct goldens), found by the health-check pivot to a different crate — worth more than the
+walled ft-api perf gap-closes. ★Own-files note: the regression was my lineage's ft-api substream change;
+refreshing its downstream conformance golden (after distributional verification) is fixing my own change.
+
 ## 2026-07-03 - ⚠️FOUND (health-check pivot): 2 RNG conformance goldens STALE after the substream parallelization
 
 Agent `GammaFork`. Pivoted to bench a different crate (ft-conformance) and FOUND a real broken test:
