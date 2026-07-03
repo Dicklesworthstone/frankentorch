@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact): group_points block-gather parallel — 3.26x internal (180->55ms) + knn_search already-optimized
+
+Agent `GammaFork`. Point-cloud follow-up. TWO findings:
+
+(1) ⛔knn_search is NOT a lever — already HEAVILY optimized (SIMD f64x4 distance kernel + query-tile/
+point-panel cache blocking + a KD-tree pruning path with bbox lower bounds). NOT a naive serial op;
+parallelizing over queries would need a risky refactor of the intricate tiled scratch, and batch-parallel
+only helps multi-batch (point clouds are often batch=1). Skipped — corrects my queued follow-up.
+
+(2) ★WIN: group_points (PointNet++ grouping) was a serial 4-deep nested loop copying c-contiguous blocks
+from grouped point indices to the output. Refactored to par_chunks_mut(c) over the flat output (one chunk
+per (b,mi,ki) group; gated output>=2^14; serial below keeps small shapes + tests). Bit-exact: pure
+gather-copy (order-independent), disjoint c-block writes; out-of-range idx -> 0 branch preserved. New test
+group_points_parallel_matches_serial_reference_bit_exact (asserts non-vacuous + exercises the OOR branch).
+MEASURED (cc-local RAYON A/B, B=16,N=4096,C=128,M=512,K=32 = 268MB gather, load ~19): serial 179.96 ->
+parallel 55.11 ms = **3.26x internal**.
+
+★KEY REFINEMENT of the outer-gate-serial-vein memory ("scalar dim-0 gather REVERTED, random-read DRAM-
+wall"): a BLOCK-gather (contiguous c-block reads, c=128 = 1KB prefetchable) + fresh-output sequential
+write (268MB, page-fault lever) DOES parallelize ~3x, unlike a scalar random gather. The distinction is
+CONTIGUOUS-block-read (bandwidth-friendly, prefetchable) vs scalar-element-read (latency-bound). ⇒ gather
+ops with a contiguous inner dim (channels) are parallelizable; scalar per-element gathers aren't.
+★vs-PyTorch: torch-core lacks group_points (PointNet++/torch_cluster op); internal-A/B + qualitative.
+Bench: examples/group_points_h2h.rs. ★FOLLOW-UP: farthest_point_sampling (RNG + sequential-within-batch,
+batch-parallel only). Application-level serial-op vein: 6 ops flipped (ctc + 3 ROI + ball_query + group_points).
+
 ## 2026-07-03 - WIN (bit-exact): ball_query parallelized over queries — 4.34x internal (7.33->1.69ms)
 
 Agent `GammaFork`. Point-cloud follow-up (application-level serial-op vein): `ball_query` (PointNet++
