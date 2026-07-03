@@ -5767,40 +5767,48 @@ pub fn group_norm_backward_f64(
         return (dx, dweight, dbias);
     }
     let mut dx = vec![0.0f64; batch * num_groups * group_numel];
-    dx.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, dxrow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let dyb = &dy[base..base + group_numel];
-            let mut sum = 0.0f64;
-            for &v in xb {
-                sum += v;
-            }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f64;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-            let mut c1 = 0.0f64;
-            let mut c2 = 0.0f64;
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
-            }
-        });
+    let dx_grp = |grp: usize, dxrow: &mut [f64]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let dyb = &dy[base..base + group_numel];
+        let mut sum = 0.0f64;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f64;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        let mut c1 = 0.0f64;
+        let mut c2 = 0.0f64;
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per group): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    } else {
+        dx.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    }
     let need_affine = weight.is_some();
     let (dweight, dbias) = if need_affine {
         let mut dw = vec![0.0f64; channels];
@@ -5857,40 +5865,48 @@ pub fn group_norm_backward_f32(
         );
     }
     let mut dx = vec![0.0f32; batch * num_groups * group_numel];
-    dx.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, dxrow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let dyb = &dy[base..base + group_numel];
-            let mut sum = 0.0f32;
-            for &v in xb {
-                sum += v;
-            }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f32;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
-            let mut c1 = 0.0f32;
-            let mut c2 = 0.0f32;
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
-            }
-        });
+    let dx_grp = |grp: usize, dxrow: &mut [f32]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let dyb = &dy[base..base + group_numel];
+        let mut sum = 0.0f32;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f32;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+        let mut c1 = 0.0f32;
+        let mut c2 = 0.0f32;
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per group): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    } else {
+        dx.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    }
     let need_affine = weight.is_some();
     let (dweight, dbias) = if need_affine {
         let mut dw = vec![0.0f32; channels];
