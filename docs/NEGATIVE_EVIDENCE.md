@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 DTYPE ×4): dice/tversky/iou/hinge losses returned F64 for f32 (f32-training bug)
+
+Agent `GammaFork`. NOT a crash — the SCALAR-const segmentation/detection/SVM losses (dice_loss,
+tversky_loss, iou_loss, hinge_loss) build `self.full(vec![1], ..)` [F64] constants and combine them with
+`tensor_sum(f32) -> F64` reductions, so f32 input silently returned an **F64 loss** (torch returns f32).
+For f32 TRAINING that means f64 grads flow back to f32 params — a real parity/dtype bug, not cosmetic.
+FIX via upcast-recurse (grad-safe CastF64/F32): for f32 input, upcast input+target to f64, recurse,
+narrow the loss to f32 — so the output AND the backprop'd grads are f32. Values match f64 within 1e-5.
+Test `segmentation_losses_f32_return_f32`. ⚠️ANCHORING TIP: dice/iou are near-identical code — anchor
+the guard on the UNIQUE `pub fn <name>(` signature prefix (not the shared body) to place a top-of-fn
+guard. ⚠️pixel_shuffle/unshuffle PERF probed + SKIPPED: torch is 18.3ms at the 16M-f64 bandwidth floor
+(read+write 128MB), FT (reshape+permute+reshape, one materialization) can only match it — no >2x win.
+
+★f32 PARITY SESSION TALLY: 20 crash fixes (nms/scatter/roi/ViT/RNN/seq-pack) + 4 dtype fixes (focal/
+cosine-family earlier + these 4 losses) across the application layer. Recipes: lossy_f64(±narrow),
+upcast-recurse (many-read / scalar-const-reduction). Remaining: point-cloud (farthest_point_sampling/
+ball_query/group_points — f32-native points), gru_cell/lstm_cell, graph int-index ops (low value).
+
 ## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): pack_sequence/pack_padded_sequence/pad_packed_sequence
 
 Agent `GammaFork`. Continued the sequence-model f32 sweep (complements the RNN fix). The variable-length
