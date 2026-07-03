@@ -4846,36 +4846,45 @@ pub fn layer_norm_backward_f64(
         return (dx, dweight, dbias);
     }
     let mut dx = vec![0.0f64; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f64;
-            for &v in xrow {
-                sum += v;
-            }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f64;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            let mut c1 = 0.0f64;
-            let mut c2 = 0.0f64;
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f64;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f64;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        let mut c1 = 0.0f64;
+        let mut c2 = 0.0f64;
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN) so
+    // small-batch training backward isn't over-parallelized. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     // Affine grads: deterministic serial reduction over rows (cache-friendly,
     // run-to-run stable — a parallel float reduce would reorder the sum).
     let mut dweight = vec![0.0f64; norm_size];
@@ -4974,36 +4983,45 @@ pub fn layer_norm_backward_f32(
         return (dx, dweight, dbias);
     }
     let mut dx = vec![0.0f32; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f32;
-            for &v in xrow {
-                sum += v;
-            }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f32;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0f32 / (vsum * inv_n + eps).sqrt();
-            let mut c1 = 0.0f32;
-            let mut c2 = 0.0f32;
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f32;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f32;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0f32 / (vsum * inv_n + eps).sqrt();
+        let mut c1 = 0.0f32;
+        let mut c2 = 0.0f32;
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN),
+    // f32 mirror of layer_norm_backward_f64. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     let mut dweight = vec![0.0f32; norm_size];
     let mut dbias = vec![0.0f32; norm_size];
     for r in 0..batch {
@@ -5192,27 +5210,35 @@ fn rms_norm_backward_f64_generic(
 ) -> (Vec<f64>, Option<Vec<f64>>) {
     let inv_n = 1.0 / norm_size as f64;
     let mut dx = vec![0.0f64; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f64;
-            for &v in xrow {
-                ss += v * v;
-            }
-            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
-            let mut c = 0.0f64;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                c += g * xrow[j];
-            }
-            let coef = rstd * rstd * rstd * c * inv_n;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                dxrow[j] = rstd * g - coef * xrow[j];
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f64;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+        let mut c = 0.0f64;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            c += g * xrow[j];
+        }
+        let coef = rstd * rstd * rstd * c * inv_n;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            dxrow[j] = rstd * g - coef * xrow[j];
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     let dweight = weight.map(|_| {
         let mut dw = vec![0.0f64; norm_size];
         for r in 0..batch {
@@ -5255,27 +5281,35 @@ fn rms_norm_backward_f32_generic(
 ) -> (Vec<f32>, Option<Vec<f32>>) {
     let inv_n = 1.0f32 / norm_size as f32;
     let mut dx = vec![0.0f32; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f32;
-            for &v in xrow {
-                ss += v * v;
-            }
-            let rstd = 1.0f32 / (ss * inv_n + eps).sqrt();
-            let mut c = 0.0f32;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                c += g * xrow[j];
-            }
-            let coef = rstd * rstd * rstd * c * inv_n;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                dxrow[j] = rstd * g - coef * xrow[j];
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f32;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0f32 / (ss * inv_n + eps).sqrt();
+        let mut c = 0.0f32;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            c += g * xrow[j];
+        }
+        let coef = rstd * rstd * rstd * c * inv_n;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            dxrow[j] = rstd * g - coef * xrow[j];
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     let dweight = weight.map(|_| {
         let mut dw = vec![0.0f32; norm_size];
         for r in 0..batch {
