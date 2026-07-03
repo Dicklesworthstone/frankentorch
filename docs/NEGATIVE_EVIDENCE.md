@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ⚠️⚠️CORRECTION: pdist is NOT a flip (cold-torch measurement inflated the baseline 5-7x)
+
+Agent `GammaFork`. ★INTEGRITY CORRECTION of my own commit 7274d627. My torch baselines this session
+were measured WITHOUT WARMUP (min-of-N over cold iterations). Re-measuring torch WITH warmup (4 untimed
+iters, then min-of-10-12) shows cold torch inflated 5-7x:
+- **pdist(512,128) p=2 fwd+bwd: cold 21.64ms -> WARM 3.31ms** (torch bwd 3.04ms, SIMD-vectorized, FAST).
+  ⇒ FT fused 6.24ms is **~1.88x SLOWER than torch, NOT 3.47x FASTER**. The commit CLAIM IS WRONG.
+- normalize(2048,256): cold 161ms bwd -> WARM 3.57ms (a 45x cold inflation — flagged & discarded).
+The pdist FUSED BACKWARD CODE STAYS (it is a legit internal improvement over the 4×[n,n] compose,
+bit-exact/tolerance, all 11 pdist tests green) and is a GAP-CLOSE (FT now within ~2x of torch, was
+worse). But it is NOT a torch flip — torch's pdist backward is a fast SIMD kernel (cold-measurement fooled
+the backward-cost probe, which flagged pdist bwd 17.9ms). RE-VERIFIED the other torch-baseline claims WARM:
+- **LRN(16,96,55,55): cold 136.74 -> WARM 128.33ms** (torch LRN genuinely slow via avg_pool3d) ⇒ FT
+  52.05ms flip is REAL, corrected **2.63x -> 2.47x FASTER**. STANDS.
+- **mlsm(256,1024): cold 2.30 -> WARM 3.05ms** ⇒ gap-close direction correct; FT 4.71ms = **1.54x SLOWER**
+  (I'd said 2.05x). STANDS as gap-close.
+- ctc/ROI/point-cloud/color_jitter etc. = internal-A/B or gap-close (FT slower), so cold-torch only made
+  FT look LESS-slow — direction correct, no false flips there.
+
+★★LESSON (adds to peer-bench-contention memory): ALWAYS WARM UP torch (>=4 untimed iters) before the
+timed min-of-N. Cold torch lazily inits/allocs and can read 5-45x slow. The torch backward-cost PROBE (no
+warmup) is fine for RANKING candidates, but the FINAL vs-torch RATIO MUST use warmup. Only genuinely-slow
+torch impls (LRN=avg_pool3d ~128ms warm) survive warmup as flips; fast SIMD kernels (pdist/normalize/
+cdist ~3ms warm) do NOT. ★NET this session's TORCH-CORE flips = LRN only (2.47x, verified warm). pdist =
+gap-close (competitive, not flip). All internal-A/B wins (ROI/point-cloud/color_jitter) unaffected.
+
 ## 2026-07-03 - ★★WIN (TORCH-CORE FLIP): pdist p=2 fused backward — ~2x SLOWER -> 3.47x FASTER vs torch
 
 Agent `GammaFork`. Landed the deep lever queued last turn (torch backward-cost probe found pdist bwd
