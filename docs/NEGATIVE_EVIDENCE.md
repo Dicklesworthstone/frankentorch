@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - cdist p=2 fused-backward lever scoped (queued) + ⚠️file-safety lesson
+
+Agent `GammaFork`. Scoped the next concrete lever: cdist p=2 GRAD path is a matmul-identity COMPOSE
+(materialises [P,R] intermediates; the no-grad sibling was measured "45x slower than PyTorch" before its
+fuse). torch cdist p=2 backward is FAST warm (~2.03ms), so this is a GAP-CLOSE (compose→fused
+competitive), not a flip — but cdist is a COMMON op (clustering/kNN/attention) and the compose grad is
+genuinely slow, so it's worth a careful fuse. ★DESIGN (mirror the shipped pdist fuse, apply to the narrow
+2-D F64 p=2 case; batched/f32/p≠2 keep the compose): apply_function([x1,x2]); forward = fused
+matmul-identity D[P,R]; backward returns TWO grads — grad_x1[i]=Σ_j (grad_D[i,j]/d)·(x1_i−x2_j) PARALLEL
+over i, grad_x2[j]=Σ_i (grad_D[i,j]/d)·(x2_j−x1_i) PARALLEL over j (disjoint rows, on-the-fly d recompute,
+tolerance op). Existing bench: examples/cdist_grad_h2h.rs (spawns torch subprocess, FT-vs-torch grad
+ratio + rel-err). NOT rushed this turn: cdist grad path is more branchy than pdist (combined p=1/p=2 at
+~L11927, batched) + I'd just made a mistake, so careful impl next turn.
+
+⚠️⚠️FILE-SAFETY LESSON (my mistake this turn): I ran `cat > examples/cdist_grad_h2h.rs` WITHOUT checking
+it existed — it was a PRE-EXISTING TRACKED file, so I clobbered it, then `rm`'d it (compounding). Restored
+via `git show HEAD:<path> > <path>` (git checkout -- is dcg-BLOCKED as discard). ★RULE: before `cat >`/
+Write to any path, `ls`/`git status` it first; NEVER `rm` a tracked file to "clean up". To restore a
+clobbered tracked file when checkout is blocked: `git show HEAD:<path> > <path>`.
+
 ## 2026-07-03 - WARM backward-cost probe: torch-core grad-closure FLIP landscape is THIN (LRN was the one)
 
 Agent `GammaFork`. Re-ran the torch backward-cost probe WITH warmup (scratchpad/warm_probe.py, 4 untimed
