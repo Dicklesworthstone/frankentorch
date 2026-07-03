@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★FIX (f32 CRASH ×3): farthest_point_sampling/ball_query/group_points on f32 points + 2 perf non-gaps
+
+Agent `GammaFork`. Point-cloud ops (PointNet/DGCNN) read `points`/`queries`/`indices` via the F64-only
+`tensor_values` → ERRORED UnsupportedDType(F32) on f32 points (native point-cloud dtype). Drop-in
+`tensor_values → tensor_values_lossy_f64` for all reads; FPS/ball_query return INDEX tensors (f64
+convention, no narrow) while group_points gathers point VALUES → narrow output to points dtype. f32:
+ERROR → works, group_points(f32) → F32. Test `point_cloud_ops_f32_no_crash`.
+
+★PERF NON-GAPS confirmed (don't re-probe): (1) **einsum f32 WORKS** + returns F32 for ij,jk->ik /
+bij,bjk->bik / ij->ji / ij,ij-> — einsum_binary routes contractions to the GEMM kernel
+(matmul_rhs_transposed_contiguous_f64) and f32 preserves dtype (via the grad-aware permute/reshape/
+matmul compose). No crash, no gap. Probe `examples/einsum_f32_probe.rs`. (2) **pixel_shuffle/unshuffle
+BANDWIDTH-WALLED**: torch 18.3ms at the 16M-f64 read+write floor; FT (reshape+permute+reshape, one
+materialization) can only match — no >2x win.
+
+★f32-PARITY VEIN ESSENTIALLY COMPLETE: 23 crash fixes (nms 5, scatter 3, roi 3, ViT 3, RNN 3, seq-pack
+3, point-cloud 3) + 4 loss dtype fixes across the application layer this session. Recipes: lossy_f64
+(±output-narrow), upcast-recurse (many-read / scalar-const-reduction). Remaining tail is deeply niche
+(gru_cell/lstm_cell single-step, graph int-index ops where f32 indices are unrealistic). The
+application-layer torchvision/geometric/ViT/RNN/point-cloud f32 surface — hand-rolled with F64-only
+reads, missed by the core-tensor sweep — is now swept.
+
 ## 2026-07-02 - ★FIX (f32 DTYPE ×4): dice/tversky/iou/hinge losses returned F64 for f32 (f32-training bug)
 
 Agent `GammaFork`. NOT a crash — the SCALAR-const segmentation/detection/SVM losses (dice_loss,
