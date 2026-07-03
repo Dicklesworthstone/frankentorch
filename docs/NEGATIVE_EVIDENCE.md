@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - CORRECTION: grid_sample lever-2 is NOT decision-blocked — it is SIMD-gather-walled (retire it)
+
+Agent `GammaFork`. Empirically resolved a standing claim I (and the ledger) repeated for many turns:
+that grid_sample lever-2 (~4.5x) is "one tolerance-ratification away." TWO findings from reading the
+actual code + tests overturn it:
+
+1. **grid_sample is ALREADY a tolerance op per its tests** — every value assertion uses `(g-w).abs() <
+   1e-9`/`1e-10` (crates/ft-api/src/lib.rs test sites ~108660, ~144618, ~148343+); the only `assert_eq!`
+   comparisons are on exactly-representable small integers (1.0/2.5/4.0) that are order-independent.
+   There is NO bit-exact-to-torch-golden test. So changing grid_sample's 4-tap arithmetic within ~1 ULP
+   needs NO ratification — the tests already permit it. My "awaits tolerance-policy ratification" framing
+   was over-conservative.
+2. **BUT the ~4.5x gap is SIMD-hardware-gather, not arithmetic rounding.** The bilinear inner body
+   (~42296) does 4 random `sample_value` gathers per output position; Pass 2 is already parallel over
+   (n,c) planes. The 4-tap arithmetic (floor/weights/`v00*wx0*wy0+...`) is cheap and hides behind the
+   gather latency. torch's edge is AVX gather + FMA vectorized across positions — which safe scalar Rust
+   cannot emit (no hardware-gather intrinsic). So a tolerance ratification is BOTH unnecessary (finding 1)
+   AND insufficient (the wall is hardware SIMD, same class as the SIMD-transcendental / interpolate-FMA
+   walls). The bit-exact arithmetic-hoist was already confirmed 0-gain for the same reason (gather-latency
+   dominates).
+
+★NET CORRECTION: grid_sample lever-2 is RETIRED from the "actionable / user-decision-gated" list — it is
+SIMD-gather-walled (deep ft-kernel-cpu SIMD or peer scope), NOT a user decision. This means BOTH remaining
+numerical wins (grid_sample gather + packed-panel GEMM) are SIMD-hardware / peer-ft-kernel-cpu walls;
+there is NO single-session ft-api win a user decision unblocks. Stop offering grid_sample as "one decision
+away."
+
 ## 2026-07-03 - WORKSPACE-WIDE frontier map: ft-nn + ft-optim swept, both at frontier (LBFGS-serial is CORRECT)
 
 Agent `GammaFork`. Took "bench per-crate" literally and swept the two numerical-perf crates I had
