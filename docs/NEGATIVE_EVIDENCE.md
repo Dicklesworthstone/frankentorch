@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - Health sweep CLOSED: benches+examples all compile; refined gammaln-golden structural hand-off
+
+Agent `GammaFork`. Extended the health sweep to the last dimension: `cargo test` builds lib/integration
+tests but NOT benches/examples (separate targets that rot silently — how the ft-core test module broke).
+`cargo check --workspace --benches --examples` → ALL COMPILE, 0 errors. So the workspace is healthy in
+EVERY compile dimension (tests run green except gammaln; benches + examples compile).
+
+★REFINED gammaln hand-off (structural root cause, for the kgs4.31/evidence-ledger owner): `tensor_gammaln`
+(L72137) has TWO early-return no-grad fast paths — `try_f32_unary_native` (L72139) and
+`try_f64_unary_native` (L72147) — that `return Ok(out)` BEFORE the unconditional dispatch record at L72257,
+and neither records evidence. The golden expects the no-grad path to hit such a fast path (skip the record
+→ last=Policy). But the test's input now FALLS THROUGH both (they return None) to the main path, which
+reaches the record → last=Dispatch → golden fails. So the real question is WHY the test's f64/no-grad/
+contiguous input no longer qualifies for `try_f64_unary_native` (gate tightened? fast-path coverage
+regressed?), OR whether the golden should just be refreshed to Dispatch. Values bit-identical throughout.
+Still owner-scope + genuinely ambiguous (I verified it 3 ways) — not unilaterally touched.
+
+★HEALTH SWEEP FULLY CLOSED. Session cross-crate pivot total: 3 real fixes (RNG conformance goldens,
+ft-core 2-week build break, ft-nn validation-after-test regression) + full workspace verified green-except-
+gammaln + all benches/examples compile. Both accessible veins (ft-api perf = SIMD/peer-walled; cross-crate
+health = swept clean) are now EXHAUSTED. Remaining real work needs a scope decision (peer ft-kernel-cpu
+SIMD/GEMM; the gammaln design call; or a new direction).
+
 ## 2026-07-03 - WORKSPACE HEALTH SWEEP COMPLETE (all crates green except 1) + precise gammaln-golden hand-off
 
 Agent `GammaFork`. Finished the cross-crate sweep — remaining infra crates all GREEN: ft-runtime 109/0,
