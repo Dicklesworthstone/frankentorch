@@ -1,5 +1,34 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WORKSPACE-WIDE frontier map: ft-nn + ft-optim swept, both at frontier (LBFGS-serial is CORRECT)
+
+Agent `GammaFork`. Took "bench per-crate" literally and swept the two numerical-perf crates I had
+NOT examined this session, to extend the frontier map beyond ft-api:
+
+- **ft-nn** (37.5k lines, 556 items, ZERO rayon): its layer forwards DELEGATE to ft-api session ops
+  (already parallel) — the 88 raw transcendental sites are either cold weight-init scalars
+  (`1/sqrt(fan_in)` bounds) or the LSTM/GRU gate soup, which is ALREADY a fused single custom op
+  batching the input projection into one GEMM + dgemm_bt recurrent matmul (bit-exact, careful). The
+  gate elementwise loop is O(batch*hidden) — cheap vs the GEMM, and the GEMM is peer-walled
+  (matrixmultiply 52 GF/s/core vs MKL). => ft-nn perf is ft-api-bounded / GEMM-walled, NOTHING winnable
+  at the ft-nn layer.
+- **ft-optim** (13.5k lines, 56 rayon sites): EVERY elementwise-step optimizer is already parallelized
+  (bit-exact fused par_iter gated on OPTIM_PARALLEL_THRESHOLD) — SGD (mine, e4e59552), Adam/AdamW/
+  RMSprop/Adagrad/RAdam/Adamax/Adadelta/NAdam/ASGD/Rprop. The SOLE serial one is **LBFGS**, and that is
+  CORRECT to leave serial: its per-step cost is dominated by the LINE SEARCH (multiple full model fwd/bwd
+  evals) + `vector_dot` REDUCTIONS (bandwidth-bound AND unparallelizable bit-exactly — parallel float
+  sum reorders). The only bit-exact-parallelizable part is the two-loop-recursion axpy, a negligible
+  fraction of a line-search-dominated step. => ft-optim fully at frontier; LBFGS-serial is a deliberate,
+  defensible exception, not an oversight.
+
+★COMPLETE WORKSPACE PERF MAP (numerical crates): ft-api (exhausted, 5 confirmations + full-suite health
+run), ft-nn (delegates/GEMM-walled), ft-optim (all elementwise optimizers parallel; LBFGS correctly
+serial), ft-kernel-cpu (peer GEMM scope — packed-panel GEMM is the standing "next 2x lever" kgs4.46).
+The single-session/own-files/bit-exact/2.0x+ lever surface is saturated across the whole workspace; the
+sole remaining numerical win is peer ft-kernel-cpu packed-panel GEMM (multi-session, parity-risky) or
+ratifying grid_sample as a tolerance op to unlock its lever-2 (~4.5x). Future turns: DON'T re-sweep
+ft-nn/ft-optim — they're mapped here.
+
 ## 2026-07-03 - SESSION HEALTH VERIFIED (full ft-api suite 2464 pass) + actionable gammaln-golden diagnosis for owner
 
 Agent `GammaFork`. Ran the FULL ft-api lib suite to verify this session's 23 f32 fixes + ~23 new
