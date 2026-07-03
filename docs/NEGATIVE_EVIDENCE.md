@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ⚠️⚠️gammaln golden is a HEISENBUG (likely UB) — my prior 2 diagnoses were BOTH wrong
+
+Agent `GammaFork`. ★INTEGRITY CORRECTION of my own commits 86393b09 ("falls through to main path") and
+3fe22f67 ("shared ledger") — BOTH WRONG. Empirical findings (temp debug added/run/removed, tree clean):
+- 3 consecutive no-instrumentation runs: the summary consistently has `fast_ledger_kind=Dispatch` (golden
+  expects Policy) — so the FAST session's no-grad gammaln records the L72257 dispatch entry, meaning its
+  fast path (`try_f64_unary_native`) did NOT fire that run.
+- BUT adding an `eprintln!` that merely READS `fast_evidence` (placed AFTER the gammaln call) flips it:
+  `fast_evidence` becomes `[Policy]` (1 entry) — the fast path DID fire, no dispatch record.
+★So the result depends on OBSERVATION = a HEISENBUG. Since the eprintln runs AFTER `fast.tensor_gammaln`
+and can't mutate an already-captured immutable borrow, the only mechanism is CODEGEN differences (the
+eprintln perturbs optimization/layout) exposing/hiding UNDEFINED BEHAVIOR — an uninitialized read or data
+race in the evidence-recording / fast-path-gating path. `RuntimeContext` owns a per-session
+`EvidenceLedger` (NOT shared — the [Policy]-only debug reading rules out global accumulation), so it's not
+a scoping issue; it's nondeterminism in whether `try_f64_unary_native` fires (or whether the record runs).
+★NOT a stale golden, NOT a values bug (digests/samples bit-identical every run). This needs SANITIZER
+debugging (miri/asan/tsan) of the ft-runtime evidence subsystem + the gammaln fast-path — firmly owner-
+scope (kgs4.31/runtime). Repro: `cargo test -p ft-api --lib gammaln_no_grad_fast_path_golden` fails; add
+an eprintln reading fast_evidence and fast_ledger_kind flips to Policy. ★I've now diagnosed this 5 ways;
+STOPPING — it's a heisenbug requiring interactive/sanitizer tools I should not chase further in-band. It
+remains the ONLY workspace red; everything else green across all crates + benches + examples.
+
 ## 2026-07-03 - ⚠️CORRECTED gammaln diagnosis: fast path FIRES (empirically) — root cause is evidence-ledger scoping, NOT gammaln
 
 Agent `GammaFork`. Resolved the gammaln golden by EMPIRICAL instrumentation (temporary eprintln in
