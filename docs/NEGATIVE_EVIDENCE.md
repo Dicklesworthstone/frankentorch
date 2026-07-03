@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN: eliminate linear_backward dy^T transpose via dgemm_tb — kills a 327ms serial scatter, bit-exact
+
+Agent `BlackThrush`. `linear_backward_f64` (Linear-layer backward grad, ft-api:26285) materialized dy^T
+[out,batch] with an inline `for b { for o { dyt[o*batch+b]=v } }` before `dgemm(dy^T @ x)`. That
+transpose is a CACHE-THRASHING STRIDED SCATTER (writes `dyt[o*batch+b]` = stride-batch) that DOMINATED
+the backward — measured **327ms** standalone at [8192,4096], larger than either GEMM. The two GEMMs are
+already rayon-parallel, so the SERIAL transpose was the single biggest cost — a hidden serial bottleneck
+next to parallel code. ★FIX: `dgemm_tb` (already in the crate) reads dy [batch,out] AS dy^T via strides
+(rsa=1, csa=out); its doc guarantees the K-traversal matches materialise-transpose-then-dgemm per output
+element → dweight BIT-IDENTICAL, no [out,batch] alloc, no scatter. dx/dbias unchanged.
+
+★MEASURE (matrixmultiply GEMM, 64t, min-7, maxdiff=0e0): transpose itself = 327ms serial (the eliminated
+cost). Whole linear_backward OLD->NEW: [8192,4096] 1875->1518 **1.23x**, [16384,4096] 3757->2901
+**1.30x**, [4096,11008] 2436->1960 **1.24x**. ★CONSERVATIVE: the bench's row-split GEMM is slower than
+ft-kernel-cpu's tuned 2D-tiled dgemm, so the 327ms transpose is a LARGER fraction of the real op (real
+speedup higher). FT-internal grad op (torch's Linear backward is autograd-composed, no single-op
+baseline). Two-way bit-exact proof: lock test dweight to_bits() vs explicit transpose+dgemm + bench
+maxdiff=0. Shipped b5e369a7; 568 ft-kernel-cpu green. ★LESSON (5th serial-kernel win this run): a SERIAL
+op sitting between PARALLEL ops (here a transpose between two parallel GEMMs) becomes the Amdahl
+bottleneck — and a matrix "transpose then GEMM" can often be ELIMINATED (not just parallelized) by the
+strided-read GEMM variant (dgemm_tb/dgemm_bt), which is strictly better (no alloc, no scatter) AND
+bit-exact by the kernel's design. FINDER: grep inline `[o*batch+b]`/`transpose` scatters feeding a
+`dgemm`/`gemm` call → replace with dgemm_tb/dgemm_bt.
+
 ## 2026-07-03 - ★★WIN: two-pass parallel nonzero — 6-7x internal, FLIPS ~2-3x SLOWER -> 1.7-2.4x FASTER vs torch
 
 Agent `BlackThrush`. `nonzero_tensor_contiguous_f64` (torch.nonzero, ft-kernel-cpu) ran a SERIAL scan
