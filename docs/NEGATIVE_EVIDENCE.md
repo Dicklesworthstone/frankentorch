@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★FRONTIER MAP: ft-api single-turn levers EXHAUSTED — remaining wins are PEER/DEEP (actionable roadmap)
+
+Agent `GammaFork`. After ~22 commits this session (6 perf flips + 15 f32 crash/dtype/feature fixes) and
+exhaustive probing, the ft-api single-turn lever surface is definitively reached. This turn's probes ALL
+confirmed DONE (don't re-probe): **FFT** — `tensor_fft_along_dim` parallelizes ALL three lane layouts
+(last-dim stride_inner==1 @76272, mid-dim stride_outer>=2 @76286, first-dim stride_outer==1 @76323
+"fftn-dim0"); fftn/fft2/rfft2/irfft2 all inherit it (the "keep serial" comment @76267 is STALE).
+**einsum** f32 works + GEMM-backed. **pixel_shuffle** bandwidth-walled. **linalg f32+grad** complete
+(all ops upcast-recurse; matrix_exp was the lone gap, fixed 751c6cf3). **quantization** composes f32-safe.
+
+★REMAINING WINS BY SCOPE (next agent/peer — NOT ft-api single-turn):
+1. **PEER ft-kernel-cpu GEMM** (biggest, ~2x on EVERY GEMM op — matmul/conv/cdist/matrix_exp/single-matrix
+   linalg): packed-panel Goto/BLIS GEMM (bead kgs4.46, [[project_gemm_bandwidth_vein]]). matrix_exp
+   single-matrix measured 9.8x SLOWER vs MKL this session = pure GEMM. Same-process A/B method documented.
+2. **DEEP grid_sample LEVER-2** (~4.5x SLOWER residual, biggest single op gap): cache-blocked SIMD
+   bilinear 4-tap gather (lever-1 shipped 2x; lever-2 = kernel rewrite, [[project_asymmetric_dtype_fastpath]]).
+3. **DEEP dense-eigensolver** D&C dstedc/dbdsdc + multishift-QR AED (fql10) — eigh/svd reduce-capped
+   ([[project_eig_geev_gap]], tolerance-parity ratified [[project_eig_tolerance_policy_ratified]]).
+4. **PARITY leads** ([[project_differential_parity]]): LU pivot-format (IPIV vs direct-perm), geqrf/ormqr
+   unimplemented — value/feature gaps, owner-scope.
+
+★CONCLUSION: ft-api quick-win levers (compose-fuse, parallelize-serial, f32-native, asymmetric-dtype,
+upcast-recurse, radix-select, sub-stream RNG) are HARVESTED. Further progress requires peer ft-kernel-cpu
+GEMM/kernel work or deep multi-session linalg rewrites. A future agent should either claim one of the
+above (coordinate on GEMM — likely peer-active) or confirm a genuinely new op class exists before probing.
+
 ## 2026-07-03 - SURFACE: linalg f32+grad surface CONFIRMED COMPLETE (matrix_exp was the lone gap, fixed)
 
 Agent `GammaFork`. Followed the matrix_exp f32+grad-error lead (751c6cf3) into a full sweep of the
