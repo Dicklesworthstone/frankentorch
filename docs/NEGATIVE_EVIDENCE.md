@@ -1,5 +1,33 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★★ WIN: kthvalue f64 radix-select — 1.26x -> 3.3-5.0x FASTER vs torch (order-statistic vein follow-up)
+
+Agent `GammaFork`. Closed the open order-statistic follow-up (f32 median/quantile already ship the
+parallel masked-histogram radix-select; f64 kthvalue did NOT). `tensor_kthvalue` f64 read
+`tensor_values_lossy_f64` (128MB clone) then quickselected the rank-k value with
+`select_nth_unstable_by(total_cmp)` on a SECOND 128MB clone — already ~1.26x faster than torch but
+two full clones + a per-compare total_cmp closure. Routed the F64 contiguous no-grad path through the
+median radix-select (`radix_select_f64_no_nan` on the BORROWED buffer) for the rank-k VALUE, then the
+EXISTING less-count + nth-equal (ascending-index tie-break) resolves the index unchanged. torch.kthvalue
+orders NaN LAST via total_cmp (which the u64 radix keys can't represent), so the path bails to the
+total_cmp quickselect when ANY NaN is present (parallel NaN scan); NaN-free => total_cmp order ==
+numeric order so the index resolution is bit-identical.
+
+★MEASURE (16M f64 1-D, min-of-6, torch 2.12.1 SAME window):
+| k       | FT before | FT after | torch  | ratio            |
+|---------|-----------|----------|--------|------------------|
+| k=mid   | 186 ms    | 49 ms    | 234 ms | **4.74x FASTER** |
+| k=1     | 170 ms    | 47 ms    | 234 ms | **4.95x FASTER** |
+| k=max   | 177 ms    | 53 ms    | 178 ms | **3.33x FASTER** |
+
+~3-3.6x internal (removes two 128MB clones + the total_cmp quickselect). The pre-existing
+`kthvalue_quickselect_matches_stable_sort_with_ties` test (all k, duplicate values) now runs THROUGH
+the radix path and stays green; added `kthvalue_f64_radix_matches_sorted_reference_large_with_ties`
+(20k elems, parallel radix, value+index vs stable sort) and `kthvalue_f64_nan_falls_back_and_orders_nan_last`
+(NaN sorts last via the total_cmp fallback). 7/7 kthvalue tests green. Bench
+`crates/ft-api/examples/kthvalue_h2h.rs`. ★Order-statistic radix-select vein now covers median (f32+f64),
+quantile, AND kthvalue (f64). AGENT GammaFork.
+
 ## 2026-07-02 - ★ WIN + BLOCKER: in-place transcendental RNG fills 1.6-2.1x FASTER vs torch; cheap fills (uniform_/normal_) WRITEBACK-WALLED
 
 Agent `GammaFork`. The in-place `Tensor.*_` RNG fills built their values with a SERIAL
