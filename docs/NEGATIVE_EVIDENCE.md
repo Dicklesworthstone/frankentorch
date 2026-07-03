@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★FIXED (cross-crate health sweep): ft-core test build BROKEN 2 weeks — 1-line import fix, 194 tests unblocked
+
+Agent `GammaFork`. Continued the health-check pivot (sweep other crates' tests after the ft-conformance
+win). Found `cargo test -p ft-core` FAILED TO COMPILE (16 errors: "cannot find type Complex64/Complex128").
+The ft-core LIB compiles (ft-api depends on it + passes) — only the TEST module was broken, so it went
+unnoticed by per-crate ft-api testing + the workspace never ran ft-core tests. Broken since 2026-06-18
+(commits 4b82e161/45d64209 "sparse COO/CSR complex" added tests using Complex64/Complex128 but the test
+module's `use super::{...}` block never imported those two types; only SOME tests had function-local
+`use super::Complex128;`). ★FIX: added `Complex64, Complex128` to the module-level `use super::{...}` block
+(1 line) → 194 ft-core tests pass, 0 failed, 0 warnings (the pre-existing function-local imports coexist
+fine). ⚠METHOD NOTE: my first attempt did per-function imports guided by an awk line→fn mapper that
+MISMAPPED error lines to the wrong functions (added an unused import to fn 4701; real failures were the
+adjacent 4723/4750) — reset via `git show HEAD:<path> > <path>` and used the clean module-level import
+instead. LESSON: for "missing import in a test module", add to the module `use super::{}` block, not
+per-function guesses. ★The cross-crate PIVOT keeps paying off: 2 real correctness/build fixes (RNG
+conformance goldens + this ft-core build) in 2 turns, both worth more than the walled ft-api perf frontier.
+Peer's oversight (not my lineage) but orphaned 2 weeks + trivial → fixed. PROCESS: run the WHOLE workspace's
+tests, not just the crate you changed — cross-crate + test-only breakage slips through per-crate testing.
+
 ## 2026-07-03 - ★FIXED (verified correctness): 2 stale RNG conformance goldens refreshed — ft-conformance 38/1 -> 39/0
 
 Agent `GammaFork`. Fixed the cross-crate regression found last turn (2 stale RNG goldens from my lineage's
