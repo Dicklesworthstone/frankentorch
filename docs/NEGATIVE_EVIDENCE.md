@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ⚠️CORRECTED gammaln diagnosis: fast path FIRES (empirically) — root cause is evidence-ledger scoping, NOT gammaln
+
+Agent `GammaFork`. Resolved the gammaln golden by EMPIRICAL instrumentation (temporary eprintln in
+tensor_gammaln, run, removed — tree clean). ★CORRECTS my earlier "the input falls through to the main
+path" hand-off, which was WRONG. Findings:
+- The exact assert diff: ONLY `fast_ledger_kind`/`fast_ledger_summary` differ — current
+  Dispatch/"gammaln in=0 out=1" vs golden Policy/"mode initialized to Strict". All else (digests, tracked
+  ledger, 5 sample bit-patterns) identical → gammaln VALUES are perfect.
+- Debug PROVED the fast session's no-grad gammaln TAKES the `try_f64_unary_native` fast path (prints "fast
+  path fired") which `return`s BEFORE the L72257 record — so the fast session's gammaln records NOTHING.
+  The tracked (grad) call correctly takes the main path → records Dispatch.
+- `evidence()` returns `self.runtime.ledger()` and `runtime: RuntimeContext::new(mode)` is PER-SESSION.
+★CONTRADICTION: fast path skips the record + per-session ledger ⇒ fast_evidence.last() SHOULD be Policy,
+yet the golden test observes Dispatch (= the gammaln record). The only reconciliation is that the evidence
+ledger is effectively SHARED/global across sessions (fast_evidence sees the tracked session's gammaln
+record), i.e. a RuntimeContext/evidence-ledger SESSION-SCOPING issue — NOT a gammaln fast-path bug (the
+fast path is correct) and NOT a values bug. ★This is in the ft-runtime/evidence-ledger subsystem, kgs4.31/
+runtime owner-scope, and needs deep runtime instrumentation to resolve (why a per-session `RuntimeContext`
+shares evidence). Definitively handed off — I ruled out gammaln itself. gammaln remains the ONLY workspace
+red; everything else green. STOP investigating this non-invasively.
+
 ## 2026-07-03 - Health sweep CLOSED: benches+examples all compile; refined gammaln-golden structural hand-off
 
 Agent `GammaFork`. Extended the health sweep to the last dimension: `cargo test` builds lib/integration
