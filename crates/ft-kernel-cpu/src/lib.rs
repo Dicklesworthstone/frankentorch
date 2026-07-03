@@ -11443,20 +11443,28 @@ pub fn addmv_tensor_contiguous_f64(
     let mat_start = mat_meta.storage_offset();
     let vec_start = vec_meta.storage_offset();
 
-    // Push-based output skips the m-cell zero-init memset
-    // (frankentorch-u04j); same row-major contract as matmul.
-    let mut out = Vec::with_capacity(m);
-    // Pairwise dot product per row. Same pattern as matmul; for K
-    // typical of LM head linear projections (vocab >= 32k) the
-    // sequential drift was visible in inference logits.
-    let mut scratch = vec![0.0_f64; k];
-    for row in 0..m {
-        for (col, scratch_slot) in scratch.iter_mut().enumerate() {
-            *scratch_slot = mat[mat_start + row * k + col] * vec_data[vec_start + col];
-        }
-        let acc = pairwise_sum_f64(&scratch);
-        out.push(beta * input[input_start + row] + alpha * acc);
-    }
+    // GEMV per row. `pairwise_dot_f64(mat_row, vec)` is BIT-FOR-BIT the
+    // `pairwise_sum_f64(&[mat_row[c]*vec[c]])` the old scratch loop computed
+    // (same mid=len/2 tree, same 128-elem serial leaf) but skips the k-scratch.
+    // Rows are INDEPENDENT and each is reduced identically regardless of thread,
+    // so the row-parallel path is bit-for-bit identical to the serial one — GEMV
+    // is bandwidth-bound (streams the whole matrix once), so spreading rows over
+    // the pool uses more memory channels (measured 6-7.5x internal at LM-head
+    // shapes, flipping ~3-4x SLOWER -> 2-3.7x FASTER vs torch's addmv). Gate on
+    // total work so tiny GEMVs (rayon split/join > gain) stay serial (measured
+    // crossover ~262144: below, par regresses; at/above, 2.5-15x). kgs4-addmv-par.
+    const ADDMV_PARALLEL_MIN_WORK: usize = 1 << 18; // 262144
+    let vec_slice = &vec_data[vec_start..vec_start + k];
+    let row_val = |row: usize| -> f64 {
+        let mrow = &mat[mat_start + row * k..mat_start + row * k + k];
+        beta * input[input_start + row] + alpha * pairwise_dot_f64(mrow, vec_slice)
+    };
+    let out: Vec<f64> = if m > 1 && m.saturating_mul(k) >= ADDMV_PARALLEL_MIN_WORK {
+        use rayon::prelude::*;
+        (0..m).into_par_iter().map(row_val).collect()
+    } else {
+        (0..m).map(row_val).collect()
+    };
     Ok(out)
 }
 
@@ -32548,16 +32556,22 @@ pub fn addmv_tensor_contiguous_f32(
 
     let mat_start = mat_meta.storage_offset();
     let vec_start = vec_meta.storage_offset();
-    // Push-based output mirrors the f64 fix (frankentorch-u04j).
-    let mut out = Vec::with_capacity(m);
-    let mut scratch = vec![0.0f32; k];
-    for row in 0..m {
-        for (col, scratch_slot) in scratch.iter_mut().enumerate() {
-            *scratch_slot = mat[mat_start + row * k + col] * vec_data[vec_start + col];
-        }
-        let acc = pairwise_sum_f32(&scratch);
-        out.push(beta * input[input_start + row] + alpha * acc);
-    }
+    // Row-parallel GEMV, f32 mirror of the f64 path: `pairwise_dot_f32(row, vec)`
+    // is bit-for-bit `pairwise_sum_f32(&[row[c]*vec[c]])` (same tree/leaf), rows
+    // are independent → row-parallel is bit-identical to serial. Bandwidth-bound;
+    // gate on total work so tiny GEMVs stay serial. kgs4-addmv-par.
+    const ADDMV_PARALLEL_MIN_WORK: usize = 1 << 18; // 262144
+    let vec_slice = &vec_data[vec_start..vec_start + k];
+    let row_val = |row: usize| -> f32 {
+        let mrow = &mat[mat_start + row * k..mat_start + row * k + k];
+        beta * input[input_start + row] + alpha * pairwise_dot_f32(mrow, vec_slice)
+    };
+    let out: Vec<f32> = if m > 1 && m.saturating_mul(k) >= ADDMV_PARALLEL_MIN_WORK {
+        use rayon::prelude::*;
+        (0..m).into_par_iter().map(row_val).collect()
+    } else {
+        (0..m).map(row_val).collect()
+    };
     Ok(out)
 }
 
@@ -38906,6 +38920,65 @@ mod tests {
         )
         .expect("alpha-zero f32 addmv should scale input");
         assert_eq!(out_f32, vec![-9.0, 15.0]);
+    }
+
+    #[test]
+    fn addmv_row_parallel_matches_serial_reference_bit_exact() {
+        // m*k = 1024*512 = 524288 >= ADDMV_PARALLEL_MIN_WORK (262144) -> the
+        // row-parallel path fires. Lock it bit-for-bit against an independent
+        // serial reference that replicates the old scratch+pairwise_sum per row.
+        let (m, k) = (1024usize, 512usize);
+        let input: Vec<f64> = (0..m).map(|i| ((i % 97) as f64) * 1e-2 - 0.3).collect();
+        let mat: Vec<f64> = (0..m * k).map(|i| ((i % 1009) as f64) * 1e-3 - 0.5).collect();
+        let vec_data: Vec<f64> = (0..k).map(|i| ((i % 733) as f64) * 2e-3 - 0.7).collect();
+        let (beta, alpha) = (0.75_f64, 1.25_f64);
+
+        let input_meta = TensorMeta::from_shape(vec![m], DType::F64, Device::Cpu);
+        let mat_meta = TensorMeta::from_shape(vec![m, k], DType::F64, Device::Cpu);
+        let vec_meta = TensorMeta::from_shape(vec![k], DType::F64, Device::Cpu);
+        let got = super::addmv_tensor_contiguous_f64(
+            &input, &mat, &vec_data, &input_meta, &mat_meta, &vec_meta, beta, alpha,
+        )
+        .expect("row-parallel addmv");
+
+        // Independent serial reference (the pre-parallel scratch loop).
+        let mut want = Vec::with_capacity(m);
+        let mut scratch = vec![0.0_f64; k];
+        for row in 0..m {
+            for (col, s) in scratch.iter_mut().enumerate() {
+                *s = mat[row * k + col] * vec_data[col];
+            }
+            want.push(beta * input[row] + alpha * super::pairwise_sum_f64(&scratch));
+        }
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(g.to_bits(), w.to_bits(), "row-parallel addmv f64 must be bit-exact");
+        }
+
+        // f32 mirror.
+        let matf: Vec<f32> = mat.iter().map(|&v| v as f32).collect();
+        let vecf: Vec<f32> = vec_data.iter().map(|&v| v as f32).collect();
+        let inpf: Vec<f32> = input.iter().map(|&v| v as f32).collect();
+        let (betaf, alphaf) = (beta as f32, alpha as f32);
+        let gotf = super::addmv_tensor_contiguous_f32(
+            &inpf,
+            &matf,
+            &vecf,
+            &TensorMeta::from_shape(vec![m], DType::F32, Device::Cpu),
+            &TensorMeta::from_shape(vec![m, k], DType::F32, Device::Cpu),
+            &TensorMeta::from_shape(vec![k], DType::F32, Device::Cpu),
+            betaf,
+            alphaf,
+        )
+        .expect("row-parallel addmv f32");
+        let mut scratchf = vec![0.0_f32; k];
+        for row in 0..m {
+            for (col, s) in scratchf.iter_mut().enumerate() {
+                *s = matf[row * k + col] * vecf[col];
+            }
+            let w = betaf * inpf[row] + alphaf * super::pairwise_sum_f32(&scratchf);
+            assert_eq!(gotf[row].to_bits(), w.to_bits(), "row-parallel addmv f32 bit-exact");
+        }
     }
 
     #[test]
