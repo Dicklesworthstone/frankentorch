@@ -33,10 +33,13 @@ wins only >=4M (6.7x). Raised both to MOVEMENT_COPY_PARALLEL_MIN; the BACKWARD (
 correctly stays at 8192. Verified rch: 8 tests green. ★rot90 NOT changed: it's a cache-blocked TRANSPOSE
 (strided/cache-latency-bound, not a straight copy) — transpose parallelism pays at medium (permute vein),
 different regime from pure copy/fill. ★tile: no inline par copy found (delegates). ★So the ft-api
-MOVEMENT pure-copy/fill set is now COMPLETE: flip/roll/repeat (0730b168) + repeat_interleave (d6f56b7f);
-rot90/kron excluded (transpose / has multiply = compute). RULE HOLDS: pure copy_from_slice/fill (no
-per-element math) into fresh vec![0.0;n] → gate at ~1<<22, NOT the compute default; transpose/compute
-movement stays at the lower gate.
+MOVEMENT pure-copy/fill set is now COMPLETE: flip/roll/repeat (0730b168) + repeat_interleave (d6f56b7f)
++ ft-api tensor_stack f64 inline path (c8d9883b — a SEPARATE inline no-grad copy, distinct from the
+ft-kernel-cpu stack kernel; had NO gate, always parallel; 13 tests green); rot90/kron excluded
+(transpose / has multiply = compute). ★AUDIT COMPLETE: grepped ft-api for the `grain = _/(threads*4)`
+idiom (7 sites) — ALL now gated (flip/roll/repeat/repeat_interleave×2/ft-api-stack). RULE HOLDS: pure
+copy_from_slice/fill (no per-element math) into fresh vec![0.0;n] → gate at ~1<<22, NOT the compute
+default; transpose/compute movement stays at the lower gate.
 
 ## 2026-07-03 - SURFACE: threshold-calibration sweep — binary/unary CALIBRATED, medium-GEMM 2D REALIZED, copy-op grain = scoped lead
 
