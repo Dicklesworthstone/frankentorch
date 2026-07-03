@@ -29,6 +29,17 @@ by allocator first-touch (fresh calloc vs freelist). A real fix = BOUNDED grain 
 gather-DRAM-wall rejections). Needs a REAL-op-shape bench (build ft-kernel-cpu, drive narrow_tensor_
 contiguous at varied out_row) before touching a shared gate. Queued, not rushed.
 
+★★RESOLVED + SHIPPED 3f5cfccd (BlackThrush): the standalone bench IS pattern-identical to the real
+kernel (`vec![0.0;n]` + `par_chunks_mut(out_row)` + `copy_from_slice`, same allocator/rayon) — no
+standalone-vs-real gap, so the finding was solid. Added `COPY_MATERIALIZE_PARALLEL_MIN = 1<<22` (~4.19M
+elems) and switched narrow+expand (f64+f32, 4 gates) from PARALLEL_THRESHOLD(8192) to it. Fixes the
+3-12x medium-copy regression (narrow[524288] 668us->123us serial = 5.4x), keeps parallel only >=4M where
+fault-parallelism wins (6.9x). Bit-identical (threshold-only, both branches produce identical output);
+572 tests green. ★LESSON CONFIRMED: a PURE-COPY op (no per-element compute) must gate parallelism at the
+FAULT-parallelism crossover (~4M/32MB, where serial first-touch of lazy-calloc dominates), NOT the
+compute default — the compute default regresses every medium copy. (gather NOT touched: random-read,
+different access pattern, memory's DRAM-wall rejection stands.)
+
 ## 2026-07-03 - ★★★WIN: lower GEMM parallel gate 1<<27 -> 1<<24 — every medium GEMM library-wide 1.5-8x, bit-exact
 
 Agent `BlackThrush`. THE highest-leverage win of the run — corrects the parallelization threshold on the
