@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH at SOURCE): tensor_one_hot(f32 labels) errored -> works (retires a crash class)
+
+Agent `GammaFork`. Acted on the higher-leverage lead from the arcface/cosface fix: `tensor_one_hot`
+read its index tensor via the F64-only `tensor_values` (line ~12563), so `one_hot(f32_labels)` ERRORED
+`UnsupportedDType(F32)` — a LATENT crash for EVERY caller that one-hots f32 labels (multi_margin/arcface/
+cosface losses all hit it; classification/embedding code paths too). ★SOURCE FIX (drop-in, per the
+CoralDrift lesson): `tensor_values` → `tensor_values_lossy_f64` — indices are integers so the f64 read
+is EXACT, and `values` is only consumed as `idx as usize` (validate + scatter), with a dtype-independent
+0/1 F64 mask output, so this is BIT-IDENTICAL for f64 input and zero-blast-radius. f32/f16/bf16 labels:
+ERROR → works, same mask as f64. Test `one_hot_f32_labels_no_crash_matches_f64`; 8 one_hot tests green.
+★This retires the whole `one_hot(f32_labels)` sub-crash-class at the source — the per-loss upcast-recurse
+label-upcasts (arcface/cosface/multi_margin) are now belt-and-suspenders, not required. ★GENERAL LESSON:
+when a crash is a shared PRIMITIVE reading user tensors via an F64-only accessor, fix the PRIMITIVE
+(one line, retires N call-site crashes) rather than each caller. Remaining `tensor_values` (F64-only)
+reads on possibly-f32 user inputs are the next grep — each is a latent f32 crash fixable by the same
+lossy_f64 drop-in.
+
 ## 2026-07-02 - ★FIX (f32 CRASH ×2): arcface_loss + cosface_loss(f32) errored -> works (upcast-recurse)
 
 Agent `GammaFork`. Completed the loss-family f32-crash sweep. `arcface_loss` + `cosface_loss` (std
