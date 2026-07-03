@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN: eliminate conv2d/3d backward dout_t transpose via gemm_tb — 1.15-1.62x weight-grad, bit-exact (4 sites)
+
+Agent `BlackThrush`. Same transpose-elimination lever as linear_backward (b5e369a7), applied to ALL FOUR
+conv backwards (conv2d/3d × f32/f64). Each computed the weight grad `dweight = dout_flat^T @ panel` by
+MATERIALIZING `dout_t = transpose(dout_flat)` [out_ch, flat] then `gemm(dout_t @ panel)`. That transpose
+is a strided-gather over out_ch*flat (~100MB at conv sizes); a prior fix parallelized it (frankentorch-
+convbwd) but it's still a full extra pass — measured ~110ms of a 322ms weight-grad. `{s,d}gemm_tb` reads
+dout_flat [flat,out_ch] AS its transpose via strides (rsa=1, csa=out_ch), K-traversal matches
+transpose-then-gemm per output → dweight BIT-IDENTICAL, no dout_t alloc/pass. dpanel still uses dout_flat.
+
+★MEASURE — standalone A/B (matrixmultiply sgemm, 64t, min-5, maxdiff=0e0), conv weight-grad OLD->NEW:
+[out_ch256,flat100352,pw1152] 322->212ms **1.52x**, [128,200704,576] 232->144ms **1.62x**,
+[512,25088,2304] 246->213ms **1.15x**. Bench scratchpad/convtb. FT-internal grad op. Lock test
+sgemm_tb_matches_materialized_transpose_bit_exact (f32; dgemm_tb already locked via linear_backward). 571
+ft-kernel-cpu green. Shipped a7b66c3d. ★7th serial/redundant-work win this run. ★The transpose-then-GEMM
+→ gemm_tb elimination now covers linear_backward (1 site) + conv2d/3d backward (4 sites) — grep any
+remaining `[oc*flat+r]=`/`dout_t`/`.t()`-materialize feeding a `gemm::` call.
+
 ## 2026-07-03 - ★WIN: row-parallel bias-add / addmm epilogue — 2.0-2.6x on the serial tail after the GEMM, bit-exact
 
 Agent `BlackThrush`. Same finder as the linear_backward transpose (a SERIAL op beside PARALLEL ops):
