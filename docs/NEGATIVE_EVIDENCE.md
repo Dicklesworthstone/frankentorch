@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - ★★WIN: parallelize per-output-channel int8 weight quant — 10-23x internal, bit-exact (asymmetric-sibling)
+
+Agent `BlackThrush`. Same finder as the cross f64 fix — a SERIAL loop whose PARALLELIZED SIBLING sits
+right next to it. `quantize_per_output_channel_i8` (ft-kernel-cpu, int8 quantized-Linear WEIGHT prep)
+ran a serial `for o in 0..out`, while `quantize_rows_i8` (int8 ACTIVATION quant, the very next fn) was
+already row-parallel (`par_chunks_mut(k)` gated `m>=8 && m*k>=8192`). Each OUTPUT CHANNEL owns a disjoint
+`[in_]` weight row + one scale slot (amax -> scale -> round/clamp), independent → serial==parallel
+byte-identical. Mirrored the sibling's exact form + gate. The per-element divide+round is COMPUTE-bound,
+so it parallelizes ~linearly on 64 cores.
+
+★MEASURE — standalone same-process A/B (f32 weights, 64t, min-of-9, byte-identical i8 AND scales):
+out4096·in4096 (17M) 35.6->3.29ms **10.8x**; out32000·in4096 (131M, LM head) 322->14.4ms **22.4x**;
+out11008·in4096 (45M, MLP up) 110->5.08ms **21.6x**; out4096·in11008 (45M, MLP down) 111->4.83ms
+**23.0x**. Bench scratchpad/qch. ★HONEST: FT-INTERNAL op (int8 Linear weight prep) — torch has no
+direct symmetric per-channel-DYNAMIC weight quant op (torch.quantize_per_channel needs precomputed
+scales), so this is an internal serial->parallel A/B (like the ROI/point-cloud internal wins), NOT a
+vs-torch flip. Load-time op, but 322ms->14ms materially cuts int8-model load. Lock test
+weight_per_channel_quant_parallel_matches_serial_reference_bit_exact; 566 ft-kernel-cpu green. Shipped
+12ed70bd. ★FINDER (proven twice now — cross + this): grep a SERIAL `for` loop over independent rows/
+channels whose SIBLING fn (adjacent, same file) already parallelizes the identical shape — the
+un-parallelized twin is a free bit-exact win.
+
 ## 2026-07-03 - ★★WIN: row-parallel addmv/GEMV f64+f32 — 6-7.5x internal, FLIPS ~3-4x SLOWER -> 2.1-3.7x FASTER vs torch
 
 Agent `BlackThrush`. GammaFork's frontier map said "remaining GEMM wins are peer/deep" — but that's
