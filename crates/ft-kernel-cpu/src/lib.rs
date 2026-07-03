@@ -29,14 +29,18 @@ mod gemm {
     // row count, so the parallel result is bit-for-bit identical to the single
     // call (proved by `gemm_row_split_matches_single_bit_exact`).
     // Row-block parallelism pays once a block carries enough work to dwarf the
-    // rayon dispatch cost. The previous 1<<29 (~537M FMA) gate left medium GEMMs
-    // single-threaded on multi-core hosts — notably the conv2d im2col matmul
-    // (M=4096,K=576,N=64 ≈ 151M FMA) and a 512×512 matmul (134M) — so all but
-    // one core sat idle. 1<<27 (~134M) brings both under the parallel path while
-    // keeping genuinely small matmuls (≤256×256 ≈ 16.7M) serial. The split is
-    // bit-for-bit identical to the single call regardless of block count
-    // (proved by `gemm_row_split_matches_single_bit_exact`).
-    const PAR_MIN_FLOPS: u128 = 1 << 27;
+    // rayon dispatch cost. History: 1<<29 (~537M) -> 1<<27 (~134M). But 1<<27 is a
+    // 512×512×512 GEMM — while the comment's OWN stated intent was "keep ≤256×256
+    // (16.7M) serial", 1<<27 ALSO left the entire 256..512 range single-threaded on
+    // these many-core hosts. Measured (64-core worker, matrixmultiply, min-of-11,
+    // f32 AND f64) — all of these ran SERIAL under 1<<27 yet are much faster
+    // row-split: 256³ (17M) 1.5-1.7x, 320³ (33M) 2.3-2.6x, 384³ (57M) 3.2-3.9x,
+    // 1024×512×128 (67M) 4.6-8x FASTER. Corrected to 1<<24 (16.7M = 256×256×256) to
+    // match the stated intent: parallelize m·k·n ≥ 256³, keep smaller serial
+    // (192³ ≈ 7M was ~parity, 128³ ≈ 4M regressed 0.84x). The split is bit-for-bit
+    // identical to the single call regardless of block count (proved by
+    // `gemm_row_split_matches_single_bit_exact`). frankentorch-kgs4-parmin.
+    const PAR_MIN_FLOPS: u128 = 1 << 24;
     // A TALL GEMM (many rows, modest total flops) can sit below PAR_MIN_FLOPS yet
     // still split into plenty of well-sized row blocks — e.g. an attention/linear
     // projection `[batch*S, embed] @ [embed, embed]` at large S (M = batch*S).
