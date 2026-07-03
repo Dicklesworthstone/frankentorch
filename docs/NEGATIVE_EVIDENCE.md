@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WARM backward-cost probe: torch-core grad-closure FLIP landscape is THIN (LRN was the one)
+
+Agent `GammaFork`. Re-ran the torch backward-cost probe WITH warmup (scratchpad/warm_probe.py, 4 untimed
++ min-of-10) — the correct methodology after the pdist cold-inflation lesson. Results (torch @32t, WARM
+bwd ms): lp_pool2d 1.5, pdist-p1 2.0, pdist-pinf 2.2, cdist-p1 1.0, triplet_margin 0.3, gaussian_nll 1.7,
+poisson_nll 0.8, hinge_embedding 1.4, **unfold-k5 55.1 (only genuinely-slow)**, fold 7.7 (fwd-slow/bwd-fast).
+★MAP: essentially ALL torch nn.functional backwards are FAST warm (<3ms) = kernel-optimal = NO flip room.
+The lone slow-backward is F.unfold (im2col, 55ms) — BUT (a) FT's `functional_unfold` is the 1-D view-based
+tensor.unfold (dimension/size/step), NOT im2col; FT's im2col is folded into GEMM-conv, so no matching op
+to flip; (b) unfold-bwd = col2im scatter-add = bandwidth-bound anyway. ⇒ NOT a clean lever.
+
+★CONCLUSION: the torch-core grad-closure/backward-cost FLIP sub-vein is EXHAUSTED — LRN (avg_pool3d
+composition, 128ms warm) was the ONE genuine flip; every other probed op has a fast SIMD backward that
+survives warmup. Cold-probe "candidates" (pdist/normalize/cross) were all measurement artifacts (fast
+warm). ★For future turns: the torch backward-cost method is validated BUT only finds a flip when torch
+COMPOSES a slow backward (rare — LRN via pooling); pure elementwise/reduction ops are SIMD-walled. Don't
+re-probe these. Remaining real levers are: (1) the internal-A/B application-op vein (FT-extension ops with
+no torch baseline — ROI/point-cloud/aug, stands on its own), (2) peer ft-kernel-cpu SIMD/GEMM. Probe:
+scratchpad/warm_probe.py + reverify.py.
+
 ## 2026-07-03 - ⚠️⚠️CORRECTION: pdist is NOT a flip (cold-torch measurement inflated the baseline 5-7x)
 
 Agent `GammaFork`. ★INTEGRITY CORRECTION of my own commit 7274d627. My torch baselines this session
