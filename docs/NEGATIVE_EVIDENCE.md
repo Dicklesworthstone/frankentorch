@@ -16,10 +16,13 @@ EVERY training step = huge cumulative cost.
 fork earlier, lower than compute's 8192 because it's bandwidth) + serial chunks_mut fallback. Bit-identical
 (serial==parallel per row). 572 ft-kernel-cpu tests green (rch). Shipped ec0cb5af. ★A THIRD threshold tier
 emerges: pure copy/fill → ~4M (1<<22); reduce-then-scale (norm/normalize) → ~512K (1<<19); per-element
-transcendental → ~8192. All bandwidth/compute-crossover-driven. ★FOLLOW-UP (same ungated pattern, lower
-priority — CNN norms not per-transformer-layer): group_norm_forward_f{64,32}, add_layer_norm_forward_f32,
-layer_norm_forward_with_stats_f64, batch_norm/instance_norm — grep ft-kernel-cpu for `par_chunks_mut` in
-*_norm_forward with no `>= NORM_FWD_PARALLEL_MIN`.
+transcendental → ~8192. All bandwidth/compute-crossover-driven. ★FOLLOW-UP DONE d95e8a77: gated the
+remaining same-pattern norm forwards at NORM_FWD_PARALLEL_MIN — add_layer_norm_forward_f32 (transformer
+residual "add & norm", 2/encoder layer), layer_norm_forward_with_stats_f64, group_norm_forward_f{64,32}
+(CNN). Bit-exact, 572 tests green (rch). ★REMAINING: batch_norm / instance_norm reduce ACROSS batch (the
+reduce is a cross-row sum, parallelism axis is channels not rows) → DIFFERENT pattern, separate analysis
+(their crossover + whether they even over-parallelize needs its own bench). NORM forward gating COMPLETE
+for the per-row/per-group family (layer_norm/rms_norm/add_layer_norm/with_stats/group_norm × f64,f32).
 
 ## 2026-07-03 - ★WIN + SURFACE: no-gate COMPUTE ops — gelu_tanh gated (SHIPPED); ~30 more ft-api ops flagged (narrower EV)
 
