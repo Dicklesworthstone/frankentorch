@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH+DTYPE ×3): pack_sequence/pack_padded_sequence/pad_packed_sequence
+
+Agent `GammaFork`. Continued the sequence-model f32 sweep (complements the RNN fix). The variable-length
+sequence packers `pack_sequence`, `pack_padded_sequence`, `pad_packed_sequence` (torch.nn.utils.rnn) read
+their sequence tensors via the F64-only `tensor_values` → ERRORED UnsupportedDType(F32) on f32 sequences
+AND rebuilt an F64 packed/padded output. Fix: `tensor_values → tensor_values_lossy_f64` + narrow the
+output to the input dtype. ⚠️pack_sequence and pack_padded_sequence are NEAR-DUPLICATE code (identical
+output/return blocks) → captured `in_dtype` early in each (unique read context) then applied one shared
+replace_all output-narrow keyed on `in_dtype`. f32: ERROR → works, returns F32 (pack→pad round-trip
+stays f32). Test `sequence_packing_ops_f32_no_crash_returns_f32`.
+
+★VISION/GRAPH/SEQUENCE f32-crash vein: nms(5)+scatter(3)+roi(3)+ViT(3)+RNN(3)+seq-pack(3) = 20 ops fixed
+this session. Recipes: lossy_f64(±output-narrow) for few-read ops, upcast-recurse for many-read ops.
+Remaining: point cloud (farthest_point_sampling/ball_query/group_points), graph (degree/add_self_loops/
+edge_index_to_adj int-index reads), gru_cell/lstm_cell. ⚠️LESSON: verify full multi-line signatures
+before writing test calls (pack_padded has a `lengths: &[usize]`, pad_packed has `batch_sizes`/
+`padding_value`/`total_length` params the truncated grep hid).
+
 ## 2026-07-02 - ★★FIX (f32 CRASH ×3, MAINSTREAM): tensor_lstm/gru/rnn on f32 — upcast-recurse
 
 Agent `GammaFork`. Highest-value target of the f32-crash vein: the RECURRENT nets (LSTM/GRU/RNN are
