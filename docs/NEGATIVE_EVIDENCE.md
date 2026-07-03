@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (bit-exact): color_jitter batch-parallel 2.34x + scan rejects (STFT/mfcc/fft/rrcrop)
+
+Agent `GammaFork`. Scanned a fresh op family (audio/image-aug) for the application-level serial-op vein.
+
+★WIN: color_jitter (image aug) ran serial `for bi { draw 4 RNG factors; for yi { for xi {per-pixel
+color transform} } }`. Per-pixel COMPUTE (brightness/contrast/saturation + HSV hue rotation, ~20-40
+flops/pixel), not a gather. Pre-drew the 4 per-image factors serially (identical Xoshiro seq), then
+applied the transform to each image's [3,H,W] chunk via par_chunks_mut(3*h*w). Bit-exact (rng-clone-peek
+test computes an independent serial reference, to_bits() equal). MEASURED (RAYON A/B, B=32,3x224x224 =
+76MB movement, load ~16): serial 52.68 -> parallel 22.56 ms = **2.34x internal** (partly bandwidth-bound:
+the transform is cheap vs the 76MB read+write, so bandwidth caps the scaling). torchvision has
+ColorJitter (different op order); internal-A/B.
+
+★SCAN REJECTS this turn (don't re-probe): STFT already parallel over frames (real-FFT + hoisted twiddles);
+mfcc = tiny DCT-matrix build + matmul (delegates, done); tensor_fft_norm = single 1-D FFT (sequential
+butterflies, no batch dim, not parallelizable bit-exact); random_resized_crop = scalar STRIDED gather
+(bandwidth/DRAM-walled) + nearest-neighbor (doesn't even match torchvision bilinear); knn_search already
+SIMD/KD-tree optimized (prior turn). ★The compute-heavy readily-parallelizable application serial-op vein
+is now largely HARVESTED: remaining flagged ops are already-parallel, sequential-by-nature (1-D FFT / RNN
+/ istft-overlap-add), peer-linalg (cholesky/inv/qr/lstsq/multi_dot), or bandwidth/scalar-gather. 8 ops
+flipped this vein (ctc + 3 ROI + ball_query + group_points + FPS + color_jitter), 7 turns. Bench:
+examples/color_jitter_h2h.rs.
+
 ## 2026-07-03 - WIN (bit-exact): farthest_point_sampling batch-parallel — 9.32x internal (120->12.9ms)
 
 Agent `GammaFork`. Point-cloud sampling op (application-level serial-op vein). FPS ran serial
