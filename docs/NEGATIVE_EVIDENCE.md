@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-02 - ★FIX (f32 CRASH, contention-robust): cosine_embedding_loss(f32) errored -> works, returns f32
+
+Agent `GammaFork`. Machine load ~47 (perf benching unreliable) → per the contention playbook picked
+a timing-independent CRASH fix (verified by bit-exactness + dtype, not timing). `cosine_embedding_loss`
+(the non-`tensor_`-prefixed public API, lib.rs ~54531) composes `cos_sim = cosine_similarity(x1,x2)`
+(F32 for f32 input) with `self.full(...)` constants (ALWAYS F64) via tensor_sub/tensor_max/tensor_where
+→ on f32 input the mixed-dtype binary op ERRORS (FT binary ops require matching dtypes; torch.
+cosine_embedding_loss(f32) → f32). Its sibling `tensor_cosine_embedding_loss` (lib.rs ~15725) already
+has an f32 fused fast path (frankentorch-cosemb-f32-fused) computing the IDENTICAL mean loss natively
+(same eps=1e-8, same (y==1)?1-cos:max(0,cos-margin) for validated target∈{1,-1}). FIX: after the
+(preserved) 2-D + target∈{1,-1} validations, route f32 inputs to the sibling. f32: ERROR → works,
+returns F32, matches the f64 reference within 1e-5. Regression test
+`cosine_embedding_loss_f32_no_crash_returns_f32` (no-error + F32 dtype + value == f64 ref); the
+existing `cosine_embedding_loss_rejects_invalid_target` (validation preserved) stays green. 7/7
+cosine_embedding tests green.
+
+★DTYPE-PARITY SCAN (contention-robust frontier, timing-independent): a python scan for
+`tensor_values_lossy_f64` reads + F64 output build without dtype narrowing found 12 candidates — most
+are FALSE POSITIVES (nll_loss/nll_loss_full build an INDEX tensor from targets, not the output;
+bitwise_* are integer-only; isin returns the f64-mask convention). REAL residual = the LOSS FAMILY that
+builds `self.full()[F64]` constants and combines them with an f32-input compose: cosine_embedding_loss
+(FIXED here); focal_loss / wing_loss / adaptive_wing_loss / ordinal_regression_loss LIKELY share the
+same f32 mixed-dtype crash (the last three are FT-custom, no torch dtype ref; focal_loss is standard).
+FOLLOW-UP: probe each with a tiny f32 no-grad call (Err = crash to fix) and route/narrow — same recipe.
+★CONFIRMED DONE this scan (don't re-probe): sdpa (f32+f64), cross_entropy, gaussian_nll, isin
+(hash-set O(n+m)), pairwise_distance (f32 path). AGENT GammaFork.
+
 ## 2026-07-02 - ★★ WIN: pdist f32 general-p fused (cdist sibling) — 330x/5.5x SLOWER -> 12.6x SLOWER/2.46x FASTER vs torch
 
 Agent `GammaFork`. Direct sibling of the cdist f32 fix (72dae1f5) — the follow-up pointer paid off.
