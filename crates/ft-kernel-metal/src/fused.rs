@@ -89,7 +89,12 @@ kernel void gelu(device const float* X [[buffer(0)]], device float* Y [[buffer(1
 {
     if(i>=n) return; float x=X[i];
     const float c=0.7978845608028654f; // sqrt(2/pi)
-    Y[i]=0.5f*x*(1.0f+tanh(c*(x+0.044715f*x*x*x)));
+    // Match ggml GGML_GELU_FP16 clamp (x>=10 -> x, x<=-10 -> 0). This is also
+    // essential numerically: for x >~ 10.7 the tanh argument exceeds ~44 and MSL
+    // tanh overflows to inf/inf = NaN. The clamp keeps tanh in its finite range.
+    if (x >= 10.0f) { Y[i]=x; }
+    else if (x <= -10.0f) { Y[i]=0.0f; }
+    else { Y[i]=0.5f*x*(1.0f+tanh(c*(x+0.044715f*x*x*x))); }
 }
 
 // Elementwise add (residual): Y = A + B.
@@ -108,10 +113,11 @@ kernel void softmax(device const float* X [[buffer(0)]], device float* Y [[buffe
     red[lid]=m; threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]=max(red[lid],red[lid+o]); threadgroup_barrier(mem_flags::mem_threadgroup);}
     float mx=red[0]; threadgroup_barrier(mem_flags::mem_threadgroup);
-    float s=0.0f; for (uint c=lid;c<cols;c+=tgsz){float e=exp(x[c]-mx); y[c]=e; s+=e;}
+    bool ok = isfinite(mx);
+    float s=0.0f; for (uint c=lid;c<cols;c+=tgsz){float e=ok?exp(x[c]-mx):0.0f; e=isfinite(e)?e:0.0f; y[c]=e; s+=e;}
     red[lid]=s; threadgroup_barrier(mem_flags::mem_threadgroup);
     for (uint o=tgsz/2;o>0;o>>=1){ if(lid<o) red[lid]+=red[lid+o]; threadgroup_barrier(mem_flags::mem_threadgroup);}
-    float inv=1.0f/red[0]; for (uint c=lid;c<cols;c+=tgsz) y[c]*=inv;
+    float inv=(red[0]>0.0f)?1.0f/red[0]:0.0f; for (uint c=lid;c<cols;c+=tgsz) y[c]*=inv;
 }
 
 // Attention scores: S[h*seq+i, j] = scale * dot(Q[i, h*hd:h*hd+hd], K[j, h*hd:h*hd+hd]).
@@ -125,7 +131,7 @@ kernel void attn_scores(
     if (i>=seq||j>=seq||h>=nh) return;
     float acc=0.0f; uint qo=i*d+h*hd, ko=j*d+h*hd;
     for (uint e=0;e<hd;e++) acc+=Q[qo+e]*K[ko+e];
-    S[(h*seq+i)*seq+j]=acc*scale;
+    float s=acc*scale; S[(h*seq+i)*seq+j]=isfinite(s)?s:-1e30f;
 }
 
 // Attention context: O[i, h*hd+e] = sum_j S[h*seq+i, j] * V[j, h*hd+e].
@@ -451,6 +457,12 @@ pub struct EncoderGpu {
     d_model: usize,
     n_heads: usize,
 }
+
+// The resident weight buffers are immutable after upload (GPU read-only), the
+// command queue is thread-safe, and `forward` allocates only per-call local
+// activation buffers — so an EncoderGpu can be shared/cached across threads.
+unsafe impl Send for EncoderGpu {}
+unsafe impl Sync for EncoderGpu {}
 
 impl EncoderGpu {
     /// Upload all layer weights to the GPU. `d_ff` is the MLP hidden width
