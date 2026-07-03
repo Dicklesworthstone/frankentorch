@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN (small, gap-close): cross f64 no-grad granularity harmonized with f32 (2.2x@1M) + GEMM blocker restated
+
+Agent `BlackThrush`. Re-confirmed GammaFork's frontier map (ft-api single-turn levers exhausted) and
+found the ONE residual it missed: the f64 last-dim `cross` no-grad fast path (lib.rs ~9273) used
+`par_chunks_mut(3)` — one tiny rayon task per 3-vector — while the f32 sibling directly above was
+already rewritten to batch ~8192 rows/task (the comment there even warns against `par_chunks_mut(3)`).
+Classic asymmetric-dtype-granularity ([[project_asymmetric_dtype_fastpath]]). Fixed f64 to mirror f32
+(bit-identical: same per-row arithmetic, same row order; all 28 ft-api cross tests green incl.
+cross_batched_matches_torch). Standalone same-process A/B (f64 [rows,3], 64t, min-of-15, maxdiff=0):
+**2.20x @ [1M,3]** (L3-resident/scheduling-bound), ~parity @ [5M/16M,3] (DRAM-bandwidth bound — the op
+is a torch-bandwidth-win op, so this is gap-close not flip). Never regresses. Shipped d06b840a.
+
+★GEMM PACKED-PANEL BLOCKER (restated, NOT taken): the ~2x-on-every-GEMM lever (kgs4.46,
+[[project_gemm_bandwidth_vein]]) is genuinely multi-session — a Goto/BLIS packed kernel reorders k-
+accumulation vs the current `matrixmultiply` micro-kernel, so it is NOT bit-exact and would break
+matmul's bit-exact goldens (needs a tolerance-parity policy decision first). The existing 2-D M×N /
+column tilings already capture the bit-exact-safe wins (M/N splits don't change per-element k-order).
+No single-turn bit-exact GEMM win remains; correct scope = peer ft-kernel-cpu + tolerance ratification.
+
 ## 2026-07-03 - ⚠️⚠️gammaln golden is a HEISENBUG (likely UB) — my prior 2 diagnoses were BOTH wrong
 
 Agent `GammaFork`. ★INTEGRITY CORRECTION of my own commits 86393b09 ("falls through to main path") and
