@@ -1,5 +1,30 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - SYSTEMATIC torch backward-cost probe (maps grad-closure flip candidates) + pdist deep-lever queued
+
+Agent `GammaFork`. Applied the refined LRN lesson (grad-closure levers flip only when torch's OWN
+backward is slow) SYSTEMATICALLY: probed 10 torch nn.functional ops for bwd/fwd cost (scratchpad/
+bwd_probe.py, torch 2.12.1 @32t) to find LRN-like slow-torch-backward flip candidates. RESULTS (fwd/bwd
+ms): local_response_norm 62.8/146.7 (already flipped), **pdist 3.7/17.9 (bwd/fwd 4.9 — SLOW)**, unfold
+69/97, multilabel_margin 13.0/15.0, pixel_shuffle 0.7/1.8, group_norm 1.6/2.9, instance_norm 0.5/1.7,
+cosine_similarity 0.3/0.9, soft_margin 0.16/0.25. ★MAP: most nn.functional ops have FAST torch backward
+(<3ms) => NO flip room (torch already kernel-optimal). Only slow-torch-backward = pdist / unfold /
+multilabel_margin.
+
+★pdist = the one real lead (torch bwd 17.9ms disproportionately slow). BUT FT's p=2 grad path is a
+matmul-identity COMPOSE (gram=matmul, +unsqueeze/expand/add/sub/clamp/reshape/index_select/sqrt) that
+materialises FOUR [n,n] intermediates (8MB each at n=512) + their backward = FT measured fwd+bwd ~44ms
+(load 25, inflated) ⇒ FT ~2x SLOWER than torch. ★FUSED-BACKWARD DESIGN (next focused turn, moderate
+rewrite): route p=2 through apply_function; forward = pdist_forward_f64 (already fast/parallel); custom
+backward computes grad_x[i,:] = Σ_{j≠i} grad_dist[pair(i,j)]·(x[i]-x[j])/d(i,j) PARALLEL over points i
+(disjoint grad_x rows = bit-exact, no scatter conflict), O(n²m) parallel, AVOIDS the [n,n] compose
+intermediates. Should flip vs torch 17.9ms. ⚠pdist is a TOLERANCE op — verify fused-bwd grad within tol
+(the compose grad is the current FT behavior; a direct-formula bwd rounds differently). Did NOT rush it:
+load ~25 (can't measure clean) + tolerance verification needed. unfold=scatter-add-overlap (bandwidth,
+not bit-exact-parallel); multilabel_margin=heavy both ways + sparse (fwd-parallel already REJECTED
+02085443). Bench queued: examples/pdist_grad_h2h.rs. ★Grad-closure flip sub-vein: easy flips exhausted
+(LRN done, mlsm gap-closed); pdist is the last high-value one and it's a deep fused-backward.
+
 ## 2026-07-03 - WIN (bit-exact, gap-close): multilabel_soft_margin_loss fwd+bwd parallel — 2.52x internal (5.17x->2.05x SLOWER vs torch)
 
 Agent `GammaFork`. Same sub-vein as LRN (serial grad closures). tensor_multilabel_soft_margin_loss
