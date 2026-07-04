@@ -1,5 +1,34 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: heaviside_ in-place binary F64 fast path (ft-api) - 5.1-8.4x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Straggler of the try_inplace_binary_f64 family (after atan2_/logaddexp_/... a5264804).
+`tensor_heaviside_` cloned BOTH operands (`tensor_values_lossy_f64(target)` + `tensor_values(values)`) +
+serial select + `update_tensor_values_for_float` writeback for ALL dtypes. Added the
+`try_inplace_binary_f64(target, values, ...)` fast path (F64+contiguous: borrow BOTH, no clone, parallel
+select). Map = `if x>0 {1} else if x==0 {v} else {0}` (torch.heaviside step, no NaN propagation). Bit-
+identical (fast-path parallel map == serial fallback map, order-preserving; only f64+contiguous activates,
+mixed-dtype/non-contig fall through unchanged). frankentorch-inplace-binary-fastpath.
+
+MEASURE (`inplace_heaviside_ab`, mixed neg/zero/pos so all 3 branches hit; OLD = clone-both + serial
+select + writeback replica; NEW = real op; RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker ovh-a):
+- 4M  ( 30MB x2): 34.757 -> 4.142 ms = **8.39x**
+- 8M  ( 61MB x2): 95.388 -> 18.424 ms = **5.18x**
+- 16M (122MB x2): 163.900 -> 32.309 ms = **5.07x**
+
+Bigger than a pure-arith in-place binary because it drops BOTH operand clones (borrow-both) on a cheap-
+compute op. ft-api --lib GREEN.
+
+### NEGATIVE (reverted, not shipped): LSTM cell gate-soup rayon parallelization
+Parallelized the `forward_cell_projected` gate loop (LSTMCell, ft-nn) serial->rayon over batch rows (4
+exp + 2 tanh/element, per-(b,j) independent). Gate-soup COMPUTE measured a clean **3.46x** bit-exact
+(serial 12.0ms -> parallel 3.5ms @ batch=1024 hidden=256). BUT end-to-end `forward_cell` was only
+**1.15x** (56ms NEW vs ~64.6ms OLD-est) — the gate soup is only ~20% of forward_cell; the matmuls +
+tape/session value-copy overhead dominate (~52ms). Below the Score>=2.0 bar for the REAL op, and
+headlining the 3.46x internal-kernel number would repeat the apply_function-borrow over-claim trap.
+REVERTED. ★ The real forward_cell wall is the ~52ms non-gate-soup (2 matmuls + expand_bias x2 + 3 adds +
+tape overhead over [1024,1024]) — a deeper ft-nn/session lever if revisited, NOT the gate soup.
+
 ## 2026-07-04 - WIN: in-place constant fills zero_/ones_/fill_ F64 in-place parallel (ft-api) - 7-46x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Fourth in-place sibling. `tensor_zero_`/`ones_`/`fill_` each built `vec![value; numel]`
