@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★WIN (LOAD-INDEPENDENT, ~9-10x vs torch): general-rank single-pass roll_dims — algorithmic, N materializing passes -> 1
+
+Agent `BlackThrush`. `tensor_roll_dims` (multi-dim roll) had a single-pass fast path ONLY for rank-2; rank-3+
+fell through to N sequential `tensor_roll` calls — each MATERIALIZES a full tensor (Vec + tape node) AND rolls
+the last dim element-wise (inner=1, cache-hostile). So a rank-3 multi-dim roll was 3 passes + 2 intermediates.
+Added a general-rank single-pass path (rank != 2 lands here; rank-2 kept as-is): accumulate the per-dim shift,
+then in ONE parallel pass over the output rows (contiguous last-dim slices) pick the source row by un-rolling
+the outer coords (unravel/adjust/reravel) and block-copy the row rotated by the last-dim shift (2 contiguous
+runs). Bit-identical to the sequential rolls (pure positional movement).
+
+★MEASURE (rank-3 16M, f64, min-9, at LOAD 10 = LOW → LOAD-INDEPENDENT, this is ALGORITHMIC not
+bandwidth/contention): single-pass ~8ms vs a parallel-sequential baseline faithful to the fallback ~139ms =
+**15-17x**; **vs torch.roll (which is itself slow at 73-86ms for a rank-3 multi-dim roll): ~9-10x FASTER** —
+the old N-pass fallback was ~1.7x SLOWER than torch, so the fast path is a FLIP + gap-close. Bit-exact
+(assert_eq vs sequential across [256^3]/[512,512,64]/[128,128,1024]). New test
+roll_dims_general_rank_fast_path_matches_sequential (rank 3 & 4, multi-dim, negative + zero + wrap>size shifts,
+rank-1). 10 roll tests + flip_roll_golden green (rch). Grad / non-contiguous / zero-size fall through to the
+sequential rolls. ★UNLIKE the cache-block vein (contention-dependent), this is a CLEAN LOAD-INDEPENDENT win:
+it removes N-1 full materializations + replaces element-wise last-dim rolls with block-copies — fewer FLOPs +
+fewer allocs regardless of load. f64+f32.
+
 ## 2026-07-04 - WIN (contention/large-data): cache-blocked argmax/argmin_dim completes the reduction family + CONTENTION-DEPENDENCE finding
 
 Agent `BlackThrush`. Extends the cache-block strided-reduction lever (prod dd45b61f, max/min f64 54aed2c6 +
