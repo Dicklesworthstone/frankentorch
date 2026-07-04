@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: block_diag F64 native no-grad fast path (ft-api) - 1.18-2.23x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Asymmetric-dtype gap: `tensor_block_diag` had an F32 native no-grad fast path
+(borrow blocks + calloc'd output + positional row copy) but F64 fell through to the apply_function
+composed path, which CLONES each block (materializes `inputs` via tensor_values) before copying it
+into the output. Mirrored the F32 fast path for F64: borrow the contiguous f64 blocks zero-copy and
+copy their rows directly into a `vec![0.0; numel]` (lazy calloc, off-diagonal costs no write
+bandwidth). Bit-identical to the composed positional copies. Grad / non-f64 / non-contiguous fall
+through unchanged.
+
+MEASURE (`block_diag_ab`, real op vs an apply_function-path replica that CLONES the blocks — matching
+the orig's `inputs` materialization so the baseline is fair, RAYON_NUM_THREADS=8, min-9, bitmatch=true;
+worker ovh-a):
+- 3 x 2048^2 blocks (288 MB out): 104.72 -> 47.88 ms = **2.19x**
+- 4 x 1500^2 blocks (274 MB out):  42.68 -> 36.18 ms = **1.18x**
+- 2 x 3000^2 blocks (274 MB out): 141.57 -> 63.55 ms = **2.23x**
+
+The win is the avoided block clone (bigger blocks -> bigger clone fraction -> ~2.2x; more/smaller
+blocks -> 1.18x). ft-api --lib 2482/0. (This closes the F64 side of the [[asymmetric_dtype_fastpath]]
+vein for block_diag; the F32 side was frankentorch-blockdiag-f32-fused.)
+
 ## 2026-07-04 - NEGATIVE: masked_scatter two-pass parallel no-grad path (ft-api) - 0.55-0.83x, REVERTED
 
 Agent `CopperBirch`. `tensor_masked_scatter`'s no-grad fast path is a serial running-counter loop
