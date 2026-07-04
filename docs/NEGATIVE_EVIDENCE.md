@@ -1,5 +1,37 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: expand/broadcast_to uninit parallel-first-touch materialize — 2.2-5.0x vs original (bit-exact)
+
+Agent `BlackThrush`. `expand`/`broadcast_to` (and every broadcasted bias/mean/var in norm op-graphs, and
+meshgrid) materialize through ft-autograd's `expand_row_structured`, which did
+`let mut output = vec![values[0]; output_numel]` — a SERIAL first-touch of the fresh lazy-`calloc` output —
+then overwrote EVERY element with the per-row `fill`/`copy_from_slice`. So the init was 100% DEAD **and**
+single-threaded, and single-threaded first-touch is the wall for pure-copy materializations (see
+`COPY_MATERIALIZE_PARALLEL_MIN`). SlateTern (2026-07-01, "REJECT: par_zeroed regresses") identified the dead
+init as elidable but deferred it: ft-autograd/ft-api are `#![forbid(unsafe_code)]` (no uninit `set_len`) and
+the safe `par_zeroed` alternative REGRESSES under contention (adds parallel dispatch overhead).
+
+FIX: moved the materialize into ft-kernel-cpu (site-level `#[allow(unsafe_code)]`) as
+`pub fn expand_row_structured<T: Copy+Send+Sync>`: `Vec::with_capacity(n)` + `set_len`, then the fill is the
+SOLE writer — so the (at-scale parallel) fill does the page FIRST-TOUCH, no dead serial pass. This REMOVES
+SERIAL DEAD WORK (contention-SAFE, unlike par_zeroed which ADDS parallel work). SAFETY:
+`output_numel == num_rows*inner` (inner = last dim) so `par_chunks_mut(inner)` covers every element and each
+chunk is fully written before `set_len` is observed; `T: Copy` = no Drop. ft-autograd's `expand_row_structured`
+now delegates. Parallel-fill gate raised `PAR_MIN` 64K → `COPY_MATERIALIZE_PARALLEL_MIN` (4M) = the documented
+copy crossover (the copy-gate comment shows 64K was a pessimization for the [64K,4M] range).
+
+★MEASURE (`examples/expand_uninit_ab.rs`, same-process SAME-WORKER A/B, RAYON_NUM_THREADS=8, min-9, f32,
+`bitmatch=true` on ALL cases incl the parallel branch). OLD = `vec![v;n]`+fill (the original path), NEW = uninit kernel:
+- `[1,2048]->[2048,2048]` (4M):    1.131 -> 0.225 ms = **5.03x vs ORIG** (≈ torch's ~0.21ms = PARITY)
+- `[1,4096]->[4096,4096]` (16M):  34.045 -> 15.189 ms = **2.24x vs ORIG**
+- `[4096,1]->[4096,4096]` (16M):  34.142 -> 15.429 ms = **2.21x vs ORIG** (col-broadcast `fill` path)
+- `[1,8192]->[8192,8192]` (64M): 134.128 -> 41.412 ms = **3.24x vs ORIG**
+Bit-IDENTICAL to the vec-init path (same source value at every position). Tests: ft-autograd expand 4/0,
+ft-api --lib 2480/0. ★LESSON: a `vec![x; numel]` before a full-overwrite parallel fill is not just dead work —
+it is a SERIAL FIRST-TOUCH that faults every page single-threaded; eliminating it (uninit + let the parallel
+fill first-touch) is contention-safe, unlike adding a par_zeroed pass. The forbid-unsafe crates can't do it —
+put the kernel in ft-kernel-cpu. AGENT BlackThrush.
+
 ## 2026-07-04 - ★WIN (LOAD-INDEPENDENT, ~9.5-10x vs torch): fftshift/ifftshift delegate to single-pass roll_dims
 
 Agent `BlackThrush`. Direct follow-on to the roll_dims single-pass win. `tensor_fft_fftshift` and

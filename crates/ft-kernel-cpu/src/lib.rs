@@ -2303,6 +2303,79 @@ const CUM_SCAN_1D_PARALLEL_MIN: usize = 1 << 19; // 524288
 // every medium copy. frankentorch-kgs4-copygate.
 const COPY_MATERIALIZE_PARALLEL_MIN: usize = 1 << 22; // ~4.19M elems (~32MB f64)
 
+/// Row-structured broadcast-expand materialization (`expand`/`broadcast_to`),
+/// building the output into an UNINITIALIZED buffer so the fill also does the
+/// page FIRST-TOUCH.
+///
+/// The old ft-autograd path did `vec![values[0]; output_numel]` (a full serial
+/// first-touch of the fresh lazy-`calloc` output) and then overwrote EVERY
+/// element with the per-row `fill`/`copy_from_slice` — so the init was 100% dead
+/// AND single-threaded, and single-threaded first-touch is the wall for these
+/// pure-copy materializations (see `COPY_MATERIALIZE_PARALLEL_MIN`). ft-autograd
+/// is `#![forbid(unsafe_code)]`, so it could not drop the init; here we allocate
+/// with `Vec::with_capacity` + `set_len` and let the fill be the sole (and, at
+/// scale, parallel) writer — parallel first-touch, no dead serial pass.
+///
+/// The output is BIT-IDENTICAL to the vec-init path (same source value at every
+/// position — see the row/inner unravel below). `T: Copy` so no Drop concerns.
+#[allow(unsafe_code)]
+pub fn expand_row_structured<T: Copy + Send + Sync>(
+    values: &[T],
+    output_numel: usize,
+    target_shape: &[usize],
+    input_strides: &[usize],
+) -> Vec<T> {
+    let nd = target_shape.len();
+    debug_assert!(nd >= 1 && !values.is_empty() && output_numel > 0);
+    let inner = target_shape[nd - 1];
+    let inner_stride = input_strides[nd - 1];
+    // Outer-space strides over the first nd-1 dims (row index r unravels into outer coords).
+    let mut outer_strides = vec![1usize; nd.saturating_sub(1)];
+    for d in (0..nd.saturating_sub(1)).rev() {
+        if d + 1 < nd - 1 {
+            outer_strides[d] = outer_strides[d + 1] * target_shape[d + 1];
+        }
+    }
+    let row_base = |r: usize| -> usize {
+        let mut idx = 0usize;
+        for d in 0..nd - 1 {
+            let c = (r / outer_strides[d]) % target_shape[d];
+            idx += c * input_strides[d];
+        }
+        idx
+    };
+    let fill_row = |r: usize, row: &mut [T]| {
+        let base = row_base(r);
+        if inner_stride == 0 {
+            row.fill(values[base]);
+        } else {
+            row.copy_from_slice(&values[base..base + inner]);
+        }
+    };
+    let mut output: Vec<T> = Vec::with_capacity(output_numel);
+    // SAFETY: capacity == output_numel. `output_numel == num_rows * inner` (inner is the
+    // last target dim), so `chunks_mut(inner)` yields exactly `num_rows` chunks that
+    // together cover every element, and `fill_row` writes each chunk in full
+    // (`fill`/`copy_from_slice` of length `inner`). Thus every element in
+    // `0..output_numel` is initialized before the Vec is read or returned. `T: Copy`
+    // has no Drop, so `set_len` over previously-uninitialized slots is sound.
+    unsafe {
+        output.set_len(output_numel);
+    }
+    if output_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        output
+            .par_chunks_mut(inner)
+            .enumerate()
+            .for_each(|(r, row)| fill_row(r, row));
+    } else {
+        for (r, row) in output.chunks_mut(inner).enumerate() {
+            fill_row(r, row);
+        }
+    }
+    output
+}
+
 // Pooling forwards (avg/max_pool2d) fan out over planes with `par_chunks_mut(oh*ow)`
 // but had NO size gate — so small CNN feature maps (e.g. ResNet 512ch x 28x28, which
 // is a REAL training shape) ran 0.32-0.81x SLOWER than serial: rayon fork/join over

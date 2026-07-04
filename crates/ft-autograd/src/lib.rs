@@ -10775,46 +10775,13 @@ impl TensorTape {
         target_shape: &[usize],
         input_strides: &[usize],
     ) -> Vec<T> {
-        let nd = target_shape.len();
-        let inner = target_shape[nd - 1];
-        let inner_stride = input_strides[nd - 1];
-        // Outer-space strides over the first nd-1 dims (row index r unravels into outer coords).
-        let mut outer_strides = vec![1usize; nd.saturating_sub(1)];
-        for d in (0..nd.saturating_sub(1)).rev() {
-            if d + 1 < nd - 1 {
-                outer_strides[d] = outer_strides[d + 1] * target_shape[d + 1];
-            }
-        }
-        let row_base = |r: usize| -> usize {
-            let mut idx = 0usize;
-            for d in 0..nd - 1 {
-                let c = (r / outer_strides[d]) % target_shape[d];
-                idx += c * input_strides[d];
-            }
-            idx
-        };
-        let mut output = vec![values[0]; output_numel];
-        let fill_row = |r: usize, row: &mut [T]| {
-            let base = row_base(r);
-            if inner_stride == 0 {
-                row.fill(values[base]);
-            } else {
-                row.copy_from_slice(&values[base..base + inner]);
-            }
-        };
-        const PAR_MIN: usize = 1 << 16;
-        if output_numel >= PAR_MIN {
-            use rayon::prelude::*;
-            output
-                .par_chunks_mut(inner)
-                .enumerate()
-                .for_each(|(r, row)| fill_row(r, row));
-        } else {
-            for (r, row) in output.chunks_mut(inner).enumerate() {
-                fill_row(r, row);
-            }
-        }
-        output
+        // Delegate to ft-kernel-cpu, which builds the output into an UNINITIALIZED
+        // buffer (this crate is `#![forbid(unsafe_code)]`). The old body here did
+        // `vec![values[0]; output_numel]` — a serial first-touch of the fresh output
+        // that the per-row fill then fully overwrote (100% dead + single-threaded);
+        // single-threaded first-touch is the wall for pure-copy materializations. The
+        // kernel lets the (at-scale parallel) fill do the first-touch. Bit-identical.
+        ft_kernel_cpu::expand_row_structured(values, output_numel, target_shape, input_strides)
     }
 
     fn broadcast_input_strides(
