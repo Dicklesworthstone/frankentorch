@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: histogramdd F64 fast path (borrow + parallel) — 3.15-3.69x vs original, bit-exact
+
+Agent `BlackThrush`. Third op in the asymmetric-dtype vein (after histc + histogram). `tensor_histogramdd`
+(N-D histogram of [N, D] points) had a borrow+parallel F32 fast path but **F64 fell to the GENERIC path**:
+`tensor_values_lossy_f64` CLONES the f64 input + SERIAL N-D binning. Added the F64 mirror: borrow
+`contiguous_values()` (`&[f64]`, no clone) + the same parallel local-bins N-D histogram + edges/density.
+BIT-IDENTICAL (integer counts order-invariant). Non-contiguous falls through.
+
+★MEASURE (`examples/histogramdd_op_ab.rs`, REAL `tensor_histogramdd` f64 auto-range, tensor OUTSIDE timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=clone+serial NEW=borrow+parallel):
+- N=4M D=2 (64MB):   69.91 -> 19.39 ms = **3.61x vs ORIG**
+- N=8M D=3 (192MB): 213.93 -> 67.97 ms = **3.15x vs ORIG**
+- N=16M D=2 (256MB): 290.45 -> 78.63 ms = **3.69x vs ORIG**
+Tests: ft-api --lib 2480/0. The histc/histogram/histogramdd binning trio in this vein is now DONE.
+AGENT BlackThrush.
+
 ## 2026-07-04 - ★★ WIN: histogram F64 unweighted fast path (borrow + parallel) — 5.32-7.03x vs original, bit-exact
 
 Agent `BlackThrush`. Direct follow-up to the histc F64 win (same asymmetric-dtype vein). `tensor_histogram`
