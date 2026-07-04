@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: gcd + lcm par_map (ft-api) - 3.2-5.0x vs ORIG, bit-exact
+
+Agent `CopperBirch`. `tensor_gcd` / `tensor_lcm` computed a SERIAL per-element Euclidean loop
+(`gcd_scalar`/`lcm_scalar` over i64 casts). The loop is compute-heavy (several mod ops per element),
+so parallelizing the map over the independent lanes is a clean compute-bound win. Kept the exact clones
+(storage().to_vec()) and only par_zip_map'd the compute — GUARANTEED bit-identical (par_zip preserves
+order, gcd/lcm deterministic), no read-path change. Gated at PARALLEL_ELEMENTWISE_MIN.
+
+★NOTE: the "gcd/lcm SIMD-walled" prior memory was about SIMD-Stein's (making each gcd faster via SIMD) —
+orthogonal to RAYON parallelization (spreading elements across cores), which IS available + bit-exact.
+
+MEASURE (`gcd_ab`, real op vs a clone-both+serial-gcd replica exactly modeling the ORIG — FAIR (no
+apply_function), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 4M  (30MB x2):  185.52 ->  36.79 ms = **5.04x**
+- 8M  (61MB x2):  468.21 -> 135.86 ms = **3.45x**
+- 16M (122MB x2): 945.55 -> 293.14 ms = **3.23x**
+
+Ratio decreases with size because the (kept) serial storage().to_vec() clones become a bigger fraction
+as the parallelized compute shrinks; a borrow fast path would lift it further but risks a
+storage()-vs-contiguous_values() read-semantics change on offset views (skipped for safety). ft-api
+--lib 2482/0.
+
 ## 2026-07-04 - WIN: binary bitwise family (and/or/xor/left_shift/right_shift) F64 borrow + par_zip_map (ft-api) - 12.6-13.5x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Follow-up to bitwise_not (81ec54a8). The 5 binary bitwise ops each CLONED input via
