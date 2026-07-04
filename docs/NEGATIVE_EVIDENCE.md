@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: in-place binary ops F64 in-place + parallel (ft-api) - 2.5-9.6x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Sibling of the in-place-unary win (c604277c). `tensor_add_`/`sub_`/`mul_`/`div_`
+(equal-shape in-place tensor-tensor) each cloned BOTH operands (`values(target)` + `values(other)`),
+built a fresh result Vec by a SERIAL zip-map, then `update_tensor_values` wrote it back = **4 serial
+passes**. New shared helper `apply_tensor_binary_in_place` (F64): clone only `other` (owned), mutate
+`target` IN PLACE via `update_tensor_values_with` + `par_iter_mut` (>= `PARALLEL_ELEMENTWISE_MIN`)
+reading the owned `other` = **2 passes, parallel** — drops the `target` clone AND the writeback memcpy.
+Bit-identical: `*a = f(*a, *b)` per element, order-independent; same `is_contiguous`/`UnsupportedLayout`
+contract. F32 has no in-place `_with` accessor → keeps clone->map->writeback but parallelizes the map
+with a NATIVE f32 op (no f64 round-trip = no double-round). frankentorch-inplace-binary-par.
+
+MEASURE (`inplace_binary_ab`, mul_ representative, other~=1.0 so repeated in-place multiply stays
+bounded; OLD = the 4-pass serial replica reusing the clone buffer for the writeback; NEW = real op;
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker ovh-a):
+- 4M  ( 30MB x2): 33.927 -> 3.548 ms = **9.56x**
+- 8M  ( 61MB x2): 93.449 -> 37.129 ms = **2.52x**
+- 16M (122MB x2): 184.853 -> 71.628 ms = **2.58x**
+
+The 4M win is largest (other-clone warm/cheap); at 8M+ the residual serial `values(other)` clone
+(64-128MB memcpy) dominates NEW, capping it ~2.5x (still drops 2 of 4 passes + parallelizes).
+Eliminating the other-clone (borrow both via a new tape borrow-both-mutate method) is the follow-up
+ceiling. ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN: in-place unary helper F64 in-place + parallel (ft-api) - 17-18x vs ORIG, bit-exact
 
 Agent `CopperBirch`. `apply_tensor_unary_in_place` backs **73** in-place unary ops (exp_/log_/erf_/
