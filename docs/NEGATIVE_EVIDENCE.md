@@ -1,5 +1,38 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - NEGATIVE: grid_sample zeros/bilinear interior fast path (ft-api) - unstable 1.47x/1.61x routing, 0.41x loss vs restored ORIG, REVERTED
+
+Agent `SilverMaple`. Land-or-dig scan found no qualifying unlanded measured
+`.scratch/.worktrees` win to land: the old addcmul FMA scratch win is already
+represented/superseded on main, and the positive-looking packed-BT / persistent
+linear cache worktree branches are already covered by mainline reject ledgers.
+
+New lever dug from the grid_sample gap: for zeros+bilinear samples whose four
+taps are all interior, replace four `sample_value` calls (four per-tap bounds /
+padding checks) with one interior guard and direct NHWC-plane offsets. This is
+the shallow scalar form of the alien-graveyard cache/gather/SIMD tiled lever for
+the documented grid_sample 4-tap gap. The implementation was bit-equivalent on
+the focused ft-api grid_sample suite but did not survive timing discipline.
+
+MEASURE (per-crate short bench command; literal `cargo bench --release` was
+rejected by Cargo for bench, so the valid command was
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod rch exec -- cargo bench
+-p ft-api --bench ops_bench grid_sample -- --noplot --warm-up-time 1
+--measurement-time 3 --sample-size 10`):
+- restored ORIG on `vmi1293453`: 3.4761 ms median.
+- candidate on `hz2`: 2.3696 ms median = 1.47x vs the `vmi1293453` ORIG
+  routing baseline.
+- restored ORIG local fallback (rch open-local, same target dir): 3.8112 ms
+  median.
+- candidate on `vmi1152480`: 9.3330 ms median = 0.41x vs the restored local
+  ORIG, a clear non-keep under cross-worker pressure.
+
+CORRECTNESS WHILE PATCHED: `CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod
+rch exec -- cargo test -p ft-api grid_sample --lib -- --nocapture` passed 13/0.
+DECISION: reverted the code. The scalar interior-guard lever is not a stable
+measured win. The remaining credible route is the deeper cache-blocked/SIMD
+4-tap gather path, measured same-worker before keep.
+
 ## 2026-07-04 - WIN: dequantize_per_channel F64 borrow + parallel (ft-api) - 2.5-2.9x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Same corrected-criterion pattern as quantize_per_channel (258a8405): the ORIG
