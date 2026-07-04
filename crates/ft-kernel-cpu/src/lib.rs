@@ -3091,12 +3091,13 @@ pub fn pow_tensor_contiguous_f64(
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
 
-    // powf is ~exp+log per element (compute-bound), so spread it across the
-    // rayon pool for large tensors. The map is a pure per-element function, so the
-    // parallel result is bit-identical to the serial one.
+    // The general powf is ~exp+log per element (compute-bound → gate at PARALLEL_THRESHOLD), but
+    // the trivial-exponent elisions below (x, x*x, x*x*x, 1/x) are cheap bandwidth-bound WRITES
+    // that over-parallelize at 8192 (measured x^2 1M 0.04x = 25x SLOWER, crossover ~4M) — so each
+    // caller passes its own `parallel_min`. Pure per-element map → bit-identical serial/parallel.
     #[inline]
-    fn run<F: Fn(f64) -> f64 + Sync>(window: &[f64], numel: usize, f: F) -> Vec<f64> {
-        if numel >= PARALLEL_THRESHOLD {
+    fn run<F: Fn(f64) -> f64 + Sync>(window: &[f64], numel: usize, parallel_min: usize, f: F) -> Vec<f64> {
+        if numel >= parallel_min {
             window.par_iter().map(|&v| f(v)).collect()
         } else {
             window.iter().map(|&v| f(v)).collect()
@@ -3109,15 +3110,15 @@ pub fn pow_tensor_contiguous_f64(
     // ±0/±inf/NaN/1e±300) and skip the powf cost. 0.5 is NOT elided — torch f64
     // pow(.,0.5) != sqrt bit-for-bit (138/20k ULP diffs). frankentorch-kgs4.172.
     let out = if exponent == 1.0 {
-        run(window, numel, |v| v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v)
     } else if exponent == 2.0 {
-        run(window, numel, |v| v * v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v)
     } else if exponent == 3.0 {
-        run(window, numel, |v| v * v * v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v * v)
     } else if exponent == -1.0 {
-        run(window, numel, |v| 1.0 / v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| 1.0 / v)
     } else {
-        run(window, numel, |v| powf_torch_signed_zero_f64(v, exponent))
+        run(window, numel, PARALLEL_THRESHOLD, |v| powf_torch_signed_zero_f64(v, exponent))
     };
     Ok(out)
 }
@@ -29254,10 +29255,12 @@ pub fn pow_tensor_contiguous_f32(
     }
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
-    // Compute-bound, pure per-element map, so par_iter is bit-identical to serial.
+    // Pure per-element map (bit-identical serial/parallel). General powf is compute-bound (gate
+    // at PARALLEL_THRESHOLD); the trivial-exponent elisions below are cheap bandwidth-bound writes
+    // that over-parallelize at 8192 (~4M crossover, f64 sibling measured) → each passes parallel_min.
     #[inline]
-    fn run<F: Fn(f32) -> f32 + Sync>(window: &[f32], numel: usize, f: F) -> Vec<f32> {
-        if numel >= PARALLEL_THRESHOLD {
+    fn run<F: Fn(f32) -> f32 + Sync>(window: &[f32], numel: usize, parallel_min: usize, f: F) -> Vec<f32> {
+        if numel >= parallel_min {
             window.par_iter().map(|&v| f(v)).collect()
         } else {
             window.iter().map(|&v| f(v)).collect()
@@ -29272,15 +29275,15 @@ pub fn pow_tensor_contiguous_f32(
     // powf cost. 0.5 is NOT elided — torch pow(.,0.5) != sqrt bit-for-bit (1535/20k
     // ULP diffs). frankentorch-kgs4.171.
     let out = if exponent == 1.0 {
-        run(window, numel, |v| v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v)
     } else if exponent == 2.0 {
-        run(window, numel, |v| v * v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v)
     } else if exponent == 3.0 {
-        run(window, numel, |v| v * v * v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v * v)
     } else if exponent == -1.0 {
-        run(window, numel, |v| 1.0 / v)
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| 1.0 / v)
     } else {
-        run(window, numel, |v| powf_torch_signed_zero_f32(v, exponent))
+        run(window, numel, PARALLEL_THRESHOLD, |v| powf_torch_signed_zero_f32(v, exponent))
     };
     Ok(out)
 }

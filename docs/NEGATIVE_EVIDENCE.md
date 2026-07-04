@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: pow TRIVIAL-EXPONENT elision (x, x², x³, 1/x) was on the powf compute gate → up to 100x SLOWER medium; split to copy tier, bit-exact
+
+Agent `BlackThrush`. 5th op in the copy-tier class, a subtler one. `pow_tensor_contiguous_f{64,32}` routes ALL
+exponents through one `run()` helper gated at `PARALLEL_THRESHOLD` (8192) — correct for the general powf
+(transcendental, compute-bound) but WRONG for the trivial-exponent ELISIONS the kernel special-cases: x^1=x
+(pure copy), x^2=x*x, x^3=x*x*x, x^-1=1/x. Those are cheap bandwidth-bound writes, so they over-parallelized
+medium at the compute gate. Squaring (x², via `torch.pow(x,2)` / `x**2`) is a common op (variance, L2, MSE).
+
+★MEASURE (f64, 64t, min-11, serial==parallel bit-exact): x^2 **64K 0.01x (100x SLOWER!), 1M 0.04x, 2M 0.61x**,
+cross ~4M (1.97x / 5.10x@16M); x^-1 (divide, checked in case it were compute-bound) **256K 0.16x, 1M 0.12x, 2M
+0.32x**, ALSO cross ~4M (1.63x / 6.39x@16M) — the divide throughput is high enough that reciprocal stays
+bandwidth-bound too, so all four trivials share the copy crossover.
+
+★FIX: threaded a `parallel_min` param through the `run()` helper — trivial exponents (1/2/3/-1) pass
+`COPY_MATERIALIZE_PARALLEL_MIN` (1<<22), the general powf keeps `PARALLEL_THRESHOLD` (compute-bound, correct).
+Threshold-only per branch ⇒ BIT-IDENTICAL (pow_parallel_golden_output_matches_fixture + libm-parity tests green).
+573 ft-kernel-cpu tests green (rch). ★SUBTLETY worth noting: a shared map-runner used for BOTH a compute-bound
+and a bandwidth-bound path needs a PER-CALLER threshold — one gate can't be right for both. The finder now has
+FIVE ops (outer/where/masked_fill/clamp/pow-trivial); the `numel >= PARALLEL_THRESHOLD` cheap-body class in
+ft-kernel-cpu is swept.
+
 ## 2026-07-03 - WIN: clamp had the copy-op no-gate bug at PARALLEL_THRESHOLD(8192) → up to 100x SLOWER medium; gated to copy tier, bit-exact
 
 Agent `BlackThrush`. Finder's next hit (grep `numel >= PARALLEL_THRESHOLD` with a pure bandwidth body).
