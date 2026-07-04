@@ -34629,6 +34629,94 @@ pub fn transpose_2d_into_f32(src: &[f32], dst: &mut [f32], rows: usize, cols: us
     }
 }
 
+// Plane-size gate for the uninit first-touch strategy in `transpose_batched_materialize_*`:
+// building the output uninitialized (so the parallel per-plane transpose does the page FIRST-TOUCH,
+// no dead serial `vec![0.0; total]`) WINS for MANY SMALL planes — the hot attention `.mT` case,
+// measured 2.31x at [b=256,256x64] — but can REGRESS for FEW LARGE planes (measured 0.75x at
+// [b=4,4096x4096]=16M/plane), where the transpose (not the init) is the cost and random-order page
+// faults on a huge plane hurt. Gate uninit to planes <= this; larger planes keep the pre-faulted path.
+const UNINIT_TRANSPOSE_MAX_PLANE: usize = 1 << 20; // 1M elems/plane
+
+/// Materialize a batched 2-D transpose (backs the permute/movedim/`.mT` elem==1 rotation path).
+/// For planes `<= UNINIT_TRANSPOSE_MAX_PLANE` the output is built into an UNINITIALIZED buffer so the
+/// parallel per-plane transpose is the sole writer and does the page FIRST-TOUCH — no dead serial
+/// `vec![0.0; total]` init. For larger planes the pre-faulted `vec![0.0]` path is kept UNCHANGED (so
+/// this can never regress the few-large-planes case). Output is BIT-IDENTICAL in either branch.
+/// ft-autograd is `#![forbid(unsafe_code)]`, so it delegates here.
+#[allow(unsafe_code)]
+pub fn transpose_batched_materialize_f64(
+    src: &[f64],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let plane = rows * cols;
+    let total = batch * plane;
+    debug_assert_eq!(src.len(), total);
+    if plane == 0 || batch == 0 {
+        return vec![0.0; total];
+    }
+    if plane <= UNINIT_TRANSPOSE_MAX_PLANE {
+        let mut dst: Vec<f64> = Vec::with_capacity(total);
+        // SAFETY: capacity == total == batch*plane; `par_chunks_mut(plane)` yields exactly `batch`
+        // full chunks covering every element, and `transpose_2d_into_f64` writes all `plane` elements
+        // of each chunk before any read. `f64: Copy` has no Drop, so `set_len` is sound.
+        unsafe {
+            dst.set_len(total);
+        }
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f64(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    } else {
+        let mut dst = vec![0.0f64; total];
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f64(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    }
+}
+
+/// f32 mirror of [`transpose_batched_materialize_f64`].
+#[allow(unsafe_code)]
+pub fn transpose_batched_materialize_f32(
+    src: &[f32],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let plane = rows * cols;
+    let total = batch * plane;
+    debug_assert_eq!(src.len(), total);
+    if plane == 0 || batch == 0 {
+        return vec![0.0; total];
+    }
+    if plane <= UNINIT_TRANSPOSE_MAX_PLANE {
+        let mut dst: Vec<f32> = Vec::with_capacity(total);
+        // SAFETY: see `transpose_batched_materialize_f64`; every element written by the per-plane
+        // transpose before read, `f32: Copy` = no Drop.
+        unsafe {
+            dst.set_len(total);
+        }
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f32(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    } else {
+        let mut dst = vec![0.0f32; total];
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f32(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    }
+}
+
 /// AVX2 in-register transpose of one 8×8 f32 block (`_MM_TRANSPOSE8_PS`): `src[ib..ib+8][jb..jb+8]`
 /// → the 8 output rows of `chunk` at column offset `ib`. Caller guarantees AVX2, `ib+8<=rows`,
 /// `jb+8<=cols`, `chunk.len()==8*rows`.

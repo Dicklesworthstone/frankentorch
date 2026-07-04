@@ -10401,34 +10401,24 @@ impl TensorTape {
                 let plane = a_dim.saturating_mul(b_dim);
                 let total = batch.saturating_mul(plane);
                 if elem == 1 && plane > 0 && total == meta.numel() {
-                    use rayon::prelude::*;
+                    // Batched transpose materialize: for many-small-planes (attention `.mT`) the
+                    // kernel builds the output uninitialized so the parallel per-plane transpose does
+                    // the page first-touch (no dead serial `vec![0.0; total]`); few-large-planes keep
+                    // the pre-faulted path unchanged (plane-size gated → can't regress). See
+                    // ft_kernel_cpu::transpose_batched_materialize_f64.
                     match tensor.typed_storage() {
                         TensorStorage::F64(values) => {
                             let src = Self::checked_storage_slice(values, start, end)?;
-                            let mut dst = vec![0.0f64; total];
-                            dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
-                                let so = b * plane;
-                                ft_kernel_cpu::transpose_2d_into_f64(
-                                    &src[so..so + plane],
-                                    dpl,
-                                    a_dim,
-                                    b_dim,
-                                );
-                            });
+                            let dst = ft_kernel_cpu::transpose_batched_materialize_f64(
+                                src, batch, a_dim, b_dim,
+                            );
                             return Ok(TensorStorage::F64(Arc::new(dst)));
                         }
                         TensorStorage::F32(values) => {
                             let src = Self::checked_storage_slice(values, start, end)?;
-                            let mut dst = vec![0.0f32; total];
-                            dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
-                                let so = b * plane;
-                                ft_kernel_cpu::transpose_2d_into_f32(
-                                    &src[so..so + plane],
-                                    dpl,
-                                    a_dim,
-                                    b_dim,
-                                );
-                            });
+                            let dst = ft_kernel_cpu::transpose_batched_materialize_f32(
+                                src, batch, a_dim, b_dim,
+                            );
                             return Ok(TensorStorage::F32(Arc::new(dst)));
                         }
                         _ => {}
