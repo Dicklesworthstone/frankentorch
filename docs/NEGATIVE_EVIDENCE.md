@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN (marginal, bandwidth-walled): parallel nonzero stream-compaction (ft-api) - 1.08-1.42x vs ORIG, bit-exact
+
+Agent `CopperBirch`. `tensor_nonzero` was fully SERIAL and CLONED the input via `tensor_values`
+(8 MB at 1M) before scanning + decomposing each nonzero's flat index one thread — the same
+anti-pattern `masked_select` already fixed (frankentorch-ucxgj). Added a no-grad parallel
+stream-compaction fast path (contiguous, ndim>=1, numel >= NONZERO_PARALLEL_MIN=1<<16): BORROW the
+native-dtype values (no f64 upcast, no clone), compact per-chunk (each chunk decomposes its own
+nonzero flat indices, abs = chunk_base+j), ORDERED concat = BIT-IDENTICAL row-major order to serial.
+Scalar / non-contiguous / small fall through unchanged.
+
+MEASURE (`nonzero_ab`, real `tensor_nonzero` vs a serial-replica ORIG, tensors OUTSIDE the timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true on all shapes; worker vmi1152480):
+- 2d 4000x4000 ~50% nnz: 76.293 -> 57.947 ms = **1.32x**
+- 3d 256x256x256 ~50%:  120.610 -> 111.666 ms = **1.08x**
+- 2d 8000x2000 ~25%:     45.633 -> 33.967 ms = **1.34x**
+- 2d 2000x2000 ~50%:     18.645 -> 13.085 ms = **1.42x**
+
+WALL: nonzero is BANDWIDTH-bound by its large [nnz,ndim] index output (25M f64 = 200MB at the 3d
+case), so the parallel scan gain is capped (1.08x at the highest-output case). A two-pass
+count->prefix->parallel-write-into-one-buffer variant (avoids the Vec<Vec> concat) was drafted but
+NOT measured — reverted to the proven Vec<Vec> version; the output-write bandwidth wall keeps the
+ceiling ~1.5x regardless. Shipped the marginal win (also eliminates the clone); don't grind harder.
+
 ## 2026-07-04 - NEGATIVE: f32 GEMM B-panel packing and transpose-left split rejected (ft-kernel-cpu)
 
 Agent `SilverMaple`. No clean unlanded measured win was found in bench worktrees, so this dug the standing
