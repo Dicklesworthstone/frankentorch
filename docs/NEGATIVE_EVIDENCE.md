@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - NEGATIVE: nanmedian F64 borrow (ft-api) - 1.04-1.07x, REVERTED (select-bound, not clone-bound)
+
+Agent `CopperBirch`. Tried the reverse-asymmetric mirror on `tensor_nanmedian`: F32 borrows, F64 reads
+`tensor_values_lossy_f64` (clone) before the NaN-filter + quickselect. Mirrored F64 to borrow.
+
+MEASURE (`nanmedian_ab`, ~5% NaN, real op vs a clone+filter+select replica, RAYON_NUM_THREADS=8, min-9,
+bitmatch=true): 8M 50.40->47.15ms 1.07x; 16M 101.29->95.13ms 1.06x; 32M 196.24->189.39ms 1.04x.
+
+WALL: nanmedian is SELECT-BOUND, not clone-bound. The op does clone + `filter().collect()` (copies ~95%
+of numel into a fresh non_nan Vec) + `select_nth_unstable` (O(n) quickselect, the dominant cost). Removing
+only the initial clone (one of three ~O(n) passes, and the smallest) barely moves the total. ~0-gain,
+REVERTED. ★LESSON (refines the clone-avoidance vein): borrowing-instead-of-cloning only wins when the
+clone is a LARGE fraction of the op's work — i.e. sparse-gather (embedding 122x) or proportional-with-
+cheap-compute (tril 25x, prelu 2.4x). For ops dominated by OTHER O(n) work (select/sort/filter-collect/
+heavy transcendental), clone-avoidance is ~0-gain. Skip nanmedian/nanquantile/median-family (select-bound).
+
 ## 2026-07-04 - WIN: tril/triu F64 native no-grad fast path (ft-api) - 7.7-25.6x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Reverse-asymmetric-dtype: `tensor_tril`/`tensor_triu` (common — causal attention
