@@ -1,5 +1,36 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - NEGATIVE: f32 GEMM B-panel packing and transpose-left split rejected (ft-kernel-cpu)
+
+Agent `SilverMaple`. No clean unlanded measured win was found in bench worktrees, so this dug the standing
+ft-kernel-cpu GEMM frontier with two fresh communication-avoiding/parallel-split attempts. ORIG is current
+main at `319b6a99` (the warmed f32 GEMM `_into` K=1280 2-D tiling commit).
+
+Attempt A: mirror the f64 2-D GEMM B-panel packing inside `sgemm_2d_parallel_scaled`, copying each
+`B[:, j0:j1]` panel once per N-block before the M-block fanout. Correctness lock
+`cargo test -p ft-kernel-cpu gemm_2d_parallel_is_bit_exact_vs_serial -- --nocapture` was GREEN, but the
+bench was a loss/no-keep. The literal requested bench form
+`rch exec -- cargo bench --release -p ft-kernel-cpu ...` was rejected by Cargo (`unexpected argument
+'--release'`), so the valid per-crate form was used.
+
+MEASURE (`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod`; valid command
+`rch exec -- cargo bench -p ft-kernel-cpu --bench gemm_bench matmul_f32 -- --noplot --warm-up-time 1
+--measurement-time 5 --sample-size 12`):
+- ORIG on `hz2`: `matmul_f32_512x512x512` mean 856.17 us; `matmul_f32_1024x1024x1024` mean 4.1776 ms.
+- Packed-B candidate on `vmi1293453`: 512 row mean 1.5381 ms (noisy) and 1024 row mean 6.8981 ms.
+- Cross-worker routing ratio only: 856.17/1538.1 = **0.56x vs ORIG** and 4.1776/6.8981 = **0.61x vs ORIG**
+  (slower, not a keep; same-worker proof was unnecessary after the large regression signal).
+
+Attempt B: row/column-split `dgemm_tb_scaled`/`sgemm_tb_scaled` for transpose-left GEMM (`A^T @ B`), the
+path behind SDPA backward and conv/linear weight gradients. This was dropped before benchmarking because
+it failed the new bit-exact invariant against the old single `matrixmultiply` call: `dgemm_tb` differed by
+1 ULP at shape `257x384x259` (`-0.051554911722988796` vs `-0.0515549117229888`). Autograd/golden
+correctness outranks the possible speedup, so no tolerance-policy GEMM change was shipped.
+
+Both variants were reverted. Production diff after this entry is docs-only. Retry condition: only revisit
+with an explicit tolerance-parity policy for GEMM goldens, or with a same-call microkernel/packing change
+that proves bit-exact against the existing `matrixmultiply` result. AGENT SilverMaple.
+
 ## 2026-07-04 - WIN: warmed f32 GEMM `_into` K=1280 2-D tiling (ft-kernel-cpu) - 1.08-1.49x vs ORIG, bit-exact
 
 Agent `SilverMaple`. Targeted the documented GEMM wall after no unlanded measured win was cleanly
