@@ -11955,7 +11955,12 @@ pub fn outer_tensor_contiguous_f64(
     // out[i*n + j] = lhs[i] * rhs[j]. Each row is independent and writes a disjoint
     // chunk, so distribute the rows across the rayon pool (par_chunks_mut → no aliasing).
     // Bit-identical to the serial fill. frankentorch-kgs4.104.
-    if out_numel >= PARALLEL_THRESHOLD {
+    // Bandwidth-bound pure write (one multiply/elem, no reduce): the parallel path's only
+    // benefit is parallel FIRST-TOUCH of the fresh output alloc, which needs the copy-tier
+    // fault-parallelism crossover (~4M/32MB). The old PARALLEL_THRESHOLD(8192) gate massively
+    // over-parallelized medium outer products (1024x1024=1M measured 0.13x = 8x SLOWER, 256K
+    // 0.07x); crossover ~4M (2048x2048 6.5x). Gate at COPY_MATERIALIZE_PARALLEL_MIN. (BlackThrush)
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         let mut out = vec![0.0_f64; out_numel];
         out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
             let l = lhs_slice[i];
@@ -30245,8 +30250,10 @@ pub fn outer_tensor_contiguous_f32(
     let lhs_slice = &lhs[lhs_start..lhs_start + m];
     let rhs_slice = &rhs[rhs_start..rhs_start + n];
     // Disjoint independent rows → distribute across the rayon pool (par_chunks_mut).
-    // Bit-identical to the serial fill. frankentorch-kgs4.104.
-    if out_numel >= PARALLEL_THRESHOLD {
+    // Bit-identical to the serial fill. frankentorch-kgs4.104. Bandwidth-bound pure write:
+    // gate at the copy-tier fault-parallelism crossover, NOT the compute default — the old
+    // PARALLEL_THRESHOLD(8192) over-parallelized medium outer products 8-14x (see f64). (BlackThrush)
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         let mut out = vec![0.0_f32; out_numel];
         out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
             let l = lhs_slice[i];

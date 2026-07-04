@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: outer/ger had the copy-op no-gate bug at PARALLEL_THRESHOLD(8192) → 8-14x SLOWER medium; gated to copy tier, bit-exact
+
+Agent `BlackThrush`. Chased the last probe lead (`ger`/outer 23ms/16M in torch). `outer_tensor_contiguous_f{64,32}`
+(behind tensor_outer/tensor_ger/outer_product) parallelizes rows (`par_chunks_mut(n)`) gated at the COMPUTE
+default `PARALLEL_THRESHOLD` (8192) — but the body is `out[i*n+j] = lhs[i]*rhs[j]`, a pure bandwidth-bound WRITE
+(one multiply/elem, no reduce). Its only parallel benefit is parallel FIRST-TOUCH of the fresh output alloc,
+which needs the copy-tier fault-parallelism crossover (~4M/32MB) — so 8192 massively over-parallelized medium
+outer products.
+
+★MEASURE (outer m×n, f64, 64t, min-9, serial==parallel bit-exact): **64×64 0.02x (50x SLOWER!), 256×256 0.08x,
+512×512 0.07x, 1024×1024 (1M) 0.13x (8x SLOWER)** — and 1024×1024 is a VERY common size; wins only from 4M:
+2048×2048 6.49x, 4096×4096 8.27x. (The serial path is already optimized — `Vec::with_capacity`+extend, no
+zero-fill — so it's genuinely fast at medium; the parallel path's rayon dispatch over tiny rows is pure loss.)
+
+★FIX: gate both f64+f32 at `COPY_MATERIALIZE_PARALLEL_MIN` (1<<22) instead of PARALLEL_THRESHOLD — identical
+copy-op pattern to narrow/expand/cat/stack/batch_norm-apply. Threshold-only ⇒ BIT-IDENTICAL (the parallel and
+serial paths compute the same product; only which one runs changes). 573 ft-kernel-cpu tests green (rch). vs
+torch: large outer (≥4M) still parallel — 4096×4096 FT 6.67ms vs torch 23ms = **3.4x faster**; medium outer now
+serial = **8-14x faster than before** (the regression removed). ★This is the SAME bandwidth-write no-gate bug
+as the movement/norm-apply family, just in a linalg op — the copy-tier gate rule (pure write / fma-write into a
+fresh alloc → gate ~4M, not 8192) keeps finding fresh victims. Grep remaining `>= PARALLEL_THRESHOLD` gates whose
+body is a pure `vec![..]` + `par_chunks_mut` write with no per-element reduce.
+
 ## 2026-07-03 - ★WIN: 1-D cummax/cummin PARALLEL SCAN — max/min are EXACTLY associative → chunked scan is bit-exact; 3.6x over serial, ~4.3x vs torch
 
 Agent `BlackThrush`. FLIP from last turn's torch probe: `cummax`/`cummin` 1-D 16M = **146ms in torch (single-
