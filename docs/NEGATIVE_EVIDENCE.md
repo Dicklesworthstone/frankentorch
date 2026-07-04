@@ -1,5 +1,33 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: no-grad scalar add/sub/mul/div always used Rayon; serial below 1M gives 3.5-16.8x on common tensor sizes
+
+Agent `SilverMaple`. Agent Mail registration/reservation was blocked by the archive SQLite corruption breaker
+(`table_seek called on index page ... database disk image is malformed`); `am doctor fix --yes` installed guard
+hooks but could not reconstruct while the server activity lock was held by pid `2093388`. Beads was also blocked
+by duplicate issue id `frankentorch-kgs4.150`, so no tracker mutation was attempted. Ownership kept to
+`crates/ft-api/src/lib.rs`, `crates/ft-api/benches/ops_bench.rs`, and this ledger.
+
+FINDING: the no-grad contiguous public scalar helpers (`add_scalar` / `sub_scalar` / `mul_scalar` /
+`div_scalar`) skipped the scalar-leaf fallback but then unconditionally used `par_iter()` for f64 and f32. That
+removed the full broadcast/tape path but still massively over-parallelized small and medium scalar maps. The
+first attempted gate reused `MOVEMENT_COPY_PARALLEL_MIN = 1 << 22`; it fixed 4K/64K, but the legacy same-worker
+rerun showed 1M f64 was already faster with Rayon, so the final fix uses a scalar-map-specific
+`SCALAR_MAP_PARALLEL_MIN = 1 << 20`.
+
+MEASURE (same RCH worker `vmi1149989`, `cargo bench -p ft-api --bench ops_bench scalar_map`; legacy original =
+temporary old always-Rayon helpers, final path below 1M = restored gated helpers): median old vs gated:
+f64 4096 **175.34us -> 10.461us = 16.76x**, f32 4096 **121.69us -> 7.315us = 16.64x**; f64 65536
+**542.39us -> 148.43us = 3.65x**, f32 65536 **321.90us -> 93.223us = 3.45x**. Rejected 4M gate evidence:
+legacy 1M f64 was **1.872ms** while serial-at-1M was **3.191ms**, so final code keeps the legacy parallel path
+at `>= 1 << 20` and only claims the sub-1M win. Cross-worker final sanity (`hz1`) after the threshold adjustment:
+4096 f64/f32 **19.761us / 11.145us**, 65536 **297.53us / 171.03us**, 1M **1.146ms / 0.831ms**, 4M
+**4.253ms / 2.777ms**.
+
+CORRECTNESS: threshold-only change, same per-element expression and same output dtype. Added
+`scalar_arithmetic_nograd_fast_path_matches_fallback_bits`, which compares below-threshold no-grad f64/f32
+add/sub/mul/div against the grad-forced fallback path by exact result bits.
+
 ## 2026-07-03 - WIN: pow TRIVIAL-EXPONENT elision (x, x², x³, 1/x) was on the powf compute gate → up to 100x SLOWER medium; split to copy tier, bit-exact
 
 Agent `BlackThrush`. 5th op in the copy-tier class, a subtler one. `pow_tensor_contiguous_f{64,32}` routes ALL

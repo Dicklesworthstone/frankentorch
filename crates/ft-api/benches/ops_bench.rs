@@ -653,6 +653,42 @@ fn bench_add(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_scalar_map(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scalar_map");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    for &size in &[4096usize, 65_536, 1 << 20, 1 << 22] {
+        group.throughput(Throughput::Elements(size as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("f64_mul_scalar", size),
+            &size,
+            |b, &size| {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let values = deterministic_values(size, 0.17);
+                let x = session.tensor_variable(values, vec![size], false).unwrap();
+                b.iter(|| black_box(session.mul_scalar(black_box(x), 2.5).unwrap()));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("f32_mul_scalar", size),
+            &size,
+            |b, &size| {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let values = patterned_f32_values(size, 0.000_019, 0.37);
+                let x = session
+                    .tensor_variable_f32(values, vec![size], false)
+                    .unwrap();
+                b.iter(|| black_box(session.mul_scalar(black_box(x), 2.5).unwrap()));
+            },
+        );
+    }
+
+    group.finish();
+}
+
 fn bench_addcmul(c: &mut Criterion) {
     let mut group = c.benchmark_group("addcmul");
     let rows = 4000usize;
@@ -2504,6 +2540,7 @@ criterion_group!(
     bench_sigmoid,
     bench_pow,
     bench_add,
+    bench_scalar_map,
     bench_addcmul,
     bench_threshold,
     bench_lerp,
