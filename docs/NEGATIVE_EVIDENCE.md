@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: binary bitwise family (and/or/xor/left_shift/right_shift) F64 borrow + par_zip_map (ft-api) - 12.6-13.5x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Follow-up to bitwise_not (81ec54a8). The 5 binary bitwise ops each CLONED input via
+tensor_values (serial to_vec first-touch) + other via values_lossy_f64, then serially zip-mapped — TWO
+first-touch clones. Refactored to a shared helper `bitwise_binary_par_f64(input, other, f: Fn(i64,i64)
+->i64)`: when both operands are contiguous f64 (the common case) BORROW both zero-copy and par_zip_map
+`f` (else fall back to clone-both). Each op passes its closure: and `|a,b| a&b`, or `a|b`, xor `a^b`,
+left_shift `if 0..=63 {a.wrapping_shl} else 0`, right_shift `if 0..=63 {a.wrapping_shr} else if a<0 {-1}
+else 0`. Bit-identical to the per-op serial closures (order-invariant, same i64 casts). No apply_function.
+
+MEASURE (`bitwise_and_ab`, representative of the shared helper, real op vs a clone-both+serial-zip
+replica exactly modeling the ORIG — FAIR, RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8M  (61MB x2):  105.04 ->  8.31 ms = **12.64x**
+- 16M (122MB x2): 265.24 -> 19.67 ms = **13.49x**
+- 32M (244MB x2): 426.97 -> 32.37 ms = **13.19x**
+
+Bigger than bitwise_not (4-5.7x) because a binary op clones TWO inputs — borrowing both avoids two
+serial first-touch walls + parallelizes. All 5 ops route through the helper so all get this. Net -33
+lines (helper dedups). ft-api --lib 2482/0.
+
 ## 2026-07-04 - WIN: bitwise_not F64 borrow + par_map (ft-api) - 4.1-5.7x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Explicit-clone + serial elementwise (the prelu pattern, NOT apply_function).
