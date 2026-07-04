@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: prelu F64 borrows input instead of cloning (ft-api) - 2.34-2.45x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Reverse-asymmetric-dtype (5th this session): `tensor_prelu`'s F32 no-grad fast
+path borrows input+weight, but the F64 no-grad path read `self.tensor_values(input)` + `tensor_values(weight)`
+— a full clone of the (large) input — before the SAME serial `prelu_forward_values`. Made the F64 path
+borrow the contiguous input+weight and run the same function on the borrowed slices. Bit-identical (same
+values, same function). Non-contiguous falls through to the clone.
+
+MEASURE (`prelu_ab`, scalar weight, real op vs a clone-then-serial-prelu replica — fair baseline,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8M  (61MB):  70.79 -> 30.20 ms = **2.34x**
+- 16M (122MB): 142.97 -> 58.64 ms = **2.44x**
+- 32M (244MB): 280.30 -> 114.57 ms = **2.45x**
+
+Clone-avoidance only (proportional elementwise ~2x). FOLLOW-UP: `prelu_forward_values` is SERIAL (NEW is
+bounded by it, ~114ms at 32M) — parallelizing that shared fn (elementwise, order-invariant, used by the
+grad forward too) would stack to ~5-15x. ft-api --lib 2482/0. Reverse-[[asymmetric_dtype_fastpath]] tally:
+block_diag 2.2x, embedding_bag 24-66x, multi_margin_loss 22-30x, embedding 19-122x, prelu 2.4x.
+
 ## 2026-07-04 - WIN: embedding F64 borrows the weight table instead of cloning (ft-api) - 19-122x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Same clone gap as embedding_bag but on the FAR more common `embedding` op (every
