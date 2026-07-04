@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: in-place binary F64 fast path for atan2_/logaddexp_/logaddexp2_/gcd_/lcm_ (ft-api) - 5.7-7.8x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Third in-place sibling (after unary c604277c + binary 4b69baf8). The existing
+`try_inplace_binary_f64` helper (F64+contiguous: borrow BOTH operands via `contiguous_values()` + parallel
+map, no clone) already backed `copysign_`/`nextafter_`/`hypot_`/`ldexp_`/`fmax_`/`fmin_`/`fmod_`/
+`remainder_`/`xlogy_` — but `atan2_`/`logaddexp_`/`logaddexp2_`/`gcd_`/`lcm_` were MISSING it and ran the
+SERIAL `tensor_values_lossy_f64` clone-both + serial map + `update_tensor_values_for_float` writeback for
+ALL dtypes. Added the fast-path call (one `if try_inplace_binary_f64(...) { return Ok(()) }` after the
+in-place validation) to all 5. The 5 are all COMPUTE-HEAVY: atan2 (transcendental), logaddexp/logaddexp2
+(exp+ln / exp2+log2), gcd/lcm (Euclidean loop). Bit-identical (the fast path's parallel map == the serial
+fallback's map, order-preserving; only f64+contiguous activates it, mixed-dtype/non-contig fall through
+unchanged). frankentorch-inplace-binary-fastpath.
+
+MEASURE (`inplace_binary_fastpath_ab`, atan2_ representative, other bounded so repeated in-place atan2
+stays in (-pi,pi]; OLD = clone-both + serial atan2 + writeback replica; NEW = real op; RAYON_NUM_THREADS=8,
+min-9, bitmatch=true; worker ovh-a):
+- 4M  ( 30MB x2): 78.105 -> 10.053 ms = **7.77x**
+- 8M  ( 61MB x2): 183.146 -> 24.252 ms = **7.55x**
+- 16M (122MB x2): 373.036 -> 65.799 ms = **5.67x**
+
+Consistent across sizes (unlike the arith in-place binary 4b69baf8 which dropped to 2.5x at 16M) because
+the transcendental compute dominates AND the fast path BORROWS both operands (no serial `lossy_f64` clone
+ceiling). ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN: in-place binary ops F64 in-place + parallel (ft-api) - 2.5-9.6x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Sibling of the in-place-unary win (c604277c). `tensor_add_`/`sub_`/`mul_`/`div_`
