@@ -2303,6 +2303,33 @@ const CUM_SCAN_1D_PARALLEL_MIN: usize = 1 << 19; // 524288
 // every medium copy. frankentorch-kgs4-copygate.
 const COPY_MATERIALIZE_PARALLEL_MIN: usize = 1 << 22; // ~4.19M elems (~32MB f64)
 
+/// Build a length-`numel` `Vec<T>` by having `fill` write EVERY element into an
+/// UNINITIALIZED buffer — no dead value/zero-init pass, so a parallel `fill` is the sole
+/// writer and also does the page FIRST-TOUCH. Generalizes the expand/transpose materialize
+/// wins to any full-overwrite fill (e.g. the permute TILE transpose, which otherwise pays a
+/// `(0..numel).into_par_iter().map(|_| src[0]).collect()` first-touch pass = a SECOND full
+/// write of the output that the fill then overwrites — `build_uninit` does N writes, not 2N).
+///
+/// CONTRACT (this is a safe fn; the caller upholds these, mirroring the shipped
+/// expand/transpose kernels that use the same `with_capacity` + `set_len` + fill pattern):
+/// - `fill` MUST write all `numel` elements before returning.
+/// - `fill` MUST NOT read from the slice before writing a given element (it is uninitialized).
+/// - `T` is a plain numeric storage element (no invalid bit patterns) — every `TensorStorage`
+///   element type (f32/f64/half/complex/i8/u8) qualifies.
+#[allow(unsafe_code)]
+pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<T> {
+    let mut v: Vec<T> = Vec::with_capacity(numel);
+    // SAFETY: capacity == numel; `fill` initializes all `numel` elements (contract) before `v`
+    // is observed/returned. `T: Copy` has no `Drop`, so `set_len` over previously-uninitialized
+    // slots is sound, and if `fill` panics mid-way the (Drop-free) elements are simply freed —
+    // no drop of uninitialized memory.
+    unsafe {
+        v.set_len(numel);
+    }
+    fill(&mut v);
+    v
+}
+
 /// Row-structured broadcast-expand materialization (`expand`/`broadcast_to`),
 /// building the output into an UNINITIALIZED buffer so the fill also does the
 /// page FIRST-TOUCH.

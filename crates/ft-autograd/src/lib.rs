@@ -10479,7 +10479,7 @@ impl TensorTape {
         })
     }
 
-    fn permute_slice<T: Clone + Send + Sync>(
+    fn permute_slice<T: Copy + Send + Sync>(
         src: &[T],
         src_shape: &[usize],
         perm: &[usize],
@@ -10536,24 +10536,11 @@ impl TensorTape {
             // Contiguous element = the fixed suffix dims (empty product = 1).
             let elem: usize = src_shape[prefix + mid..ndim].iter().product();
             let plane = a_dim * b_dim * elem;
-            // Parallel first-touch of the destination: a serial `vec![src[0]; numel]`
-            // faults every dst page on ONE thread (~30ms at 64MB) BEFORE the parallel
-            // transpose below overwrites them all — so the serial fill dominated (e.g.
-            // movedim(0,2) on [512,512,64] = 38ms, mostly this alloc). The transpose writes
-            // every element, so the fill value is irrelevant; distribute the faults across
-            // the pool. Bit-identical.
-            const DST_PAR_MIN: usize = 1 << 16;
-            let mut dst: Vec<T> = if numel >= DST_PAR_MIN {
-                use rayon::prelude::*;
-                (0..numel).into_par_iter().map(|_| src[0].clone()).collect()
-            } else {
-                vec![src[0].clone(); numel]
-            };
-            // 16×16 (~2 KB f64) fits L1, minimizing the transpose's destination
-            // write cache-misses — a TILE sweep showed 16 clearly beats 32/64/128
-            // (2.2x vs 1.2x at 2048², and large tiles regress as the working set
-            // spills L1).
+            // The TILE transpose writes EVERY dst element exactly once (pure data movement, no
+            // reads of dst) → factor it so both allocation strategies below share it. 16×16
+            // (~2 KB f64) TILE fits L1 (sweep: 16 beats 32/64/128; 2.2x vs 1.2x at 2048²).
             const TILE: usize = 16;
+            let do_transpose = |dst: &mut [T]| {
             if let Some(batch) = numel.checked_div(plane) {
                 use rayon::prelude::*;
                 // One plane's cache-blocked [a_dim, b_dim] transpose of elem-runs.
@@ -10641,6 +10628,21 @@ impl TensorTape {
                         });
                 }
             }
+            };
+            // Plane-size gate: uninit first-touch wins for MANY SMALL planes (measured 1.25-1.29x)
+            // but the STRIDED transpose faults pages in random order on FEW HUGE planes, where a
+            // sequential par-collect pre-fault is cheaper (measured 0.92x at plane=4.2M) — so use
+            // uninit only for planes <= this, else the pre-faulted par-collect path. Bit-identical
+            // either way (the transpose is the value-producing writer in both).
+            const UNINIT_PERMUTE_MAX_PLANE: usize = 1 << 21; // 2M elems/plane
+            let dst: Vec<T> = if plane <= UNINIT_PERMUTE_MAX_PLANE {
+                ft_kernel_cpu::build_uninit(numel, do_transpose)
+            } else {
+                use rayon::prelude::*;
+                let mut dst: Vec<T> = (0..numel).into_par_iter().map(|_| src[0]).collect();
+                do_transpose(&mut dst);
+                dst
+            };
             return Ok(dst);
         }
 

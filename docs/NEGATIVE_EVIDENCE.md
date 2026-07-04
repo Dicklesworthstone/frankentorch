@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN (gated): generic elem!=1 permute uninit first-touch via build_uninit — 1.25-1.29x vs original
+
+Agent `BlackThrush`. The generic rotation-permute materialize (ft-autograd `permute_slice`, the `elem!=1`
+layout-transform path: movedim / NCHW<->NHWC-with-channels, plus all non-f32/f64 dtypes that skip the AVX2
+`elem==1` route) allocated `dst` via `(0..numel).into_par_iter().map(|_| src[0]).collect()` — a PAR-COLLECT
+first-touch that is a full SECOND write of the output (src[0] to every element) which the TILE transpose
+then overwrites: **2N writes**. New reusable `ft_kernel_cpu::build_uninit<T:Copy,F:FnOnce(&mut[T])>(numel,
+fill)` (`with_capacity`+`set_len`; contract: `fill` writes every elem, never reads; `T:Copy`=no Drop →
+panic-safe) makes the transpose the SOLE writer (**N writes**). Changed `permute_slice`'s bound `Clone->Copy`
+(all 9 storage element types feeding it — f32/f64/half/complex/i8/u8 — are Copy; verified every call site).
+
+PLANE-GATED: uninit wins for MANY SMALL planes, but the STRIDED transpose faults pages in random order on
+FEW HUGE planes where a sequential par-collect pre-fault is cheaper — so uninit only for `plane <= 1<<21`
+(2M), else the par-collect path (UNCHANGED → cannot regress). ★MEASURE (`examples/permute_uninit_ab.rs`,
+same-worker A/B, RAYON_NUM_THREADS=8, min-9, f32, bitmatch=true, OLD=par-collect NEW=build_uninit):
+- `[64,256,256,8]` plane=524K:  35.98 -> 28.86 ms = **1.25x vs ORIG** (gated: uninit)
+- `[16,512,512,4]` plane=1M:    18.12 -> 14.08 ms = **1.29x vs ORIG** (gated: uninit)
+- `[8,512,512,16]` plane=4.2M:  45.24 -> 49.31 ms = 0.92x → GATED OUT (uses par-collect, 1.0x, no regression)
+Tests: ft-autograd permute 11/0, ft-api --lib 2480/0. `build_uninit` is reusable for any future
+full-overwrite Copy materialize. AGENT BlackThrush.
+
 ## 2026-07-04 - WIN: f32 threshold no-grad serial gate below 8192 gives 5.79x at 4K, neutral above
 
 Agent `GreenLake` (`AGENT_NAME=GreenLake`) plus follow-up calibration by `SilverMaple`. Agent Mail
