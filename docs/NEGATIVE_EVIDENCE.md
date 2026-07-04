@@ -1,5 +1,31 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: in-place unary helper F64 in-place + parallel (ft-api) - 17-18x vs ORIG, bit-exact
+
+Agent `CopperBirch`. `apply_tensor_unary_in_place` backs **73** in-place unary ops (exp_/log_/erf_/
+lgamma_/digamma_/sigmoid_/tanh_/gelu_/silu_/mish_/i0_/ndtr_/cbrt_/... plus neg_/abs_/floor_/clamp_/...).
+Its F64 path was clone (`values()`) -> SERIAL `into_iter().map(transform).collect()` -> `update_tensor_values`
+writeback = **3 serial passes**, and the map is compute-heavy for the transcendental members. Rewrote the
+F64 path to `update_tensor_values_with` (a true in-place `&mut [f64]` accessor) + `par_iter_mut` for tensors
+>= `PARALLEL_ELEMENTWISE_MIN`: **ONE in-place pass** — dropping the `values()` clone AND the writeback
+memcpy AND parallelizing the transform. Bit-identical: `*v = transform(*v)` per element, order-independent;
+contiguity contract unchanged (the old `update_contiguous_values` writeback ALSO required `is_contiguous()`,
+same `UnsupportedLayout` error otherwise). F32 has no in-place `_with` accessor, so it keeps
+clone->map->writeback but parallelizes the (order-preserving) map. The `transform` bound gained `+ Sync`
+(all 73 callers capture only `Copy` f64 scalars — verified). frankentorch-inplace-unary-par.
+
+MEASURE (`inplace_unary_ab`, sigmoid_ representative = numel `exp()` per call; OLD = the 3-pass serial
+replica reusing the clone buffer for the writeback so it is NOT inflated; NEW = real in-place op;
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker ovh-a):
+- 4M  ( 30MB): 44.651 -> 2.628 ms = **16.99x**
+- 8M  ( 61MB): 91.206 -> 5.300 ms = **17.21x**
+- 16M (122MB): 182.926 -> 9.994 ms = **18.30x**
+
+Heavy transcendentals get the full ~17x (parallel compute + 2 dropped memcpys); cheap members
+(neg_/abs_/floor_) still gain the 3->1 pass in-place-with elimination. A prior session left a flawed
+harness (OLD = 1-pass serial map, under-modeling the real 3-pass helper) that likely read ~1x and was
+abandoned undocumented — the helper was still serial. ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN: multilabel_margin_loss F64 no-grad parallel (ft-api) - 2.8-4.0x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Same pattern as multi_margin_loss (1625665c): `tensor_multilabel_margin_loss`
