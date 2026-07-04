@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: diagonal_scatter parallel input-copy (ft-api) - 6.6-7.4x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Completes the scatter-into-copy family (slice_scatter dc96043a, select_scatter+put
+cfe92dab). `tensor_diagonal_scatter`'s F64 no-grad path (the apply_function is only the GRAD path) built
+its output via `result = self.tensor_values(input)` (a serial `to_vec` memcpy whose page FIRST-TOUCH is
+the wall for large numel) then a serial diagonal overwrite. Now, for a contiguous f64 input >=
+MOVEMENT_COPY_PARALLEL_MIN, BORROW input and build the base output via a PARALLEL copy (calloc'd out +
+par_chunks copy_from_slice = parallel first-touch), then overwrite the offset diagonal. Bit-identical.
+Non-contiguous / non-f64 / small (and f32) fall back to the serial clone.
+
+MEASURE (`diag_scatter_ab`, offset0 square, real op vs a to_vec+serial replica exactly modeling the
+ORIG — FAIR (no apply_function borrow), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 4000x4000 (122MB): 83.82 -> 12.61 ms = **6.65x**
+- 5000x5000 (190MB): 131.94 -> 18.23 ms = **7.24x**
+- 6000x6000 (274MB): 189.09 -> 25.71 ms = **7.36x**
+
+ft-api --lib 2482/0. Scatter-into-copy family DONE: slice_scatter, select_scatter, put, diagonal_scatter
+(all ~6.5-7.4x from parallelizing the base copy's page first-touch — [[expand_uninit_firsttouch]]).
+
 ## 2026-07-04 - WIN: select_scatter + put parallel input-copy (ft-api) - 6.8-7.1x vs ORIG, bit-exact (commit cfe92dab)
 
 Agent `CopperBirch`. Deferred ledger entry for cfe92dab (docs was occupied by a peer's uncommitted
