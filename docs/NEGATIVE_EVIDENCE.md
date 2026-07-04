@@ -1,5 +1,29 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: in-place constant fills zero_/ones_/fill_ F64 in-place parallel (ft-api) - 7-46x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Fourth in-place sibling. `tensor_zero_`/`ones_`/`fill_` each built `vec![value; numel]`
+(a fresh serial alloc that page-faults for non-zero values, and crosses the glibc mmap cliff at ~64MB)
+then `update_tensor_values_for_float` copied it into storage = 2 passes + a full fresh allocation EVERY
+call. New shared helper `fill_inplace_scalar` (F64+contiguous): fill the storage IN PLACE in ONE parallel
+pass via `update_tensor_values_with` + `par_iter_mut` (>= `PARALLEL_ELEMENTWISE_MIN`) — no intermediate
+Vec, no writeback copy, first-touch fanned across cores. Bit-identical (constant fill). f32 /
+non-contiguous fall through to the generic `vec![value;n]` + writeback path unchanged. Verified
+`update_tensor_values_for_float` does NO hidden evidence recording (just a dtype-dispatch to
+`update_tensor_values`), so no evidence-contract skip; `record_tensor_in_place_operation` preserved.
+frankentorch-inplace-fill-par.
+
+MEASURE (`inplace_fill_ab`, ones_ = non-zero fill so no calloc shortcut; OLD = `vec![1.0;n]` + copy into
+warm scratch storage, faithfully modeling the real op's fresh alloc + writeback; NEW = real op;
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker ovh-a):
+- 4M  ( 30MB): 3.254 -> 0.460 ms = **7.08x**
+- 8M  ( 61MB): 26.408 -> 0.567 ms = **46.56x**
+- 16M (122MB): 54.062 -> 1.541 ms = **35.09x**
+
+The 8M/16M ratios are large because the OLD op genuinely allocates a fresh `vec![1.0;n]` EVERY call (the
+mmap fault cliff dominates >64MB); the new in-place fill avoids the allocation entirely. 4M (7x, OLD still
+in-arena) is the conservative steady-state. Common op family (tensor init / reset). ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN: in-place binary F64 fast path for atan2_/logaddexp_/logaddexp2_/gcd_/lcm_ (ft-api) - 5.7-7.8x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Third in-place sibling (after unary c604277c + binary 4b69baf8). The existing
