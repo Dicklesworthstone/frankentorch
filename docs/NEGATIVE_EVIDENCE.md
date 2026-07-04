@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: bitwise_not F64 borrow + par_map (ft-api) - 4.1-5.7x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Explicit-clone + serial elementwise (the prelu pattern, NOT apply_function).
+`tensor_bitwise_not` read `self.tensor_values(input)` (a serial to_vec first-touch clone) then mapped
+serially (`|a| (!(a as i64)) as f64`). Now, for a contiguous f64 input >= PARALLEL_ELEMENTWISE_MIN,
+BORROW the input + par_map — bit-identical (order-invariant elementwise). Non-contiguous / non-f64 /
+small fall back to the serial clone. (Bitwise ops are non-differentiable; no grad path.)
+
+MEASURE (`bitwise_not_ab`, real op vs a to_vec+serial-map replica exactly modeling the ORIG — FAIR
+(no apply_function), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8M  (61MB):  58.38 -> 12.04 ms = **4.85x**
+- 16M (122MB): 120.09 -> 29.35 ms = **4.09x**
+- 32M (244MB): 252.17 -> 44.60 ms = **5.65x**
+
+Win = clone-avoidance (serial first-touch) + par_map. FOLLOW-UP: the binary bitwise ops
+(and/or/xor/left_shift/right_shift, all @~19072-19256) share the pattern but clone TWO inputs
+(input + other) — a two-input borrow + par_zip_map would win similarly. ft-api --lib 2482/0.
+
 ## 2026-07-04 - WIN: diagonal_scatter parallel input-copy (ft-api) - 6.6-7.4x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Completes the scatter-into-copy family (slice_scatter dc96043a, select_scatter+put
