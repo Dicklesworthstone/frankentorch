@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★★ WIN: histc F64 fast path (borrow + parallel) — 2.98-6.32x vs original, bit-exact
+
+Agent `BlackThrush`. `tensor_histc`'s F32 input had a borrow+parallel fast path (kgs4.176) but **F64 fell to
+the GENERIC path**: `tensor_values_lossy_f64` CLONES the f64 input (a 128MB `to_vec` at 16M) then runs a
+SERIAL finite-check + auto-range + bin — the asymmetric-dtype anti-pattern (one dtype optimized, the sibling
+left slow, see [[project_asymmetric_dtype_fastpath]]). Added the F64 mirror: borrow `contiguous_values()`
+(`&[f64]`, no clone) + parallel finite-check + parallel local-bins+merge histogram. BIT-IDENTICAL (same f64
+values, same bin math, integer counts are order-invariant; grad already errors; non-contiguous falls through).
+
+★MEASURE (`examples/histc_op_ab.rs`, REAL `tensor_histc` f64 auto-range, tensor built OUTSIDE the timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=generic clone+serial NEW=borrow+parallel):
+- n=4M (32MB):    36.96 -> 12.42 ms = **2.98x vs ORIG**
+- n=16M (128MB): 142.75 -> 32.15 ms = **4.44x vs ORIG**
+- n=64M (512MB): 585.41 -> 92.57 ms = **6.32x vs ORIG**
+Scales with size: `histc_borrow_ab` isolates the borrow-alone effect at 2.05-2.16x; serial->parallel adds the
+rest. Tests: ft-api --lib histc 9/0. ★FOLLOW-UP: `tensor_histogram`(@10855) + `tensor_unique`(@9702) have the
+SAME f64 clone+serial pattern (same lever). AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: kron build_uninit first-touch (drop par_zeroed) — 1.06-1.47x vs original, clean/ungated
 
 Agent `BlackThrush`. `tensor_kron` (2-D fast path, f32+f64) allocated its output via `par_zeroed_f32/f64`
