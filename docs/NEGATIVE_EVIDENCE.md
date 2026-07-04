@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: in-place TERNARY addcmul_/addcdiv_ F64 borrow+parallel — 2.74-3.12x vs original, bit-exact
+
+Agent `BlackThrush`. Completed the in-place asymmetric-dtype family with the TERNARY (3-operand) ops.
+`addcmul_`/`addcdiv_` CLONE ALL THREE operands via `tensor_values_lossy_f64` (3x to_vec) + map SERIALLY.
+Added a shared `try_inplace_ternary_f64<F: Fn(f64,f64,f64)->f64 + Sync>` helper: borrow all three
+`contiguous_values()` (no clone) + parallel `.zip().zip().map(f)`. addcmul_ = `t + value*t1*t2`, addcdiv_ =
+`t + value*t1/t2` — BIT-IDENTICAL to the serial (elementwise, same op order). Bigger win than the binary
+family (3 clones saved instead of 2).
+
+★MEASURE (`examples/inplace_addc_ab.rs`, REAL `tensor_addcmul_` f64 ternary, tensors OUTSIDE timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=clone-3+serial NEW=borrow-3+parallel):
+- n=16M (128MB): 896.10 -> 287.27 ms = **3.12x vs ORIG**
+- n=64M (512MB): 3769.05 -> 1374.35 ms = **2.74x vs ORIG**
+Tests: ft-api --lib 2480/0. The in-place elementwise family (10 ops: max/min/fmax/fmin/fmod/hypot/nextafter/
+ldexp + addcmul/addcdiv) is now borrow+parallel. Only in-place `lerp_` remains (needs FMA-parity care).
+AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: in-place binary FAMILY (fmax_/fmin_/fmod_/hypot_/nextafter_/ldexp_) F64 borrow+parallel — 2.12-2.55x vs original, bit-exact
 
 Agent `BlackThrush`. Extended the in-place asymmetric-dtype win (after maximum_/minimum_) to the rest of the
