@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: multilabel_margin_loss F64 no-grad parallel (ft-api) - 2.8-4.0x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Same pattern as multi_margin_loss (1625665c): `tensor_multilabel_margin_loss`
+routed through apply_function whose forward runs the O(N*C*|pos|) hinge SERIALLY and clones `input` via
+save_for_backward's to_vec — both dead in no-grad. Added a no-grad F64 fast path: borrow the contiguous
+input, parallelize the per-sample loss over N (each sample independent), reduce via the SAME
+tensor_sum/tensor_mean the composed path uses. Bit-identical (same positive-index set, same k-ascending
+hinge order per sample; kept the exact `positive_indices.contains` scan so the ONLY change is
+parallelization). Grad / non-contiguous fall through.
+
+MEASURE (`multilabel_margin_ab`, reduction="none", real op vs a clone+serial-hinge replica modeling the
+ORIG (its input save-clone ~ the replica's input clone; serial hinge in both) — RAYON_NUM_THREADS=8,
+min-9, bitmatch=true; worker fleet):
+- 50k x 200 pos5  (76MB): 173.70 -> 53.03 ms = **3.28x**
+- 100k x 100 pos4 (76MB): 143.11 -> 51.96 ms = **2.75x**
+- 30k x 400 pos8  (91MB): 296.62 -> 74.68 ms = **3.97x**
+
+Lower than multi_margin (22-30x) because the per-sample `contains` scan + per-sample positive-index Vec
+alloc cap the parallel speedup; still a solid real win (pure parallelization of the serial hinge).
+ft-api --lib 2482/0.
+
 ## 2026-07-04 - WIN: round_decimals F64 no-grad fused (ft-api) - 6.6-8.3x vs ORIG (compose), bit-exact
 
 Agent `CopperBirch`. `tensor_round_decimals(x, n)` COMPOSED full(factor) + mul + round + div = 3 full
