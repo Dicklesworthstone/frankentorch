@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: where + masked_fill (contiguous) had the copy-op no-gate bug → up to 50x SLOWER small/medium; gated to copy tier, bit-exact
+
+Agent `BlackThrush`. Ran the live finder (grep `>= PARALLEL_THRESHOLD` whose body is a pure select/copy WRITE)
+after the outer/ger fix — it immediately hit two COMMON attention ops. `masked_fill_tensor_contiguous_f{64,32}`
+(`out[i] = if mask[i]!=0 {value} else {data[i]}`) and `where_tensor_contiguous_f{64,32}`
+(`out[i] = if cond[i]!=0 {x[i]} else {y[i]}`) both parallelize a per-element SELECT via `par_iter().map(..).
+collect()` gated at the compute default `PARALLEL_THRESHOLD` (8192). A select is a bandwidth-bound pure write
+(one branch/elem, no reduce), so 8192 over-parallelized everything below the ~4M fault-parallelism crossover.
+
+★MEASURE (f64, 64t, min-11, serial==parallel bit-exact): where **8192 0.04x (25x SLOWER!), 64K 0.20x, 256K
+0.33x, 512K 0.36x, 1M 0.91x**, wins from 4M (2.22x) / 16M (2.58x). masked_fill **8192 0.02x (50x SLOWER!), 256K
+0.56x, 1M 0.41x**, wins from 4M (3.64x) / 16M (4.03x). These are HOT ops (causal/key-padding attention masks,
+dropout, conditionals) — the small/medium regression hit every masked op below 4M elems.
+
+★FIX: gate all 4 at `COPY_MATERIALIZE_PARALLEL_MIN` (1<<22). Threshold-only ⇒ BIT-IDENTICAL (both branches
+compute the same select). 573 ft-kernel-cpu tests green (rch). ★NOTE these are the EQUAL-SHAPE contiguous paths;
+the BROADCAST-mask attention fusion (causal [1,1,S,S] / key-padding [B,1,1,S]) is a separate already-fixed path
+(broadcast_offset_plan). Now both the broadcast AND the contiguous where/masked_fill paths are correctly gated.
+★The finder keeps paying: outer (last), now where+masked_fill — bandwidth-write ops mis-gated at the compute
+default 8192 are a recurring class across movement / norm-apply / linalg / SELECT ops.
+
 ## 2026-07-03 - WIN: outer/ger had the copy-op no-gate bug at PARALLEL_THRESHOLD(8192) → 8-14x SLOWER medium; gated to copy tier, bit-exact
 
 Agent `BlackThrush`. Chased the last probe lead (`ger`/outer 23ms/16M in torch). `outer_tensor_contiguous_f{64,32}`

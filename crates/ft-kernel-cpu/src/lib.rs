@@ -14431,9 +14431,11 @@ pub fn masked_fill_tensor_contiguous_f64(
 
     let data = &input[offset..offset + numel];
     let mask_w = &mask[offset..offset + numel];
-    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial zip-map). The serial form
-    // left in-place masked_fill_ (hot in attention causal-masking) single-threaded.
-    let output = if numel >= PARALLEL_THRESHOLD {
+    // masked_fill_ is hot in attention causal-masking; bit-identical to the serial zip-map.
+    // Bandwidth-bound select-WRITE (read data+mask, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — measured PARALLEL_THRESHOLD
+    // (8192) over-parallelized medium masked_fill 0.02-0.56x (up to 50x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         use rayon::prelude::*;
         data.par_iter()
             .zip(mask_w.par_iter())
@@ -14482,10 +14484,12 @@ pub fn where_tensor_contiguous_f64(
     let x_data = &x[offset..offset + numel];
     let y_data = &y[offset..offset + numel];
 
-    // Pure per-element select → parallel above PARALLEL_THRESHOLD (bit-identical to the serial
-    // zip-map; indexed parallel collect preserves order). The serial form left grad/broadcast
-    // `where` single-threaded (the no-grad equal-shape path is fast-pathed in ft-api).
-    let output = if numel >= PARALLEL_THRESHOLD {
+    // Pure per-element select; bit-identical to the serial zip-map (indexed parallel collect
+    // preserves order). The no-grad equal-shape path is fast-pathed in ft-api.
+    // Bandwidth-bound select-WRITE (read cond+x+y, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover — PARALLEL_THRESHOLD(8192) over-parallelized medium
+    // where 0.04-0.91x (up to 25x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         use rayon::prelude::*;
         cond.par_iter()
             .zip(x_data.par_iter())
@@ -32120,8 +32124,11 @@ pub fn masked_fill_tensor_contiguous_f32(
     }
     let data = &input[offset..offset + numel];
     let mask_w = &mask[offset..offset + numel];
-    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial zip-map; f32 companion).
-    let output = if numel >= PARALLEL_THRESHOLD {
+    // Bit-identical to the serial zip-map (f32 companion of masked_fill_tensor_contiguous_f64).
+    // Bandwidth-bound select-WRITE (read data+mask, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — measured PARALLEL_THRESHOLD
+    // (8192) over-parallelized medium masked_fill 0.02-0.56x (up to 50x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         use rayon::prelude::*;
         data.par_iter()
             .zip(mask_w.par_iter())
@@ -32163,8 +32170,11 @@ pub fn where_tensor_contiguous_f32(
     let cond = &condition[offset..offset + numel];
     let x_data = &x[offset..offset + numel];
     let y_data = &y[offset..offset + numel];
-    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial zip-map; f32 companion).
-    let output = if numel >= PARALLEL_THRESHOLD {
+    // Bit-identical to the serial zip-map (f32 companion of where_tensor_contiguous_f64).
+    // Bandwidth-bound select-WRITE (read cond+x+y, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover — PARALLEL_THRESHOLD(8192) over-parallelized medium
+    // where 0.04-0.91x (up to 25x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         use rayon::prelude::*;
         cond.par_iter()
             .zip(x_data.par_iter())
