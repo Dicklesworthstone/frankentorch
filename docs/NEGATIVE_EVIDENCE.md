@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: logaddexp F64 fused fast path (borrow-both + fuse ~9-op compose) — 3.30-3.64x vs original, bit-exact (finite)
+
+Agent `BlackThrush`. Asymmetric-dtype vein. `tensor_logaddexp(a, b)` had a fused borrow+parallel F32 fast
+path but **F64 fell to the GENERIC path**: `tensor_values_lossy_f64` CLONES BOTH operands then COMPOSES ~9
+tape ops (max, sub x2, exp x2, add, log, add) — each materializing an intermediate tensor. Added the F64
+mirror: borrow both `contiguous_values()` + fuse into ONE parallel pass via `stable_logaddexp_value`.
+★BIT-EXACT (unlike the tolerance-gated F32 path which has an f32<->f64 cast): for FINITE inputs the fused
+does the IDENTICAL f64 ops (max/sub/exp/add/ln, same libm) as the compose. GATED to all-finite (parallel
+check); any non-finite falls through to the compose (which routes non-finite specially) → exact behavior
+preserved. Confirmed `bitmatch=true` vs the compose formula.
+
+★MEASURE (`examples/logaddexp_op_ab.rs`, REAL `tensor_logaddexp` f64 finite, tensors OUTSIDE timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=inline compose replica NEW=fused-parallel):
+- n=4M (32MB):    93.44 -> 28.34 ms = **3.30x vs ORIG**
+- n=16M (128MB): 372.05 -> 105.72 ms = **3.52x vs ORIG**
+- n=64M (512MB): 1481.91 -> 406.64 ms = **3.64x vs ORIG**
+CONSERVATIVE: OLD is the inline max/sub/exp/add/ln formula; the real HEAD did the SLOWER 9-op TAPE compose
+(materializes intermediates) so the real win is larger. Tests: ft-api --lib 2480/0. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: heaviside F64 fast path (borrow-both + parallel) — 2.54-2.59x vs original, bit-exact
 
 Agent `BlackThrush`. Asymmetric-dtype vein (beyond the binning trio). `tensor_heaviside(input, values)` had
