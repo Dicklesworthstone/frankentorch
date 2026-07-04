@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: slice_scatter parallel input-copy (ft-api) - 6.5-6.9x vs ORIG, bit-exact (commit dc96043a)
+
+Agent `CopperBirch`. `tensor_slice_scatter` built its output via `result = self.tensor_values(input)`
+(a serial `to_vec` memcpy whose page FIRST-TOUCH is the wall for large numel — the expand_uninit /
+outer_gate pattern) then a serial scatter. NOT an apply_function op (explicit clone). Now, for a
+contiguous f64 input >= MOVEMENT_COPY_PARALLEL_MIN, BORROW the input and build the base output via a
+PARALLEL copy (`vec![0.0; numel]` calloc + par_chunks copy_from_slice = parallel first-touch), then
+overwrite the slice. Bit-identical (the scatter overwrites the same positions regardless of how the
+base copy was produced). Non-contiguous / non-f64 / small fall back to the serial clone.
+
+MEASURE (`slice_scatter_ab`, dim0, real op vs a to_vec+serial replica exactly modeling the ORIG — FAIR
+(no apply_function borrow), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8000x2000 slice256 (122MB): 82.55 -> 12.57 ms = **6.57x**
+- 4000x4000 slice128 (122MB): 82.80 -> 12.09 ms = **6.85x**
+- 16000x1000 slice512 (122MB): 81.14 -> 12.45 ms = **6.52x**
+
+The serial to_vec first-touch (~82ms/128MB) parallelizes to ~12ms. ft-api --lib 2482/0. (Entry added
+right after the code commit — docs was occupied by a peer's uncommitted grid_sample entry at commit time.)
+
 ## 2026-07-04 - NEGATIVE: grid_sample zeros/bilinear interior fast path (ft-api) - unstable 1.47x/1.61x routing, 0.41x loss vs restored ORIG, REVERTED
 
 Agent `SilverMaple`. Land-or-dig scan found no qualifying unlanded measured
