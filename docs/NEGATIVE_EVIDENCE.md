@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: in-place lerp_ F64 borrow+parallel — 2.18-2.23x vs original, bit-exact (COMPLETES the in-place family)
+
+Agent `BlackThrush`. Last op of the in-place elementwise family. `tensor_lerp_(target, end, weight)` CLONES
+BOTH operands via `tensor_values_lossy_f64` + maps SERIALLY. Added an F64 borrow+parallel fast path (inline —
+needs the `weight=` record detail, so not the shared binary helper). Mirrors the EXISTING naive formula
+`s + weight*(e-s)` → BIT-IDENTICAL to the serial (parity-vs-original). ⚠️NOTE: the naive-vs-FMA torch-parity
+gap (cf. non-in-place lerp fix 23ca42e0; scalar lerp still naive per [[project_lerp_fma_parity]]) is a SEPARATE
+follow-up — NOT changed here (this is a perf-only win, output unchanged vs original).
+
+★MEASURE (`examples/inplace_lerp_ab.rs`, REAL `tensor_lerp_` f64, tensors OUTSIDE timer, RAYON_NUM_THREADS=8,
+min-9, bitmatch=true; OLD=clone-both+serial NEW=borrow-both+parallel):
+- n=16M (128MB): 250.09 -> 114.56 ms = **2.18x vs ORIG**
+- n=64M (512MB): 1038.42 -> 466.18 ms = **2.23x vs ORIG**
+Tests: ft-api --lib 2480/0. ★★The ENTIRE in-place elementwise family (11 ops: max/min/fmax/fmin/fmod/hypot/
+nextafter/ldexp/addcmul/addcdiv/lerp) is now F64 borrow+parallel. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: in-place TERNARY addcmul_/addcdiv_ F64 borrow+parallel — 2.74-3.12x vs original, bit-exact
 
 Agent `BlackThrush`. Completed the in-place asymmetric-dtype family with the TERNARY (3-operand) ops.
