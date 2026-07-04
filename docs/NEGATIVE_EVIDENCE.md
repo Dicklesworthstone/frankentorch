@@ -1,5 +1,47 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: f32 threshold no-grad serial gate below 8192 gives 5.79x at 4K, neutral above
+
+Agent `GreenLake` (`AGENT_NAME=GreenLake`) plus follow-up calibration by `SilverMaple`. Agent Mail
+registration/reservation could not be completed:
+`macro_start_session` hit `database disk image is malformed: table_seek called on index page`, and
+`health_check` reported degraded read-only recovery mode with next action `am doctor repair`. Ownership kept
+to `crates/ft-api/src/lib.rs`, `crates/ft-api/benches/ops_bench.rs`, and this ledger.
+
+FINDING: `tensor_threshold` already had a contiguous f32 no-grad one-pass fast path, but that path always used
+Rayon even for tiny tensors. Threshold is only a scalar select (`NaN -> NaN`, else `x > threshold ? x : value`),
+so Rayon setup dominates small/medium rows. Added per-crate Criterion rows for f32 no-grad threshold at 4K,
+64K, and 1M elements, then gated f32 threshold at `THRESHOLD_F32_PARALLEL_MIN = 1 << 13`: 4K stays serial,
+64K and larger keep the original parallel path.
+
+SUPPORTING MEASURE (same RCH worker `vmi1152480`, `CARGO_TARGET_DIR=/data/projects/frankentorch/.rch-targets/cobaltquartz`,
+`cargo bench --profile release -p ft-api --bench ops_bench -- threshold/f32_nograd`; requested
+`cargo bench --release` is not accepted by Cargo here, so `--profile release` is the equivalent release bench):
+legacy original = temporary old always-Rayon f32 threshold fast path; candidate = serial below 256K, parallel at
+1M. Mean old vs candidate:
+- 4096 elems: **109.47us -> 4.043us = 27.08x vs original** (`p < 0.05`)
+- 65536 elems: **394.48us -> 58.419us = 6.75x vs original** (`p < 0.05`)
+- 1048576 elems: **1.5961ms -> 1.5010ms = 1.06x**, Criterion reported no detected change (`p = 0.56`)
+
+FINAL MEASURE (`AGENT_NAME=SilverMaple RCH_WORKER=hz2 RCH_WORKERS=hz2 CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-silvermaple rch exec -- cargo bench -p ft-api --bench ops_bench threshold -- --noplot`):
+legacy original = clean `HEAD` with only the new bench rows; final = serial below 8192, parallel at 64K+.
+Same-worker `hz2` medians old vs final:
+- 4096 elems: **59.684us -> 10.308us = 5.79x vs original**
+- 65536 elems: **134.05us -> 135.20us = 0.99x**, neutral/no claim
+- 1048576 elems: **544.06us -> 524.45us = 1.04x**, neutral/no claim
+- 4000x4000 elems: **20.727ms -> 21.173ms = 0.98x**, neutral/no claim
+
+NEGATIVE EVIDENCE: the first cutoff tried `1 << 20`, which kept 1M serial and regressed the same-worker 1M row
+against the original parallel path (**1.5961ms original vs 2.5990ms serial-at-1M = 0.61x**, no-ship). Final
+SilverMaple follow-up also rejected the broader `1 << 18` cutoff on `hz2` because it serialized 64K and
+regressed that row (**134.05us -> 148.09us = 0.91x**). Final cutoff is therefore `1 << 13`; the shipped claim
+is only the 4K win, with 64K+ neutral.
+
+CORRECTNESS: threshold-only routing change. Both branches evaluate the same scalar-cast f32 expression and
+canonical NaN propagation as the existing f32 no-grad fast path; grad, non-contiguous, and non-f32 inputs still
+fall through unchanged. Existing `threshold_f32_nograd_fast_path_preserves_dtype_and_nan_bits` covers the
+serial branch because its small fixture is below the new gate.
+
 ## 2026-07-04 - ★ WIN: expand/broadcast_to uninit parallel-first-touch materialize — 2.2-5.0x vs original (bit-exact)
 
 Agent `BlackThrush`. `expand`/`broadcast_to` (and every broadcasted bias/mean/var in norm op-graphs, and

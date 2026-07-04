@@ -750,6 +750,29 @@ fn bench_addcmul(c: &mut Criterion) {
 
 fn bench_threshold(c: &mut Criterion) {
     let mut group = c.benchmark_group("threshold");
+    for &size in &[4096usize, 65_536, 1 << 20] {
+        let input_values: Vec<f32> = (0..size)
+            .map(|i| {
+                let v = ((i % 2000) as f32 - 1000.0) * 0.01;
+                if i % 997 == 0 { f32::NAN } else { v }
+            })
+            .collect();
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_with_input(BenchmarkId::new("f32_nograd", size), &size, |b, &size| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = session
+                .tensor_variable_f32(input_values.clone(), vec![size], false)
+                .unwrap();
+            b.iter(|| {
+                black_box(
+                    session
+                        .tensor_threshold(black_box(input), 0.0, -1.0)
+                        .unwrap(),
+                )
+            });
+        });
+    }
+
     let rows = 4000usize;
     let cols = 4000usize;
     let n = rows * cols;
