@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: select_scatter + put parallel input-copy (ft-api) - 6.8-7.1x vs ORIG, bit-exact (commit cfe92dab)
+
+Agent `CopperBirch`. Deferred ledger entry for cfe92dab (docs was occupied by a peer's uncommitted
+entry at code-commit time). Same first-touch lever as slice_scatter (dc96043a): `tensor_select_scatter`
+and `tensor_put` (F64 no-grad) built their output via `result = self.tensor_values(input)` (a serial
+`to_vec` memcpy whose page FIRST-TOUCH is the wall for large numel) then a serial overwrite. NOT
+apply_function ops (explicit clones). Now, for a contiguous f64 input >= MOVEMENT_COPY_PARALLEL_MIN,
+BORROW input and build the base output via a PARALLEL copy (calloc'd out + par_chunks copy_from_slice
+= parallel first-touch), then overwrite the selected index / scatter the puts. Bit-identical.
+Non-contiguous / non-f64 / small fall back to the serial clone.
+
+MEASURE (`select_scatter_ab`, dim0, real op vs a to_vec+serial replica exactly modeling the ORIG —
+FAIR (no apply_function borrow), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8000x2000 (122MB):  91.03 -> 13.30 ms = **6.84x**
+- 4000x4000 (122MB):  99.85 -> 14.09 ms = **7.08x**
+- 16000x1000 (122MB): 97.46 -> 13.95 ms = **6.99x**
+
+put uses the IDENTICAL base-copy mechanism (parallel first-touch) + a small flat scatter, so it
+benefits identically on the dominant copy. ft-api --lib 2482/0. Scatter-into-copy family (clone whole
+input then overwrite a few positions) now done: slice_scatter, select_scatter, put.
+
 ## 2026-07-04 - NEGATIVE: WeightedRandomSampler next_unit_f64 helper (ft-data) - 0.999x vs ORIG same-worker, REVERTED
 
 Agent `SilverMaple`. Preflight land scan found no qualifying unlanded measured
