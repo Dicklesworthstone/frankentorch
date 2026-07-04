@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-03 - WIN: clamp had the copy-op no-gate bug at PARALLEL_THRESHOLD(8192) → up to 100x SLOWER medium; gated to copy tier, bit-exact
+
+Agent `BlackThrush`. Finder's next hit (grep `numel >= PARALLEL_THRESHOLD` with a pure bandwidth body).
+`clamp_tensor_contiguous_f{64,32}` (`out[i] = min(max(x[i], min_val), max_val)` = NaN-check + 2 conditional bound
+compares, no reduce) parallelizes `par_iter().map(clamp_one).collect()` gated at the compute default
+`PARALLEL_THRESHOLD` (8192). clamp is a cheap bandwidth-bound per-element op, so 8192 over-parallelized medium.
+
+★MEASURE (f64, 64t, min-11, serial==parallel bit-exact): **8192 0.03x, 64K 0.01x (100x SLOWER!), 256K 0.01x,
+512K 0.02x, 1M 0.07x, 2M 0.26x** — wins only from 4M (1.81x) / 16M (3.52x). clamp is HOT (gradient clipping,
+activation bounds, clamp_min/max, logit-eps, norm renorm) — the regression hit every clamp below 4M elems, i.e.
+essentially all of them in practice (grad-clip tensors are model-param-sized, usually < 4M per tensor).
+
+★FIX: gate both dtypes at `COPY_MATERIALIZE_PARALLEL_MIN` (1<<22). Threshold-only ⇒ BIT-IDENTICAL. 573
+ft-kernel-cpu tests green (rch). ★The finder has now yielded FOUR ops in a row from the same `numel >=
+PARALLEL_THRESHOLD` pure-write class — outer, where, masked_fill, clamp — all cheap bandwidth ops mis-gated at
+the compute default. Confirmed CORRECTLY-gated (leave alone): pow (transcendental, 8192 right), the generic
+op/compute/eval dispatchers (unknown per-elem cost), reduction gates (out_numel*reduce_size), and scan lane
+gates. The remaining `numel >= PARALLEL_THRESHOLD` pure-cheap-body hits are the target class.
+
 ## 2026-07-03 - WIN: where + masked_fill (contiguous) had the copy-op no-gate bug → up to 50x SLOWER small/medium; gated to copy tier, bit-exact
 
 Agent `BlackThrush`. Ran the live finder (grep `>= PARALLEL_THRESHOLD` whose body is a pure select/copy WRITE)

@@ -3139,10 +3139,9 @@ pub fn clamp_tensor_contiguous_f64(
     let window = &input[start..start + numel];
 
     // clamp is min(max(x, min_val), max_val): lower bound first, then upper, so when
-    // min_val > max_val the upper bound wins. Pure per-element map → fan over the rayon pool
-    // above PARALLEL_THRESHOLD (bit-for-bit identical to the serial map; index order
-    // preserved by the indexed parallel collect). The serial `.iter().map()` left this
-    // bandwidth-bound op single-threaded; clamp is hot (clamp_min/max, logit-eps, norms).
+    // min_val > max_val the upper bound wins. Bit-for-bit identical to the serial map (index
+    // order preserved by the indexed parallel collect). clamp is hot (clamp_min/max, logit-eps,
+    // grad clipping, norms).
     let clamp_one = |value: &f64| -> f64 {
         if value.is_nan() {
             f64::NAN
@@ -3159,7 +3158,10 @@ pub fn clamp_tensor_contiguous_f64(
             }
         }
     };
-    if numel >= PARALLEL_THRESHOLD {
+    // Bandwidth-bound per-element clamp (NaN-check + 2 bound compares, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — PARALLEL_THRESHOLD(8192)
+    // over-parallelized medium clamp up to 100x (64K-256K 0.01x, 1M 0.07x, 2M 0.26x), crossover ~4M.
+    if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         use rayon::prelude::*;
         Ok(window.par_iter().map(clamp_one).collect())
     } else {
@@ -29296,8 +29298,7 @@ pub fn clamp_tensor_contiguous_f32(
     }
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
-    // Parallel above PARALLEL_THRESHOLD (bit-identical to the serial map; f32 companion of
-    // clamp_tensor_contiguous_f64).
+    // Bit-identical to the serial map (f32 companion of clamp_tensor_contiguous_f64).
     let clamp_one = |value: &f32| -> f32 {
         if value.is_nan() {
             f32::NAN
@@ -29314,7 +29315,10 @@ pub fn clamp_tensor_contiguous_f32(
             }
         }
     };
-    if numel >= PARALLEL_THRESHOLD {
+    // Bandwidth-bound per-element clamp (NaN-check + 2 bound compares, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — PARALLEL_THRESHOLD(8192)
+    // over-parallelized medium clamp up to 100x (64K-256K 0.01x, 1M 0.07x, 2M 0.26x), crossover ~4M.
+    if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         use rayon::prelude::*;
         Ok(window.par_iter().map(clamp_one).collect())
     } else {
