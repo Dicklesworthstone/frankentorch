@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: dequantize_per_channel F64 borrow + parallel (ft-api) - 2.5-2.9x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Same corrected-criterion pattern as quantize_per_channel (258a8405): the ORIG
+`tensor_dequantize_per_channel` read `self.tensor_values(quantized)` (explicit owned-Vec CLONE) then ran
+a SERIAL nested per-channel loop `out[idx] = (q[idx] - zp[c]) * scale[c]`. NOT an apply_function op.
+Now borrows the contiguous f64 input + parallelizes the per-element map (channel =
+`(idx / stride_after) % channel_size`). Bit-identical. Non-contiguous / non-f64 fall back to the clone.
+(fake_quantize_per_channel composes quantize+dequantize_per_channel, so it auto-benefits from both.)
+
+MEASURE (`dequant_pc_ab`, real op vs a clone+serial replica exactly reproducing the ORIG loop — FAIR
+(no apply_function), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 256x128x1024 (256MB): 239.66 -> 95.01 ms = **2.52x**
+- 128x64x2048  (128MB): 111.15 -> 37.80 ms = **2.94x**
+- 512x256x256  (256MB): 192.45 -> 68.99 ms = **2.79x**
+
+Lower ratio than quantize (7.6-8.2x) because dequant's per-element compute is cheaper ((q-zp)*scale, 2
+ops) so NEW is more bandwidth-bound; still a solid clone-avoidance + parallelization win. ft-api --lib
+2482/0. Verified real-win tally (post-mbitj-correction, explicit-clone+serial ops): embedding 19-122x,
+prelu 9.5x, multi_margin 22-30x, quantize_per_channel 7.6-8.2x, dequantize_per_channel 2.5-2.9x.
+
 ## 2026-07-04 - WIN: quantize_per_channel F64 borrow + parallel (ft-api) - 7.6-8.2x vs ORIG, bit-exact
 
 Agent `CopperBirch`. A GENUINE clone+serial win (NOT an apply_function op — verified fair). The ORIG
