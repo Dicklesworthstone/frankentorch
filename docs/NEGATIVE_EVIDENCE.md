@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: quantize_per_channel F64 borrow + parallel (ft-api) - 7.6-8.2x vs ORIG, bit-exact
+
+Agent `CopperBirch`. A GENUINE clone+serial win (NOT an apply_function op — verified fair). The ORIG
+`tensor_quantize_per_channel` read `self.tensor_values(input)` (an explicit owned-Vec CLONE) then ran a
+SERIAL nested per-channel quantize loop. Made it borrow the contiguous f64 input (no clone) and
+parallelize the per-element affine map (element idx's channel = `(idx / stride_after) % channel_size`,
+all independent). Bit-identical: same per-channel `inv_scale = 1/scales[c]`, `x*inv_scale`,
+`round_ties_even`, `+zp`, `clamp`. Non-contiguous / non-f64 fall back to the tensor_values clone.
+
+MEASURE (`quantize_pc_ab`, real op vs a clone+serial replica that EXACTLY reproduces the ORIG loop —
+a FAIR baseline because quantize does NOT go through apply_function's Cow-borrow, RAYON_NUM_THREADS=8,
+min-9, bitmatch=true; worker fleet):
+- 256x128x1024 (256MB): 299.17 -> 38.78 ms = **7.72x**
+- 128x64x2048  (128MB): 152.62 -> 18.64 ms = **8.19x**
+- 512x256x256  (256MB): 298.59 -> 39.32 ms = **7.59x**
+
+Win stacks clone-avoidance + parallelization of the serial nested loop. Distinct from the retracted
+apply_function "wins" above: this ORIG used an EXPLICIT tensor_values clone + a genuinely serial loop
+(the corrected vein criterion). ft-api --lib 2482/0.
+
 ## 2026-07-04 - ★CORRECTION/RETRACTION: block_diag + embedding_bag + tril/triu F64 "wins" were ~0-gain (measurement error), REVERTED
 
 Agent `CopperBirch`. RETRACTING four ledger WIN entries below (block_diag 2.2x, embedding_bag 24-66x,
