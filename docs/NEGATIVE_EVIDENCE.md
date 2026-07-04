@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: embedding_bag F64 native no-grad fast path (ft-api) - 24.5-66x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Same asymmetric-dtype gap as block_diag: `tensor_embedding_bag` had an F32
+native no-grad fast path (borrow the weight table + gather+reduce) but F64 fell through to the
+apply_function path, which materializes `weight` via `inputs` — a FULL clone of the
+[num_embeddings, embedding_dim] table per forward — before gathering. For the common recsys inference
+case (large table, bags gather only a few of many rows) that clone is the entire cost. Mirrored the
+F32 path for F64: borrow the contiguous f64 table zero-copy and gather+reduce directly (parallel over
+bags). Bit-identical to the closure (same per-bag math, "max" tie-break, out-of-range check, flatten
+order). Non-contiguous / grad fall through.
+
+MEASURE (`embedding_bag_ab`, mode=sum, real op vs an apply_function-path replica that CLONES the
+244 MB table — fair baseline, RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker hz2/ovh):
+- 500K x 64 table, 8K bags x4:  147.02 -> 3.29 ms = **44.6x**
+- 1M x 32 table, 4K bags x8:    148.67 -> 2.25 ms = **66.0x**
+- 250K x 128 table, 16K bags x2: 151.42 -> 6.18 ms = **24.5x**
+
+The ratio is table-size / gather-sparsity dependent (a full-table clone dwarfing a sparse gather);
+small tables or dense gathers would show less. Still a large clean win for the dominant inference
+pattern. ft-api --lib 2482/0. Continues the reverse-[[asymmetric_dtype_fastpath]] vein (F32-only fast
+paths leaving F64 on apply_function's clone floor); block_diag was the prior one.
+
 ## 2026-07-04 - WIN: block_diag F64 native no-grad fast path (ft-api) - 1.18-2.23x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Asymmetric-dtype gap: `tensor_block_diag` had an F32 native no-grad fast path
