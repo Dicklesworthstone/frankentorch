@@ -1,7 +1,7 @@
 // embedding_bag f32 vs torch: perf + dtype + value (gather+reduce, no-grad). cc.
 // The f64 path upcasts the whole f32 table to f64 before gathering; native-f32 avoids it.
 use ft_api::FrankenTorchSession;
-use ft_core::{DType, ExecutionMode};
+use ft_core::ExecutionMode;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;

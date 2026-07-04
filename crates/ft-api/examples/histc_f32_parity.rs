@@ -8,7 +8,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = 500_003usize;
     let mut a: Vec<f32> = (0..n).map(|i| (((i*2654435761usize) % 800_003) as f32) * 0.00001 - 4.0).collect();
     // sprinkle exact boundary values for bins over [-2,2], 8 bins (width 0.5)
-    for k in 0..16 { a[k] = -2.0 + k as f32 * 0.5; }
+    for (k, slot) in a.iter_mut().take(16).enumerate() { *slot = -2.0 + k as f32 * 0.5; }
     a[20] = 2.0; a[21] = -2.0; a[22] = -10.0; a[23] = 10.0; // boundaries + out of range
     let bins = 8usize; let (lo, hi) = (-2.0_f64, 2.0_f64);
 

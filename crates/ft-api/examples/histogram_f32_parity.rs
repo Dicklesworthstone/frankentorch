@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = 500_003usize;
     let mut a: Vec<f32> = (0..n).map(|i| (((i*2654435761usize)%800_003) as f32)*0.00001 - 4.0).collect();
     for k in 0..16 { a[k] = -2.0 + k as f32 * 0.5; } // exact boundaries
-    a[20]=2.0; a[21]=-2.0; a[22]=-10.0; a[23]=10.0;
+    a[20]=2.0; a[21] = -2.0; a[22] = -10.0; a[23]=10.0;
     let (bins, lo, hi) = (8usize, -2.0_f64, 2.0_f64);
 
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);

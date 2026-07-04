@@ -1,7 +1,7 @@
 // prelu f32 vs torch: perf + dtype + value (per-channel, no-grad). cc.
 // Before this fix, no-grad f32 prelu errored (UnsupportedDType(F32)) in the f64 path.
 use ft_api::FrankenTorchSession;
-use ft_core::{DType, ExecutionMode};
+use ft_core::ExecutionMode;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;

@@ -14,7 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let de: Vec<f64> = (0..10000 * 50).map(|i| (i % 17) as f64 - 8.0).collect();
     let anc: Vec<f64> = (0..4_000_000).map(|i| (i % 7) as f64).collect();
 
-    let bench = |label: &str, mut f: Box<dyn FnMut() -> ()>| -> f64 {
+    let bench = |label: &str, mut f: Box<dyn FnMut()>| -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..7 { let t = Instant::now(); f(); let e = t.elapsed().as_secs_f64()*1e3; if e<best {best=e;} }
         let _ = label; best

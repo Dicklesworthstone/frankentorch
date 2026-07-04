@@ -14,6 +14,8 @@ const R: usize = 4000;
 const C: usize = 4000;
 const P: usize = 16;
 
+type UnaryOp = fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId);
+
 fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId)>(data: &[f64], f: F) -> f64 {
     let mut best = f64::INFINITY;
     for _ in 0..7 {
@@ -43,7 +45,7 @@ fn time_ft_f32_constant_pad() -> f64 {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data: Vec<f64> = (0..R * C).map(|i| ((i % 17) as f64) - 8.0).collect();
-    let ops: Vec<(&str, fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId))> = vec![
+    let ops: Vec<(&str, UnaryOp)> = vec![
         ("cat_anchor", |s, x| { let _ = s.tensor_cat(&[x, x], 1); }),
         ("constant_pad", |s, x| { let _ = s.tensor_pad(x, &[P, P, P, P], 0.0); }),
         ("reflect_pad", |s, x| { let _ = s.tensor_pad_mode(x, &[P, P, P, P], "reflect", 0.0); }),

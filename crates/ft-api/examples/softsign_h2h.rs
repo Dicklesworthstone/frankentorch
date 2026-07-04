@@ -1,6 +1,6 @@
 // softsign f32 head-to-head + BIT-EXACT correctness vs torch (value op, parity absolute).
 use ft_api::FrankenTorchSession;
-use ft_core::{DType, ExecutionMode};
+use ft_core::ExecutionMode;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;

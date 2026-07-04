@@ -12,6 +12,8 @@ use ft_core::ExecutionMode;
 const R: usize = 4000;
 const C: usize = 4000;
 
+type UnaryOp = fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId);
+
 fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> ()>(data: &[f32], f: F) -> f64 {
     let mut best = f64::INFINITY;
     for _ in 0..6 {
@@ -27,7 +29,7 @@ fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> ()>(dat
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data: Vec<f32> = (0..R * C).map(|i| ((i % 17) as f32) - 8.0).collect();
-    let ops: Vec<(&str, fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId))> = vec![
+    let ops: Vec<(&str, UnaryOp)> = vec![
         ("prod", |s, x| { let _ = s.tensor_prod(x); }),
         ("var", |s, x| { let _ = s.tensor_var(x, 1); }),
         ("std", |s, x| { let _ = s.tensor_std(x, 1); }),

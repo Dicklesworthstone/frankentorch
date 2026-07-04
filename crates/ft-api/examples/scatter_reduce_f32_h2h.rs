@@ -1,7 +1,7 @@
 // scatter_reduce f32 vs torch across reduce modes (no-grad). cc.
 // torch leaves rare CPU reduce modes (amax/amin/prod) slow (cf. embedding_bag max).
 use ft_api::FrankenTorchSession;
-use ft_core::{DType, ExecutionMode};
+use ft_core::ExecutionMode;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;

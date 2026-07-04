@@ -9,8 +9,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a: Vec<f32> = (0..n).map(|i| ((i % 4099) as f32 - 2049.5) * 0.013).collect();
     let mut b: Vec<f32> = (0..n).map(|i| ((i % 3001) as f32 - 1500.5) * 0.017 + 1.0).collect();
     let t = n - 5;
-    a[t]=f32::INFINITY; a[t+1]=f32::NEG_INFINITY; a[t+2]=f32::NAN; a[t+3]=-0.0; a[t+4]=0.0;
-    b[t]=2.0; b[t+1]=-3.0; b[t+2]=0.0; b[t+3]=f32::INFINITY; b[t+4]=f32::NAN;
+    a[t]=f32::INFINITY; a[t+1]=f32::NEG_INFINITY; a[t+2]=f32::NAN; a[t+3] = -0.0; a[t+4]=0.0;
+    b[t]=2.0; b[t+1] = -3.0; b[t+2]=0.0; b[t+3]=f32::INFINITY; b[t+4]=f32::NAN;
 
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let xa = s.tensor_variable_f32(a.clone(), vec![n], false)?;

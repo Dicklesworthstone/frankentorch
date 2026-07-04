@@ -620,6 +620,29 @@ fn bench_sigmoid(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_logit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("logit");
+
+    for &size in &[4096usize, 16_384, 1 << 20] {
+        let values: Vec<f64> = (0..size)
+            .map(|i| {
+                let bucket = ((i.wrapping_mul(37) % 997) as f64 + 0.5) / 997.0;
+                0.01 + bucket * 0.98
+            })
+            .collect();
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_with_input(BenchmarkId::new("f64_nograd", size), &size, |b, &size| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(values.clone(), vec![size], false)
+                .unwrap();
+            b.iter(|| black_box(session.tensor_logit(x, None).unwrap()));
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_pow(c: &mut Criterion) {
     let mut group = c.benchmark_group("pow");
 
@@ -2538,6 +2561,7 @@ criterion_group!(
     bench_relu,
     bench_exp,
     bench_sigmoid,
+    bench_logit,
     bench_pow,
     bench_add,
     bench_scalar_map,

@@ -1,6 +1,6 @@
 // embedding f32 vs torch: perf + dtype + value (gather, no-grad). cc.
 use ft_api::FrankenTorchSession;
-use ft_core::{DType, ExecutionMode};
+use ft_core::ExecutionMode;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;

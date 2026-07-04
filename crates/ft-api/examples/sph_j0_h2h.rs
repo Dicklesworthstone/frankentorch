@@ -1,6 +1,6 @@
 // spherical_bessel_j0 f32 head-to-head + correctness vs torch (8t / FT default).
 use ft_api::FrankenTorchSession;
-use ft_core::{DType, ExecutionMode};
+use ft_core::ExecutionMode;
 use std::io::Write;
 use std::process::{Command, Stdio};
 use std::time::Instant;

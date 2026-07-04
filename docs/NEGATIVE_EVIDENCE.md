@@ -28,6 +28,31 @@ CORRECTNESS: threshold-only change, same per-element expression and same output 
 `scalar_arithmetic_nograd_fast_path_matches_fallback_bits`, which compares below-threshold no-grad f64/f32
 add/sub/mul/div against the grad-forced fallback path by exact result bits.
 
+## 2026-07-04 - WIN + SURFACE: f64 logit no-grad used the generic 8192 compute gate; calibrated to 512K, 2.2-7.0x vs prior FT, mixed vs PyTorch
+
+Agent `SilverQuartz`. Agent Mail registration/reservation was blocked by the archive SQLite corruption breaker
+(`table_seek called on index page ... database disk image is malformed`), so this pass kept ownership to
+`crates/ft-api/src/lib.rs`, `crates/ft-api/benches/ops_bench.rs`, and this ledger only. Beads was also blocked
+by duplicate issue id `frankentorch-kgs4.150`; no tracker mutation was attempted.
+
+FINDING: `tensor_logit(..., eps=None)` f64 no-grad contiguous still ran an unconditional Rayon `par_iter()`
+for every size. The first attempt routed it through the generic native unary helper (`PARALLEL_ELEMENTWISE_MIN`
+=8192): 4K improved but 16K regressed, proving logit's one `ln` + divide is not heavy enough for the generic
+8192 compute cutoff. Final fix uses a logit-specific `LOGIT_F64_PARALLEL_MIN = 1 << 19`, so 4K/16K stay serial
+and 1M remains parallel. Behavior is bit-exact: same formula, same element order, no grad/eps/non-contiguous
+surface changed; added `logit_nograd_f64_fast_path_matches_composed_bits`.
+
+MEASURE (same RCH worker `vmi1153651`, `cargo bench -p ft-api --bench ops_bench -- logit`): prior FT vs final
+FT median: 4096 **278.27us -> 39.77us = 7.0x**, 16384 **341.72us -> 155.94us = 2.19x**, 1M **8.404ms ->
+3.406ms = 2.47x**. The rejected generic-8192 attempt was `39.45us / 550.21us / 4.829ms`: good at 4K and 1M
+but bad at 16K, which is why the final cutoff is 512K.
+
+PYTORCH LEGACY CHECK (local PyTorch 2.12.1+cpu sanity probe, same deterministic f64 data, supporting evidence
+only because raw Python is not an RCH compilation command): with 8 torch threads, PyTorch was 130.76us / 84.72us
+/ 8.293ms for 4K/16K/1M, so final FT is **3.29x faster at 4K**, **1.84x slower at 16K**, and **2.43x faster
+at 1M**. With 1 torch thread, PyTorch remains faster at 4K/16K (28.03us / 93.30us) but slower at 1M (13.265ms).
+SURFACE: f64 logit's mid-size kernel still has a PyTorch gap; do not claim universal PyTorch superiority.
+
 ## 2026-07-03 - WIN: pow TRIVIAL-EXPONENT elision (x, x², x³, 1/x) was on the powf compute gate → up to 100x SLOWER medium; split to copy tier, bit-exact
 
 Agent `BlackThrush`. 5th op in the copy-tier class, a subtler one. `pow_tensor_contiguous_f{64,32}` routes ALL

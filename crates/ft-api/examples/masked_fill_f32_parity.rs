@@ -7,7 +7,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = 100_003usize;
     let mut a: Vec<f32> = (0..n).map(|i| ((i*37%257) as f32 - 128.0) * 0.1).collect();
     let mask: Vec<f32> = (0..n).map(|i| (i % 3 == 0) as i32 as f32).collect();
-    a[0]=f32::NAN; a[1]=f32::INFINITY; a[2]=f32::NEG_INFINITY; a[3]=-0.0;
+    a[0]=f32::NAN; a[1]=f32::INFINITY; a[2]=f32::NEG_INFINITY; a[3] = -0.0;
     let value = -1.5_f64;
 
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
