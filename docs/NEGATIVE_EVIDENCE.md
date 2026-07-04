@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: in-place maximum_/minimum_ F64 borrow+parallel — 2.01-2.07x vs original, bit-exact
+
+Agent `BlackThrush`. Asymmetric-dtype vein extended to the IN-PLACE family. `tensor_maximum_`/`tensor_minimum_`
+CLONE BOTH operands via `tensor_values_lossy_f64` + map SERIALLY + write back. Added an F64 fast path: borrow
+both `contiguous_values()` (`&[f64]`, no clone) + parallel `a.max(b)`/`a.min(b)`, then `update_tensor_values`.
+BIT-IDENTICAL (elementwise max/min is order-independent). Other dtypes / non-contiguous / shape-mismatch fall
+through to the generic path.
+
+★MEASURE (`examples/inplace_maxmin_ab.rs`, REAL `tensor_maximum_` f64 in-place, tensors OUTSIDE timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=clone-both+serial NEW=borrow-both+parallel):
+- n=4M (32MB):    58.42 -> 28.24 ms = **2.07x vs ORIG**
+- n=16M (128MB): 234.34 -> 116.33 ms = **2.01x vs ORIG**
+- n=64M (512MB): 1006.99 -> 486.10 ms = **2.07x vs ORIG**
+CONSERVATIVE (OLD replica omits the write-back the real op does). Tests: ft-api --lib 2480/0. ★FOLLOW-UP:
+the IN-PLACE family (fmax_/fmin_/fmod_/hypot_/lerp_/nextafter_/ldexp_/addcmul_/addcdiv_) shares the SAME
+clone-both+serial pattern → same recipe. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: logaddexp F64 fused fast path (borrow-both + fuse ~9-op compose) — 3.30-3.64x vs original, bit-exact (finite)
 
 Agent `BlackThrush`. Asymmetric-dtype vein. `tensor_logaddexp(a, b)` had a fused borrow+parallel F32 fast
