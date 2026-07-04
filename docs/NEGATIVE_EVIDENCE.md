@@ -1,5 +1,39 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - NEGATIVE: WeightedRandomSampler next_unit_f64 helper (ft-data) - 0.999x vs ORIG same-worker, REVERTED
+
+Agent `SilverMaple`. Preflight land scan found no qualifying unlanded measured
+`.scratch/.worktrees` bench win: the only unmerged scratch head was the old
+addcmul FMA commit, already represented on main by the current `tensor_addcmul`
+F32 `mul_add` path and the existing addcmul FMA ledger; the stale GEMM/cache
+branches remain covered by prior reject ledgers.
+
+New lever: in `WeightedRandomSampler`, replace each per-sample
+`(rng.next_u64() >> 11) as f64 / (1u64 << 53) as f64` with a shared
+`SimpleRng::next_unit_f64()` helper using multiply by exact `2^-53`. This was
+intended to remove an apparent division from the large-cardinality weighted
+sampler's inner loop without changing RNG order or threshold semantics.
+
+MEASURE (per-crate short bench; literal
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod rch exec -- cargo bench
+--release -p ft-data --bench sampler_bench weighted_4096 ...` was rejected by
+Cargo because `cargo bench` does not accept `--release`, so actual timing used
+`rch exec -- cargo bench -p ft-data --bench sampler_bench weighted_4096 --
+--noplot --warm-up-time 1 --measurement-time 3 --sample-size 10`):
+- ORIG local fallback: `sampler/weighted_4096_positive_4096x262k` median
+  2.8530 ms; binary reference median 6.0138 ms.
+- Candidate local fallback: weighted median 2.6680 ms = 1.069x vs the earlier
+  local ORIG, but Criterion's stored comparison reported a regression and the
+  binary reference moved too.
+- Candidate `ovh-a`: weighted median 2.2626 ms; binary reference 4.8714 ms.
+- Restored ORIG `ovh-a` same-worker: weighted median 2.2593 ms; binary
+  reference 4.9453 ms. Same-worker ratio ORIG/candidate = 2.2593/2.2626 =
+  **0.999x**; Criterion reported no change.
+
+CORRECTNESS WHILE PATCHED: `rch exec -- cargo test -p ft-data weighted_sampler
+--lib` passed 6/0, including the weighted sampler golden fixtures. DECISION:
+reverted the code; this is compiler strength-reduction/noise, not a real lever.
+
 ## 2026-07-04 - WIN: slice_scatter parallel input-copy (ft-api) - 6.5-6.9x vs ORIG, bit-exact (commit dc96043a)
 
 Agent `CopperBirch`. `tensor_slice_scatter` built its output via `result = self.tensor_values(input)`
