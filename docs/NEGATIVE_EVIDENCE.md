@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - NEGATIVE: nonzero_as_tuple via nonzero-kernel + parallel column transpose (ft-api) - 0.36-1.35x, REVERTED
+
+Agent `CopperBirch`. Tried to give `tensor_nonzero_as_tuple` (fully serial ORIG) the same win as
+`tensor_nonzero` (5aeb9067) by reusing the two-pass `nonzero_tensor_contiguous_f64` kernel to produce
+the row-major [nnz, ndim] indices, then splitting into ndim per-dim columns via a parallel-per-dim
+strided gather (`(0..ndim).into_par_iter().map(|d| (0..nnz).map(|r| rm[r*ndim+d]))`).
+
+MEASURE (`nonzero_tuple_ab`, real op vs serial-replica ORIG, RAYON_NUM_THREADS=8, min-9, bitmatch=true):
+- 2d 4000x4000 ~50%: 97.22 -> 83.93 ms = 1.16x
+- 3d 256x256x256 ~50%: 146.60 -> 108.92 ms = 1.35x
+- 2d 8000x2000 ~25%: 55.12 -> 56.25 ms = **0.98x** (regression)
+- 2d 2000x2000 ~50%: 10.38 -> 28.62 ms = **0.36x** (2.8x SLOWER)
+
+WALL: the per-dim column TRANSPOSE is the killer — a strided gather `rm[r*ndim+d]` (cache-unfriendly,
+only ndim=2-4-way parallel) costs more than the serial scan it replaces, and on smaller inputs the
+kernel+alloc+dispatch overhead dominates (0.36x at 2000x2000). REVERTED. A DIRECT two-pass writing the
+ndim per-dim columns during decompose (no transpose, carve each column into per-chunk slices) would be
+needed to win — but nonzero_as_tuple is a less-common op; not worth the ndim x nchunks slice-carving.
+Don't retry the kernel+transpose approach.
+
 ## 2026-07-04 - WIN: nonzero F64 delegates to the two-pass kernel (ft-api) - 2.94-6.79x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Follow-up to the marginal 1.08-1.42x Vec<Vec> entry below: ft-api `tensor_nonzero`
