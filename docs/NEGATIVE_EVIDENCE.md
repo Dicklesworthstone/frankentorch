@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: multi_margin_loss F64 native no-grad fast path (ft-api) - 21.6-29.9x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Reverse-asymmetric-dtype vein (3rd this session, after block_diag + embedding_bag):
+`tensor_multi_margin_loss` had an F32 native no-grad fast path (borrow + parallel over N) but F64 fell
+through to apply_function, which runs the O(N*C) hinge SERIALLY and clones `input` TWICE (once as
+apply_function's materialized `inputs`, once via save_for_backward's unconditional to_vec) — both dead
+in no-grad. Mirrored the F32 path for F64: borrow the contiguous f64 storage, parallelize the
+per-sample multi-margin over N, then reduce via the SAME tensor_sum/tensor_mean the composed path uses
+(bit-exact pairwise). Each per-sample row is bit-identical to the closure (same j-ascending accumulation,
+same w*loss_j). Grad / non-contiguous / other reductions fall through.
+
+MEASURE (`multi_margin_ab`, reduction="none", real op vs an apply_function-path replica that clones the
+input + runs the serial hinge — CONSERVATIVE (omits the 2nd save-clone the real orig also pays),
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 200k x 128 p=1 (195MB in): 156.28 -> 5.23 ms = **29.9x**
+- 200k x 128 p=2 (195MB in): 158.38 -> 7.32 ms = **21.6x**
+- 100k x 256 p=1 (195MB in): 161.65 -> 5.71 ms = **28.3x**
+
+Win stacks clone-avoidance + parallelization of the serial hinge. ft-api --lib 2482/0. Vein tally
+(F32-fast/F64-apply_function-clone): block_diag 2.2x, embedding_bag 24-66x, multi_margin_loss 22-30x.
+
 ## 2026-07-04 - WIN: embedding_bag F64 native no-grad fast path (ft-api) - 24.5-66x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Same asymmetric-dtype gap as block_diag: `tensor_embedding_bag` had an F32
