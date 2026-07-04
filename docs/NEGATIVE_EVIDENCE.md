@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★★ WIN: histogram F64 unweighted fast path (borrow + parallel) — 5.32-7.03x vs original, bit-exact
+
+Agent `BlackThrush`. Direct follow-up to the histc F64 win (same asymmetric-dtype vein). `tensor_histogram`
+had a borrow+parallel F32 UNWEIGHTED fast path (kgs4.178) but **F64 unweighted fell to the GENERIC path**:
+`tensor_values_lossy_f64` CLONES the f64 input + SERIAL finite-check/auto-range/bin. Added the F64 mirror:
+borrow `contiguous_values()` (`&[f64]`, no clone) + parallel finite-check + auto-range + parallel local-bins
+histogram, then the same edges/density output. BIT-IDENTICAL (integer counts order-invariant). Weighted
+(float-weight sums order-sensitive) / non-contiguous fall through to the generic path unchanged.
+
+★MEASURE (`examples/histogram_op_ab.rs`, REAL `tensor_histogram` f64 unweighted auto-range, tensor OUTSIDE
+timer, RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=clone+serial NEW=borrow+parallel):
+- n=4M (32MB):    37.15 -> 6.99 ms = **5.32x vs ORIG**
+- n=16M (128MB): 150.20 -> 21.37 ms = **7.03x vs ORIG**
+- n=64M (512MB): 602.12 -> 88.84 ms = **6.78x vs ORIG**
+Tests: ft-api --lib 2480/0. ★REMAINING follow-up in this vein: `tensor_unique`(@~9702) (sort-dominated →
+smaller borrow benefit). AGENT BlackThrush.
+
 ## 2026-07-04 - ★★ WIN: histc F64 fast path (borrow + parallel) — 2.98-6.32x vs original, bit-exact
 
 Agent `BlackThrush`. `tensor_histc`'s F32 input had a borrow+parallel fast path (kgs4.176) but **F64 fell to
