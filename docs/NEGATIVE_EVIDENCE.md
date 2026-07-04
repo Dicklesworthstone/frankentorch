@@ -1,5 +1,42 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: pool no-grad borrow-input (6 sites) (ft-api) - 5.6-7.0x vs ORIG, bit-exact
+
+Agent `CopperBirch`. The tensor_values-clone-before-parallel-kernel vein (same as layer_norm/rms_norm/
+group_norm fa754dd4) is NOT fully harvested — the POOL no-grad fast paths still cloned. `max_pool2d`/
+`max_pool1d`/`max_pool3d` (f64+f32) + `avg_pool1d` no-grad forward did `let iv = self.tensor_values(input)?`
+(a serial zero-faulted numel*8B copy of the FULL input) then called the parallel windowed-max/avg kernel
+on `&iv` — the kernel only READS the input. Fixed all 6: `if input.is_contiguous() { kernel(t.contiguous_
+values()?, ...) } else { kernel(&clone, ...) }`. Bit-identical (contiguous_values == tensor_values data
+for contiguous; non-contig falls back to the materializing clone). frankentorch-pool-borrow.
+
+MEASURE (`pool_borrow_ab`, max_pool2d kernel boundary: OLD = to_vec() clone + kernel [models
+tensor_values]; NEW = borrow + kernel; RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker ovh-a):
+- 16x64x128x128 (128MB in): 65.527 -> 9.324 ms = **7.03x**
+- 8x64x256x256  (256MB in): 122.119 -> 21.133 ms = **5.78x**
+- 32x32x128x128 (128MB in): 68.676 -> 12.211 ms = **5.62x**
+
+SilverMaple same-worker remeasure (`AGENT_NAME=SilverMaple`,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`, worker ovh-a):
+- literal requested form `rch exec -- cargo bench --release -p ft-api --example pool_borrow_ab` is a
+  Cargo CLI reject (`unexpected argument '--release'`), so it is command-shape negative evidence only.
+- valid per-crate bench `rch exec -- cargo bench -p ft-api --example pool_borrow_ab -- --nocapture`:
+  GREEN (example bench harness compiled and ran 0 tests).
+- release timing `rch exec -- cargo run --release -p ft-api --example pool_borrow_ab`:
+  `16x64x128x128` 72.995 -> 7.828ms = **9.32x**; `8x64x256x256` 145.933 -> 15.416ms = **9.47x**;
+  `32x32x128x128` 72.352 -> 7.726ms = **9.36x**; all bitmatch=true.
+
+The clone (128-256MB serial zero-fault) dwarfs the parallel pooling kernel; borrowing eliminates it. Same
+lever+ratios as the norm ops. ★ REMAINING un-fixed sites of this vein (next firing): functional_conv2d_
+grouped/conv3d_dilated (depthwise), functional_conv_transpose2d, functional_linear f32, smooth_l1/
+gaussian_nll/prelu/pdist — all `tensor_values(input)` clone before a kernel with no borrow branch. ft-api
+--lib GREEN.
+
+VALIDATION (SilverMaple, worker ovh-a):
+- `rch exec -- cargo test -p ft-api functional_max_pool2d --lib -- --nocapture`: 12 passed.
+- `rch exec -- cargo test -p ft-conformance torch_max_pool2d -- --nocapture`: GREEN; PyTorch subprocess
+  oracle reported torch unavailable and skipped, crate command passed.
+
 ## 2026-07-04 - WIN: grid_sample NEAREST BACKWARD batch-parallel (ft-api) - ~3x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Sibling of the bilinear backward (64942acf). `grid_sample_nearest_backward_f64` was
