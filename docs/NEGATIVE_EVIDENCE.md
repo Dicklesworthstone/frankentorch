@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: nonzero F64 delegates to the two-pass kernel (ft-api) - 2.94-6.79x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Follow-up to the marginal 1.08-1.42x Vec<Vec> entry below: ft-api `tensor_nonzero`
+was reimplementing compaction when ft-kernel-cpu ALREADY had the superior TWO-PASS
+`nonzero_tensor_contiguous_f64` (BlackThrush 0c267767: par count -> exclusive-prefix carve of disjoint
+output slices -> parallel decompose-write, NO serial concat; already lock-tested bit-exact). Routed the
+F64 no-grad contiguous path to it (borrow contiguous values + fresh contiguous meta). The Vec<Vec>
+concat was the wall: eliminating it jumps the win from ~1.1x to ~3-7x. F32 keeps the per-chunk path
+(no f32 kernel). Serial fallback (scalar / non-contiguous / small) unchanged.
+
+MEASURE (`nonzero_ab`, real op vs serial-replica ORIG, tensors OUTSIDE timer, RAYON_NUM_THREADS=8,
+min-9, bitmatch=true all shapes; worker hz2):
+- 2d 4000x4000 ~50% nnz: 91.557 -> 13.481 ms = **6.79x**
+- 3d 256x256x256 ~50%:  135.354 -> 23.812 ms = **5.68x**
+- 2d 8000x2000 ~25%:     52.799 -> 11.649 ms = **4.53x**
+- 2d 2000x2000 ~50%:     22.233 ->  7.570 ms = **2.94x**
+
+★PROCESS LESSON: before reimplementing a compaction/kernel in ft-api, grep ft-kernel-cpu for an
+existing `<op>_tensor_contiguous_*` kernel and DELEGATE — the earlier Vec<Vec> path (below) rebuilt a
+weaker version of a kernel that already existed. ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN (marginal, bandwidth-walled): parallel nonzero stream-compaction (ft-api) - 1.08-1.42x vs ORIG, bit-exact
 
 Agent `CopperBirch`. `tensor_nonzero` was fully SERIAL and CLONED the input via `tensor_values`
