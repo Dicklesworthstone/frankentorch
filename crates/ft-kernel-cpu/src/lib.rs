@@ -2372,6 +2372,20 @@ where
     unary_f64_with_threshold(input, meta, op, PARALLEL_THRESHOLD)
 }
 
+/// Like [`unary_f64`] but for the CHEAP BANDWIDTH-bound element ops (floor/ceil/round/sign/trunc/
+/// frac — a single rounding instruction or a couple of compares). Per-element cost is tiny, so the
+/// only parallel benefit is fault-parallel first-touch of the fresh output (par_iter map-collect) —
+/// a copy-tier crossover (~4M). `SCALAR_UNARY_PARALLEL_THRESHOLD` (524288, tuned for the medium
+/// transcendentals `unary_f64` also serves) is far too low here: an anchored A/B (x*x, same cheap
+/// class) measures 0.01x@512K / 0.04x@1M (100x/25x SLOWER parallel) below ~4M. So gate at
+/// `COPY_MATERIALIZE_PARALLEL_MIN`, the same tier as clamp/where/outer/pow-trivial. (BlackThrush)
+fn unary_f64_bandwidth<F>(input: &[f64], meta: &TensorMeta, op: F) -> Result<Vec<f64>, KernelError>
+where
+    F: Fn(f64) -> f64 + Sync,
+{
+    unary_f64_with_threshold(input, meta, op, COPY_MATERIALIZE_PARALLEL_MIN)
+}
+
 fn unary_f64_with_threshold<F>(
     input: &[f64],
     meta: &TensorMeta,
@@ -2833,21 +2847,21 @@ pub fn floor_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.floor())
+    unary_f64_bandwidth(input, meta, |value| value.floor())
 }
 
 pub fn ceil_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.ceil())
+    unary_f64_bandwidth(input, meta, |value| value.ceil())
 }
 
 pub fn round_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, round_ties_even_f64)
+    unary_f64_bandwidth(input, meta, round_ties_even_f64)
 }
 
 pub fn log2_tensor_contiguous_f64(
@@ -2882,21 +2896,21 @@ pub fn sign_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, torch_sign_f64)
+    unary_f64_bandwidth(input, meta, torch_sign_f64)
 }
 
 pub fn trunc_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.trunc())
+    unary_f64_bandwidth(input, meta, |value| value.trunc())
 }
 
 pub fn frac_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.fract())
+    unary_f64_bandwidth(input, meta, |value| value.fract())
 }
 
 pub fn asin_tensor_contiguous_f64(
@@ -28898,8 +28912,9 @@ fn torch_sign_f32(value: f32) -> f32 {
 // ── Macro-generated simple f32 unary kernels ────────────────────────────
 
 macro_rules! define_unary_f32 {
-    // Cheap ops (sign/round/clamp/…): keep the high cheap-op gate so a small input
-    // never eats rayon dispatch overhead.
+    // Default arm = medium ops at SCALAR_UNARY_PARALLEL_THRESHOLD. The TRULY cheap bandwidth ops
+    // (floor/ceil/round/sign/trunc/frac) pass COPY_MATERIALIZE_PARALLEL_MIN explicitly (3-arg form):
+    // a single instruction per elem crosses at ~4M, not 524288 (anchored A/B, see unary_f64_bandwidth).
     ($name:ident, $op:expr) => {
         define_unary_f32!($name, $op, SCALAR_UNARY_PARALLEL_THRESHOLD);
     };
@@ -28929,16 +28944,16 @@ define_unary_f32!(tanh_tensor_contiguous_f32, f32::tanh, PARALLEL_THRESHOLD);
 define_unary_f32!(sin_tensor_contiguous_f32, f32::sin, PARALLEL_THRESHOLD);
 define_unary_f32!(cos_tensor_contiguous_f32, f32::cos, PARALLEL_THRESHOLD);
 define_unary_f32!(tan_tensor_contiguous_f32, f32::tan, PARALLEL_THRESHOLD);
-define_unary_f32!(floor_tensor_contiguous_f32, f32::floor);
-define_unary_f32!(ceil_tensor_contiguous_f32, f32::ceil);
-define_unary_f32!(round_tensor_contiguous_f32, round_ties_even_f32);
+define_unary_f32!(floor_tensor_contiguous_f32, f32::floor, COPY_MATERIALIZE_PARALLEL_MIN);
+define_unary_f32!(ceil_tensor_contiguous_f32, f32::ceil, COPY_MATERIALIZE_PARALLEL_MIN);
+define_unary_f32!(round_tensor_contiguous_f32, round_ties_even_f32, COPY_MATERIALIZE_PARALLEL_MIN);
 define_unary_f32!(log2_tensor_contiguous_f32, f32::log2, PARALLEL_THRESHOLD);
 define_unary_f32!(log10_tensor_contiguous_f32, f32::log10, PARALLEL_THRESHOLD);
 define_unary_f32!(log1p_tensor_contiguous_f32, f32::ln_1p, PARALLEL_THRESHOLD);
 define_unary_f32!(expm1_tensor_contiguous_f32, f32::exp_m1, PARALLEL_THRESHOLD);
-define_unary_f32!(sign_tensor_contiguous_f32, torch_sign_f32);
-define_unary_f32!(trunc_tensor_contiguous_f32, f32::trunc);
-define_unary_f32!(frac_tensor_contiguous_f32, f32::fract);
+define_unary_f32!(sign_tensor_contiguous_f32, torch_sign_f32, COPY_MATERIALIZE_PARALLEL_MIN);
+define_unary_f32!(trunc_tensor_contiguous_f32, f32::trunc, COPY_MATERIALIZE_PARALLEL_MIN);
+define_unary_f32!(frac_tensor_contiguous_f32, f32::fract, COPY_MATERIALIZE_PARALLEL_MIN);
 define_unary_f32!(asin_tensor_contiguous_f32, f32::asin, PARALLEL_THRESHOLD);
 define_unary_f32!(acos_tensor_contiguous_f32, f32::acos, PARALLEL_THRESHOLD);
 define_unary_f32!(atan_tensor_contiguous_f32, f32::atan, PARALLEL_THRESHOLD);
