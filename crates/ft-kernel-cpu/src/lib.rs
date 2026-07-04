@@ -57,6 +57,7 @@ mod gemm {
     // n2048 sgemm 0.81x). Above this K, keep the 1-D row split. K <= 1024 covers the
     // measured wins (sgemm 1.10-1.45x, sgemm_bt 1.02-1.25x). frankentorch-kgs4.48.
     const F32_2D_MAX_K: usize = 1024;
+    const F32_2D_TALL_MAX_K: usize = 1536;
 
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
@@ -68,6 +69,14 @@ mod gemm {
     fn block_rows(m: usize) -> usize {
         let threads = rayon::current_num_threads().max(1);
         m.div_ceil(threads).max(MIN_BLOCK_ROWS)
+    }
+
+    fn should_use_f32_reused_output_2d_tiling(m: usize, k: usize, n: usize) -> bool {
+        n >= 2 * MIN_BLOCK_COLS
+            && k > F32_2D_MAX_K
+            && k <= F32_2D_TALL_MAX_K
+            && m >= TALL_MIN_ROWS
+            && n >= TALL_MIN_ROWS
     }
 
     pub fn dgemm(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
@@ -944,8 +953,8 @@ mod gemm {
     mod tile_iso_tests {
         use super::{
             dgemm_2d_parallel, dgemm_block, dgemm_bt_2d_parallel, dgemm_bt_block,
-            dgemm_col_parallel, sgemm_2d_parallel, sgemm_block, sgemm_bt_2d_parallel,
-            sgemm_bt_block, sgemm_col_parallel,
+            dgemm_col_parallel, sgemm, sgemm_2d_parallel, sgemm_block, sgemm_bt_2d_parallel,
+            sgemm_bt_block, sgemm_col_parallel, sgemm_reused_output,
         };
 
         const SHAPES: &[(usize, usize, usize)] = &[
@@ -998,6 +1007,31 @@ mod gemm {
                 assert!(
                     s3.iter().zip(&t3).all(|(x, y)| x.to_bits() == y.to_bits()),
                     "sgemm_bt {m}x{k}x{n}"
+                );
+            }
+        }
+
+        #[test]
+        fn sgemm_reused_output_tall_2d_matches_standard_route() {
+            let (m, k, n) = (1024usize, 1025usize, 1024usize);
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 19) as f32 - 9.0) * 0.03125 + (i as f32) * 1e-7)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.015625 - (i as f32) * 1e-7)
+                .collect();
+
+            let mut standard = vec![0.0_f32; m * n];
+            sgemm(m, k, n, &a, &b, &mut standard);
+
+            let mut reused = vec![f32::NAN; m * n];
+            sgemm_reused_output(m, k, n, &a, &b, &mut reused);
+
+            for (idx, (s, r)) in standard.iter().zip(&reused).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    r.to_bits(),
+                    "reused-output sgemm diverged at {idx}: standard {s} vs reused {r}"
                 );
             }
         }
@@ -1131,6 +1165,20 @@ mod gemm {
             }
         } else {
             sgemm_block_scaled(m, k, n, alpha, a, b, c);
+        }
+    }
+
+    pub fn sgemm_reused_output(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        if should_parallelize(m, k, n)
+            && !should_parallelize_cols(m, k, n)
+            && should_use_f32_reused_output_2d_tiling(m, k, n)
+        {
+            let a = &a[..m * k];
+            let b = &b[..k * n];
+            let c = &mut c[..m * n];
+            sgemm_2d_parallel(m, k, n, a, b, c);
+        } else {
+            sgemm(m, k, n, a, b, c);
         }
     }
 
@@ -30064,6 +30112,7 @@ pub fn matmul_tensor_contiguous_f32_into(
     ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
+    let reused_output = out.len() == out_numel;
 
     // Size `out` to exactly out_numel WITHOUT re-zeroing the region that is
     // already there. `resize` only writes the fill value into newly-added tail
@@ -30080,8 +30129,14 @@ pub fn matmul_tensor_contiguous_f32_into(
         out.resize(out_numel, 0.0f32);
     }
 
-    // Use optimized GEMM via matrixmultiply crate
-    gemm::sgemm(m, k, n, &lhs[lhs_start..], &rhs[rhs_start..], out);
+    // Use optimized GEMM via matrixmultiply crate. A resident output buffer
+    // marks the steady-state transformer projection path; it can use the wider
+    // f32 2-D tiling gate without penalizing the fresh-allocation API.
+    if reused_output {
+        gemm::sgemm_reused_output(m, k, n, &lhs[lhs_start..], &rhs[rhs_start..], out);
+    } else {
+        gemm::sgemm(m, k, n, &lhs[lhs_start..], &rhs[rhs_start..], out);
+    }
 
     Ok(())
 }

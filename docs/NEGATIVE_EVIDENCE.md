@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: warmed f32 GEMM `_into` K=1280 2-D tiling (ft-kernel-cpu) - 1.08-1.49x vs ORIG, bit-exact
+
+Agent `SilverMaple`. Targeted the documented GEMM wall after no unlanded measured win was cleanly
+landable from bench worktrees. ORIG was current-main `matmul_tensor_contiguous_f32_into` with a resident
+output buffer still routed through the 1-D row split for f32 `K > 1024`. NEW keeps the fresh-allocation
+API and generic f32 GEMM on the old route, but lets exact-size resident output buffers with `m,n >= 1024`
+and `1024 < k <= 1536` use the existing bit-exact 2-D tiler.
+
+MEASURE (`CARGO_TARGET_DIR=/data/projects/.rch-targets/frankentorch-cod`; command `rch exec -- cargo bench -p ft-kernel-cpu --bench gemm_bench matmul_whisper_f32_into_1500x1280 -- --noplot --warm-up-time 1 --measurement-time 5 --sample-size 12`; RCH local fallback for both A/B runs because workers were under critical pressure; Cargo rejected the literal `cargo bench --release` form):
+- warmed `_into` `[1500,1280]x[1280,1280]`: 5.3488 -> 4.9339 ms = **1.08x vs ORIG**
+- warmed `_into` `[1500,1280]x[1280,5120]`: 24.306 -> 16.307 ms = **1.49x vs ORIG**
+
+DROPPED broader variant: routing all f32 K<=1536 GEMMs through the 2-D tiler produced `_into` wins but
+regressed the fresh-allocation `[1500,1280]x[1280,1280]` row, so it was narrowed to resident buffers only.
+VERIFY: `cargo test -p ft-kernel-cpu sgemm_reused_output_tall_2d_matches_standard_route -- --nocapture`
+GREEN; `cargo check -p ft-kernel-cpu --all-targets` GREEN; `cargo test -p ft-conformance` GREEN
+(199/0 plus bins/integration/smoke/doc-tests). `cargo fmt --check -p ft-kernel-cpu` and `cargo clippy
+-p ft-kernel-cpu --all-targets -- -D warnings` remain blocked by pre-existing unrelated crate drift/lints
+outside this lever. AGENT SilverMaple.
+
 ## 2026-07-04 - ★★ WIN: apply_rotary_pos_emb (RoPE) fused no-grad F64 fast path — 2.33-3.18x vs original, bit-exact
 
 Agent `BlackThrush`. RoPE (HOT — every LLaMA-style attention layer) COMPOSED ~6 tape ops PER q/k
