@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: pack_attention_heads (ft-nn) parallel head-SPLIT — 2.69-2.87x vs original, bit-exact
+
+Agent `BlackThrush`. The INVERSE of concat_attention_heads: `pack_attention_heads` (head-split
+`[B,S,H*D]->[B,H,S,D]`, equally HOT — every attention layer splits input proj into heads) was a SERIAL nested
+loop. Parallelized over OUTPUT PLANES `[batch, head]` (each `seq_len*head_dim` contiguous in packed),
+gathering per-seq head_dim blocks from the input at stride embed_dim: SEQUENTIAL write per plane +
+BLOCK-CONTIGUOUS strided reads → parallelizes cleanly. Serial fallback below 32K elems. BIT-IDENTICAL (same
+src->dst index map).
+
+★MEASURE (`examples/pack_heads_ab.rs`, standalone replica, RAYON_NUM_THREADS=8, min-9, bitmatch=true;
+OLD=serial nested loop NEW=par-over-planes):
+- B32 H8 S512 D64 (64MB):   38.03 -> 13.75 ms = **2.77x vs ORIG**
+- B16 H16 S256 D64 (32MB):  17.72 -> 6.60 ms = **2.69x vs ORIG**
+- B8 H12 S1024 D64 (48MB):  27.56 -> 9.60 ms = **2.87x vs ORIG**
+Tests: ft-nn --lib 777/0. Both attention head reshapes (split + merge) now parallel. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: concat_attention_heads (ft-nn) parallel head-merge — 2.89-2.95x vs original, bit-exact
 
 Agent `BlackThrush`. NEW CRATE (ft-nn, pivoted after the ft-api clone+serial surface exhausted).
