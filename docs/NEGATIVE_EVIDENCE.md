@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: embedding F64 borrows the weight table instead of cloning (ft-api) - 19-122x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Same clone gap as embedding_bag but on the FAR more common `embedding` op (every
+NLP model's embedding layer). The F32 no-grad fast path borrows the weight via contiguous_values_f32,
+but the F64 no-grad path read `self.tensor_values(weight)` — a full clone of the entire
+[num_embeddings, embedding_dim] table per forward — before the (already parallel) per-row gather. When
+few of many rows are looked up (the normal case), that clone IS the whole cost. Made the F64 path
+borrow the contiguous table zero-copy (fall back to the tensor_values clone for non-contiguous / non-F64).
+Bit-identical (same disjoint per-row copies).
+
+MEASURE (`embedding_ab`, real op vs a replica of the old path that clones the table then gathers — fair
+baseline, RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 50K x 768 table (292MB), 16K lookups:  171.72 -> 8.94 ms = **19.2x**
+- 250K x 128 table (244MB), 8K lookups:  131.80 -> 1.31 ms = **101x**
+- 1M x 64 table (488MB), 32K lookups:    273.71 -> 2.24 ms = **122x**
+
+Ratio scales with table-size / lookup-sparsity (full-table clone dwarfing a sparse gather). ft-api --lib
+2482/0. Reverse-[[asymmetric_dtype_fastpath]] vein tally: block_diag 2.2x, embedding_bag 24-66x,
+multi_margin_loss 22-30x, embedding 19-122x.
+
 ## 2026-07-04 - WIN: multi_margin_loss F64 native no-grad fast path (ft-api) - 21.6-29.9x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Reverse-asymmetric-dtype vein (3rd this session, after block_diag + embedding_bag):
