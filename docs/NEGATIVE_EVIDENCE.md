@@ -1,5 +1,20 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: heaviside F64 fast path (borrow-both + parallel) — 2.54-2.59x vs original, bit-exact
+
+Agent `BlackThrush`. Asymmetric-dtype vein (beyond the binning trio). `tensor_heaviside(input, values)` had
+a borrow+parallel F32 fast path but **F64 fell to the GENERIC path**: `tensor_values_lossy_f64` CLONES BOTH
+operands (2x to_vec) then steps SERIALLY. Added the F64 mirror: borrow both `contiguous_values()` (`&[f64]`,
+no clone) + step in parallel. BIT-IDENTICAL (deterministic step: x>0→1, x==0→v, else 0; NaN→0). Broadcast /
+non-contiguous fall through to the generic path.
+
+★MEASURE (`examples/heaviside_op_ab.rs`, REAL `tensor_heaviside` f64, tensors OUTSIDE timer,
+RAYON_NUM_THREADS=8, min-9, bitmatch=true; OLD=clone-both+serial NEW=borrow-both+parallel):
+- n=4M (32MB):    68.34 -> 26.61 ms = **2.57x vs ORIG**
+- n=16M (128MB): 262.44 -> 103.28 ms = **2.54x vs ORIG**
+- n=64M (512MB): 1066.76 -> 412.44 ms = **2.59x vs ORIG**
+Consistent (2 clones saved + serial->parallel). Tests: ft-api --lib 2480/0. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: histogramdd F64 fast path (borrow + parallel) — 3.15-3.69x vs original, bit-exact
 
 Agent `BlackThrush`. Third op in the asymmetric-dtype vein (after histc + histogram). `tensor_histogramdd`
