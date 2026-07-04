@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: grid_sample NEAREST BACKWARD batch-parallel (ft-api) - ~3x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Sibling of the bilinear backward (64942acf). `grid_sample_nearest_backward_f64` was
+the last serial `for n/h/w` grid_sample backward. Nearest has ZERO coordinate gradient (grad_grid stays
+all-zeros), so only the grad_input scatter needs work; grad_input[n] is DISJOINT per batch, so same
+batch-disjoint parallelization: `grad_input.par_chunks_mut(channels*in_h*in_w)` over batch, each task owns
+its gi_n (scatter uses `GridSamplePoint{n:0,..}`); grid/grad_output reads global. Bit-identical
+(within-batch scatter order unchanged, batches disjoint). Same gate + FT_GRIDSAMPLE_SERIAL env lever.
+Cheaper compute than bilinear (a round + scatter, no bilinear weights/derivatives) so the win is more
+bandwidth/contention-sensitive. frankentorch-gridsample-backward-par.
+
+MEASURE (`gridsample_backward_ab` with FT_GRIDSAMPLE_MODE=nearest; real session fwd+bwd, backward min-9;
+SERIAL vs PARALLEL via FT_GRIDSAMPLE_SERIAL; batch=8 ch=32 in/out=64x64; RAYON_NUM_THREADS=8):
+- run A: SERIAL 13.813 -> PARALLEL 4.660 ms = **2.96x**
+- run B (contended, serial 23.7ms): SERIAL 23.652 -> PARALLEL 7.436 ms = **3.18x**
+- checksum a5f0000000000000 IDENTICAL serial==parallel (non-cancelling wrapping_add fold; xor collapses to
+  0 for the many duplicate integer grads). One intermediate reading showed 1.31x = a parallel-side
+  contention spike (serial clean 12.3ms / parallel hit 9.4ms), NOT a real ceiling — the two clean-window
+  readings both ~3x. The shipped bilinear anchor (42.8ms serial here vs 20ms clean) confirmed the worker
+  was contended during these runs.
+
+grid_sample backward family (bilinear + nearest) now BOTH batch-parallel. ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN: grid_sample bilinear BACKWARD batch-parallel (ft-api) - 3.22x vs ORIG, bit-exact
 
 Agent `CopperBirch`. The flagged grid_sample "lever2" (backward). `grid_sample_bilinear_backward_f64` ran
