@@ -12868,6 +12868,49 @@ pub fn argmax_dim_tensor_contiguous_f64(
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
 
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmax
+    // INDEX. first-strict-extremum (`>`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f64]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f64::NEG_INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f64::NAN;
+                            out_idx[c] = r as f64;
+                        } else if val > acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f64;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output.par_chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output.par_chunks_mut(inner_size).enumerate().for_each(|(outer, orow)| {
+                let obase = outer * reduce_size * inner_size;
+                orow.chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+            });
+        }
+        return Ok(output);
+    }
+
     // Each output lane (outer,inner) reduces an independent strided column of
     // `reduce_size` elements; the per-lane scan (first strict-max wins, NaN
     // short-circuits) is identical regardless of scheduling, so parallelizing over
@@ -12934,6 +12977,49 @@ pub fn argmin_dim_tensor_contiguous_f64(
     let offset = meta.storage_offset();
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmin
+    // INDEX. first-strict-extremum (`<`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f64]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f64::INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f64::NAN;
+                            out_idx[c] = r as f64;
+                        } else if val < acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f64;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output.par_chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output.par_chunks_mut(inner_size).enumerate().for_each(|(outer, orow)| {
+                let obase = outer * reduce_size * inner_size;
+                orow.chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+            });
+        }
+        return Ok(output);
+    }
 
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.50.
     let argmin = |out_idx: usize| -> f64 {
@@ -31503,6 +31589,49 @@ pub fn argmax_dim_tensor_contiguous_f32(
     let offset = meta.storage_offset();
     let mut output = vec![0.0f32; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmax
+    // INDEX. first-strict-extremum (`>`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f32]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f32::NEG_INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f32::NAN;
+                            out_idx[c] = r as f32;
+                        } else if val > acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output.par_chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output.par_chunks_mut(inner_size).enumerate().for_each(|(outer, orow)| {
+                let obase = outer * reduce_size * inner_size;
+                orow.chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+            });
+        }
+        return Ok(output);
+    }
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.50.
     let argmax = |out_idx: usize| -> f32 {
         let outer = out_idx / inner_size;
@@ -31560,6 +31689,49 @@ pub fn argmin_dim_tensor_contiguous_f32(
     let offset = meta.storage_offset();
     let mut output = vec![0.0f32; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmin
+    // INDEX. first-strict-extremum (`<`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f32]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f32::INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f32::NAN;
+                            out_idx[c] = r as f32;
+                        } else if val < acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output.par_chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output.par_chunks_mut(inner_size).enumerate().for_each(|(outer, orow)| {
+                let obase = outer * reduce_size * inner_size;
+                orow.chunks_mut(blk).enumerate().for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+            });
+        }
+        return Ok(output);
+    }
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.50.
     let argmin = |out_idx: usize| -> f32 {
         let outer = out_idx / inner_size;
@@ -41447,6 +41619,50 @@ mod tests {
                     assert_eq!(out.1[k].to_bits(), ri[k].to_bits(), "{tag} idx bits at {k} is_max={is_max}");
                 }
             }
+        }
+    }
+
+    #[test]
+    fn argmax_argmin_dim_cache_blocked_matches_strided_lane_bit_exact() {
+        // Blocked argmax/argmin (index-only) must match a strided lane reference: first-strict
+        // extremum wins, NaN short-circuits to its row. dim=0 large + middle dim, NaN + int-ties.
+        let strided_ref = |data: &[f64], r_size: usize, inner: usize, outer: usize, is_max: bool| -> Vec<f64> {
+            let mut ix = vec![0.0f64; outer * inner];
+            for o in 0..outer {
+                for i in 0..inner {
+                    let base = o * r_size * inner + i;
+                    let mut bi = 0usize;
+                    let mut bv = if is_max { f64::NEG_INFINITY } else { f64::INFINITY };
+                    for r in 0..r_size {
+                        let val = data[base + r * inner];
+                        if val.is_nan() { bi = r; break; }
+                        else if (is_max && val > bv) || (!is_max && val < bv) { bv = val; bi = r; }
+                    }
+                    ix[o * inner + i] = bi as f64;
+                }
+            }
+            ix
+        };
+        let mk64 = |n: usize, mul: u64| -> Vec<f64> {
+            (0..n).map(|k| { let h = (k as u64).wrapping_mul(mul) % 211; if h == 7 { f64::NAN } else { (h as f64) - 100.0 } }).collect()
+        };
+        let (r0, i0) = (300usize, 200usize);
+        let d0 = mk64(r0 * i0, 2654435761);
+        let m0 = TensorMeta::from_shape(vec![r0, i0], DType::F64, Device::Cpu);
+        let (o1, r1, i1) = (4usize, 64usize, 128usize);
+        let d1 = mk64(o1 * r1 * i1, 40503);
+        let m1 = TensorMeta::from_shape(vec![o1, r1, i1], DType::F64, Device::Cpu);
+        let d0_f32: Vec<f32> = d0.iter().map(|&x| x as f32).collect();
+        let m0_f32 = TensorMeta::from_shape(vec![r0, i0], DType::F32, Device::Cpu);
+        for &is_max in &[true, false] {
+            let got0 = if is_max { argmax_dim_tensor_contiguous_f64(&d0, &m0, 0) } else { argmin_dim_tensor_contiguous_f64(&d0, &m0, 0) }.unwrap();
+            let ref0 = strided_ref(&d0, r0, i0, 1, is_max);
+            for k in 0..got0.len() { assert_eq!(got0[k].to_bits(), ref0[k].to_bits(), "f64 dim0 arg at {k} is_max={is_max}"); }
+            let got1 = if is_max { argmax_dim_tensor_contiguous_f64(&d1, &m1, 1) } else { argmin_dim_tensor_contiguous_f64(&d1, &m1, 1) }.unwrap();
+            let ref1 = strided_ref(&d1, r1, i1, o1, is_max);
+            for k in 0..got1.len() { assert_eq!(got1[k].to_bits(), ref1[k].to_bits(), "f64 mid arg at {k} is_max={is_max}"); }
+            let gotf = if is_max { super::argmax_dim_tensor_contiguous_f32(&d0_f32, &m0_f32, 0) } else { super::argmin_dim_tensor_contiguous_f32(&d0_f32, &m0_f32, 0) }.unwrap();
+            for k in 0..gotf.len() { assert_eq!(gotf[k], ref0[k] as f32, "f32 dim0 arg at {k} is_max={is_max}"); }
         }
     }
 

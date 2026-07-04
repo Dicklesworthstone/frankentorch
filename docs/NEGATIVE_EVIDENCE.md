@@ -1,5 +1,27 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN (contention/large-data): cache-blocked argmax/argmin_dim completes the reduction family + CONTENTION-DEPENDENCE finding
+
+Agent `BlackThrush`. Extends the cache-block strided-reduction lever (prod dd45b61f, max/min f64 54aed2c6 +
+f32 52cb5a4e) to `argmax_dim`/`argmin_dim_tensor_contiguous_f{64,32}` (index-only). For dim=0/middle dims each
+lane strides its column by `inner_size`; the blocked path sweeps row-major CONTIGUOUS slices into a scratch
+column-extremum, emitting the index. first-strict-extremum + NaN-freeze (acc_v=NaN sentinel == the serial
+`break`) are order-independent => BIT-FOR-BIT identical (test argmax_argmin_dim_cache_blocked_matches_strided_lane;
+conformance 199/0 green; 577 lib tests).
+
+★★HONEST RATIO + KEY FINDING: the cache-block win is CONTENTION-DEPENDENT, not universal. A CONSTANT stride is
+HARDWARE-PREFETCHABLE, so at LOW load (measured 11-14, 3 runs, prod-anchored) the strided access already
+saturates bandwidth (~20 GB/s) and blocked is ~NEUTRAL (0.7-1.8x, mildly NEGATIVE for shallow-reduce/large-stride).
+The big ratios are under CONTENTION (load 68-116) where shared bandwidth + degraded prefetch expose the strided
+penalty: **max blocked 4.14x@[4000x4000] / 8.37x@[256x65536] (anchor-validated)**. Idle exception: data > L3
+(numel>=~32M) wins even at low load (prod 1.8-2.4x). WIN CONDITION = contention (the shared-box/scorecard norm —
+this box has been load 15-116 all session) OR data>L3. ★METHOD: an anchored A/B proves internal consistency at a
+load but the ANCHOR ITSELF shifts with load (prod 3.8x contended -> 0.96x idle); to claim a production-idle win,
+measure at low load. ★argmax ships consistent with the landed family (same PARALLEL_THRESHOLD gate + contention
+profile), NOT as a false universal win. ★VEIN CLOSED: strided-reduction cache-block complete (prod/max/min/
+argmax/argmin, f64+f32); do NOT extend — sum/mean/var are pairwise-sum-bound (WALLED) and the benefit is
+contention/size-gated.
+
 ## 2026-07-04 - WIN: no-grad scalar add/sub/mul/div always used Rayon; serial below 1M gives 3.5-16.8x on common tensor sizes
 
 Agent `SilverMaple`. Agent Mail registration/reservation was blocked by the archive SQLite corruption breaker
