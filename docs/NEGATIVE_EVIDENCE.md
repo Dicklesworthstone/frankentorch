@@ -1,5 +1,26 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: tril/triu F64 native no-grad fast path (ft-api) - 7.7-25.6x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Reverse-asymmetric-dtype: `tensor_tril`/`tensor_triu` (common — causal attention
+masks, linalg) had F32 native no-grad fast paths (borrow + parallel per-row mask fill) but F64 fell
+through to apply_function, which CLONES the input (materializes `inputs`) before the SAME parallel fill.
+Added F64 fast paths mirroring the f32 ones: borrow the contiguous f64 input and fill directly (calloc'd
+output, explicit 0.0 in zeroed positions => triangular NaN/inf/-0.0 semantics preserved). Bit-identical
+to the composed positional select. Non-contiguous / grad fall through.
+
+MEASURE (`tril_ab`, F64, real op vs an apply_function-path replica that clones the input then fills —
+fair baseline, RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 4000x4000 (122MB): 79.50 ->  7.22 ms = **11.0x**
+- 8000x2000 (122MB): 82.44 -> 10.70 ms = **7.7x**
+- 2000x8000 (122MB): 68.14 ->  2.67 ms = **25.6x**
+
+Win = clone-avoidance + the calloc-lazy SPARSE triangular output (only the kept triangle is written; the
+zeroed rest costs no bandwidth) — wider/taller shapes with more zeros give the biggest ratios. triu is
+the bit-identical sibling (same mirror, `j >= lim`; shared test suite green). ft-api --lib 2482/0.
+Reverse-[[asymmetric_dtype_fastpath]] tally: block_diag 2.2x, embedding_bag 24-66x, multi_margin_loss
+22-30x, embedding 19-122x, prelu 9.5x, tril/triu 7.7-25.6x.
+
 ## 2026-07-04 - WIN: prelu_forward_values parallelized (ft-api) - prelu F64 now 9.0-9.5x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Follow-up to the prelu borrow commit (c6b2d464, 2.4x): that made the F64 no-grad
