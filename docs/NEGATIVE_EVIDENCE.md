@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - NEGATIVE: masked_scatter two-pass parallel no-grad path (ft-api) - 0.55-0.83x, REVERTED
+
+Agent `CopperBirch`. `tensor_masked_scatter`'s no-grad fast path is a serial running-counter loop
+(`result[i] = mask[i]!=0 ? src[count++] : input[i]`) — a classic two-pass-parallelizable compaction
+(source read is SEQUENTIAL, not DRAM-walled). Replaced it with a two-pass parallel build (per-chunk
+count -> exclusive-prefix source offset -> parallel per-chunk build, borrow input so no input clone).
+
+MEASURE (`masked_scatter_ab`, RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker ovh-a):
+- 2d 4000x4000 ~50%: 74.66 -> 89.45 ms = 0.83x
+- 1d 16M ~25%:       74.17 -> 90.30 ms = 0.82x
+- 2d 2000x2000 ~50%:  4.88 ->  8.80 ms = 0.55x
+
+WALL: the op is CLONE-DOMINATED by `mask_vals = values_lossy_f64(mask)` (line ~67105, a full
+mask clone/upcast computed UNCONDITIONALLY before the fast path for validation + the grad prefix).
+That clone dwarfs the overwrite the two-pass parallelizes, so the total time barely moves — and the
+parallel full-rewrite of the output is actually more work than the serial `input.to_vec()` memcpy +
+sparse overwrite. ★A/B PITFALL: my serial-replica ORIG baseline did NOT clone the mask (borrowed it),
+so it was faster than the REAL original fast path (which also pays mask_vals) — the ratio looked worse
+than a fair NEW-vs-original comparison, but the op is clone-floored either way. To win, `mask_vals`
+would have to be eliminated (borrow native mask + move the f64 upcast into the grad path), a risky
+restructure of a validation-contract-heavy op (beads zdpm/c4tx/n0un) for a mask-clone-floored ceiling.
+REVERTED. Don't retry without first removing the mask upcast.
+
 ## 2026-07-04 - NEGATIVE: nonzero_as_tuple via nonzero-kernel + parallel column transpose (ft-api) - 0.36-1.35x, REVERTED
 
 Agent `CopperBirch`. Tried to give `tensor_nonzero_as_tuple` (fully serial ORIG) the same win as
