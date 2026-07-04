@@ -1,5 +1,22 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: round_decimals F64 no-grad fused (ft-api) - 6.6-8.3x vs ORIG (compose), bit-exact
+
+Agent `CopperBirch`. `tensor_round_decimals(x, n)` COMPOSED full(factor) + mul + round + div = 3 full
+intermediates + 4 passes (factor = 10^n). Added a no-grad fused F64 fast path: borrow the contiguous
+input + par_map `round_ties_even(x*factor)/factor` in ONE pass. Bit-exact to the compose (same f64
+mul, the round KERNEL is round_ties_even — verified — and per-element div; no FMA). Grad /
+non-contiguous / non-f64 fall through unchanged.
+
+MEASURE (`round_dec_ab`, dec=3, real op vs a 3-pass PARALLEL compose replica (mul->round->div, 2
+intermediates) — CONSERVATIVE (omits the full(factor) alloc + tape-node overhead the real compose also
+pays, so the true win is >= this), RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8M  (61MB):  89.73 -> 20.82 ms = 4.31x (first case, noisy warmup)
+- 16M (122MB): 76.76 -> 11.63 ms = **6.60x**
+- 32M (244MB): 185.67 -> 22.42 ms = **8.28x**
+
+Compose-fusion (intermediate + alloc + pass elimination). ft-api --lib 2482/0.
+
 ## 2026-07-04 - WIN: gcd + lcm par_map (ft-api) - 3.2-5.0x vs ORIG, bit-exact
 
 Agent `CopperBirch`. `tensor_gcd` / `tensor_lcm` computed a SERIAL per-element Euclidean loop
