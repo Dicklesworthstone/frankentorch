@@ -1,5 +1,28 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: grid_sample bilinear BACKWARD batch-parallel (ft-api) - 3.22x vs ORIG, bit-exact
+
+Agent `CopperBirch`. The flagged grid_sample "lever2" (backward). `grid_sample_bilinear_backward_f64` ran
+a fully SERIAL `for n { for h { for w }}` scatter (per output position: coordinate math + per-channel
+bilinear scatter-add to grad_input + coordinate-derivative accumulation to grad_grid) — compute-heavy but
+single-threaded. KEY: the scatter-add write conflicts are only WITHIN a batch's (h,w) positions;
+`grad_input[n]` and `grad_grid[n]` are DISJOINT across batch n. So restructured the per-n body into a
+closure driven by `grad_input.par_chunks_mut(channels*in_h*in_w).zip(grad_grid.par_chunks_mut(out_h*out_w
+*2))` — each rayon task owns its batch's gi_n/gg_n slice (scatter uses `GridSamplePoint{n:0,...}` = local
+index); input/grid/grad_output reads stay global (immutable). Bit-identical: within a batch the (h,w,c)
+accumulation order is unchanged and batches are disjoint. Gated `batch>=2 && batch*out_h*out_w*channels
+>= 4096`; f32/nearest paths + <threshold fall through serial. FT_GRIDSAMPLE_SERIAL env forces serial (A/B
+lever, one-shot read per backward). frankentorch-gridsample-backward-par.
+
+MEASURE (`gridsample_backward_ab`, real session fwd+backward, backward timed min-9; SERIAL vs PARALLEL
+selected by FT_GRIDSAMPLE_SERIAL, same worker one binary-pair; batch=8 ch=32 in/out=64x64;
+RAYON_NUM_THREADS=8; ovh-a/hz2):
+- SERIAL 20.282ms -> PARALLEL 6.297ms = **3.22x**, checksum 84ca06151eb4c14f IDENTICAL (bit-exact).
+
+The changed fn IS the whole grid_sample backward, so this end-to-end backward ratio is the real op (NOT
+an internal-component ratio like the reverted LSTM below). Capped ~batch-way (par over batch only); larger
+batch scales further. ft-api --lib GREEN.
+
 ## 2026-07-04 - WIN: heaviside_ in-place binary F64 fast path (ft-api) - 5.1-8.4x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Straggler of the try_inplace_binary_f64 family (after atan2_/logaddexp_/... a5264804).
