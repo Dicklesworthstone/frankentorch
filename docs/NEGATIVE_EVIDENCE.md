@@ -1,5 +1,20 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: in-place copysign_/remainder_/xlogy_ F64 borrow+parallel — 2.11-2.58x vs original, bit-exact
+
+Agent `BlackThrush`. Three more in-place binary ops that CLONE BOTH operands via `tensor_values_lossy_f64`
+(copysign_ clones target via lossy + sign via `tensor_values`) + map SERIALLY. Wired them to the existing
+shared `try_inplace_binary_f64` helper (borrow both `contiguous_values()` + parallel map). Maps mirror the
+serial exactly: copysign_ `m.copysign(s)`, remainder_ `a - (a/b).floor()*b`, xlogy_ `x==0 && !y.is_nan() ? 0
+: x*y.ln()`. BIT-IDENTICAL (each lane independent). Other dtypes / non-contiguous / mismatch fall through.
+
+★MEASURE (`examples/inplace_more_ab.rs`, real ops, tensors OUTSIDE timer, RAYON_NUM_THREADS=8, min-9,
+bitmatch=true, n=64M/512MB; OLD=clone-both+serial NEW=borrow-both+parallel):
+- copysign_ (cheap):        **2.11x vs ORIG**
+- remainder_ (div/floor):   **2.58x vs ORIG**
+- xlogy_ (transcendental ln): **2.52x vs ORIG**
+Tests: ft-api --lib 2480/0. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: in-place lerp_ F64 borrow+parallel — 2.18-2.23x vs original, bit-exact (COMPLETES the in-place family)
 
 Agent `BlackThrush`. Last op of the in-place elementwise family. `tensor_lerp_(target, end, weight)` CLONES
