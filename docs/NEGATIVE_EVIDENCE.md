@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★★ WIN: apply_rotary_pos_emb (RoPE) fused no-grad F64 fast path — 2.33-3.18x vs original, bit-exact
+
+Agent `BlackThrush`. RoPE (HOT — every LLaMA-style attention layer) COMPOSED ~6 tape ops PER q/k
+(narrow x2 + neg + cat for rotate_half, then mul x2 + add), each materializing a full-size intermediate.
+Added a no-grad fused F64 fast path: when q/k/cos/sin are all no-grad contiguous F64 and cos/sin are a
+trailing `[seq, head_dim]` tile broadcasting over q/k's leading dims, fuse each into ONE parallel pass:
+`out[f] = q[f]*cos[f%tile] + rot[f]*sin[f%tile]`, `rot[f] = (i<half) ? -q[f+half] : q[f-half]`.
+★BIT-IDENTICAL to the compose: mul-then-add (NO FMA — Rust doesn't auto-FMA `a*b+c*d`), same rotate_half
+convention (`cat(-x2,x1)`, read directly from the fn), same trailing-tile broadcast `tensor_mul` does.
+Grad / non-F64 / non-contiguous / non-tile-broadcast fall through unchanged.
+
+★MEASURE (`examples/rope_ab.rs`, REAL `apply_rotary_pos_emb`, tensors OUTSIDE timer, RAYON_NUM_THREADS=8,
+min-9, **bitmatch=true** vs a compose replica that mirrors the exact tape ops):
+- B8 H8 S512 D64 (16MB q):    55.19 -> 23.70 ms = **2.33x vs ORIG**
+- B16 H16 S256 D64 (32MB q): 160.70 -> 50.59 ms = **3.18x vs ORIG**
+- B4 H32 S1024 D128 (128MB q): 609.65 -> 223.06 ms = **2.73x vs ORIG**
+Tests: ft-api --lib 2480/0 (no regression; no dedicated rotary lib test exists — A/B bitmatch is the
+correctness evidence; FOLLOW-UP: add a fused-vs-compose lock test via a non-contiguous input). AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: pack_attention_heads (ft-nn) parallel head-SPLIT — 2.69-2.87x vs original, bit-exact
 
 Agent `BlackThrush`. The INVERSE of concat_attention_heads: `pack_attention_heads` (head-split
