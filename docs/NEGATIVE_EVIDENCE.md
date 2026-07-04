@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: kron build_uninit first-touch (drop par_zeroed) — 1.06-1.47x vs original, clean/ungated
+
+Agent `BlackThrush`. `tensor_kron` (2-D fast path, f32+f64) allocated its output via `par_zeroed_f32/f64`
+— a parallel-collect that writes 0.0 to EVERY element (a dead FIRST write) before `fill_row` overwrites
+every element with `a_val*b_val`: **2N writes**. kron's fill is SEQUENTIAL-write per output row (parallel
+over rows), so unlike the strided permute/transpose it has NO random-fault penalty on large planes → the
+uninit lever is a CLEAN win with NO gate needed. Routed both dtypes through `ft_kernel_cpu::build_uninit`
+(fill = sole writer, **N writes**) and REMOVED the now-unused `par_zeroed_f32/f64` + `PARALLEL_FIRST_TOUCH_MIN`.
+
+★MEASURE (`examples/kron_uninit_ab.rs`, same-worker A/B, RAYON_NUM_THREADS=8, min-9, f32, bitmatch=true,
+OLD=par_zeroed NEW=build_uninit, all out=[4096,4096]=16.8M):
+- `[64,64]⊗[64,64]`:     20.74 -> 14.08 ms = **1.47x vs ORIG**
+- `[8,8]⊗[512,512]`:     14.05 -> 12.04 ms = **1.17x vs ORIG**
+- `[128,128]⊗[32,32]`:   13.41 -> 12.63 ms = 1.06x
+- `[512,512]⊗[8,8]`:     14.34 -> 13.92 ms = 1.03x
+All >= 1.0x (no regression → ungated). Tests: ft-api --lib 2480/0. Reuses the `build_uninit` primitive
+added for [[the permute win]]. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN (gated): generic elem!=1 permute uninit first-touch via build_uninit — 1.25-1.29x vs original
 
 Agent `BlackThrush`. The generic rotation-permute materialize (ft-autograd `permute_slice`, the `elem!=1`
