@@ -1,5 +1,34 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★CORRECTION/RETRACTION: block_diag + embedding_bag + tril/triu F64 "wins" were ~0-gain (measurement error), REVERTED
+
+Agent `CopperBirch`. RETRACTING four ledger WIN entries below (block_diag 2.2x, embedding_bag 24-66x,
+tril/triu 7.7-25.6x). ROOT CAUSE: those ops' F64 no-grad forward routes through `tensor_apply_function`,
+which has ALREADY borrowed contiguous-f64 inputs zero-copy since 2026-06-20 (dbe00877, frankentorch-mbitj:
+`Cow::Borrowed(contiguous_values())`). My "fast paths" that borrowed instead of cloning were therefore
+REDUNDANT — the real path already borrowed. My A/B replicas modeled the ORIG as CLONING the input
+(`to_vec`), so they were slower than the real (borrowing) apply_function path, and the ratios measured the
+replica's phantom clone, not a real speedup.
+
+VERIFIED: re-ran embedding_bag_ab with my fast path DISABLED — the real apply_function path is STILL
+~2.4ms (vs my replica's ~130ms), i.e. IDENTICAL to my "fast path". Net gain ~0. Same mechanism for
+block_diag and tril/triu (their apply_function forwards borrow via Cow and do no save_for_backward clone).
+Reverted all four fast paths + deleted their A/B examples. ft-api --lib GREEN (34 affected tests pass).
+
+★★LESSON (critical, reusable): before claiming a "borrow-instead-of-clone" win on an op that uses
+`tensor_apply_function`, CHECK whether apply_function already borrows the input (it does, for contiguous
+f64, since mbitj). An A/B replica MUST model the REAL orig path — verify by DISABLING the new fast path
+and measuring the real op, not by hand-writing a replica that may pay a cost the real path doesn't.
+
+STILL-VALID wins this session (NOT retracted — these used an EXPLICIT `tensor_values`/`to_vec` clone or
+a genuine serial->parallel change that apply_function's borrow does NOT cover):
+- embedding 19-122x (86bbc217): ORIG used explicit `self.tensor_values(weight)` (a real owned-Vec clone).
+- prelu 9.5x (c6b2d464 + 86651007): ORIG explicit `tensor_values(input)` clone + SERIAL prelu_forward_values
+  (the parallelization of that serial fn is a real gain apply_function's borrow doesn't provide).
+- multi_margin_loss 22-30x (1625665c): apply_function forward runs the O(N*C) hinge SERIALLY + does an
+  unconditional `save_for_backward(input_vals.to_vec())` clone; my fast path parallelizes the hinge (real
+  ~8-26x) and drops the save clone. (Re-verify next firing by the disable-and-measure method to be safe.)
+
 ## 2026-07-04 - NEGATIVE: nanmedian F64 borrow (ft-api) - 1.04-1.07x, REVERTED (select-bound, not clone-bound)
 
 Agent `CopperBirch`. Tried the reverse-asymmetric mirror on `tensor_nanmedian`: F32 borrows, F64 reads
