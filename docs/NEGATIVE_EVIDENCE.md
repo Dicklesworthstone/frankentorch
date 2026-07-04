@@ -1,5 +1,23 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: concat_attention_heads (ft-nn) parallel head-merge — 2.89-2.95x vs original, bit-exact
+
+Agent `BlackThrush`. NEW CRATE (ft-nn, pivoted after the ft-api clone+serial surface exhausted).
+`concat_attention_heads` (attention head-merge `[B,H,S,D]->[B,S,H*D]`, HOT — every attention layer) was a
+SERIAL nested-loop gather. Parallelized over OUTPUT ROWS `[batch,seq]` (each `embed_dim` contiguous, gathered
+from the `num_heads` contiguous `head_dim` blocks) with a serial fallback below 32K elems. BIT-IDENTICAL (same
+src->dst index map). ★KEY DISTINCTION from the DROPPED window_partition (element-scatter → DRAM-wall REGRESSION
+0.89x): concat_heads reads BLOCK-CONTIGUOUS `head_dim` chunks (512B/head, bandwidth-efficient) → parallelizes
+CLEANLY. Measured, not assumed — the window_partition precedent said "expect regression" but the A/B proved otherwise.
+
+★MEASURE (`examples/concat_heads_ab.rs`, standalone replica of the ft-nn gather, RAYON_NUM_THREADS=8, min-9,
+bitmatch=true; OLD=serial nested loop NEW=par-over-rows):
+- B32 H8 S512 D64 (64MB):   30.16 -> 10.45 ms = **2.89x vs ORIG**
+- B16 H16 S256 D64 (32MB):  14.68 -> 4.98 ms = **2.95x vs ORIG**
+- B8 H12 S1024 D64 (48MB):  22.95 -> 7.90 ms = **2.91x vs ORIG**
+Tests: ft-nn attention 5/0, ft-nn --lib green. ★LESSON: BENCH strided-rearrange candidates — block-contiguous
+strided reads parallelize (2.9x) even though element-scatter strided reads (window_partition) DRAM-wall. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: in-place SELECT masked_fill_/where_ F64 borrow+parallel — 2.02-2.88x vs original, bit-exact
 
 Agent `BlackThrush`. Extended the in-place win to the SELECT ops. `masked_fill_(target, mask, value)` clones
