@@ -1,5 +1,21 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: in-place binary FAMILY (fmax_/fmin_/fmod_/hypot_/nextafter_/ldexp_) F64 borrow+parallel — 2.12-2.55x vs original, bit-exact
+
+Agent `BlackThrush`. Extended the in-place asymmetric-dtype win (after maximum_/minimum_) to the rest of the
+in-place elementwise-binary family. All CLONE BOTH operands via `tensor_values_lossy_f64` + map SERIALLY.
+Added a SHARED `try_inplace_binary_f64<F: Fn(f64,f64)->f64 + Sync>` helper: borrow both `contiguous_values()`
+(no clone) + parallel map, returns true if handled (F64 + contiguous + equal-length), else falls through.
+Each op calls it with its EXACT map (bit-identical to the serial): fmax_/fmin_ (NaN-aware max/min), fmod_
+(`a-(a/b).trunc()*b`), hypot_ (`x.hypot(y)`), nextafter_ (next_up/next_down), ldexp_ (`x*2^e`).
+
+★MEASURE (`examples/inplace_family_ab.rs`, real ops, tensors OUTSIDE timer, RAYON_NUM_THREADS=8, min-9,
+bitmatch=true):
+- hypot_ (transcendental): 128MB **2.44x**, 512MB **2.55x** (parallelizing the sqrt helps MORE than the cheap ones)
+- fmod_ (cheap):           128MB **2.12x**, 512MB **2.26x**
+Tests: ft-api --lib 2480/0. The whole in-place elementwise-binary family (8 ops incl maximum_/minimum_) is
+now borrow+parallel. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: in-place maximum_/minimum_ F64 borrow+parallel — 2.01-2.07x vs original, bit-exact
 
 Agent `BlackThrush`. Asymmetric-dtype vein extended to the IN-PLACE family. `tensor_maximum_`/`tensor_minimum_`
