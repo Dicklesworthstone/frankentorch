@@ -1,5 +1,25 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - WIN: prelu_forward_values parallelized (ft-api) - prelu F64 now 9.0-9.5x vs ORIG, bit-exact
+
+Agent `CopperBirch`. Follow-up to the prelu borrow commit (c6b2d464, 2.4x): that made the F64 no-grad
+path borrow the input, but it was then bounded by the SERIAL `prelu_forward_values` — while its f32
+sibling `prelu_forward_values_f32` was already parallel (par_iter gated at PARALLEL_ELEMENTWISE_MIN).
+An asymmetric-parallelization gap. Parallelized the f64 fn the same way (par_iter + enumerate preserves
+index order => BIT-IDENTICAL to the serial map; same prelu_at select+multiply). Used by BOTH the no-grad
+fast path and the grad-path forward, so both speed up.
+
+MEASURE (`prelu_ab`, scalar weight, real op vs a clone-then-SERIAL-prelu replica = the ORIGINAL f64
+path, RAYON_NUM_THREADS=8, min-9, bitmatch=true; worker fleet):
+- 8M  (61MB):  62.15 ->  6.89 ms = **9.02x**
+- 16M (122MB): 128.50 -> 13.53 ms = **9.50x**
+- 32M (244MB): 249.23 -> 26.10 ms = **9.55x**
+
+Stacks clone-avoidance (2.4x, prior commit) + forward parallelization (this commit, ~4.4x more) = 9.5x
+total vs the original clone+serial f64 prelu. ft-api --lib 2482/0. Reverse-[[asymmetric_dtype_fastpath]]
++ asymmetric-parallelization tally: block_diag 2.2x, embedding_bag 24-66x, multi_margin_loss 22-30x,
+embedding 19-122x, prelu 9.5x.
+
 ## 2026-07-04 - WIN: prelu F64 borrows input instead of cloning (ft-api) - 2.34-2.45x vs ORIG, bit-exact
 
 Agent `CopperBirch`. Reverse-asymmetric-dtype (5th this session): `tensor_prelu`'s F32 no-grad fast
