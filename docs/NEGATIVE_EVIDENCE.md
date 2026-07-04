@@ -1,5 +1,19 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★ WIN: in-place SELECT masked_fill_/where_ F64 borrow+parallel — 2.02-2.88x vs original, bit-exact
+
+Agent `BlackThrush`. Extended the in-place win to the SELECT ops. `masked_fill_(target, mask, value)` clones
+both + serial `m!=0 ? value : t`; `where_(target, condition, other)` clones all 3 + serial `c!=0 ? o : t`.
+masked_fill_ inline (needs `value=` record detail); where_ reuses the shared `try_inplace_ternary_f64` helper
+(records None). BIT-IDENTICAL (each lane independent select). Other dtypes / non-contiguous / mismatch fall
+through.
+
+★MEASURE (`examples/inplace_select_ab.rs`, real ops, tensors OUTSIDE timer, RAYON_NUM_THREADS=8, min-9,
+bitmatch=true, n=64M/512MB; OLD=clone-all+serial NEW=borrow-all+parallel):
+- masked_fill_ (binary, 2 clones):  **2.02x vs ORIG**
+- where_ (ternary, 3 clones):        **2.88x vs ORIG**
+Tests: ft-api --lib 2480/0. AGENT BlackThrush.
+
 ## 2026-07-04 - ★ WIN: in-place copysign_/remainder_/xlogy_ F64 borrow+parallel — 2.11-2.58x vs original, bit-exact
 
 Agent `BlackThrush`. Three more in-place binary ops that CLONE BOTH operands via `tensor_values_lossy_f64`
