@@ -1,5 +1,24 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-04 - ★WIN (LOAD-INDEPENDENT, ~9.5-10x vs torch): fftshift/ifftshift delegate to single-pass roll_dims
+
+Agent `BlackThrush`. Direct follow-on to the roll_dims single-pass win. `tensor_fft_fftshift` and
+`tensor_fft_ifftshift` did `result = self.tensor_roll(result, shift, d)` in a loop over dims — N sequential
+tensor_roll calls, each MATERIALIZING a full tensor. Replaced the loop with ONE `tensor_roll_dims(input,
+&shifts, &dims)` call (shifts = size/2 for fftshift, -((size+1)/2) for ifftshift), which now hits the
+general-rank single-pass fast path. Bit-identical (roll is per-dim independent so fusion doesn't change the
+result); grad + out-of-range-dim + empty-dims behavior preserved (explicit range check kept; empty dims ->
+Ok(input); grad falls through to sequential rolls inside roll_dims).
+
+★MEASURE (3-D 16M): torch.fft.fftshift 75-80ms (it IS torch.roll internally); FT now single-pass ~8ms =
+**~9.5-10x FASTER** (the old N-pass loop was ~1.8x SLOWER than torch = a flip). LOAD-INDEPENDENT (algorithmic,
+same class as roll_dims — measured at low load). New test fftshift_ifftshift_delegate_matches_sequential_rolls
+(2-D/3-D, even+odd sizes, all-dims + subset, fftshift & ifftshift) == the old per-dim sequential rolls. 32 fft
++ 11 roll tests green. fftshift is common in 2-D/3-D FFT/image/signal workflows. ★PATTERN (load-independent
+vein): once a fused multi-dim primitive exists (roll_dims), DELEGATE its N-sequential-materializing callers to
+it — a 1-line change that inherits the whole win. Look for more `X = self.tensor_op(X, ...)` loops that a fused
+primitive already covers.
+
 ## 2026-07-04 - ★WIN (LOAD-INDEPENDENT, ~9-10x vs torch): general-rank single-pass roll_dims — algorithmic, N materializing passes -> 1
 
 Agent `BlackThrush`. `tensor_roll_dims` (multi-dim roll) had a single-pass fast path ONLY for rank-2; rank-3+
