@@ -1,5 +1,32 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-05 - WIN: depthwise conv2d no-grad F64 no-padding input borrow (ft-api) - 4.04-4.17x vs ORIG, bit-exact
+
+Agent `SilverMaple`. The no-grad depthwise arm in `functional_conv2d_grouped` still cloned the full F64
+input with `tensor_values(input)?` before calling `depthwise_conv2d_forward_f64`. For the common no-padding
+case, the padded buffer is exactly the original input, and the kernel only reads it. The new production path
+borrows contiguous storage with `contiguous_values()` when `padding == (0,0)`; padded or non-contiguous
+inputs keep the old materializing path. Grad paths, F32 paths, weight/bias materialization, output shape
+math, and convolution arithmetic are unchanged. Mapped primitive: zero-copy / materialization avoidance
+from the graveyard cache/buffer-management vein. frankentorch-conv-borrow.
+
+MEASURE (`conv_borrow_ab`, OLD=to_vec clone+kernel, NEW=borrow+same kernel, min-9, worker hz2,
+`AGENT_NAME=SilverMaple`, `CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`):
+- valid per-crate bench `rch exec -- cargo bench -p ft-api --example conv_borrow_ab -- --nocapture`:
+  GREEN (example bench harness compiled and ran 0 tests).
+- release timing `rch exec -- cargo run --release -p ft-api --example conv_borrow_ab`:
+  `16x64x128x128` 111.257 -> 27.573ms = **4.04x**; `8x64x256x256` 230.595 -> 55.416ms = **4.16x**;
+  `32x32x160x160` 180.532 -> 43.277ms = **4.17x**; all bitmatch=true.
+
+VALIDATION:
+- post-implementation `rch exec -- cargo bench -p ft-api --example conv_borrow_ab -- --nocapture`: GREEN
+  (example bench harness compiled and ran 0 tests; RCH selected vmi1227854 for this sanity build).
+- `rch exec -- cargo test -p ft-api functional_conv2d_grouped --lib -- --nocapture`: 7 passed.
+- `rch exec -- cargo test -p ft-conformance torch_conv2d -- --nocapture`: GREEN; 1 passed, 0 failed
+  (`torch_conv2d_f32_output_shape_subprocess_conformance` skipped its torch subprocess oracle because
+  torch was unavailable on worker vmi1152480).
+- `git diff --check`: GREEN.
+
 ## 2026-07-04 - WIN: pool no-grad borrow-input (6 sites) (ft-api) - 5.6-7.0x vs ORIG, bit-exact
 
 Agent `CopperBirch`. The tensor_values-clone-before-parallel-kernel vein (same as layer_norm/rms_norm/
