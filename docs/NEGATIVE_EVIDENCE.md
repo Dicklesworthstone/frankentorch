@@ -1,5 +1,45 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-08 - WIN: depthwise conv3d no-grad F64 no-padding input borrow (ft-api) - 3.50-4.45x vs ORIG, bit-exact
+
+Agent `AmberCedar`. Checked `.scratch` first: the visible scratch lanes were already landed/rejected or stale
+threshold work already present on `main`, so there was no unlanded measured win to land. Rejected levers were
+not retried: the f32 `functional_linear` borrow lane is already recorded as rejected in
+`artifacts/perf/frankentorch-cjfsb/rejected_f32_borrowed_linear_inputs.md`, and the ledger already rules out
+the grid-sample scalar fast path, f32 GEMM B-panel packing, masked-scatter two-pass, nanmedian borrow, and pdist
+direct-writer repeats. New lever: extend the already-proven zero-copy/materialization-avoidance primitive from
+depthwise conv2d to the no-grad F64 `functional_conv3d_dilated` depthwise path. For zero padding and contiguous
+input, the padded buffer equals the original input and the kernel only reads it, so the production path now
+borrows `contiguous_values()` instead of cloning the full NCDHW tensor. Padded, non-contiguous, F32, grad, and
+non-depthwise paths keep the previous materializing routes.
+
+MEASURE (`conv_borrow_ab`, OLD=to_vec clone+kernel, NEW=borrow+same kernel, min-9, worker hz2,
+`AGENT_NAME=AmberCedar`, `CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`):
+- literal requested form `rch exec -- cargo bench --release -p ft-api --example conv_borrow_ab -- --nocapture`
+  is a Cargo CLI reject (`unexpected argument '--release'`), so it is command-shape negative evidence only.
+- valid per-crate bench `rch exec -- cargo bench -p ft-api --example conv_borrow_ab -- --nocapture`:
+  GREEN (example bench harness compiled and ran 0 tests).
+- release timing `rch exec -- cargo run --release -p ft-api --example conv_borrow_ab`:
+  `2x32x32x64x64` 64.971 -> 18.579ms = **3.50x**; `4x32x24x64x64` 91.441 -> 20.530ms = **4.45x**;
+  `2x64x16x96x64` 87.314 -> 24.233ms = **3.60x**; all bitmatch=true.
+
+VALIDATION:
+- `rch exec -- cargo test -p ft-api functional_conv3d_depthwise_nopad_f64_borrow_fast_path_matches_reference
+  --lib -- --nocapture`: GREEN; 1 passed.
+- `rch exec -- cargo test -p ft-conformance`: GREEN; 199 library tests plus ft-conformance bins/integration
+  tests passed.
+- `rch exec -- cargo check --workspace --all-targets`: GREEN exit 0; emitted existing all-target warnings in
+  unrelated examples.
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`: BLOCKED by existing `ft-kernel-cpu`
+  lint debt (`clippy::uninit_vec`, `if_same_then_else`, `manual_memcpy`, `needless_range_loop`, and test
+  `type_complexity`), not by the touched `ft-api` files.
+- `rch exec -- cargo fmt --check`: BLOCKED by repo-wide pre-existing formatting drift; no formatter was run
+  after isolating the accidental rustfmt churn in stash `codex-ambercedar-accidental-rustfmt-churn`.
+- `ubs crates/ft-api/src/lib.rs crates/ft-api/examples/conv_borrow_ab.rs docs/NEGATIVE_EVIDENCE.md`:
+  BLOCKED by UBS Rust module timeout after 300s on the large shadow workspace scan.
+- `git diff --check`: GREEN.
+- `br sync --flush-only`: BLOCKED by duplicate bead id `frankentorch-kgs4.150` in `.beads/issues.jsonl`.
+
 ## 2026-07-05 - WIN: depthwise conv2d no-grad F64 no-padding input borrow (ft-api) - 4.04-4.17x vs ORIG, bit-exact
 
 Agent `SilverMaple`. The no-grad depthwise arm in `functional_conv2d_grouped` still cloned the full F64
