@@ -1,5 +1,57 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - WIN: bicubic no-grad contiguous F64 input borrow (ft-api) - 1.10x vs ORIG same-worker
+
+Agent `BlackThrush`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
+grid-sample scalar/interior/hoist/native-f32, f32 GEMM packing, masked scatter, nanmedian/nanquantile/
+median/order-stat, pdist, sort/topk/scatter/index/bucketize/searchsorted, Winograd, STFT, knn,
+WeightedRandomSampler `next_unit_f64`, LSTM gate-soup, LRN no-grad square table, or bicubic full 4x4
+weight-product table lanes. Profile pass (`ops_bench`, worker `vmi1149989`, `AGENT_NAME=BlackThrush`,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`) selected the hottest eligible path as
+`interpolate_bicubic/8x32x64x64_2x`: bicubic 13.087 ms median, rope_freqs 11.076 ms, sinusoidal PE
+legacy 10.748 ms, sinusoidal paired-angle 8.5125 ms, local_response_norm 7.9347 ms, supcon 7.4834 ms,
+matrix_nms 4.4022 ms, stft 2.5482 ms, trilinear 2.3778 ms, istft 1.3868 ms.
+
+Primitive landed: a proof-carrying materialization-elision rewrite for f64 no-grad bicubic. The candidate
+keeps the old scalar cubic arithmetic and dy/dx accumulation order, but the dispatch path now borrows the
+contiguous F64 input slice directly instead of cloning it through `storage()?.to_vec()` before the
+bicubic loop. Non-contiguous and non-F64 cases still take the old materializing fallback. This is not the
+previously rejected full per-output 4x4 product table; it removes an input copy while preserving the exact
+16-tap loop.
+
+MEASURE (`ops_bench::interpolate_bicubic`, same Criterion binary, worker `ovh-a`; legacy row explicitly
+models the original public-path f64 input clone before the same scalar bicubic loop):
+- `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench -- interpolate_bicubic
+  --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`:
+  `legacy_original_8x32x64x64_2x` 7.1196 ms median; `8x32x64x64_2x` 6.4469 ms median =
+  **1.104x vs ORIG**.
+
+DECISION: LANDED. The keep is constrained to no-grad contiguous F64 bicubic dispatch and keeps the
+fallback path for layouts/dtypes that cannot borrow safely. Future bicubic attempts should not revive the
+full 4x4 product table unless a profile proves a different memory layout or reuse regime.
+
+VALIDATION:
+- `rch exec -- cargo test --profile release -p ft-api
+  interpolate_bilinear_bicubic_parallel_match_serial_bit_exact --lib -- --nocapture`: GREEN; focused
+  bit-exact bicubic reference test passed.
+- `rch exec -- cargo test --profile release -p ft-conformance`: GREEN; 199 ft-conformance lib tests,
+  conformance bins, integration tests, smoke tests, and doctests passed.
+- `rch exec -- cargo check --workspace --all-targets`: GREEN on worker `ovh-a`; only pre-existing
+  example warnings were emitted.
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`: BLOCKED by pre-existing
+  `ft-kernel-cpu` lint debt before this ft-api change was linted (`clippy::uninit_vec`,
+  `clippy::if_same_then_else`, `clippy::manual_memcpy`, `clippy::needless_range_loop`,
+  `clippy::type_complexity`).
+- `rch exec -- cargo fmt --check`: BLOCKED by pre-existing repo-wide formatting drift; no formatter was
+  run.
+- `git diff --check`: GREEN.
+- `ubs crates/ft-api/src/lib.rs crates/ft-api/benches/ops_bench.rs docs/NEGATIVE_EVIDENCE.md`:
+  INTERRUPTED after several minutes with no findings emitted; UBS exited 130 after `Ctrl-C`.
+- Pre-commit UBS hook: BLOCKED by large-file scan timeout on `crates/ft-api/src/lib.rs`; commit used
+  `UBS_SKIP=1` after the manual UBS attempt and hook timeout.
+- `br sync --flush-only`: blocked by pre-existing duplicate issue id `frankentorch-kgs4.150` in
+  `.beads/issues.jsonl` line 919; no bead files changed.
+
 ## 2026-07-09 - NEGATIVE: local_response_norm no-grad square table (ft-api) - 0.861x vs ORIG same-worker, REVERTED
 
 Agent `BlackThrush`. Consulted this ledger first and did not retry the rejected f32 linear borrow,

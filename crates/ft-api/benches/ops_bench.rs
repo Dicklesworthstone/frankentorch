@@ -2,8 +2,11 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use ft_api::FrankenTorchSession;
+use ft_autograd::TensorNodeId;
 use ft_core::ExecutionMode;
 use std::time::Duration;
+
+const PARALLEL_ELEMENTWISE_MIN: usize = 8192;
 
 fn deterministic_values(n: usize, shift: f64) -> Vec<f64> {
     (0..n)
@@ -2350,6 +2353,23 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
     // element, so it is compute-bound and parallelizes over output rows.
     let (n, ch, h, w) = (8usize, 32usize, 64usize, 64usize);
     group.throughput(Throughput::Elements((n * ch * h * 2 * w * 2) as u64));
+    group.bench_function("legacy_original_8x32x64x64_2x", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_randn(vec![n, ch, h, w], false).unwrap();
+        b.iter(|| {
+            black_box(legacy_bicubic_public_path(
+                &mut session,
+                black_box(x),
+                n,
+                ch,
+                h,
+                w,
+                h * 2,
+                w * 2,
+                false,
+            ))
+        });
+    });
     group.bench_function("8x32x64x64_2x", |b| {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session.tensor_randn(vec![n, ch, h, w], false).unwrap();
@@ -2368,6 +2388,100 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
         });
     });
     group.finish();
+}
+
+fn legacy_bicubic_public_path(
+    session: &mut FrankenTorchSession,
+    input: TensorNodeId,
+    batch: usize,
+    channels: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    align_corners: bool,
+) -> TensorNodeId {
+    #[derive(Clone, Copy)]
+    struct CubicPlan {
+        indices: [usize; 4],
+        weights: [f64; 4],
+    }
+
+    let storage = session.tensor_values(input).unwrap();
+    let total = batch * channels * oh * ow;
+    let in_plane = ih * iw;
+    let mut values = vec![0.0_f64; total];
+    let build_plan = |out_size: usize, in_size: usize| -> Vec<CubicPlan> {
+        (0..out_size)
+            .map(|out_idx| {
+                let src = if align_corners && out_size > 1 {
+                    out_idx as f64 * (in_size - 1) as f64 / (out_size - 1) as f64
+                } else {
+                    (out_idx as f64 + 0.5) * in_size as f64 / out_size as f64 - 0.5
+                };
+                let base = src.floor() as i64;
+                let frac = src - base as f64;
+                let mut indices = [0usize; 4];
+                let mut weights = [0.0_f64; 4];
+                for (slot, offset) in (-1..=2_i64).enumerate() {
+                    indices[slot] = (base + offset).clamp(0, in_size as i64 - 1) as usize;
+                    weights[slot] = legacy_cubic_weight(frac - offset as f64);
+                }
+                CubicPlan { indices, weights }
+            })
+            .collect()
+    };
+    let y_plan = build_plan(oh, ih);
+    let x_plan = build_plan(ow, iw);
+
+    let fill_row = |r: usize, out_row: &mut [f64]| {
+        let plane = r / oh;
+        let oy = r % oh;
+        let base = plane * in_plane;
+        let y = y_plan[oy];
+        for (ox, slot) in out_row.iter_mut().enumerate() {
+            let x = x_plan[ox];
+            let mut val = 0.0;
+            for dy in 0..4 {
+                let wy = y.weights[dy];
+                let sy = y.indices[dy];
+                for dx in 0..4 {
+                    let wx = x.weights[dx];
+                    let sx = x.indices[dx];
+                    val += wy * wx * storage[base + sy * iw + sx];
+                }
+            }
+            *slot = val;
+        }
+    };
+
+    if total >= PARALLEL_ELEMENTWISE_MIN {
+        use rayon::prelude::*;
+        values
+            .par_chunks_mut(ow)
+            .enumerate()
+            .for_each(|(r, out_row)| fill_row(r, out_row));
+    } else {
+        values
+            .chunks_mut(ow)
+            .enumerate()
+            .for_each(|(r, out_row)| fill_row(r, out_row));
+    }
+    session
+        .tensor_variable(values, vec![batch, channels, oh, ow], false)
+        .unwrap()
+}
+
+fn legacy_cubic_weight(x: f64) -> f64 {
+    let a = -0.75;
+    let abs_x = x.abs();
+    if abs_x <= 1.0 {
+        (a + 2.0) * abs_x * abs_x * abs_x - (a + 3.0) * abs_x * abs_x + 1.0
+    } else if abs_x <= 2.0 {
+        a * abs_x * abs_x * abs_x - 5.0 * a * abs_x * abs_x + 8.0 * a * abs_x - 4.0 * a
+    } else {
+        0.0
+    }
 }
 
 fn bench_lstsq(c: &mut Criterion) {
