@@ -1,5 +1,43 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - REJECTED: cross_entropy f64 backward logsumexp sidecar (ft-api/ft-kernel-cpu) - 0.972x vs ORIG same-worker
+
+Agent `BlackThrush`. Negative-evidence pass ruled out the current Conv2d/Conv1d direct no-panel
+all-ones-dout wins, f32 BatchNorm all-ones dy, f32 GroupNorm scalar/unit-dy norm-vein retries, LRN
+square table, bicubic 4x4 product table, and the older f32 linear borrow, grid-sample, GEMM packing,
+masked scatter, order-stat, sort/topk/scatter/index/searchsorted, Winograd, STFT, knn, sampler, and
+LSTM gate-soup lanes. Profile therefore moved to the hottest admissible fresh path:
+`cross_entropy/grad_4096x8192` after excluding hotter norm rows already covered by rejected/landed
+evidence.
+
+Primitive tested and reverted: save the exact per-row f64 `logsumexp` from the fused cross-entropy forward
+into the autograd custom-op context, then consume that sidecar in backward to avoid recomputing the row
+max, exp-sum, and ln before the softmax-gradient pass. A focused kernel bit-exact test showed the sidecar
+backward matched recomputed legacy bits, and the existing API zero-logit golden stayed green, but the
+extra saved-tensor/context traffic did not buy a measured bench win.
+
+MEASURE (`ops_bench::cross_entropy`, `cross_entropy/grad_4096x8192`,
+`AGENT_NAME=BlackThrush`, `CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`,
+`rch exec -- cargo bench --profile release -p ft-api --bench ops_bench --
+'cross_entropy/grad_4096x8192' --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`):
+- Legacy ORIG same-worker routing evidence from the pre-edit profile on `hz2`:
+  [95.370 ms 96.878 ms 98.360 ms].
+- Candidate same-worker rerun on `hz2`: [97.432 ms 99.701 ms 102.13 ms], Criterion
+  `change: [+0.1480% +2.9146% +5.9180%] (p = 0.07 > 0.05)`, "No change in performance detected."
+  Ratio-vs-ORIG = 96.878 / 99.701 = **0.972x**; rejected as zero-gain/slower.
+- Explicit isolated LEGACY ORIGINAL on `ovh-a` by temporarily restoring the recompute path:
+  [87.461 ms 90.948 ms 94.827 ms]. The only sidecar candidate run before that routed to
+  `vmi1152480` ([177.94 ms 219.25 ms 268.67 ms]) and is recorded as routing context only, not scored.
+
+CONFORMANCE: after reverting the code and keeping only this ledger entry,
+`rch exec -- cargo test --profile release -p ft-conformance`: GREEN on `vmi1227854` (199 lib tests plus
+all conformance binaries, e2e, PyTorch subprocess, and smoke tests passed). `git diff --check`: GREEN.
+
+DECISION: REJECTED and code reverted. Do not retry a plain f64 cross-entropy backward `logsumexp`
+sidecar saved in the custom-op context for this row. A future cross-entropy attempt needs a genuinely
+different primitive, such as eliminating broader autograd buffer traffic, changing reduction/backward
+graph structure, or improving the softmax-gradient streaming kernel itself.
+
 ## 2026-07-09 - WIN: conv2d 3x3 stride1 all-ones dout backward no-panel (ft-kernel-cpu) - 1.43x explicit / 2.12x same-worker history vs ORIG
 
 Agent `BlackThrush`. Negative-evidence pass ruled out the prior materialized-im2col all-ones row-collapse
