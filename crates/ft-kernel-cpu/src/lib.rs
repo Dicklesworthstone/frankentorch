@@ -7243,6 +7243,28 @@ pub fn conv2d_backward_f64(
             has_bias,
         );
     }
+    if ph > 1
+        && oh > 1
+        && kh == 3
+        && kw == 3
+        && sh == 1
+        && sw == 1
+        && !dout.is_empty()
+        && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+    {
+        return conv2d_backward_3x3_stride1_ones_dout_f64(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            oh,
+            ow,
+            out_ch,
+            has_bias,
+        );
+    }
     // Gather dout [N,out_ch,patch_count] -> dout_flat [flat, out_ch].
     let mut dout_flat = vec![0.0f64; flat * out_ch];
     dout_flat
@@ -7362,6 +7384,99 @@ fn conv2d_backward_height1_ones_dout_f64(
             }
         }
     });
+
+    let dbias = if has_bias {
+        Some(vec![flat as f64; out_ch])
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_3x3_stride1_ones_dout_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let kh = 3usize;
+    let kw = 3usize;
+    let patch_width = in_ch * kh * kw;
+    let flat = batch * oh * ow;
+
+    let mut dweight_row = vec![0.0f64; patch_width];
+    dweight_row
+        .par_chunks_mut(kh * kw)
+        .enumerate()
+        .for_each(|(c, dwc)| {
+            for kr in 0..kh {
+                for kc in 0..kw {
+                    let mut acc = 0.0f64;
+                    for n in 0..batch {
+                        let ch_off = (n * in_ch + c) * ph * pw;
+                        for oy in 0..oh {
+                            let irow = ch_off + (oy + kr) * pw + kc;
+                            for ox in 0..ow {
+                                acc += padded[irow + ox];
+                            }
+                        }
+                    }
+                    dwc[kr * kw + kc] = acc;
+                }
+            }
+        });
+
+    let mut dweight = vec![0.0f64; out_ch * patch_width];
+    dweight
+        .par_chunks_mut(patch_width)
+        .for_each(|row| row.copy_from_slice(&dweight_row));
+
+    let mut dpanel_row = vec![0.0f64; patch_width];
+    dpanel_row
+        .par_chunks_mut(kh * kw)
+        .enumerate()
+        .for_each(|(c, dpc)| {
+            let pch = c * kh * kw;
+            for kr in 0..kh {
+                for kc in 0..kw {
+                    let kidx = pch + kr * kw + kc;
+                    let mut acc = 0.0f64;
+                    for oc in 0..out_ch {
+                        acc += weight_flat[oc * patch_width + kidx];
+                    }
+                    dpc[kr * kw + kc] = acc;
+                }
+            }
+        });
+
+    let patch_count = oh * ow;
+    let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
+    dpadded
+        .par_chunks_mut(ph * pw)
+        .enumerate()
+        .for_each(|(plane, dp)| {
+            let c = plane % in_ch;
+            let pch = c * kh * kw;
+            for pc in 0..patch_count {
+                let base_h = pc / ow;
+                let base_w = pc % ow;
+                for kr in 0..kh {
+                    let irow = (base_h + kr) * pw + base_w;
+                    let prow_off = pch + kr * kw;
+                    for kc in 0..kw {
+                        dp[irow + kc] += dpanel_row[prow_off + kc];
+                    }
+                }
+            }
+        });
 
     let dbias = if has_bias {
         Some(vec![flat as f64; out_ch])
@@ -36020,6 +36135,60 @@ mod tests {
         for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
             assert!(
                 (g - w).abs() <= 1.0e-12,
+                "dweight[{i}] direct {g} vs generic {w}"
+            );
+        }
+        assert_eq!(got_db.unwrap(), want_db);
+    }
+
+    #[test]
+    fn conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference() {
+        let (batch, in_ch, out_ch) = (2usize, 3usize, 4usize);
+        let (ph, pw, kh, kw, oh, ow, sh, sw) =
+            (7usize, 8usize, 3usize, 3usize, 5usize, 6usize, 1usize, 1usize);
+        let patch_width = in_ch * kh * kw;
+        let patch_count = oh * ow;
+        let flat = batch * patch_count;
+        let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i * 17 % 31) as f64 - 15.0) / 1024.0)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 37) as f64 - 18.0) / 2048.0)
+            .collect();
+        let dout = vec![1.0f64; batch * out_ch * patch_count];
+
+        let mut dout_flat = vec![0.0f64; flat * out_ch];
+        for row in 0..flat {
+            let n = row / patch_count;
+            let p = row % patch_count;
+            for oc in 0..out_ch {
+                dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * patch_count + p];
+            }
+        }
+        let panel =
+            super::conv2d_im2col_f64(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        let mut want_dw = vec![0.0f64; out_ch * patch_width];
+        super::gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut want_dw);
+        let mut dpanel = vec![0.0f64; flat * patch_width];
+        super::gemm::dgemm(flat, out_ch, patch_width, &dout_flat, &weight, &mut dpanel);
+        let want_dp =
+            super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        let want_db = vec![flat as f64; out_ch];
+
+        let (got_dp, got_dw, got_db) = super::conv2d_backward_3x3_stride1_ones_dout_f64(
+            &padded, &weight, batch, in_ch, ph, pw, oh, ow, out_ch, true,
+        );
+        for (i, (&g, &w)) in got_dp.iter().zip(want_dp.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "dpadded[{i}] direct {g} vs generic {w}"
+            );
+        }
+        for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
                 "dweight[{i}] direct {g} vs generic {w}"
             );
         }

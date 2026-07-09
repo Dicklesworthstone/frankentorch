@@ -1,5 +1,48 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - WIN: conv2d 3x3 stride1 all-ones dout backward no-panel (ft-kernel-cpu) - 1.43x explicit / 2.12x same-worker history vs ORIG
+
+Agent `BlackThrush`. Negative-evidence pass ruled out the prior materialized-im2col all-ones row-collapse
+lane (`frankentorch-kgs4.133`), f32 BatchNorm all-ones dy, LRN square table, and bicubic weight-product
+variants. Profile selected the hottest admissible path: `conv2d/grad_hw/64` (broad short profile on
+`vmi1149989`: 259.77 ms median; batch_norm was also hot but excluded by prior rejected BN all-ones dy
+evidence).
+
+Primitive landed: a guarded direct no-panel adjoint for f64 3x3 stride-1 Conv2d scalar sum-loss (`dout`
+exact all +1.0, `ph>1`, `oh>1`, `kh=kw=3`, `sh=sw=1`). It bypasses `dout_flat`, full im2col `panel`,
+full `dpanel`, and ones GEMMs. It streams one shared `dweight_row` from padded input, copies it across
+output channels, reduces one `dpanel_row` from weights, and performs the col2im accumulation directly per
+plane. Generic non-3x3, non-stride1, non-all-ones, and height-1 conv1d-style paths are unchanged. This is
+not the rejected 2026-06-20 Conv2d row-collapse retry: that path still built the full im2col panel and
+allocated ones/GEMM intermediates; this is the direct no-panel primitive that entry left open.
+
+MEASURE (`ops_bench::conv2d`, `conv2d/grad_hw/64`, `rch exec -- cargo bench --profile release -p ft-api
+--bench ops_bench -- 'conv2d/grad_hw/64' --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`):
+- Primary explicit A/B, same worker `ovh-a`: legacy ORIG measured by temporarily disabling only the new
+  guard: 113.60 ms median; candidate after restoring guard: 79.487 ms median = **1.429x vs ORIG**
+  (candidate run was noisy, Criterion interval `[-52.781% -30.027% +3.2601%]`, p=0.06).
+- Independent same-worker history check, worker `hz2`: legacy ORIG/top-profile row from the previous
+  ledger state: 146.46 ms median; candidate: 69.125 ms median = **2.119x vs ORIG**. Criterion reported
+  `[-56.126% -52.560% -49.187%]`, p=0.00, Performance has improved.
+- Cross-worker routing context only: broad current profile on `vmi1149989` ORIG-ish hottest row was
+  259.77 ms; candidate on `vmi1264463` 157.63 ms. These are not used for scoring.
+
+CONFORMANCE: `rch exec -- cargo test --profile release -p ft-conformance`: GREEN on `ovh-a` (199 lib
+tests + all conformance binaries/smoke/subprocess tests passed). Focused kernel proof
+`conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference`: GREEN on `vmi1227854`, bit-exact vs
+im2col+dgemm_tb+dgemm+col2im reference.
+
+QUALITY: `rch exec -- cargo check --workspace --all-targets`: GREEN on `ovh-b` with pre-existing example
+warnings. `git diff --check`: GREEN. `cargo clippy --workspace --all-targets -- -D warnings` remains
+blocked by pre-existing `ft-kernel-cpu` lint debt outside the new conv2d helper (`uninit_vec`,
+`if_same_then_else`, `manual_memcpy`, `needless_range_loop`, test `type_complexity`). `cargo fmt --check`
+remains blocked by pre-existing repo-wide formatting drift; no global formatting applied.
+
+Do not retry the old materialized-im2col all-ones row-collapse / ones-vector GEMM lane. Future conv2d
+scalar-loss work should stay in the direct no-panel family, cache-blocked col2im, workspace/arena temp
+reuse, or a fused loss/backward path that removes autograd buffer traffic.
+
 ## 2026-07-09 - WIN: conv1d height-1 all-ones dout backward no-panel (ft-kernel-cpu) - 1.37x vs ORIG same-worker
 
 Agent `BlackThrush`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
