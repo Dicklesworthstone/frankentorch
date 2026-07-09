@@ -7224,6 +7224,25 @@ pub fn conv2d_backward_f64(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let flat = batch * patch_count;
+    if ph == 1
+        && kh == 1
+        && oh == 1
+        && !dout.is_empty()
+        && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+    {
+        return conv2d_backward_height1_ones_dout_f64(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            pw,
+            kw,
+            ow,
+            sw,
+            out_ch,
+            has_bias,
+        );
+    }
     // Gather dout [N,out_ch,patch_count] -> dout_flat [flat, out_ch].
     let mut dout_flat = vec![0.0f64; flat * out_ch];
     dout_flat
@@ -7272,6 +7291,80 @@ pub fn conv2d_backward_f64(
             *dbo = s;
         });
         Some(db)
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_height1_ones_dout_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pw: usize,
+    kw: usize,
+    ow: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let patch_width = in_ch * kw;
+    let flat = batch * ow;
+
+    let mut dweight_row = vec![0.0f64; patch_width];
+    dweight_row
+        .par_chunks_mut(kw)
+        .enumerate()
+        .for_each(|(c, dw)| {
+            for (kc, slot) in dw.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for n in 0..batch {
+                    let base = (n * in_ch + c) * pw + kc;
+                    for ox in 0..ow {
+                        acc += padded[base + ox * sw];
+                    }
+                }
+                *slot = acc;
+            }
+        });
+
+    let mut dweight = vec![0.0f64; out_ch * patch_width];
+    dweight
+        .par_chunks_mut(patch_width)
+        .for_each(|row| row.copy_from_slice(&dweight_row));
+
+    let mut dpanel_row = vec![0.0f64; patch_width];
+    dpanel_row
+        .par_chunks_mut(kw)
+        .enumerate()
+        .for_each(|(c, dp)| {
+            let pch = c * kw;
+            for (kc, slot) in dp.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for oc in 0..out_ch {
+                    acc += weight_flat[oc * patch_width + pch + kc];
+                }
+                *slot = acc;
+            }
+        });
+
+    let mut dpadded = vec![0.0f64; batch * in_ch * pw];
+    dpadded.par_chunks_mut(pw).enumerate().for_each(|(plane, dp)| {
+        let c = plane % in_ch;
+        let row = &dpanel_row[c * kw..(c + 1) * kw];
+        for ox in 0..ow {
+            let base = ox * sw;
+            for kc in 0..kw {
+                dp[base + kc] += row[kc];
+            }
+        }
+    });
+
+    let dbias = if has_bias {
+        Some(vec![flat as f64; out_ch])
     } else {
         None
     };
@@ -35884,6 +35977,53 @@ mod tests {
         for (g, w) in got32.iter().zip(want_f.iter()) {
             assert_eq!(g.to_bits(), w.to_bits(), "conv2d_col2im_f32 per-plane must match per-batch");
         }
+    }
+
+    #[test]
+    fn conv2d_height1_ones_dout_backward_matches_generic_reference() {
+        let (batch, in_ch, out_ch, pw, kw, ow, sw) =
+            (3usize, 4usize, 5usize, 19usize, 3usize, 17usize, 1usize);
+        let patch_width = in_ch * kw;
+        let padded: Vec<f64> = (0..batch * in_ch * pw)
+            .map(|i| ((i * 17 % 101) as f64 - 50.0) * 0.03125)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 97) as f64 - 48.0) * 0.015625)
+            .collect();
+        let dout = vec![1.0f64; batch * out_ch * ow];
+
+        let panel = super::conv2d_im2col_f64(&padded, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw);
+        let mut dout_flat = vec![0.0f64; batch * ow * out_ch];
+        for row in 0..batch * ow {
+            let n = row / ow;
+            let p = row % ow;
+            for oc in 0..out_ch {
+                dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * ow + p];
+            }
+        }
+        let mut want_dw = vec![0.0f64; out_ch * patch_width];
+        super::gemm::dgemm_tb(out_ch, batch * ow, patch_width, &dout_flat, &panel, &mut want_dw);
+        let mut dpanel = vec![0.0f64; batch * ow * patch_width];
+        super::gemm::dgemm(batch * ow, out_ch, patch_width, &dout_flat, &weight, &mut dpanel);
+        let want_dp = super::conv2d_col2im_f64(&dpanel, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw);
+        let want_db = vec![(batch * ow) as f64; out_ch];
+
+        let (got_dp, got_dw, got_db) = super::conv2d_backward_height1_ones_dout_f64(
+            &padded, &weight, batch, in_ch, pw, kw, ow, sw, out_ch, true,
+        );
+        for (i, (&g, &w)) in got_dp.iter().zip(want_dp.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1.0e-12,
+                "dpadded[{i}] direct {g} vs generic {w}"
+            );
+        }
+        for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1.0e-12,
+                "dweight[{i}] direct {g} vs generic {w}"
+            );
+        }
+        assert_eq!(got_db.unwrap(), want_db);
     }
 
     #[test]

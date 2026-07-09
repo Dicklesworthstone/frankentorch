@@ -1,5 +1,64 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - WIN: conv1d height-1 all-ones dout backward no-panel (ft-kernel-cpu) - 1.37x vs ORIG same-worker
+
+Agent `BlackThrush`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
+grid-sample scalar/interior/hoist/native-f32, f32 GEMM packing, masked scatter, nanmedian/nanquantile/
+median/order-stat, pdist, sort/topk/scatter/index/bucketize/searchsorted, Winograd, STFT, knn,
+WeightedRandomSampler `next_unit_f64`, LSTM gate-soup, LRN no-grad square table, bicubic full 4x4
+weight-product table, or the rejected `conv2d` materialized-im2col all-ones row-collapse lanes.
+Profile pass (`ops_bench`, worker `hz2`, `AGENT_NAME=BlackThrush`,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`) picked the hottest eligible path as
+`conv1d/grad_L/4096`: 165.79 ms median, ahead of `conv2d/grad_hw/64` 146.46 ms,
+`batch_norm/grad_1d_8192x1024` 136.45 ms, `group_norm/grad_32x256x28x28` 95.44 ms, and
+`conv1d/grad_L/1024` 66.810 ms.
+
+Primitive landed: a no-panel algebraic adjoint for the exact height-1 conv1d-as-conv2d scalar-loss
+backward shape. Guarded on `ph == 1`, `kh == 1`, `oh == 1`, and exact all-`+1.0` upstream `dout`,
+`conv2d_backward_f64` now bypasses `dout_flat`, full im2col panel, full `dpanel`, and col2im for this
+case. It directly computes one input-channel/kernel dweight row from the padded input, replicates it
+across output channels, sums the weight columns once into a compact dpanel row, and scatters that row
+over width positions. Generic non-height-1 and non-all-ones backward stays on the old GEMM path. This is
+not the prior rejected Conv2d all-ones row-collapse: that attempt still built the full im2col panel and
+allocated ones vectors for small GEMMs; this one is the direct no-panel retry that the 2026-06-20
+rejection entry explicitly left open.
+
+MEASURE (`ops_bench::conv1d`, same worker `hz2`; legacy ORIG measured by temporarily disabling only the
+new guarded branch in the same checkout/cache, then restoring the branch and rerunning the same command):
+- ORIG command: `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench --
+  'conv1d/grad_L/4096|conv1d/grad_L/1024' --warm-up-time 1 --measurement-time 2 --sample-size 10
+  --noplot`: `conv1d/grad_L/4096` 166.96 ms median; `conv1d/grad_L/1024` 68.843 ms median.
+- Candidate command, same worker `hz2`: same command with the no-panel guard restored:
+  `conv1d/grad_L/4096` 121.82 ms median = **1.371x vs ORIG**; `conv1d/grad_L/1024` 28.283 ms median
+  = **2.434x vs ORIG**.
+- Post-clippy-loop current-source rerun routed to worker `ovh-a` (not used for ratio):
+  `conv1d/grad_L/4096` 75.373 ms median; `conv1d/grad_L/1024` 19.431 ms median.
+
+DECISION: LANDED. Keep this only for exact height-1, kernel-height-1, output-height-1 f64 backward with
+all-ones upstream gradient. Future conv scalar-loss attempts must not reintroduce materialized im2col
+row-collapse or ones-vector GEMM variants for this lane; credible next work should target a different
+shape guard or a direct no-panel non-unit-dout primitive.
+
+VALIDATION:
+- `rch exec -- cargo test --profile release -p ft-kernel-cpu
+  conv2d_height1_ones_dout_backward_matches_generic_reference --lib -- --nocapture`: GREEN after final
+  source edit; focused helper reference test passed.
+- `rch exec -- cargo test --profile release -p ft-conformance`: GREEN; all ft-conformance lib, bin,
+  integration, smoke, and doc-test targets passed.
+- `rch exec -- cargo check --workspace --all-targets`: GREEN; only pre-existing example warnings were
+  emitted.
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`: BLOCKED by pre-existing
+  `ft-kernel-cpu` lint debt after the new helper's own `needless_range_loop` was fixed
+  (`clippy::uninit_vec`, `clippy::if_same_then_else`, `clippy::manual_memcpy`,
+  unrelated `clippy::needless_range_loop`, `clippy::type_complexity`).
+- `rch exec -- cargo fmt --check`: BLOCKED by pre-existing repo-wide example formatting drift; no
+  formatter was run.
+- `git diff --check`: GREEN.
+- `timeout 180s ubs crates/ft-kernel-cpu/src/lib.rs docs/NEGATIVE_EVIDENCE.md`: GREEN exit 0; no
+  critical findings, with existing large warning/info inventory in `ft-kernel-cpu`.
+- `br sync --flush-only`: blocked by pre-existing duplicate issue id `frankentorch-kgs4.150` in
+  `.beads/issues.jsonl` line 919; no bead files changed.
+
 ## 2026-07-09 - WIN: bicubic no-grad contiguous F64 input borrow (ft-api) - 1.10x vs ORIG same-worker
 
 Agent `BlackThrush`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
