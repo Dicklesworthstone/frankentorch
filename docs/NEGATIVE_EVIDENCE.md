@@ -1,5 +1,45 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - NEGATIVE: bicubic 4x4 separable weight-product table (ft-api) - 0.705x vs ORIG same-worker, REVERTED
+
+Agent `AmberCedar`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
+grid-sample scalar/interior, f32 GEMM packing, masked scatter, nanmedian/nanquantile/median/order-stat,
+pdist, sort/topk/scatter/index/bucketize/searchsorted, Winograd, STFT, knn, WeightedRandomSampler
+`next_unit_f64`, or LSTM gate-soup lanes. Profile pass (`ops_bench`, worker `vmi1152480`,
+`AGENT_NAME=AmberCedar`, `CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`) picked the hottest
+fresh row as `interpolate_bicubic/8x32x64x64_2x`: bicubic 41.951 ms median, supcon 23.532 ms,
+matrix_nms 18.611 ms, trilinear 8.6298 ms, stft 6.0556 ms, istft 4.9334 ms.
+
+Primitive tried: a compiled-artifact/separable-table rewrite for f64 bicubic no-grad forward. The candidate
+precomputed each output pixel's 4x4 `wy * wx` products and source-row offsets once, then reused that table
+across all batch/channel planes. It preserved the original dy/dx accumulation order, but turned cheap
+register multiplies into extra weight-table memory traffic.
+
+MEASURE (`ops_bench::interpolate_bicubic`, same Criterion binary, worker `hz2` for the decisive corrected
+same-worker ratio; legacy row includes the original f64 public-path storage clone before the old scalar
+bicubic loop):
+- `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench -- interpolate_bicubic
+  --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`:
+  `legacy_original_8x32x64x64_2x` 8.4904 ms median; `weight_table_8x32x64x64_2x` 12.048 ms median =
+  **0.705x vs ORIG**.
+- Earlier uncorrected inner-loop-only comparator on worker `vmi1152480` also rejected the shape:
+  `legacy_original_8x32x64x64_2x` 16.435 ms median; `weight_table_8x32x64x64_2x` 26.644 ms median =
+  **0.617x vs ORIG**.
+
+DECISION: REJECTED and reverted from source/bench. Do not retry the full per-output 4x4 bicubic
+weight-product table for this row; the old scalar product stays faster because the x/y weight plans are tiny
+and cache-resident while the product table adds bandwidth pressure.
+
+VALIDATION:
+- `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench -- interpolate_bicubic
+  --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`: GREEN, rejection measured.
+- `rch exec -- cargo test --profile release -p ft-conformance`: GREEN; ft-conformance library tests, bins,
+  integration tests, smoke tests, and doctests passed.
+- `git diff --check`: GREEN.
+- `ubs docs/NEGATIVE_EVIDENCE.md`: no supported language files detected, so UBS did not scan this
+  Markdown-only change.
+- Source and bench edits reverted; docs-only negative-evidence closeout.
+
 ## 2026-07-09 - WIN: sinusoidal positional encoding paired-angle quotient (ft-api) - 1.30x vs ORIG, bit-exact
 
 Agent `AmberCedar`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
