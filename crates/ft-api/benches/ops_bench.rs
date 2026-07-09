@@ -2121,7 +2121,32 @@ fn bench_sinusoidal_pe(c: &mut Criterion) {
     // element -> compute-bound, parallel over positions.
     let (seq_len, d_model) = (4096usize, 1024usize);
     group.throughput(Throughput::Elements((seq_len * d_model) as u64));
-    group.bench_function("4096x1024", |b| {
+    group.bench_function("legacy_original_4096x1024", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        b.iter(|| {
+            let mut encoding = vec![0.0_f64; seq_len * d_model];
+            let denominators: Vec<f64> = (0..d_model)
+                .map(|i| (10000_f64).powf((2 * (i / 2)) as f64 / d_model as f64))
+                .collect();
+            let fill_row = |pos: usize, row: &mut [f64]| {
+                for (i, slot) in row.iter_mut().enumerate() {
+                    let angle = (pos as f64) / denominators[i];
+                    *slot = if i % 2 == 0 { angle.sin() } else { angle.cos() };
+                }
+            };
+            use rayon::prelude::*;
+            encoding
+                .par_chunks_mut(d_model)
+                .enumerate()
+                .for_each(|(pos, row)| fill_row(pos, row));
+            black_box(
+                session
+                    .tensor_variable(encoding, vec![seq_len, d_model], false)
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("paired_angle_4096x1024", |b| {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         b.iter(|| {
             black_box(

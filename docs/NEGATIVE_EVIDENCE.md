@@ -1,5 +1,45 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - WIN: sinusoidal positional encoding paired-angle quotient (ft-api) - 1.30x vs ORIG, bit-exact
+
+Agent `AmberCedar`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
+grid-sample scalar/interior, f32 GEMM packing, masked scatter, nanmedian, pdist, sort/topk, scatter/index,
+Winograd, STFT, or knn lanes. Profile probes pointed at positional-table generation as the hottest fresh
+candidate in the remaining surface: `rope_freqs/32768x128` measured 6.9223 ms median, while
+`sinusoidal_pe/4096x1024` measured 16.120 ms median before the edit. New primitive: quotient the sinusoidal
+frequency lattice by its even/odd column-pair equivalence class. The old path computed the same denominator
+and division independently for columns `2k` and `2k+1`; the new path stores one denominator per pair, computes
+`pos / denom[k]` once per pair, and emits both `sin(angle)` and `cos(angle)` from that same f64. It preserves
+the original formula, output layout, row-parallel schedule, and bit pattern.
+
+MEASURE (`ops_bench::sinusoidal_pe`, OLD=legacy per-column denominators/divisions, NEW=paired denominators
+and paired angle, same Criterion binary, worker ovh-a, `AGENT_NAME=AmberCedar`,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`):
+- `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench -- sinusoidal_pe --warm-up-time 1
+  --measurement-time 3 --sample-size 10 --noplot`:
+  `legacy_original_4096x1024` 5.5401 ms median; `paired_angle_4096x1024` 4.2701 ms median =
+  **1.30x vs ORIG**.
+
+VALIDATION:
+- `rch exec -- cargo test --profile release -p ft-api
+  sinusoidal_position_encoding_parallel_match_serial_bit_exact --lib -- --nocapture`: GREEN; 1 passed,
+  golden digest unchanged.
+- `rch exec -- cargo test --profile release -p ft-conformance`: GREEN; ft-conformance library tests, bins,
+  integration tests, smoke tests, and doctests passed.
+- `rch exec -- cargo check --workspace --all-targets`: GREEN exit 0; emitted existing unrelated example
+  warnings.
+- `git diff --check`: GREEN.
+- `rch exec -- cargo fmt --check`: BLOCKED by repo-wide pre-existing formatting drift across unrelated
+  examples and older ft-api/ft-kernel-metal code; no formatter was run.
+- `rch exec -- cargo clippy --workspace --all-targets -- -D warnings`: BLOCKED by existing `ft-kernel-cpu`
+  lint debt (`clippy::uninit_vec`, `if_same_then_else`, `manual_memcpy`, `needless_range_loop`, and test
+  `type_complexity`), not by the touched `ft-api` path.
+- `rch exec -- cargo clippy -p ft-api --lib --benches -- -D warnings`: BLOCKED by the same `ft-kernel-cpu`
+  path-dependency lint debt before clippy reached the edited ft-api crate.
+- `ubs crates/ft-api/src/lib.rs crates/ft-api/benches/ops_bench.rs docs/NEGATIVE_EVIDENCE.md`: BLOCKED by
+  UBS Rust module timeout after 300s on the shadow workspace scan.
+- `br sync --flush-only`: BLOCKED by duplicate bead id `frankentorch-kgs4.150` in `.beads/issues.jsonl`.
+
 ## 2026-07-08 - WIN: depthwise conv3d no-grad F64 no-padding input borrow (ft-api) - 3.50-4.45x vs ORIG, bit-exact
 
 Agent `AmberCedar`. Checked `.scratch` first: the visible scratch lanes were already landed/rejected or stale
