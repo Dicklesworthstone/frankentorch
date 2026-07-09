@@ -1,5 +1,44 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## 2026-07-09 - NEGATIVE: local_response_norm no-grad square table (ft-api) - 0.861x vs ORIG same-worker, REVERTED
+
+Agent `BlackThrush`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
+grid-sample scalar/interior/hoist/native-f32, f32 GEMM packing, masked scatter, nanmedian/nanquantile/
+median/order-stat, pdist, sort/topk/scatter/index/bucketize/searchsorted, Winograd, STFT, knn,
+WeightedRandomSampler `next_unit_f64`, LSTM gate-soup, or bicubic full 4x4 weight-product table lanes.
+Profile pass (`ops_bench`, worker `vmi1149989`, `AGENT_NAME=BlackThrush`,
+`CARGO_TARGET_DIR=/data/projects/.rch-targets/torch-cod`) selected the hottest fresh eligible row as
+`local_response_norm/8x64x56x56`: LRN 18.629 ms median, rope_freqs 16.019 ms, bicubic 12.609 ms,
+supcon 11.219 ms, matrix_nms 5.4490 ms, stft 3.3982 ms, istft 2.7993 ms, trilinear 2.0736 ms.
+
+Primitive tried: a compiled-artifact / dynamic-programming square table for f64 no-grad LRN. The candidate
+precomputed each `x*x` once, then reused those products inside the same ascending channel-window summation
+order. The proof shape was bit-exact in principle because every product and every addition order was
+unchanged, but the extra 12.8 MiB square table write/read outweighed the avoided repeated multiplications;
+the row is dominated by `powf` and memory traffic, not square recomputation.
+
+MEASURE (`ops_bench::local_response_norm`, same Criterion binary, worker `ovh-a`; legacy row includes the
+original f64 public-path input clone before the old per-window `data[idx] * data[idx]` loop):
+- `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench -- local_response_norm
+  --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`:
+  `legacy_original_8x64x56x56` 4.8050 ms median; `square_table_8x64x56x56` 5.5779 ms median =
+  **0.861x vs ORIG**.
+
+DECISION: REJECTED and reverted from source/bench. Do not retry a standalone LRN no-grad square table for
+this row; a credible next LRN attempt must reduce `powf` cost or exploit a mathematically equivalent
+denominator transform without adding another full-size memory stream.
+
+VALIDATION:
+- `rch exec -- cargo bench --profile release -p ft-api --bench ops_bench -- local_response_norm
+  --warm-up-time 1 --measurement-time 2 --sample-size 10 --noplot`: GREEN, rejection measured.
+- `rch exec -- cargo test --profile release -p ft-conformance`: GREEN on worker `hz2` (199 lib tests plus
+  all ft-conformance bin/integration/doc-test targets passed).
+- `git diff --check`: GREEN.
+- `ubs docs/NEGATIVE_EVIDENCE.md`: no supported language scanners for markdown, so UBS did not run a scanner.
+- `br sync --flush-only`: blocked by pre-existing duplicate issue id `frankentorch-kgs4.150` in
+  `.beads/issues.jsonl` line 919; no bead files changed.
+- Source and bench edits reverted; docs-only negative-evidence closeout.
+
 ## 2026-07-09 - NEGATIVE: bicubic 4x4 separable weight-product table (ft-api) - 0.705x vs ORIG same-worker, REVERTED
 
 Agent `AmberCedar`. Consulted this ledger first and did not retry the rejected f32 linear borrow,
