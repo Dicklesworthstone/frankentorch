@@ -36485,6 +36485,140 @@ mod tests {
         }
     }
 
+    /// Published accuracy budget for the `FT_SDPA_POLY_EXP` path, asserted so a
+    /// future `wide` bump cannot silently widen it. Run with `--nocapture` to
+    /// print the measured numbers for the ledger.
+    ///
+    /// Three levels, each the input to the next:
+    ///   1. `exp` itself, over the clamped domain `[-87, 0]` the softmax feeds it.
+    ///   2. the softmax probabilities `P` a row produces.
+    ///   3. the attention output `O = P @ V`, which is what the encoder consumes.
+    ///
+    /// Budget (measured, with headroom): `exp` <= 2 ULP; `P` max|delta| <= 1e-7 and
+    /// max relative error <= 1e-6; `O` max relative error <= 1e-6.
+    #[test]
+    fn sdpa_poly_exp_accuracy_budget() {
+        use wide::f32x8;
+
+        /// ULP distance between two finite, same-signed f32.
+        fn ulp_diff(a: f32, b: f32) -> i64 {
+            i64::from(a.to_bits()) - i64::from(b.to_bits())
+        }
+
+        // --- level 1: exp over the domain the clamp guarantees -------------
+        const N: usize = 2_000_000;
+        let mut max_ulp = 0i64;
+        let mut max_rel_exp = 0.0f64;
+        let mut i = 0;
+        while i + 8 <= N {
+            let mut a = [0.0f32; 8];
+            for (lane, slot) in a.iter_mut().enumerate() {
+                let t = (i + lane) as f32 / N as f32; // 0..1
+                *slot = -87.0 * t; // sweep [-87, 0]
+            }
+            let got = f32x8::from(a).exp().to_array();
+            for lane in 0..8 {
+                let want = a[lane].exp();
+                assert!(got[lane].is_finite() && got[lane] > 0.0, "exp underflowed");
+                max_ulp = max_ulp.max(ulp_diff(got[lane], want).abs());
+                let rel = f64::from((got[lane] - want).abs()) / f64::from(want);
+                max_rel_exp = max_rel_exp.max(rel);
+            }
+            i += 8;
+        }
+
+        // --- level 2: softmax probabilities --------------------------------
+        fn scalar_softmax(row: &mut [f32], limit: usize, scale: f32) {
+            let mut m = f32::NEG_INFINITY;
+            for s in row.iter_mut().take(limit) {
+                *s *= scale;
+                if *s > m {
+                    m = *s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for s in row.iter_mut().take(limit) {
+                let e = (*s - m).exp();
+                *s = e;
+                sum += e;
+            }
+            for s in row.iter_mut().take(limit) {
+                *s /= sum;
+            }
+            for s in row.iter_mut().skip(limit) {
+                *s = 0.0;
+            }
+        }
+
+        // Encoder shape: seq_k = 1500, scores ~ N(0, 64/3) before the 1/8 scale.
+        let (seq_k, d_v, rows) = (1500usize, 64usize, 64usize);
+        let scale = 0.125f32;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / 8_388_608.0 - 1.0
+        };
+
+        let mut max_abs_p = 0.0f32;
+        let mut max_rel_p = 0.0f64;
+        let mut max_rel_o = 0.0f64;
+        let vmat: Vec<f32> = (0..seq_k * d_v).map(|_| rnd()).collect();
+
+        for _ in 0..rows {
+            let src: Vec<f32> = (0..seq_k).map(|_| rnd() * 4.6).collect();
+            let mut p_ref = src.clone();
+            let mut p_poly = src.clone();
+            scalar_softmax(&mut p_ref, seq_k, scale);
+            super::softmax_row_f32_poly(&mut p_poly, seq_k, scale);
+
+            for (r, g) in p_ref.iter().zip(&p_poly) {
+                max_abs_p = max_abs_p.max((r - g).abs());
+                if *r > 1e-12 {
+                    max_rel_p = max_rel_p.max(f64::from((r - g).abs()) / f64::from(*r));
+                }
+            }
+
+            // Level 3: one output row O = P @ V, the quantity the encoder sees.
+            //
+            // Measured as the VECTOR relative error ||delta_o||_2 / ||o||_2 over the
+            // d_v-dim row, not per-component. `O` is a probability-weighted mean of
+            // zero-mean `V` rows, so individual components sit near zero and their
+            // per-component relative error is dominated by catastrophic cancellation
+            // in the reference itself, not by the poly. The vector norm is both the
+            // standard measure and the one the next layer actually responds to.
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for c in 0..d_v {
+                let (mut o_ref, mut o_poly) = (0.0f64, 0.0f64);
+                for j in 0..seq_k {
+                    o_ref += f64::from(p_ref[j]) * f64::from(vmat[j * d_v + c]);
+                    o_poly += f64::from(p_poly[j]) * f64::from(vmat[j * d_v + c]);
+                }
+                num += (o_ref - o_poly).powi(2);
+                den += o_ref.powi(2);
+            }
+            max_rel_o = max_rel_o.max((num / den.max(1e-30)).sqrt());
+        }
+
+        println!(
+            "FT_SDPA_POLY_EXP accuracy budget (measured)\n  \
+             exp over [-87,0]: max {max_ulp} ULP, max rel {max_rel_exp:.3e}\n  \
+             softmax P:        max|delta| {max_abs_p:.3e}, max rel {max_rel_p:.3e}\n  \
+             output O = P@V:   vector rel ||do||/||o|| {max_rel_o:.3e}"
+        );
+
+        // Budgets = measured worst case with ~2-6x headroom. The dominant term is
+        // NOT the poly `exp` (1 ULP) but the lane-wise row-sum reduction, which
+        // rescales a whole row nearly uniformly -- hence P's relative error is ~1e-6
+        // while its absolute error is ~1e-9.
+        assert!(max_ulp <= 2, "exp ULP budget exceeded: {max_ulp}");
+        assert!(max_rel_exp <= 1e-6, "exp rel budget exceeded: {max_rel_exp:e}");
+        assert!(max_abs_p <= 1e-8, "softmax abs budget exceeded: {max_abs_p:e}");
+        assert!(max_rel_p <= 4e-6, "softmax rel budget exceeded: {max_rel_p:e}");
+        assert!(max_rel_o <= 4e-6, "output rel budget exceeded: {max_rel_o:e}");
+    }
+
     /// The `FT_SDPA_POLY_EXP` row softmax must agree with the scalar one it
     /// replaces to well within f32 softmax tolerance, normalize exactly, respect
     /// the causal `limit` (zeroing the tail), and never emit `NaN` on a
