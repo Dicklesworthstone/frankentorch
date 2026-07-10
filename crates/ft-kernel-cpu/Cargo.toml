@@ -17,6 +17,10 @@ proptest = "1.6.0"
 criterion = { workspace = true }
 
 [[bench]]
+name = "sgemm_tile_shape"
+harness = false
+
+[[bench]]
 name = "gemm_bench"
 harness = false
 

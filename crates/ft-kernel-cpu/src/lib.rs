@@ -796,10 +796,23 @@ mod gemm {
     // Shared M×N tile grid: ~sqrt(threads) blocks per axis (minimises B+A traffic
     // for square shapes), clamped to the GEMM block-size floors. Returns the block
     // extents and the list of (i0,j0) tile origins — disjoint rectangles tiling C.
+    /// Rows x cols of the 2-D tile grid. See [`crate::set_sgemm_tile_balanced`].
+    ///
+    /// Historical: `p = floor(sqrt(T))`, `q = ceil(T/p)` — but `p*q != T` for many T, e.g.
+    /// T=32 -> 5x7 = 35 tiles on 32 threads (a 3-tile straggler wave). Balanced: `p` = the
+    /// largest divisor of T that is <= sqrt(T), so `p*q == T`. Both are bit-exact.
+    pub(crate) fn tile_grid(threads: usize) -> (usize, usize) {
+        let lim = (threads as f64).sqrt().floor().max(1.0) as usize;
+        if crate::sgemm_tile_balanced() {
+            let p = (1..=lim).filter(|c| threads % c == 0).max().unwrap_or(1);
+            return (p, threads / p);
+        }
+        (lim, threads.div_ceil(lim))
+    }
+
     fn tile_shape(m: usize, n: usize) -> (usize, usize) {
         let threads = rayon::current_num_threads().max(1);
-        let p = (threads as f64).sqrt().floor().max(1.0) as usize; // M-blocks
-        let q = threads.div_ceil(p); // N-blocks
+        let (p, q) = tile_grid(threads);
         let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
         let nb = n.div_ceil(q).max(MIN_BLOCK_COLS);
         (mb, nb)
@@ -4369,6 +4382,50 @@ pub fn set_sdpa_poly_exp(on: bool) {
 #[must_use]
 pub fn sdpa_poly_exp() -> bool {
     sdpa_poly_exp_enabled()
+}
+
+static SGEMM_TILE_BALANCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn sgemm_tile_balanced_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var("FT_SGEMM_TILE_BALANCED").is_ok_and(|v| v == "1") {
+            SGEMM_TILE_BALANCED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Select the 2-D GEMM tile grid policy. **Default off** = the historical grid.
+///
+/// The historical grid is `p = floor(sqrt(T))`, `q = ceil(T/p)`, which gives `p*q != T` for
+/// many thread counts: at `T = 32` it is `5x7 = 35` tiles on 32 threads, so a straggler wave
+/// of 3 tiles runs while 29 threads idle. With this enabled, `p` is the largest **divisor**
+/// of `T` that is `<= sqrt(T)`, so `p*q == T` exactly (32 -> 4x8). Thread counts whose grid
+/// is already balanced (`T = 64 -> 8x8`, `T = 16 -> 4x4`) do not move.
+///
+/// **Both policies are bit-exact**: every output element's full k-accumulation happens inside
+/// one serial micro-kernel call, and neither the row nor the column count changes that order
+/// (the invariant behind `gemm_2d_parallel_is_bit_exact_vs_serial`). This knob therefore
+/// cannot change results — only scheduling.
+///
+/// Default off pending a keep-gate measurement on a host that can field the thread count
+/// under test; `FT_SGEMM_TILE_BALANCED=1` seeds it on at process start. This setter exists so
+/// a bench can flip the policy **inside one binary** and time the real
+/// `matmul_tensor_contiguous_f32` both ways — a bench that times a *replica* of the scheduler
+/// is not evidence about the scheduler.
+///
+/// Read once per GEMM call; set it during setup, not mid-flight.
+pub fn set_sgemm_tile_balanced(on: bool) {
+    sgemm_tile_balanced_init();
+    SGEMM_TILE_BALANCED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the balanced 2-D tile grid policy is currently enabled.
+#[must_use]
+pub fn sgemm_tile_balanced() -> bool {
+    sgemm_tile_balanced_init();
+    SGEMM_TILE_BALANCED.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 /// `softmax(scale * row[..limit])` in place, zeroing `row[limit..]` — the 8-lane
