@@ -4384,6 +4384,51 @@ pub fn sdpa_poly_exp() -> bool {
     sdpa_poly_exp_enabled()
 }
 
+/// Query-row tile size (`BR`) for [`sdpa_forward_f32`]. Default **64**.
+static SDPA_BR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn sdpa_br() -> usize {
+    let v = SDPA_BR.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 0 {
+        return v;
+    }
+    let seeded = std::env::var("FT_SDPA_BR")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .filter(|b| *b >= 8 && *b <= 512)
+        .unwrap_or(SDPA_BR_DEFAULT);
+    SDPA_BR.store(seeded, std::sync::atomic::Ordering::Relaxed);
+    seeded
+}
+
+const SDPA_BR_DEFAULT: usize = 64;
+/// Row count above which `sdpa_forward_f32` splits a head's blocks across the pool.
+/// Deliberately a CONSTANT, not `BR`: the parallel structure must not change when the
+/// tile size is tuned, or a `BR` sweep silently measures two different schedulers.
+const SDPA_PAR_MIN_ROWS: usize = 64;
+
+/// Set the query-row tile size for [`sdpa_forward_f32`] (clamped to `[8, 512]`).
+///
+/// `kh`/`vh` are invariant across a head's `ceil(seq_q / BR)` blocks, yet `matrixmultiply`
+/// repacks them on every call (it has no prepack API), so a larger `BR` amortizes both
+/// B-packs. Counter-force: the per-block scratch is `BR * seq_k * 4` bytes and leaves L2.
+///
+/// **Bit-exact in `BR`**: `matrixmultiply`'s k-accumulation order is fixed by the
+/// micro-kernel and does not depend on the row count, and the softmax is per-row. Changing
+/// `BR` can only change scheduling, never results.
+///
+/// Exists so a bench can sweep `BR` inside **one binary** — an env var is read once per
+/// process, and an A/B split across two process invocations is not admissible.
+pub fn set_sdpa_br(br: usize) {
+    SDPA_BR.store(br.clamp(8, 512), std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current query-row tile size for [`sdpa_forward_f32`].
+#[must_use]
+pub fn sdpa_br_current() -> usize {
+    sdpa_br()
+}
+
 static SGEMM_TILE_BALANCED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
@@ -4531,7 +4576,7 @@ pub fn sdpa_forward_f32(
     scale: f32,
     causal: bool,
 ) -> Vec<f32> {
-    const BR: usize = 64;
+    let br_tile = sdpa_br();
     let mut out = vec![0.0f32; num_bh * seq_q * d_v];
     let q_stride = seq_q * d_k;
     let k_stride = seq_k * d_k;
@@ -4580,14 +4625,14 @@ pub fn sdpa_forward_f32(
     };
     // Few heads but many cores: also split each head's independent BR-row blocks across the
     // pool (same guard/rationale as the f64 kernel; head-heavy inputs keep the serial loop).
-    if num_bh < rayon::current_num_threads() && seq_q > BR {
+    if num_bh < rayon::current_num_threads() && seq_q > SDPA_PAR_MIN_ROWS {
         out.par_chunks_mut(o_stride)
             .enumerate()
             .for_each(|(bh, o_chunk)| {
                 o_chunk
-                    .par_chunks_mut(BR * d_v)
+                    .par_chunks_mut(br_tile * d_v)
                     .enumerate()
-                    .for_each(|(blk, o_block)| block(bh, blk * BR, o_block));
+                    .for_each(|(blk, o_block)| block(bh, blk * br_tile, o_block));
             });
     } else {
         out.par_chunks_mut(o_stride)
@@ -4595,7 +4640,7 @@ pub fn sdpa_forward_f32(
             .for_each(|(bh, o_chunk)| {
                 let mut q0 = 0;
                 while q0 < seq_q {
-                    let br = (q0 + BR).min(seq_q) - q0;
+                    let br = (q0 + br_tile).min(seq_q) - q0;
                     block(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v]);
                     q0 += br;
                 }
