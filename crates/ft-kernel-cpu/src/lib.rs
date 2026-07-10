@@ -4319,11 +4319,6 @@ pub fn sdpa_forward_masked_gqa_f64(
     out
 }
 
-/// f32 mirror of [`sdpa_forward_f64`] (the common transformer inference dtype):
-/// same block-row flash-attention pattern, using the `sgemm_bt`/`sgemm`
-/// microkernels and f32 softmax.
-#[allow(clippy::too_many_arguments)]
-#[must_use]
 /// Opt-in: replace [`sdpa_forward_f32`]'s scalar `libm` softmax with an 8-lane
 /// polynomial one (`FT_SDPA_POLY_EXP=1`). Probed once, cached.
 ///
@@ -4613,6 +4608,11 @@ fn softmax_row_f32_poly(row: &mut [f32], limit: usize, scale: f32) {
     }
 }
 
+/// f32 mirror of [`sdpa_forward_f64`] (the common transformer inference dtype):
+/// same block-row flash-attention pattern, using the `sgemm_bt`/`sgemm`
+/// microkernels and f32 softmax.
+#[allow(clippy::too_many_arguments)]
+#[must_use]
 pub fn sdpa_forward_f32(
     q: &[f32],
     k: &[f32],
