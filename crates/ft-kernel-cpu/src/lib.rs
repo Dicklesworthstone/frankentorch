@@ -4323,9 +4323,52 @@ pub fn sdpa_forward_masked_gqa_f64(
 /// **124.5 ms of the kernel's 525.0 ms (23.7%)** — not the "negligible fraction"
 /// a franken-side per-head rewrite had suggested. Vectorising it recovers
 /// **111.2 ms/window (21.2% of the kernel)** at `max|delta| = 3.2e-9` vs `libm`.
+static SDPA_POLY_EXP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Seed [`SDPA_POLY_EXP`] from `FT_SDPA_POLY_EXP` exactly once, before any read or write.
+///
+/// The setter calls this first, so an explicit [`set_sdpa_poly_exp`] always wins over
+/// the environment regardless of call order.
+fn sdpa_poly_exp_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var("FT_SDPA_POLY_EXP").is_ok_and(|val| val == "1") {
+            SDPA_POLY_EXP.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
 fn sdpa_poly_exp_enabled() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("FT_SDPA_POLY_EXP").is_ok_and(|val| val == "1"))
+    sdpa_poly_exp_init();
+    SDPA_POLY_EXP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enable/disable the 8-lane polynomial softmax inside [`sdpa_forward_f32`].
+///
+/// Default **off**; `FT_SDPA_POLY_EXP=1` turns it on for the process. This setter exists
+/// because an env var is the wrong control surface for a library: it is process-global,
+/// and a downstream crate under `#![forbid(unsafe_code)]` cannot call `std::env::set_var`
+/// (unsafe in edition 2024). A consumer that has certified the numerics for *its* model
+/// can opt in here instead.
+///
+/// **Not bit-exact.** The poly `exp` is 1 ULP (rel 1.192e-7), but the lane-wise row-sum
+/// reduction reorders the softmax denominator, so `O = P@V` moves by a vector-relative
+/// 1.425e-6 (see `sdpa_poly_exp_accuracy_budget`). Certify with a task-level gate before
+/// enabling: `franken_whisper`'s WER gate passes 4/4 on `large-v3-turbo` but does **not**
+/// certify `tiny.en`.
+///
+/// `sdpa_forward_f32` reads this once per call, so flipping it concurrently with a call
+/// in flight cannot tear a single invocation — but the flip may or may not be observed by
+/// that call. Set it during setup, not mid-inference.
+pub fn set_sdpa_poly_exp(on: bool) {
+    sdpa_poly_exp_init();
+    SDPA_POLY_EXP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the poly softmax in [`sdpa_forward_f32`] is currently enabled.
+#[must_use]
+pub fn sdpa_poly_exp() -> bool {
+    sdpa_poly_exp_enabled()
 }
 
 /// `softmax(scale * row[..limit])` in place, zeroing `row[limit..]` — the 8-lane
