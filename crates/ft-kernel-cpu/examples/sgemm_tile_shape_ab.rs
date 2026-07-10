@@ -129,11 +129,21 @@ fn main() {
     rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
     let reps: usize = std::env::var("TILE_AB_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
 
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".into());
+    // A ratio is admissible ONLY if both arms ran in this one process (they do) AND the
+    // host can actually field the thread count under test. rch picks workers
+    // non-deterministically and the ORIG/CAND ratio is NOT worker-invariant, so a ratio
+    // compared across two rch invocations is meaningless -- never do that.
+    let admissible = avail >= threads;
+
     let (pc, qc) = grid_current(threads);
     let (pb, qb) = grid_balanced(threads);
-    println!("threads={threads}  available_parallelism={avail}  reps={reps}");
-    if avail < threads {
-        println!("  !! WARNING: worker has {avail} < {threads} hw threads -- pool is oversubscribed, ratios degraded");
+    println!("host={host}  threads={threads}  available_parallelism={avail}  reps={reps}");
+    if !admissible {
+        println!("  !! WARNING: host has {avail} < {threads} hw threads -- pool is oversubscribed {}x;", threads.div_ceil(avail.max(1)));
+        println!("  !! rayon work-steals across the oversubscription and SMEARS the straggler being measured.");
     }
     println!("  current  grid p x q = {pc} x {qc}  (p*q = {})", pc * qc);
     println!("  balanced grid p x q = {pb} x {qb}  (p*q = {})", pb * qb);
@@ -194,9 +204,20 @@ fn main() {
     }
 
     println!("\nTURBO LINEAR-GEMM LAYER (4x qkv/out + fc1 + fc2):  A {:.2} ms -> C {:.2} ms = {:.3}x", la, lc, la / lc);
-    println!("all arms bit-exact: {all_bit}");
-    let enc = 1.0 / (1.0 - 0.728 + 0.728 / (la / lc));
-    println!("projected: encoder {:.3}x -> e2e {:.3}x  (linear GEMMs 72.8% of encoder_window, encoder 89.5% of e2e)",
-        enc, 1.0 / (0.105 + 0.895 / enc));
+    println!("all arms bit-exact: {all_bit}   (this half IS certified: it is host-independent)");
+
+    println!("\n=== VERDICT ===");
+    if admissible {
+        let enc = 1.0 / (1.0 - 0.728 + 0.728 / (la / lc));
+        println!("PERF ADMISSIBLE (host={host}, {avail} hw threads >= {threads} under test, single binary, single invocation)");
+        println!("projected: encoder {:.3}x -> e2e {:.3}x  (linear GEMMs 72.8% of encoder_window, encoder 89.5% of e2e)",
+            enc, 1.0 / (0.105 + 0.895 / enc));
+    } else {
+        println!("PERF *** NOT ADMISSIBLE *** on host={host}: {avail} hw threads < {threads} under test.");
+        println!("DO NOT QUOTE ANY RATIO ABOVE. Re-run on a host with >= {threads} physical cores.");
+    }
     println!("\nFIDELITY GUARD: B/A must be ~1.00x and A==B bit-exact. If not, the replication is wrong and C is meaningless.");
+    println!("SUBSTRATE: all arms run in ONE binary + ONE invocation, order rotated per rep, so host identity and");
+    println!("drift cancel WITHIN a run. Ratios are NOT worker-invariant: never compare a ratio from one rch");
+    println!("invocation against a ratio from another (franken_networkx br-r37-c1-839yx).");
 }
