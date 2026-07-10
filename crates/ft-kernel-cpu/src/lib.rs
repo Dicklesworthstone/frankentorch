@@ -4284,6 +4284,114 @@ pub fn sdpa_forward_masked_gqa_f64(
 /// microkernels and f32 softmax.
 #[allow(clippy::too_many_arguments)]
 #[must_use]
+/// Opt-in: replace [`sdpa_forward_f32`]'s scalar `libm` softmax with an 8-lane
+/// polynomial one (`FT_SDPA_POLY_EXP=1`). Probed once, cached.
+///
+/// Default OFF, so the kernel is bit-for-bit unchanged for every existing caller.
+/// The transcendental is NOT the same function, so the ON path is deliberately
+/// non-byte-exact and belongs behind a caller-side quality gate.
+///
+/// Motivation (franken_whisper, 2026-07-09, real large-v3-turbo encoder shape
+/// `num_bh=20, seq=1500, d=64`, 32 layers, min-of-7): the scalar `exp` is
+/// **124.5 ms of the kernel's 525.0 ms (23.7%)** — not the "negligible fraction"
+/// a franken-side per-head rewrite had suggested. Vectorising it recovers
+/// **111.2 ms/window (21.2% of the kernel)** at `max|delta| = 3.2e-9` vs `libm`.
+fn sdpa_poly_exp_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("FT_SDPA_POLY_EXP").is_ok_and(|val| val == "1"))
+}
+
+/// `softmax(scale * row[..limit])` in place, zeroing `row[limit..]` — the 8-lane
+/// counterpart of [`sdpa_forward_f32`]'s scalar row softmax.
+///
+/// `wide`'s polynomial `exp` is ~1-2 ULP but wrongly flushes to `0.0` unless every
+/// lane is finite with `|x| < 88`, so the reduced argument is clamped to
+/// `>= -87.0` first: `exp(-87) = 1.6e-38` is already at the bottom of the normal
+/// f32 range, and the clamp only lifts terms that contribute nothing to the sum.
+/// A non-finite row max (a fully-masked row, unreachable for a bidirectional
+/// encoder) falls back to the scalar path rather than propagating `NaN`.
+///
+/// The lane-wise sum reduces in a different order than the scalar loop, so this is
+/// non-byte-exact by construction — see [`sdpa_poly_exp_enabled`].
+fn softmax_row_f32_poly(row: &mut [f32], limit: usize, scale: f32) {
+    /// Below this the reduced argument contributes nothing but would trip wide's
+    /// flush-to-zero band.
+    const LO: f32 = -87.0;
+
+    let vscale = f32x8::splat(scale);
+    let mut vmax = f32x8::splat(f32::NEG_INFINITY);
+    let mut i = 0;
+    while i + 8 <= limit {
+        let mut a = [0.0f32; 8];
+        a.copy_from_slice(&row[i..i + 8]);
+        let scaled = f32x8::from(a) * vscale;
+        row[i..i + 8].copy_from_slice(&scaled.to_array());
+        vmax = vmax.max(scaled);
+        i += 8;
+    }
+    let mut m = vmax
+        .to_array()
+        .into_iter()
+        .fold(f32::NEG_INFINITY, f32::max);
+    for s in row[i..limit].iter_mut() {
+        *s *= scale;
+        if *s > m {
+            m = *s;
+        }
+    }
+
+    if !m.is_finite() {
+        // Degenerate row: reproduce the scalar kernel's own behaviour exactly.
+        let mut sum = 0.0f32;
+        for s in row.iter_mut().take(limit) {
+            let e = (*s - m).exp();
+            *s = e;
+            sum += e;
+        }
+        for s in row.iter_mut().take(limit) {
+            *s /= sum;
+        }
+        for s in row.iter_mut().skip(limit) {
+            *s = 0.0;
+        }
+        return;
+    }
+
+    let vm = f32x8::splat(m);
+    let vlo = f32x8::splat(LO);
+    let mut vsum = f32x8::splat(0.0);
+    let mut i = 0;
+    while i + 8 <= limit {
+        let mut a = [0.0f32; 8];
+        a.copy_from_slice(&row[i..i + 8]);
+        let e = ((f32x8::from(a) - vm).max(vlo)).exp();
+        row[i..i + 8].copy_from_slice(&e.to_array());
+        vsum += e;
+        i += 8;
+    }
+    let mut sum: f32 = vsum.to_array().iter().sum();
+    for s in row[i..limit].iter_mut() {
+        let e = (*s - m).exp();
+        *s = e;
+        sum += e;
+    }
+
+    let vsum_b = f32x8::splat(sum);
+    let mut i = 0;
+    while i + 8 <= limit {
+        let mut a = [0.0f32; 8];
+        a.copy_from_slice(&row[i..i + 8]);
+        row[i..i + 8].copy_from_slice(&(f32x8::from(a) / vsum_b).to_array());
+        i += 8;
+    }
+    for s in row[i..limit].iter_mut() {
+        *s /= sum;
+    }
+    for s in row.iter_mut().skip(limit) {
+        *s = 0.0;
+    }
+}
+
 pub fn sdpa_forward_f32(
     q: &[f32],
     k: &[f32],
@@ -4302,6 +4410,7 @@ pub fn sdpa_forward_f32(
     let k_stride = seq_k * d_k;
     let v_stride = seq_k * d_v;
     let o_stride = seq_q * d_v;
+    let poly = sdpa_poly_exp_enabled();
     // One independent BR-row block (f32 mirror of the f64 kernel). Blocks within a head are
     // independent, so they are the unit of both the serial loop and the parallel split.
     let block = |bh: usize, q0: usize, o_block: &mut [f32]| {
@@ -4316,6 +4425,10 @@ pub fn sdpa_forward_f32(
             let qi = q0 + r;
             let limit = if causal { (qi + 1).min(seq_k) } else { seq_k };
             let row = &mut sc[r * seq_k..(r + 1) * seq_k];
+            if poly {
+                softmax_row_f32_poly(row, limit, scale);
+                continue;
+            }
             let mut m = f32::NEG_INFINITY;
             for s in row.iter_mut().take(limit) {
                 *s *= scale;
@@ -36370,6 +36483,79 @@ mod tests {
                 assert!(rel < 1e-9, "batch {bi}: {g} vs {w} (rel {rel:.2e})");
             }
         }
+    }
+
+    /// The `FT_SDPA_POLY_EXP` row softmax must agree with the scalar one it
+    /// replaces to well within f32 softmax tolerance, normalize exactly, respect
+    /// the causal `limit` (zeroing the tail), and never emit `NaN` on a
+    /// fully-masked row.
+    #[test]
+    fn softmax_row_f32_poly_matches_scalar_softmax() {
+        fn scalar(row: &mut [f32], limit: usize, scale: f32) {
+            let mut m = f32::NEG_INFINITY;
+            for s in row.iter_mut().take(limit) {
+                *s *= scale;
+                if *s > m {
+                    m = *s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for s in row.iter_mut().take(limit) {
+                let e = (*s - m).exp();
+                *s = e;
+                sum += e;
+            }
+            for s in row.iter_mut().take(limit) {
+                *s /= sum;
+            }
+            for s in row.iter_mut().skip(limit) {
+                *s = 0.0;
+            }
+        }
+
+        let scale = 0.125f32;
+        // Widths straddling the 8-lane body/tail split; limits exercise the
+        // causal masking path (limit < len) and the bidirectional one (== len).
+        for len in [1usize, 7, 8, 9, 16, 100, 1500] {
+            for &limit in &[len, len.div_ceil(2), 1] {
+                let src: Vec<f32> = (0..len)
+                    .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.31)
+                    .collect();
+                let mut a = src.clone();
+                let mut b = src.clone();
+                scalar(&mut a, limit, scale);
+                super::softmax_row_f32_poly(&mut b, limit, scale);
+
+                let maxabs = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    maxabs < 1e-6,
+                    "len={len} limit={limit}: max|delta| = {maxabs:e}"
+                );
+                let sum: f32 = b[..limit].iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 1e-5,
+                    "len={len} limit={limit}: sum={sum}"
+                );
+                assert!(
+                    b[limit..].iter().all(|v| *v == 0.0),
+                    "len={len} limit={limit}: masked tail not zeroed"
+                );
+                assert!(b.iter().all(|v| v.is_finite()), "non-finite output");
+            }
+        }
+
+        // Fully-masked row: the scalar kernel produces NaN here; the poly path
+        // must reproduce that rather than silently diverging.
+        let mut row = vec![f32::NEG_INFINITY; 16];
+        super::softmax_row_f32_poly(&mut row, 16, scale);
+        assert!(
+            row.iter().all(|v| v.is_nan()),
+            "degenerate row must match scalar NaN"
+        );
     }
 
     #[test]
