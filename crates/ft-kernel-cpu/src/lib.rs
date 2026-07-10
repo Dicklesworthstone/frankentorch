@@ -57,7 +57,34 @@ mod gemm {
     // n2048 sgemm 0.81x). Above this K, keep the 1-D row split. K <= 1024 covers the
     // measured wins (sgemm 1.10-1.45x, sgemm_bt 1.02-1.25x). frankentorch-kgs4.48.
     const F32_2D_MAX_K: usize = 1024;
-    const F32_2D_TALL_MAX_K: usize = 1536;
+    // The 1536 cap above was justified by "large-K square sgemm regresses (m2048 k2048
+    // n2048, 0.81x)". Re-measured 2026-07-10 on a 32-core Zen3 (x86-64-v3, 32 rayon
+    // threads, interleaved, min-of-9): that shape is **1.27x FASTER** 2-D tiled, and
+    // `[1500,5120]x[5120,1280]` (large-v3-turbo's encoder MLP fc2, the only franken
+    // shape the cap excluded) is **1.18-1.24x faster**. Both are BIT-EXACT vs the 1-D
+    // row split: every output element's full k-accumulation still happens inside ONE
+    // serial micro-kernel call, and neither the row nor the column count changes that
+    // order (same invariant as `gemm_row_split_matches_single_bit_exact`).
+    //
+    // Mechanism the old cap missed: gating on K alone is wrong. What decides whether
+    // the 1-D row split hurts is the size of B (k*n*4 bytes) that EVERY thread must
+    // re-stream — fc2's B is 26.2 MB, re-streamed 32x = 839 MB. The 2-D grid cuts that
+    // by the column-block count. K is only a proxy, and a bad one for wide-N shapes.
+    //
+    // Kill-switch: `FT_SGEMM_2D_LARGE_K=0` restores the historical 1536 bound.
+    const F32_2D_TALL_MAX_K_DEFAULT: usize = 8192;
+    const F32_2D_TALL_MAX_K_LEGACY: usize = 1536;
+
+    fn f32_2d_tall_max_k() -> usize {
+        static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            if std::env::var("FT_SGEMM_2D_LARGE_K").is_ok_and(|v| v == "0") {
+                F32_2D_TALL_MAX_K_LEGACY
+            } else {
+                F32_2D_TALL_MAX_K_DEFAULT
+            }
+        })
+    }
 
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
@@ -74,7 +101,7 @@ mod gemm {
     fn should_use_f32_reused_output_2d_tiling(m: usize, k: usize, n: usize) -> bool {
         n >= 2 * MIN_BLOCK_COLS
             && k > F32_2D_MAX_K
-            && k <= F32_2D_TALL_MAX_K
+            && k <= f32_2d_tall_max_k()
             && m >= TALL_MIN_ROWS
             && n >= TALL_MIN_ROWS
     }
