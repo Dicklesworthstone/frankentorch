@@ -31,7 +31,7 @@
 //!        cargo bench -p ft-kernel-cpu --bench sdpa_br
 
 use criterion::{criterion_group, criterion_main, Criterion};
-use ft_kernel_cpu::{sdpa_forward_f32, set_sdpa_br};
+use ft_kernel_cpu::{sdpa_forward_f32, set_sdpa_br, set_sdpa_br_auto};
 use std::hint::black_box;
 use std::time::Instant;
 
@@ -71,23 +71,32 @@ fn run(br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize, sq: usize, sk: us
 
 fn blocks(sq: usize, br: usize) -> usize { sq.div_ceil(br) }
 
-/// interleaved, paired, order-alternated. returns (med_a, med_b, med_ratio, cv_pct, wins, n)
+/// **ABBA within every rep.** Each rep times A,B,B,A and forms `(tA1+tA2)/(tB1+tB2)`.
+///
+/// Why not simple alternation: `sdpa_forward_f32` allocates and returns a fresh 7.7 MB output per
+/// call, so the FIRST call of a rep page-faults new pages while the SECOND reuses the ones the
+/// first just freed. Plain A/B alternation over an odd rep count leaves one arm in first position
+/// more often — which is exactly the +11.6% systematic bias the null control caught (1.1163x at
+/// cv 29.0%, worker vmi1149989). In ABBA, A occupies positions 1 and 4 and B positions 2 and 3, so
+/// the position effect and any linear drift cancel *within each rep*.
+///
+/// Returns (med_a, med_b, med_ratio, cv_pct, wins, n).
 #[allow(clippy::too_many_arguments)]
 fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize, sq: usize, sk: usize, d: usize, reps: usize) -> (f64, f64, f64, f64, usize, usize) {
     let scale = 1.0 / (d as f32).sqrt();
     let warm = 3usize;
     let (mut va, mut vb, mut rs) = (Vec::new(), Vec::new(), Vec::new());
     for r in 0..(reps + warm) {
-        let (ta, tb) = if r % 2 == 0 {
-            let (x, _) = run(a_br, q, k, v, nbh, sq, sk, d, scale);
-            let (y, _) = run(b_br, q, k, v, nbh, sq, sk, d, scale);
-            (x, y)
-        } else {
-            let (y, _) = run(b_br, q, k, v, nbh, sq, sk, d, scale);
-            let (x, _) = run(a_br, q, k, v, nbh, sq, sk, d, scale);
-            (x, y)
-        };
-        if r >= warm { va.push(ta); vb.push(tb); rs.push(ta / tb); }
+        let (ta1, _) = run(a_br, q, k, v, nbh, sq, sk, d, scale);
+        let (tb1, _) = run(b_br, q, k, v, nbh, sq, sk, d, scale);
+        let (tb2, _) = run(b_br, q, k, v, nbh, sq, sk, d, scale);
+        let (ta2, _) = run(a_br, q, k, v, nbh, sq, sk, d, scale);
+        if r >= warm {
+            let (ta, tb) = (ta1 + ta2, tb1 + tb2);
+            va.push(ta / 2.0);
+            vb.push(tb / 2.0);
+            rs.push(ta / tb);
+        }
     }
     let med = |x: &mut Vec<f64>| { x.sort_by(|p, q| p.partial_cmp(q).unwrap()); x[x.len() / 2] };
     let mean = rs.iter().sum::<f64>() / rs.len() as f64;
@@ -101,7 +110,7 @@ fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize,
 fn bench(_c: &mut Criterion) {
     let avail = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "?".into());
-    let reps: usize = std::env::var("BR_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+    let reps: usize = std::env::var("BR_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
     println!("\n===== sdpa_forward_f32 BR sweep — REAL fn, one binary, interleaved =====");
     println!("host={host} available_parallelism={avail} reps={reps} threads={}", rayon::current_num_threads());
 
@@ -129,6 +138,10 @@ fn bench(_c: &mut Criterion) {
     let (a, b, r, cv, w, n) = paired(64, 64, &q, &k, &v, nbh, sq, sk, d, reps);
     println!("{:<34} {a:>9.1} {b:>9.1} {r:>7.4}x {cv:>6.1} {w:>4}/{n:<3} {}", "NULL CONTROL (BR=64 vs BR=64)", if cv < 5.0 { "PASS" } else { "FAIL" });
 
+    // AUTO (the new default policy) vs the historical fixed 64
+    let (a, b, r, cv, w, n) = paired(64, 0, &q, &k, &v, nbh, sq, sk, d, reps);
+    println!("{:<34} {a:>9.1} {b:>9.1} {r:>7.4}x {cv:>6.1} {w:>4}/{n:<3} {}", "AUTO policy (adaptive BR)", if cv < 5.0 { "PASS" } else { "FAIL" });
+
     for br in [96usize, 128, 160] {
         let (a, b, r, cv, w, n) = paired(64, br, &q, &k, &v, nbh, sq, sk, d, reps);
         println!("{:<34} {a:>9.1} {b:>9.1} {r:>7.4}x {cv:>6.1} {w:>4}/{n:<3} {}", format!("BR={br}"), if cv < 5.0 { "PASS" } else { "FAIL" });
@@ -143,10 +156,10 @@ fn bench(_c: &mut Criterion) {
         let (_, o64) = run(64, &q2, &k2, &v2, nbh2, sq2, sq2, d, scale);
         let (_, o128) = run(128, &q2, &k2, &v2, nbh2, sq2, sq2, d, scale);
         assert!(o64.iter().zip(o128.iter()).all(|(x, y)| x.to_bits() == y.to_bits()), "bit-exact must hold at every shape");
-        let (a, b, r, cv, w, n) = paired(64, 128, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(7));
-        println!("  nbh={nbh2:<3} seq={sq2:<5} BR64 {a:>7.2} ms  BR128 {b:>7.2} ms  ratio {r:.4}x  cv {cv:.1}%  wins {w}/{n}  bit-exact");
+        let (a, b, r, cv, w, n) = paired(64, 0, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(9));
+        println!("  nbh={nbh2:<3} seq={sq2:<5} BR64 {a:>7.2} ms  AUTO {b:>7.2} ms  ratio {r:.4}x  cv {cv:.1}%  wins {w}/{n}  bit-exact");
     }
-    set_sdpa_br(64);
+    set_sdpa_br_auto();
 }
 
 criterion_group!(benches, bench);

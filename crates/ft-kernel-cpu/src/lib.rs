@@ -4384,24 +4384,65 @@ pub fn sdpa_poly_exp() -> bool {
     sdpa_poly_exp_enabled()
 }
 
-/// Query-row tile size (`BR`) for [`sdpa_forward_f32`]. Default **64**.
-static SDPA_BR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+/// Query-row tile size (`BR`) for [`sdpa_forward_f32`]. **Default: fixed 64** (historical).
+/// `SDPA_BR_AUTO` (0) selects [`sdpa_br_for`]'s adaptive policy; opt in via [`set_sdpa_br_auto`].
+static SDPA_BR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
 
-fn sdpa_br() -> usize {
-    let v = SDPA_BR.load(std::sync::atomic::Ordering::Relaxed);
-    if v != 0 {
-        return v;
+/// Sentinel stored in [`SDPA_BR`] meaning "choose adaptively".
+const SDPA_BR_AUTO: usize = 0;
+/// Historical tile. Also the floor: never coarsen below it.
+const SDPA_BR_SMALL: usize = 64;
+/// Coarser tile. Amortizes the per-block `kh`/`vh` repack (`matrixmultiply` has no prepack
+/// API) over 2x the query rows. MEASURED +2.29% (null-corrected, 34/41 paired wins, sign-p
+/// < 0.001, cv 4.1%, worker hz2) on the large-v3-turbo shape.
+const SDPA_BR_LARGE: usize = 128;
+/// Blocks per thread we insist on keeping before coarsening the tile.
+const SDPA_BR_TASKS_PER_THREAD: usize = 4;
+
+/// Adaptive query-row tile.
+///
+/// Coarsening `BR` amortizes the per-block B-repack, but it also **halves the number of
+/// parallel row-blocks**. When `num_bh < threads` the kernel splits a head's blocks across the
+/// pool, so with few heads the coarser tile starves the pool: MEASURED **0.9414x** (1/7 wins)
+/// at `num_bh = 4, seq_q = 1500`. So coarsen only when the block supply stays ample.
+///
+/// * `num_bh >= threads` — heads alone fill the pool, blocks run serially per head ⇒ coarsen.
+/// * otherwise coarsen only if `num_bh * ceil(seq_q / BR_LARGE) >= TASKS_PER_THREAD * threads`.
+///
+/// **Bit-exact either way**: `BR` can only change scheduling.
+fn sdpa_br_pick(seq_q: usize, num_bh: usize, threads: usize) -> usize {
+    let threads = threads.max(1);
+    if num_bh >= threads {
+        return SDPA_BR_LARGE;
     }
-    let seeded = std::env::var("FT_SDPA_BR")
-        .ok()
-        .and_then(|s| s.parse::<usize>().ok())
-        .filter(|b| *b >= 8 && *b <= 512)
-        .unwrap_or(SDPA_BR_DEFAULT);
-    SDPA_BR.store(seeded, std::sync::atomic::Ordering::Relaxed);
-    seeded
+    let blocks = seq_q.div_ceil(SDPA_BR_LARGE);
+    if num_bh.saturating_mul(blocks) >= SDPA_BR_TASKS_PER_THREAD.saturating_mul(threads) {
+        SDPA_BR_LARGE
+    } else {
+        SDPA_BR_SMALL
+    }
 }
 
-const SDPA_BR_DEFAULT: usize = 64;
+fn sdpa_br_for(seq_q: usize, num_bh: usize) -> usize {
+    let explicit = SDPA_BR.load(std::sync::atomic::Ordering::Relaxed);
+    if explicit != SDPA_BR_AUTO {
+        return explicit;
+    }
+    sdpa_br_pick(seq_q, num_bh, rayon::current_num_threads())
+}
+
+fn sdpa_br_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if let Some(b) = std::env::var("FT_SDPA_BR")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|b| *b >= 8 && *b <= 512)
+        {
+            SDPA_BR.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
 /// Row count above which `sdpa_forward_f32` splits a head's blocks across the pool.
 /// Deliberately a CONSTANT, not `BR`: the parallel structure must not change when the
 /// tile size is tuned, or a `BR` sweep silently measures two different schedulers.
@@ -4420,13 +4461,21 @@ const SDPA_PAR_MIN_ROWS: usize = 64;
 /// Exists so a bench can sweep `BR` inside **one binary** — an env var is read once per
 /// process, and an A/B split across two process invocations is not admissible.
 pub fn set_sdpa_br(br: usize) {
-    SDPA_BR.store(br.clamp(8, 512), std::sync::atomic::Ordering::Relaxed);
+    sdpa_br_init();
+    let v = if br == SDPA_BR_AUTO { SDPA_BR_AUTO } else { br.clamp(8, 512) };
+    SDPA_BR.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restore the adaptive tile policy (the default).
+pub fn set_sdpa_br_auto() {
+    set_sdpa_br(SDPA_BR_AUTO);
 }
 
 /// Current query-row tile size for [`sdpa_forward_f32`].
 #[must_use]
-pub fn sdpa_br_current() -> usize {
-    sdpa_br()
+pub fn sdpa_br_current(seq_q: usize, num_bh: usize) -> usize {
+    sdpa_br_init();
+    sdpa_br_for(seq_q, num_bh)
 }
 
 static SGEMM_TILE_BALANCED: std::sync::atomic::AtomicBool =
@@ -4576,7 +4625,8 @@ pub fn sdpa_forward_f32(
     scale: f32,
     causal: bool,
 ) -> Vec<f32> {
-    let br_tile = sdpa_br();
+    sdpa_br_init();
+    let br_tile = sdpa_br_for(seq_q, num_bh);
     let mut out = vec![0.0f32; num_bh * seq_q * d_v];
     let q_stride = seq_q * d_k;
     let k_stride = seq_k * d_k;
@@ -36669,6 +36719,21 @@ mod tests {
     /// Budget (measured, with headroom): `exp` <= 2 ULP; `P` max|delta| <= 1e-7 and
     /// max relative error <= 1e-6; `O` max relative error <= 1e-6.
     #[test]
+    /// The adaptive `BR` policy is pure logic — verify its SELECTIONS deterministically,
+    /// host-independently, with no timing. Timing evidence lives in the ledger.
+    #[test]
+    fn sdpa_br_policy_picks_the_measured_tile() {
+        // heads alone fill the pool -> blocks run serially per head -> coarsen freely
+        assert_eq!(crate::sdpa_br_pick(1500, 64, 16), crate::SDPA_BR_LARGE);
+        assert_eq!(crate::sdpa_br_pick(1500, 32, 32), crate::SDPA_BR_LARGE);
+        // large-v3-turbo encoder at franken's 32-thread cap: 20 * ceil(1500/128) = 240 >= 128
+        assert_eq!(crate::sdpa_br_pick(1500, 20, 32), crate::SDPA_BR_LARGE);
+        // few heads + nested split: coarsening starves the pool. MEASURED 0.9414x at nbh=4.
+        assert_eq!(crate::sdpa_br_pick(1500, 4, 16), crate::SDPA_BR_SMALL);
+        // short sequences never coarsen below the floor
+        assert_eq!(crate::sdpa_br_pick(96, 4, 16), crate::SDPA_BR_SMALL);
+    }
+
     fn sdpa_poly_exp_accuracy_budget() {
         use wide::f32x8;
 
