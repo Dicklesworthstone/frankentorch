@@ -80,9 +80,14 @@ fn blocks(sq: usize, br: usize) -> usize { sq.div_ceil(br) }
 /// cv 29.0%, worker vmi1149989). In ABBA, A occupies positions 1 and 4 and B positions 2 and 3, so
 /// the position effect and any linear drift cancel *within each rep*.
 ///
-/// Returns (med_a, med_b, med_ratio, cv_pct, wins, n).
+/// Returns `Stat` — median plus the OBSERVED SPREAD of the paired ratio.
+///
+/// The gate is the MEDIAN against the null control's spread, not `cv < 5`: a cv gate is
+/// unreachable on this hardware (frankenmermaid swept min_sample x min_of and never hit it).
+/// A claim is decidable only when the candidate median lies clearly outside the null's range.
+/// The null floor is PER-FUNCTION (frankenlibc) — calibrate it for the fn you are measuring.
 #[allow(clippy::too_many_arguments)]
-fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize, sq: usize, sk: usize, d: usize, reps: usize) -> (f64, f64, f64, f64, usize, usize) {
+fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize, sq: usize, sk: usize, d: usize, reps: usize) -> Stat {
     let scale = 1.0 / (d as f32).sqrt();
     let warm = 3usize;
     let (mut va, mut vb, mut rs) = (Vec::new(), Vec::new(), Vec::new());
@@ -104,7 +109,27 @@ fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize,
     let wins = rs.iter().filter(|x| **x > 1.0).count();
     let n = rs.len();
     let mut rc = rs.clone();
-    (med(&mut va), med(&mut vb), med(&mut rc), 100.0 * sd / mean, wins, n)
+    rc.sort_by(|p, q| p.partial_cmp(q).unwrap());
+    let q = |f: f64| rc[((rc.len() - 1) as f64 * f).round() as usize];
+    Stat { a: med(&mut va), b: med(&mut vb), med: q(0.5), p10: q(0.10), p90: q(0.90),
+           lo: rc[0], hi: rc[rc.len() - 1], cv: 100.0 * sd / mean, wins, n }
+}
+
+#[derive(Clone, Copy)]
+struct Stat { a: f64, b: f64, med: f64, p10: f64, p90: f64, lo: f64, hi: f64, cv: f64, wins: usize, n: usize }
+
+impl Stat {
+    /// Decidable iff the candidate median lies outside the NULL control's observed [p10, p90].
+    fn verdict(&self, null: &Stat) -> &'static str {
+        if self.med > null.p90 { "DECIDABLE (faster)" }
+        else if self.med < null.p10 { "DECIDABLE (slower)" }
+        else { "INSIDE NULL FLOOR" }
+    }
+    fn line(&self, label: &str, null: Option<&Stat>) -> String {
+        let v = null.map_or("— (this IS the null)".to_string(), |nl| self.verdict(nl).to_string());
+        format!("{label:<30} {:>8.1} {:>8.1}  med {:>6.4}x  [p10 {:>6.4} p90 {:>6.4}]  range [{:>6.4},{:>6.4}]  cv {:>4.1}%  wins {}/{}  {v}",
+            self.a, self.b, self.med, self.p10, self.p90, self.lo, self.hi, self.cv, self.wins, self.n)
+    }
 }
 
 fn bench(_c: &mut Criterion) {
@@ -133,18 +158,14 @@ fn bench(_c: &mut Criterion) {
     }
     println!("  => flipping BR changes the schedule and never the result");
 
-    println!("\n{:<34} {:>9} {:>9} {:>8} {:>7} {:>8} {:>6}", "arm (vs BR=64)", "BR64 ms", "cand ms", "ratio", "cv%", "wins", "gate");
-    // NULL CONTROL first: identical code both arms
-    let (a, b, r, cv, w, n) = paired(64, 64, &q, &k, &v, nbh, sq, sk, d, reps);
-    println!("{:<34} {a:>9.1} {b:>9.1} {r:>7.4}x {cv:>6.1} {w:>4}/{n:<3} {}", "NULL CONTROL (BR=64 vs BR=64)", if cv < 5.0 { "PASS" } else { "FAIL" });
-
-    // AUTO (the new default policy) vs the historical fixed 64
-    let (a, b, r, cv, w, n) = paired(64, 0, &q, &k, &v, nbh, sq, sk, d, reps);
-    println!("{:<34} {a:>9.1} {b:>9.1} {r:>7.4}x {cv:>6.1} {w:>4}/{n:<3} {}", "AUTO policy (adaptive BR)", if cv < 5.0 { "PASS" } else { "FAIL" });
-
+    println!("\nGATE: candidate median must lie outside the NULL control's [p10, p90]. cv is reported, NOT gated.");
+    let null = paired(64, 64, &q, &k, &v, nbh, sq, sk, d, reps);
+    println!("{}", null.line("NULL CONTROL (64 vs 64)", None));
+    let auto = paired(64, 0, &q, &k, &v, nbh, sq, sk, d, reps);
+    println!("{}", auto.line("AUTO policy (adaptive)", Some(&null)));
     for br in [96usize, 128, 160] {
-        let (a, b, r, cv, w, n) = paired(64, br, &q, &k, &v, nbh, sq, sk, d, reps);
-        println!("{:<34} {a:>9.1} {b:>9.1} {r:>7.4}x {cv:>6.1} {w:>4}/{n:<3} {}", format!("BR={br}"), if cv < 5.0 { "PASS" } else { "FAIL" });
+        let st = paired(64, br, &q, &k, &v, nbh, sq, sk, d, reps);
+        println!("{}", st.line(&format!("BR={br}"), Some(&null)));
     }
 
     // ---- generality: the guard is now a constant, so short-seq consumers keep their split ----
@@ -156,8 +177,10 @@ fn bench(_c: &mut Criterion) {
         let (_, o64) = run(64, &q2, &k2, &v2, nbh2, sq2, sq2, d, scale);
         let (_, o128) = run(128, &q2, &k2, &v2, nbh2, sq2, sq2, d, scale);
         assert!(o64.iter().zip(o128.iter()).all(|(x, y)| x.to_bits() == y.to_bits()), "bit-exact must hold at every shape");
-        let (a, b, r, cv, w, n) = paired(64, 0, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(9));
-        println!("  nbh={nbh2:<3} seq={sq2:<5} BR64 {a:>7.2} ms  AUTO {b:>7.2} ms  ratio {r:.4}x  cv {cv:.1}%  wins {w}/{n}  bit-exact");
+        let nl = paired(64, 64, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(9));
+        let st = paired(64, 0, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(9));
+        println!("  nbh={nbh2:<3} seq={sq2:<5}  null med {:.4}x [p10 {:.4} p90 {:.4}]   AUTO med {:.4}x  wins {}/{}  {}  bit-exact",
+            nl.med, nl.p10, nl.p90, st.med, st.wins, st.n, st.verdict(&nl));
     }
     set_sdpa_br_auto();
 }
