@@ -52,8 +52,8 @@ pub mod fused;
 mod imp {
     use super::Error;
     use metal::{
-        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, MTLResourceOptions,
-        MTLSize,
+        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
+        MTLResourceOptions, MTLSize,
     };
     use std::sync::OnceLock;
 
@@ -152,12 +152,12 @@ kernel void matmul_tiled(
         }
         let ctx = ctx().ok_or(Error::Unavailable)?;
         let opts = MTLResourceOptions::StorageModeShared;
-        let ba = ctx
-            .device
-            .new_buffer_with_data(a.as_ptr() as *const _, (a.len() * 4) as u64, opts);
-        let bb = ctx
-            .device
-            .new_buffer_with_data(b.as_ptr() as *const _, (b.len() * 4) as u64, opts);
+        let ba =
+            ctx.device
+                .new_buffer_with_data(a.as_ptr() as *const _, (a.len() * 4) as u64, opts);
+        let bb =
+            ctx.device
+                .new_buffer_with_data(b.as_ptr() as *const _, (b.len() * 4) as u64, opts);
         let bc = ctx.device.new_buffer((m * n * 4) as u64, opts);
         let dims = [m as u32, k as u32, n as u32];
         let bd = ctx
@@ -213,7 +213,14 @@ pub fn is_available() -> bool {
 /// `a` must be `m*k`, `b` must be `k*n`, `c` must be `m*n`; `c` is fully
 /// overwritten. Returns [`Error::Unavailable`] if there's no GPU (callers should
 /// fall back to a CPU kernel) or [`Error::Kernel`] on a shape/Metal error.
-pub fn sgemm(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize) -> Result<(), Error> {
+pub fn sgemm(
+    a: &[f32],
+    b: &[f32],
+    c: &mut [f32],
+    m: usize,
+    k: usize,
+    n: usize,
+) -> Result<(), Error> {
     imp::sgemm(a, b, c, m, k, n)
 }
 
@@ -240,8 +247,12 @@ mod tests {
         // Shapes incl. non-multiples of 64 and whisper encoder-ish dims.
         let shapes = [(2, 3, 2), (64, 64, 64), (65, 33, 129), (300, 384, 512)];
         for &(m, k, n) in &shapes {
-            let a: Vec<f32> = (0..m * k).map(|i| ((i * 7 % 13) as f32) * 0.1 - 0.6).collect();
-            let b: Vec<f32> = (0..k * n).map(|i| ((i * 5 % 11) as f32) * 0.1 - 0.5).collect();
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i * 7 % 13) as f32) * 0.1 - 0.6)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i * 5 % 11) as f32) * 0.1 - 0.5)
+                .collect();
             let mut c = vec![0.0f32; m * n];
             match sgemm(&a, &b, &mut c, m, k, n) {
                 Ok(()) => {

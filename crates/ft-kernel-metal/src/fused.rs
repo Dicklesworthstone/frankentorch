@@ -259,9 +259,11 @@ impl GpuTensor {
             )));
         }
         Ok(GpuTensor {
-            buf: p
-                .device
-                .new_buffer_with_data(data.as_ptr() as *const _, (data.len() * 4).max(4) as u64, SHARED),
+            buf: p.device.new_buffer_with_data(
+                data.as_ptr() as *const _,
+                (data.len() * 4).max(4) as u64,
+                SHARED,
+            ),
             rows,
             cols,
         })
@@ -310,7 +312,10 @@ impl<'a> Batch<'a> {
         }
         let w = pso.thread_execution_width().max(1);
         let tg = ((n as u64).div_ceil(w) * w).max(w);
-        enc.dispatch_threads(MTLSize::new(n as u64, 1, 1), MTLSize::new(tg.min(w * 8), 1, 1));
+        enc.dispatch_threads(
+            MTLSize::new(n as u64, 1, 1),
+            MTLSize::new(tg.min(w * 8), 1, 1),
+        );
         enc.end_encoding();
     }
 
@@ -335,7 +340,13 @@ impl<'a> Batch<'a> {
     }
 
     /// Row layernorm with affine `gamma`/`beta` (length `cols`), `eps`.
-    pub fn layernorm(&self, x: &GpuTensor, gamma: &GpuTensor, beta: &GpuTensor, eps: f32) -> GpuTensor {
+    pub fn layernorm(
+        &self,
+        x: &GpuTensor,
+        gamma: &GpuTensor,
+        beta: &GpuTensor,
+        eps: f32,
+    ) -> GpuTensor {
         let out = GpuTensor::new_uninit(&self.p.device, x.rows, x.cols);
         let dims = self.u32buf(&[x.rows as u32, x.cols as u32]);
         let epsb = self
@@ -360,7 +371,11 @@ impl<'a> Batch<'a> {
         let out = GpuTensor::new_uninit(&self.p.device, x.rows, x.cols);
         let n = (x.rows * x.cols) as u32;
         let nb = self.u32buf(&[n]);
-        self.dispatch1d(&self.p.gelu, &[(&x.buf, 0), (&out.buf, 0), (&nb, 0)], n as usize);
+        self.dispatch1d(
+            &self.p.gelu,
+            &[(&x.buf, 0), (&out.buf, 0), (&nb, 0)],
+            n as usize,
+        );
         out
     }
 
@@ -398,10 +413,10 @@ impl<'a> Batch<'a> {
         let hd = d / n_heads;
         let scale = 1.0f32 / (hd as f32).sqrt();
         let dims = self.u32buf(&[seq as u32, d as u32, n_heads as u32, hd as u32]);
-        let scaleb = self
-            .p
-            .device
-            .new_buffer_with_data((&scale as *const f32) as *const _, 4, SHARED);
+        let scaleb =
+            self.p
+                .device
+                .new_buffer_with_data((&scale as *const f32) as *const _, 4, SHARED);
         // FlashAttention fast path (whisper head_dim = 64): one fused dispatch that
         // streams K/V with an online softmax — the scores matrix is never materialized.
         if hd == 64 {
@@ -619,8 +634,12 @@ mod tests {
         let gb = GpuTensor::upload(&bias, 1, n).unwrap();
         let b = Batch::new().unwrap();
         let mm = b.matmul_bias(&ga, &gw, Some(&gb));
-        let ln = b.layernorm(&mm, &GpuTensor::upload(&vec![1.0; n], 1, n).unwrap(),
-            &GpuTensor::upload(&vec![0.0; n], 1, n).unwrap(), 1e-5);
+        let ln = b.layernorm(
+            &mm,
+            &GpuTensor::upload(&vec![1.0; n], 1, n).unwrap(),
+            &GpuTensor::upload(&vec![0.0; n], 1, n).unwrap(),
+            1e-5,
+        );
         let ge = b.gelu(&mm);
         let sm = b.softmax(&mm);
         b.finish(); // commit + wait, THEN read results back
@@ -628,11 +647,15 @@ mod tests {
 
         // CPU refs.
         let mut cmm = vec![0.0f32; m * n];
-        for i in 0..m { for j in 0..n {
-            let mut acc = bias[j];
-            for e in 0..k { acc += a[i * k + e] * w[e * n + j]; }
-            cmm[i * n + j] = acc;
-        }}
+        for i in 0..m {
+            for j in 0..n {
+                let mut acc = bias[j];
+                for e in 0..k {
+                    acc += a[i * k + e] * w[e * n + j];
+                }
+                cmm[i * n + j] = acc;
+            }
+        }
         approx(&mm_o, &cmm, 1e-3, "matmul_bias");
         // layernorm(gamma=1,beta=0)
         let mut cln = vec![0.0f32; m * n];
@@ -641,18 +664,25 @@ mod tests {
             let mean: f32 = row.iter().sum::<f32>() / n as f32;
             let var: f32 = row.iter().map(|v| (v - mean).powi(2)).sum::<f32>() / n as f32;
             let inv = 1.0 / (var + 1e-5).sqrt();
-            for j in 0..n { cln[i * n + j] = (row[j] - mean) * inv; }
+            for j in 0..n {
+                cln[i * n + j] = (row[j] - mean) * inv;
+            }
         }
         approx(&ln_o, &cln, 1e-2, "layernorm");
         let c = 0.7978845608028654f32;
-        let cge: Vec<f32> = cmm.iter().map(|&x| 0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh())).collect();
+        let cge: Vec<f32> = cmm
+            .iter()
+            .map(|&x| 0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh()))
+            .collect();
         approx(&ge_o, &cge, 1e-3, "gelu");
         let mut csm = vec![0.0f32; m * n];
         for i in 0..m {
             let row = &cmm[i * n..(i + 1) * n];
             let mx = row.iter().cloned().fold(f32::MIN, f32::max);
             let s: f32 = row.iter().map(|v| (v - mx).exp()).sum();
-            for j in 0..n { csm[i * n + j] = (row[j] - mx).exp() / s; }
+            for j in 0..n {
+                csm[i * n + j] = (row[j] - mx).exp() / s;
+            }
         }
         approx(&sm_o, &csm, 1e-3, "softmax");
     }
@@ -695,7 +725,9 @@ mod tests {
         }
         let (seq, d, nh) = (12usize, 16usize, 4usize);
         let q: Vec<f32> = (0..seq * d).map(|i| ((i % 7) as f32) * 0.2 - 0.6).collect();
-        let k: Vec<f32> = (0..seq * d).map(|i| ((i % 5) as f32) * 0.15 - 0.3).collect();
+        let k: Vec<f32> = (0..seq * d)
+            .map(|i| ((i % 5) as f32) * 0.15 - 0.3)
+            .collect();
         let v: Vec<f32> = (0..seq * d).map(|i| ((i % 9) as f32) * 0.1 - 0.4).collect();
         let gq = GpuTensor::upload(&q, seq, d).unwrap();
         let gk = GpuTensor::upload(&k, seq, d).unwrap();
@@ -713,7 +745,9 @@ mod tests {
         }
         let (seq, d, nh) = (40usize, 128usize, 2usize); // head_dim = 64 -> flash path
         let q: Vec<f32> = (0..seq * d).map(|i| ((i % 7) as f32) * 0.2 - 0.6).collect();
-        let k: Vec<f32> = (0..seq * d).map(|i| ((i % 5) as f32) * 0.15 - 0.3).collect();
+        let k: Vec<f32> = (0..seq * d)
+            .map(|i| ((i % 5) as f32) * 0.15 - 0.3)
+            .collect();
         let v: Vec<f32> = (0..seq * d).map(|i| ((i % 9) as f32) * 0.1 - 0.4).collect();
         let gq = GpuTensor::upload(&q, seq, d).unwrap();
         let gk = GpuTensor::upload(&k, seq, d).unwrap();
@@ -721,7 +755,12 @@ mod tests {
         let b = Batch::new().unwrap();
         let o = b.mha(&gq, &gk, &gv, nh);
         b.finish();
-        approx(&o.download(), &cpu_mha(&q, &k, &v, seq, d, nh), 1e-3, "mha_flash");
+        approx(
+            &o.download(),
+            &cpu_mha(&q, &k, &v, seq, d, nh),
+            1e-3,
+            "mha_flash",
+        );
     }
 
     fn cpu_ln(x: &[f32], g: &[f32], be: &[f32], seq: usize, d: usize) -> Vec<f32> {
@@ -737,7 +776,14 @@ mod tests {
         }
         o
     }
-    fn cpu_mmb(x: &[f32], w: &[f32], bias: Option<&[f32]>, m: usize, k: usize, n: usize) -> Vec<f32> {
+    fn cpu_mmb(
+        x: &[f32],
+        w: &[f32],
+        bias: Option<&[f32]>,
+        m: usize,
+        k: usize,
+        n: usize,
+    ) -> Vec<f32> {
         let mut o = vec![0.0f32; m * n];
         for i in 0..m {
             for jn in 0..n {
@@ -752,7 +798,9 @@ mod tests {
     }
     fn cpu_gelu(x: &[f32]) -> Vec<f32> {
         let c = 0.7978845608028654f32;
-        x.iter().map(|&v| 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh())).collect()
+        x.iter()
+            .map(|&v| 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh()))
+            .collect()
     }
     fn cpu_add(a: &[f32], b: &[f32]) -> Vec<f32> {
         a.iter().zip(b).map(|(x, y)| x + y).collect()
@@ -781,8 +829,21 @@ mod tests {
         let w2 = mk(dff * d, 0.02, 0.15);
         let b2 = mk(d, 0.01, 0.03);
         let lref = LayerWeightsRef {
-            ln1_g: &ln1_g, ln1_b: &ln1_b, wq: &wq, bq: &bq, wk: &wk, wv: &wv, bv: &bv,
-            wo: &wo, bo: &bo, ln2_g: &ln2_g, ln2_b: &ln2_b, w1: &w1, b1: &b1, w2: &w2, b2: &b2,
+            ln1_g: &ln1_g,
+            ln1_b: &ln1_b,
+            wq: &wq,
+            bq: &bq,
+            wk: &wk,
+            wv: &wv,
+            bv: &bv,
+            wo: &wo,
+            bo: &bo,
+            ln2_g: &ln2_g,
+            ln2_b: &ln2_b,
+            w1: &w1,
+            b1: &b1,
+            w2: &w2,
+            b2: &b2,
         };
         let x = mk(seq * d, 0.04, 0.6);
 

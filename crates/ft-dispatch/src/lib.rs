@@ -6054,7 +6054,12 @@ pub fn dispatch_tensor_norm_dim_contiguous_typed(
         TensorStorage::F32(data) => {
             // f32-native (no f32->f64->f32 round-trip); bit-identical kernel output.
             let (values, decision) = dispatch_tensor_norm_dim_contiguous_f32_native(
-                mode, data, meta, p, dim, requires_grad,
+                mode,
+                data,
+                meta,
+                p,
+                dim,
+                requires_grad,
             )?;
             Ok(TypedNormDimOutcome {
                 storage: narrow_f32_to_storage_dtype(storage, values),
@@ -6510,10 +6515,7 @@ pub fn dispatch_tensor_join_contiguous_typed(
         } else {
             TensorStorage::F32(Arc::new(values))
         };
-        Ok(TypedJoinOutcome {
-            storage,
-            decision,
-        })
+        Ok(TypedJoinOutcome { storage, decision })
     }
 }
 

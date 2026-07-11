@@ -10098,20 +10098,22 @@ impl TensorTape {
             // Value semantics are preserved: the shared storage is immutable through the read path,
             // and any in-place write goes through Arc::make_mut (copy-on-write), so a mutation of
             // the view clones THEN and does NOT propagate to the source — exactly as the old copy.
-            let view = if dim == 0
-                && length > 0
-                && !shape.is_empty()
-                && meta.is_contiguous()
-            {
+            let view = if dim == 0 && length > 0 && !shape.is_empty() && meta.is_contiguous() {
                 let inner: usize = shape[1..].iter().product();
                 match start
                     .checked_mul(inner)
                     .and_then(|off| meta.storage_offset().checked_add(off))
                 {
-                    Some(new_offset) if start.checked_add(length).map(|e| e <= shape[0]).unwrap_or(false) => {
+                    Some(new_offset)
+                        if start
+                            .checked_add(length)
+                            .map(|e| e <= shape[0])
+                            .unwrap_or(false) =>
+                    {
                         new_shape[0] = length;
-                        let new_meta = ft_core::TensorMeta::from_shape(new_shape.clone(), dtype, device)
-                            .with_storage_offset(new_offset);
+                        let new_meta =
+                            ft_core::TensorMeta::from_shape(new_shape.clone(), dtype, device)
+                                .with_storage_offset(new_offset);
                         // Arc-level clone of the storage enum (refcount bump, no data copy).
                         Some(DenseTensor::from_typed_storage(
                             new_meta,
@@ -10222,7 +10224,10 @@ impl TensorTape {
         // `storage_offset + start*inner` → emit an O(1) OFFSET-VIEW (shared Arc + offset) instead
         // of copying each chunk (chunk/split of a 64MB tensor was ~48ms, 20000x SLOWER than torch's
         // views). COW (Arc::make_mut) preserves value semantics on in-place writes. See narrow().
-        let inner: usize = original_shape.get(1..).map(|t| t.iter().product()).unwrap_or(1);
+        let inner: usize = original_shape
+            .get(1..)
+            .map(|t| t.iter().product())
+            .unwrap_or(1);
 
         for (chunk_index, &sz) in split_sizes.iter().enumerate() {
             let mut chunk_shape = original_shape.clone();
@@ -10355,15 +10360,15 @@ impl TensorTape {
             match tensor.typed_storage() {
                 TensorStorage::F64(values) => {
                     let slice = Self::checked_storage_slice(values, start, end)?;
-                    return Ok(TensorStorage::F64(Arc::new(ft_kernel_cpu::transpose_2d_f64(
-                        slice, rows, cols,
-                    ))));
+                    return Ok(TensorStorage::F64(Arc::new(
+                        ft_kernel_cpu::transpose_2d_f64(slice, rows, cols),
+                    )));
                 }
                 TensorStorage::F32(values) => {
                     let slice = Self::checked_storage_slice(values, start, end)?;
-                    return Ok(TensorStorage::F32(Arc::new(ft_kernel_cpu::transpose_2d_f32(
-                        slice, rows, cols,
-                    ))));
+                    return Ok(TensorStorage::F32(Arc::new(
+                        ft_kernel_cpu::transpose_2d_f32(slice, rows, cols),
+                    )));
                 }
                 _ => {}
             }
@@ -10376,7 +10381,11 @@ impl TensorTape {
         // transpose permute_slice would run) in parallel over batches. f64/f32; bit-identical (same
         // kernel the 2-D [1,0] path uses; the index map is the rotation path's, verified).
         let ndim = perm.len();
-        if ndim >= 3 && matches!(tensor.typed_storage(), TensorStorage::F64(_) | TensorStorage::F32(_))
+        if ndim >= 3
+            && matches!(
+                tensor.typed_storage(),
+                TensorStorage::F64(_) | TensorStorage::F32(_)
+            )
         {
             let shape = meta.shape();
             let mut prefix = 0;
@@ -10541,93 +10550,94 @@ impl TensorTape {
             // (~2 KB f64) TILE fits L1 (sweep: 16 beats 32/64/128; 2.2x vs 1.2x at 2048²).
             const TILE: usize = 16;
             let do_transpose = |dst: &mut [T]| {
-            if let Some(batch) = numel.checked_div(plane) {
-                use rayon::prelude::*;
-                // One plane's cache-blocked [a_dim, b_dim] transpose of elem-runs.
-                let transpose_plane = |sgn: &[T], dgn: &mut [T]| {
-                    let mut ii = 0;
-                    while ii < a_dim {
-                        let i_end = (ii + TILE).min(a_dim);
-                        let mut jj = 0;
-                        while jj < b_dim {
-                            let j_end = (jj + TILE).min(b_dim);
-                            if elem == 1 {
-                                // SCALAR fast path for the pure transpose (no suffix dims — the
-                                // dominant 2-D / matrix_transpose case). A direct element move is
-                                // ~3x faster than `clone_from_slice` of a 1-element slice, which
-                                // pays a call + 4 range-bounds checks PER ELEMENT (16M of them at
-                                // 4k×4k). Bit-identical (same single value moved).
-                                for i in ii..i_end {
-                                    for j in jj..j_end {
-                                        dgn[j * a_dim + i] = sgn[i * b_dim + j].clone();
-                                    }
-                                }
-                            } else {
-                                for i in ii..i_end {
-                                    for j in jj..j_end {
-                                        let s_off = (i * b_dim + j) * elem;
-                                        let d_off = (j * a_dim + i) * elem;
-                                        dgn[d_off..d_off + elem]
-                                            .clone_from_slice(&sgn[s_off..s_off + elem]);
-                                    }
-                                }
-                            }
-                            jj += TILE;
-                        }
-                        ii += TILE;
-                    }
-                };
-                // The transpose is pure data movement — each dst element is written
-                // exactly once, so any disjoint-chunk parallel split is bit-for-bit
-                // identical to the serial sweep. Fan out above PAR_MIN (tiny permutes
-                // keep serial so rayon split/join doesn't dominate). frankentorch-permpar.
-                const PAR_MIN: usize = 1 << 16;
-                if numel < PAR_MIN {
-                    for bi in 0..batch {
-                        let base = bi * plane;
-                        transpose_plane(&src[base..base + plane], &mut dst[base..base + plane]);
-                    }
-                } else if batch >= 2 {
-                    // Independent planes → disjoint contiguous dst chunks (covers the
-                    // batched attention/conv-layout permutes where batch = leading dims).
-                    dst.par_chunks_mut(plane)
-                        .zip(src[..numel].par_chunks(plane))
-                        .for_each(|(dgn, sgn)| transpose_plane(sgn, dgn));
-                } else {
-                    // Single large plane (e.g. a plain 2-D transpose): parallelize the
-                    // output row-tiles. A TILE block of output rows j ∈ [jj, j_end) owns
-                    // the contiguous dst region [jj·a_dim·elem .. j_end·a_dim·elem),
-                    // reading scattered src — disjoint writes, so still bit-exact.
-                    let row = a_dim * elem;
-                    dst.par_chunks_mut(row * TILE)
-                        .enumerate()
-                        .for_each(|(blk, dblk)| {
-                            let jj = blk * TILE;
-                            let j_end = jj + dblk.len() / row;
-                            let mut ii = 0;
-                            while ii < a_dim {
-                                let i_end = (ii + TILE).min(a_dim);
+                if let Some(batch) = numel.checked_div(plane) {
+                    use rayon::prelude::*;
+                    // One plane's cache-blocked [a_dim, b_dim] transpose of elem-runs.
+                    let transpose_plane = |sgn: &[T], dgn: &mut [T]| {
+                        let mut ii = 0;
+                        while ii < a_dim {
+                            let i_end = (ii + TILE).min(a_dim);
+                            let mut jj = 0;
+                            while jj < b_dim {
+                                let j_end = (jj + TILE).min(b_dim);
                                 if elem == 1 {
-                                    for j in jj..j_end {
-                                        for i in ii..i_end {
-                                            dblk[(j - jj) * a_dim + i] = src[i * b_dim + j].clone();
+                                    // SCALAR fast path for the pure transpose (no suffix dims — the
+                                    // dominant 2-D / matrix_transpose case). A direct element move is
+                                    // ~3x faster than `clone_from_slice` of a 1-element slice, which
+                                    // pays a call + 4 range-bounds checks PER ELEMENT (16M of them at
+                                    // 4k×4k). Bit-identical (same single value moved).
+                                    for i in ii..i_end {
+                                        for j in jj..j_end {
+                                            dgn[j * a_dim + i] = sgn[i * b_dim + j].clone();
                                         }
                                     }
                                 } else {
-                                    for j in jj..j_end {
-                                        for i in ii..i_end {
+                                    for i in ii..i_end {
+                                        for j in jj..j_end {
                                             let s_off = (i * b_dim + j) * elem;
-                                            let d_off = ((j - jj) * a_dim + i) * elem;
-                                            dblk[d_off..d_off + elem]
-                                                .clone_from_slice(&src[s_off..s_off + elem]);
+                                            let d_off = (j * a_dim + i) * elem;
+                                            dgn[d_off..d_off + elem]
+                                                .clone_from_slice(&sgn[s_off..s_off + elem]);
                                         }
                                     }
                                 }
-                                ii += TILE;
+                                jj += TILE;
                             }
-                        });
+                            ii += TILE;
+                        }
+                    };
+                    // The transpose is pure data movement — each dst element is written
+                    // exactly once, so any disjoint-chunk parallel split is bit-for-bit
+                    // identical to the serial sweep. Fan out above PAR_MIN (tiny permutes
+                    // keep serial so rayon split/join doesn't dominate). frankentorch-permpar.
+                    const PAR_MIN: usize = 1 << 16;
+                    if numel < PAR_MIN {
+                        for bi in 0..batch {
+                            let base = bi * plane;
+                            transpose_plane(&src[base..base + plane], &mut dst[base..base + plane]);
+                        }
+                    } else if batch >= 2 {
+                        // Independent planes → disjoint contiguous dst chunks (covers the
+                        // batched attention/conv-layout permutes where batch = leading dims).
+                        dst.par_chunks_mut(plane)
+                            .zip(src[..numel].par_chunks(plane))
+                            .for_each(|(dgn, sgn)| transpose_plane(sgn, dgn));
+                    } else {
+                        // Single large plane (e.g. a plain 2-D transpose): parallelize the
+                        // output row-tiles. A TILE block of output rows j ∈ [jj, j_end) owns
+                        // the contiguous dst region [jj·a_dim·elem .. j_end·a_dim·elem),
+                        // reading scattered src — disjoint writes, so still bit-exact.
+                        let row = a_dim * elem;
+                        dst.par_chunks_mut(row * TILE)
+                            .enumerate()
+                            .for_each(|(blk, dblk)| {
+                                let jj = blk * TILE;
+                                let j_end = jj + dblk.len() / row;
+                                let mut ii = 0;
+                                while ii < a_dim {
+                                    let i_end = (ii + TILE).min(a_dim);
+                                    if elem == 1 {
+                                        for j in jj..j_end {
+                                            for i in ii..i_end {
+                                                dblk[(j - jj) * a_dim + i] =
+                                                    src[i * b_dim + j].clone();
+                                            }
+                                        }
+                                    } else {
+                                        for j in jj..j_end {
+                                            for i in ii..i_end {
+                                                let s_off = (i * b_dim + j) * elem;
+                                                let d_off = ((j - jj) * a_dim + i) * elem;
+                                                dblk[d_off..d_off + elem]
+                                                    .clone_from_slice(&src[s_off..s_off + elem]);
+                                            }
+                                        }
+                                    }
+                                    ii += TILE;
+                                }
+                            });
+                    }
                 }
-            }
             };
             // Plane-size gate: uninit first-touch wins for MANY SMALL planes (measured 1.25-1.29x)
             // but the STRIDED transpose faults pages in random order on FEW HUGE planes, where a
@@ -13425,9 +13435,7 @@ impl TensorTape {
                             &mut grads[input.0],
                             input_numel,
                             |i| {
-                                grad_scalar
-                                    * Self::torch_sign(iv[i])
-                                    * iv[i].abs().powf(p - 1.0)
+                                grad_scalar * Self::torch_sign(iv[i]) * iv[i].abs().powf(p - 1.0)
                                     / norm_pow
                             },
                         )?;
@@ -19836,11 +19844,8 @@ impl TensorTape {
             .map_err(|_| Self::shape_overflow_error("roll dimension size exceeds isize range"))?;
         // dim_size > 0 is guaranteed here: `numel == 0` already returned above, and `numel` is a
         // product that includes `shape[dim] = dim_size`, so `numel > 0` implies `dim_size > 0`.
-        let shift_mod = Self::normalized_roll_shift(
-            shift,
-            dim_size_i,
-            "roll shift normalization overflow",
-        )?;
+        let shift_mod =
+            Self::normalized_roll_shift(shift, dim_size_i, "roll shift normalization overflow")?;
         // Output-driven parallel gather: dst_coord[dim] = (src + shift) mod n,
         // so src_coord[dim] = (dst + n - shift) mod n. Each output written once
         // → bit-for-bit identical to the serial scatter. frankentorch-permpar.
@@ -20266,35 +20271,35 @@ impl TensorTape {
         end: usize,
     ) -> Result<TensorStorage, AutogradError> {
         match storage {
-            TensorStorage::F32(values) => {
-                Ok(TensorStorage::F32(Self::slice_or_share_arc(values, start, end)?))
-            }
-            TensorStorage::F64(values) => {
-                Ok(TensorStorage::F64(Self::slice_or_share_arc(values, start, end)?))
-            }
+            TensorStorage::F32(values) => Ok(TensorStorage::F32(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::F64(values) => Ok(TensorStorage::F64(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
             // Inline storage has no Arc to share; it is at most 4 elements, so the
             // copy is negligible.
             TensorStorage::F64Inline4(values) => Ok(TensorStorage::F64(Arc::new(
                 Self::checked_storage_slice(values.as_slice(), start, end)?.to_vec(),
             ))),
-            TensorStorage::F16(values) => {
-                Ok(TensorStorage::F16(Self::slice_or_share_arc(values, start, end)?))
-            }
-            TensorStorage::BF16(values) => {
-                Ok(TensorStorage::BF16(Self::slice_or_share_arc(values, start, end)?))
-            }
-            TensorStorage::Complex64(values) => {
-                Ok(TensorStorage::Complex64(Self::slice_or_share_arc(values, start, end)?))
-            }
-            TensorStorage::Complex128(values) => {
-                Ok(TensorStorage::Complex128(Self::slice_or_share_arc(values, start, end)?))
-            }
-            TensorStorage::QInt8(values) => {
-                Ok(TensorStorage::QInt8(Self::slice_or_share_arc(values, start, end)?))
-            }
-            TensorStorage::QUInt8(values) => {
-                Ok(TensorStorage::QUInt8(Self::slice_or_share_arc(values, start, end)?))
-            }
+            TensorStorage::F16(values) => Ok(TensorStorage::F16(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::BF16(values) => Ok(TensorStorage::BF16(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::Complex64(values) => Ok(TensorStorage::Complex64(
+                Self::slice_or_share_arc(values, start, end)?,
+            )),
+            TensorStorage::Complex128(values) => Ok(TensorStorage::Complex128(
+                Self::slice_or_share_arc(values, start, end)?,
+            )),
+            TensorStorage::QInt8(values) => Ok(TensorStorage::QInt8(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::QUInt8(values) => Ok(TensorStorage::QUInt8(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
         }
     }
 
@@ -29096,19 +29101,39 @@ mod tests {
             // narrow rows [2, 4) -> [2, 2] at storage_offset 4; read LOGICAL values.
             let nw = tape.narrow(a, 0, 2, 2).unwrap();
             assert_eq!(tape.dtype(nw).unwrap(), half);
-            let nv = tape.node(nw).unwrap().tensor.contiguous_values_as_f64().unwrap();
+            let nv = tape
+                .node(nw)
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
             assert_eq!(nv, vec![5.0, 6.0, 7.0, 8.0], "narrow dim0 {half:?}");
 
             // squeeze/unsqueeze/reshape of the offset-view must preserve the logical values.
             let un = tape.unsqueeze(nw, 0).unwrap(); // [1,2,2]
             let rs = tape.reshape(un, vec![4]).unwrap();
-            let rv = tape.node(rs).unwrap().tensor.contiguous_values_as_f64().unwrap();
+            let rv = tape
+                .node(rs)
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
             assert_eq!(rv, vec![5.0, 6.0, 7.0, 8.0], "reshape offset-view {half:?}");
 
             // split along dim 0 -> two offset-views; each reads its own logical rows.
             let parts = tape.split(a, &[1, 3], 0).unwrap();
-            let p0 = tape.node(parts[0]).unwrap().tensor.contiguous_values_as_f64().unwrap();
-            let p1 = tape.node(parts[1]).unwrap().tensor.contiguous_values_as_f64().unwrap();
+            let p0 = tape
+                .node(parts[0])
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
+            let p1 = tape
+                .node(parts[1])
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
             assert_eq!(p0, vec![1.0, 2.0], "split[0] {half:?}");
             assert_eq!(p1, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0], "split[1] {half:?}");
         }
