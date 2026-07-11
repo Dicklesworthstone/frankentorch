@@ -42,7 +42,11 @@ fn cholesky_forward_and_first_grad_match_torch() {
     let m = s.tensor_variable(A.to_vec(), vec![2, 2], false).unwrap();
     let l = s.tensor_cholesky(m, false).unwrap();
     let lv = s.tensor_values(l).unwrap();
-    close("L fwd", &lv, &[std::f64::consts::SQRT_2, 0.0, 0.353553391, 1.17260394]);
+    close(
+        "L fwd",
+        &lv,
+        &[std::f64::consts::SQRT_2, 0.0, 0.353553391, 1.17260394],
+    );
 
     // 1st-order grad of sum(L) wrt A
     let mut s = sess();

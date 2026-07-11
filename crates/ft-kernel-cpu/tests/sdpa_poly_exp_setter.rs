@@ -54,7 +54,11 @@ fn setter_overrides_default_and_stays_within_the_published_accuracy_budget() {
         .map(|(a, b)| f64::from(a - b).powi(2))
         .sum::<f64>()
         .sqrt();
-    let den: f64 = off.iter().map(|a| f64::from(*a).powi(2)).sum::<f64>().sqrt();
+    let den: f64 = off
+        .iter()
+        .map(|a| f64::from(*a).powi(2))
+        .sum::<f64>()
+        .sqrt();
     let rel = num / den;
     assert!(
         rel <= 1e-5,
