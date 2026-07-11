@@ -16,7 +16,9 @@ const C: usize = 4000;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     // ~half nonzero (every other element zero).
-    let data: Vec<f64> = (0..R * C).map(|i| if i % 2 == 0 { 0.0 } else { (i % 7 + 1) as f64 }).collect();
+    let data: Vec<f64> = (0..R * C)
+        .map(|i| if i % 2 == 0 { 0.0 } else { (i % 7 + 1) as f64 })
+        .collect();
     let mut best = f64::INFINITY;
     let mut chk = 0.0;
     for _ in 0..8 {
@@ -43,19 +45,36 @@ for _ in range(8):
     t=time.perf_counter(); c=torch.count_nonzero(x); ts.append((time.perf_counter()-t)*1e3); chk=float(c.item())
 print("MS", sorted(ts)[0]); print("CHK", chk)
 "#;
-    let mut child = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-    child.stdin.as_mut().ok_or_else(|| std::io::Error::other("no stdin"))?.write_all(py.as_bytes())?;
+    let mut child = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?
+        .write_all(py.as_bytes())?;
     let out = child.wait_with_output();
     println!("count_nonzero(x) [{R},{C}] f64 no-grad, 8 iters MIN:");
     println!("  FrankenTorch : {best:8.3} ms   chk {chk:.6e}");
-    if let Ok(o) = out && o.status.success() {
+    if let Ok(o) = out
+        && o.status.success()
+    {
         let s = String::from_utf8_lossy(&o.stdout);
-        let g = |p: &str| s.lines().find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()));
+        let g = |p: &str| {
+            s.lines()
+                .find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()))
+        };
         if let (Some(p), Some(pc)) = (g("MS "), g("CHK ")) {
             let rel = (chk - pc).abs() / (pc.abs() + 1e-9);
             println!("  PyTorch      : {p:8.3} ms   chk {pc:.6e}  (count rel {rel:.1e})");
             let r = p / best;
-            if r >= 1.0 { println!("  => FT {r:.2}x FASTER"); } else { println!("  => FT {:.2}x SLOWER", 1.0 / r); }
+            if r >= 1.0 {
+                println!("  => FT {r:.2}x FASTER");
+            } else {
+                println!("  => FT {:.2}x SLOWER", 1.0 / r);
+            }
         }
     }
     Ok(())

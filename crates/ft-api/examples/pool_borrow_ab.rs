@@ -24,7 +24,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("max_pool2d no-grad clone-vs-borrow (f64), min-9:  OLD=to_vec clone+kernel  NEW=borrow+kernel");
+    println!(
+        "max_pool2d no-grad clone-vs-borrow (f64), min-9:  OLD=to_vec clone+kernel  NEW=borrow+kernel"
+    );
     // [B, C, H, W] large inputs; 2x2 stride-2 pooling -> quarter output.
     let cases: [(&str, usize, usize, usize, usize); 3] = [
         ("16x64x128x128", 16, 64, 128, 128),
@@ -35,7 +37,9 @@ fn main() {
     for (label, b, c, ih, iw) in cases {
         let oh = (ih - kh) / sh + 1;
         let ow = (iw - kw) / sw + 1;
-        let input: Vec<f64> = (0..b * c * ih * iw).map(|i| ((i % 1021) as f64 - 510.0) * 0.01).collect();
+        let input: Vec<f64> = (0..b * c * ih * iw)
+            .map(|i| ((i % 1021) as f64 - 510.0) * 0.01)
+            .collect();
 
         let new_out = k::max_pool2d_forward_f64(&input, b, c, ih, iw, kh, kw, oh, ow, sh, sw);
         let old_out = {
@@ -48,7 +52,8 @@ fn main() {
             let iv = input.to_vec();
             k::max_pool2d_forward_f64(&iv, b, c, ih, iw, kh, kw, oh, ow, sh, sw).len()
         });
-        let new_ms = bench(|| k::max_pool2d_forward_f64(&input, b, c, ih, iw, kh, kw, oh, ow, sh, sw).len());
+        let new_ms =
+            bench(|| k::max_pool2d_forward_f64(&input, b, c, ih, iw, kh, kw, oh, ow, sh, sw).len());
         println!(
             "  {label:<16} ({:>4}MB in)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
             b * c * ih * iw * 8 / (1 << 20),

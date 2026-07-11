@@ -12,7 +12,14 @@ const C: usize = 4000;
 
 fn best<F: FnMut()>(mut f: F) -> f64 {
     let mut b = f64::INFINITY;
-    for _ in 0..9 { let t = Instant::now(); f(); let e = t.elapsed().as_secs_f64()*1e3; if e<b {b=e;} }
+    for _ in 0..9 {
+        let t = Instant::now();
+        f();
+        let e = t.elapsed().as_secs_f64() * 1e3;
+        if e < b {
+            b = e;
+        }
+    }
     b
 }
 
@@ -24,8 +31,12 @@ fn main() {
     let mask: Vec<f64> = (0..n).map(|i| (i % 3 == 0) as i32 as f64).collect();
     let meta = TensorMeta::from_shape(vec![R, C], DType::F64, ft_core::Device::Cpu);
 
-    let wh = best(|| { let _ = ft_kernel_cpu::where_tensor_contiguous_f64(&cond, &x, &y, &meta).unwrap(); });
-    let mf = best(|| { let _ = ft_kernel_cpu::masked_fill_tensor_contiguous_f64(&x, &meta, &mask, 0.0).unwrap(); });
+    let wh = best(|| {
+        let _ = ft_kernel_cpu::where_tensor_contiguous_f64(&cond, &x, &y, &meta).unwrap();
+    });
+    let mf = best(|| {
+        let _ = ft_kernel_cpu::masked_fill_tensor_contiguous_f64(&x, &meta, &mask, 0.0).unwrap();
+    });
 
     let t = rayon::current_num_threads();
     println!("where      [{R},{C}] f64: {wh:.3} ms  (threads={t})");

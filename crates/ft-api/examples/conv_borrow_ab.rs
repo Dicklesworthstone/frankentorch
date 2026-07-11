@@ -22,7 +22,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("depthwise conv no-grad clone-vs-borrow (f64), min-9:  OLD=to_vec+kernel  NEW=borrow+kernel");
+    println!(
+        "depthwise conv no-grad clone-vs-borrow (f64), min-9:  OLD=to_vec+kernel  NEW=borrow+kernel"
+    );
     bench_conv2d();
     bench_conv3d();
 }
@@ -39,22 +41,36 @@ fn bench_conv2d() {
     for (label, b, c, ph, pw) in cases {
         let oh = (ph - kh) / sh + 1;
         let ow = (pw - kw) / sw + 1;
-        let input: Vec<f64> = (0..b * c * ph * pw).map(|i| ((i % 1021) as f64 - 510.0) * 0.01).collect();
-        let weight: Vec<f64> = (0..c * kh * kw).map(|i| ((i % 17) as f64 - 8.0) * 0.05).collect();
+        let input: Vec<f64> = (0..b * c * ph * pw)
+            .map(|i| ((i % 1021) as f64 - 510.0) * 0.01)
+            .collect();
+        let weight: Vec<f64> = (0..c * kh * kw)
+            .map(|i| ((i % 17) as f64 - 8.0) * 0.05)
+            .collect();
 
-        let new_out = k::depthwise_conv2d_forward_f64(&input, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw);
+        let new_out = k::depthwise_conv2d_forward_f64(
+            &input, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw,
+        );
         let old_out = {
             let iv = input.to_vec();
-            k::depthwise_conv2d_forward_f64(&iv, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw)
+            k::depthwise_conv2d_forward_f64(
+                &iv, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw,
+            )
         };
         let bitmatch = new_out == old_out;
 
         let old_ms = bench(|| {
             let iv = input.to_vec();
-            k::depthwise_conv2d_forward_f64(&iv, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw).len()
+            k::depthwise_conv2d_forward_f64(
+                &iv, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw,
+            )
+            .len()
         });
         let new_ms = bench(|| {
-            k::depthwise_conv2d_forward_f64(&input, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw).len()
+            k::depthwise_conv2d_forward_f64(
+                &input, &weight, None, b, c, ph, pw, kh, kw, oh, ow, sh, sw,
+            )
+            .len()
         });
         println!(
             "  {label:<16} ({:>4}MB in)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
@@ -81,22 +97,36 @@ fn bench_conv3d() {
         let od = (pd - kd) / sd + 1;
         let oh = (ph - kh) / sh + 1;
         let ow = (pw - kw) / sw + 1;
-        let input: Vec<f64> = (0..b * c * pd * ph * pw).map(|i| ((i % 2053) as f64 - 1026.0) * 0.005).collect();
-        let weight: Vec<f64> = (0..c * kd * kh * kw).map(|i| ((i % 23) as f64 - 11.0) * 0.04).collect();
+        let input: Vec<f64> = (0..b * c * pd * ph * pw)
+            .map(|i| ((i % 2053) as f64 - 1026.0) * 0.005)
+            .collect();
+        let weight: Vec<f64> = (0..c * kd * kh * kw)
+            .map(|i| ((i % 23) as f64 - 11.0) * 0.04)
+            .collect();
 
-        let new_out = k::depthwise_conv3d_forward_f64(&input, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw);
+        let new_out = k::depthwise_conv3d_forward_f64(
+            &input, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
         let old_out = {
             let iv = input.to_vec();
-            k::depthwise_conv3d_forward_f64(&iv, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw)
+            k::depthwise_conv3d_forward_f64(
+                &iv, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            )
         };
         let bitmatch = new_out == old_out;
 
         let old_ms = bench(|| {
             let iv = input.to_vec();
-            k::depthwise_conv3d_forward_f64(&iv, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw).len()
+            k::depthwise_conv3d_forward_f64(
+                &iv, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            )
+            .len()
         });
         let new_ms = bench(|| {
-            k::depthwise_conv3d_forward_f64(&input, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw).len()
+            k::depthwise_conv3d_forward_f64(
+                &input, &weight, None, b, c, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+            )
+            .len()
         });
         println!(
             "  {label:<16} ({:>4}MB in)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",

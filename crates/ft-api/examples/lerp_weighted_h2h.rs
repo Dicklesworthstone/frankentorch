@@ -23,17 +23,34 @@ o=torch.lerp(s,e,w)
 print("VALS"," ".join("%.17g"%v for v in o.tolist()))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_s.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let pv: Vec<f64> = pt.lines().find_map(|l| l.strip_prefix("VALS ")).map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect()).unwrap_or_default();
+    let pv: Vec<f64> = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("VALS "))
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let a = s.tensor_variable(sv.clone(), vec![ns], false)?;
     let b = s.tensor_variable(ev.clone(), vec![ns], false)?;
     let w = s.tensor_variable(wv.clone(), vec![ns], false)?;
     let o = s.tensor_lerp_weighted(a, b, w)?;
     let fv = s.tensor_values(o)?;
-    let mm = fv.iter().zip(&pv).filter(|(x, y)| x.to_bits() != y.to_bits()).count() + fv.len().abs_diff(pv.len());
+    let mm = fv
+        .iter()
+        .zip(&pv)
+        .filter(|(x, y)| x.to_bits() != y.to_bits())
+        .count()
+        + fv.len().abs_diff(pv.len());
     println!("parity: {mm}/{} value-bit mismatches", pv.len());
 
     // ---- perf: 16M f64 no-grad ----
@@ -51,7 +68,9 @@ print("VALS"," ".join("%.17g"%v for v in o.tolist()))
         let t = Instant::now();
         let _ = s.tensor_lerp_weighted(a, b, w).unwrap();
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
     }
     let label = if orig { "FT_ORIG(compose)" } else { "FT_FUSED" };
 
@@ -71,11 +90,28 @@ def t(fn,reps=9):
 print("PT lerp %.4f"%t(lambda:torch.lerp(s,e,w)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_b.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let ptw = pt.lines().find_map(|l| l.strip_prefix("PT lerp ")).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  lerp_weighted(16M) {label} {best:.3}ms  PT {ptw:.3}ms  => {}", v(best, ptw));
+    let ptw = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("PT lerp "))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(f64::NAN);
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  lerp_weighted(16M) {label} {best:.3}ms  PT {ptw:.3}ms  => {}",
+        v(best, ptw)
+    );
     Ok(())
 }

@@ -20,7 +20,10 @@ fn gcd(mut a: i64, mut b: i64) -> i64 {
 fn old_gcd(a: &[f64], b: &[f64]) -> Vec<f64> {
     let ca = a.to_vec();
     let cb = b.to_vec();
-    ca.iter().zip(cb.iter()).map(|(&x, &y)| gcd(x as i64, y as i64) as f64).collect()
+    ca.iter()
+        .zip(cb.iter())
+        .map(|(&x, &y)| gcd(x as i64, y as i64) as f64)
+        .collect()
 }
 
 fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
@@ -42,8 +45,12 @@ fn main() {
     let cases: [(&str, usize); 3] = [("4M", 4_000_000), ("8M", 8_000_000), ("16M", 16_000_000)];
     for (label, numel) in cases {
         // Mixed large-ish values so the Euclidean loop runs several iterations.
-        let a: Vec<f64> = (0..numel).map(|i| ((i * 2_654_435_761usize) % 1_000_003) as f64).collect();
-        let b: Vec<f64> = (0..numel).map(|i| ((i * 40_503usize) % 999_983 + 1) as f64).collect();
+        let a: Vec<f64> = (0..numel)
+            .map(|i| ((i * 2_654_435_761usize) % 1_000_003) as f64)
+            .collect();
+        let b: Vec<f64> = (0..numel)
+            .map(|i| ((i * 40_503usize) % 999_983 + 1) as f64)
+            .collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
         let at = sess.tensor_variable(a.clone(), vec![numel], false).unwrap();

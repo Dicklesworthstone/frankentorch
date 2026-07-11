@@ -11,7 +11,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let inp = s.tensor_variable_f32(vec![1.0f32; rows * cols], vec![rows, cols], false)?;
-        let idx = s.tensor_variable((0..nsrc).map(|i| (i % rows) as f64).collect(), vec![nsrc], false)?;
+        let idx = s.tensor_variable(
+            (0..nsrc).map(|i| (i % rows) as f64).collect(),
+            vec![nsrc],
+            false,
+        )?;
         let src = s.tensor_variable_f32(vec![2.0f32; nsrc * cols], vec![nsrc, cols], false)?;
         match s.tensor_index_reduce(inp, 0, idx, src, "amax", true) {
             Ok(o) => println!("f32 index_reduce: OK dtype={:?}", s.tensor_dtype(o)?),
@@ -19,25 +23,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         }
     }
     // f64 perf
-    let input: Vec<f64> = (0..rows * cols).map(|i| ((i % 9973) as f64 - 5000.0) * 0.001).collect();
+    let input: Vec<f64> = (0..rows * cols)
+        .map(|i| ((i % 9973) as f64 - 5000.0) * 0.001)
+        .collect();
     let idxv: Vec<f64> = (0..nsrc).map(|i| ((i * 7919) % rows) as f64).collect();
-    let srcv: Vec<f64> = (0..nsrc * cols).map(|i| ((i % 7919) as f64) * 0.001 + 0.5).collect();
+    let srcv: Vec<f64> = (0..nsrc * cols)
+        .map(|i| ((i % 7919) as f64) * 0.001 + 0.5)
+        .collect();
     for mode in ["amax", "prod", "mean"] {
         let bench = || {
             let mut best = f64::INFINITY;
             for _ in 0..5 {
                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-                let xi = s.tensor_variable(input.clone(), vec![rows, cols], false).unwrap();
+                let xi = s
+                    .tensor_variable(input.clone(), vec![rows, cols], false)
+                    .unwrap();
                 let ix = s.tensor_variable(idxv.clone(), vec![nsrc], false).unwrap();
-                let sr = s.tensor_variable(srcv.clone(), vec![nsrc, cols], false).unwrap();
+                let sr = s
+                    .tensor_variable(srcv.clone(), vec![nsrc, cols], false)
+                    .unwrap();
                 let t = Instant::now();
                 let _ = s.tensor_index_reduce(xi, 0, ix, sr, mode, true);
                 let e = t.elapsed().as_secs_f64() * 1e3;
-                if e < best { best = e; }
+                if e < best {
+                    best = e;
+                }
             }
             best
         };
-        let py = format!(r#"
+        let py = format!(
+            r#"
 import time,torch
 torch.set_num_threads(8)
 rows,cols,nsrc={rows},{cols},{nsrc}
@@ -50,14 +65,35 @@ def tm(fn,reps=5):
     for _ in range(reps): s=time.perf_counter(); fn(); ts.append((time.perf_counter()-s)*1e3)
     return min(ts)
 print("PT ir %.3f"%tm(lambda:input.index_reduce(0,idx,src,'{mode}',include_self=True)))
-"#);
-        let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#
+        );
+        let mut ch = Command::new(&python)
+            .arg("-")
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
         ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
         let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-        let pt = out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == "ir" { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
+        let pt = out
+            .lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == "ir" {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN);
         let ft = bench();
-        let vrb = if pt >= ft { format!("FT {:.2}x FASTER", pt / ft) } else { format!("FT {:.2}x SLOWER", ft / pt) };
-        println!("index_reduce f64 dim=0 [{rows}x{cols}] nsrc={nsrc} mode={mode}: FT {ft:8.3}ms torch {pt:8.3}ms => {vrb}");
+        let vrb = if pt >= ft {
+            format!("FT {:.2}x FASTER", pt / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / pt)
+        };
+        println!(
+            "index_reduce f64 dim=0 [{rows}x{cols}] nsrc={nsrc} mode={mode}: FT {ft:8.3}ms torch {pt:8.3}ms => {vrb}"
+        );
     }
     Ok(())
 }

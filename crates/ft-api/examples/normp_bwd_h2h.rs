@@ -27,7 +27,9 @@ fn main() {
         let mut samples = [0.0f64; 3];
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let a = s.tensor_variable(data.clone(), vec![rows, cols], true).unwrap();
+            let a = s
+                .tensor_variable(data.clone(), vec![rows, cols], true)
+                .unwrap();
             let t0 = Instant::now();
             let nrm = s.tensor_norm(a, p).unwrap();
             s.tensor_backward(nrm).unwrap();

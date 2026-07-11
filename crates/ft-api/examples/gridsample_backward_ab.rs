@@ -16,10 +16,21 @@ fn mode() -> GridSampleMode {
     }
 }
 
-fn build(batch: usize, ch: usize, ih: usize, iw: usize, oh: usize, ow: usize) -> (Vec<f64>, Vec<f64>) {
-    let input: Vec<f64> = (0..batch * ch * ih * iw).map(|i| ((i % 251) as f64 - 125.0) * 0.01).collect();
+fn build(
+    batch: usize,
+    ch: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+) -> (Vec<f64>, Vec<f64>) {
+    let input: Vec<f64> = (0..batch * ch * ih * iw)
+        .map(|i| ((i % 251) as f64 - 125.0) * 0.01)
+        .collect();
     // grid in [-1,1] with variety so all interp branches are hit.
-    let grid: Vec<f64> = (0..batch * oh * ow * 2).map(|i| ((i % 197) as f64 / 98.0) - 1.0).collect();
+    let grid: Vec<f64> = (0..batch * oh * ow * 2)
+        .map(|i| ((i % 197) as f64 / 98.0) - 1.0)
+        .collect();
     (input, grid)
 }
 
@@ -30,8 +41,12 @@ fn run_once(
 ) -> (Vec<f64>, Vec<f64>) {
     let (batch, ch, ih, iw, oh, ow) = dims;
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let inp = s.tensor_variable(input_v.to_vec(), vec![batch, ch, ih, iw], true).unwrap();
-    let grd = s.tensor_variable(grid_v.to_vec(), vec![batch, oh, ow, 2], true).unwrap();
+    let inp = s
+        .tensor_variable(input_v.to_vec(), vec![batch, ch, ih, iw], true)
+        .unwrap();
+    let grd = s
+        .tensor_variable(grid_v.to_vec(), vec![batch, oh, ow, 2], true)
+        .unwrap();
     let out = s
         .grid_sample_tensor(inp, grd, mode(), GridSamplePaddingMode::Zeros, false)
         .unwrap();
@@ -49,8 +64,12 @@ fn time_backward(
 ) -> f64 {
     let (batch, ch, ih, iw, oh, ow) = dims;
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let inp = s.tensor_variable(input_v.to_vec(), vec![batch, ch, ih, iw], true).unwrap();
-    let grd = s.tensor_variable(grid_v.to_vec(), vec![batch, oh, ow, 2], true).unwrap();
+    let inp = s
+        .tensor_variable(input_v.to_vec(), vec![batch, ch, ih, iw], true)
+        .unwrap();
+    let grd = s
+        .tensor_variable(grid_v.to_vec(), vec![batch, oh, ow, 2], true)
+        .unwrap();
     let mut best = f64::INFINITY;
     for _ in 0..9 {
         let out = s

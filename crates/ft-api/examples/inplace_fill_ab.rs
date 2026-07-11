@@ -29,7 +29,9 @@ fn main() {
         let init: Vec<f64> = (0..numel).map(|i| (i % 97) as f64 * 0.01).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tt = sess.tensor_variable(init.clone(), vec![numel], false).unwrap();
+        let tt = sess
+            .tensor_variable(init.clone(), vec![numel], false)
+            .unwrap();
         // bitmatch: one application of the real op -> all 1.0.
         sess.tensor_ones_(tt).unwrap();
         let new_vals = sess.tensor_values(tt).unwrap();

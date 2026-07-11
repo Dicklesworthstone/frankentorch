@@ -13,7 +13,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xd: Vec<f64> = (0..n).map(|i| ((i % 4000) as f64) * 0.005 - 10.0).collect();
     let dd: Vec<f64> = (0..n).map(|i| ((i % 300) as f64) * 0.01 + 0.7).collect(); // divisor for remainder/fmod
 
-    let ops: &[&str] = &["exp", "add", "frac", "hardswish", "mish", "softplus", "logsigmoid", "hardsigmoid", "remainder", "fmod"];
+    let ops: &[&str] = &[
+        "exp",
+        "add",
+        "frac",
+        "hardswish",
+        "mish",
+        "softplus",
+        "logsigmoid",
+        "hardsigmoid",
+        "remainder",
+        "fmod",
+    ];
     let run = |which: &str| -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
@@ -35,7 +46,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => unreachable!(),
             };
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -65,14 +78,38 @@ print("PT remainder %.4f"%t(lambda:torch.remainder(x,d)))
 print("PT fmod %.4f"%t(lambda:torch.fmod(x,d)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
     for (name, ftms) in &ft {
         let pt = g(name);
-        println!("  {name:14} FT {ftms:8.3}ms  PT {pt:8.3}ms  => {}", v(*ftms, pt));
+        println!(
+            "  {name:14} FT {ftms:8.3}ms  PT {pt:8.3}ms  => {}",
+            v(*ftms, pt)
+        );
     }
     Ok(())
 }

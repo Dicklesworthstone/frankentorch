@@ -42,7 +42,9 @@ fn main() {
         .tensor_beta(2.0, 3.0, shape.clone(), false)
         .unwrap());
     bench!("poisson(4)", |s: &mut FrankenTorchSession| {
-        let rate = s.tensor_variable(vec![4.0; n], shape.clone(), false).unwrap();
+        let rate = s
+            .tensor_variable(vec![4.0; n], shape.clone(), false)
+            .unwrap();
         s.tensor_poisson(rate).unwrap()
     });
     bench!("binomial(20)", |s: &mut FrankenTorchSession| s

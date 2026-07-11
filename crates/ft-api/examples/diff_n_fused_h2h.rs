@@ -25,7 +25,9 @@ fn main() {
     let d32: Vec<f32> = d64.iter().map(|&x| x as f32).collect();
     for order in [2usize, 3] {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(d64.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable(d64.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_diff_full(a, order, 1, None, None).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -34,11 +36,16 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[{tag}] diff f64 [4096,4096] dim=1 n={order}: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[{tag}] diff f64 [4096,4096] dim=1 n={order}: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable_f32(d32.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable_f32(d32.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_diff_full(a, 3, 1, None, None).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -47,6 +54,9 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[{tag}] diff f32 [4096,4096] dim=1 n=3: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[{tag}] diff f32 [4096,4096] dim=1 n=3: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
 }

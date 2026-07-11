@@ -9,10 +9,15 @@ use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let n: usize = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(16_000_000);
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(16_000_000);
     let data: Vec<f64> = (0..n)
         .map(|i| {
-            let z = (i as u64).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let z = (i as u64)
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
             ((z >> 11) as f64 / (1u64 << 53) as f64) * 2.0 - 1.0
         })
         .collect();
@@ -25,17 +30,35 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let x = s.tensor_variable(data.clone(), vec![n], false).unwrap();
             let ti = Instant::now();
             match which {
-                0 => { let _ = s.tensor_sort(x, 0, false); }
-                1 => { let _ = s.tensor_msort(x); }
-                2 => { let _ = s.tensor_topk(x, 100, 0, true, true); }
-                3 => { let _ = s.tensor_topk(x, kbig, 0, true, true); }
-                4 => { let _ = s.tensor_kthvalue(x, n / 2); }
-                5 => { let _ = s.tensor_unique(x, true, true, false); }
-                6 => { let _ = s.tensor_unique(x, true, false, true); }
-                _ => { let _ = s.tensor_unique(x, true, true, true); }
+                0 => {
+                    let _ = s.tensor_sort(x, 0, false);
+                }
+                1 => {
+                    let _ = s.tensor_msort(x);
+                }
+                2 => {
+                    let _ = s.tensor_topk(x, 100, 0, true, true);
+                }
+                3 => {
+                    let _ = s.tensor_topk(x, kbig, 0, true, true);
+                }
+                4 => {
+                    let _ = s.tensor_kthvalue(x, n / 2);
+                }
+                5 => {
+                    let _ = s.tensor_unique(x, true, true, false);
+                }
+                6 => {
+                    let _ = s.tensor_unique(x, true, false, true);
+                }
+                _ => {
+                    let _ = s.tensor_unique(x, true, true, true);
+                }
             }
             let e = ti.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -60,17 +83,52 @@ print("PT unique_inv %.3f"%tm(lambda:torch.unique(x,return_inverse=True)))
 print("PT unique_counts %.3f"%tm(lambda:torch.unique(x,return_counts=True)))
 print("PT unique_both %.3f"%tm(lambda:torch.unique(x,return_inverse=True,return_counts=True)))
 "#,
-        n = n, kbig = kbig
+        n = n,
+        kbig = kbig
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
     println!("1-D selection surface, N={n} f64 (torch 8t / FT default), min-of-5");
-    for (lbl, key, w) in [("sort", "sort", 0u8), ("msort", "msort", 1), ("topk100", "topk100", 2), ("topkN/4", "topkbig", 3), ("kthvalue", "kthvalue", 4), ("unique_inv", "unique_inv", 5), ("unique_cnt", "unique_counts", 6), ("unique_both", "unique_both", 7)] {
+    for (lbl, key, w) in [
+        ("sort", "sort", 0u8),
+        ("msort", "msort", 1),
+        ("topk100", "topk100", 2),
+        ("topkN/4", "topkbig", 3),
+        ("kthvalue", "kthvalue", 4),
+        ("unique_inv", "unique_inv", 5),
+        ("unique_cnt", "unique_counts", 6),
+        ("unique_both", "unique_both", 7),
+    ] {
         let ft = tt(w);
-        println!("  {lbl:<9} FT {ft:9.3}  PT {:9.3}  => {}", g(key), v(ft, g(key)));
+        println!(
+            "  {lbl:<9} FT {ft:9.3}  PT {:9.3}  => {}",
+            g(key),
+            v(ft, g(key))
+        );
     }
     Ok(())
 }

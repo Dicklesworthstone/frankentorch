@@ -38,7 +38,7 @@ fn main() {
         ("attn.mT [b=256,256x64]", 256, 256, 64), // plane=16K <=1M -> uninit (WIN expected)
         ("mid [b=64,512x512]", 64, 512, 512),     // plane=262K <=1M -> uninit (neutral)
         ("single [b=1,8192x8192]", 1, 8192, 8192), // plane=64M >1M -> old path (== 1.0x)
-        ("few [b=4,4096x4096]", 4, 4096, 4096),   // plane=16M >1M -> old path (== 1.0x, regression gated out)
+        ("few [b=4,4096x4096]", 4, 4096, 4096), // plane=16M >1M -> old path (== 1.0x, regression gated out)
     ];
     println!("case                       OLD(ms)  NEW(ms)  NEW/OLD   bitmatch   [f32, min-9]");
     for (label, batch, rows, cols) in cases {
@@ -48,8 +48,9 @@ fn main() {
         let b = ft_kernel_cpu::transpose_batched_materialize_f32(&src, batch, rows, cols);
         let bitmatch = a == b;
         let old_ms = bench(|| old_transpose_f32(&src, batch, rows, cols).len());
-        let new_ms =
-            bench(|| ft_kernel_cpu::transpose_batched_materialize_f32(&src, batch, rows, cols).len());
+        let new_ms = bench(|| {
+            ft_kernel_cpu::transpose_batched_materialize_f32(&src, batch, rows, cols).len()
+        });
         let ratio = old_ms / new_ms;
         println!("  {label:<24} {old_ms:7.3} {new_ms:7.3}   {ratio:5.2}x   bitmatch={bitmatch}");
     }

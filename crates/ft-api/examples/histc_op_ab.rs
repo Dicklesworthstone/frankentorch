@@ -59,7 +59,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 
 fn main() {
     let bins = 256;
-    println!("tensor_histc f64 (auto-range), min-9:  OLD=generic clone+serial  NEW=borrow+parallel");
+    println!(
+        "tensor_histc f64 (auto-range), min-9:  OLD=generic clone+serial  NEW=borrow+parallel"
+    );
     for &n in &[1usize << 22, 1 << 24, 1 << 26] {
         let input: Vec<f64> = (0..n).map(|i| (i % 100003) as f64 * 0.01).collect();
         // Session + input tensor built ONCE outside the timer; time only tensor_histc.

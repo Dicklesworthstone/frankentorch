@@ -13,7 +13,9 @@ use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
 
 fn vdata(n: usize) -> Vec<f64> {
-    (0..n).map(|i| if i % 2 == 0 { 1.0001 } else { 0.9999 }).collect()
+    (0..n)
+        .map(|i| if i % 2 == 0 { 1.0001 } else { 0.9999 })
+        .collect()
 }
 
 fn ft_cumprod(shape: &[usize], dim: usize, iters: usize) -> (f64, f64) {
@@ -28,7 +30,9 @@ fn ft_cumprod(shape: &[usize], dim: usize, iters: usize) -> (f64, f64) {
         let out = s.tensor_cumprod(x, dim).unwrap();
         let el = t.elapsed().as_secs_f64() * 1e3;
         chk = s.tensor_values(out).unwrap().iter().sum();
-        if el < best { best = el; }
+        if el < best {
+            best = el;
+        }
     }
     (chk, best)
 }
@@ -50,12 +54,24 @@ print("MS", sorted(ts)[0]); print("CHK", chk)
 
 fn py(shape: &[usize], dim: usize) -> (Option<f64>, Option<f64>) {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let shp = shape.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(",");
-    let o = Command::new(&python).arg("-c").arg(PY).env("SHAPE", shp).env("DIM", dim.to_string()).output();
+    let shp = shape
+        .iter()
+        .map(|x| x.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let o = Command::new(&python)
+        .arg("-c")
+        .arg(PY)
+        .env("SHAPE", shp)
+        .env("DIM", dim.to_string())
+        .output();
     match o {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let g = |p: &str| s.lines().find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()));
+            let g = |p: &str| {
+                s.lines()
+                    .find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()))
+            };
             (g("MS "), g("CHK "))
         }
         _ => (None, None),
@@ -73,8 +89,15 @@ fn main() {
             (Some(p), Some(psum)) => {
                 let rel = (fs - psum).abs() / (psum.abs() + 1e-12);
                 let r = p / fm;
-                let v = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x slower", 1.0 / r) };
-                println!("  | PyTorch {p:8.3} ms => {v}  ({} {rel:.1e})", if rel < 1e-9 { "MATCH" } else { "MISMATCH!" });
+                let v = if r >= 1.0 {
+                    format!("FT {r:.2}x FASTER")
+                } else {
+                    format!("FT {:.2}x slower", 1.0 / r)
+                };
+                println!(
+                    "  | PyTorch {p:8.3} ms => {v}  ({} {rel:.1e})",
+                    if rel < 1e-9 { "MATCH" } else { "MISMATCH!" }
+                );
             }
             _ => println!("  | PyTorch (unavailable)"),
         }

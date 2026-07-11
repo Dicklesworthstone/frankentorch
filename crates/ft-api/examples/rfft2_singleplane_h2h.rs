@@ -19,9 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = Instant::now();
         let _ = s.tensor_rfft2(x).unwrap();
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
     }
-    let label = if orig { "FT_ORIG(serial-row)" } else { "FT_PARALLEL" };
+    let label = if orig {
+        "FT_ORIG(serial-row)"
+    } else {
+        "FT_PARALLEL"
+    };
     let py = format!(
         r#"
 import time,torch
@@ -36,11 +42,28 @@ def t(fn,reps=7):
 print("PT rfft2 %.4f"%t(lambda:torch.fft.rfft2(x)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let ptw = pt.lines().find_map(|l| l.strip_prefix("PT rfft2 ")).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  rfft2[{r}x{c}] {label} {best:.3}ms  PT {ptw:.3}ms => {}", v(best, ptw));
+    let ptw = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("PT rfft2 "))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(f64::NAN);
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  rfft2[{r}x{c}] {label} {best:.3}ms  PT {ptw:.3}ms => {}",
+        v(best, ptw)
+    );
     Ok(())
 }

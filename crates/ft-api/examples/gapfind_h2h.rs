@@ -13,23 +13,42 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let data = if matches!(w, 1 | 2) { pos.clone() } else { spread.clone() };
+            let data = if matches!(w, 1 | 2) {
+                pos.clone()
+            } else {
+                spread.clone()
+            };
             let x = s.tensor_variable_f32(data, vec![n], false).unwrap();
             let t = Instant::now();
             match w {
-                0 => { let _ = s.tensor_add(x, x); }                                  // anchor
-                1 => { let _ = s.tensor_special_spherical_bessel_j0(x); }
-                2 => { let _ = s.tensor_polygamma(5, x); }
-                3 => { let _ = s.tensor_special_airy_ai(x); }
-                4 => { let _ = s.tensor_special_scaled_modified_bessel_k0(x); }       // shipped-fast anchor
-                _ => { let _ = s.tensor_digamma(x); }                                  // shipped-fast anchor
+                0 => {
+                    let _ = s.tensor_add(x, x);
+                } // anchor
+                1 => {
+                    let _ = s.tensor_special_spherical_bessel_j0(x);
+                }
+                2 => {
+                    let _ = s.tensor_polygamma(5, x);
+                }
+                3 => {
+                    let _ = s.tensor_special_airy_ai(x);
+                }
+                4 => {
+                    let _ = s.tensor_special_scaled_modified_bessel_k0(x);
+                } // shipped-fast anchor
+                _ => {
+                    let _ = s.tensor_digamma(x);
+                } // shipped-fast anchor
             }
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
-    let py = format!(r#"
+    let py = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n={n}
@@ -46,16 +65,49 @@ print("PT polyg5 %.3f"%tm(lambda:torch.special.polygamma(5,pos)))
 print("PT airy %.3f"%tm(lambda:torch.special.airy_ai(spread)))
 print("PT sk0 %.3f"%tm(lambda:torch.special.scaled_modified_bessel_k0(pos)))
 print("PT digamma %.3f"%tm(lambda:torch.special.digamma(spread)))
-"#);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let vrb = |ft: f64, pp: f64| if pp >= ft { format!("FT {:.2}x FASTER", pp / ft) } else { format!("FT {:.2}x SLOWER", ft / pp) };
+    let g = |k: &str| {
+        out.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let vrb = |ft: f64, pp: f64| {
+        if pp >= ft {
+            format!("FT {:.2}x FASTER", pp / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / pp)
+        }
+    };
     println!("gapfind ~16M f32 (torch 8t / FT default), min-of-7:");
-    for (lbl, w) in [("add", 0u8), ("sph_j0", 1), ("polyg5", 2), ("airy", 3), ("sk0", 4), ("digamma", 5)] {
+    for (lbl, w) in [
+        ("add", 0u8),
+        ("sph_j0", 1),
+        ("polyg5", 2),
+        ("airy", 3),
+        ("sk0", 4),
+        ("digamma", 5),
+    ] {
         let ft = bench(w);
-        println!("  {lbl:<9} FT {ft:8.3}  PT {:8.3}  => {}", g(lbl), vrb(ft, g(lbl)));
+        println!(
+            "  {lbl:<9} FT {ft:8.3}  PT {:8.3}  => {}",
+            g(lbl),
+            vrb(ft, g(lbl))
+        );
     }
     Ok(())
 }

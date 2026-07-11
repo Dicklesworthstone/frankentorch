@@ -15,16 +15,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = sess.tensor_variable(xd.clone(), vec![b, s, 2 * d], false).unwrap();
+            let x = sess
+                .tensor_variable(xd.clone(), vec![b, s, 2 * d], false)
+                .unwrap();
             let t = Instant::now();
-            let _ = match which { "swiglu" => sess.tensor_swiglu(x, 2).unwrap(), "reglu" => sess.tensor_reglu(x, 2).unwrap(), _ => sess.tensor_geglu(x, 2).unwrap() };
+            let _ = match which {
+                "swiglu" => sess.tensor_swiglu(x, 2).unwrap(),
+                "reglu" => sess.tensor_reglu(x, 2).unwrap(),
+                _ => sess.tensor_geglu(x, 2).unwrap(),
+            };
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
     let (fsg, frg, fgg) = (run("swiglu"), run("reglu"), run("geglu"));
-    let label = if std::env::var("FT_ORIG").is_ok() { "FT_ORIG(compose)" } else { "FT_FUSED" };
+    let label = if std::env::var("FT_ORIG").is_ok() {
+        "FT_ORIG(compose)"
+    } else {
+        "FT_FUSED"
+    };
     let py = format!(
         r#"
 import time,torch,torch.nn.functional as F
@@ -47,13 +59,46 @@ print("PT reglu %.4f"%t(lambda:reglu(x)))
 print("PT geglu %.4f"%t(lambda:geglu(x)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  swiglu {label} {fsg:.3}ms  PT {:.3}ms => {}", g("swiglu"), v(fsg, g("swiglu")));
-    println!("  reglu  {label} {frg:.3}ms  PT {:.3}ms => {}", g("reglu"), v(frg, g("reglu")));
-    println!("  geglu  {label} {fgg:.3}ms  PT {:.3}ms => {}", g("geglu"), v(fgg, g("geglu")));
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  swiglu {label} {fsg:.3}ms  PT {:.3}ms => {}",
+        g("swiglu"),
+        v(fsg, g("swiglu"))
+    );
+    println!(
+        "  reglu  {label} {frg:.3}ms  PT {:.3}ms => {}",
+        g("reglu"),
+        v(frg, g("reglu"))
+    );
+    println!(
+        "  geglu  {label} {fgg:.3}ms  PT {:.3}ms => {}",
+        g("geglu"),
+        v(fgg, g("geglu"))
+    );
     Ok(())
 }

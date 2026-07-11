@@ -26,14 +26,17 @@ fn new_pack(values: &[f64], b: usize, s: usize, h: usize, d: usize) -> Vec<f64> 
     let batch_stride = s * embed;
     let head_stride = s * d;
     let mut packed = vec![0.0; values.len()];
-    packed.par_chunks_mut(head_stride).enumerate().for_each(|(bh, plane)| {
-        let batch = bh / h;
-        let head = bh % h;
-        for seq in 0..s {
-            let src = batch * batch_stride + seq * embed + head * d;
-            plane[seq * d..seq * d + d].copy_from_slice(&values[src..src + d]);
-        }
-    });
+    packed
+        .par_chunks_mut(head_stride)
+        .enumerate()
+        .for_each(|(bh, plane)| {
+            let batch = bh / h;
+            let head = bh % h;
+            for seq in 0..s {
+                let src = batch * batch_stride + seq * embed + head * d;
+                plane[seq * d..seq * d + d].copy_from_slice(&values[src..src + d]);
+            }
+        });
     packed
 }
 
@@ -52,14 +55,27 @@ fn bench<F: Fn() -> usize>(f: F) -> f64 {
 }
 
 fn main() {
-    println!("pack_attention_heads [B,S,H*D]->[B,H,S,D] f64, min-9:  OLD=serial  NEW=par-over-planes");
-    let cases = [("B32 H8 S512 D64", 32usize, 512, 8, 64), ("B16 H16 S256 D64", 16, 256, 16, 64), ("B8 H12 S1024 D64", 8, 1024, 12, 64)];
+    println!(
+        "pack_attention_heads [B,S,H*D]->[B,H,S,D] f64, min-9:  OLD=serial  NEW=par-over-planes"
+    );
+    let cases = [
+        ("B32 H8 S512 D64", 32usize, 512, 8, 64),
+        ("B16 H16 S256 D64", 16, 256, 16, 64),
+        ("B8 H12 S1024 D64", 8, 1024, 12, 64),
+    ];
     for (label, b, s, h, d) in cases {
         let n = b * s * h * d;
         let src: Vec<f64> = (0..n).map(|i| (i % 1009) as f64 + 0.5).collect();
         let bm = old_pack(&src, b, s, h, d) == new_pack(&src, b, s, h, d);
         let o = bench(|| old_pack(&src, b, s, h, d).len());
         let nw = bench(|| new_pack(&src, b, s, h, d).len());
-        println!("  {label:<18} ({:>3}MB)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}", n * 8 / (1 << 20), o, nw, o / nw, bm);
+        println!(
+            "  {label:<18} ({:>3}MB)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
+            n * 8 / (1 << 20),
+            o,
+            nw,
+            o / nw,
+            bm
+        );
     }
 }

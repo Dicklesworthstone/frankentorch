@@ -20,8 +20,10 @@ fn main() {
                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
                 let (x1, x2) = if dt == "f32" {
                     (
-                        s.tensor_variable_f32(a32.clone(), vec![m, d], false).unwrap(),
-                        s.tensor_variable_f32(b32.clone(), vec![m, d], false).unwrap(),
+                        s.tensor_variable_f32(a32.clone(), vec![m, d], false)
+                            .unwrap(),
+                        s.tensor_variable_f32(b32.clone(), vec![m, d], false)
+                            .unwrap(),
                     )
                 } else {
                     (

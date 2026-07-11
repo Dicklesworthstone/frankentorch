@@ -25,7 +25,14 @@ fn best<F: FnMut()>(mut f: F) -> f64 {
 }
 
 // Reproduction of the ORIGINAL serial per-element push path (pre-change baseline).
-fn narrow_old_push(data: &[f64], outer: usize, dim_size: usize, inner: usize, start: usize, length: usize) -> Vec<f64> {
+fn narrow_old_push(
+    data: &[f64],
+    outer: usize,
+    dim_size: usize,
+    inner: usize,
+    start: usize,
+    length: usize,
+) -> Vec<f64> {
     let mut output = Vec::with_capacity(outer * length * inner);
     for o in 0..outer {
         for r in 0..length {

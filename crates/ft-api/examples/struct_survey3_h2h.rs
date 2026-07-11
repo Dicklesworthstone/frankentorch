@@ -27,16 +27,29 @@ where
         let t = Instant::now();
         op(&mut s, x);
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
     }
     best
 }
 
 fn report(name: &str, ftv: f64, pt: &str) {
-    let p = pt.lines().find_map(|l| { let mut it=l.strip_prefix("PT ")?.split_whitespace(); if it.next()?==name {it.next()?.parse::<f64>().ok()} else {None} });
+    let p = pt.lines().find_map(|l| {
+        let mut it = l.strip_prefix("PT ")?.split_whitespace();
+        if it.next()? == name {
+            it.next()?.parse::<f64>().ok()
+        } else {
+            None
+        }
+    });
     if let Some(p) = p {
         let r = p / ftv;
-        let tag = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x SLOWER", 1.0 / r) };
+        let tag = if r >= 1.0 {
+            format!("FT {r:.2}x FASTER")
+        } else {
+            format!("FT {:.2}x SLOWER", 1.0 / r)
+        };
         println!("  {name:<12} {ftv:8.3} {p:8.3}   {tag}");
     } else {
         println!("  {name:<12} {ftv:8.3}      nan   (torch failed)");
@@ -71,23 +84,81 @@ for name,fn in [("cat_anchor",lambda:torch.cat([x,x],1)),
                 ("tile",lambda:tb.tile((2,2)))]:
     print("PT %s %.4f"%(name,t(fn)))
 "#;
-    let mut child = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-    child.stdin.as_mut().ok_or_else(|| std::io::Error::other("no stdin"))?.write_all(py.as_bytes())?;
+    let mut child = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?
+        .write_all(py.as_bytes())?;
     let out = child.wait_with_output();
-    let pt = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let pt = out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
 
     println!("op            FT(ms)    PT(ms)   verdict");
-    report("cat_anchor", timed(
-        || { let mut s = FrankenTorchSession::new(ExecutionMode::Strict); let x = s.tensor_variable(mat.clone(), vec![R, C], false).unwrap(); (s, x) },
-        |s, x| { let _ = s.tensor_cat(&[x, x], 1); }), &pt);
-    report("one_hot", timed(
-        || { let mut s = FrankenTorchSession::new(ExecutionMode::Strict); let x = s.tensor_variable(idx.clone(), vec![ON], false).unwrap(); (s, x) },
-        |s, x| { let _ = s.tensor_one_hot(x, OC); }), &pt);
-    report("pad", timed(
-        || { let mut s = FrankenTorchSession::new(ExecutionMode::Strict); let x = s.tensor_variable(mat.clone(), vec![R, C], false).unwrap(); (s, x) },
-        |s, x| { let _ = s.tensor_pad(x, &[50, 50, 50, 50], 0.0); }), &pt);
-    report("tile", timed(
-        || { let mut s = FrankenTorchSession::new(ExecutionMode::Strict); let x = s.tensor_variable(tbase.clone(), vec![TH, TH], false).unwrap(); (s, x) },
-        |s, x| { let _ = s.tensor_tile(x, &[2, 2]); }), &pt);
+    report(
+        "cat_anchor",
+        timed(
+            || {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(mat.clone(), vec![R, C], false).unwrap();
+                (s, x)
+            },
+            |s, x| {
+                let _ = s.tensor_cat(&[x, x], 1);
+            },
+        ),
+        &pt,
+    );
+    report(
+        "one_hot",
+        timed(
+            || {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(idx.clone(), vec![ON], false).unwrap();
+                (s, x)
+            },
+            |s, x| {
+                let _ = s.tensor_one_hot(x, OC);
+            },
+        ),
+        &pt,
+    );
+    report(
+        "pad",
+        timed(
+            || {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s.tensor_variable(mat.clone(), vec![R, C], false).unwrap();
+                (s, x)
+            },
+            |s, x| {
+                let _ = s.tensor_pad(x, &[50, 50, 50, 50], 0.0);
+            },
+        ),
+        &pt,
+    );
+    report(
+        "tile",
+        timed(
+            || {
+                let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = s
+                    .tensor_variable(tbase.clone(), vec![TH, TH], false)
+                    .unwrap();
+                (s, x)
+            },
+            |s, x| {
+                let _ = s.tensor_tile(x, &[2, 2]);
+            },
+        ),
+        &pt,
+    );
     Ok(())
 }

@@ -22,8 +22,12 @@ fn main() {
         let mut fpa = 0u64;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let a = s.tensor_variable(da.clone(), vec![rows, cols], true).unwrap();
-            let b = s.tensor_variable(db.clone(), vec![rows, cols], true).unwrap();
+            let a = s
+                .tensor_variable(da.clone(), vec![rows, cols], true)
+                .unwrap();
+            let b = s
+                .tensor_variable(db.clone(), vec![rows, cols], true)
+                .unwrap();
             let t0 = Instant::now();
             let c = match op {
                 "add" => s.tensor_add(a, b).unwrap(),
@@ -43,6 +47,8 @@ fn main() {
             }
             std::hint::black_box(&s);
         }
-        println!("[{tag}] {op} fwd+bwd f64 [4096,4096]: total {best:.2} ms (sum/bwd {best_bwd:.2}) | grad_a_fp=0x{fpa:016x}");
+        println!(
+            "[{tag}] {op} fwd+bwd f64 [4096,4096]: total {best:.2} ms (sum/bwd {best_bwd:.2}) | grad_a_fp=0x{fpa:016x}"
+        );
     }
 }

@@ -21,36 +21,82 @@ m=torch.tensor({msk:?},dtype=torch.float64).bool()
 o=a.masked_fill(m,{val})
 print("VALS"," ".join("%.17g"%v for v in o.tolist()))
 "#,
-        inp = inp, msk = msk, val = val
+        inp = inp,
+        msk = msk,
+        val = val
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_s.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let pv: Vec<f64> = pt.lines().find_map(|l| l.strip_prefix("VALS ")).map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect()).unwrap_or_default();
+    let pv: Vec<f64> = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("VALS "))
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = s.tensor_variable(inp.clone(), vec![inp.len()], false)?;
     let m = s.tensor_variable(msk.clone(), vec![msk.len()], false)?;
     let o = s.tensor_masked_fill(x, m, val)?;
     let dt = s.tensor_dtype(o)?;
     let fv = s.tensor_values(o)?;
-    let mm = fv.iter().zip(&pv).filter(|(a, b)| a.to_bits() != b.to_bits()).count() + fv.len().abs_diff(pv.len());
-    println!("parity: dtype={dt:?} (f64={})  value-bit mismatches: {mm}/{}", dt == DType::F64, pv.len());
+    let mm = fv
+        .iter()
+        .zip(&pv)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count()
+        + fv.len().abs_diff(pv.len());
+    println!(
+        "parity: dtype={dt:?} (f64={})  value-bit mismatches: {mm}/{}",
+        dt == DType::F64,
+        pv.len()
+    );
 
     // perf: 16M f64, time only the op
     let n = 16_000_000usize;
-    let a: Vec<f64> = (0..n).map(|i| ((i % 9973) as f64 - 5000.0) * 0.001).collect();
+    let a: Vec<f64> = (0..n)
+        .map(|i| ((i % 9973) as f64 - 5000.0) * 0.001)
+        .collect();
     let mv: Vec<f64> = (0..n).map(|i| if i % 3 == 0 { 1.0 } else { 0.0 }).collect();
     let ft_add = {
         let mut best = f64::INFINITY;
-        for _ in 0..9 { let mut s = FrankenTorchSession::new(ExecutionMode::Strict); let x = s.tensor_variable(a.clone(), vec![n], false).unwrap(); let y = s.tensor_variable(mv.clone(), vec![n], false).unwrap(); let t = Instant::now(); let _ = s.tensor_add(x, y); let e = t.elapsed().as_secs_f64()*1e3; if e<best{best=e;} }
+        for _ in 0..9 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(a.clone(), vec![n], false).unwrap();
+            let y = s.tensor_variable(mv.clone(), vec![n], false).unwrap();
+            let t = Instant::now();
+            let _ = s.tensor_add(x, y);
+            let e = t.elapsed().as_secs_f64() * 1e3;
+            if e < best {
+                best = e;
+            }
+        }
         best
     };
     let ft_mf = {
         let mut best = f64::INFINITY;
-        for _ in 0..9 { let mut s = FrankenTorchSession::new(ExecutionMode::Strict); let x = s.tensor_variable(a.clone(), vec![n], false).unwrap(); let m = s.tensor_variable(mv.clone(), vec![n], false).unwrap(); let t = Instant::now(); let _ = s.tensor_masked_fill(x, m, val); let e = t.elapsed().as_secs_f64()*1e3; if e<best{best=e;} }
+        for _ in 0..9 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s.tensor_variable(a.clone(), vec![n], false).unwrap();
+            let m = s.tensor_variable(mv.clone(), vec![n], false).unwrap();
+            let t = Instant::now();
+            let _ = s.tensor_masked_fill(x, m, val);
+            let e = t.elapsed().as_secs_f64() * 1e3;
+            if e < best {
+                best = e;
+            }
+        }
         best
     };
-    let py_b = format!(r#"
+    let py_b = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n={n}
@@ -63,13 +109,39 @@ def t(fn,reps=9):
     return min(ts)
 print("PT add %.4f"%t(lambda:a+a))
 print("PT masked_fill %.4f"%t(lambda:a.masked_fill(m,{val})))
-"#, n = n, val = val);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        n = n,
+        val = val
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_b.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |n: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == n { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
+    let g = |n: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == n {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
     let (pa, pm) = (g("add"), g("masked_fill"));
-    println!("  add_anchor   FT {ft_add:.3} PT {pa:.3}  => FT {:.2}x {}", (pa/ft_add).max(ft_add/pa), if pa>=ft_add {"FASTER"} else {"SLOWER"});
-    println!("  masked_fill  FT {ft_mf:.3} PT {pm:.3}  => FT {:.2}x {}", (pm/ft_mf).max(ft_mf/pm), if pm>=ft_mf {"FASTER"} else {"SLOWER"});
+    println!(
+        "  add_anchor   FT {ft_add:.3} PT {pa:.3}  => FT {:.2}x {}",
+        (pa / ft_add).max(ft_add / pa),
+        if pa >= ft_add { "FASTER" } else { "SLOWER" }
+    );
+    println!(
+        "  masked_fill  FT {ft_mf:.3} PT {pm:.3}  => FT {:.2}x {}",
+        (pm / ft_mf).max(ft_mf / pm),
+        if pm >= ft_mf { "FASTER" } else { "SLOWER" }
+    );
     Ok(())
 }

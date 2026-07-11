@@ -5,11 +5,19 @@ use std::time::Instant;
 #[inline]
 fn key(v: f32) -> u32 {
     let b = v.to_bits();
-    if b & 0x8000_0000 != 0 { !b } else { b | 0x8000_0000 }
+    if b & 0x8000_0000 != 0 {
+        !b
+    } else {
+        b | 0x8000_0000
+    }
 }
 #[inline]
 fn unkey(k: u32) -> f32 {
-    let b = if k & 0x8000_0000 != 0 { k & 0x7fff_ffff } else { !k };
+    let b = if k & 0x8000_0000 != 0 {
+        k & 0x7fff_ffff
+    } else {
+        !k
+    };
     f32::from_bits(b)
 }
 
@@ -17,7 +25,9 @@ fn main() {
     let n = 16_000_000usize;
     // CLUSTERED positive data (matches norm_select_sweep): worst case for filter-radix
     // (sign bit constant, exponent clustered -> active set barely shrinks).
-    let data: Vec<f32> = (0..n).map(|i| ((i * 7919) % 1_000_003) as f32 * 0.001).collect();
+    let data: Vec<f32> = (0..n)
+        .map(|i| ((i * 7919) % 1_000_003) as f32 * 0.001)
+        .collect();
     let mid = (n - 1) / 2;
 
     // A: total_cmp closure (current impl)
@@ -111,11 +121,22 @@ fn main() {
                     }
                     h
                 })
-                .reduce(|| [0usize; 256], |mut a, b| { for i in 0..256 { a[i] += b[i]; } a });
+                .reduce(
+                    || [0usize; 256],
+                    |mut a, b| {
+                        for i in 0..256 {
+                            a[i] += b[i];
+                        }
+                        a
+                    },
+                );
             let mut cum = 0usize;
             let mut chosen = 0u8;
             for (bk, &c) in hist.iter().enumerate() {
-                if cum + c > rank { chosen = bk as u8; break; }
+                if cum + c > rank {
+                    chosen = bk as u8;
+                    break;
+                }
                 cum += c;
             }
             prefix |= (chosen as u32) << shift;
@@ -130,9 +151,21 @@ fn main() {
     let rc = c();
     let rd = d();
     let re = e();
-    assert_eq!(ra.to_bits(), re.to_bits(), "masked-histogram median differs");
-    assert_eq!(ra.to_bits(), rb.to_bits(), "u32-key median differs from total_cmp");
-    assert_eq!(ra.to_bits(), rc.to_bits(), "parallel u32-key median differs");
+    assert_eq!(
+        ra.to_bits(),
+        re.to_bits(),
+        "masked-histogram median differs"
+    );
+    assert_eq!(
+        ra.to_bits(),
+        rb.to_bits(),
+        "u32-key median differs from total_cmp"
+    );
+    assert_eq!(
+        ra.to_bits(),
+        rc.to_bits(),
+        "parallel u32-key median differs"
+    );
     assert_eq!(ra.to_bits(), rd.to_bits(), "radix-select median differs");
 
     let bench = |f: &dyn Fn() -> f32| {
@@ -142,7 +175,9 @@ fn main() {
             let v = f();
             let e = t.elapsed().as_secs_f64() * 1e3;
             std::hint::black_box(v);
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -150,11 +185,26 @@ fn main() {
     let tb = bench(&b);
     let tc = bench(&c);
     let td = bench(&d);
-    println!("f32 median select, n={n}, median={ra}, threads={}, min-of-9", rayon::current_num_threads());
+    println!(
+        "f32 median select, n={n}, median={ra}, threads={}, min-of-9",
+        rayon::current_num_threads()
+    );
     println!("  A total_cmp closure   {ta:7.3} ms");
-    println!("  B u32-key native      {tb:7.3} ms  ({:.2}x vs A)", ta / tb);
-    println!("  C u32-key par-xform   {tc:7.3} ms  ({:.2}x vs A)", ta / tc);
-    println!("  D radix-filter par    {td:7.3} ms  ({:.2}x vs A)", ta / td);
+    println!(
+        "  B u32-key native      {tb:7.3} ms  ({:.2}x vs A)",
+        ta / tb
+    );
+    println!(
+        "  C u32-key par-xform   {tc:7.3} ms  ({:.2}x vs A)",
+        ta / tc
+    );
+    println!(
+        "  D radix-filter par    {td:7.3} ms  ({:.2}x vs A)",
+        ta / td
+    );
     let te = bench(&e);
-    println!("  E radix-masked par    {te:7.3} ms  ({:.2}x vs A)", ta / te);
+    println!(
+        "  E radix-masked par    {te:7.3} ms  ({:.2}x vs A)",
+        ta / te
+    );
 }

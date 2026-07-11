@@ -20,18 +20,41 @@ o=F.gelu(x,approximate='tanh')
 print("VALS"," ".join("%.17g"%v for v in o.tolist()))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_s.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let pv: Vec<f64> = pt.lines().find_map(|l| l.strip_prefix("VALS ")).map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect()).unwrap_or_default();
+    let pv: Vec<f64> = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("VALS "))
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = s.tensor_variable(sv.clone(), vec![ns], false)?;
     let o = s.tensor_gelu_tanh(x)?;
     let fv = s.tensor_values(o)?;
     // gelu_tanh is an approx op — report max abs diff + bit-mismatch count (torch may use a fused kernel).
-    let maxad = fv.iter().zip(&pv).map(|(a, b)| (a - b).abs()).fold(0.0f64, f64::max);
-    let mm = fv.iter().zip(&pv).filter(|(a, b)| a.to_bits() != b.to_bits()).count();
-    println!("parity: {mm}/{} bit-mismatch, max_abs_diff={maxad:.2e}", pv.len());
+    let maxad = fv
+        .iter()
+        .zip(&pv)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f64, f64::max);
+    let mm = fv
+        .iter()
+        .zip(&pv)
+        .filter(|(a, b)| a.to_bits() != b.to_bits())
+        .count();
+    println!(
+        "parity: {mm}/{} bit-mismatch, max_abs_diff={maxad:.2e}",
+        pv.len()
+    );
 
     // perf: 16M no-grad, f64 and f32
     let n = 16_000_000usize;
@@ -46,16 +69,22 @@ print("VALS"," ".join("%.17g"%v for v in o.tolist()))
         let t = Instant::now();
         let _ = s.tensor_gelu_tanh(x).unwrap();
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
         let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x2 = s2.tensor_variable_f32(xf32.clone(), vec![n], false).unwrap();
+        let x2 = s2
+            .tensor_variable_f32(xf32.clone(), vec![n], false)
+            .unwrap();
         let t2 = Instant::now();
         let _ = s2.tensor_gelu_tanh(x2).unwrap();
         let e2 = t2.elapsed().as_secs_f64() * 1e3;
-        if e2 < best32 { best32 = e2; }
+        if e2 < best32 {
+            best32 = e2;
+        }
     }
     let label = if orig { "FT_ORIG(compose)" } else { "FT_FUSED" };
-    println!("  gelu_tanh(16M,f32) {label} {best32:.3}ms", );
+    println!("  gelu_tanh(16M,f32) {label} {best32:.3}ms",);
     let py_b = format!(
         r#"
 import time,torch,torch.nn.functional as F
@@ -70,11 +99,28 @@ def t(fn,reps=7):
 print("PT gelu %.4f"%t(lambda:F.gelu(x,approximate='tanh')))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_b.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let ptw = pt.lines().find_map(|l| l.strip_prefix("PT gelu ")).and_then(|s| s.trim().parse::<f64>().ok()).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  gelu_tanh(16M) {label} {best:.3}ms  PT {ptw:.3}ms  => {}", v(best, ptw));
+    let ptw = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("PT gelu "))
+        .and_then(|s| s.trim().parse::<f64>().ok())
+        .unwrap_or(f64::NAN);
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  gelu_tanh(16M) {label} {best:.3}ms  PT {ptw:.3}ms  => {}",
+        v(best, ptw)
+    );
     Ok(())
 }

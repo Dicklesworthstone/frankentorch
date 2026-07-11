@@ -63,7 +63,13 @@ fn bcast_strides(in_shape: &[usize], target_shape: &[usize]) -> Vec<usize> {
         s[d] = s[d + 1] * in_shape[d + 1];
     }
     (0..in_shape.len())
-        .map(|d| if in_shape[d] == target_shape[d] { s[d] } else { 0 })
+        .map(|d| {
+            if in_shape[d] == target_shape[d] {
+                s[d]
+            } else {
+                0
+            }
+        })
         .collect()
 }
 
@@ -145,7 +151,8 @@ for name,insh,tgt in [("row2048",[1,2048],[2048,2048]),("row4096",[1,4096],[4096
         let b = ft_kernel_cpu::expand_row_structured(&values, numel, tgt, &strides);
         let bitmatch = a == b;
         let old_ms = bench(|| old_expand(&values, numel, tgt, &strides).len());
-        let new_ms = bench(|| ft_kernel_cpu::expand_row_structured(&values, numel, tgt, &strides).len());
+        let new_ms =
+            bench(|| ft_kernel_cpu::expand_row_structured(&values, numel, tgt, &strides).len());
         let ptms = ptval(pt_keys[i]);
         let ratio = old_ms / new_ms;
         let vs_torch = if ptms.is_finite() {

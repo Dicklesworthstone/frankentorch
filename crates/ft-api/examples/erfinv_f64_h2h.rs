@@ -22,9 +22,13 @@ fn main() {
     let tag = if orig { "ORIG(apply_fn)" } else { "FUSED" };
     let (rows, cols) = (4096usize, 4096usize);
     let n = rows * cols;
-    let data: Vec<f64> = (0..n).map(|i| ((i % 1999) as f64 / 1000.0) - 0.999).collect(); // (-1,1)
+    let data: Vec<f64> = (0..n)
+        .map(|i| ((i % 1999) as f64 / 1000.0) - 0.999)
+        .collect(); // (-1,1)
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let a = s.tensor_variable(data.clone(), vec![rows, cols], false).unwrap();
+    let a = s
+        .tensor_variable(data.clone(), vec![rows, cols], false)
+        .unwrap();
     let _ = s.tensor_erfinv(a).unwrap();
     let t = bench(9, || {
         let t0 = Instant::now();
@@ -33,5 +37,8 @@ fn main() {
         std::hint::black_box(o);
         e
     });
-    println!("[{tag}] erfinv f64 [4096,4096]: {:.2} ms", t as f64 / 1000.0);
+    println!(
+        "[{tag}] erfinv f64 [4096,4096]: {:.2} ms",
+        t as f64 / 1000.0
+    );
 }

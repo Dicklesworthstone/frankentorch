@@ -15,7 +15,8 @@ fn main() {
             for _ in 0..5 {
                 let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
                 let x = if dt == "f32" {
-                    s.tensor_variable_f32(a32.clone(), vec![n, d], false).unwrap()
+                    s.tensor_variable_f32(a32.clone(), vec![n, d], false)
+                        .unwrap()
                 } else {
                     s.tensor_variable(a64.clone(), vec![n, d], false).unwrap()
                 };

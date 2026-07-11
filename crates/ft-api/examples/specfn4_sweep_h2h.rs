@@ -24,29 +24,59 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let pb = s.tensor_variable_f32(q, vec![n], false).unwrap();
             let t = Instant::now();
             match w {
-                0 => { let _ = s.tensor_igamma(pa, pb); }
-                1 => { let _ = s.tensor_igammac(pa, pb); }
-                _ => { let _ = s.tensor_zeta(pa, pb); }
+                0 => {
+                    let _ = s.tensor_igamma(pa, pb);
+                }
+                1 => {
+                    let _ = s.tensor_igammac(pa, pb);
+                }
+                _ => {
+                    let _ = s.tensor_zeta(pa, pb);
+                }
             }
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
     let m = 4096usize;
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let mk = |s: &mut FrankenTorchSession, d: &[f32]| s.tensor_variable_f32(d[..m].to_vec(), vec![m], false).unwrap();
-    let ai = mk(&mut s, &av); let xi = mk(&mut s, &xv);
-    let yg = s.tensor_igamma(ai, xi)?; let dg = s.tensor_dtype(yg)?;
-    let vg: Vec<f32> = s.tensor_values_lossy_f64(yg)?.iter().map(|&v| v as f32).collect();
-    let ai2 = mk(&mut s, &av); let xi2 = mk(&mut s, &xv);
-    let yc = s.tensor_igammac(ai2, xi2)?; let dc = s.tensor_dtype(yc)?;
-    let vc: Vec<f32> = s.tensor_values_lossy_f64(yc)?.iter().map(|&v| v as f32).collect();
-    let si = mk(&mut s, &sv); let qi = mk(&mut s, &qv);
-    let yz = s.tensor_zeta(si, qi)?; let dz = s.tensor_dtype(yz)?;
-    let vz: Vec<f32> = s.tensor_values_lossy_f64(yz)?.iter().map(|&v| v as f32).collect();
+    let mk = |s: &mut FrankenTorchSession, d: &[f32]| {
+        s.tensor_variable_f32(d[..m].to_vec(), vec![m], false)
+            .unwrap()
+    };
+    let ai = mk(&mut s, &av);
+    let xi = mk(&mut s, &xv);
+    let yg = s.tensor_igamma(ai, xi)?;
+    let dg = s.tensor_dtype(yg)?;
+    let vg: Vec<f32> = s
+        .tensor_values_lossy_f64(yg)?
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    let ai2 = mk(&mut s, &av);
+    let xi2 = mk(&mut s, &xv);
+    let yc = s.tensor_igammac(ai2, xi2)?;
+    let dc = s.tensor_dtype(yc)?;
+    let vc: Vec<f32> = s
+        .tensor_values_lossy_f64(yc)?
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    let si = mk(&mut s, &sv);
+    let qi = mk(&mut s, &qv);
+    let yz = s.tensor_zeta(si, qi)?;
+    let dz = s.tensor_dtype(yz)?;
+    let vz: Vec<f32> = s
+        .tensor_values_lossy_f64(yz)?
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
 
-    let py = format!(r#"
+    let py = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n={n}; m={m}
@@ -66,29 +96,77 @@ yg=torch.special.gammainc(av[:m],xv[:m]); yc=torch.special.gammaincc(av[:m],xv[:
 for nm,y in [("igamma",yg),("igammac",yc),("zeta",yz)]:
     assert y.dtype==torch.float32, (nm,y.dtype)
     print("REF %s "%nm+" ".join("%a"%float(v) for v in y.tolist()))
-"#);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let vrb = |ft: f64, pp: f64| if pp >= ft { format!("FT {:.2}x FASTER", pp / ft) } else { format!("FT {:.2}x SLOWER", ft / pp) };
-    let check = |lbl: &str, dt: DType, fv: &[f32]| {
-        let line = out.lines().find(|l| l.starts_with(&format!("REF {lbl} "))).unwrap_or("");
-        let tv: Vec<f32> = line.split_whitespace().skip(2).filter_map(|t| t.parse().ok()).collect();
-        let mut max_abs = 0f32; let mut max_rel = 0f32; let mut exact = 0usize; let mut cmp = 0usize;
-        for (&f, &t) in fv.iter().zip(tv.iter()) {
-            if !f.is_finite() || !t.is_finite() { continue; }
-            cmp += 1;
-            if f.to_bits() == t.to_bits() { exact += 1; }
-            let a = (f - t).abs(); if a > max_abs { max_abs = a; }
-            let r = if t.abs() > 0.0 { a / t.abs() } else { a }; if r > max_rel { max_rel = r; }
+    let g = |k: &str| {
+        out.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let vrb = |ft: f64, pp: f64| {
+        if pp >= ft {
+            format!("FT {:.2}x FASTER", pp / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / pp)
         }
-        println!("  {lbl:<8} dtype={dt:?} bit_exact={exact}/{cmp} max_abs={max_abs:.3e} max_rel={max_rel:.3e}");
+    };
+    let check = |lbl: &str, dt: DType, fv: &[f32]| {
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(&format!("REF {lbl} ")))
+            .unwrap_or("");
+        let tv: Vec<f32> = line
+            .split_whitespace()
+            .skip(2)
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        let mut max_abs = 0f32;
+        let mut max_rel = 0f32;
+        let mut exact = 0usize;
+        let mut cmp = 0usize;
+        for (&f, &t) in fv.iter().zip(tv.iter()) {
+            if !f.is_finite() || !t.is_finite() {
+                continue;
+            }
+            cmp += 1;
+            if f.to_bits() == t.to_bits() {
+                exact += 1;
+            }
+            let a = (f - t).abs();
+            if a > max_abs {
+                max_abs = a;
+            }
+            let r = if t.abs() > 0.0 { a / t.abs() } else { a };
+            if r > max_rel {
+                max_rel = r;
+            }
+        }
+        println!(
+            "  {lbl:<8} dtype={dt:?} bit_exact={exact}/{cmp} max_abs={max_abs:.3e} max_rel={max_rel:.3e}"
+        );
     };
     println!("specfn4 ~16M f32 (torch 8t / FT default), min-of-7:");
     for (lbl, w) in [("igamma", 0u8), ("igammac", 1), ("zeta", 2)] {
         let ft = bench(w);
-        println!("  {lbl:<8} FT {ft:8.3}  PT {:8.3}  => {}", g(lbl), vrb(ft, g(lbl)));
+        println!(
+            "  {lbl:<8} FT {ft:8.3}  PT {:8.3}  => {}",
+            g(lbl),
+            vrb(ft, g(lbl))
+        );
     }
     println!("correctness vs torch f32 (finite-only):");
     check("igamma", dg, &vg);

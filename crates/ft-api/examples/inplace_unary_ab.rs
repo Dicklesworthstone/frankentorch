@@ -42,10 +42,14 @@ fn main() {
     print!("{report}");
     let cases: [(&str, usize); 3] = [("4M", 4_000_000), ("8M", 8_000_000), ("16M", 16_000_000)];
     for (label, numel) in cases {
-        let input: Vec<f64> = (0..numel).map(|i| ((i % 2000) as f64 - 1000.0) * 0.01).collect();
+        let input: Vec<f64> = (0..numel)
+            .map(|i| ((i % 2000) as f64 - 1000.0) * 0.01)
+            .collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![numel], false).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![numel], false)
+            .unwrap();
         // bitmatch: one application of the real op vs the old replica on the same input.
         sess.tensor_sigmoid_(it).unwrap();
         let new_once = sess.tensor_values(it).unwrap();

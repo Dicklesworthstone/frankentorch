@@ -105,7 +105,9 @@ static GLOBAL: CachingAlloc = CachingAlloc;
 
 // ---- gauntlet train-step workloads -----------------------------------------
 fn seq(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 // avg_pool1d [8,64,8192] (kgs4.122): allocator-heavy (4M leaf grad + distribute).
@@ -113,7 +115,9 @@ fn lane_avg_pool1d() -> f64 {
     const N: usize = 8;
     const C: usize = 64;
     const L: usize = 8192;
-    let base: Vec<f64> = (0..N * C * L).map(|i| ((i % 251) as f64) * 0.001 - 0.12).collect();
+    let base: Vec<f64> = (0..N * C * L)
+        .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+        .collect();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = s.tensor_variable(base, vec![N, C, L], true).unwrap();
     let out = s.functional_avg_pool1d(x, 2, 2).unwrap();
@@ -129,7 +133,9 @@ fn lane_max_pool3d() -> f64 {
     const D: usize = 16;
     const H: usize = 32;
     const W: usize = 32;
-    let base: Vec<f64> = (0..N * C * D * H * W).map(|i| ((i % 251) as f64) * 0.001 - 0.12).collect();
+    let base: Vec<f64> = (0..N * C * D * H * W)
+        .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
+        .collect();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = s.tensor_variable(base, vec![N, C, D, H, W], true).unwrap();
     let out = s.functional_max_pool3d(x, (2, 2, 2), (2, 2, 2)).unwrap();
@@ -148,10 +154,16 @@ fn lane_sdpa() -> f64 {
     let total = BH * SEQ * D;
     let shape = vec![BH, SEQ, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let q = s.tensor_variable(seq(total, 0.0), shape.clone(), true).unwrap();
-    let k = s.tensor_variable(seq(total, 1.0), shape.clone(), true).unwrap();
+    let q = s
+        .tensor_variable(seq(total, 0.0), shape.clone(), true)
+        .unwrap();
+    let k = s
+        .tensor_variable(seq(total, 1.0), shape.clone(), true)
+        .unwrap();
     let v = s.tensor_variable(seq(total, 2.0), shape, true).unwrap();
-    let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, false).unwrap();
+    let out = s
+        .scaled_dot_product_attention(q, k, v, None, 0.0, false)
+        .unwrap();
     let loss = s.tensor_sum(out).unwrap();
     let report = s.tensor_backward(loss).unwrap();
     report.gradient(q).unwrap().iter().sum()
@@ -165,7 +177,9 @@ fn lane_conv3d() -> f64 {
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let x = s.tensor_variable(xs, vec![2, 32, 8, 16, 16], true).unwrap();
     let w = s.tensor_variable(ws, vec![32, 32, 3, 3, 3], true).unwrap();
-    let out = s.functional_conv3d(x, w, None, (1, 1, 1), (1, 1, 1)).unwrap();
+    let out = s
+        .functional_conv3d(x, w, None, (1, 1, 1), (1, 1, 1))
+        .unwrap();
     let loss = s.tensor_sum(out).unwrap();
     let report = s.tensor_backward(loss).unwrap();
     report.gradient(x).unwrap().iter().sum()
@@ -224,8 +238,13 @@ fn run_lane(name: &str, workload: &dyn Fn() -> f64, iters: usize) {
 }
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
-    println!("pure-Rust caching allocator: per-lane same-process A/B (cache off vs on), {iters} iters median:");
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
+    println!(
+        "pure-Rust caching allocator: per-lane same-process A/B (cache off vs on), {iters} iters median:"
+    );
     run_lane("avg_pool1d", &lane_avg_pool1d, iters);
     run_lane("max_pool3d", &lane_max_pool3d, iters);
     run_lane("sdpa", &lane_sdpa, iters);

@@ -9,10 +9,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let big = 16 * 1024 * 1024;
     let med = 4 * 1024 * 1024;
-    let vbig: Vec<f32> = (0..big).map(|i| ((i % 9973) as f32 - 5000.0) * 0.001).collect();
+    let vbig: Vec<f32> = (0..big)
+        .map(|i| ((i % 9973) as f32 - 5000.0) * 0.001)
+        .collect();
     // prod: values near 1.0 to keep the product finite
-    let vprod: Vec<f32> = (0..med).map(|i| 1.0 + ((i % 7) as f32 - 3.0) * 1e-7).collect();
-    let vmed: Vec<f32> = (0..med).map(|i| ((i % 9973) as f32 - 5000.0) * 0.001).collect();
+    let vprod: Vec<f32> = (0..med)
+        .map(|i| 1.0 + ((i % 7) as f32 - 3.0) * 1e-7)
+        .collect();
+    let vmed: Vec<f32> = (0..med)
+        .map(|i| ((i % 9973) as f32 - 5000.0) * 0.001)
+        .collect();
     macro_rules! bench {
         ($v:expr, $shape:expr, $op:expr) => {{
             let mut best = f64::INFINITY;
@@ -26,12 +32,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             best
         }};
     }
-    let t_sum = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s.tensor_sum(x));
-    let t_mean = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s.tensor_mean(x));
-    let t_prod = bench!(vprod, vec![med], |s: &mut FrankenTorchSession, x| s.tensor_prod(x));
-    let t_var = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s.tensor_var(x, 1));
-    let t_std = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s.tensor_std(x, 1));
-    let t_median = bench!(vmed, vec![med], |s: &mut FrankenTorchSession, x| s.tensor_median(x));
+    let t_sum = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s
+        .tensor_sum(x));
+    let t_mean = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s
+        .tensor_mean(x));
+    let t_prod = bench!(vprod, vec![med], |s: &mut FrankenTorchSession, x| s
+        .tensor_prod(x));
+    let t_var = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s
+        .tensor_var(x, 1));
+    let t_std = bench!(vbig, vec![big], |s: &mut FrankenTorchSession, x| s
+        .tensor_std(x, 1));
+    let t_median = bench!(vmed, vec![med], |s: &mut FrankenTorchSession, x| s
+        .tensor_median(x));
 
     let py = r#"
 import time,torch
@@ -52,15 +64,39 @@ print("PT var %.4f"%tm(lambda:torch.var(vb,correction=1)))
 print("PT std %.4f"%tm(lambda:torch.std(vb,correction=1)))
 print("PT median %.4f"%tm(lambda:torch.median(vm)))
 "#;
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
     let pt = |name: &str| -> f64 {
-        out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == name { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN)
+        out.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == name {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
     };
-    for (name, ft) in [("sum", t_sum), ("mean", t_mean), ("prod", t_prod), ("var", t_var), ("std", t_std), ("median", t_median)] {
+    for (name, ft) in [
+        ("sum", t_sum),
+        ("mean", t_mean),
+        ("prod", t_prod),
+        ("var", t_var),
+        ("std", t_std),
+        ("median", t_median),
+    ] {
         let p = pt(name);
-        let vrb = if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
+        let vrb = if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        };
         println!("{name:<8} FT {ft:9.4}ms torch {p:9.4}ms => {vrb}");
     }
     Ok(())

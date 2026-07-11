@@ -30,7 +30,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_round_decimals f64 (dec=3), min-9:  OLD=3-pass parallel compose  NEW=fused 1-pass");
+    println!(
+        "tensor_round_decimals f64 (dec=3), min-9:  OLD=3-pass parallel compose  NEW=fused 1-pass"
+    );
     let cases: [(&str, usize); 3] = [("8M", 8_000_000), ("16M", 16_000_000), ("32M", 32_000_000)];
     for (label, numel) in cases {
         let decimals = 3;
@@ -38,7 +40,9 @@ fn main() {
         let input: Vec<f64> = (0..numel).map(|i| (i % 100_003) as f64 * 0.0007).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![numel], false).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![numel], false)
+            .unwrap();
         let out = sess.tensor_round_decimals(it, decimals).unwrap();
         let new_out = sess.tensor_values(out).unwrap();
         let old_out = old_round_decimals(&input, factor);

@@ -33,7 +33,9 @@ fn run_ft(batch: usize, n: usize) -> Result<f64, Box<dyn Error>> {
     for _ in 0..3 {
         let data = fill(batch, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, n, n], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, n, n], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let (w, v) = s.tensor_linalg_eigh(a).map_err(boxed)?;
         let sw = s.tensor_sum(w).map_err(boxed)?;
@@ -41,7 +43,9 @@ fn run_ft(batch: usize, n: usize) -> Result<f64, Box<dyn Error>> {
         let loss = s.tensor_add(sw, sv).map_err(boxed)?;
         s.tensor_backward(loss).map_err(boxed)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }
@@ -68,8 +72,12 @@ print("MS", min(s))
 "#
     );
     let mut child = Command::new(&python)
-        .arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().ok()?;
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
     child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -77,11 +85,18 @@ print("MS", min(s))
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().find_map(|l| l.strip_prefix("MS ")).and_then(|v| v.trim().parse::<f64>().ok())
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("MS "))
+        .and_then(|v| v.trim().parse::<f64>().ok())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (batch, n) in [(2000usize, 64usize), (800usize, 96usize), (400usize, 128usize)] {
+    for (batch, n) in [
+        (2000usize, 64usize),
+        (800usize, 96usize),
+        (400usize, 128usize),
+    ] {
         let ft_ms = run_ft(batch, n)?;
         print!("B={batch} n={n}: FT {ft_ms:.1} ms");
         if let Some(tms) = run_pytorch(batch, n) {

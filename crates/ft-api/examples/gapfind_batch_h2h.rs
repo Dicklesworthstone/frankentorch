@@ -12,7 +12,9 @@ fn bench<F: FnMut(&mut FrankenTorchSession)>(mut f: F) -> f64 {
         let t = Instant::now();
         f(&mut s);
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
     }
     best
 }
@@ -20,7 +22,9 @@ fn bench<F: FnMut(&mut FrankenTorchSession)>(mut f: F) -> f64 {
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let mkf32 = |s: &mut FrankenTorchSession, n: usize, shape: Vec<usize>| {
-        let v: Vec<f32> = (0..n).map(|i| ((i % 9973) as f32 - 5000.0) * 0.001).collect();
+        let v: Vec<f32> = (0..n)
+            .map(|i| ((i % 9973) as f32 - 5000.0) * 0.001)
+            .collect();
         s.tensor_variable_f32(v, shape, false).unwrap()
     };
 
@@ -88,18 +92,32 @@ print("PT cumprod %.3f"%tm(lambda:torch.cumprod(xc,1)))
 xn=mk(4000000,(4000000,))
 print("PT count_nonzero %.3f"%tm(lambda:torch.count_nonzero(xn)))
 "#;
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
     let pt = |name: &str| -> f64 {
-        out.lines().find_map(|l| {
-            let mut it = l.strip_prefix("PT ")?.split_whitespace();
-            if it.next()? == name { it.next()?.parse::<f64>().ok() } else { None }
-        }).unwrap_or(f64::NAN)
+        out.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == name {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
     };
     let report = |name: &str, ft: f64| {
         let p = pt(name);
-        let vrb = if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
+        let vrb = if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        };
         println!("{name:<16} FT {ft:9.3}ms torch {p:9.3}ms => {vrb}");
     };
     report("vander", t_vander);

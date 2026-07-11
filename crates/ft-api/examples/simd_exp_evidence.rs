@@ -11,11 +11,16 @@ use std::time::Instant;
 use wide::f32x8;
 
 fn main() {
-    let n: usize = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(8_000_000);
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(8_000_000);
     // values in a softmax-like range after max-subtraction: [-30, 0]
     let data: Vec<f32> = (0..n)
         .map(|i| {
-            let z = (i as u64).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let z = (i as u64)
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
             -((z >> 40) as f32 / (1u64 << 24) as f32) * 30.0
         })
         .collect();
@@ -27,7 +32,9 @@ fn main() {
             let t = Instant::now();
             out = f();
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < b { b = e; }
+            if e < b {
+                b = e;
+            }
         }
         (b, out)
     };
@@ -75,19 +82,33 @@ fn main() {
     let mut max_ulp = 0u32;
     for (&a, &b) in ref_out.iter().zip(&simd_out) {
         let d = (a as f64 - b as f64).abs();
-        if d > max_abs { max_abs = d; }
+        if d > max_abs {
+            max_abs = d;
+        }
         let r = d / (a.abs() as f64).max(1e-30);
-        if r > max_rel { max_rel = r; }
+        if r > max_rel {
+            max_rel = r;
+        }
         let ua = a.to_bits() as i64;
         let ub = b.to_bits() as i64;
         let u = (ua - ub).unsigned_abs() as u32;
-        if u > max_ulp { max_ulp = u; }
+        if u > max_ulp {
+            max_ulp = u;
+        }
     }
 
     println!("SIMD-exp DECISION EVIDENCE, N={n} f32 (single core unless noted), min-of-7");
     println!("  scalar libm exp (FT today): {t_scalar:8.3} ms");
-    println!("  SIMD exp (wide f32x8):      {t_simd:8.3} ms  => {:.2}x faster than scalar", t_scalar / t_simd);
-    println!("  SIMD exp + rayon:           {t_simd_par:8.3} ms  => {:.2}x faster than scalar", t_scalar / t_simd_par);
+    println!(
+        "  SIMD exp (wide f32x8):      {t_simd:8.3} ms  => {:.2}x faster than scalar",
+        t_scalar / t_simd
+    );
+    println!(
+        "  SIMD exp + rayon:           {t_simd_par:8.3} ms  => {:.2}x faster than scalar",
+        t_scalar / t_simd_par
+    );
     println!("  parity vs libm: max_abs={max_abs:.3e}  max_rel={max_rel:.3e}  max_ulp={max_ulp}");
-    println!("  (the per-element exp speedup is the softmax/cross-entropy ceiling; ULP is the tolerance cost)");
+    println!(
+        "  (the per-element exp speedup is the softmax/cross-entropy ceiling; ULP is the tolerance cost)"
+    );
 }

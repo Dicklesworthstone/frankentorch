@@ -2,7 +2,10 @@
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
 fn approx(a: &[f64], b: &[f64]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).all(|(x, y)| (x - y).abs() <= 1e-6 * y.abs().max(1.0))
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| (x - y).abs() <= 1e-6 * y.abs().max(1.0))
 }
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -17,9 +20,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let exp = vec![3.0, 5.0, 8.0, 9.0];
             let pass = approx(&r, &exp);
             ok &= pass;
-            println!("maximum_  f32: OK  result={r:?} {}", if pass { "CORRECT" } else { "WRONG" });
+            println!(
+                "maximum_  f32: OK  result={r:?} {}",
+                if pass { "CORRECT" } else { "WRONG" }
+            );
         }
-        Err(e) => { ok = false; println!("maximum_  f32: ERROR {e:?}"); }
+        Err(e) => {
+            ok = false;
+            println!("maximum_  f32: ERROR {e:?}");
+        }
     }
 
     // masked_fill_ (mask, scalar): a[mask] = value
@@ -31,9 +40,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let exp = vec![1.0, -7.0, 3.0, -7.0];
             let pass = approx(&r, &exp);
             ok &= pass;
-            println!("masked_fill_ f32: OK result={r:?} {}", if pass { "CORRECT" } else { "WRONG" });
+            println!(
+                "masked_fill_ f32: OK result={r:?} {}",
+                if pass { "CORRECT" } else { "WRONG" }
+            );
         }
-        Err(e) => { ok = false; println!("masked_fill_ f32: ERROR {e:?}"); }
+        Err(e) => {
+            ok = false;
+            println!("masked_fill_ f32: ERROR {e:?}");
+        }
     }
 
     // addcmul_ (ternary arithmetic): a += scalar * t1 * t2
@@ -46,9 +61,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let exp = vec![11.0, 19.0, 29.0]; // 1 + 1*(2*5), 1+3*6, 1+4*7
             let pass = approx(&r, &exp);
             ok &= pass;
-            println!("addcmul_  f32: OK  result={r:?} {}", if pass { "CORRECT" } else { "WRONG" });
+            println!(
+                "addcmul_  f32: OK  result={r:?} {}",
+                if pass { "CORRECT" } else { "WRONG" }
+            );
         }
-        Err(e) => { ok = false; println!("addcmul_  f32: ERROR {e:?}"); }
+        Err(e) => {
+            ok = false;
+            println!("addcmul_  f32: ERROR {e:?}");
+        }
     }
 
     println!("ALL_F32_INPLACE_OK={ok}");

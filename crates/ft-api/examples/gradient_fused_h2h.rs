@@ -27,7 +27,9 @@ fn main() {
     // f64 dim=1 (last, contiguous rows)
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data64.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable(data64.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_gradient_dim(a, 1, 0.5, 1).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -36,12 +38,17 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[{tag}] gradient f64 [4096,4096] dim=1 eo=1: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[{tag}] gradient f64 [4096,4096] dim=1 eo=1: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
     // f64 dim=0 (interior stride)
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data64.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable(data64.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_gradient_dim(a, 0, 0.5, 2).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -50,12 +57,17 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[{tag}] gradient f64 [4096,4096] dim=0 eo=2: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[{tag}] gradient f64 [4096,4096] dim=0 eo=2: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
     // f32 dim=1
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable_f32(data32.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable_f32(data32.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_gradient_dim(a, 1, 0.5, 1).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -64,6 +76,9 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[{tag}] gradient f32 [4096,4096] dim=1 eo=1: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[{tag}] gradient f32 [4096,4096] dim=1 eo=1: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
 }

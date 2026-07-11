@@ -32,7 +32,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             best = el;
             // checksum: sum of (col-weighted) sorted values to catch order, not just multiset
             let v = s.tensor_values(vals)?;
-            chk = v.iter().enumerate().map(|(i, &x)| x * ((i % 7) as f64)).sum();
+            chk = v
+                .iter()
+                .enumerate()
+                .map(|(i, &x)| x * ((i % 7) as f64))
+                .sum();
         }
     }
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());

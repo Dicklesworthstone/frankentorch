@@ -14,7 +14,9 @@ const N: usize = 4_000_000;
 fn main() {
     let data: Vec<f64> = (0..N).map(|i| ((i as f64) * 0.0007).sin()).collect();
     // ~50% kept.
-    let mask: Vec<f64> = (0..N).map(|i| if data[i] > 0.0 { 1.0 } else { 0.0 }).collect();
+    let mask: Vec<f64> = (0..N)
+        .map(|i| if data[i] > 0.0 { 1.0 } else { 0.0 })
+        .collect();
     let mut best = f64::INFINITY;
     let mut chk = 0.0;
     let mut klen = 0.0;
@@ -66,7 +68,10 @@ print("MS", sorted(ts)[0]); print("CHK", chk); print("KL", kl)
             } else {
                 format!("FT {:.2}x slower", 1.0 / r)
             };
-            println!("  PyTorch      : {p:9.2} ms   kept {kl:.0}  chk {pc:.6e}  => {verdict}  [{}]", if ok { "MATCH" } else { "MISMATCH!" });
+            println!(
+                "  PyTorch      : {p:9.2} ms   kept {kl:.0}  chk {pc:.6e}  => {verdict}  [{}]",
+                if ok { "MATCH" } else { "MISMATCH!" }
+            );
         }
     }
 }

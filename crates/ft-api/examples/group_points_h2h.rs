@@ -17,12 +17,18 @@ fn main() {
     let mut best = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let pt = s.tensor_variable(pts.clone(), vec![batch, n_points, c], false).unwrap();
-        let it = s.tensor_variable(idxs.clone(), vec![batch, m, k], false).unwrap();
+        let pt = s
+            .tensor_variable(pts.clone(), vec![batch, n_points, c], false)
+            .unwrap();
+        let it = s
+            .tensor_variable(idxs.clone(), vec![batch, m, k], false)
+            .unwrap();
         let t0 = Instant::now();
         let gp = s.group_points(pt, it).unwrap();
         best = best.min(t0.elapsed().as_secs_f64() * 1e3);
         std::hint::black_box((&s, gp));
     }
-    println!("[group_points B={batch} N={n_points} C={c} M={m} K={k}] threads={threads}: {best:.2} ms");
+    println!(
+        "[group_points B={batch} N={n_points} C={c} M={m} K={k}] threads={threads}: {best:.2} ms"
+    );
 }

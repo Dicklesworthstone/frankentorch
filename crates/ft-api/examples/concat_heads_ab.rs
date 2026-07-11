@@ -25,14 +25,16 @@ fn old_concat(src: &[f64], b: usize, h: usize, s: usize, d: usize) -> Vec<f64> {
 fn new_concat(src: &[f64], b: usize, h: usize, s: usize, d: usize) -> Vec<f64> {
     let embed = h * d;
     let mut out = vec![0.0; b * s * embed];
-    out.par_chunks_mut(embed).enumerate().for_each(|(row, orow)| {
-        let batch = row / s;
-        let seq = row % s;
-        for head in 0..h {
-            let so = batch * h * s * d + head * s * d + seq * d;
-            orow[head * d..head * d + d].copy_from_slice(&src[so..so + d]);
-        }
-    });
+    out.par_chunks_mut(embed)
+        .enumerate()
+        .for_each(|(row, orow)| {
+            let batch = row / s;
+            let seq = row % s;
+            for head in 0..h {
+                let so = batch * h * s * d + head * s * d + seq * d;
+                orow[head * d..head * d + d].copy_from_slice(&src[so..so + d]);
+            }
+        });
     out
 }
 
@@ -51,7 +53,9 @@ fn bench<F: Fn() -> usize>(f: F) -> f64 {
 }
 
 fn main() {
-    println!("concat_attention_heads [B,H,S,D]->[B,S,H*D] f64, min-9:  OLD=serial  NEW=par-over-rows");
+    println!(
+        "concat_attention_heads [B,H,S,D]->[B,S,H*D] f64, min-9:  OLD=serial  NEW=par-over-rows"
+    );
     let cases = [
         ("B32 H8 S512 D64", 32usize, 8, 512, 64),
         ("B16 H16 S256 D64", 16, 16, 256, 64),

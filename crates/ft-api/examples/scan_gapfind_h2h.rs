@@ -16,7 +16,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = s.tensor_variable(xd.clone(), vec![rows, cols], false).unwrap();
+            let x = s
+                .tensor_variable(xd.clone(), vec![rows, cols], false)
+                .unwrap();
             let t = Instant::now();
             let _ = match which {
                 "cumsum" => s.tensor_cumsum(x, dim).unwrap(),
@@ -24,12 +26,21 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => s.tensor_logcumsumexp(x, dim).unwrap(),
             };
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
-    let results: Vec<(String, f64)> = [("cumsum", 1usize), ("cumsum", 0), ("cumprod", 1), ("logcumsumexp", 1)]
-        .iter().map(|(o, d)| (format!("{o}_d{d}"), run(o, *d))).collect();
+    let results: Vec<(String, f64)> = [
+        ("cumsum", 1usize),
+        ("cumsum", 0),
+        ("cumprod", 1),
+        ("logcumsumexp", 1),
+    ]
+    .iter()
+    .map(|(o, d)| (format!("{o}_d{d}"), run(o, *d)))
+    .collect();
     let py = format!(
         r#"
 import time,torch
@@ -47,13 +58,38 @@ print("PT cumprod_d1 %.4f"%t(lambda:torch.cumprod(x,1)))
 print("PT logcumsumexp_d1 %.4f"%t(lambda:torch.logcumsumexp(x,1)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
     for (name, ftms) in &results {
-        println!("  {name:18} FT {ftms:8.3}ms  PT {:8.3}ms => {}", g(name), v(*ftms, g(name)));
+        println!(
+            "  {name:18} FT {ftms:8.3}ms  PT {:8.3}ms => {}",
+            g(name),
+            v(*ftms, g(name))
+        );
     }
     Ok(())
 }

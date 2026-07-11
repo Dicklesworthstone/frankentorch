@@ -43,7 +43,9 @@ fn run_ft(op: &str, batch: usize, m: usize, n: usize) -> Result<(f64, f64), Box<
     for _ in 0..5 {
         let data = fill(op, batch, m, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable_f32(data, vec![batch, m, n], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable_f32(data, vec![batch, m, n], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let loss = match op {
             "eigh" => {
@@ -67,8 +69,12 @@ fn run_ft(op: &str, batch: usize, m: usize, n: usize) -> Result<(f64, f64), Box<
                 s.tensor_add(sq, sr).map_err(boxed)?
             }
             _ => {
-                let bdata: Vec<f32> = (0..batch * m * 2).map(|i| ((i % 13) as f32) * 0.01 - 0.06).collect();
-                let b = s.tensor_variable_f32(bdata, vec![batch, m, 2], true).map_err(boxed)?;
+                let bdata: Vec<f32> = (0..batch * m * 2)
+                    .map(|i| ((i % 13) as f32) * 0.01 - 0.06)
+                    .collect();
+                let b = s
+                    .tensor_variable_f32(bdata, vec![batch, m, 2], true)
+                    .map_err(boxed)?;
                 let x = s.tensor_linalg_lstsq(a, b).map_err(boxed)?;
                 let sq = s.tensor_mul(x, x).map_err(boxed)?;
                 s.tensor_sum(sq).map_err(boxed)?
@@ -78,7 +84,12 @@ fn run_ft(op: &str, batch: usize, m: usize, n: usize) -> Result<(f64, f64), Box<
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
         if elapsed_ms < best {
             best = elapsed_ms;
-            checksum = s.tensor_grad(a).map_err(boxed)?.unwrap_or_default().iter().sum();
+            checksum = s
+                .tensor_grad(a)
+                .map_err(boxed)?
+                .unwrap_or_default()
+                .iter()
+                .sum();
         }
     }
     Ok((best, checksum))
@@ -117,8 +128,12 @@ print("MS", min(s))
 "#
     );
     let mut child = Command::new(&python)
-        .arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().ok()?;
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
     child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -126,16 +141,33 @@ print("MS", min(s))
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().find_map(|l| l.strip_prefix("MS ")).and_then(|v| v.trim().parse::<f64>().ok())
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("MS "))
+        .and_then(|v| v.trim().parse::<f64>().ok())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
     // (op, m, n): eigh/svd/qr/lstsq
-    for (op, m, n) in [("eigh", 8, 8), ("eigh", 16, 16), ("eigh", 32, 32),
-                       ("svd", 8, 4), ("svd", 16, 8), ("svd", 32, 16),
-                       ("qr", 8, 4), ("qr", 16, 8), ("qr", 32, 16),
-                       ("lstsq", 8, 4), ("lstsq", 16, 8), ("lstsq", 32, 16)] {
-        let batch = match m { 8 => 20_000usize, 16 => 8_000, _ => 3_000 };
+    for (op, m, n) in [
+        ("eigh", 8, 8),
+        ("eigh", 16, 16),
+        ("eigh", 32, 32),
+        ("svd", 8, 4),
+        ("svd", 16, 8),
+        ("svd", 32, 16),
+        ("qr", 8, 4),
+        ("qr", 16, 8),
+        ("qr", 32, 16),
+        ("lstsq", 8, 4),
+        ("lstsq", 16, 8),
+        ("lstsq", 32, 16),
+    ] {
+        let batch = match m {
+            8 => 20_000usize,
+            16 => 8_000,
+            _ => 3_000,
+        };
         let (ft_ms, _ft_sum) = run_ft(op, batch, m, n)?;
         print!("op={op} B={batch} m={m} n={n}: FT {ft_ms:.3} ms");
         if let Some(tms) = run_pytorch(op, batch, m, n) {

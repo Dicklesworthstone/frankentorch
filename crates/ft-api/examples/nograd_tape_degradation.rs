@@ -13,12 +13,17 @@ use ft_core::ExecutionMode;
 const SZ: usize = 512 * 512; // 256K elem, ~2MB — small enough that tape-degradation dominates
 
 fn main() {
-    let n: usize = std::env::var("N").ok().and_then(|s| s.parse().ok()).unwrap_or(40);
+    let n: usize = std::env::var("N")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(40);
     let base: Vec<f64> = (0..SZ).map(|i| ((i % 251) as f64) * 0.001 - 0.12).collect();
 
     // One long-lived session: each tensor_relu adds a node; tape grows to N+1.
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let mut cur = s.tensor_variable(base.clone(), vec![512, 512], false).unwrap();
+    let mut cur = s
+        .tensor_variable(base.clone(), vec![512, 512], false)
+        .unwrap();
     let mut per_op = Vec::with_capacity(n);
     for _ in 0..n {
         let t = Instant::now();
@@ -30,7 +35,9 @@ fn main() {
     let mut fresh = Vec::with_capacity(n);
     for _ in 0..n {
         let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s2.tensor_variable(base.clone(), vec![512, 512], false).unwrap();
+        let x = s2
+            .tensor_variable(base.clone(), vec![512, 512], false)
+            .unwrap();
         let t = Instant::now();
         let _ = s2.tensor_relu(x).unwrap();
         fresh.push(t.elapsed().as_secs_f64() * 1e3);
@@ -41,7 +48,10 @@ fn main() {
     println!("  one-session op[{}]  : {:.3} ms", n / 2, per_op[n / 2]);
     println!("  one-session op[{}]  : {:.3} ms", n - 1, per_op[n - 1]);
     let chain_total: f64 = per_op.iter().sum();
-    println!("  one-session TOTAL   : {:.3} ms  (sum of {n} ops)", chain_total);
+    println!(
+        "  one-session TOTAL   : {:.3} ms  (sum of {n} ops)",
+        chain_total
+    );
     let fresh_med = {
         let mut f = fresh.clone();
         f.sort_by(|a, b| a.partial_cmp(b).unwrap());
@@ -52,7 +62,11 @@ fn main() {
     println!(
         "  degradation slope   : {:.4} ms/op-added   ({}x op[last]/op[0])",
         slope,
-        if per_op[0] > 0.0 { per_op[n - 1] / per_op[0] } else { 0.0 }
+        if per_op[0] > 0.0 {
+            per_op[n - 1] / per_op[0]
+        } else {
+            0.0
+        }
     );
     if per_op[n - 1] > 2.0 * per_op[0].max(fresh_med) {
         println!("  => CONFIRMED: no-grad op cost grows with tape size (gmuml tape-retention).");

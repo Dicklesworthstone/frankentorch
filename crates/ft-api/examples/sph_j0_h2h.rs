@@ -15,9 +15,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
             let t = s.tensor_variable_f32(x.clone(), vec![n], false).unwrap();
             let ti = Instant::now();
-            if w == 0 { let _ = s.tensor_add(t, t); } else { let _ = s.tensor_special_spherical_bessel_j0(t); }
+            if w == 0 {
+                let _ = s.tensor_add(t, t);
+            } else {
+                let _ = s.tensor_special_spherical_bessel_j0(t);
+            }
             let e = ti.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -26,9 +32,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xt = s.tensor_variable_f32(x[..m].to_vec(), vec![m], false)?;
     let yt = s.tensor_special_spherical_bessel_j0(xt)?;
     let dt = s.tensor_dtype(yt)?;
-    let fv: Vec<f32> = s.tensor_values_lossy_f64(yt)?.iter().map(|&v| v as f32).collect();
+    let fv: Vec<f32> = s
+        .tensor_values_lossy_f64(yt)?
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
 
-    let py = format!(r#"
+    let py = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n={n}; m={m}
@@ -42,24 +53,71 @@ print("PT add %.3f"%tm(lambda:x+x))
 print("PT sph_j0 %.3f"%tm(lambda:torch.special.spherical_bessel_j0(x)))
 y=torch.special.spherical_bessel_j0(x[:m]); assert y.dtype==torch.float32
 print("REF "+" ".join("%a"%float(v) for v in y.tolist()))
-"#);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let vrb = |ft: f64, pp: f64| if pp >= ft { format!("FT {:.2}x FASTER", pp / ft) } else { format!("FT {:.2}x SLOWER", ft / pp) };
+    let g = |k: &str| {
+        out.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let vrb = |ft: f64, pp: f64| {
+        if pp >= ft {
+            format!("FT {:.2}x FASTER", pp / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / pp)
+        }
+    };
     println!("sph_j0 ~16M f32 (torch 8t / FT default), min-of-7:");
     let (fa, fj) = (bench(0), bench(1));
-    println!("  add     FT {fa:8.3}  PT {:8.3}  => {}", g("add"), vrb(fa, g("add")));
-    println!("  sph_j0  FT {fj:8.3}  PT {:8.3}  => {}", g("sph_j0"), vrb(fj, g("sph_j0")));
+    println!(
+        "  add     FT {fa:8.3}  PT {:8.3}  => {}",
+        g("add"),
+        vrb(fa, g("add"))
+    );
+    println!(
+        "  sph_j0  FT {fj:8.3}  PT {:8.3}  => {}",
+        g("sph_j0"),
+        vrb(fj, g("sph_j0"))
+    );
     let line = out.lines().find(|l| l.starts_with("REF ")).unwrap_or("");
-    let tv: Vec<f32> = line.split_whitespace().skip(1).filter_map(|t| t.parse().ok()).collect();
-    let mut max_abs = 0f32; let mut max_rel = 0f32; let mut exact = 0usize;
+    let tv: Vec<f32> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    let mut max_abs = 0f32;
+    let mut max_rel = 0f32;
+    let mut exact = 0usize;
     for (&f, &t) in fv.iter().zip(tv.iter()) {
-        if f.to_bits() == t.to_bits() { exact += 1; }
-        let a = (f - t).abs(); if a > max_abs { max_abs = a; }
-        let r = if t.abs() > 0.0 { a / t.abs() } else { a }; if r > max_rel { max_rel = r; }
+        if f.to_bits() == t.to_bits() {
+            exact += 1;
+        }
+        let a = (f - t).abs();
+        if a > max_abs {
+            max_abs = a;
+        }
+        let r = if t.abs() > 0.0 { a / t.abs() } else { a };
+        if r > max_rel {
+            max_rel = r;
+        }
     }
-    println!("correctness: sph_j0 dtype={dt:?} bit_exact={exact}/{} max_abs={max_abs:.3e} max_rel={max_rel:.3e}", fv.len());
+    println!(
+        "correctness: sph_j0 dtype={dt:?} bit_exact={exact}/{} max_abs={max_abs:.3e} max_rel={max_rel:.3e}",
+        fv.len()
+    );
     Ok(())
 }

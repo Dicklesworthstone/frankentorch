@@ -39,14 +39,37 @@ def t(fn,n=7):
 for name,fn in [("cat_anchor",lambda:torch.cat([m,m],1)),("group_norm",lambda:Fn.group_norm(x,G))]:
     print("PT %s %.4f"%(name,t(fn)))
 "#;
-    let mut child = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-    child.stdin.as_mut().ok_or_else(|| std::io::Error::other("no stdin"))?.write_all(py.as_bytes())?;
+    let mut child = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?
+        .write_all(py.as_bytes())?;
     let out = child.wait_with_output();
-    let pt = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let pt = out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
     let report = |name: &str, ftv: f64| {
-        if let Some(p) = pt.lines().find_map(|l| { let mut it=l.strip_prefix("PT ")?.split_whitespace(); if it.next()?==name {it.next()?.parse::<f64>().ok()} else {None} }) {
+        if let Some(p) = pt.lines().find_map(|l| {
+            let mut it = l.strip_prefix("PT ")?.split_whitespace();
+            if it.next()? == name {
+                it.next()?.parse::<f64>().ok()
+            } else {
+                None
+            }
+        }) {
             let r = p / ftv;
-            let tag = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x SLOWER", 1.0 / r) };
+            let tag = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x SLOWER", 1.0 / r)
+            };
             println!("  {name:<12} {ftv:8.3} {p:8.3}   {tag}");
         }
     };
@@ -56,16 +79,26 @@ for name,fn in [("cat_anchor",lambda:torch.cat([m,m],1)),("group_norm",lambda:Fn
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let xm = s.tensor_variable(mat.clone(), vec![R, R], false).unwrap();
-        let t = Instant::now(); let _ = s.tensor_cat(&[xm, xm], 1);
-        let e = t.elapsed().as_secs_f64() * 1e3; if e < b { b = e; }
+        let t = Instant::now();
+        let _ = s.tensor_cat(&[xm, xm], 1);
+        let e = t.elapsed().as_secs_f64() * 1e3;
+        if e < b {
+            b = e;
+        }
     }
     report("cat_anchor", b);
     let mut b = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let xn = s.tensor_variable(x.clone(), vec![N, CH, H, W], false).unwrap();
-        let t = Instant::now(); let _ = s.functional_group_norm(xn, G, None, None, 1e-5);
-        let e = t.elapsed().as_secs_f64() * 1e3; if e < b { b = e; }
+        let xn = s
+            .tensor_variable(x.clone(), vec![N, CH, H, W], false)
+            .unwrap();
+        let t = Instant::now();
+        let _ = s.functional_group_norm(xn, G, None, None, 1e-5);
+        let e = t.elapsed().as_secs_f64() * 1e3;
+        if e < b {
+            b = e;
+        }
     }
     report("group_norm", b);
     Ok(())

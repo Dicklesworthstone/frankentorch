@@ -25,14 +25,22 @@ print("VALS"," ".join("%.9g"%v for v in m.flatten().tolist()))
 "#,
         small = small
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_small.as_bytes())?;
     let out = ch.wait_with_output()?;
     let pt = String::from_utf8_lossy(&out.stdout).to_string();
     let pt_vals: Vec<f64> = pt
         .lines()
         .find_map(|l| l.strip_prefix("VALS "))
-        .map(|s| s.split_whitespace().filter_map(|t| t.parse::<f64>().ok()).collect())
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|t| t.parse::<f64>().ok())
+                .collect()
+        })
         .unwrap_or_default();
 
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
@@ -84,7 +92,11 @@ print("PT %.4f"%t(lambda:torch.diag(v)))
 "#,
         k = k
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_big.as_bytes())?;
     let out = ch.wait_with_output()?;
     let pt = String::from_utf8_lossy(&out.stdout).to_string();
@@ -98,6 +110,8 @@ print("PT %.4f"%t(lambda:torch.diag(v)))
     } else {
         format!("FT {:.2}x SLOWER", 1.0 / ratio)
     };
-    println!("diag_embed f32 [{k}x{k}]: FT {best:.3} ms  PT {ptms:.3} ms  => {verdict}  (sink {sink:.3})");
+    println!(
+        "diag_embed f32 [{k}x{k}]: FT {best:.3} ms  PT {ptms:.3} ms  => {verdict}  (sink {sink:.3})"
+    );
     Ok(())
 }

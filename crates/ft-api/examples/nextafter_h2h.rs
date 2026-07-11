@@ -16,25 +16,52 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let x = s.tensor_variable_f32(a.clone(), vec![n], false).unwrap();
             let y = s.tensor_variable_f32(b.clone(), vec![n], false).unwrap();
             let t = Instant::now();
-            if w == 0 { let _ = s.tensor_add(x, y); } else { let _ = s.tensor_nextafter(x, y); }
+            if w == 0 {
+                let _ = s.tensor_add(x, y);
+            } else {
+                let _ = s.tensor_nextafter(x, y);
+            }
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
     // correctness incl edge values: 0, equal, x>y, x<y, negatives
     let m = 4096usize;
     let xa: Vec<f32> = (0..m).map(|i| ((i as i32 - 2048) as f32) / 64.0).collect();
-    let xb: Vec<f32> = (0..m).map(|i| if i % 7 == 0 { xa[i] } else { ((i as i32 - 1024) as f32) / 32.0 }).collect();
+    let xb: Vec<f32> = (0..m)
+        .map(|i| {
+            if i % 7 == 0 {
+                xa[i]
+            } else {
+                ((i as i32 - 1024) as f32) / 32.0
+            }
+        })
+        .collect();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let xt = s.tensor_variable_f32(xa.clone(), vec![m], false)?;
     let yt = s.tensor_variable_f32(xb.clone(), vec![m], false)?;
     let zt = s.tensor_nextafter(xt, yt)?;
     let dt = s.tensor_dtype(zt)?;
-    let fv: Vec<f32> = s.tensor_values_lossy_f64(zt)?.iter().map(|&v| v as f32).collect();
-    let xa_s = xa.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>().join(" ");
-    let xb_s = xb.iter().map(|v| v.to_bits().to_string()).collect::<Vec<_>>().join(" ");
-    let py = format!(r#"
+    let fv: Vec<f32> = s
+        .tensor_values_lossy_f64(zt)?
+        .iter()
+        .map(|&v| v as f32)
+        .collect();
+    let xa_s = xa
+        .iter()
+        .map(|v| v.to_bits().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let xb_s = xb
+        .iter()
+        .map(|v| v.to_bits().to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    let py = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n={n}; m={m}
@@ -53,22 +80,69 @@ xa=torch.tensor([fb(t) for t in "{xa}".split()],dtype=torch.float32)
 xb=torch.tensor([fb(t) for t in "{xb}".split()],dtype=torch.float32)
 z=torch.nextafter(xa,xb); assert z.dtype==torch.float32
 print("REF "+" ".join("%a"%float(v) for v in z.tolist()))
-"#, n=n, m=m, xa=xa_s, xb=xb_s);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        n = n,
+        m = m,
+        xa = xa_s,
+        xb = xb_s
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let vrb = |ft: f64, pp: f64| if pp >= ft { format!("FT {:.2}x FASTER", pp / ft) } else { format!("FT {:.2}x SLOWER", ft / pp) };
+    let g = |k: &str| {
+        out.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let vrb = |ft: f64, pp: f64| {
+        if pp >= ft {
+            format!("FT {:.2}x FASTER", pp / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / pp)
+        }
+    };
     println!("nextafter ~16M f32 (torch 8t / FT default), min-of-7:");
     let (fa, fj) = (bench(0), bench(1));
-    println!("  add        FT {fa:8.3}  PT {:8.3}  => {}", g("add"), vrb(fa, g("add")));
-    println!("  nextafter  FT {fj:8.3}  PT {:8.3}  => {}", g("nextafter"), vrb(fj, g("nextafter")));
+    println!(
+        "  add        FT {fa:8.3}  PT {:8.3}  => {}",
+        g("add"),
+        vrb(fa, g("add"))
+    );
+    println!(
+        "  nextafter  FT {fj:8.3}  PT {:8.3}  => {}",
+        g("nextafter"),
+        vrb(fj, g("nextafter"))
+    );
     let line = out.lines().find(|l| l.starts_with("REF ")).unwrap_or("");
-    let tv: Vec<f32> = line.split_whitespace().skip(1).filter_map(|t| t.parse().ok()).collect();
-    let mut exact = 0usize; let mut mism = 0usize;
+    let tv: Vec<f32> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    let mut exact = 0usize;
+    let mut mism = 0usize;
     for (&f, &t) in fv.iter().zip(tv.iter()) {
-        if f.to_bits() == t.to_bits() { exact += 1; } else { mism += 1; }
+        if f.to_bits() == t.to_bits() {
+            exact += 1;
+        } else {
+            mism += 1;
+        }
     }
-    println!("correctness: nextafter dtype={dt:?} bit_exact={exact}/{} mism={mism} (torch_ref_len={})", fv.len(), tv.len());
+    println!(
+        "correctness: nextafter dtype={dt:?} bit_exact={exact}/{} mism={mism} (torch_ref_len={})",
+        fv.len(),
+        tv.len()
+    );
     Ok(())
 }

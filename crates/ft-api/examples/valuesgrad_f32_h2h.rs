@@ -40,7 +40,9 @@ fn run_ft(op: &str, batch: usize, m: usize, n: usize) -> Result<f64, Box<dyn Err
     for _ in 0..5 {
         let data = fill(op, batch, m, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable_f32(data, vec![batch, m, n], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable_f32(data, vec![batch, m, n], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let out = if op == "eigvalsh" {
             s.tensor_linalg_eigvalsh(a).map_err(boxed)?
@@ -86,8 +88,12 @@ print("MS", min(s))
 "#
     );
     let mut child = Command::new(&python)
-        .arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().ok()?;
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
     child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -95,13 +101,26 @@ print("MS", min(s))
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    stdout.lines().find_map(|l| l.strip_prefix("MS ")).and_then(|v| v.trim().parse::<f64>().ok())
+    stdout
+        .lines()
+        .find_map(|l| l.strip_prefix("MS "))
+        .and_then(|v| v.trim().parse::<f64>().ok())
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (op, m, n) in [("eigvalsh", 8, 8), ("eigvalsh", 16, 16), ("eigvalsh", 32, 32),
-                       ("svdvals", 8, 4), ("svdvals", 16, 8), ("svdvals", 32, 16)] {
-        let batch = match m { 8 => 20_000usize, 16 => 8_000, _ => 3_000 };
+    for (op, m, n) in [
+        ("eigvalsh", 8, 8),
+        ("eigvalsh", 16, 16),
+        ("eigvalsh", 32, 32),
+        ("svdvals", 8, 4),
+        ("svdvals", 16, 8),
+        ("svdvals", 32, 16),
+    ] {
+        let batch = match m {
+            8 => 20_000usize,
+            16 => 8_000,
+            _ => 3_000,
+        };
         let ft_ms = run_ft(op, batch, m, n)?;
         print!("op={op} B={batch} m={m} n={n}: FT {ft_ms:.3} ms");
         if let Some(tms) = run_pytorch(op, batch, m, n) {

@@ -26,17 +26,25 @@ fn run_ft(batch: usize, m: usize, n: usize) -> Result<f64, Box<dyn Error>> {
     for _ in 0..4 {
         let data = fill(batch, m, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, m, n], false).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, m, n], false)
+            .map_err(boxed)?;
         let start = Instant::now();
         let (_u, _s, _vh) = s.tensor_linalg_svd(a, false).map_err(boxed)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (batch, m, n) in [(2000usize, 128usize, 16usize), (1000usize, 256usize, 32usize), (500usize, 512usize, 32usize)] {
+    for (batch, m, n) in [
+        (2000usize, 128usize, 16usize),
+        (1000usize, 256usize, 32usize),
+        (500usize, 512usize, 32usize),
+    ] {
         let ft_ms = run_ft(batch, m, n)?;
         println!("B={batch} m={m} n={n}: FT {ft_ms:.1} ms");
     }

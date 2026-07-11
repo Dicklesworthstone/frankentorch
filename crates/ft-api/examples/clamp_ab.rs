@@ -20,7 +20,12 @@ fn main() {
         let t = Instant::now();
         let _ = s.tensor_clamp(x, -3.0, 3.0).unwrap();
         let el = t.elapsed().as_secs_f64() * 1e3;
-        if el < best { best = el; }
+        if el < best {
+            best = el;
+        }
     }
-    println!("clamp [{R},{C}] f64 no-grad: {best:.3} ms  (threads={})", rayon::current_num_threads());
+    println!(
+        "clamp [{R},{C}] f64 no-grad: {best:.3} ms  (threads={})",
+        rayon::current_num_threads()
+    );
 }

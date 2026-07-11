@@ -17,18 +17,26 @@ const SEQ: usize = 512;
 const D: usize = 64;
 
 fn seq(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 fn ft_causal_sdpa_step() -> f64 {
     let total = BH * SEQ * D;
     let shape = vec![BH, SEQ, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let q = s.tensor_variable(seq(total, 0.0), shape.clone(), true).unwrap();
-    let k = s.tensor_variable(seq(total, 1.0), shape.clone(), true).unwrap();
+    let q = s
+        .tensor_variable(seq(total, 0.0), shape.clone(), true)
+        .unwrap();
+    let k = s
+        .tensor_variable(seq(total, 1.0), shape.clone(), true)
+        .unwrap();
     let v = s.tensor_variable(seq(total, 2.0), shape, true).unwrap();
     // is_causal = true
-    let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, true).unwrap();
+    let out = s
+        .scaled_dot_product_attention(q, k, v, None, 0.0, true)
+        .unwrap();
     let loss = s.tensor_sum(out).unwrap();
     let report = s.tensor_backward(loss).unwrap();
     report.gradient(q).unwrap().iter().sum()
@@ -74,7 +82,10 @@ fn bench_ft(iters: usize) -> f64 {
 }
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(20);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(20);
     let ft_ms = bench_ft(iters);
 
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -87,8 +98,10 @@ fn main() {
     let py_ms = match out {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            s.lines()
-                .find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse::<f64>().ok()))
+            s.lines().find_map(|l| {
+                l.strip_prefix("ELAPSED_MS ")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
         }
         Ok(o) => {
             eprintln!("pytorch failed: {}", String::from_utf8_lossy(&o.stderr));
@@ -112,6 +125,8 @@ fn main() {
                 println!("  => FrankenTorch is {:.2}x slower (causal SDPA)", 1.0 / r);
             }
         }
-        None => println!("  PyTorch      : (unavailable — set PYTORCH_PYTHON to a torch interpreter)"),
+        None => {
+            println!("  PyTorch      : (unavailable — set PYTORCH_PYTHON to a torch interpreter)")
+        }
     }
 }

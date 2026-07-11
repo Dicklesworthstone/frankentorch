@@ -42,7 +42,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_nonzero f64, min-9:  OLD=serial clone+scan+decompose  NEW=parallel compaction");
+    println!(
+        "tensor_nonzero f64, min-9:  OLD=serial clone+scan+decompose  NEW=parallel compaction"
+    );
     let cases: [(&str, Vec<usize>, usize); 4] = [
         ("2d 4000x4000 ~50%", vec![4000, 4000], 2),
         ("3d 256x256x256 ~50%", vec![256, 256, 256], 2),
@@ -53,11 +55,19 @@ fn main() {
         let numel: usize = shape.iter().product();
         // ~1/frac nonzero, deterministic (nonzero value varies so decompose isn't trivially skipped).
         let vals: Vec<f64> = (0..numel)
-            .map(|i| if i % frac == 0 { (i % 97) as f64 + 1.0 } else { 0.0 })
+            .map(|i| {
+                if i % frac == 0 {
+                    (i % 97) as f64 + 1.0
+                } else {
+                    0.0
+                }
+            })
             .collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let t = sess.tensor_variable(vals.clone(), shape.clone(), false).unwrap();
+        let t = sess
+            .tensor_variable(vals.clone(), shape.clone(), false)
+            .unwrap();
         let nz = sess.tensor_nonzero(t).unwrap();
         let new_out = sess.tensor_values(nz).unwrap();
         let old_out = old_nonzero(&vals, &shape);

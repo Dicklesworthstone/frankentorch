@@ -9,7 +9,9 @@ fn boxed<E: std::fmt::Debug>(err: E) -> std::io::Error {
 }
 
 fn fill(n: usize, salt: usize) -> Vec<f64> {
-    (0..n).map(|i| (((i + salt) % 17) as f64 - 8.0) * 0.05).collect()
+    (0..n)
+        .map(|i| (((i + salt) % 17) as f64 - 8.0) * 0.05)
+        .collect()
 }
 
 fn run_ft(b: usize, m: usize, n: usize) -> Result<f64, Box<dyn Error>> {
@@ -21,7 +23,9 @@ fn run_ft(b: usize, m: usize, n: usize) -> Result<f64, Box<dyn Error>> {
         let start = Instant::now();
         let _r = s.tensor_linalg_matrix_rank(a, None).map_err(boxed)?;
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
-        if elapsed_ms < best { best = elapsed_ms; }
+        if elapsed_ms < best {
+            best = elapsed_ms;
+        }
     }
     Ok(best)
 }

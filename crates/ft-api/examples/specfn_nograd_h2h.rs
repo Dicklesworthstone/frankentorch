@@ -24,7 +24,9 @@ fn main() {
     let data: Vec<f64> = (0..n).map(|i| ((i % 800) as f64 / 100.0) - 4.0).collect(); // [-4,4)
     for which in ["i0e", "i1e", "erfcx"] {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable(data.clone(), vec![rows, cols], false)
+            .unwrap();
         let call = |s: &mut FrankenTorchSession, a| match which {
             "i0e" => s.tensor_i0e(a).unwrap(),
             "i1e" => s.tensor_i1e(a).unwrap(),
@@ -38,7 +40,14 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        let tag = if std::env::var("FT_ORIG").is_ok() { "ORIG(apply_fn)" } else { "FUSED" };
-        println!("[{tag}] {which} f64 [4096,4096]: {:.2} ms", t as f64 / 1000.0);
+        let tag = if std::env::var("FT_ORIG").is_ok() {
+            "ORIG(apply_fn)"
+        } else {
+            "FUSED"
+        };
+        println!(
+            "[{tag}] {which} f64 [4096,4096]: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
 }

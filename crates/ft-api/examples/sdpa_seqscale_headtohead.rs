@@ -15,17 +15,27 @@ const BH: usize = 4;
 const D: usize = 64;
 
 fn seq_vals(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 fn ft_step(seq: usize) -> f64 {
     let total = BH * seq * D;
     let shape = vec![BH, seq, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let q = s.tensor_variable(seq_vals(total, 0.0), shape.clone(), true).unwrap();
-    let k = s.tensor_variable(seq_vals(total, 1.0), shape.clone(), true).unwrap();
-    let v = s.tensor_variable(seq_vals(total, 2.0), shape, true).unwrap();
-    let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, false).unwrap();
+    let q = s
+        .tensor_variable(seq_vals(total, 0.0), shape.clone(), true)
+        .unwrap();
+    let k = s
+        .tensor_variable(seq_vals(total, 1.0), shape.clone(), true)
+        .unwrap();
+    let v = s
+        .tensor_variable(seq_vals(total, 2.0), shape, true)
+        .unwrap();
+    let out = s
+        .scaled_dot_product_attention(q, k, v, None, 0.0, false)
+        .unwrap();
     let loss = s.tensor_sum(out).unwrap();
     let report = s.tensor_backward(loss).unwrap();
     report.gradient(q).unwrap().iter().map(|x| x.abs()).sum()
@@ -80,16 +90,23 @@ fn py_ms(seq: usize, iters: usize) -> Option<f64> {
         .output()
         .ok()?;
     if !out.status.success() {
-        eprintln!("pytorch failed (seq={seq}): {}", String::from_utf8_lossy(&out.stderr));
+        eprintln!(
+            "pytorch failed (seq={seq}): {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse::<f64>().ok()))
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        l.strip_prefix("ELAPSED_MS ")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    })
 }
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(10);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(10);
     println!("f64 SDPA [BH={BH},D={D}] non-causal train step, seq sweep, {iters} iters median:");
     for &seq in &[512usize, 1024, 2048] {
         let ft = bench_ft(seq, iters);

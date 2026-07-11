@@ -23,7 +23,9 @@ fn main() {
         let mut fp = 0u64;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let a = s.tensor_variable(data.clone(), vec![rows, cols], true).unwrap();
+            let a = s
+                .tensor_variable(data.clone(), vec![rows, cols], true)
+                .unwrap();
             let t0 = Instant::now();
             let y = match op {
                 "sumonly" => a,
@@ -49,6 +51,8 @@ fn main() {
             }
             std::hint::black_box(&s);
         }
-        println!("[{tag}] {op} f64 [4096,4096]: total {best:.2} ms (fwd {best_fwd:.2} + sum/bwd {best_bwd:.2}) | grad_fp=0x{fp:016x}");
+        println!(
+            "[{tag}] {op} f64 [4096,4096]: total {best:.2} ms (fwd {best_fwd:.2} + sum/bwd {best_bwd:.2}) | grad_fp=0x{fp:016x}"
+        );
     }
 }

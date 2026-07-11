@@ -21,7 +21,9 @@ fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId)>(a: &[f64]
         let t = Instant::now();
         f(&mut s, x);
         let el = t.elapsed().as_secs_f64() * 1e3;
-        if el < best { best = el; }
+        if el < best {
+            best = el;
+        }
     }
     best
 }
@@ -30,16 +32,36 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<f64> = (0..R * C).map(|i| -4.0 + ((i % 17) as f64) * 0.5).collect();
     type Op = fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId);
     let ops: Vec<(&str, Op)> = vec![
-        ("cat_anchor", |s, x| { let _ = s.tensor_cat(&[x, x], 1); }),
-        ("hardswish", |s, x| { let _ = s.tensor_hardswish(x); }),
-        ("hardsigmoid", |s, x| { let _ = s.tensor_hardsigmoid(x); }),
-        ("hardtanh", |s, x| { let _ = s.tensor_hardtanh(x); }),
-        ("mish", |s, x| { let _ = s.tensor_mish(x); }),
-        ("softplus", |s, x| { let _ = s.tensor_softplus(x); }),
-        ("silu", |s, x| { let _ = s.tensor_silu(x); }),
-        ("elu", |s, x| { let _ = s.tensor_elu(x); }),
-        ("softshrink", |s, x| { let _ = s.tensor_softshrink(x, 0.5); }),
-        ("tanhshrink", |s, x| { let _ = s.tensor_tanhshrink(x); }),
+        ("cat_anchor", |s, x| {
+            let _ = s.tensor_cat(&[x, x], 1);
+        }),
+        ("hardswish", |s, x| {
+            let _ = s.tensor_hardswish(x);
+        }),
+        ("hardsigmoid", |s, x| {
+            let _ = s.tensor_hardsigmoid(x);
+        }),
+        ("hardtanh", |s, x| {
+            let _ = s.tensor_hardtanh(x);
+        }),
+        ("mish", |s, x| {
+            let _ = s.tensor_mish(x);
+        }),
+        ("softplus", |s, x| {
+            let _ = s.tensor_softplus(x);
+        }),
+        ("silu", |s, x| {
+            let _ = s.tensor_silu(x);
+        }),
+        ("elu", |s, x| {
+            let _ = s.tensor_elu(x);
+        }),
+        ("softshrink", |s, x| {
+            let _ = s.tensor_softshrink(x, 0.5);
+        }),
+        ("tanhshrink", |s, x| {
+            let _ = s.tensor_tanhshrink(x);
+        }),
     ];
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let py = r#"
@@ -69,20 +91,40 @@ for name,fn in [("cat_anchor",lambda:torch.cat([x,x],1)),
                 ("tanhshrink",lambda:F.tanhshrink(x))]:
     print("PT %s %.4f"%(name,t(fn)))
 "#;
-    let mut child = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-    child.stdin.as_mut().ok_or_else(|| std::io::Error::other("no stdin"))?.write_all(py.as_bytes())?;
+    let mut child = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?
+        .write_all(py.as_bytes())?;
     let out = child.wait_with_output();
-    let pt = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let pt = out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
     println!("op            FT(ms)    PT(ms)   ratio(PT/FT, <1=FT slower)");
     for (name, f) in &ops {
         let ftv = time_ft(&a, *f);
         let p = pt.lines().find_map(|l| {
             let mut it = l.strip_prefix("PT ")?.split_whitespace();
-            if it.next()? == *name { it.next()?.parse::<f64>().ok() } else { None }
+            if it.next()? == *name {
+                it.next()?.parse::<f64>().ok()
+            } else {
+                None
+            }
         });
         if let Some(p) = p {
             let r = p / ftv;
-            let tag = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x SLOWER", 1.0 / r) };
+            let tag = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x SLOWER", 1.0 / r)
+            };
             println!("  {name:<14} {ftv:8.3} {p:8.3}   {tag}");
         }
     }

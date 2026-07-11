@@ -60,7 +60,10 @@ print("MS", sorted(ts)[0]); print("VSUM", v.double().sum().item()); print("ISUM"
         return None;
     }
     let s = String::from_utf8_lossy(&o.stdout);
-    let g = |p: &str| s.lines().find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()));
+    let g = |p: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()))
+    };
     Some((g("MS ")?, g("VSUM ")?, g("ISUM ")?))
 }
 
@@ -72,11 +75,19 @@ fn main() {
         if let Some((p, pv, pi)) = py(op) {
             let vrel = (vs - pv).abs() / (pv.abs() + 1e-9);
             let r = p / ms;
-            let verdict = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x slower", 1.0 / r) };
+            let verdict = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x slower", 1.0 / r)
+            };
             println!(
                 "  | PyTorch {p:8.3} ms => {verdict}  (values {} ; indices {})",
                 if vrel < 1e-6 { "MATCH" } else { "MISMATCH!" },
-                if (is_ - pi).abs() < 0.5 { "MATCH" } else { "MISMATCH!" }
+                if (is_ - pi).abs() < 0.5 {
+                    "MATCH"
+                } else {
+                    "MISMATCH!"
+                }
             );
         } else {
             println!("  | PyTorch (unavailable)");

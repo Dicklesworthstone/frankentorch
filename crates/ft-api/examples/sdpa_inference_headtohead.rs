@@ -16,7 +16,9 @@ const SEQ: usize = 512;
 const D: usize = 64;
 
 fn seq_vals(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 
 // Pre-computed inputs are CLONED in (no sin()-generation inside the timed region,
@@ -25,10 +27,16 @@ fn ft_infer(qb: &[f64], kb: &[f64], vb: &[f64], causal: bool) -> f64 {
     let shape = vec![BH, SEQ, D];
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     // requires_grad = false -> no tape, no-grad fast-path flash kernel
-    let q = s.tensor_variable(qb.to_vec(), shape.clone(), false).unwrap();
-    let k = s.tensor_variable(kb.to_vec(), shape.clone(), false).unwrap();
+    let q = s
+        .tensor_variable(qb.to_vec(), shape.clone(), false)
+        .unwrap();
+    let k = s
+        .tensor_variable(kb.to_vec(), shape.clone(), false)
+        .unwrap();
     let v = s.tensor_variable(vb.to_vec(), shape, false).unwrap();
-    let out = s.scaled_dot_product_attention(q, k, v, None, 0.0, causal).unwrap();
+    let out = s
+        .scaled_dot_product_attention(q, k, v, None, 0.0, causal)
+        .unwrap();
     s.tensor_values(out).unwrap().iter().map(|x| x.abs()).sum()
 }
 
@@ -73,17 +81,20 @@ fn bench_ft(qb: &[f64], kb: &[f64], vb: &[f64], causal: bool, iters: usize) -> f
 fn py(causal: bool, iters: usize) -> Option<f64> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let out = Command::new(&python)
-        .arg("-c").arg(PY)
+        .arg("-c")
+        .arg(PY)
         .env("FT_GAUNTLET_ITERS", iters.to_string())
         .env("FT_CAUSAL", if causal { "1" } else { "0" })
-        .output().ok()?;
+        .output()
+        .ok()?;
     if !out.status.success() {
         eprintln!("pytorch failed: {}", String::from_utf8_lossy(&out.stderr));
         return None;
     }
-    String::from_utf8_lossy(&out.stdout)
-        .lines()
-        .find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse::<f64>().ok()))
+    String::from_utf8_lossy(&out.stdout).lines().find_map(|l| {
+        l.strip_prefix("ELAPSED_MS ")
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    })
 }
 
 fn report(qb: &[f64], kb: &[f64], vb: &[f64], label: &str, causal: bool, iters: usize) {
@@ -103,7 +114,10 @@ fn report(qb: &[f64], kb: &[f64], vb: &[f64], label: &str, causal: bool, iters: 
 }
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     println!("f64 SDPA INFERENCE (no-grad) [{BH},{SEQ},{D}], {iters} iters MIN:");
     // localize: RAW kernel (no session/API) vs the full no-grad API path
     let total = BH * SEQ * D;
@@ -137,7 +151,9 @@ fn main() {
         let vn = s.tensor_variable(v.clone(), shape.clone(), false).unwrap();
         t_var = t_var.min(a.elapsed().as_secs_f64() * 1e3);
         let a = Instant::now();
-        let out = s.scaled_dot_product_attention(qn, kn, vn, None, 0.0, false).unwrap();
+        let out = s
+            .scaled_dot_product_attention(qn, kn, vn, None, 0.0, false)
+            .unwrap();
         t_sdpa = t_sdpa.min(a.elapsed().as_secs_f64() * 1e3);
         let a = Instant::now();
         let r: f64 = s.tensor_values(out).unwrap().iter().sum();

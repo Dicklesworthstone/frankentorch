@@ -23,11 +23,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
                 _ => s.tensor_rad2deg(x).unwrap(),
             };
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
-    let vals: Vec<(&str, f64)> = ["softsign", "deg2rad", "rad2deg"].iter().map(|o| (*o, run(o))).collect();
+    let vals: Vec<(&str, f64)> = ["softsign", "deg2rad", "rad2deg"]
+        .iter()
+        .map(|o| (*o, run(o)))
+        .collect();
     let label = if orig { "FT_ORIG(compose)" } else { "FT_FUSED" };
     let py = format!(
         r#"
@@ -45,13 +50,38 @@ print("PT deg2rad %.4f"%t(lambda:torch.deg2rad(x)))
 print("PT rad2deg %.4f"%t(lambda:torch.rad2deg(x)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
     for (name, ftms) in &vals {
-        println!("  {name:9} {label} {ftms:.3}ms  PT {:.3}ms => {}", g(name), v(*ftms, g(name)));
+        println!(
+            "  {name:9} {label} {ftms:.3}ms  PT {:.3}ms => {}",
+            g(name),
+            v(*ftms, g(name))
+        );
     }
     Ok(())
 }

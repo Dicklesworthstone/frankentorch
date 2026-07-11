@@ -48,11 +48,18 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_multilabel_margin_loss f64 none, min-9:  OLD=clone+serial  NEW=borrow+parallel");
-    let cases: [(&str, usize, usize, usize); 3] =
-        [("50k x 200 pos5", 50_000, 200, 5), ("100k x 100 pos4", 100_000, 100, 4), ("30k x 400 pos8", 30_000, 400, 8)];
+    println!(
+        "tensor_multilabel_margin_loss f64 none, min-9:  OLD=clone+serial  NEW=borrow+parallel"
+    );
+    let cases: [(&str, usize, usize, usize); 3] = [
+        ("50k x 200 pos5", 50_000, 200, 5),
+        ("100k x 100 pos4", 100_000, 100, 4),
+        ("30k x 400 pos8", 30_000, 400, 8),
+    ];
     for (label, n, c, num_pos) in cases {
-        let input: Vec<f64> = (0..n * c).map(|i| ((i % 211) as f64 - 100.0) * 0.01).collect();
+        let input: Vec<f64> = (0..n * c)
+            .map(|i| ((i % 211) as f64 - 100.0) * 0.01)
+            .collect();
         // target[i][0..num_pos] = distinct positive class indices; rest = -1.
         let target: Vec<f64> = (0..n * c)
             .map(|idx| {
@@ -62,15 +69,23 @@ fn main() {
             .collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![n, c], false).unwrap();
-        let tt = sess.tensor_variable(target.clone(), vec![n, c], false).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![n, c], false)
+            .unwrap();
+        let tt = sess
+            .tensor_variable(target.clone(), vec![n, c], false)
+            .unwrap();
         let out = sess.tensor_multilabel_margin_loss(it, tt, "none").unwrap();
         let new_out = sess.tensor_values(out).unwrap();
         let old_out = old_multilabel(&input, &target, n, c);
         let bitmatch = new_out == old_out;
 
         let old_ms = bench(|| old_multilabel(&input, &target, n, c).len());
-        let new_ms = bench(|| sess.tensor_multilabel_margin_loss(it, tt, "none").unwrap().0);
+        let new_ms = bench(|| {
+            sess.tensor_multilabel_margin_loss(it, tt, "none")
+                .unwrap()
+                .0
+        });
         println!(
             "  {label:<16} ({:>3}MB in)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
             n * c * 8 / (1 << 20),

@@ -4,9 +4,12 @@ use ft_core::ExecutionMode;
 fn main() {
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     // well-conditioned 2x2 f32 matrix with grad
-    let a =
-        s.tensor_variable_f32(vec![2.0, 0.5, 0.3, 1.5], vec![2, 2], true).unwrap();
-    let bvec = s.tensor_variable_f32(vec![1.0, 2.0], vec![2, 1], true).unwrap();
+    let a = s
+        .tensor_variable_f32(vec![2.0, 0.5, 0.3, 1.5], vec![2, 2], true)
+        .unwrap();
+    let bvec = s
+        .tensor_variable_f32(vec![1.0, 2.0], vec![2, 1], true)
+        .unwrap();
 
     macro_rules! p {
         ($name:expr, $call:expr) => {{

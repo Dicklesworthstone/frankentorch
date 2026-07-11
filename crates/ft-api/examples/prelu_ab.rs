@@ -9,7 +9,10 @@ use std::time::Instant;
 
 fn old_prelu(input: &[f64], w: f64) -> Vec<f64> {
     let cloned = input.to_vec(); // old fallback materialized the whole input via tensor_values
-    cloned.iter().map(|&x| if x >= 0.0 { x } else { w * x }).collect()
+    cloned
+        .iter()
+        .map(|&x| if x >= 0.0 { x } else { w * x })
+        .collect()
 }
 
 fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
@@ -27,14 +30,20 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_prelu f64 (scalar w), min-9:  OLD=clone input + serial prelu  NEW=borrow input");
+    println!(
+        "tensor_prelu f64 (scalar w), min-9:  OLD=clone input + serial prelu  NEW=borrow input"
+    );
     let cases: [(&str, usize); 3] = [("8M", 8_000_000), ("16M", 16_000_000), ("32M", 32_000_000)];
     for (label, numel) in cases {
         let w = 0.25_f64;
-        let input: Vec<f64> = (0..numel).map(|i| ((i % 211) as f64 - 100.0) * 0.01).collect();
+        let input: Vec<f64> = (0..numel)
+            .map(|i| ((i % 211) as f64 - 100.0) * 0.01)
+            .collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![numel], false).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![numel], false)
+            .unwrap();
         let wt = sess.tensor_variable(vec![w], vec![1], false).unwrap();
         let out = sess.tensor_prelu(it, wt).unwrap();
         let new_out = sess.tensor_values(out).unwrap();

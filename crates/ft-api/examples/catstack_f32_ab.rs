@@ -34,8 +34,7 @@ fn main() {
             (data, meta)
         })
         .collect();
-    let refs: Vec<(&[f32], &TensorMeta)> =
-        inputs.iter().map(|(d, m)| (d.as_slice(), m)).collect();
+    let refs: Vec<(&[f32], &TensorMeta)> = inputs.iter().map(|(d, m)| (d.as_slice(), m)).collect();
 
     let cat = best(|| {
         let _ = ft_kernel_cpu::cat_tensor_contiguous_f32(&refs, 1).unwrap();

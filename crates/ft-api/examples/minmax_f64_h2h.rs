@@ -6,7 +6,9 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 fn t2<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId, ft_autograd::TensorNodeId)>(
-    a: &[f64], b: &[f64], f: F,
+    a: &[f64],
+    b: &[f64],
+    f: F,
 ) -> f64 {
     let mut best = f64::INFINITY;
     for _ in 0..9 {
@@ -16,15 +18,21 @@ fn t2<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId, ft_autograd::Te
         let t = Instant::now();
         f(&mut s, x, y);
         let e = t.elapsed().as_secs_f64() * 1e3;
-        if e < best { best = e; }
+        if e < best {
+            best = e;
+        }
     }
     best
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let n = 16_000_000usize;
-    let a: Vec<f64> = (0..n).map(|i| ((i % 9973) as f64 - 5000.0) * 0.013).collect();
-    let b: Vec<f64> = (0..n).map(|i| ((i % 7919) as f64 - 4000.0) * 0.017 + 1.0).collect();
+    let a: Vec<f64> = (0..n)
+        .map(|i| ((i % 9973) as f64 - 5000.0) * 0.013)
+        .collect();
+    let b: Vec<f64> = (0..n)
+        .map(|i| ((i % 7919) as f64 - 4000.0) * 0.017 + 1.0)
+        .collect();
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let py = r#"
 import time,torch
@@ -41,22 +49,49 @@ print("PT add_anchor %.4f"%t(lambda:a+b))
 print("PT maximum %.4f"%t(lambda:torch.maximum(a,b)))
 print("PT minimum %.4f"%t(lambda:torch.minimum(a,b)))
 "#;
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
     let rep = |name: &str, ft: f64| {
         if let Some(p) = pt.lines().find_map(|l| {
             let mut it = l.strip_prefix("PT ")?.split_whitespace();
-            if it.next()? == name { it.next()?.parse::<f64>().ok() } else { None }
+            if it.next()? == name {
+                it.next()?.parse::<f64>().ok()
+            } else {
+                None
+            }
         }) {
             let r = p / ft;
-            let v = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x SLOWER", 1.0 / r) };
+            let v = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x SLOWER", 1.0 / r)
+            };
             println!("  {name:<12} {ft:8.3} {p:8.3}   {v}");
         }
     };
     println!("op            FT(ms)    PT(ms)   verdict");
-    rep("add_anchor", t2(&a, &b, |s, x, y| { let _ = s.tensor_add(x, y); }));
-    rep("maximum", t2(&a, &b, |s, x, y| { let _ = s.tensor_maximum(x, y); }));
-    rep("minimum", t2(&a, &b, |s, x, y| { let _ = s.tensor_minimum(x, y); }));
+    rep(
+        "add_anchor",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_add(x, y);
+        }),
+    );
+    rep(
+        "maximum",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_maximum(x, y);
+        }),
+    );
+    rep(
+        "minimum",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_minimum(x, y);
+        }),
+    );
     Ok(())
 }

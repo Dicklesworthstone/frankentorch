@@ -1,27 +1,60 @@
 //! Broad f32 survey: reductions, comparison/min-max binary, misc — find serial outliers.
-use std::io::Write; use std::process::{Command, Stdio}; use std::time::Instant;
-use ft_api::FrankenTorchSession; use ft_autograd::TensorNodeId; use ft_core::ExecutionMode;
-const R: usize = 4000; const C: usize = 4000;
+use ft_api::FrankenTorchSession;
+use ft_autograd::TensorNodeId;
+use ft_core::ExecutionMode;
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::Instant;
+const R: usize = 4000;
+const C: usize = 4000;
 
 fn t1<F: Fn(&mut FrankenTorchSession, TensorNodeId)>(a: &[f32], f: F) -> f64 {
     let mut best = f64::INFINITY;
-    for _ in 0..9 { let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable_f32(a.to_vec(), vec![R, C], false).unwrap();
-        let t = Instant::now(); f(&mut s, x); let e = t.elapsed().as_secs_f64()*1e3; if e<best {best=e;} }
+    for _ in 0..9 {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(a.to_vec(), vec![R, C], false)
+            .unwrap();
+        let t = Instant::now();
+        f(&mut s, x);
+        let e = t.elapsed().as_secs_f64() * 1e3;
+        if e < best {
+            best = e;
+        }
+    }
     best
 }
-fn t2<F: Fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId)>(a: &[f32], b: &[f32], f: F) -> f64 {
+fn t2<F: Fn(&mut FrankenTorchSession, TensorNodeId, TensorNodeId)>(
+    a: &[f32],
+    b: &[f32],
+    f: F,
+) -> f64 {
     let mut best = f64::INFINITY;
-    for _ in 0..9 { let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable_f32(a.to_vec(), vec![R, C], false).unwrap();
-        let y = s.tensor_variable_f32(b.to_vec(), vec![R, C], false).unwrap();
-        let t = Instant::now(); f(&mut s, x, y); let e = t.elapsed().as_secs_f64()*1e3; if e<best {best=e;} }
+    for _ in 0..9 {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable_f32(a.to_vec(), vec![R, C], false)
+            .unwrap();
+        let y = s
+            .tensor_variable_f32(b.to_vec(), vec![R, C], false)
+            .unwrap();
+        let t = Instant::now();
+        f(&mut s, x, y);
+        let e = t.elapsed().as_secs_f64() * 1e3;
+        if e < best {
+            best = e;
+        }
+    }
     best
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let a: Vec<f32> = (0..R*C).map(|i| ((i%2000) as f32 - 1000.0) * 0.01).collect();
-    let b: Vec<f32> = (0..R*C).map(|i| ((i%1500) as f32 - 700.0) * 0.013 + 1.0).collect();
+    let a: Vec<f32> = (0..R * C)
+        .map(|i| ((i % 2000) as f32 - 1000.0) * 0.01)
+        .collect();
+    let b: Vec<f32> = (0..R * C)
+        .map(|i| ((i % 1500) as f32 - 700.0) * 0.013 + 1.0)
+        .collect();
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let py = r#"
 import time,torch
@@ -48,22 +81,104 @@ for name,fn in [("add_anchor",lambda:a+b),
                 ("fmod",lambda:torch.fmod(a,b))]:
     print("PT %s %.4f"%(name,t(fn)))
 "#;
-    let mut ch=Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
-    let o=ch.wait_with_output(); let pt=String::from_utf8_lossy(&o.unwrap().stdout).to_string();
-    let rep=|n:&str,ft:f64|{ if let Some(p)=pt.lines().find_map(|l|{let mut it=l.strip_prefix("PT ")?.split_whitespace(); if it.next()?==n {it.next()?.parse::<f64>().ok()} else {None}}){let r=p/ft; let tag=if r>=1.0{format!("FT {r:.2}x FASTER")}else{format!("FT {:.2}x SLOWER",1.0/r)}; println!("  {n:<12} {ft:8.3} {p:8.3}   {tag}");}};
+    let o = ch.wait_with_output();
+    let pt = String::from_utf8_lossy(&o.unwrap().stdout).to_string();
+    let rep = |n: &str, ft: f64| {
+        if let Some(p) = pt.lines().find_map(|l| {
+            let mut it = l.strip_prefix("PT ")?.split_whitespace();
+            if it.next()? == n {
+                it.next()?.parse::<f64>().ok()
+            } else {
+                None
+            }
+        }) {
+            let r = p / ft;
+            let tag = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x SLOWER", 1.0 / r)
+            };
+            println!("  {n:<12} {ft:8.3} {p:8.3}   {tag}");
+        }
+    };
     println!("op            FT(ms)    PT(ms)   verdict");
-    rep("add_anchor", t2(&a,&b, |s,x,y| { let _=s.tensor_add(x,y); }));
-    rep("sum_all", t1(&a, |s,x| { let _=s.tensor_sum(x); }));
-    rep("mean_all", t1(&a, |s,x| { let _=s.tensor_mean(x); }));
-    rep("amax_dim0", t1(&a, |s,x| { let _=s.tensor_amax(x, 0); }));
-    rep("amax_dim1", t1(&a, |s,x| { let _=s.tensor_amax(x, 1); }));
-    rep("maximum", t2(&a,&b, |s,x,y| { let _=s.tensor_maximum(x,y); }));
-    rep("minimum", t2(&a,&b, |s,x,y| { let _=s.tensor_minimum(x,y); }));
-    rep("eq", t2(&a,&b, |s,x,y| { let _=s.tensor_eq(x,y); }));
-    rep("gt", t2(&a,&b, |s,x,y| { let _=s.tensor_gt(x,y); }));
-    rep("pow2", t1(&a, |s,x| { let _=s.tensor_pow(x, 2.0); }));
-    rep("clamp", t1(&a, |s,x| { let _=s.tensor_clamp(x, -1.0, 1.0); }));
-    rep("fmod", t2(&a,&b, |s,x,y| { let _=s.tensor_fmod(x,y); }));
+    rep(
+        "add_anchor",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_add(x, y);
+        }),
+    );
+    rep(
+        "sum_all",
+        t1(&a, |s, x| {
+            let _ = s.tensor_sum(x);
+        }),
+    );
+    rep(
+        "mean_all",
+        t1(&a, |s, x| {
+            let _ = s.tensor_mean(x);
+        }),
+    );
+    rep(
+        "amax_dim0",
+        t1(&a, |s, x| {
+            let _ = s.tensor_amax(x, 0);
+        }),
+    );
+    rep(
+        "amax_dim1",
+        t1(&a, |s, x| {
+            let _ = s.tensor_amax(x, 1);
+        }),
+    );
+    rep(
+        "maximum",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_maximum(x, y);
+        }),
+    );
+    rep(
+        "minimum",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_minimum(x, y);
+        }),
+    );
+    rep(
+        "eq",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_eq(x, y);
+        }),
+    );
+    rep(
+        "gt",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_gt(x, y);
+        }),
+    );
+    rep(
+        "pow2",
+        t1(&a, |s, x| {
+            let _ = s.tensor_pow(x, 2.0);
+        }),
+    );
+    rep(
+        "clamp",
+        t1(&a, |s, x| {
+            let _ = s.tensor_clamp(x, -1.0, 1.0);
+        }),
+    );
+    rep(
+        "fmod",
+        t2(&a, &b, |s, x, y| {
+            let _ = s.tensor_fmod(x, y);
+        }),
+    );
     Ok(())
 }

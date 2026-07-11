@@ -25,17 +25,23 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let t = Instant::now();
         let _ = s.tensor_cross(x, y);
         let el = t.elapsed().as_secs_f64() * 1e3;
-        if el < best { best = el; }
+        if el < best {
+            best = el;
+        }
     }
     // FT anchor (cat)
     let mut anchor_ms = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable(anchor.clone(), vec![1_000_000, 4], false).unwrap();
+        let x = s
+            .tensor_variable(anchor.clone(), vec![1_000_000, 4], false)
+            .unwrap();
         let t = Instant::now();
         let _ = s.tensor_cat(&[x, x], 1);
         let el = t.elapsed().as_secs_f64() * 1e3;
-        if el < anchor_ms { anchor_ms = el; }
+        if el < anchor_ms {
+            anchor_ms = el;
+        }
     }
 
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
@@ -59,18 +65,41 @@ def t(fn,n=7):
 print("PT cross %.4f"%t(lambda:torch.linalg.cross(a,b,dim=1)))
 print("PT cat_anchor %.4f"%t(lambda:torch.cat([anc,anc],1)))
 "#;
-    let mut child = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
-    child.stdin.as_mut().ok_or_else(|| std::io::Error::other("no stdin"))?.write_all(py.as_bytes())?;
+    let mut child = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?
+        .write_all(py.as_bytes())?;
     let out = child.wait_with_output();
-    let pt = out.ok().filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).to_string()).unwrap_or_default();
+    let pt = out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
     let lk = |name: &str| -> Option<f64> {
-        pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == name { it.next()?.parse().ok() } else { None } })
+        pt.lines().find_map(|l| {
+            let mut it = l.strip_prefix("PT ")?.split_whitespace();
+            if it.next()? == name {
+                it.next()?.parse().ok()
+            } else {
+                None
+            }
+        })
     };
     println!("op            FT(ms)    PT(ms)   ratio(PT/FT, <1=FT slower)");
     for (name, ftv) in [("cross", best), ("cat_anchor", anchor_ms)] {
         if let Some(p) = lk(name) {
             let r = p / ftv;
-            let tag = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x SLOWER", 1.0 / r) };
+            let tag = if r >= 1.0 {
+                format!("FT {r:.2}x FASTER")
+            } else {
+                format!("FT {:.2}x SLOWER", 1.0 / r)
+            };
             println!("  {name:<14} {ftv:8.3} {p:8.3}   {tag}");
         }
     }

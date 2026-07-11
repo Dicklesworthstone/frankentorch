@@ -35,7 +35,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_logaddexp f64 (finite), min-9:  OLD=clone-both+9op-compose  NEW=borrow-both+fused-parallel");
+    println!(
+        "tensor_logaddexp f64 (finite), min-9:  OLD=clone-both+9op-compose  NEW=borrow-both+fused-parallel"
+    );
     for &n in &[1usize << 22, 1 << 24, 1 << 26] {
         let a: Vec<f64> = (0..n).map(|i| ((i % 211) as f64 - 100.0) * 0.1).collect();
         let b: Vec<f64> = (0..n).map(|i| ((i % 173) as f64 - 80.0) * 0.1).collect();

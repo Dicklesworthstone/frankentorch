@@ -31,7 +31,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_addcmul_ (in-place, ternary) f64, min-9:  OLD=clone-3+serial  NEW=borrow-3+parallel");
+    println!(
+        "tensor_addcmul_ (in-place, ternary) f64, min-9:  OLD=clone-3+serial  NEW=borrow-3+parallel"
+    );
     let value = 0.7;
     for &n in &[1usize << 24, 1 << 26] {
         let t: Vec<f64> = (0..n).map(|i| (i % 211) as f64).collect();

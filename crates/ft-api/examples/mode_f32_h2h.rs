@@ -29,7 +29,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let el = t.elapsed().as_secs_f64() * 1e3;
         if el < best {
             best = el;
-            chk = s.tensor_values_f32(vals)?.iter().map(|&v| f64::from(v)).sum();
+            chk = s
+                .tensor_values_f32(vals)?
+                .iter()
+                .map(|&v| f64::from(v))
+                .sum();
         }
     }
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());

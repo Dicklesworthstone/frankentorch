@@ -63,18 +63,22 @@ fn bench<F: Fn() -> usize>(f: F) -> f64 {
 fn main() {
     // (label, a_rows, a_cols, b_rows, b_cols)
     let cases: Vec<(&str, usize, usize, usize, usize)> = vec![
-        ("[64,64]⊗[64,64]", 64, 64, 64, 64),       // out 4096x4096 = 16.8M, 64MB
-        ("[512,512]⊗[8,8]", 512, 512, 8, 8),        // out 4096x4096
-        ("[8,8]⊗[512,512]", 8, 8, 512, 512),        // out 4096x4096
-        ("[128,128]⊗[32,32]", 128, 128, 32, 32),    // out 4096x4096
+        ("[64,64]⊗[64,64]", 64, 64, 64, 64), // out 4096x4096 = 16.8M, 64MB
+        ("[512,512]⊗[8,8]", 512, 512, 8, 8), // out 4096x4096
+        ("[8,8]⊗[512,512]", 8, 8, 512, 512), // out 4096x4096
+        ("[128,128]⊗[32,32]", 128, 128, 32, 32), // out 4096x4096
     ];
     println!("case                    OLD(ms)  NEW(ms)  NEW/OLD   bitmatch   [f32, min-9]");
     for (label, a_rows, a_cols, b_rows, b_cols) in cases {
         let out_rows = a_rows * b_rows;
         let out_cols = a_cols * b_cols;
         let total = out_rows * out_cols;
-        let a_vals: Vec<f32> = (0..a_rows * a_cols).map(|i| (i % 97) as f32 + 0.5).collect();
-        let b_vals: Vec<f32> = (0..b_rows * b_cols).map(|i| (i % 89) as f32 + 0.25).collect();
+        let a_vals: Vec<f32> = (0..a_rows * a_cols)
+            .map(|i| (i % 97) as f32 + 0.5)
+            .collect();
+        let b_vals: Vec<f32> = (0..b_rows * b_cols)
+            .map(|i| (i % 89) as f32 + 0.25)
+            .collect();
         let mut a = par_zeroed_f32(total);
         fill(&mut a, &a_vals, &b_vals, a_cols, b_rows, b_cols, out_cols);
         let b = ft_kernel_cpu::build_uninit(total, |r: &mut [f32]| {

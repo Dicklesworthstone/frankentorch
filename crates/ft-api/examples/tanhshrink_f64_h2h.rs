@@ -26,7 +26,9 @@ fn main() {
     // FUSED
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable(data.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_tanhshrink(a).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -35,12 +37,17 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[FUSED] tanhshrink f64 [4096,4096]: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[FUSED] tanhshrink f64 [4096,4096]: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
     // ORIG compose (tanh + sub explicitly)
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data.clone(), vec![rows, cols], false).unwrap();
+        let a = s
+            .tensor_variable(data.clone(), vec![rows, cols], false)
+            .unwrap();
         let t0w = s.tensor_tanh(a).unwrap();
         let _ = s.tensor_sub(a, t0w).unwrap();
         let t = bench(9, || {
@@ -51,6 +58,9 @@ fn main() {
             std::hint::black_box(o);
             e
         });
-        println!("[ORIG(compose)] tanhshrink f64 [4096,4096]: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[ORIG(compose)] tanhshrink f64 [4096,4096]: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
 }

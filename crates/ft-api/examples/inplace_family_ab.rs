@@ -9,7 +9,10 @@ use std::time::Instant;
 fn old_hypot(t: &[f64], o: &[f64]) -> Vec<f64> {
     let tv = t.to_vec();
     let ov = o.to_vec();
-    tv.iter().zip(ov.iter()).map(|(&x, &y)| x.hypot(y)).collect()
+    tv.iter()
+        .zip(ov.iter())
+        .map(|(&x, &y)| x.hypot(y))
+        .collect()
 }
 fn old_fmod(t: &[f64], o: &[f64]) -> Vec<f64> {
     let tv = t.to_vec();

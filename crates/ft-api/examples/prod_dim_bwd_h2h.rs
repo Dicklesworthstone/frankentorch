@@ -26,7 +26,9 @@ fn main() {
     let mut samples = [0.0f64; 3];
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data.clone(), vec![rows, cols], true).unwrap();
+        let a = s
+            .tensor_variable(data.clone(), vec![rows, cols], true)
+            .unwrap();
         let t0 = Instant::now();
         let red = s.tensor_prod_dim(a, dim).unwrap();
         let loss = s.tensor_sum(red).unwrap();

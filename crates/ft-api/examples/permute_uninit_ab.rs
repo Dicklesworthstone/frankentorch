@@ -68,9 +68,9 @@ fn bench<F: Fn() -> usize>(f: F) -> f64 {
 fn main() {
     // (label, batch, a_dim, b_dim, elem) — elem!=1 (trailing kept dims), the permute_slice case.
     let cases: Vec<(&str, usize, usize, usize, usize)> = vec![
-        ("[8,512,512,16] swapWH", 8, 512, 512, 16),  // plane=4.2M, 8 planes, 134MB
-        ("[64,256,256,8] swapWH", 64, 256, 256, 8),  // plane=524K, 64 planes, 134MB
-        ("[16,512,512,4] swapWH", 16, 512, 512, 4),  // plane=1M, 16 planes, 134MB
+        ("[8,512,512,16] swapWH", 8, 512, 512, 16), // plane=4.2M, 8 planes, 134MB
+        ("[64,256,256,8] swapWH", 64, 256, 256, 8), // plane=524K, 64 planes, 134MB
+        ("[16,512,512,4] swapWH", 16, 512, 512, 4), // plane=1M, 16 planes, 134MB
     ];
     println!("case                     OLD(ms)  NEW(ms)  NEW/OLD   bitmatch   [f32, min-9]");
     for (label, batch, a_dim, b_dim, elem) in cases {

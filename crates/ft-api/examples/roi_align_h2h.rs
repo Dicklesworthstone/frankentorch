@@ -34,7 +34,9 @@ fn main() {
     let mut best = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let ff = s.tensor_variable(feat.clone(), vec![n, c, h, w], false).unwrap();
+        let ff = s
+            .tensor_variable(feat.clone(), vec![n, c, h, w], false)
+            .unwrap();
         let bb = s.tensor_variable(boxes.clone(), vec![k, 5], false).unwrap();
         let t0 = Instant::now();
         let ra = s
@@ -44,5 +46,7 @@ fn main() {
         best = best.min(ms);
         std::hint::black_box((&s, ra));
     }
-    println!("[roi_align N={n} C={c} H={h} W={w} K={k} out={out_h}x{out_w} sr={sampling_ratio}] threads={threads}: {best:.2} ms");
+    println!(
+        "[roi_align N={n} C={c} H={h} W={w} K={k} out={out_h}x{out_w} sr={sampling_ratio}] threads={threads}: {best:.2} ms"
+    );
 }

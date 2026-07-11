@@ -10,7 +10,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let n = 16_000_000usize;
     let asinh_x: Vec<f64> = (0..n).map(|i| ((i % 4000) as f64) * 0.01 - 20.0).collect();
-    let atanh_x: Vec<f64> = (0..n).map(|i| ((i % 1999) as f64) / 1000.0 - 0.999).collect(); // (-1,1)
+    let atanh_x: Vec<f64> = (0..n)
+        .map(|i| ((i % 1999) as f64) / 1000.0 - 0.999)
+        .collect(); // (-1,1)
     let orig = std::env::var("FT_ORIG").is_ok();
     let run = |which: &str| -> f64 {
         let mut best = f64::INFINITY;
@@ -19,9 +21,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let v = if which == "asinh" { &asinh_x } else { &atanh_x };
             let x = s.tensor_variable(v.clone(), vec![n], false).unwrap();
             let t = Instant::now();
-            let _ = if which == "asinh" { s.tensor_asinh(x).unwrap() } else { s.tensor_atanh(x).unwrap() };
+            let _ = if which == "asinh" {
+                s.tensor_asinh(x).unwrap()
+            } else {
+                s.tensor_atanh(x).unwrap()
+            };
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -43,12 +51,41 @@ print("PT asinh %.4f"%t(lambda:torch.asinh(a)))
 print("PT atanh %.4f"%t(lambda:torch.atanh(b)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  asinh(16M) {label} {fa:.3}ms  PT {:.3}ms => {}", g("asinh"), v(fa, g("asinh")));
-    println!("  atanh(16M) {label} {ft2:.3}ms  PT {:.3}ms => {}", g("atanh"), v(ft2, g("atanh")));
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  asinh(16M) {label} {fa:.3}ms  PT {:.3}ms => {}",
+        g("asinh"),
+        v(fa, g("asinh"))
+    );
+    println!(
+        "  atanh(16M) {label} {ft2:.3}ms  PT {:.3}ms => {}",
+        g("atanh"),
+        v(ft2, g("atanh"))
+    );
     Ok(())
 }

@@ -32,7 +32,9 @@ fn run_ft(batch: usize, k: usize) -> Result<(f64, f64), Box<dyn Error>> {
     for _ in 0..5 {
         let data = fill_input(batch, k);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, k, k], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, k, k], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let ev = s.tensor_linalg_eigvals(a).map_err(boxed)?;
         let sq = s.tensor_mul(ev, ev).map_err(boxed)?;
@@ -115,9 +117,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             let tag = if ratio >= 1.0 { "FASTER" } else { "SLOWER" };
             // NOTE: gradsum differs from PyTorch by eigenvalue ORDERING gauge
             // (sum-of-squares weights eigenvalues, and geev vs torch order differ).
-            println!(
-                " | PyTorch {torch_ms:.3} ms gradsum {torch_sum:.6e} | FT {ratio:.2}x {tag}"
-            );
+            println!(" | PyTorch {torch_ms:.3} ms gradsum {torch_sum:.6e} | FT {ratio:.2}x {tag}");
         } else {
             println!(" | PyTorch unavailable");
         }

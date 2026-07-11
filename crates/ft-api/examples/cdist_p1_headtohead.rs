@@ -17,14 +17,20 @@ const M: usize = 1024;
 const D: usize = 128;
 
 fn vals(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.013 + shift).sin()) * 0.5).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.013 + shift).sin()) * 0.5)
+        .collect()
 }
 
 fn ft_cdist_p1() -> f64 {
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     // no-grad forward (requires_grad = false) -> fused cdist path
-    let x1 = s.tensor_variable(vals(N * D, 0.0), vec![N, D], false).unwrap();
-    let x2 = s.tensor_variable(vals(M * D, 1.0), vec![M, D], false).unwrap();
+    let x1 = s
+        .tensor_variable(vals(N * D, 0.0), vec![N, D], false)
+        .unwrap();
+    let x2 = s
+        .tensor_variable(vals(M * D, 1.0), vec![M, D], false)
+        .unwrap();
     let out = s.tensor_cdist(x1, x2, 1.0).unwrap();
     // checksum to force materialization + validate
     s.tensor_values(out).unwrap().iter().sum()
@@ -53,7 +59,10 @@ print("ELAPSED_MS", ts[0])
 "#;
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(15);
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(15);
     for _ in 0..3 {
         let _ = ft_cdist_p1();
     }
@@ -76,12 +85,15 @@ fn main() {
         .ok()
         .filter(|o| o.status.success())
         .and_then(|o| {
-            String::from_utf8_lossy(&o.stdout)
-                .lines()
-                .find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse::<f64>().ok()))
+            String::from_utf8_lossy(&o.stdout).lines().find_map(|l| {
+                l.strip_prefix("ELAPSED_MS ")
+                    .and_then(|v| v.trim().parse::<f64>().ok())
+            })
         });
 
-    println!("cdist p=1 f64 [{N},{D}] x [{M},{D}] -> [{N},{M}] forward (no-grad), {iters} iters MIN:");
+    println!(
+        "cdist p=1 f64 [{N},{D}] x [{M},{D}] -> [{N},{M}] forward (no-grad), {iters} iters MIN:"
+    );
     println!("  FrankenTorch : {ft:8.3} ms   (checksum {checksum:.4e})");
     match py {
         Some(p) => {

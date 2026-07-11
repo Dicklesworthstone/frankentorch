@@ -20,7 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let o = s.tensor_block_diag(&[i0, i1, i2])?;
     let dt = s.tensor_dtype(o)?;
     let fv = s.tensor_values_lossy_f64(o)?;
-    let py_s = format!(r#"
+    let py_s = format!(
+        r#"
 import torch
 b0=torch.tensor({b0:?},dtype=torch.float32).reshape(2,2)
 b1=torch.tensor({b1:?},dtype=torch.float32).reshape(1,3)
@@ -28,13 +29,39 @@ b2=torch.tensor({b2:?},dtype=torch.float32).reshape(1,1)
 o=torch.block_diag(b0,b1,b2)
 print("SHAPE",list(o.shape))
 print("V"," ".join("%.9g"%v for v in o.flatten().tolist()))
-"#, b0 = b0, b1 = b1, b2 = b2);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        b0 = b0,
+        b1 = b1,
+        b2 = b2
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_s.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let pv: Vec<f64> = pt.lines().find_map(|l| l.strip_prefix("V ")).map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect()).unwrap_or_default();
-    let mm = fv.iter().zip(&pv).filter(|(a, b)| (**a as f32).to_bits() != (**b as f32).to_bits()).count() + fv.len().abs_diff(pv.len());
-    println!("parity f32: dtype={dt:?} mismatch={mm}/{} (len ft={} torch={})", pv.len(), fv.len(), pv.len());
+    let pv: Vec<f64> = pt
+        .lines()
+        .find_map(|l| l.strip_prefix("V "))
+        .map(|s| {
+            s.split_whitespace()
+                .filter_map(|t| t.parse().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mm = fv
+        .iter()
+        .zip(&pv)
+        .filter(|(a, b)| (**a as f32).to_bits() != (**b as f32).to_bits())
+        .count()
+        + fv.len().abs_diff(pv.len());
+    println!(
+        "parity f32: dtype={dt:?} mismatch={mm}/{} (len ft={} torch={})",
+        pv.len(),
+        fv.len(),
+        pv.len()
+    );
 
     // perf: 32 blocks of [128,128] -> [4096,4096] (16.7M, mostly zeros)
     let (nb, bs) = (32usize, 128usize);
@@ -43,11 +70,18 @@ print("V"," ".join("%.9g"%v for v in o.flatten().tolist()))
         let mut bst = f64::INFINITY;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let ids: Vec<_> = (0..nb).map(|_| s.tensor_variable_f32(blk.clone(), vec![bs, bs], false).unwrap()).collect();
+            let ids: Vec<_> = (0..nb)
+                .map(|_| {
+                    s.tensor_variable_f32(blk.clone(), vec![bs, bs], false)
+                        .unwrap()
+                })
+                .collect();
             let ti = Instant::now();
             let _ = s.tensor_block_diag(&ids);
             let e = ti.elapsed().as_secs_f64() * 1e3;
-            if e < bst { bst = e; }
+            if e < bst {
+                bst = e;
+            }
         }
         bst
     };
@@ -57,15 +91,24 @@ print("V"," ".join("%.9g"%v for v in o.flatten().tolist()))
         let mut bst = f64::INFINITY;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = s.tensor_variable_f32(big.clone(), vec![4096, 4096], false).unwrap();
-            let y = s.tensor_variable_f32(big.clone(), vec![4096, 4096], false).unwrap();
-            let ti = Instant::now(); let _ = s.tensor_add(x, y); let e = ti.elapsed().as_secs_f64() * 1e3;
-            if e < bst { bst = e; }
+            let x = s
+                .tensor_variable_f32(big.clone(), vec![4096, 4096], false)
+                .unwrap();
+            let y = s
+                .tensor_variable_f32(big.clone(), vec![4096, 4096], false)
+                .unwrap();
+            let ti = Instant::now();
+            let _ = s.tensor_add(x, y);
+            let e = ti.elapsed().as_secs_f64() * 1e3;
+            if e < bst {
+                bst = e;
+            }
         }
         bst
     };
     let (ta, tb) = (tadd(), tt());
-    let py_b = format!(r#"
+    let py_b = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 nb={nb}; bs={bs}
@@ -79,13 +122,45 @@ def tm(fn,reps=7):
     return min(ts)
 print("PT add %.4f"%tm(lambda:big+big))
 print("PT bd %.4f"%tm(lambda:torch.block_diag(*blocks)))
-"#, nb = nb, bs = bs);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        nb = nb,
+        bs = bs
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_b.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  add_anchor  FT {ta:.3} PT {:.3}  => {}", g("add"), v(ta, g("add")));
-    println!("  block_diag  FT {tb:.3} PT {:.3}  => {}", g("bd"), v(tb, g("bd")));
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  add_anchor  FT {ta:.3} PT {:.3}  => {}",
+        g("add"),
+        v(ta, g("add"))
+    );
+    println!(
+        "  block_diag  FT {tb:.3} PT {:.3}  => {}",
+        g("bd"),
+        v(tb, g("bd"))
+    );
     Ok(())
 }

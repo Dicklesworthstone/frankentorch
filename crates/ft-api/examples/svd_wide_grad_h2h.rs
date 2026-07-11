@@ -29,7 +29,9 @@ fn run_ft(batch: usize, m: usize, n: usize) -> Result<(f64, f64), Box<dyn Error>
     for _ in 0..5 {
         let data = fill(batch, m, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, m, n], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, m, n], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let (_u, sg, _vh) = s.tensor_linalg_svd(a, false).map_err(boxed)?;
         let loss = s.tensor_sum(sg).map_err(boxed)?;
@@ -37,7 +39,12 @@ fn run_ft(batch: usize, m: usize, n: usize) -> Result<(f64, f64), Box<dyn Error>
         let elapsed_ms = start.elapsed().as_secs_f64() * 1e3;
         if elapsed_ms < best {
             best = elapsed_ms;
-            checksum = s.tensor_grad(a).map_err(boxed)?.unwrap_or_default().iter().sum();
+            checksum = s
+                .tensor_grad(a)
+                .map_err(boxed)?
+                .unwrap_or_default()
+                .iter()
+                .sum();
         }
     }
     Ok((best, checksum))
@@ -69,8 +76,12 @@ print("MS", min(s)); print("SUM", g.sum().item())
 "#
     );
     let mut child = Command::new(&python)
-        .arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped())
-        .spawn().ok()?;
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
     child.stdin.as_mut()?.write_all(script.as_bytes()).ok()?;
     let output = child.wait_with_output().ok()?;
     if !output.status.success() {
@@ -78,19 +89,30 @@ print("MS", min(s)); print("SUM", g.sum().item())
         return None;
     }
     let stdout = String::from_utf8_lossy(&output.stdout);
-    let get = |pre: &str| stdout.lines().find_map(|l| l.strip_prefix(pre)).and_then(|v| v.trim().parse::<f64>().ok());
+    let get = |pre: &str| {
+        stdout
+            .lines()
+            .find_map(|l| l.strip_prefix(pre))
+            .and_then(|v| v.trim().parse::<f64>().ok())
+    };
     Some((get("MS ")?, get("SUM ")?))
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
-    for (batch, m, n) in [(20_000usize, 4usize, 8usize), (8_000usize, 8usize, 16usize), (3_000usize, 16usize, 32usize)] {
+    for (batch, m, n) in [
+        (20_000usize, 4usize, 8usize),
+        (8_000usize, 8usize, 16usize),
+        (3_000usize, 16usize, 32usize),
+    ] {
         let (ft_ms, ft_sum) = run_ft(batch, m, n)?;
         print!("B={batch} m={m} n={n}: FT {ft_ms:.3} ms gradsum {ft_sum:.6e}");
         if let Some((tms, tsum)) = run_pytorch(batch, m, n) {
             let rel = (ft_sum - tsum).abs() / (tsum.abs() + 1e-12);
             let ratio = tms / ft_ms;
             let tag = if ratio >= 1.0 { "FASTER" } else { "SLOWER" };
-            println!(" | PyTorch {tms:.3} ms gradsum {tsum:.6e} rel {rel:.3e} | FT {ratio:.2}x {tag}");
+            println!(
+                " | PyTorch {tms:.3} ms gradsum {tsum:.6e} rel {rel:.3e} | FT {ratio:.2}x {tag}"
+            );
         } else {
             println!(" | PyTorch unavailable");
         }

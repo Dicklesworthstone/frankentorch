@@ -6,14 +6,40 @@ use std::time::Instant;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let m = 4096usize;
-    let mat: Vec<f32> = (0..m*m).map(|i| ((i*7919)%1_000_003) as f32 * 0.001).collect();
-    let tt = |w: u8| { let mut best=f64::INFINITY; for _ in 0..7 {
-        let mut s=FrankenTorchSession::new(ExecutionMode::Strict);
-        let x=s.tensor_variable_f32(mat.clone(),vec![m,m],false).unwrap();
-        let ti=Instant::now();
-        match w {0=>{let _=s.tensor_add(x,x);}1=>{let _=s.tensor_max_dim(x,1);}2=>{let _=s.tensor_min_dim(x,1);}_=>{let _=s.tensor_max_dim(x,0);}}
-        let e=ti.elapsed().as_secs_f64()*1e3; if e<best{best=e;} } best };
-    let py = format!(r#"
+    let mat: Vec<f32> = (0..m * m)
+        .map(|i| ((i * 7919) % 1_000_003) as f32 * 0.001)
+        .collect();
+    let tt = |w: u8| {
+        let mut best = f64::INFINITY;
+        for _ in 0..7 {
+            let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = s
+                .tensor_variable_f32(mat.clone(), vec![m, m], false)
+                .unwrap();
+            let ti = Instant::now();
+            match w {
+                0 => {
+                    let _ = s.tensor_add(x, x);
+                }
+                1 => {
+                    let _ = s.tensor_max_dim(x, 1);
+                }
+                2 => {
+                    let _ = s.tensor_min_dim(x, 1);
+                }
+                _ => {
+                    let _ = s.tensor_max_dim(x, 0);
+                }
+            }
+            let e = ti.elapsed().as_secs_f64() * 1e3;
+            if e < best {
+                best = e;
+            }
+        }
+        best
+    };
+    let py = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 m={m}
@@ -27,13 +53,48 @@ print("PT add %.3f"%tm(lambda:mat+mat))
 print("PT max1 %.3f"%tm(lambda:torch.max(mat,1)))
 print("PT min1 %.3f"%tm(lambda:torch.min(mat,1)))
 print("PT max0 %.3f"%tm(lambda:torch.max(mat,0)))
-"#, m=m);
-    let mut ch=Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        m = m
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
-    let pt=String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g=|k:&str| pt.lines().find_map(|l|{let mut it=l.strip_prefix("PT ")?.split_whitespace(); if it.next()?==k {it.next()?.parse::<f64>().ok()} else {None}}).unwrap_or(f64::NAN);
-    let v=|ft:f64,p:f64| if p>=ft {format!("FT {:.2}x FASTER",p/ft)} else {format!("FT {:.2}x SLOWER",ft/p)};
+    let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
     println!("max_dim/min_dim [4096,4096] (torch 8t / FT default), min-of-7");
-    for (lbl,w) in [("add",0u8),("max_dim1",1),("min_dim1",2),("max_dim0",3)] { let ft=tt(w); println!("  {lbl:<10} FT {ft:8.3}  PT {:8.3}  => {}",g(lbl),v(ft,g(lbl))); }
+    for (lbl, w) in [
+        ("add", 0u8),
+        ("max_dim1", 1),
+        ("min_dim1", 2),
+        ("max_dim0", 3),
+    ] {
+        let ft = tt(w);
+        println!(
+            "  {lbl:<10} FT {ft:8.3}  PT {:8.3}  => {}",
+            g(lbl),
+            v(ft, g(lbl))
+        );
+    }
     Ok(())
 }

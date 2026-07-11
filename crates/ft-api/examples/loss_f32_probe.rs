@@ -12,8 +12,16 @@ fn main() {
     let pred = mk(&mut s, vec![0.5, -1.0, 2.0, -0.5], vec![4]);
     let tgt = mk(&mut s, vec![1.0, -1.0, 1.0, -1.0], vec![4]);
     // boxes [2,4]: x1,y1,x2,y2
-    let pb = mk(&mut s, vec![0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 3.0, 3.0], vec![2, 4]);
-    let tb = mk(&mut s, vec![0.0, 0.0, 2.0, 2.0, 0.5, 0.5, 2.5, 2.5], vec![2, 4]);
+    let pb = mk(
+        &mut s,
+        vec![0.0, 0.0, 2.0, 2.0, 1.0, 1.0, 3.0, 3.0],
+        vec![2, 4],
+    );
+    let tb = mk(
+        &mut s,
+        vec![0.0, 0.0, 2.0, 2.0, 0.5, 0.5, 2.5, 2.5],
+        vec![2, 4],
+    );
 
     macro_rules! probe {
         ($name:expr, $call:expr) => {{

@@ -40,7 +40,9 @@ fn run_ft(batch: usize, k: usize) -> Result<(f64, f64), Box<dyn Error>> {
     for _ in 0..5 {
         let data = fill_input(batch, k);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(data, vec![batch, k, k], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(data, vec![batch, k, k], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let (evals, evecs) = s.tensor_linalg_eigh(a).map_err(boxed)?;
         let se = s.tensor_sum(evals).map_err(boxed)?;

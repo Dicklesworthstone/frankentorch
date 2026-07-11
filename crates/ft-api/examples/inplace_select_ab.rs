@@ -8,13 +8,20 @@ use std::time::Instant;
 fn old_masked_fill(t: &[f64], m: &[f64], value: f64) -> Vec<f64> {
     let tv = t.to_vec();
     let mv = m.to_vec();
-    tv.iter().zip(mv.iter()).map(|(&t, &m)| if m != 0.0 { value } else { t }).collect()
+    tv.iter()
+        .zip(mv.iter())
+        .map(|(&t, &m)| if m != 0.0 { value } else { t })
+        .collect()
 }
 fn old_where(t: &[f64], c: &[f64], o: &[f64]) -> Vec<f64> {
     let tv = t.to_vec();
     let cv = c.to_vec();
     let ov = o.to_vec();
-    tv.iter().zip(cv.iter()).zip(ov.iter()).map(|((&t, &c), &o)| if c != 0.0 { o } else { t }).collect()
+    tv.iter()
+        .zip(cv.iter())
+        .zip(ov.iter())
+        .map(|((&t, &c), &o)| if c != 0.0 { o } else { t })
+        .collect()
 }
 
 fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
@@ -32,7 +39,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("in-place masked_fill_/where_ f64, min-9:  OLD=clone-all+serial  NEW=borrow-all+parallel");
+    println!(
+        "in-place masked_fill_/where_ f64, min-9:  OLD=clone-all+serial  NEW=borrow-all+parallel"
+    );
     let n = 1usize << 26; // 512MB
     let t: Vec<f64> = (0..n).map(|i| (i % 211) as f64).collect();
     let m: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
@@ -44,7 +53,10 @@ fn main() {
     s.tensor_masked_fill_(tt, mt, -1.0).unwrap();
     let bm_m = s.tensor_values(tt).unwrap() == old_masked_fill(&t, &m, -1.0);
     let mo = bench(|| old_masked_fill(&t, &m, -1.0).len());
-    let mn = bench(|| { s.tensor_masked_fill_(tt, mt, -1.0).unwrap(); s.tensor_values(tt).unwrap().len() });
+    let mn = bench(|| {
+        s.tensor_masked_fill_(tt, mt, -1.0).unwrap();
+        s.tensor_values(tt).unwrap().len()
+    });
 
     let mut s2 = FrankenTorchSession::new(ExecutionMode::Strict);
     let tt2 = s2.tensor_variable(t.clone(), vec![n], false).unwrap();
@@ -53,7 +65,17 @@ fn main() {
     s2.tensor_where_(tt2, ct2, ot2).unwrap();
     let bm_w = s2.tensor_values(tt2).unwrap() == old_where(&t, &m, &o);
     let wo = bench(|| old_where(&t, &m, &o).len());
-    let wn = bench(|| { s2.tensor_where_(tt2, ct2, ot2).unwrap(); s2.tensor_values(tt2).unwrap().len() });
+    let wn = bench(|| {
+        s2.tensor_where_(tt2, ct2, ot2).unwrap();
+        s2.tensor_values(tt2).unwrap().len()
+    });
 
-    println!("  n={} (512MB)  masked_fill_ {:.2}x (bm={})  where_ {:.2}x (bm={})", n, mo / mn, bm_m, wo / wn, bm_w);
+    println!(
+        "  n={} (512MB)  masked_fill_ {:.2}x (bm={})  where_ {:.2}x (bm={})",
+        n,
+        mo / mn,
+        bm_m,
+        wo / wn,
+        bm_w
+    );
 }

@@ -20,10 +20,14 @@ const SEQ: usize = 512;
 const D: usize = 64;
 
 fn seq_vals(n: usize, shift: f64) -> Vec<f64> {
-    (0..n).map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2).collect()
+    (0..n)
+        .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
 }
 fn mask_vals() -> Vec<f64> {
-    (0..SEQ * SEQ).map(|idx| if idx % 3 == 0 { -0.5 } else { 0.0 }).collect()
+    (0..SEQ * SEQ)
+        .map(|idx| if idx % 3 == 0 { -0.5 } else { 0.0 })
+        .collect()
 }
 
 // Inputs built ONCE; timed region = GQA op + f64 output read, matching PyTorch's harness.
@@ -31,10 +35,18 @@ fn bench_ft(iters: usize) -> (f64, f64) {
     let q_total = B * HQ * SEQ * D;
     let kv_total = B * HKV * SEQ * D;
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let q = s.tensor_variable(seq_vals(q_total, 0.0), vec![B, HQ, SEQ, D], false).unwrap();
-    let k = s.tensor_variable(seq_vals(kv_total, 1.0), vec![B, HKV, SEQ, D], false).unwrap();
-    let v = s.tensor_variable(seq_vals(kv_total, 2.0), vec![B, HKV, SEQ, D], false).unwrap();
-    let m = s.tensor_variable(mask_vals(), vec![SEQ, SEQ], false).unwrap();
+    let q = s
+        .tensor_variable(seq_vals(q_total, 0.0), vec![B, HQ, SEQ, D], false)
+        .unwrap();
+    let k = s
+        .tensor_variable(seq_vals(kv_total, 1.0), vec![B, HKV, SEQ, D], false)
+        .unwrap();
+    let v = s
+        .tensor_variable(seq_vals(kv_total, 2.0), vec![B, HKV, SEQ, D], false)
+        .unwrap();
+    let m = s
+        .tensor_variable(mask_vals(), vec![SEQ, SEQ], false)
+        .unwrap();
     let op = |s: &mut FrankenTorchSession| -> f64 {
         let out = s
             .tensor_scaled_dot_product_attention_gqa(q, k, v, Some(m), false, None, true)
@@ -83,23 +95,45 @@ print("CHECKSUM", chk)
 "#;
 
 fn main() {
-    let iters: usize = std::env::var("ITERS").ok().and_then(|s| s.parse().ok()).unwrap_or(25);
-    println!("fair masked f64 GQA SDPA [B{B},HQ{HQ},HKV{HKV},S{SEQ},D{D}], {iters} iters MIN (op+read only):");
+    let iters: usize = std::env::var("ITERS")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(25);
+    println!(
+        "fair masked f64 GQA SDPA [B{B},HQ{HQ},HKV{HKV},S{SEQ},D{D}], {iters} iters MIN (op+read only):"
+    );
     let (ft, ft_sum) = bench_ft(iters);
     print!("  FrankenTorch GQA {ft:8.3} ms");
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    match Command::new(&python).arg("-c").arg(PY).env("FT_GAUNTLET_ITERS", iters.to_string()).output() {
+    match Command::new(&python)
+        .arg("-c")
+        .arg(PY)
+        .env("FT_GAUNTLET_ITERS", iters.to_string())
+        .output()
+    {
         Ok(o) if o.status.success() => {
             let s = String::from_utf8_lossy(&o.stdout);
-            let p: Option<f64> = s.lines().find_map(|l| l.strip_prefix("ELAPSED_MS ").and_then(|v| v.trim().parse().ok()));
-            let ps: Option<f64> = s.lines().find_map(|l| l.strip_prefix("CHECKSUM ").and_then(|v| v.trim().parse().ok()));
+            let p: Option<f64> = s.lines().find_map(|l| {
+                l.strip_prefix("ELAPSED_MS ")
+                    .and_then(|v| v.trim().parse().ok())
+            });
+            let ps: Option<f64> = s.lines().find_map(|l| {
+                l.strip_prefix("CHECKSUM ")
+                    .and_then(|v| v.trim().parse().ok())
+            });
             match (p, ps) {
                 (Some(p), Some(ps)) => {
                     let rel = (ft_sum - ps).abs() / (ps.abs() + 1e-12);
                     let r = p / ft;
-                    let verdict = if r >= 1.0 { format!("FT {r:.2}x FASTER") } else { format!("FT {:.2}x slower", 1.0 / r) };
-                    println!("   PyTorch {p:8.3} ms  => {verdict}  (rel-diff {rel:.2e} {})",
-                        if rel < 1e-9 { "MATCH" } else { "MISMATCH!" });
+                    let verdict = if r >= 1.0 {
+                        format!("FT {r:.2}x FASTER")
+                    } else {
+                        format!("FT {:.2}x slower", 1.0 / r)
+                    };
+                    println!(
+                        "   PyTorch {p:8.3} ms  => {verdict}  (rel-diff {rel:.2e} {})",
+                        if rel < 1e-9 { "MATCH" } else { "MISMATCH!" }
+                    );
                 }
                 _ => println!("   PyTorch (parse failed)"),
             }

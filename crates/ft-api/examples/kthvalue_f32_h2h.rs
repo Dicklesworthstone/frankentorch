@@ -11,8 +11,7 @@ use std::process::{Command, Stdio};
 use std::time::Instant;
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let python =
-        std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
 
     // ── parity: DISTINCT values isolate rank-k correctness (FT and torch must
     // agree exactly). Tie/±0 index tie-breaking is FT's pre-existing stable
@@ -117,7 +116,10 @@ for k in range({n}):
             let (_, v, _) = scratch.select_nth_unstable_by(k - 1, |a, b| a.total_cmp(b));
             *v
         };
-        let less = vals.iter().filter(|&&x| x.total_cmp(&kth) == Ordering::Less).count();
+        let less = vals
+            .iter()
+            .filter(|&&x| x.total_cmp(&kth) == Ordering::Less)
+            .count();
         let off = (k - 1) - less;
         let idx = vals
             .iter()

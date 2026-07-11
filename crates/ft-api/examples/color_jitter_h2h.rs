@@ -15,7 +15,9 @@ fn main() {
     let mut best = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let imgs = s.tensor_variable(data.clone(), vec![b, 3, h, w], false).unwrap();
+        let imgs = s
+            .tensor_variable(data.clone(), vec![b, 3, h, w], false)
+            .unwrap();
         let t0 = Instant::now();
         let cj = s.color_jitter(imgs, 0.4, 0.4, 0.4, 0.1).unwrap();
         best = best.min(t0.elapsed().as_secs_f64() * 1e3);

@@ -13,7 +13,11 @@ use std::time::Instant;
 fn old_inplace_atan2(target: &[f64], other: &[f64]) -> Vec<f64> {
     let mut buf = target.to_vec(); // lossy_f64(target) clone
     let other_c = other.to_vec(); // lossy_f64(other) clone
-    let mapped: Vec<f64> = buf.iter().zip(other_c.iter()).map(|(&y, &x)| y.atan2(x)).collect(); // serial
+    let mapped: Vec<f64> = buf
+        .iter()
+        .zip(other_c.iter())
+        .map(|(&y, &x)| y.atan2(x))
+        .collect(); // serial
     buf.copy_from_slice(&mapped); // update_for_float writeback
     buf
 }
@@ -38,12 +42,20 @@ fn main() {
     );
     let cases: [(&str, usize); 3] = [("4M", 4_000_000), ("8M", 8_000_000), ("16M", 16_000_000)];
     for (label, numel) in cases {
-        let target: Vec<f64> = (0..numel).map(|i| ((i % 2000) as f64 - 1000.0) * 0.01).collect();
-        let other: Vec<f64> = (0..numel).map(|i| ((i % 1500) as f64 - 700.0) * 0.01 + 0.3).collect();
+        let target: Vec<f64> = (0..numel)
+            .map(|i| ((i % 2000) as f64 - 1000.0) * 0.01)
+            .collect();
+        let other: Vec<f64> = (0..numel)
+            .map(|i| ((i % 1500) as f64 - 700.0) * 0.01 + 0.3)
+            .collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tt = sess.tensor_variable(target.clone(), vec![numel], false).unwrap();
-        let ot = sess.tensor_variable(other.clone(), vec![numel], false).unwrap();
+        let tt = sess
+            .tensor_variable(target.clone(), vec![numel], false)
+            .unwrap();
+        let ot = sess
+            .tensor_variable(other.clone(), vec![numel], false)
+            .unwrap();
         // bitmatch: one application of the real op vs the old replica on the same inputs.
         sess.tensor_atan2_(tt, ot).unwrap();
         let new_once = sess.tensor_values(tt).unwrap();

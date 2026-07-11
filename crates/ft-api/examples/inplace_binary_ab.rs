@@ -11,7 +11,11 @@ use std::time::Instant;
 fn old_inplace_mul(target: &[f64], other: &[f64]) -> Vec<f64> {
     let mut buf = target.to_vec(); // values(target) clone
     let other_c = other.to_vec(); // values(other) clone
-    let mapped: Vec<f64> = buf.iter().zip(other_c.iter()).map(|(&a, &b)| a * b).collect(); // serial map
+    let mapped: Vec<f64> = buf
+        .iter()
+        .zip(other_c.iter())
+        .map(|(&a, &b)| a * b)
+        .collect(); // serial map
     buf.copy_from_slice(&mapped); // writeback into existing storage
     buf
 }
@@ -37,13 +41,19 @@ fn main() {
     print!("{report}");
     let cases: [(&str, usize); 3] = [("4M", 4_000_000), ("8M", 8_000_000), ("16M", 16_000_000)];
     for (label, numel) in cases {
-        let target: Vec<f64> = (0..numel).map(|i| ((i % 1000) as f64 - 500.0) * 0.01).collect();
+        let target: Vec<f64> = (0..numel)
+            .map(|i| ((i % 1000) as f64 - 500.0) * 0.01)
+            .collect();
         // other in [0.99, 1.01] so repeated in-place multiply stays bounded (stable timing).
         let other: Vec<f64> = (0..numel).map(|i| 0.99 + (i % 21) as f64 * 0.001).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tt = sess.tensor_variable(target.clone(), vec![numel], false).unwrap();
-        let ot = sess.tensor_variable(other.clone(), vec![numel], false).unwrap();
+        let tt = sess
+            .tensor_variable(target.clone(), vec![numel], false)
+            .unwrap();
+        let ot = sess
+            .tensor_variable(other.clone(), vec![numel], false)
+            .unwrap();
         // bitmatch: one application of the real op vs the old replica on the same inputs.
         sess.tensor_mul_(tt, ot).unwrap();
         let new_once = sess.tensor_values(tt).unwrap();

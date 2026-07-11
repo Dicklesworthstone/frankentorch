@@ -29,7 +29,9 @@ fn run_ft(batch: usize, m: usize, n: usize, ord: &str) -> Result<(f64, f64), Box
     for _ in 0..5 {
         let ad = fill(batch, m, n);
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let a = s.tensor_variable(ad, vec![batch, m, n], true).map_err(boxed)?;
+        let a = s
+            .tensor_variable(ad, vec![batch, m, n], true)
+            .map_err(boxed)?;
         let start = Instant::now();
         let nrm = s.tensor_linalg_matrix_norm(a, ord).map_err(boxed)?;
         let loss = s.tensor_sum(nrm).map_err(boxed)?;
@@ -46,7 +48,11 @@ fn run_ft(batch: usize, m: usize, n: usize, ord: &str) -> Result<(f64, f64), Box
 
 fn run_pytorch(batch: usize, m: usize, n: usize, ord: &str) -> Option<(f64, f64)> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
-    let ordpy = if ord == "nuc" { "'nuc'".to_string() } else { ord.to_string() };
+    let ordpy = if ord == "nuc" {
+        "'nuc'".to_string()
+    } else {
+        ord.to_string()
+    };
     let script = format!(
         r#"
 import time, torch

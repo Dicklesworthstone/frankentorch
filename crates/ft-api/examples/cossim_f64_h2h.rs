@@ -22,10 +22,16 @@ fn main() {
     let (rows, cols) = (4096usize, 4096usize);
     let n = rows * cols;
     let x1: Vec<f64> = (0..n).map(|i| ((i % 97) as f64) * 0.031 - 1.4).collect();
-    let x2: Vec<f64> = (0..n).map(|i| ((i * 7 % 89) as f64) * 0.027 - 1.1).collect();
+    let x2: Vec<f64> = (0..n)
+        .map(|i| ((i * 7 % 89) as f64) * 0.027 - 1.1)
+        .collect();
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-    let a = s.tensor_variable(x1.clone(), vec![rows, cols], false).unwrap();
-    let b = s.tensor_variable(x2.clone(), vec![rows, cols], false).unwrap();
+    let a = s
+        .tensor_variable(x1.clone(), vec![rows, cols], false)
+        .unwrap();
+    let b = s
+        .tensor_variable(x2.clone(), vec![rows, cols], false)
+        .unwrap();
     let _ = s.tensor_cosine_similarity(a, b, 1, 1e-8).unwrap();
     let t = bench(9, || {
         let t0 = Instant::now();
@@ -34,5 +40,8 @@ fn main() {
         std::hint::black_box(o);
         e
     });
-    println!("[{tag}] cosine_similarity f64 [4096,4096] dim=1: {:.2} ms", t as f64 / 1000.0);
+    println!(
+        "[{tag}] cosine_similarity f64 [4096,4096] dim=1: {:.2} ms",
+        t as f64 / 1000.0
+    );
 }

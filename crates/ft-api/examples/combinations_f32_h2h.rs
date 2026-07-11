@@ -17,7 +17,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let t = Instant::now();
             let _ = s.tensor_combinations(xi, r, false);
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -25,8 +27,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let xi = s.tensor_variable_f32(inp.clone(), vec![n], false)?;
     let o = s.tensor_combinations(xi, r, false)?;
     let dt = s.tensor_dtype(o)?;
-    let fv: Vec<f32> = s.tensor_values_lossy_f64(o)?.iter().take(8192).map(|&v| v as f32).collect();
-    let py = format!(r#"
+    let fv: Vec<f32> = s
+        .tensor_values_lossy_f64(o)?
+        .iter()
+        .take(8192)
+        .map(|&v| v as f32)
+        .collect();
+    let py = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n,r={n},{r}
@@ -39,16 +47,46 @@ def tm(fn,reps=5):
 print("PT cb %.3f"%tm(lambda:torch.combinations(x,r)))
 o=torch.combinations(x,r); assert o.dtype==torch.float32
 print("REF "+" ".join("%a"%float(v) for v in o.flatten()[:8192].tolist()))
-"#);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let pt = out.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == "cb" { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
+    let pt = out
+        .lines()
+        .find_map(|l| {
+            let mut it = l.strip_prefix("PT ")?.split_whitespace();
+            if it.next()? == "cb" {
+                it.next()?.parse::<f64>().ok()
+            } else {
+                None
+            }
+        })
+        .unwrap_or(f64::NAN);
     let ft = bench();
     let line = out.lines().find(|l| l.starts_with("REF ")).unwrap_or("");
-    let tv: Vec<f32> = line.split_whitespace().skip(1).filter_map(|t| t.parse().ok()).collect();
-    let exact = fv.iter().zip(tv.iter()).filter(|(a, b)| a.to_bits() == b.to_bits()).count();
-    let vrb = if pt >= ft { format!("FT {:.2}x FASTER", pt / ft) } else { format!("FT {:.2}x SLOWER", ft / pt) };
-    println!("combinations f32 [n={n} r={r}]: FT {ft:8.3}ms torch {pt:8.3}ms => {vrb} | dtype={dt:?} exact={exact}/{}", fv.len().min(tv.len()));
+    let tv: Vec<f32> = line
+        .split_whitespace()
+        .skip(1)
+        .filter_map(|t| t.parse().ok())
+        .collect();
+    let exact = fv
+        .iter()
+        .zip(tv.iter())
+        .filter(|(a, b)| a.to_bits() == b.to_bits())
+        .count();
+    let vrb = if pt >= ft {
+        format!("FT {:.2}x FASTER", pt / ft)
+    } else {
+        format!("FT {:.2}x SLOWER", ft / pt)
+    };
+    println!(
+        "combinations f32 [n={n} r={r}]: FT {ft:8.3}ms torch {pt:8.3}ms => {vrb} | dtype={dt:?} exact={exact}/{}",
+        fv.len().min(tv.len())
+    );
     Ok(())
 }

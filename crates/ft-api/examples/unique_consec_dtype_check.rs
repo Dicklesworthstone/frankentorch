@@ -13,9 +13,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt_ok = dt == DType::F32;
     let val_ok = v == vec![1.0, 2.0, 3.0, 1.0];
     ok &= dt_ok && val_ok;
-    println!("f32 unique_consecutive: dtype={dt:?} ({}) values={v:?} ({})",
-        if dt_ok { "F32 CORRECT" } else { "WRONG (expected F32)" },
-        if val_ok { "CORRECT" } else { "WRONG" });
+    println!(
+        "f32 unique_consecutive: dtype={dt:?} ({}) values={v:?} ({})",
+        if dt_ok {
+            "F32 CORRECT"
+        } else {
+            "WRONG (expected F32)"
+        },
+        if val_ok { "CORRECT" } else { "WRONG" }
+    );
 
     // f64 must stay F64 (no regression)
     let y = s.tensor_variable(vec![5.0, 5.0, 7.0], vec![3], false)?;
@@ -23,7 +29,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let dt2 = s.tensor_dtype(u2)?;
     let dt2_ok = dt2 == DType::F64;
     ok &= dt2_ok;
-    println!("f64 unique_consecutive: dtype={dt2:?} ({})", if dt2_ok { "F64 CORRECT" } else { "REGRESSION" });
+    println!(
+        "f64 unique_consecutive: dtype={dt2:?} ({})",
+        if dt2_ok { "F64 CORRECT" } else { "REGRESSION" }
+    );
 
     println!("ALL_OK={ok}");
     Ok(())

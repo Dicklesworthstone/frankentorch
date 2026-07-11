@@ -11,7 +11,9 @@ fn main() {
             let mut best = f64::INFINITY;
             for _ in 0..6 {
                 let mut $s = FrankenTorchSession::new(ExecutionMode::Strict);
-                let $t = $s.tensor_variable(vec![0.0; n], shape.clone(), false).unwrap();
+                let $t = $s
+                    .tensor_variable(vec![0.0; n], shape.clone(), false)
+                    .unwrap();
                 let t0 = Instant::now();
                 $body;
                 let ms = t0.elapsed().as_secs_f64() * 1e3;
@@ -27,6 +29,11 @@ fn main() {
     bench!("uniform_", s, t, s.tensor_uniform_(t, 0.0, 1.0).unwrap());
     bench!("exponential_", s, t, s.tensor_exponential_(t, 1.5).unwrap());
     bench!("cauchy_", s, t, s.tensor_cauchy_(t, 0.0, 1.0).unwrap());
-    bench!("log_normal_", s, t, s.tensor_log_normal_(t, 0.0, 1.0).unwrap());
+    bench!(
+        "log_normal_",
+        s,
+        t,
+        s.tensor_log_normal_(t, 0.0, 1.0).unwrap()
+    );
     bench!("geometric_", s, t, s.tensor_geometric_(t, 0.3).unwrap());
 }

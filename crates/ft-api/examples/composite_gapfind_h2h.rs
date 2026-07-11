@@ -6,7 +6,9 @@ fn main() {
     let tag = std::env::var("FT_TAG").unwrap_or_else(|_| "FT".into());
     let v4000: Vec<f64> = (0..4000).map(|i| (i as f64) * 1e-3 + 0.5).collect();
     let m500: Vec<f64> = (0..250_000).map(|i| ((i % 997) as f64) * 1e-3).collect();
-    let m128: Vec<f64> = (0..128 * 128).map(|i| ((i % 131) as f64) * 1e-3 + 0.1).collect();
+    let m128: Vec<f64> = (0..128 * 128)
+        .map(|i| ((i % 131) as f64) * 1e-3 + 0.1)
+        .collect();
     let v4m: Vec<f64> = (0..4_000_000).map(|i| ((i % 9973) as f64) * 1e-4).collect();
 
     // Each closure builds its inputs in the session, then times ONLY the op (inputs
@@ -40,31 +42,39 @@ fn main() {
     bench!(
         "tensordot500d1",
         |s: &mut FrankenTorchSession| (
-            s.tensor_variable(m500.clone(), vec![500, 500], false).unwrap(),
-            s.tensor_variable(m500.clone(), vec![500, 500], false).unwrap()
+            s.tensor_variable(m500.clone(), vec![500, 500], false)
+                .unwrap(),
+            s.tensor_variable(m500.clone(), vec![500, 500], false)
+                .unwrap()
         ),
         |s: &mut FrankenTorchSession, i: &(_, _)| s.tensor_tensordot(i.0, i.1, 1).unwrap()
     );
     bench!(
         "block_diag50x128",
         |s: &mut FrankenTorchSession| (0..50)
-            .map(|_| s.tensor_variable(m128.clone(), vec![128, 128], false).unwrap())
+            .map(|_| s
+                .tensor_variable(m128.clone(), vec![128, 128], false)
+                .unwrap())
             .collect::<Vec<_>>(),
         |s: &mut FrankenTorchSession, ids: &Vec<_>| s.tensor_block_diag(ids).unwrap()
     );
     bench!(
         "inner4m",
         |s: &mut FrankenTorchSession| (
-            s.tensor_variable(v4m.clone(), vec![4_000_000], false).unwrap(),
-            s.tensor_variable(v4m.clone(), vec![4_000_000], false).unwrap()
+            s.tensor_variable(v4m.clone(), vec![4_000_000], false)
+                .unwrap(),
+            s.tensor_variable(v4m.clone(), vec![4_000_000], false)
+                .unwrap()
         ),
         |s: &mut FrankenTorchSession, i: &(_, _)| s.tensor_inner(i.0, i.1).unwrap()
     );
     bench!(
         "dot4m",
         |s: &mut FrankenTorchSession| (
-            s.tensor_variable(v4m.clone(), vec![4_000_000], false).unwrap(),
-            s.tensor_variable(v4m.clone(), vec![4_000_000], false).unwrap()
+            s.tensor_variable(v4m.clone(), vec![4_000_000], false)
+                .unwrap(),
+            s.tensor_variable(v4m.clone(), vec![4_000_000], false)
+                .unwrap()
         ),
         |s: &mut FrankenTorchSession, i: &(_, _)| s.tensor_dot(i.0, i.1).unwrap()
     );

@@ -45,18 +45,34 @@ print("MS", sorted(ts)[0]); print("VSUM", v.sum().item()); print("ISUM", float(i
     let out = Command::new(&python).arg("-c").arg(py).output();
     println!("tensor_cummin_dim API dim=0 [{R},{C}] f64 no-grad, 15 iters MIN:");
     println!("  FrankenTorch : {best:8.3} ms   vsum {vsum:.6e}  isum {isum:.6e}");
-    let Ok(o) = out else { return; };
-    if !o.status.success() { return; }
+    let Ok(o) = out else {
+        return;
+    };
+    if !o.status.success() {
+        return;
+    }
     let s = String::from_utf8_lossy(&o.stdout);
-    let g = |p: &str| s.lines().find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()));
+    let g = |p: &str| {
+        s.lines()
+            .find_map(|l| l.strip_prefix(p).and_then(|v| v.trim().parse::<f64>().ok()))
+    };
     if let (Some(p), Some(pv), Some(pi)) = (g("MS "), g("VSUM "), g("ISUM ")) {
         let vrel = (vsum - pv).abs() / (pv.abs() + 1e-12);
         println!("  PyTorch      : {p:8.3} ms   vsum {pv:.6e}  isum {pi:.6e}");
-        println!("  CORRECTNESS  : values rel {vrel:.2e} ({}) ; indices ({})",
+        println!(
+            "  CORRECTNESS  : values rel {vrel:.2e} ({}) ; indices ({})",
             if vrel < 1e-9 { "MATCH" } else { "MISMATCH!" },
-            if (isum - pi).abs() < 0.5 { "MATCH" } else { "MISMATCH!" });
+            if (isum - pi).abs() < 0.5 {
+                "MATCH"
+            } else {
+                "MISMATCH!"
+            }
+        );
         let r = p / best;
-        if r >= 1.0 { println!("  => FT {r:.2}x FASTER (cummin end-to-end)"); }
-        else { println!("  => FT {:.2}x slower", 1.0 / r); }
+        if r >= 1.0 {
+            println!("  => FT {r:.2}x FASTER (cummin end-to-end)");
+        } else {
+            println!("  => FT {:.2}x slower", 1.0 / r);
+        }
     }
 }

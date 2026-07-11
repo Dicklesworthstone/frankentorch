@@ -19,9 +19,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             let x = s.tensor_variable(xd.clone(), vec![n], false).unwrap();
             let y = s.tensor_variable(yd.clone(), vec![n], false).unwrap();
             let t = Instant::now();
-            let _ = if which == "rel_entr" { s.tensor_rel_entr(x, y).unwrap() } else { s.tensor_xlog1py(x, y).unwrap() };
+            let _ = if which == "rel_entr" {
+                s.tensor_rel_entr(x, y).unwrap()
+            } else {
+                s.tensor_xlog1py(x, y).unwrap()
+            };
             let e = t.elapsed().as_secs_f64() * 1e3;
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -43,11 +49,36 @@ def t(fn,reps=7):
 print("PT rel_entr %.4f"%t(lambda:x*torch.log(x/y)))
 "#
     );
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  rel_entr(16M) {label} {fr:.3}ms  PT[x*log(x/y)] {:.3}ms => {}", g("rel_entr"), v(fr, g("rel_entr")));
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  rel_entr(16M) {label} {fr:.3}ms  PT[x*log(x/y)] {:.3}ms => {}",
+        g("rel_entr"),
+        v(fr, g("rel_entr"))
+    );
     Ok(())
 }

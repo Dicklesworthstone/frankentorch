@@ -11,13 +11,10 @@ use std::time::Instant;
 fn old_embedding(weight: &[f64], idx: &[usize], dim: usize) -> Vec<f64> {
     let cloned = weight.to_vec(); // old path materialized the whole table via tensor_values
     let mut result = vec![0.0_f64; idx.len() * dim];
-    result
-        .par_chunks_mut(dim)
-        .enumerate()
-        .for_each(|(i, row)| {
-            let s = idx[i] * dim;
-            row.copy_from_slice(&cloned[s..s + dim]);
-        });
+    result.par_chunks_mut(dim).enumerate().for_each(|(i, row)| {
+        let s = idx[i] * dim;
+        row.copy_from_slice(&cloned[s..s + dim]);
+    });
     result
 }
 
@@ -45,13 +42,21 @@ fn main() {
     ];
     for (label, num_emb, dim, num_idx) in cases {
         let table_mb = num_emb * dim * 8 / (1 << 20);
-        let weight: Vec<f64> = (0..num_emb * dim).map(|i| (i % 251) as f64 * 0.01).collect();
-        let idx_usize: Vec<usize> = (0..num_idx).map(|i| (i * 2_654_435_761usize) % num_emb).collect();
+        let weight: Vec<f64> = (0..num_emb * dim)
+            .map(|i| (i % 251) as f64 * 0.01)
+            .collect();
+        let idx_usize: Vec<usize> = (0..num_idx)
+            .map(|i| (i * 2_654_435_761usize) % num_emb)
+            .collect();
         let idx_f64: Vec<f64> = idx_usize.iter().map(|&i| i as f64).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let wt = sess.tensor_variable(weight.clone(), vec![num_emb, dim], false).unwrap();
-        let it = sess.tensor_variable(idx_f64.clone(), vec![num_idx], false).unwrap();
+        let wt = sess
+            .tensor_variable(weight.clone(), vec![num_emb, dim], false)
+            .unwrap();
+        let it = sess
+            .tensor_variable(idx_f64.clone(), vec![num_idx], false)
+            .unwrap();
         let out = sess.tensor_embedding(it, wt, None).unwrap();
         let new_out = sess.tensor_values(out).unwrap();
         let old_out = old_embedding(&weight, &idx_usize, dim);
@@ -61,7 +66,11 @@ fn main() {
         let new_ms = bench(|| sess.tensor_embedding(it, wt, None).unwrap().0);
         println!(
             "  {label:<24} (table {:>4}MB)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
-            table_mb, old_ms, new_ms, old_ms / new_ms, bitmatch
+            table_mb,
+            old_ms,
+            new_ms,
+            old_ms / new_ms,
+            bitmatch
         );
     }
 }

@@ -52,24 +52,40 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 fn main() {
     println!("tensor_quantize_per_channel f64, min-9:  OLD=clone + serial  NEW=borrow + parallel");
     // shape [before, channels, after], axis=1
-    let cases: [(&str, usize, usize, usize); 3] =
-        [("256x128x1024", 256, 128, 1024), ("128x64x2048", 128, 64, 2048), ("512x256x256", 512, 256, 256)];
+    let cases: [(&str, usize, usize, usize); 3] = [
+        ("256x128x1024", 256, 128, 1024),
+        ("128x64x2048", 128, 64, 2048),
+        ("512x256x256", 512, 256, 256),
+    ];
     for (label, before, channels, after) in cases {
         let numel = before * channels * after;
-        let input: Vec<f64> = (0..numel).map(|i| ((i % 997) as f64 - 500.0) * 0.01).collect();
-        let scales: Vec<f64> = (0..channels).map(|c| 0.02 + (c % 7) as f64 * 0.001).collect();
+        let input: Vec<f64> = (0..numel)
+            .map(|i| ((i % 997) as f64 - 500.0) * 0.01)
+            .collect();
+        let scales: Vec<f64> = (0..channels)
+            .map(|c| 0.02 + (c % 7) as f64 * 0.001)
+            .collect();
         let zps: Vec<i64> = (0..channels).map(|c| (c % 5) as i64 - 2).collect();
         let (qmin, qmax) = (-128_i64, 127_i64);
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![before, channels, after], false).unwrap();
-        let out = sess.tensor_quantize_per_channel(it, &scales, &zps, 1, qmin, qmax).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![before, channels, after], false)
+            .unwrap();
+        let out = sess
+            .tensor_quantize_per_channel(it, &scales, &zps, 1, qmin, qmax)
+            .unwrap();
         let new_out = sess.tensor_values(out).unwrap();
         let old_out = old_quant(&input, &scales, &zps, before, channels, after, qmin, qmax);
         let bitmatch = new_out == old_out;
 
-        let old_ms = bench(|| old_quant(&input, &scales, &zps, before, channels, after, qmin, qmax).len());
-        let new_ms = bench(|| sess.tensor_quantize_per_channel(it, &scales, &zps, 1, qmin, qmax).unwrap().0);
+        let old_ms =
+            bench(|| old_quant(&input, &scales, &zps, before, channels, after, qmin, qmax).len());
+        let new_ms = bench(|| {
+            sess.tensor_quantize_per_channel(it, &scales, &zps, 1, qmin, qmax)
+                .unwrap()
+                .0
+        });
         println!(
             "  {label:<14} ({:>3}MB)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
             numel * 8 / (1 << 20),

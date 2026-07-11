@@ -8,7 +8,9 @@ fn main() {
     // pseudo-random f64 in [0,1), materialized OUTSIDE the timer
     let data: Vec<f64> = (0..n)
         .map(|i| {
-            let x = (i as u64).wrapping_mul(2862933555777941757).wrapping_add(3037000493);
+            let x = (i as u64)
+                .wrapping_mul(2862933555777941757)
+                .wrapping_add(3037000493);
             (x >> 11) as f64 / ((1u64 << 53) as f64)
         })
         .collect();

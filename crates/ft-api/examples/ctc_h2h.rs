@@ -31,8 +31,12 @@ fn main() {
     let mut best_bwd = f64::INFINITY;
     for _ in 0..7 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let log_probs = s.tensor_variable(lp.clone(), vec![t_len, n, c], true).unwrap();
-        let tg = s.tensor_variable(targets.clone(), vec![n * tgt_len], false).unwrap();
+        let log_probs = s
+            .tensor_variable(lp.clone(), vec![t_len, n, c], true)
+            .unwrap();
+        let tg = s
+            .tensor_variable(targets.clone(), vec![n * tgt_len], false)
+            .unwrap();
         let il = s.tensor_variable(in_lens.clone(), vec![n], false).unwrap();
         let tl = s.tensor_variable(tgt_lens.clone(), vec![n], false).unwrap();
         let t0 = Instant::now();

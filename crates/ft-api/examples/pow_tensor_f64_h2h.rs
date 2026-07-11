@@ -25,8 +25,12 @@ fn main() {
     // FUSED
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable(base.clone(), vec![rows, cols], false).unwrap();
-        let e = s.tensor_variable(expo.clone(), vec![rows, cols], false).unwrap();
+        let x = s
+            .tensor_variable(base.clone(), vec![rows, cols], false)
+            .unwrap();
+        let e = s
+            .tensor_variable(expo.clone(), vec![rows, cols], false)
+            .unwrap();
         let _ = s.tensor_pow_tensor(x, e).unwrap();
         let t = bench(9, || {
             let t0 = Instant::now();
@@ -35,13 +39,20 @@ fn main() {
             std::hint::black_box(o);
             el
         });
-        println!("[FUSED] pow_tensor f64 [4096,4096]: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[FUSED] pow_tensor f64 [4096,4096]: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
     // ORIG compose (log + mul + exp, no 0^0 mask since base>0)
     {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = s.tensor_variable(base.clone(), vec![rows, cols], false).unwrap();
-        let e = s.tensor_variable(expo.clone(), vec![rows, cols], false).unwrap();
+        let x = s
+            .tensor_variable(base.clone(), vec![rows, cols], false)
+            .unwrap();
+        let e = s
+            .tensor_variable(expo.clone(), vec![rows, cols], false)
+            .unwrap();
         let lg = s.tensor_log(x).unwrap();
         let ml = s.tensor_mul(e, lg).unwrap();
         let _ = s.tensor_exp(ml).unwrap();
@@ -54,6 +65,9 @@ fn main() {
             std::hint::black_box(o);
             el
         });
-        println!("[ORIG(compose)] pow_tensor f64 [4096,4096]: {:.2} ms", t as f64 / 1000.0);
+        println!(
+            "[ORIG(compose)] pow_tensor f64 [4096,4096]: {:.2} ms",
+            t as f64 / 1000.0
+        );
     }
 }

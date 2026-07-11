@@ -20,7 +20,11 @@ fn heaviside(x: f64, v: f64) -> f64 {
 fn old_inplace_heaviside(target: &[f64], values: &[f64]) -> Vec<f64> {
     let mut buf = target.to_vec(); // lossy_f64(target) clone
     let vals_c = values.to_vec(); // tensor_values(values) clone
-    let mapped: Vec<f64> = buf.iter().zip(vals_c.iter()).map(|(&x, &v)| heaviside(x, v)).collect();
+    let mapped: Vec<f64> = buf
+        .iter()
+        .zip(vals_c.iter())
+        .map(|(&x, &v)| heaviside(x, v))
+        .collect();
     buf.copy_from_slice(&mapped); // update_for_float writeback
     buf
 }
@@ -40,7 +44,9 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("in-place heaviside_ f64, min-9:  OLD=clone both+serial select+writeback  NEW=borrow both+par");
+    println!(
+        "in-place heaviside_ f64, min-9:  OLD=clone both+serial select+writeback  NEW=borrow both+par"
+    );
     let cases: [(&str, usize); 3] = [("4M", 4_000_000), ("8M", 8_000_000), ("16M", 16_000_000)];
     for (label, numel) in cases {
         // Mix of negative / zero / positive so all three heaviside branches are exercised.
@@ -48,8 +54,12 @@ fn main() {
         let values: Vec<f64> = (0..numel).map(|i| (i % 7) as f64 * 0.5).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let tt = sess.tensor_variable(target.clone(), vec![numel], false).unwrap();
-        let vt = sess.tensor_variable(values.clone(), vec![numel], false).unwrap();
+        let tt = sess
+            .tensor_variable(target.clone(), vec![numel], false)
+            .unwrap();
+        let vt = sess
+            .tensor_variable(values.clone(), vec![numel], false)
+            .unwrap();
         // bitmatch: one application of the real op vs the old replica on the same inputs.
         sess.tensor_heaviside_(tt, vt).unwrap();
         let new_once = sess.tensor_values(tt).unwrap();

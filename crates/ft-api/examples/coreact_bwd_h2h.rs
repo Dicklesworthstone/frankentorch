@@ -21,7 +21,9 @@ fn main() {
         let mut fp = 0u64;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let a = s.tensor_variable(data.clone(), vec![rows, cols], true).unwrap();
+            let a = s
+                .tensor_variable(data.clone(), vec![rows, cols], true)
+                .unwrap();
             let t0 = Instant::now();
             let y = match op {
                 "exp" => s.tensor_exp(a).unwrap(),

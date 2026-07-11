@@ -21,8 +21,7 @@ fn main() {
             (data, meta)
         })
         .collect();
-    let refs: Vec<(&[f64], &TensorMeta)> =
-        inputs.iter().map(|(d, m)| (d.as_slice(), m)).collect();
+    let refs: Vec<(&[f64], &TensorMeta)> = inputs.iter().map(|(d, m)| (d.as_slice(), m)).collect();
 
     let mut best = f64::INFINITY;
     for _ in 0..9 {

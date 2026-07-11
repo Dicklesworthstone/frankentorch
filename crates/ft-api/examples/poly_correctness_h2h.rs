@@ -19,11 +19,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             _ => s.tensor_special_laguerre_polynomial_l(x, 5),
         }?;
         let dt = s.tensor_dtype(y)?;
-        let vals: Vec<f32> = s.tensor_values_lossy_f64(y)?.iter().map(|&v| v as f32).collect();
+        let vals: Vec<f32> = s
+            .tensor_values_lossy_f64(y)?
+            .iter()
+            .map(|&v| v as f32)
+            .collect();
         ft_out.push((lbl.to_string(), dt, vals));
     }
     // torch reference (f32), emit as space-separated per op
-    let py = format!(r#"
+    let py = format!(
+        r#"
 import torch
 torch.set_num_threads(1)
 n={n}
@@ -35,25 +40,52 @@ emit("cheb_t", torch.special.chebyshev_polynomial_t(a,5))
 emit("herm_h", torch.special.hermite_polynomial_h(a,5))
 emit("herm_he", torch.special.hermite_polynomial_he(a,5))
 emit("lag_l", torch.special.laguerre_polynomial_l(a,5))
-"#);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py.as_bytes())?;
     let out = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
     for (lbl, dt, fv) in &ft_out {
-        let line = out.lines().find(|l| l.starts_with(&format!("{lbl} "))).unwrap_or("");
-        let tv: Vec<f32> = line.split_whitespace().skip(1).filter_map(|t| t.parse().ok()).collect();
-        assert_eq!(tv.len(), fv.len(), "{lbl}: torch len {} != ft {}", tv.len(), fv.len());
+        let line = out
+            .lines()
+            .find(|l| l.starts_with(&format!("{lbl} ")))
+            .unwrap_or("");
+        let tv: Vec<f32> = line
+            .split_whitespace()
+            .skip(1)
+            .filter_map(|t| t.parse().ok())
+            .collect();
+        assert_eq!(
+            tv.len(),
+            fv.len(),
+            "{lbl}: torch len {} != ft {}",
+            tv.len(),
+            fv.len()
+        );
         let mut max_abs = 0f32;
         let mut max_rel = 0f32;
         let mut exact = 0usize;
         for (&f, &t) in fv.iter().zip(tv.iter()) {
-            if f.to_bits() == t.to_bits() { exact += 1; }
+            if f.to_bits() == t.to_bits() {
+                exact += 1;
+            }
             let a = (f - t).abs();
-            if a > max_abs { max_abs = a; }
+            if a > max_abs {
+                max_abs = a;
+            }
             let r = if t.abs() > 0.0 { a / t.abs() } else { a };
-            if r > max_rel { max_rel = r; }
+            if r > max_rel {
+                max_rel = r;
+            }
         }
-        println!("{lbl:<8} dtype={dt:?} bit_exact={exact}/{} max_abs={max_abs:.3e} max_rel={max_rel:.3e}", fv.len());
+        println!(
+            "{lbl:<8} dtype={dt:?} bit_exact={exact}/{} max_abs={max_abs:.3e} max_rel={max_rel:.3e}",
+            fv.len()
+        );
     }
     Ok(())
 }

@@ -32,7 +32,9 @@ fn main() {
         let input: Vec<f64> = (0..numel).map(|i| (i % 100_003) as f64).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![numel], false).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![numel], false)
+            .unwrap();
         let out = sess.tensor_bitwise_not(it).unwrap();
         let new_out = sess.tensor_values(out).unwrap();
         let old_out = old_bitwise_not(&input);

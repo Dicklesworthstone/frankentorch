@@ -20,7 +20,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             tg[i * cc + 1] = ((i + 2) % cc) as i64;
         }
     }
-    let py_s = format!(r#"
+    let py_s = format!(
+        r#"
 import torch
 x=torch.tensor({x:?},dtype=torch.float32).reshape({nn},{cc})
 t=torch.tensor({tg:?},dtype=torch.int64).reshape({nn},{cc})
@@ -28,11 +29,29 @@ o32=torch.nn.functional.multilabel_margin_loss(x,t,reduction='none')
 o64=torch.nn.functional.multilabel_margin_loss(x.double(),t,reduction='none')
 print("V32"," ".join("%.9g"%v for v in o32.tolist()))
 print("V64"," ".join("%.17g"%v for v in o64.tolist()))
-"#, x = x, tg = tg, nn = nn, cc = cc);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        x = x,
+        tg = tg,
+        nn = nn,
+        cc = cc
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_s.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let parse = |k: &str| -> Vec<f64> { pt.lines().find_map(|l| l.strip_prefix(k)).map(|s| s.split_whitespace().filter_map(|t| t.parse().ok()).collect()).unwrap_or_default() };
+    let parse = |k: &str| -> Vec<f64> {
+        pt.lines()
+            .find_map(|l| l.strip_prefix(k))
+            .map(|s| {
+                s.split_whitespace()
+                    .filter_map(|t| t.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
     let (p32, _p64) = (parse("V32 "), parse("V64 "));
     let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
     let a = s.tensor_variable_f32(x.clone(), vec![nn, cc], false)?;
@@ -41,15 +60,24 @@ print("V64"," ".join("%.17g"%v for v in o64.tolist()))
         Ok(o) => {
             let dt = s.tensor_dtype(o)?;
             let fv = s.tensor_values_lossy_f64(o)?;
-            let mr = fv.iter().zip(&p32).map(|(u, w)| (u - w).abs() / w.abs().max(1e-6)).fold(0.0f64, f64::max);
-            println!("parity f32: dtype={dt:?} max_rel={mr:.2e} (tol<1e-5: {})", mr < 1e-5);
+            let mr = fv
+                .iter()
+                .zip(&p32)
+                .map(|(u, w)| (u - w).abs() / w.abs().max(1e-6))
+                .fold(0.0f64, f64::max);
+            println!(
+                "parity f32: dtype={dt:?} max_rel={mr:.2e} (tol<1e-5: {})",
+                mr < 1e-5
+            );
         }
         Err(e) => println!("f32 ERROR -> {e:?}"),
     }
 
     // perf [N=200k, C=128] reduction='mean'; each row: 3 labels then -1 padding
     let (n, c) = (200_000usize, 128usize);
-    let xf: Vec<f32> = (0..n * c).map(|i| ((i % 9973) as f32 - 5000.0) * 0.001).collect();
+    let xf: Vec<f32> = (0..n * c)
+        .map(|i| ((i % 9973) as f32 - 5000.0) * 0.001)
+        .collect();
     let mut tf: Vec<f64> = vec![-1.0; n * c];
     for i in 0..n {
         tf[i * c] = (i % c) as f64;
@@ -60,20 +88,31 @@ print("V64"," ".join("%.17g"%v for v in o64.tolist()))
         let mut bst = f64::INFINITY;
         for _ in 0..7 {
             let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
-            let x = s.tensor_variable_f32(xf.clone(), vec![n, c], false).unwrap();
+            let x = s
+                .tensor_variable_f32(xf.clone(), vec![n, c], false)
+                .unwrap();
             let e = if which == 0 {
-                let y = s.tensor_variable_f32(xf.clone(), vec![n, c], false).unwrap();
-                let ti = Instant::now(); let _ = s.tensor_add(x, y); ti.elapsed().as_secs_f64() * 1e3
+                let y = s
+                    .tensor_variable_f32(xf.clone(), vec![n, c], false)
+                    .unwrap();
+                let ti = Instant::now();
+                let _ = s.tensor_add(x, y);
+                ti.elapsed().as_secs_f64() * 1e3
             } else {
                 let t = s.tensor_variable(tf.clone(), vec![n, c], false).unwrap();
-                let ti = Instant::now(); let _ = s.tensor_multilabel_margin_loss(x, t, "mean"); ti.elapsed().as_secs_f64() * 1e3
+                let ti = Instant::now();
+                let _ = s.tensor_multilabel_margin_loss(x, t, "mean");
+                ti.elapsed().as_secs_f64() * 1e3
             };
-            if e < bst { bst = e; }
+            if e < bst {
+                bst = e;
+            }
         }
         bst
     };
     let (tadd, tml) = (tt(0), tt(1));
-    let py_b = format!(r#"
+    let py_b = format!(
+        r#"
 import time,torch
 torch.set_num_threads(8)
 n={n}; c={c}
@@ -88,13 +127,45 @@ def tm(fn,reps=7):
     return min(ts)
 print("PT add %.4f"%tm(lambda:x+x))
 print("PT ml %.4f"%tm(lambda:torch.nn.functional.multilabel_margin_loss(x,t,reduction='mean')))
-"#, n = n, c = c);
-    let mut ch = Command::new(&python).arg("-").stdin(Stdio::piped()).stdout(Stdio::piped()).spawn()?;
+"#,
+        n = n,
+        c = c
+    );
+    let mut ch = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
     ch.stdin.as_mut().unwrap().write_all(py_b.as_bytes())?;
     let pt = String::from_utf8_lossy(&ch.wait_with_output()?.stdout).to_string();
-    let g = |k: &str| pt.lines().find_map(|l| { let mut it = l.strip_prefix("PT ")?.split_whitespace(); if it.next()? == k { it.next()?.parse::<f64>().ok() } else { None } }).unwrap_or(f64::NAN);
-    let v = |ft: f64, p: f64| if p >= ft { format!("FT {:.2}x FASTER", p / ft) } else { format!("FT {:.2}x SLOWER", ft / p) };
-    println!("  add_anchor   FT {tadd:.3} PT {:.3}  => {}", g("add"), v(tadd, g("add")));
-    println!("  multilabel   FT {tml:.3} PT {:.3}  => {}", g("ml"), v(tml, g("ml")));
+    let g = |k: &str| {
+        pt.lines()
+            .find_map(|l| {
+                let mut it = l.strip_prefix("PT ")?.split_whitespace();
+                if it.next()? == k {
+                    it.next()?.parse::<f64>().ok()
+                } else {
+                    None
+                }
+            })
+            .unwrap_or(f64::NAN)
+    };
+    let v = |ft: f64, p: f64| {
+        if p >= ft {
+            format!("FT {:.2}x FASTER", p / ft)
+        } else {
+            format!("FT {:.2}x SLOWER", ft / p)
+        }
+    };
+    println!(
+        "  add_anchor   FT {tadd:.3} PT {:.3}  => {}",
+        g("add"),
+        v(tadd, g("add"))
+    );
+    println!(
+        "  multilabel   FT {tml:.3} PT {:.3}  => {}",
+        g("ml"),
+        v(tml, g("ml"))
+    );
     Ok(())
 }

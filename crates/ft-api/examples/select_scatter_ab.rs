@@ -28,8 +28,14 @@ fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
 }
 
 fn main() {
-    println!("tensor_select_scatter f64 dim0, min-9:  OLD=to_vec + serial  NEW=borrow + parallel copy");
-    let cases: [(&str, usize, usize); 3] = [("8000x2000", 8000, 2000), ("4000x4000", 4000, 4000), ("16000x1000", 16000, 1000)];
+    println!(
+        "tensor_select_scatter f64 dim0, min-9:  OLD=to_vec + serial  NEW=borrow + parallel copy"
+    );
+    let cases: [(&str, usize, usize); 3] = [
+        ("8000x2000", 8000, 2000),
+        ("4000x4000", 4000, 4000),
+        ("16000x1000", 16000, 1000),
+    ];
     for (label, rows, cols) in cases {
         let numel = rows * cols;
         let input: Vec<f64> = (0..numel).map(|i| (i % 251) as f64 * 0.5).collect();
@@ -37,15 +43,23 @@ fn main() {
         let src: Vec<f64> = (0..cols).map(|i| (i % 97) as f64 + 1000.0).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);
-        let it = sess.tensor_variable(input.clone(), vec![rows, cols], false).unwrap();
-        let st = sess.tensor_variable(src.clone(), vec![cols], false).unwrap();
+        let it = sess
+            .tensor_variable(input.clone(), vec![rows, cols], false)
+            .unwrap();
+        let st = sess
+            .tensor_variable(src.clone(), vec![cols], false)
+            .unwrap();
         let out = sess.tensor_select_scatter(it, st, 0, index as i64).unwrap();
         let new_out = sess.tensor_values(out).unwrap();
         let old_out = old_select_scatter(&input, &src, cols, index);
         let bitmatch = new_out == old_out;
 
         let old_ms = bench(|| old_select_scatter(&input, &src, cols, index).len());
-        let new_ms = bench(|| sess.tensor_select_scatter(it, st, 0, index as i64).unwrap().0);
+        let new_ms = bench(|| {
+            sess.tensor_select_scatter(it, st, 0, index as i64)
+                .unwrap()
+                .0
+        });
         println!(
             "  {label:<12} ({:>3}MB)  OLD {:8.3}  NEW {:8.3}  = {:.2}x  bitmatch={}",
             numel * 8 / (1 << 20),
