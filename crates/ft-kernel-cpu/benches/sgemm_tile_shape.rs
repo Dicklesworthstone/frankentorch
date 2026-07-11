@@ -30,7 +30,7 @@
 //!
 //! Run:  rch exec -- cargo bench -p ft-kernel-cpu --bench sgemm_tile_shape
 
-use criterion::{criterion_group, criterion_main, BenchmarkId, Criterion};
+use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use ft_core::{DType, Device, TensorMeta};
 use ft_kernel_cpu::{matmul_tensor_contiguous_f32_into, set_sgemm_tile_balanced};
 use std::hint::black_box;
@@ -92,7 +92,10 @@ const SHAPES: &[(&str, usize, usize, usize)] = &[
 fn exercise_proof(t: usize) -> bool {
     let (go, gb) = (grid_orig(t), grid_balanced(t));
     let mut differs = false;
-    println!("  exercise proof @ T={t}: orig {}x{} vs balanced {}x{}", go.0, go.1, gb.0, gb.1);
+    println!(
+        "  exercise proof @ T={t}: orig {}x{} vs balanced {}x{}",
+        go.0, go.1, gb.0, gb.1
+    );
     for (name, m, k, n) in SHAPES {
         let (m, k, n) = (*m, *k, *n);
         let (to, tb) = (tiles(m, n, go), tiles(m, n, gb));
@@ -103,7 +106,10 @@ fn exercise_proof(t: usize) -> bool {
         let mut cb = vec![0.0f32; m * n];
         ft_mm(false, &a, &b, &mut co, m, k, n);
         ft_mm(true, &a, &b, &mut cb, m, k, n);
-        let bit = co.iter().zip(cb.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+        let bit = co
+            .iter()
+            .zip(cb.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits());
         assert!(bit, "{name}: policies must be bit-exact");
         println!("    {name:<26} tiles {to:>3} -> {tb:>3}   bit-exact {bit}");
     }
@@ -111,9 +117,15 @@ fn exercise_proof(t: usize) -> bool {
 }
 
 fn alternating(t: usize, label: &str) {
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(t)
+        .build()
+        .unwrap();
     println!("\n--- alternating A/B @ T={t} ({label}) ---");
-    let reps: usize = std::env::var("TILE_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(25);
+    let reps: usize = std::env::var("TILE_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(25);
     let warm = 3usize;
     for (name, m, k, n) in SHAPES {
         let (m, k, n) = (*m, *k, *n);
@@ -149,7 +161,8 @@ fn alternating(t: usize, label: &str) {
             v[v.len() / 2]
         };
         let mean = ratios.iter().sum::<f64>() / ratios.len() as f64;
-        let sd = (ratios.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / ratios.len() as f64).sqrt();
+        let sd =
+            (ratios.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / ratios.len() as f64).sqrt();
         let cv = 100.0 * sd / mean;
         let wins = ratios.iter().filter(|r| **r > 1.0).count();
         let mut rs = ratios.clone();
@@ -169,37 +182,69 @@ fn bench(c: &mut Criterion) {
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
         .unwrap_or_else(|_| "?".into());
-    let cap = std::env::var("TILE_T_CAP").ok().and_then(|v| v.parse().ok()).unwrap_or(32).min(avail);
+    let cap = std::env::var("TILE_T_CAP")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(32)
+        .min(avail);
     let t_imb = pick_t(cap, imbalanced);
     let t_bal = pick_t(cap, |t| !imbalanced(t));
 
-    println!("\n======== sgemm tile_shape A/B (real ft fn, both arms, ONE binary, ONE invocation) ========");
+    println!(
+        "\n======== sgemm tile_shape A/B (real ft fn, both arms, ONE binary, ONE invocation) ========"
+    );
     println!("host={host}  available_parallelism={avail}  cap={cap}");
     println!("T_imb={t_imb:?}  T_bal={t_bal:?} (null control)");
-    println!("PERF ADMISSIBLE for the SHIPPED T=32 config: {}", if avail >= 32 { "YES" } else { "NO -- host too small; only the MECHANISM is measured here" });
+    println!(
+        "PERF ADMISSIBLE for the SHIPPED T=32 config: {}",
+        if avail >= 32 {
+            "YES"
+        } else {
+            "NO -- host too small; only the MECHANISM is measured here"
+        }
+    );
 
     if let Some(t) = t_bal {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build()
+            .unwrap();
         let d = pool.install(|| exercise_proof(t));
         assert!(!d, "null control must yield identical grids");
-        alternating(t, "NULL CONTROL -- identical grids, ratio MUST be ~1.000x, wins ~50%");
+        alternating(
+            t,
+            "NULL CONTROL -- identical grids, ratio MUST be ~1.000x, wins ~50%",
+        );
     }
     let Some(t) = t_imb else {
         println!("\nno imbalanced T <= {cap}; nothing to compare");
         return;
     };
     {
-        let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(t)
+            .build()
+            .unwrap();
         let d = pool.install(|| exercise_proof(t));
-        assert!(d, "EXERCISE PROOF FAILED: flipping the policy did not change the grid -> the bench does not reach tile_shape; every ratio below would be noise");
-        println!("  => exercise proof PASSED: the policy flag reaches tile_shape and changes the grid");
+        assert!(
+            d,
+            "EXERCISE PROOF FAILED: flipping the policy did not change the grid -> the bench does not reach tile_shape; every ratio below would be noise"
+        );
+        println!(
+            "  => exercise proof PASSED: the policy flag reaches tile_shape and changes the grid"
+        );
     }
     alternating(t, "LEVER -- orig grid has more tiles than threads");
 
     // criterion group: ORIG and CANDIDATE, same group, same binary, same invocation
-    let pool = rayon::ThreadPoolBuilder::new().num_threads(t).build().unwrap();
+    let pool = rayon::ThreadPoolBuilder::new()
+        .num_threads(t)
+        .build()
+        .unwrap();
     let mut g = c.benchmark_group(format!("sgemm_tile_shape_T{t}"));
-    g.sample_size(10).warm_up_time(Duration::from_millis(500)).measurement_time(Duration::from_secs(2));
+    g.sample_size(10)
+        .warm_up_time(Duration::from_millis(500))
+        .measurement_time(Duration::from_secs(2));
     for (name, m, k, n) in SHAPES {
         let (m, k, n) = (*m, *k, *n);
         let a = fill(1, m * k);

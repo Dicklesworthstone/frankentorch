@@ -54,31 +54,42 @@ unsafe fn chain_products(buf: &[i8], passes: u64) -> (u64, i32) {
         }
     }
     let mut sm = _mm256_setzero_si256();
-    for a_i in acc { sm = _mm256_add_epi32(sm, a_i); }
+    for a_i in acc {
+        sm = _mm256_add_epi32(sm, a_i);
+    }
     let mut out = [0i32; 8];
     _mm256_storeu_si256(out.as_mut_ptr().cast(), sm);
     (products, out.iter().sum())
 }
 
 fn main() {
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_default();
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_default();
     let cores = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
     #[cfg(target_arch = "x86_64")]
     if !is_x86_feature_detected!("avx2") {
         println!("host={host}: no AVX2 at runtime — cannot measure");
         return;
     }
-    println!("host={host} cores={cores}  measuring sustained vpmaddubsw->madd->paddd chain (int8 products/s)\n");
+    println!(
+        "host={host} cores={cores}  measuring sustained vpmaddubsw->madd->paddd chain (int8 products/s)\n"
+    );
 
     // 256 KiB per-thread buffer -> L2-resident (Zen3 L2 = 512 KiB/core), the GEMM's inner regime.
-    let buf: Vec<i8> = (0..256 * 1024).map(|k| ((k * 2654435761usize) >> 13) as i8).collect();
+    let buf: Vec<i8> = (0..256 * 1024)
+        .map(|k| ((k * 2654435761usize) >> 13) as i8)
+        .collect();
     let passes: u64 = 2_000_000;
     #[cfg(target_arch = "x86_64")]
-    unsafe { black_box(chain_products(&buf, 50)); }
+    unsafe {
+        black_box(chain_products(&buf, 50));
+    }
 
     let measure = |threads: usize| -> f64 {
-        let counts: Vec<std::sync::atomic::AtomicU64> =
-            (0..threads).map(|_| std::sync::atomic::AtomicU64::new(0)).collect();
+        let counts: Vec<std::sync::atomic::AtomicU64> = (0..threads)
+            .map(|_| std::sync::atomic::AtomicU64::new(0))
+            .collect();
         let t = Instant::now();
         std::thread::scope(|sc| {
             for c in counts.iter() {
@@ -94,25 +105,50 @@ fn main() {
             }
         });
         let secs = t.elapsed().as_secs_f64();
-        let total: u64 = counts.iter().map(|c| c.load(std::sync::atomic::Ordering::Relaxed)).sum();
+        let total: u64 = counts
+            .iter()
+            .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+            .sum();
         total as f64 / secs
     };
 
     // best-of-3 at a few thread counts to see single-core peak and the all-core throttle
     for &th in &[1usize, cores / 2, cores] {
-        if th == 0 { continue; }
+        if th == 0 {
+            continue;
+        }
         let mut best = 0.0f64;
-        for _ in 0..2 { best = best.max(measure(th)); }
-        println!("  {th:>3}t : {:.2} TMAC/s  ({:.1} Gproducts/s)   [{:.1}% of the 1.25 TMAC/s the i7 GEMM achieves]",
-            best / 1e12, best / 1e9, 100.0 * 1.25e12 / best.max(1.0));
+        for _ in 0..2 {
+            best = best.max(measure(th));
+        }
+        println!(
+            "  {th:>3}t : {:.2} TMAC/s  ({:.1} Gproducts/s)   [{:.1}% of the 1.25 TMAC/s the i7 GEMM achieves]",
+            best / 1e12,
+            best / 1e9,
+            100.0 * 1.25e12 / best.max(1.0)
+        );
     }
     let ghz: f64 = 3.0; // rough; VPS workers vary
-    println!("\nPer-core streaming maddubs+madd+paddd throughput on THIS host (int8, L2-resident).");
-    println!("~1 maddubs/cycle/core is the physical chain limit (maddubs+madd contend for 2 FP ports);");
-    println!("scaled to a 32-core box at ~2 GHz all-core throttle => ~2 TMAC/s ALU peak, matching the");
-    println!("roofline. The i7 GEMM's 1.25 TMAC/s (5975WX) is ~60% of that; the 40% gap is the GEMM's");
-    println!("NON-minimal-chain overhead (activation loads, M2col shuffle, int8->uint8 sign trick, dispatch)");
-    println!("that a wider register tile amortizes. CAVEAT: cross-machine (probe on this worker vs GEMM on");
-    println!("local 5975WX) -- a rigorous same-machine peak is infra-blocked (model benches need the local box).");
+    println!(
+        "\nPer-core streaming maddubs+madd+paddd throughput on THIS host (int8, L2-resident)."
+    );
+    println!(
+        "~1 maddubs/cycle/core is the physical chain limit (maddubs+madd contend for 2 FP ports);"
+    );
+    println!(
+        "scaled to a 32-core box at ~2 GHz all-core throttle => ~2 TMAC/s ALU peak, matching the"
+    );
+    println!(
+        "roofline. The i7 GEMM's 1.25 TMAC/s (5975WX) is ~60% of that; the 40% gap is the GEMM's"
+    );
+    println!(
+        "NON-minimal-chain overhead (activation loads, M2col shuffle, int8->uint8 sign trick, dispatch)"
+    );
+    println!(
+        "that a wider register tile amortizes. CAVEAT: cross-machine (probe on this worker vs GEMM on"
+    );
+    println!(
+        "local 5975WX) -- a rigorous same-machine peak is infra-blocked (model benches need the local box)."
+    );
     let _ = ghz;
 }

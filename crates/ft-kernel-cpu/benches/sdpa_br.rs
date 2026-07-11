@@ -30,7 +30,7 @@
 //! Run: RCH_REQUIRE_REMOTE=1 env -u CARGO_TARGET_DIR rch exec -- \
 //!        cargo bench -p ft-kernel-cpu --bench sdpa_br
 
-use criterion::{criterion_group, criterion_main, Criterion};
+use criterion::{Criterion, criterion_group, criterion_main};
 use ft_kernel_cpu::{sdpa_forward_f32, set_sdpa_br, set_sdpa_br_auto};
 use std::hint::black_box;
 use std::time::Instant;
@@ -56,20 +56,39 @@ fn consume(v: &[f32]) -> f32 {
     black_box(a)
 }
 
-fn run(br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize, sq: usize, sk: usize, d: usize, scale: f32) -> (f64, Vec<f32>) {
+fn run(
+    br: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    nbh: usize,
+    sq: usize,
+    sk: usize,
+    d: usize,
+    scale: f32,
+) -> (f64, Vec<f32>) {
     set_sdpa_br(br);
     let t = Instant::now();
     let o = sdpa_forward_f32(
-        black_box(q), black_box(k), black_box(v),
-        black_box(nbh), black_box(sq), black_box(sk), black_box(d), black_box(d),
-        black_box(scale), false,
+        black_box(q),
+        black_box(k),
+        black_box(v),
+        black_box(nbh),
+        black_box(sq),
+        black_box(sk),
+        black_box(d),
+        black_box(d),
+        black_box(scale),
+        false,
     );
     let dt = t.elapsed().as_secs_f64() * 1e3;
     black_box(consume(&o));
     (dt, o)
 }
 
-fn blocks(sq: usize, br: usize) -> usize { sq.div_ceil(br) }
+fn blocks(sq: usize, br: usize) -> usize {
+    sq.div_ceil(br)
+}
 
 /// **ABBA within every rep.** Each rep times A,B,B,A and forms `(tA1+tA2)/(tB1+tB2)`.
 ///
@@ -87,7 +106,18 @@ fn blocks(sq: usize, br: usize) -> usize { sq.div_ceil(br) }
 /// A claim is decidable only when the candidate median lies clearly outside the null's range.
 /// The null floor is PER-FUNCTION (frankenlibc) — calibrate it for the fn you are measuring.
 #[allow(clippy::too_many_arguments)]
-fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize, sq: usize, sk: usize, d: usize, reps: usize) -> Stat {
+fn paired(
+    a_br: usize,
+    b_br: usize,
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    nbh: usize,
+    sq: usize,
+    sk: usize,
+    d: usize,
+    reps: usize,
+) -> Stat {
     let scale = 1.0 / (d as f32).sqrt();
     let warm = 3usize;
     let (mut va, mut vb, mut rs) = (Vec::new(), Vec::new(), Vec::new());
@@ -103,7 +133,10 @@ fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize,
             rs.push(ta / tb);
         }
     }
-    let med = |x: &mut Vec<f64>| { x.sort_by(|p, q| p.partial_cmp(q).unwrap()); x[x.len() / 2] };
+    let med = |x: &mut Vec<f64>| {
+        x.sort_by(|p, q| p.partial_cmp(q).unwrap());
+        x[x.len() / 2]
+    };
     let mean = rs.iter().sum::<f64>() / rs.len() as f64;
     let sd = (rs.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / rs.len() as f64).sqrt();
     let wins = rs.iter().filter(|x| **x > 1.0).count();
@@ -111,33 +144,79 @@ fn paired(a_br: usize, b_br: usize, q: &[f32], k: &[f32], v: &[f32], nbh: usize,
     let mut rc = rs.clone();
     rc.sort_by(|p, q| p.partial_cmp(q).unwrap());
     let q = |f: f64| rc[((rc.len() - 1) as f64 * f).round() as usize];
-    Stat { a: med(&mut va), b: med(&mut vb), med: q(0.5), p10: q(0.10), p90: q(0.90),
-           lo: rc[0], hi: rc[rc.len() - 1], cv: 100.0 * sd / mean, wins, n }
+    Stat {
+        a: med(&mut va),
+        b: med(&mut vb),
+        med: q(0.5),
+        p10: q(0.10),
+        p90: q(0.90),
+        lo: rc[0],
+        hi: rc[rc.len() - 1],
+        cv: 100.0 * sd / mean,
+        wins,
+        n,
+    }
 }
 
 #[derive(Clone, Copy)]
-struct Stat { a: f64, b: f64, med: f64, p10: f64, p90: f64, lo: f64, hi: f64, cv: f64, wins: usize, n: usize }
+struct Stat {
+    a: f64,
+    b: f64,
+    med: f64,
+    p10: f64,
+    p90: f64,
+    lo: f64,
+    hi: f64,
+    cv: f64,
+    wins: usize,
+    n: usize,
+}
 
 impl Stat {
     /// Decidable iff the candidate median lies outside the NULL control's observed [p10, p90].
     fn verdict(&self, null: &Stat) -> &'static str {
-        if self.med > null.p90 { "DECIDABLE (faster)" }
-        else if self.med < null.p10 { "DECIDABLE (slower)" }
-        else { "INSIDE NULL FLOOR" }
+        if self.med > null.p90 {
+            "DECIDABLE (faster)"
+        } else if self.med < null.p10 {
+            "DECIDABLE (slower)"
+        } else {
+            "INSIDE NULL FLOOR"
+        }
     }
     fn line(&self, label: &str, null: Option<&Stat>) -> String {
-        let v = null.map_or("— (this IS the null)".to_string(), |nl| self.verdict(nl).to_string());
-        format!("{label:<30} {:>8.1} {:>8.1}  med {:>6.4}x  [p10 {:>6.4} p90 {:>6.4}]  range [{:>6.4},{:>6.4}]  cv {:>4.1}%  wins {}/{}  {v}",
-            self.a, self.b, self.med, self.p10, self.p90, self.lo, self.hi, self.cv, self.wins, self.n)
+        let v = null.map_or("— (this IS the null)".to_string(), |nl| {
+            self.verdict(nl).to_string()
+        });
+        format!(
+            "{label:<30} {:>8.1} {:>8.1}  med {:>6.4}x  [p10 {:>6.4} p90 {:>6.4}]  range [{:>6.4},{:>6.4}]  cv {:>4.1}%  wins {}/{}  {v}",
+            self.a,
+            self.b,
+            self.med,
+            self.p10,
+            self.p90,
+            self.lo,
+            self.hi,
+            self.cv,
+            self.wins,
+            self.n
+        )
     }
 }
 
 fn bench(_c: &mut Criterion) {
     let avail = std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-    let host = std::fs::read_to_string("/proc/sys/kernel/hostname").map(|s| s.trim().to_string()).unwrap_or_else(|_| "?".into());
-    let reps: usize = std::env::var("BR_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(15);
+    let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
+        .map(|s| s.trim().to_string())
+        .unwrap_or_else(|_| "?".into());
+    let reps: usize = std::env::var("BR_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(15);
     println!("\n===== sdpa_forward_f32 BR sweep — REAL fn, one binary, interleaved =====");
-    println!("host={host} available_parallelism={avail} reps={reps} threads={}", rayon::current_num_threads());
+    println!(
+        "host={host} available_parallelism={avail} reps={reps} threads={}",
+        rayon::current_num_threads()
+    );
 
     // large-v3-turbo encoder shape
     let (nbh, sq, sk, d) = (20usize, 1500usize, 1500usize, 64usize);
@@ -151,14 +230,27 @@ fn bench(_c: &mut Criterion) {
     println!("\nexercise proof (turbo shape nbh={nbh} seq={sq} d={d}):");
     for br in [32usize, 96, 128, 160] {
         let (_, o) = run(br, &q, &k, &v, nbh, sq, sk, d, scale);
-        let bit = base.iter().zip(o.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+        let bit = base
+            .iter()
+            .zip(o.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits());
         assert!(bit, "BR={br} changed results — BR must be bit-exact");
-        assert_ne!(blocks(sq, br), blocks(sq, 64), "BR={br} yields the same block count as 64 — arms are identical code");
-        println!("  BR {br:>3}: blocks {:>3} (vs 24 at BR=64)  scratch {:>4} KiB  bit-exact {bit}", blocks(sq, br), br * sk * 4 / 1024);
+        assert_ne!(
+            blocks(sq, br),
+            blocks(sq, 64),
+            "BR={br} yields the same block count as 64 — arms are identical code"
+        );
+        println!(
+            "  BR {br:>3}: blocks {:>3} (vs 24 at BR=64)  scratch {:>4} KiB  bit-exact {bit}",
+            blocks(sq, br),
+            br * sk * 4 / 1024
+        );
     }
     println!("  => flipping BR changes the schedule and never the result");
 
-    println!("\nGATE: candidate median must lie outside the NULL control's [p10, p90]. cv is reported, NOT gated.");
+    println!(
+        "\nGATE: candidate median must lie outside the NULL control's [p10, p90]. cv is reported, NOT gated."
+    );
     let null = paired(64, 64, &q, &k, &v, nbh, sq, sk, d, reps);
     println!("{}", null.line("NULL CONTROL (64 vs 64)", None));
     let auto = paired(64, 0, &q, &k, &v, nbh, sq, sk, d, reps);
@@ -176,11 +268,24 @@ fn bench(_c: &mut Criterion) {
         let v2 = fill(13, nbh2 * sq2 * d);
         let (_, o64) = run(64, &q2, &k2, &v2, nbh2, sq2, sq2, d, scale);
         let (_, o128) = run(128, &q2, &k2, &v2, nbh2, sq2, sq2, d, scale);
-        assert!(o64.iter().zip(o128.iter()).all(|(x, y)| x.to_bits() == y.to_bits()), "bit-exact must hold at every shape");
+        assert!(
+            o64.iter()
+                .zip(o128.iter())
+                .all(|(x, y)| x.to_bits() == y.to_bits()),
+            "bit-exact must hold at every shape"
+        );
         let nl = paired(64, 64, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(9));
         let st = paired(64, 0, &q2, &k2, &v2, nbh2, sq2, sq2, d, reps.min(9));
-        println!("  nbh={nbh2:<3} seq={sq2:<5}  null med {:.4}x [p10 {:.4} p90 {:.4}]   AUTO med {:.4}x  wins {}/{}  {}  bit-exact",
-            nl.med, nl.p10, nl.p90, st.med, st.wins, st.n, st.verdict(&nl));
+        println!(
+            "  nbh={nbh2:<3} seq={sq2:<5}  null med {:.4}x [p10 {:.4} p90 {:.4}]   AUTO med {:.4}x  wins {}/{}  {}  bit-exact",
+            nl.med,
+            nl.p10,
+            nl.p90,
+            st.med,
+            st.wins,
+            st.n,
+            st.verdict(&nl)
+        );
     }
     set_sdpa_br_auto();
 }

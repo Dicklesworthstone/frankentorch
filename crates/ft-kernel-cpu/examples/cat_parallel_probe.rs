@@ -57,7 +57,9 @@ fn main() {
             let o = f();
             let e = t.elapsed().as_secs_f64() * 1e3;
             std::hint::black_box(&o);
-            if e < best { best = e; }
+            if e < best {
+                best = e;
+            }
         }
         best
     };
@@ -65,6 +67,13 @@ fn main() {
     let tp = bench(&parallel);
     let mb = (out_numel * 4) as f64 / 1e6;
     println!("cat dim0 outer=1, out={out_numel} ({mb:.0}MB), threads={threads}, min-of-9");
-    println!("  serial   {ts:7.3} ms  ({:.1} GB/s w)", mb / 1e3 / (ts / 1e3));
-    println!("  parallel {tp:7.3} ms  ({:.1} GB/s w)  => {:.2}x", mb / 1e3 / (tp / 1e3), ts / tp);
+    println!(
+        "  serial   {ts:7.3} ms  ({:.1} GB/s w)",
+        mb / 1e3 / (ts / 1e3)
+    );
+    println!(
+        "  parallel {tp:7.3} ms  ({:.1} GB/s w)  => {:.2}x",
+        mb / 1e3 / (tp / 1e3),
+        ts / tp
+    );
 }

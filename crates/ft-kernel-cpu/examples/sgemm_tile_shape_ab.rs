@@ -58,7 +58,10 @@ fn grid_balanced(threads: usize) -> (usize, usize) {
 }
 
 fn blocks(m: usize, n: usize, p: usize, q: usize) -> (usize, usize) {
-    (m.div_ceil(p).max(MIN_BLOCK_ROWS), n.div_ceil(q).max(MIN_BLOCK_COLS))
+    (
+        m.div_ceil(p).max(MIN_BLOCK_ROWS),
+        n.div_ceil(q).max(MIN_BLOCK_COLS),
+    )
 }
 
 fn tile_count(m: usize, n: usize, mb: usize, nb: usize) -> usize {
@@ -84,11 +87,20 @@ fn tiled(a: &[f32], b: &[f32], c: &mut [f32], m: usize, k: usize, n: usize, mb: 
         let bj = (j0 + nb).min(n) - j0;
         unsafe {
             matrixmultiply::sgemm(
-                bi, k, bj, 1.0,
-                a.as_ptr().add(i0 * k), k as isize, 1,
-                b.as_ptr().add(j0), n as isize, 1,
+                bi,
+                k,
+                bj,
+                1.0,
+                a.as_ptr().add(i0 * k),
+                k as isize,
+                1,
+                b.as_ptr().add(j0),
+                n as isize,
+                1,
                 0.0,
-                cp.0.add(i0 * n + j0), n as isize, 1,
+                cp.0.add(i0 * n + j0),
+                n as isize,
+                1,
             );
         }
     });
@@ -126,8 +138,14 @@ fn main() {
         .and_then(|v| v.parse().ok())
         .unwrap_or(32);
     let avail = std::thread::available_parallelism().map_or(0, std::num::NonZeroUsize::get);
-    rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().unwrap();
-    let reps: usize = std::env::var("TILE_AB_REPS").ok().and_then(|v| v.parse().ok()).unwrap_or(9);
+    rayon::ThreadPoolBuilder::new()
+        .num_threads(threads)
+        .build_global()
+        .unwrap();
+    let reps: usize = std::env::var("TILE_AB_REPS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(9);
 
     let host = std::fs::read_to_string("/proc/sys/kernel/hostname")
         .map(|s| s.trim().to_string())
@@ -142,13 +160,20 @@ fn main() {
     let (pb, qb) = grid_balanced(threads);
     println!("host={host}  threads={threads}  available_parallelism={avail}  reps={reps}");
     if !admissible {
-        println!("  !! WARNING: host has {avail} < {threads} hw threads -- pool is oversubscribed {}x;", threads.div_ceil(avail.max(1)));
-        println!("  !! rayon work-steals across the oversubscription and SMEARS the straggler being measured.");
+        println!(
+            "  !! WARNING: host has {avail} < {threads} hw threads -- pool is oversubscribed {}x;",
+            threads.div_ceil(avail.max(1))
+        );
+        println!(
+            "  !! rayon work-steals across the oversubscription and SMEARS the straggler being measured."
+        );
     }
     println!("  current  grid p x q = {pc} x {qc}  (p*q = {})", pc * qc);
     println!("  balanced grid p x q = {pb} x {qb}  (p*q = {})", pb * qb);
     if pc * qc == threads {
-        println!("  !! at T={threads} the current grid is ALREADY balanced -- this thread count cannot show the lever");
+        println!(
+            "  !! at T={threads} the current grid is ALREADY balanced -- this thread count cannot show the lever"
+        );
     }
     println!();
 
@@ -158,7 +183,10 @@ fn main() {
         ("turbo fc2     [1500,5120]x[5120,1280]", 1500, 5120, 1280, 1),
     ];
 
-    println!("{:<40} {:>8} {:>8} {:>8}   {:>7} {:>7}  {:>11}", "shape", "A ft ms", "B cur ms", "C bal ms", "B/A", "C/A", "tiles cur/bal");
+    println!(
+        "{:<40} {:>8} {:>8} {:>8}   {:>7} {:>7}  {:>11}",
+        "shape", "A ft ms", "B cur ms", "C bal ms", "B/A", "C/A", "tiles cur/bal"
+    );
     let (mut la, mut lc) = (0.0f64, 0.0f64);
     let mut all_bit = true;
 
@@ -177,21 +205,56 @@ fn main() {
         ft_mm(&a, &b, &mut ca, m, k, n);
         tiled(&a, &b, &mut cb, m, k, n, mbc, nbc);
         tiled(&a, &b, &mut cc, m, k, n, mbb, nbb);
-        let ab = ca.iter().zip(cb.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
-        let ac = ca.iter().zip(cc.iter()).all(|(x, y)| x.to_bits() == y.to_bits());
+        let ab = ca
+            .iter()
+            .zip(cb.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits());
+        let ac = ca
+            .iter()
+            .zip(cc.iter())
+            .all(|(x, y)| x.to_bits() == y.to_bits());
         all_bit &= ab && ac;
 
-        let ra = |c: &mut Vec<f32>| { let t = Instant::now(); ft_mm(&a, &b, c, m, k, n); black_box(&c[0]); t.elapsed().as_secs_f64() * 1e3 };
-        let rb = |c: &mut Vec<f32>| { let t = Instant::now(); tiled(&a, &b, c, m, k, n, mbc, nbc); black_box(&c[0]); t.elapsed().as_secs_f64() * 1e3 };
-        let rc = |c: &mut Vec<f32>| { let t = Instant::now(); tiled(&a, &b, c, m, k, n, mbb, nbb); black_box(&c[0]); t.elapsed().as_secs_f64() * 1e3 };
-        black_box(ra(&mut ca)); black_box(rb(&mut cb)); black_box(rc(&mut cc));
+        let ra = |c: &mut Vec<f32>| {
+            let t = Instant::now();
+            ft_mm(&a, &b, c, m, k, n);
+            black_box(&c[0]);
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let rb = |c: &mut Vec<f32>| {
+            let t = Instant::now();
+            tiled(&a, &b, c, m, k, n, mbc, nbc);
+            black_box(&c[0]);
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        let rc = |c: &mut Vec<f32>| {
+            let t = Instant::now();
+            tiled(&a, &b, c, m, k, n, mbb, nbb);
+            black_box(&c[0]);
+            t.elapsed().as_secs_f64() * 1e3
+        };
+        black_box(ra(&mut ca));
+        black_box(rb(&mut cb));
+        black_box(rc(&mut cc));
 
         let (mut va, mut vb, mut vc) = (Vec::new(), Vec::new(), Vec::new());
         for r in 0..reps {
             match r % 3 {
-                0 => { va.push(ra(&mut ca)); vb.push(rb(&mut cb)); vc.push(rc(&mut cc)); }
-                1 => { vc.push(rc(&mut cc)); va.push(ra(&mut ca)); vb.push(rb(&mut cb)); }
-                _ => { vb.push(rb(&mut cb)); vc.push(rc(&mut cc)); va.push(ra(&mut ca)); }
+                0 => {
+                    va.push(ra(&mut ca));
+                    vb.push(rb(&mut cb));
+                    vc.push(rc(&mut cc));
+                }
+                1 => {
+                    vc.push(rc(&mut cc));
+                    va.push(ra(&mut ca));
+                    vb.push(rb(&mut cb));
+                }
+                _ => {
+                    vb.push(rb(&mut cb));
+                    vc.push(rc(&mut cc));
+                    va.push(ra(&mut ca));
+                }
             }
         }
         let (fa, cva) = stat(&mut va);
@@ -199,25 +262,59 @@ fn main() {
         let (fc, cvc) = stat(&mut vc);
         la += fa * cnt as f64;
         lc += fc * cnt as f64;
-        println!("{:<40} {:>8.2} {:>8.2} {:>8.2}   {:>6.3}x {:>6.3}x  {:>5}/{:<5}  cv {:.1}/{:.1}/{:.1}%  bitexact A==B {} A==C {}",
-            label, fa, fb, fc, fa / fb, fa / fc, tc, tb, cva, cvb, cvc, ab, ac);
+        println!(
+            "{:<40} {:>8.2} {:>8.2} {:>8.2}   {:>6.3}x {:>6.3}x  {:>5}/{:<5}  cv {:.1}/{:.1}/{:.1}%  bitexact A==B {} A==C {}",
+            label,
+            fa,
+            fb,
+            fc,
+            fa / fb,
+            fa / fc,
+            tc,
+            tb,
+            cva,
+            cvb,
+            cvc,
+            ab,
+            ac
+        );
     }
 
-    println!("\nTURBO LINEAR-GEMM LAYER (4x qkv/out + fc1 + fc2):  A {:.2} ms -> C {:.2} ms = {:.3}x", la, lc, la / lc);
+    println!(
+        "\nTURBO LINEAR-GEMM LAYER (4x qkv/out + fc1 + fc2):  A {:.2} ms -> C {:.2} ms = {:.3}x",
+        la,
+        lc,
+        la / lc
+    );
     println!("all arms bit-exact: {all_bit}   (this half IS certified: it is host-independent)");
 
     println!("\n=== VERDICT ===");
     if admissible {
         let enc = 1.0 / (1.0 - 0.728 + 0.728 / (la / lc));
-        println!("PERF ADMISSIBLE (host={host}, {avail} hw threads >= {threads} under test, single binary, single invocation)");
-        println!("projected: encoder {:.3}x -> e2e {:.3}x  (linear GEMMs 72.8% of encoder_window, encoder 89.5% of e2e)",
-            enc, 1.0 / (0.105 + 0.895 / enc));
+        println!(
+            "PERF ADMISSIBLE (host={host}, {avail} hw threads >= {threads} under test, single binary, single invocation)"
+        );
+        println!(
+            "projected: encoder {:.3}x -> e2e {:.3}x  (linear GEMMs 72.8% of encoder_window, encoder 89.5% of e2e)",
+            enc,
+            1.0 / (0.105 + 0.895 / enc)
+        );
     } else {
-        println!("PERF *** NOT ADMISSIBLE *** on host={host}: {avail} hw threads < {threads} under test.");
-        println!("DO NOT QUOTE ANY RATIO ABOVE. Re-run on a host with >= {threads} physical cores.");
+        println!(
+            "PERF *** NOT ADMISSIBLE *** on host={host}: {avail} hw threads < {threads} under test."
+        );
+        println!(
+            "DO NOT QUOTE ANY RATIO ABOVE. Re-run on a host with >= {threads} physical cores."
+        );
     }
-    println!("\nFIDELITY GUARD: B/A must be ~1.00x and A==B bit-exact. If not, the replication is wrong and C is meaningless.");
-    println!("SUBSTRATE: all arms run in ONE binary + ONE invocation, order rotated per rep, so host identity and");
-    println!("drift cancel WITHIN a run. Ratios are NOT worker-invariant: never compare a ratio from one rch");
+    println!(
+        "\nFIDELITY GUARD: B/A must be ~1.00x and A==B bit-exact. If not, the replication is wrong and C is meaningless."
+    );
+    println!(
+        "SUBSTRATE: all arms run in ONE binary + ONE invocation, order rotated per rep, so host identity and"
+    );
+    println!(
+        "drift cancel WITHIN a run. Ratios are NOT worker-invariant: never compare a ratio from one rch"
+    );
     println!("invocation against a ratio from another (franken_networkx br-r37-c1-839yx).");
 }
