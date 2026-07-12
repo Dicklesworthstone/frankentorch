@@ -195,7 +195,10 @@ fn main() {
         "  current  grid p x q = {pc} x {qc}  (p*q = {})   [FIDELITY GUARD arm]",
         pc * qc
     );
-    println!("  naive-balanced grid p x q = {pb} x {qb}  (p*q = {})", pb * qb);
+    println!(
+        "  naive-balanced grid p x q = {pb} x {qb}  (p*q = {})",
+        pb * qb
+    );
     println!(
         "  divisor grids swept: {}",
         grids
@@ -334,18 +337,26 @@ fn main() {
         println!(
             "PERF ADMISSIBLE (host={host}, {avail} hw threads >= {threads} under test, single binary, single invocation)."
         );
-        println!("The SELECTOR row is the shippable projection; the sweep proves it picks the per-shape winner.");
+        println!(
+            "The SELECTOR row is the shippable projection; the sweep proves it picks the per-shape winner."
+        );
     } else {
         println!(
             "PERF *** NOT ADMISSIBLE *** on host={host}: {avail} hw threads < {threads} under test."
         );
-        println!("DO NOT QUOTE ANY RATIO ABOVE. Re-run on a host with >= {threads} physical cores.");
+        println!(
+            "DO NOT QUOTE ANY RATIO ABOVE. Re-run on a host with >= {threads} physical cores."
+        );
     }
     println!(
         "\nFIDELITY GUARD: the {pc}x{qc} row must be ~1.00x and bit-exact vs A. If not, the replication is"
     );
     println!("wrong and every other row is meaningless.");
-    println!("SUBSTRATE: all arms run in ONE binary + ONE invocation, order rotated per rep, so host identity");
-    println!("and drift cancel WITHIN a run. Ratios are NOT worker-invariant: never compare a ratio from one");
+    println!(
+        "SUBSTRATE: all arms run in ONE binary + ONE invocation, order rotated per rep, so host identity"
+    );
+    println!(
+        "and drift cancel WITHIN a run. Ratios are NOT worker-invariant: never compare a ratio from one"
+    );
     println!("rch invocation against a ratio from another (franken_networkx br-r37-c1-839yx).");
 }
