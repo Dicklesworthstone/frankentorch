@@ -48,6 +48,13 @@ impl std::error::Error for Error {}
 #[cfg(target_os = "macos")]
 pub mod fused;
 
+/// The **generic Metal compute gateway**: compile caller-supplied MSL, bind
+/// unified-memory buffers, dispatch, read back — for consumers whose GPU work
+/// is their own kernel rather than one of this crate's tensor ops. Present on
+/// every target (a stub off macOS), so callers compile everywhere and fall back
+/// to their CPU path where no device exists. See [`compute::Gateway`].
+pub mod compute;
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Error;
