@@ -127,8 +127,8 @@ impl Grid {
 mod imp {
     use super::{Error, Grid, MathMode};
     use metal::{
-        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device, MTLResourceOptions,
-        MTLSize,
+        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
+        MTLResourceOptions, MTLSize,
     };
     use std::sync::OnceLock;
 
@@ -306,7 +306,10 @@ mod imp {
             for (i, b) in buffers.iter().enumerate() {
                 enc.set_buffer(i as u64, Some(&b.buf), 0);
             }
-            enc.dispatch_thread_groups(msize(grid.threadgroups), msize(grid.threads_per_threadgroup));
+            enc.dispatch_thread_groups(
+                msize(grid.threadgroups),
+                msize(grid.threads_per_threadgroup),
+            );
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
