@@ -46,6 +46,12 @@ asupersync = { version = "0.3.9", default-features = false, features = ["test-in
 ftui = { version = "0.2.0", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 
+[patch.crates-io]
+# `metal 0.33.0` still depends on the unmaintained `block 0.1.6`. This
+# reviewed fork changes only its invalid uninhabited extern-static model;
+# keep the exact revision aligned with FrankenManim's governed closure.
+block = { git = "https://github.com/Dicklesworthstone/rust-block", rev = "b39ae859d1ee8e8cb5eef6a516471f1578d26b96" }
+
 [workspace.lints.rust]
 unsafe_code = "deny"
 
