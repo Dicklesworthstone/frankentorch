@@ -164,6 +164,7 @@ mod imp {
     }
 
     /// A compiled Metal Shading Language library. Immutable after creation.
+    #[derive(Debug)]
     pub struct Library {
         lib: metal::Library,
     }
@@ -216,6 +217,14 @@ mod imp {
         /// address space must fit inside this.
         pub fn max_threadgroup_memory(&self) -> usize {
             self.ctx.device.max_threadgroup_memory_length() as usize
+        }
+
+        pub(crate) fn metal_device(&self) -> &metal::DeviceRef {
+            &self.ctx.device
+        }
+
+        pub(crate) fn metal_queue(&self) -> &metal::CommandQueueRef {
+            &self.ctx.queue
         }
 
         /// Compile MSL source into a [`Library`] under [`MathMode::Safe`].
@@ -356,6 +365,10 @@ mod imp {
     }
 
     impl SharedBuffer {
+        pub(crate) fn metal_buffer(&self) -> &metal::BufferRef {
+            &self.buf
+        }
+
         /// The buffer's size in bytes.
         pub fn len_bytes(&self) -> usize {
             self.bytes
@@ -426,6 +439,7 @@ mod imp {
     }
 
     /// Stub companion to the macOS [`Library`](super::Library).
+    #[derive(Debug)]
     pub struct Library {
         _never: (),
     }

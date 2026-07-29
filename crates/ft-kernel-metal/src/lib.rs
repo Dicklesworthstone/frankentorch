@@ -55,6 +55,16 @@ pub mod fused;
 /// to their CPU path where no device exists. See [`compute::Gateway`].
 pub mod compute;
 
+/// A native macOS preview surface backed by `CAMetalLayer`.
+///
+/// [`presentation::NativePresenter`] accepts a unified-memory
+/// [`compute::SharedBuffer`] containing RGBA8 pixels and presents it without
+/// copying the pixels back into host-owned memory. AppKit, Objective-C,
+/// drawables, and command-buffer lifetimes remain inside this crate's sanctioned
+/// unsafe boundary. Off macOS, construction reports
+/// [`presentation::PresentationError::Unavailable`].
+pub mod presentation;
+
 #[cfg(target_os = "macos")]
 mod imp {
     use super::Error;
