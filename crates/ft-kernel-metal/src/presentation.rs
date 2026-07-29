@@ -11,6 +11,7 @@
 //! touching AppKit. A missing drawable is an occlusion outcome, not a fatal
 //! Metal failure. Resize and close are idempotent.
 
+pub use crate::CommandBufferState;
 use crate::compute::{Gateway, SharedBuffer};
 use std::fmt;
 
@@ -65,18 +66,6 @@ pub enum PresentOutcome {
     Presented,
     /// No drawable was acquired because the surface is currently occluded.
     Occluded,
-}
-
-/// Terminal or unexpected state observed after waiting for a Metal command
-/// buffer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CommandBufferState {
-    NotEnqueued,
-    Enqueued,
-    Committed,
-    Scheduled,
-    Completed,
-    Error,
 }
 
 /// Occupancy facts for the fixed RGBA8-to-drawable presentation kernel.
@@ -213,8 +202,8 @@ mod imp {
     use core_graphics_types::geometry::CGSize;
     use foreign_types::ForeignType;
     use metal::{
-        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, MTLCommandBufferStatus,
-        MTLPixelFormat, MTLSize, MetalLayer,
+        CompileOptions, ComputePipelineDescriptor, ComputePipelineState, MTLPixelFormat, MTLSize,
+        MetalLayer,
     };
     use objc::{
         Encode, Encoding, class, msg_send,
@@ -517,7 +506,7 @@ kernel void present_rgba8(
                 command.commit();
                 command.wait_until_completed();
 
-                let state = command_state(command.status());
+                let state = CommandBufferState::from(command.status());
                 if state != CommandBufferState::Completed {
                     return Err(PresentationError::CommandBuffer(state));
                 }
@@ -645,17 +634,6 @@ kernel void present_rgba8(
             thread_execution_width: width,
         };
         Ok((pipeline, info))
-    }
-
-    fn command_state(status: MTLCommandBufferStatus) -> CommandBufferState {
-        match status {
-            MTLCommandBufferStatus::NotEnqueued => CommandBufferState::NotEnqueued,
-            MTLCommandBufferStatus::Enqueued => CommandBufferState::Enqueued,
-            MTLCommandBufferStatus::Committed => CommandBufferState::Committed,
-            MTLCommandBufferStatus::Scheduled => CommandBufferState::Scheduled,
-            MTLCommandBufferStatus::Completed => CommandBufferState::Completed,
-            MTLCommandBufferStatus::Error => CommandBufferState::Error,
-        }
     }
 
     fn require_main_thread() -> Result<(), PresentationError> {

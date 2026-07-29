@@ -49,6 +49,8 @@
 //! [`Error::Unavailable`], so consumers compile everywhere and fall back to
 //! their CPU path on non-Apple targets.
 
+#[cfg(any(test, target_os = "macos"))]
+use crate::CommandBufferState;
 use crate::Error;
 
 /// How the Metal compiler is allowed to rearrange floating-point arithmetic.
@@ -119,13 +121,72 @@ impl Grid {
                 self.threadgroups, self.threads_per_threadgroup
             )));
         }
+        let groups = self.threadgroup_count()?;
+        let threads = self.threads_per_threadgroup_count()?;
+        groups
+            .checked_mul(threads)
+            .ok_or(Error::SizeOverflow("dispatch thread count"))?;
         Ok(())
+    }
+
+    fn threadgroup_count(&self) -> Result<usize, Error> {
+        checked_product(self.threadgroups, "threadgroup count")
+    }
+
+    fn threads_per_threadgroup_count(&self) -> Result<usize, Error> {
+        checked_product(
+            self.threads_per_threadgroup,
+            "threads-per-threadgroup count",
+        )
+    }
+}
+
+fn checked_product(values: [usize; 3], what: &'static str) -> Result<usize, Error> {
+    values
+        .into_iter()
+        .try_fold(1usize, |product, value| product.checked_mul(value))
+        .ok_or(Error::SizeOverflow(what))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn checked_byte_len(
+    elements: usize,
+    element_bytes: usize,
+    what: &'static str,
+) -> Result<usize, Error> {
+    elements
+        .checked_mul(element_bytes)
+        .ok_or(Error::SizeOverflow(what))
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn validate_buffer_size(bytes: usize, maximum: usize) -> Result<(), Error> {
+    if bytes == 0 {
+        return Err(Error::Kernel("zero-length buffer".into()));
+    }
+    if bytes > maximum {
+        return Err(Error::BufferTooLarge {
+            requested: bytes,
+            maximum,
+        });
+    }
+    Ok(())
+}
+
+#[cfg(any(test, target_os = "macos"))]
+fn ensure_command_completed(state: CommandBufferState) -> Result<(), Error> {
+    if state == CommandBufferState::Completed {
+        Ok(())
+    } else {
+        Err(Error::CommandBuffer(state))
     }
 }
 
 #[cfg(target_os = "macos")]
 mod imp {
-    use super::{Error, Grid, MathMode};
+    use super::{
+        Error, Grid, MathMode, checked_byte_len, ensure_command_completed, validate_buffer_size,
+    };
     use metal::{
         CompileOptions, ComputePipelineDescriptor, ComputePipelineState, Device,
         MTLResourceOptions, MTLSize,
@@ -219,6 +280,11 @@ mod imp {
             self.ctx.device.max_threadgroup_memory_length() as usize
         }
 
+        /// Largest shared buffer this device can allocate, in bytes.
+        pub fn max_buffer_length(&self) -> usize {
+            usize::try_from(self.ctx.device.max_buffer_length()).unwrap_or(usize::MAX)
+        }
+
         pub(crate) fn metal_device(&self) -> &metal::DeviceRef {
             &self.ctx.device
         }
@@ -249,21 +315,31 @@ mod imp {
 
         /// Allocate a shared buffer holding a copy of `data`.
         pub fn buffer_f32(&self, data: &[f32]) -> Result<SharedBuffer, Error> {
+            checked_byte_len(
+                data.len(),
+                std::mem::size_of::<f32>(),
+                "f32 buffer byte count",
+            )?;
             self.buffer_from_bytes(bytes_of_f32(data))
         }
 
         /// Allocate a shared buffer holding a copy of `data`.
         pub fn buffer_u32(&self, data: &[u32]) -> Result<SharedBuffer, Error> {
+            checked_byte_len(
+                data.len(),
+                std::mem::size_of::<u32>(),
+                "u32 buffer byte count",
+            )?;
             self.buffer_from_bytes(bytes_of_u32(data))
         }
 
         /// Allocate a zero-filled shared buffer of `bytes` bytes — the usual
         /// shape for a kernel's output surface.
         pub fn buffer_zeroed(&self, bytes: usize) -> Result<SharedBuffer, Error> {
-            if bytes == 0 {
-                return Err(Error::Kernel("zero-length buffer".into()));
-            }
-            let buf = self.ctx.device.new_buffer(bytes as u64, SHARED);
+            validate_buffer_size(bytes, self.max_buffer_length())?;
+            let length = u64::try_from(bytes)
+                .map_err(|_| Error::SizeOverflow("buffer allocation length"))?;
+            let buf = self.ctx.device.new_buffer(length, SHARED);
             // `new_buffer` does not promise zeroed contents; make it explicit so
             // an output surface a kernel only partially writes is deterministic.
             unsafe {
@@ -273,14 +349,13 @@ mod imp {
         }
 
         fn buffer_from_bytes(&self, data: &[u8]) -> Result<SharedBuffer, Error> {
-            if data.is_empty() {
-                return Err(Error::Kernel("zero-length buffer".into()));
-            }
-            let buf = self.ctx.device.new_buffer_with_data(
-                data.as_ptr() as *const _,
-                data.len() as u64,
-                SHARED,
-            );
+            validate_buffer_size(data.len(), self.max_buffer_length())?;
+            let length = u64::try_from(data.len())
+                .map_err(|_| Error::SizeOverflow("buffer upload length"))?;
+            let buf =
+                self.ctx
+                    .device
+                    .new_buffer_with_data(data.as_ptr() as *const _, length, SHARED);
             Ok(SharedBuffer {
                 buf,
                 bytes: data.len(),
@@ -301,28 +376,32 @@ mod imp {
         ) -> Result<(), Error> {
             grid.validate()?;
             let max = pipeline.max_threads_per_threadgroup();
-            let want: usize = grid.threads_per_threadgroup.iter().product();
+            let want = grid.threads_per_threadgroup_count()?;
             if want > max {
                 return Err(Error::Kernel(format!(
                     "kernel '{}': {want} threads/threadgroup exceeds the pipeline maximum {max}",
                     pipeline.name
                 )));
             }
+            let threadgroups = msize(grid.threadgroups, "threadgroup extent")?;
+            let threads_per_threadgroup = msize(
+                grid.threads_per_threadgroup,
+                "threads-per-threadgroup extent",
+            )?;
 
             let cmd = self.ctx.queue.new_command_buffer();
             let enc = cmd.new_compute_command_encoder();
             enc.set_compute_pipeline_state(&pipeline.pso);
             for (i, b) in buffers.iter().enumerate() {
-                enc.set_buffer(i as u64, Some(&b.buf), 0);
+                let index =
+                    u64::try_from(i).map_err(|_| Error::SizeOverflow("buffer argument index"))?;
+                enc.set_buffer(index, Some(&b.buf), 0);
             }
-            enc.dispatch_thread_groups(
-                msize(grid.threadgroups),
-                msize(grid.threads_per_threadgroup),
-            );
+            enc.dispatch_thread_groups(threadgroups, threads_per_threadgroup);
             enc.end_encoding();
             cmd.commit();
             cmd.wait_until_completed();
-            Ok(())
+            ensure_command_completed(cmd.status().into())
         }
     }
 
@@ -377,7 +456,12 @@ mod imp {
         /// Copy the buffer's contents out as `f32`s. `out.len() * 4` must not
         /// exceed the buffer size.
         pub fn read_f32(&self, out: &mut [f32]) -> Result<(), Error> {
-            self.check(out.len() * 4)?;
+            let bytes = checked_byte_len(
+                out.len(),
+                std::mem::size_of::<f32>(),
+                "f32 readback byte count",
+            )?;
+            self.check(bytes)?;
             let src =
                 unsafe { std::slice::from_raw_parts(self.buf.contents() as *const f32, out.len()) };
             out.copy_from_slice(src);
@@ -386,7 +470,12 @@ mod imp {
 
         /// Copy the buffer's contents out as `u32`s.
         pub fn read_u32(&self, out: &mut [u32]) -> Result<(), Error> {
-            self.check(out.len() * 4)?;
+            let bytes = checked_byte_len(
+                out.len(),
+                std::mem::size_of::<u32>(),
+                "u32 readback byte count",
+            )?;
+            self.check(bytes)?;
             let src =
                 unsafe { std::slice::from_raw_parts(self.buf.contents() as *const u32, out.len()) };
             out.copy_from_slice(src);
@@ -414,8 +503,13 @@ mod imp {
         }
     }
 
-    fn msize(v: [usize; 3]) -> MTLSize {
-        MTLSize::new(v[0] as u64, v[1] as u64, v[2] as u64)
+    fn msize(v: [usize; 3], what: &'static str) -> Result<MTLSize, Error> {
+        let [x, y, z] = v.map(u64::try_from);
+        Ok(MTLSize::new(
+            x.map_err(|_| Error::SizeOverflow(what))?,
+            y.map_err(|_| Error::SizeOverflow(what))?,
+            z.map_err(|_| Error::SizeOverflow(what))?,
+        ))
     }
 
     fn bytes_of_f32(v: &[f32]) -> &[u8] {
@@ -469,6 +563,10 @@ mod imp {
         }
         /// Unreachable off macOS: no `Gateway` can exist.
         pub fn max_threadgroup_memory(&self) -> usize {
+            0
+        }
+        /// Unreachable off macOS: no `Gateway` can exist.
+        pub fn max_buffer_length(&self) -> usize {
             0
         }
         /// Unreachable off macOS: no `Gateway` can exist.
@@ -561,12 +659,12 @@ kernel void scale_add(
 "#;
 
     #[test]
-    fn generic_dispatch_round_trip_or_unavailable() {
+    fn generic_dispatch_round_trip_or_unavailable() -> Result<(), Error> {
         let gw = match Gateway::open() {
             Ok(gw) => gw,
             // Non-macOS or headless macOS: the consumer's CPU path is the answer.
-            Err(Error::Unavailable) => return,
-            Err(e) => panic!("gateway open failed: {e}"),
+            Err(Error::Unavailable) => return Ok(()),
+            Err(error) => return Err(error),
         };
         let n = 1000usize;
         let x: Vec<f32> = (0..n).map(|i| i as f32 * 0.25 - 3.0).collect();
@@ -591,18 +689,22 @@ kernel void scale_add(
             let want = xi * 2.0 + 1.0;
             assert!((g - want).abs() <= 1e-6, "idx {i}: {g} vs {want}");
         }
+        Ok(())
     }
 
     #[test]
-    fn a_shader_syntax_error_reads_as_a_shader_syntax_error() {
-        let Ok(gw) = Gateway::open() else { return };
+    fn a_shader_syntax_error_reads_as_a_shader_syntax_error() -> Result<(), String> {
+        let Ok(gw) = Gateway::open() else {
+            return Ok(());
+        };
         let err = gw
             .library("kernel void broken( { }")
             .expect_err("must reject");
         match err {
             Error::Kernel(msg) => assert!(!msg.is_empty(), "compiler diagnostics must survive"),
-            Error::Unavailable => panic!("a compile error is not an availability error"),
+            other => return Err(format!("a compile error has the wrong type: {other}")),
         }
+        Ok(())
     }
 
     #[test]
@@ -626,5 +728,84 @@ kernel void scale_add(
             threads_per_threadgroup: [8, 8, 1],
         };
         assert!(g.validate().is_err());
+    }
+
+    #[test]
+    fn pathological_grid_products_fail_before_dispatch() {
+        let group_overflow = Grid {
+            threadgroups: [usize::MAX, 2, 1],
+            threads_per_threadgroup: [1, 1, 1],
+        };
+        assert_eq!(
+            group_overflow.validate(),
+            Err(Error::SizeOverflow("threadgroup count"))
+        );
+
+        let threadgroup_overflow = Grid {
+            threadgroups: [1, 1, 1],
+            threads_per_threadgroup: [usize::MAX, 2, 1],
+        };
+        assert_eq!(
+            threadgroup_overflow.validate(),
+            Err(Error::SizeOverflow("threads-per-threadgroup count"))
+        );
+
+        let total_overflow = Grid {
+            threadgroups: [usize::MAX, 1, 1],
+            threads_per_threadgroup: [2, 1, 1],
+        };
+        assert_eq!(
+            total_overflow.validate(),
+            Err(Error::SizeOverflow("dispatch thread count"))
+        );
+    }
+
+    #[test]
+    fn typed_byte_products_and_device_limits_fail_closed() {
+        assert_eq!(
+            checked_byte_len(usize::MAX, 4, "test byte count"),
+            Err(Error::SizeOverflow("test byte count"))
+        );
+        assert_eq!(
+            validate_buffer_size(1025, 1024),
+            Err(Error::BufferTooLarge {
+                requested: 1025,
+                maximum: 1024,
+            })
+        );
+    }
+
+    #[test]
+    fn injected_terminal_command_states_are_typed() {
+        assert_eq!(
+            ensure_command_completed(CommandBufferState::Completed),
+            Ok(())
+        );
+        for state in [
+            CommandBufferState::NotEnqueued,
+            CommandBufferState::Enqueued,
+            CommandBufferState::Committed,
+            CommandBufferState::Scheduled,
+            CommandBufferState::Error,
+        ] {
+            assert_eq!(
+                ensure_command_completed(state),
+                Err(Error::CommandBuffer(state))
+            );
+        }
+    }
+
+    #[test]
+    fn device_buffer_limit_is_checked_before_allocation_or_unavailable() {
+        let Ok(gateway) = Gateway::open() else { return };
+        let maximum = gateway.max_buffer_length();
+        assert!(maximum > 0, "Metal reported a zero buffer limit");
+        let requested = maximum
+            .checked_add(1)
+            .expect("Metal buffer limit must leave a representable refusal");
+        assert_eq!(
+            gateway.buffer_zeroed(requested).err(),
+            Some(Error::BufferTooLarge { requested, maximum })
+        );
     }
 }
