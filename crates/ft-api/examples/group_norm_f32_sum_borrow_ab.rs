@@ -94,7 +94,10 @@ fn main() {
 
     let old_result = scalar(&input.to_vec());
     let new_result = scalar(&input);
-    assert_eq!(old_result, new_result, "clone and borrow arms must agree exactly");
+    assert_eq!(
+        old_result, new_result,
+        "clone and borrow arms must agree exactly"
+    );
 
     // Warm both arms before collecting the paired samples.
     for _ in 0..4 {
@@ -143,7 +146,10 @@ fn main() {
     // RCH may detach child stdout after execution; its worker target directory
     // is synchronized back, so retain the exact same-invocation decision there.
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
-        let _ = std::fs::write(format!("{target_dir}/group_norm_f32_sum_borrow_ab.txt"), &report);
+        let _ = std::fs::write(
+            format!("{target_dir}/group_norm_f32_sum_borrow_ab.txt"),
+            &report,
+        );
     }
     print!("{report}");
 }

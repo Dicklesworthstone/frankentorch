@@ -142083,8 +142083,12 @@ mod tests {
                     > 0,
                 "narrowed input must preserve a nonzero storage offset"
             );
-            let weight = session.tensor_variable_f32(wv.clone(), vec![c], false).unwrap();
-            let bias = session.tensor_variable_f32(bv.clone(), vec![c], false).unwrap();
+            let weight = session
+                .tensor_variable_f32(wv.clone(), vec![c], false)
+                .unwrap();
+            let bias = session
+                .tensor_variable_f32(bv.clone(), vec![c], false)
+                .unwrap();
             let loss = if scalar_path {
                 session
                     .functional_group_norm_sum(input, groups, Some(weight), Some(bias), eps)
