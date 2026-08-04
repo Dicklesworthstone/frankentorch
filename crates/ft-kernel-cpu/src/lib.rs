@@ -6100,21 +6100,65 @@ pub fn group_norm_forward_f32(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        let vmean = f32x8::splat(mean);
+        let vrstd = f32x8::splat(rstd);
         for local_channel in 0..cpg {
             let c = g * cpg + local_channel;
             let channel_base = local_channel * spatial;
             let channel_end = channel_base + spatial;
-            let w = weight.map(|values| values[c]);
-            let b = bias.map(|values| values[c]);
-            for i in channel_base..channel_end {
-                let mut y = (xb[i] - mean) * rstd;
-                if let Some(w) = w {
-                    y *= w;
+            let input = &xb[channel_base..channel_end];
+            let output = &mut orow[channel_base..channel_end];
+            let mut lane = 0;
+            match (weight, bias) {
+                (Some(weights), Some(biases)) => {
+                    let vweight = f32x8::splat(weights[c]);
+                    let vbias = f32x8::splat(biases[c]);
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8].copy_from_slice(
+                            &(((values - vmean) * vrstd * vweight) + vbias).to_array(),
+                        );
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd * weights[c] + biases[c];
+                    }
                 }
-                if let Some(b) = b {
-                    y += b;
+                (Some(weights), None) => {
+                    let vweight = f32x8::splat(weights[c]);
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8]
+                            .copy_from_slice(&((values - vmean) * vrstd * vweight).to_array());
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd * weights[c];
+                    }
                 }
-                orow[i] = y;
+                (None, Some(biases)) => {
+                    let vbias = f32x8::splat(biases[c]);
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8]
+                            .copy_from_slice(&(((values - vmean) * vrstd) + vbias).to_array());
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd + biases[c];
+                    }
+                }
+                (None, None) => {
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8]
+                            .copy_from_slice(&((values - vmean) * vrstd).to_array());
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd;
+                    }
+                }
             }
         }
     };
@@ -50795,41 +50839,49 @@ mod tests {
             .collect();
         let weight: Vec<f32> = (0..channels).map(|c| 0.5 + c as f32 * 0.125).collect();
         let bias: Vec<f32> = (0..channels).map(|c| -0.3 + c as f32 * 0.0625).collect();
-        let got = crate::group_norm_forward_f32(
-            &x,
-            Some(&weight),
-            Some(&bias),
-            batch,
-            num_groups,
-            cpg,
-            spatial,
-            1e-5,
-        );
         let group_numel = cpg * spatial;
         let inv_m = 1.0 / group_numel as f32;
-        let mut want = vec![0.0; x.len()];
-        for group in 0..batch * num_groups {
-            let channel_group = group % num_groups;
-            let base = group * group_numel;
-            let input = &x[base..base + group_numel];
-            let mean = input.iter().copied().sum::<f32>() * inv_m;
-            let variance = input
-                .iter()
-                .map(|&value| {
-                    let delta = value - mean;
-                    delta * delta
-                })
-                .sum::<f32>();
-            let rstd = 1.0 / (variance * inv_m + 1e-5).sqrt();
-            for i in 0..group_numel {
-                let channel = channel_group * cpg + i / spatial;
-                want[base + i] = (input[i] - mean) * rstd * weight[channel] + bias[channel];
+        for (weight_arg, bias_arg) in [
+            (None, None),
+            (Some(weight.as_slice()), None),
+            (None, Some(bias.as_slice())),
+            (Some(weight.as_slice()), Some(bias.as_slice())),
+        ] {
+            let got = crate::group_norm_forward_f32(
+                &x, weight_arg, bias_arg, batch, num_groups, cpg, spatial, 1e-5,
+            );
+            let mut want = vec![0.0; x.len()];
+            for group in 0..batch * num_groups {
+                let channel_group = group % num_groups;
+                let base = group * group_numel;
+                let input = &x[base..base + group_numel];
+                let mean = input.iter().copied().sum::<f32>() * inv_m;
+                let variance = input
+                    .iter()
+                    .map(|&value| {
+                        let delta = value - mean;
+                        delta * delta
+                    })
+                    .sum::<f32>();
+                let rstd = 1.0 / (variance * inv_m + 1e-5).sqrt();
+                for i in 0..group_numel {
+                    let channel = channel_group * cpg + i / spatial;
+                    let mut value = (input[i] - mean) * rstd;
+                    if let Some(weights) = weight_arg {
+                        value *= weights[channel];
+                    }
+                    if let Some(biases) = bias_arg {
+                        value += biases[channel];
+                    }
+                    want[base + i] = value;
+                }
             }
+            assert_eq!(
+                got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "f32 GroupNorm channel blocks must preserve scalar arithmetic"
+            );
         }
-        assert_eq!(
-            got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
-            want.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
-        );
     }
 
     #[test]
