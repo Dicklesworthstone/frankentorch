@@ -35,14 +35,21 @@ ft-nn = { path = "crates/ft-nn" }
 ft-optim = { path = "crates/ft-optim" }
 ft-data = { path = "crates/ft-data" }
 
-serde = { version = "1.0.218", features = ["derive"] }
-serde_json = "1.0.139"
-safetensors = "0.7"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+safetensors = "0.8"
 allocation-counter = "0.8.1"
-libm = "0.2.15"
-bytemuck = "1.25.0"
+libm = "0.2.16"
+bytemuck = "1.25.2"
 
-asupersync = { version = "0.3.4", default-features = false, features = ["test-internals"] }
+# NOTE: `test-internals` is deliberately NOT enabled. It is a security gate
+# (it unlocks `Cx::for_testing`, which bypasses runtime cap-mask enforcement, and
+# swaps `DetHasher::default()` to a fixed seed). Up to asupersync 0.3.4 we needed it
+# because `DetBuildHasher::for_production()` re-seeded on every `build_hasher()` call,
+# violating the `BuildHasher` contract; asupersync 0.3.9 fixed that (the seed is now
+# captured once per builder). Code that needs a reproducible content hash now calls
+# `DetHasher::for_lab()` explicitly instead of relying on the feature flag.
+asupersync = { version = "0.3.9", default-features = false }
 ftui = { version = "0.2.0", default-features = false }
 criterion = { version = "0.5", features = ["html_reports"] }
 

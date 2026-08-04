@@ -49,7 +49,7 @@ fn main() {
         for c in 0..chunks {
             let v = f32x8::from(&data[c * 8..c * 8 + 8]);
             let e = v.exp();
-            out[c * 8..c * 8 + 8].copy_from_slice(e.as_array_ref());
+            out[c * 8..c * 8 + 8].copy_from_slice(e.as_array());
         }
         for i in chunks * 8..n {
             out[i] = data[i].exp();
@@ -67,7 +67,7 @@ fn main() {
             let full = len / 8;
             for c in 0..full {
                 let v = f32x8::from(&data[base + c * 8..base + c * 8 + 8]);
-                dst[c * 8..c * 8 + 8].copy_from_slice(v.exp().as_array_ref());
+                dst[c * 8..c * 8 + 8].copy_from_slice(v.exp().as_array());
             }
             for i in full * 8..len {
                 dst[i] = data[base + i].exp();

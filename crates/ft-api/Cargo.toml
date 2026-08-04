@@ -12,8 +12,8 @@ ft-kernel-cpu = { workspace = true }
 ft-runtime = { workspace = true }
 libm = { workspace = true }
 mimalloc = { version = "0.1.52", optional = true }
-rayon = "1.10"
-wide = "0.7"
+rayon = "1.12"
+wide = "1.5"
 
 [features]
 default = []

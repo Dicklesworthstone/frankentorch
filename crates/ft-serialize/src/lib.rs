@@ -504,7 +504,11 @@ fn normalize_entries(entries: &[SnapshotEntry]) -> Vec<SnapshotEntry> {
 }
 
 fn checkpoint_hash(schema_version: u32, mode: CheckpointMode, entries: &[SnapshotEntry]) -> String {
-    let mut hasher = DetHasher::default();
+    // `for_lab()` (fixed seed), NOT `default()`: this hash is written into the
+    // serialized checkpoint envelope and must be reproducible across processes and
+    // builds. `DetHasher::default()` is randomly seeded unless the `test-internals`
+    // security gate is on, which we deliberately do not enable.
+    let mut hasher = DetHasher::for_lab();
     hasher.write_u32(schema_version);
     hasher.write_u8(match mode {
         CheckpointMode::Strict => 1,
@@ -525,7 +529,9 @@ fn checkpoint_hash(schema_version: u32, mode: CheckpointMode, entries: &[Snapsho
 }
 
 fn hash_bytes(bytes: &[u8]) -> String {
-    let mut hasher = DetHasher::default();
+    // `for_lab()` (fixed seed) — see `checkpoint_hash`: this value is part of the
+    // on-disk sidecar contract, so it must not depend on per-process random seeding.
+    let mut hasher = DetHasher::for_lab();
     hasher.write(bytes);
     format!("det64:{:016x}", hasher.finish())
 }

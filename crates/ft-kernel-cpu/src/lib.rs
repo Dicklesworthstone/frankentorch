@@ -9,7 +9,7 @@
 use std::fmt;
 
 use rayon::prelude::*;
-use wide::{CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, f32x8, f64x4};
+use wide::{f32x8, f64x4};
 
 const BATCH_NORM_MIN_PAR_ROWS: usize = 8;
 
@@ -2621,7 +2621,7 @@ where
             .zip(inp[..simd_len].chunks_exact(SIMD_WIDTH))
         {
             let a = f64x4::new([i[0], i[1], i[2], i[3]]);
-            o.copy_from_slice(simd_op(a).as_array_ref());
+            o.copy_from_slice(simd_op(a).as_array());
         }
         for (o, &v) in out[simd_len..].iter_mut().zip(&inp[simd_len..]) {
             *o = scalar_op(v);
@@ -3203,8 +3203,8 @@ pub fn hardswish_tensor_contiguous_f64(
     let neg3 = f64x4::splat(-3.0);
     simd_unary_f64_kernel(input, meta, hardswish_value, move |a| {
         let mid = (a * (a + three)) / six;
-        let r = a.cmp_le(neg3).blend(zero, mid);
-        a.cmp_ge(three).blend(a, r)
+        let r = a.simd_le(neg3).blend(zero, mid);
+        a.simd_ge(three).blend(a, r)
     })
 }
 
@@ -3219,8 +3219,8 @@ pub fn hardsigmoid_tensor_contiguous_f64(
     let neg3 = f64x4::splat(-3.0);
     simd_unary_f64_kernel(input, meta, hardsigmoid_value, move |a| {
         let mid = (a + three) / six;
-        let r = a.cmp_le(neg3).blend(zero, mid);
-        a.cmp_ge(three).blend(one, r)
+        let r = a.simd_le(neg3).blend(zero, mid);
+        a.simd_ge(three).blend(one, r)
     })
 }
 
@@ -3232,7 +3232,7 @@ pub fn hardtanh_tensor_contiguous_f64(
     let one = f64x4::splat(1.0);
     let nan = f64x4::splat(f64::NAN);
     simd_unary_f64_kernel(input, meta, hardtanh_value, move |a| {
-        (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+        (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
     })
 }
 
@@ -3404,7 +3404,7 @@ pub fn min_tensor_contiguous_f64(
         },
         |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
         },
     )
 }
@@ -3430,7 +3430,7 @@ pub fn max_tensor_contiguous_f64(
         },
         |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
         },
     )
 }
@@ -3885,7 +3885,7 @@ where
         {
             let a = f64x4::new([lc[0], lc[1], lc[2], lc[3]]);
             let b = f64x4::new([rc[0], rc[1], rc[2], rc[3]]);
-            o.copy_from_slice(simd_op(a, b).as_array_ref());
+            o.copy_from_slice(simd_op(a, b).as_array());
         }
         for ((o, &lv), &rv) in out[simd_len..]
             .iter_mut()
@@ -29294,7 +29294,7 @@ where
             window[i + 7],
         ]);
         let result = simd_op(a);
-        output.extend_from_slice(result.as_array_ref());
+        output.extend_from_slice(result.as_array());
     }
 
     for &value in &window[simd_len..numel] {
@@ -29344,7 +29344,7 @@ where
                     in_chunk[i + 7],
                 ]);
                 let result = simd_op(a);
-                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array_ref());
+                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array());
                 i += SIMD_WIDTH_F32;
             }
             for j in simd_len..n {
@@ -29390,7 +29390,7 @@ where
             rhs_window[i + 7],
         ]);
         let result = simd_op(a, b);
-        output.extend_from_slice(result.as_array_ref());
+        output.extend_from_slice(result.as_array());
     }
 
     for i in simd_len..numel {
@@ -29455,7 +29455,7 @@ where
                     rhs_chunk[i + 7],
                 ]);
                 let result = simd_op(a, b);
-                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array_ref());
+                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array());
                 i += SIMD_WIDTH_F32;
             }
             for j in simd_len..n {
@@ -30164,8 +30164,8 @@ pub fn hardswish_tensor_contiguous_f32(
     simd_unary_f32_kernel(input, meta, hardswish_value_f32, move |a| {
         // x<=-3 -> 0 ; x>=3 -> x ; else x*(x+3)/6 (NaN flows to the mid branch -> NaN).
         let mid = (a * (a + three)) / six;
-        let r = a.cmp_le(neg3).blend(zero, mid);
-        a.cmp_ge(three).blend(a, r)
+        let r = a.simd_le(neg3).blend(zero, mid);
+        a.simd_ge(three).blend(a, r)
     })
 }
 pub fn hardsigmoid_tensor_contiguous_f32(
@@ -30180,8 +30180,8 @@ pub fn hardsigmoid_tensor_contiguous_f32(
     simd_unary_f32_kernel(input, meta, hardsigmoid_value_f32, move |a| {
         // x<=-3 -> 0 ; x>=3 -> 1 ; else (x+3)/6 (NaN flows to the mid branch -> NaN).
         let mid = (a + three) / six;
-        let r = a.cmp_le(neg3).blend(zero, mid);
-        a.cmp_ge(three).blend(one, r)
+        let r = a.simd_le(neg3).blend(zero, mid);
+        a.simd_ge(three).blend(one, r)
     })
 }
 pub fn hardtanh_tensor_contiguous_f32(
@@ -30194,7 +30194,7 @@ pub fn hardtanh_tensor_contiguous_f32(
     simd_unary_f32_kernel(input, meta, hardtanh_value_f32, move |a| {
         // clamp(a, -1, 1): min(max(a,-1),1) is bit-exact for non-NaN; clamp propagates NaN,
         // so force NaN where a is NaN.
-        (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+        (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
     })
 }
 define_unary_f32!(
@@ -30273,7 +30273,7 @@ pub fn min_tensor_contiguous_f32(
         },
         |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
         },
     )
 }
@@ -30297,7 +30297,7 @@ pub fn max_tensor_contiguous_f32(
         },
         |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
         },
     )
 }
@@ -30330,7 +30330,7 @@ pub fn eq_tensor_contiguous_f32(
         |l, r| {
             if l == r { 1.0f32 } else { 0.0f32 }
         },
-        |a, b| f32_comparison_mask(a.cmp_eq(b)),
+        |a, b| f32_comparison_mask(a.simd_eq(b)),
     )
 }
 
@@ -30348,7 +30348,7 @@ pub fn ne_tensor_contiguous_f32(
         |l, r| {
             if l != r { 1.0f32 } else { 0.0f32 }
         },
-        |a, b| f32_comparison_mask(!a.cmp_eq(b)),
+        |a, b| f32_comparison_mask(!a.simd_eq(b)),
     )
 }
 
@@ -30366,7 +30366,7 @@ pub fn lt_tensor_contiguous_f32(
         |l, r| {
             if l < r { 1.0f32 } else { 0.0f32 }
         },
-        |a, b| f32_comparison_mask(a.cmp_lt(b)),
+        |a, b| f32_comparison_mask(a.simd_lt(b)),
     )
 }
 
@@ -30384,7 +30384,7 @@ pub fn gt_tensor_contiguous_f32(
         |l, r| {
             if l > r { 1.0f32 } else { 0.0f32 }
         },
-        |a, b| f32_comparison_mask(a.cmp_gt(b)),
+        |a, b| f32_comparison_mask(a.simd_gt(b)),
     )
 }
 
@@ -30402,7 +30402,7 @@ pub fn le_tensor_contiguous_f32(
         |l, r| {
             if l <= r { 1.0f32 } else { 0.0f32 }
         },
-        |a, b| f32_comparison_mask(a.cmp_le(b)),
+        |a, b| f32_comparison_mask(a.simd_le(b)),
     )
 }
 
@@ -30420,7 +30420,7 @@ pub fn ge_tensor_contiguous_f32(
         |l, r| {
             if l >= r { 1.0f32 } else { 0.0f32 }
         },
-        |a, b| f32_comparison_mask(a.cmp_ge(b)),
+        |a, b| f32_comparison_mask(a.simd_ge(b)),
     )
 }
 
@@ -31783,7 +31783,7 @@ fn product_f32_simd_contiguous(values: &[f32]) -> f32 {
     }
 
     let mut prod = 1.0f32;
-    for &lane in acc.as_array_ref() {
+    for &lane in acc.as_array() {
         prod *= lane;
     }
     for &value in &values[simd_len..] {
@@ -35800,7 +35800,7 @@ mod tests {
     // NaN-propagating scalar fmax/fmin across every ordered pair of IEEE f64 edge values.
     #[test]
     fn min_max_f64_simd_matches_scalar_bit_for_bit() {
-        use wide::{CmpEq, f64x4};
+        use wide::f64x4;
         let edge = [
             0.0f64,
             -0.0,
@@ -35847,11 +35847,11 @@ mod tests {
         };
         let max_simd = |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
         };
         let min_simd = |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
         };
         for (name, got, scalar) in [
             (
@@ -35884,7 +35884,7 @@ mod tests {
     // sign-of-zero on ±0 ties and NaN propagation are checked in both operand positions.
     #[test]
     fn min_max_f32_simd_matches_scalar_bit_for_bit() {
-        use wide::{CmpEq, f32x8};
+        use wide::f32x8;
         let edge = [
             0.0f32,
             -0.0,
@@ -35935,11 +35935,11 @@ mod tests {
         };
         let max_simd = |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
         };
         let min_simd = |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
         };
         for (name, got, scalar) in [
             (
@@ -35972,7 +35972,7 @@ mod tests {
     // BIT-IDENTICAL to their scalar value fns across every IEEE f64 edge value + breakpoints.
     #[test]
     fn hard_activation_f64_simd_matches_scalar() {
-        use wide::{CmpEq, CmpGe, CmpLe, f64x4};
+        use wide::f64x4;
         let mut xs: Vec<f64> = vec![
             0.0,
             -0.0,
@@ -36005,8 +36005,8 @@ mod tests {
                     let zero = f64x4::splat(0.0);
                     let neg3 = f64x4::splat(-3.0);
                     let mid = (a * (a + three)) / six;
-                    let r = a.cmp_le(neg3).blend(zero, mid);
-                    a.cmp_ge(three).blend(a, r)
+                    let r = a.simd_le(neg3).blend(zero, mid);
+                    a.simd_ge(three).blend(a, r)
                 }
                 s
             }),
@@ -36018,8 +36018,8 @@ mod tests {
                     let one = f64x4::splat(1.0);
                     let neg3 = f64x4::splat(-3.0);
                     let mid = (a + three) / six;
-                    let r = a.cmp_le(neg3).blend(zero, mid);
-                    a.cmp_ge(three).blend(one, r)
+                    let r = a.simd_le(neg3).blend(zero, mid);
+                    a.simd_ge(three).blend(one, r)
                 }
                 s
             }),
@@ -36028,7 +36028,7 @@ mod tests {
                     let neg1 = f64x4::splat(-1.0);
                     let one = f64x4::splat(1.0);
                     let nan = f64x4::splat(f64::NAN);
-                    (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+                    (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
                 }
                 s
             }),
@@ -36053,7 +36053,7 @@ mod tests {
     // the affine/quadratic arithmetic, the clamp branches, and NaN propagation are all checked.
     #[test]
     fn hard_activation_f32_simd_matches_scalar() {
-        use wide::{CmpEq, CmpGe, CmpLe, f32x8};
+        use wide::f32x8;
         let mut xs: Vec<f32> = vec![
             0.0,
             -0.0,
@@ -36088,8 +36088,8 @@ mod tests {
                     let zero = f32x8::splat(0.0f32);
                     let neg3 = f32x8::splat(-3.0f32);
                     let mid = (a * (a + three)) / six;
-                    let r = a.cmp_le(neg3).blend(zero, mid);
-                    a.cmp_ge(three).blend(a, r)
+                    let r = a.simd_le(neg3).blend(zero, mid);
+                    a.simd_ge(three).blend(a, r)
                 }
                 s
             }),
@@ -36101,8 +36101,8 @@ mod tests {
                     let one = f32x8::splat(1.0f32);
                     let neg3 = f32x8::splat(-3.0f32);
                     let mid = (a + three) / six;
-                    let r = a.cmp_le(neg3).blend(zero, mid);
-                    a.cmp_ge(three).blend(one, r)
+                    let r = a.simd_le(neg3).blend(zero, mid);
+                    a.simd_ge(three).blend(one, r)
                 }
                 s
             }),
@@ -36111,7 +36111,7 @@ mod tests {
                     let neg1 = f32x8::splat(-1.0f32);
                     let one = f32x8::splat(1.0f32);
                     let nan = f32x8::splat(f32::NAN);
-                    (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+                    (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
                 }
                 s
             }),

@@ -7,13 +7,13 @@ license-file = "../../LICENSE"
 [dependencies]
 ft-core = { workspace = true }
 libm = { workspace = true }
-matrixmultiply = "0.3"
-rayon = "1.10"
-wide = "0.7"
+matrixmultiply = "0.3.11"
+rayon = "1.12"
+wide = "1.5"
 
 [dev-dependencies]
-insta = "1.47.2"
-proptest = "1.6.0"
+insta = "1.48.0"
+proptest = "1.11.0"
 criterion = { workspace = true }
 
 [[bench]]

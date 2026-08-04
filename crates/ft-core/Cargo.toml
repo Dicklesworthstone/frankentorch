@@ -5,12 +5,12 @@ edition = "2024"
 license-file = "../../LICENSE"
 
 [dependencies]
-half = { version = "2.4", features = ["bytemuck"] }
-num-complex = "0.4"
+half = { version = "2.7", features = ["bytemuck"] }
+num-complex = "0.4.6"
 
 [dev-dependencies]
 criterion = { workspace = true }
-proptest = "1.6.0"
+proptest = "1.11.0"
 
 [[bench]]
 name = "core_bench"

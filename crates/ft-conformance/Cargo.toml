@@ -23,7 +23,7 @@ serde_json = { workspace = true }
 allocation-counter = { workspace = true }
 
 [dev-dependencies]
-proptest = "1.6.0"
+proptest = "1.11.0"
 
 [lints]
 workspace = true

@@ -9,11 +9,11 @@ ft-core = { workspace = true }
 ft-dispatch = { workspace = true }
 ft-kernel-cpu = { workspace = true }
 libm = { workspace = true }
-rayon = "1.10"
+rayon = "1.12"
 
 [dev-dependencies]
-insta = "1.47.2"
-proptest = "1.6.0"
+insta = "1.48.0"
+proptest = "1.11.0"
 criterion = { workspace = true }
 
 [[bench]]

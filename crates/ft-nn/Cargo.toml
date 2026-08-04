@@ -10,11 +10,11 @@ ft-api = { workspace = true }
 ft-autograd = { workspace = true }
 ft-dispatch = { workspace = true }
 ft-kernel-cpu = { workspace = true }
-rayon = "1.10"
+rayon = "1.12"
 
 [dev-dependencies]
 criterion = { workspace = true }
-insta = "1.47.2"
+insta = "1.48.0"
 ft-serialize = { workspace = true }
 
 [[bench]]

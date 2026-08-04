@@ -17,7 +17,7 @@ ftui = { workspace = true, optional = true }
 [dev-dependencies]
 criterion = { workspace = true }
 ft-serialize = { workspace = true }
-insta = "1.43.1"
+insta = "1.48.0"
 
 [[bench]]
 name = "runtime_bench"

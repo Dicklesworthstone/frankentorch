@@ -14,8 +14,8 @@ bytemuck = { workspace = true }
 
 [dev-dependencies]
 criterion = { workspace = true }
-insta = "1.47.2"
-proptest = "1.6.0"
+insta = "1.48.0"
+proptest = "1.11.0"
 
 [[bench]]
 name = "serialize_bench"
