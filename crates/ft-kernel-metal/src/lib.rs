@@ -22,14 +22,57 @@
 
 use std::fmt;
 
-/// Reason a GPU matmul could not run. Callers should treat this as "fall back to
-/// the CPU kernel", not as a hard failure.
-#[derive(Debug, Clone)]
+/// Terminal or unexpected state observed after waiting for a Metal command
+/// buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CommandBufferState {
+    /// The command buffer was never enqueued.
+    NotEnqueued,
+    /// The command buffer was enqueued but not committed.
+    Enqueued,
+    /// The command buffer was committed but did not reach scheduling.
+    Committed,
+    /// The command buffer was scheduled but did not complete.
+    Scheduled,
+    /// Every encoded command completed successfully.
+    Completed,
+    /// Metal reported an execution failure.
+    Error,
+}
+
+#[cfg(target_os = "macos")]
+impl From<metal::MTLCommandBufferStatus> for CommandBufferState {
+    fn from(status: metal::MTLCommandBufferStatus) -> Self {
+        match status {
+            metal::MTLCommandBufferStatus::NotEnqueued => Self::NotEnqueued,
+            metal::MTLCommandBufferStatus::Enqueued => Self::Enqueued,
+            metal::MTLCommandBufferStatus::Committed => Self::Committed,
+            metal::MTLCommandBufferStatus::Scheduled => Self::Scheduled,
+            metal::MTLCommandBufferStatus::Completed => Self::Completed,
+            metal::MTLCommandBufferStatus::Error => Self::Error,
+        }
+    }
+}
+
+/// Reason a Metal operation could not run. Callers may fall back to a CPU
+/// implementation, but should retain the typed cause in provenance.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// No usable Metal device on this machine/target.
     Unavailable,
     /// A Metal call failed (shape rejected, pipeline error, …).
     Kernel(String),
+    /// A host-side count or byte calculation overflowed.
+    SizeOverflow(&'static str),
+    /// A requested buffer exceeds the selected device's allocation limit.
+    BufferTooLarge {
+        /// Requested buffer bytes.
+        requested: usize,
+        /// Maximum bytes reported by `MTLDevice.maxBufferLength`.
+        maximum: usize,
+    },
+    /// A synchronous command buffer did not complete successfully.
+    CommandBuffer(CommandBufferState),
 }
 
 impl fmt::Display for Error {
@@ -37,6 +80,14 @@ impl fmt::Display for Error {
         match self {
             Error::Unavailable => write!(f, "Metal GPU unavailable"),
             Error::Kernel(m) => write!(f, "Metal kernel error: {m}"),
+            Error::SizeOverflow(what) => write!(f, "Metal {what} exceeds this platform"),
+            Error::BufferTooLarge { requested, maximum } => write!(
+                f,
+                "Metal buffer request is {requested} bytes; device limit is {maximum} bytes"
+            ),
+            Error::CommandBuffer(state) => {
+                write!(f, "Metal command buffer ended in {state:?}")
+            }
         }
     }
 }
@@ -47,6 +98,23 @@ impl std::error::Error for Error {}
 /// batches a run of ops into one command buffer / one sync. See [`fused::Batch`].
 #[cfg(target_os = "macos")]
 pub mod fused;
+
+/// The **generic Metal compute gateway**: compile caller-supplied MSL, bind
+/// unified-memory buffers, dispatch, read back — for consumers whose GPU work
+/// is their own kernel rather than one of this crate's tensor ops. Present on
+/// every target (a stub off macOS), so callers compile everywhere and fall back
+/// to their CPU path where no device exists. See [`compute::Gateway`].
+pub mod compute;
+
+/// A native macOS preview surface backed by `CAMetalLayer`.
+///
+/// [`presentation::NativePresenter`] accepts a unified-memory
+/// [`compute::SharedBuffer`] containing RGBA8 pixels and presents it without
+/// copying the pixels back into host-owned memory. AppKit, Objective-C,
+/// drawables, and command-buffer lifetimes remain inside this crate's sanctioned
+/// unsafe boundary. Off macOS, construction reports
+/// [`presentation::PresentationError::Unavailable`].
+pub mod presentation;
 
 #[cfg(target_os = "macos")]
 mod imp {
@@ -243,7 +311,7 @@ mod tests {
     }
 
     #[test]
-    fn sgemm_matches_cpu_or_unavailable() {
+    fn sgemm_matches_cpu_or_unavailable() -> Result<(), Error> {
         // Shapes incl. non-multiples of 64 and whisper encoder-ish dims.
         let shapes = [(2, 3, 2), (64, 64, 64), (65, 33, 129), (300, 384, 512)];
         for &(m, k, n) in &shapes {
@@ -266,8 +334,9 @@ mod tests {
                     }
                 }
                 Err(Error::Unavailable) => { /* non-macOS or no GPU: fine */ }
-                Err(e) => panic!("sgemm failed: {e}"),
+                Err(error) => return Err(error),
             }
         }
+        Ok(())
     }
 }

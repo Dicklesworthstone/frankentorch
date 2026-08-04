@@ -669,7 +669,7 @@ mod tests {
             }
         }
         approx(&ln_o, &cln, 1e-2, "layernorm");
-        let c = 0.7978845608028654f32;
+        let c = 0.797_884_6_f32;
         let cge: Vec<f32> = cmm
             .iter()
             .map(|&x| 0.5 * x * (1.0 + (c * (x + 0.044715 * x * x * x)).tanh()))
@@ -703,8 +703,8 @@ mod tests {
                 }
                 let mx = sc.iter().cloned().fold(f32::MIN, f32::max);
                 let s: f32 = sc.iter().map(|x| (x - mx).exp()).sum();
-                for j in 0..seq {
-                    sc[j] = (sc[j] - mx).exp() / s;
+                for score in sc.iter_mut().take(seq) {
+                    *score = (*score - mx).exp() / s;
                 }
                 for e in 0..hd {
                     let mut acc = 0.0f32;
@@ -797,7 +797,7 @@ mod tests {
         o
     }
     fn cpu_gelu(x: &[f32]) -> Vec<f32> {
-        let c = 0.7978845608028654f32;
+        let c = 0.797_884_6_f32;
         x.iter()
             .map(|&v| 0.5 * v * (1.0 + (c * (v + 0.044715 * v * v * v)).tanh()))
             .collect()
