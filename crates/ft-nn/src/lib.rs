@@ -24923,6 +24923,100 @@ mod tests {
         );
     }
 
+    /// Worst absolute deviation between a produced golden summary and its
+    /// fixture, skipping the exact-match (`shape`, `backward_err`) lines.
+    fn golden_max_abs_delta(produced: &str, golden: &str) -> f64 {
+        let p_lines: Vec<&str> = produced.lines().collect();
+        let g_lines: Vec<&str> = golden.lines().collect();
+        assert_eq!(
+            p_lines.len(),
+            g_lines.len(),
+            "golden line count mismatch:\n--- produced ---\n{produced}\n--- golden ---\n{golden}"
+        );
+        let mut worst = 0.0_f64;
+        for (pl, gl) in p_lines.iter().zip(g_lines.iter()) {
+            let (pk, pv) = pl.split_once('=').expect("produced line has '='");
+            let (gk, gv) = gl.split_once('=').expect("golden line has '='");
+            assert_eq!(pk, gk, "golden key mismatch: {pk:?} vs {gk:?}");
+            if pk == "shape" || pk == "backward_err" {
+                assert_eq!(pv, gv, "golden {pk} mismatch: {pv:?} vs {gv:?}");
+                continue;
+            }
+            let pnums = parse_golden_f64_list(pv);
+            let gnums = parse_golden_f64_list(gv);
+            assert_eq!(
+                pnums.len(),
+                gnums.len(),
+                "golden {pk} length mismatch: {} vs {}",
+                pnums.len(),
+                gnums.len()
+            );
+            for (a, b) in pnums.iter().zip(gnums.iter()) {
+                worst = worst.max((a - b).abs());
+            }
+        }
+        worst
+    }
+
+    /// The MHA fixtures are compared at 1e-12, which is only defensible while
+    /// the live deviation really is accumulation-order roundoff. Pin the
+    /// measured drift three orders of magnitude below that band so a genuine
+    /// numeric regression cannot park itself inside the tolerance unnoticed.
+    #[test]
+    fn mha_golden_drift_stays_at_roundoff_scale() {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mha = MultiheadAttention::new(&mut session, 4, 2).expect("mha");
+        let x = session
+            .tensor_variable(
+                vec![0.25, -0.5, 0.75, 1.0, -1.25, 1.5, -1.75, 2.0],
+                vec![1, 2, 4],
+                false,
+            )
+            .expect("variable");
+        let y = mha.forward(&mut session, x).expect("forward");
+        let (vals, meta) = session.tensor_values_meta(y).expect("values");
+        let produced = format!("shape={:?}\nvalues={vals:.17?}\n", meta.shape());
+
+        let measured = [
+            (
+                "pass18",
+                golden_max_abs_delta(
+                    &produced,
+                    include_str!(
+                        "../../../artifacts/optimization/golden_outputs/ft_nn_mha_pass18.txt"
+                    ),
+                ),
+            ),
+            (
+                "batched_heads_pass24",
+                golden_max_abs_delta(
+                    &produced,
+                    include_str!(
+                        "../../../artifacts/optimization/golden_outputs/ft_nn_mha_batched_heads_pass24.txt"
+                    ),
+                ),
+            ),
+            (
+                "no_grad_linear_fast_path",
+                golden_max_abs_delta(
+                    &mha_no_grad_linear_fast_path_golden_summary(),
+                    include_str!(
+                        "../../../artifacts/optimization/golden_outputs/ft_nn_mha_no_grad_linear_fast_path_frankentorch-rngz.txt"
+                    ),
+                ),
+            ),
+        ];
+
+        for (name, drift) in measured {
+            assert!(
+                drift <= 1e-15,
+                "MHA golden {name} drifted {drift:e}, past the roundoff scale the 1e-12 \
+                 fixture tolerance is predicated on; investigate for a real regression \
+                 instead of widening the bound"
+            );
+        }
+    }
+
     #[test]
     fn mha_self_flat_reuse_golden_output_matches_fixture() {
         assert_golden_within_tol(

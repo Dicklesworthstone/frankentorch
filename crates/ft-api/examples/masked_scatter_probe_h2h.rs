@@ -13,7 +13,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let mask: Vec<f32> = (0..n)
         .map(|i| {
-            if (i * 2654435761usize) % 2 == 0 {
+            if (i * 2654435761usize).is_multiple_of(2) {
                 1.0
             } else {
                 0.0

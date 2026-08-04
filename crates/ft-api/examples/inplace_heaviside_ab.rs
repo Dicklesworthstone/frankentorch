@@ -50,7 +50,7 @@ fn main() {
     let cases: [(&str, usize); 3] = [("4M", 4_000_000), ("8M", 8_000_000), ("16M", 16_000_000)];
     for (label, numel) in cases {
         // Mix of negative / zero / positive so all three heaviside branches are exercised.
-        let target: Vec<f64> = (0..numel).map(|i| ((i % 3) as f64 - 1.0)).collect();
+        let target: Vec<f64> = (0..numel).map(|i| (i % 3) as f64 - 1.0).collect();
         let values: Vec<f64> = (0..numel).map(|i| (i % 7) as f64 * 0.5).collect();
 
         let mut sess = FrankenTorchSession::new(ExecutionMode::Strict);

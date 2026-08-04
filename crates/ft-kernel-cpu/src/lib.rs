@@ -804,7 +804,10 @@ mod gemm {
     pub(crate) fn tile_grid(threads: usize) -> (usize, usize) {
         let lim = (threads as f64).sqrt().floor().max(1.0) as usize;
         if crate::sgemm_tile_balanced() {
-            let p = (1..=lim).filter(|c| threads % c == 0).max().unwrap_or(1);
+            let p = (1..=lim)
+                .filter(|c| threads.is_multiple_of(*c))
+                .max()
+                .unwrap_or(1);
             return (p, threads / p);
         }
         (lim, threads.div_ceil(lim))
@@ -3203,8 +3206,8 @@ pub fn hardswish_tensor_contiguous_f64(
     let neg3 = f64x4::splat(-3.0);
     simd_unary_f64_kernel(input, meta, hardswish_value, move |a| {
         let mid = (a * (a + three)) / six;
-        let r = a.simd_le(neg3).blend(zero, mid);
-        a.simd_ge(three).blend(a, r)
+        let r = a.simd_le(neg3).select(zero, mid);
+        a.simd_ge(three).select(a, r)
     })
 }
 
@@ -3219,8 +3222,8 @@ pub fn hardsigmoid_tensor_contiguous_f64(
     let neg3 = f64x4::splat(-3.0);
     simd_unary_f64_kernel(input, meta, hardsigmoid_value, move |a| {
         let mid = (a + three) / six;
-        let r = a.simd_le(neg3).blend(zero, mid);
-        a.simd_ge(three).blend(one, r)
+        let r = a.simd_le(neg3).select(zero, mid);
+        a.simd_ge(three).select(one, r)
     })
 }
 
@@ -3232,7 +3235,7 @@ pub fn hardtanh_tensor_contiguous_f64(
     let one = f64x4::splat(1.0);
     let nan = f64x4::splat(f64::NAN);
     simd_unary_f64_kernel(input, meta, hardtanh_value, move |a| {
-        (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
+        (!a.simd_eq(a)).select(nan, a.max(neg1).min(one))
     })
 }
 
@@ -3404,7 +3407,7 @@ pub fn min_tensor_contiguous_f64(
         },
         |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
         },
     )
 }
@@ -3430,7 +3433,7 @@ pub fn max_tensor_contiguous_f64(
         },
         |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
         },
     )
 }
@@ -6032,16 +6035,22 @@ pub fn group_norm_forward_f64(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-        for i in 0..group_numel {
-            let c = g * cpg + i / spatial;
-            let mut y = (xb[i] - mean) * rstd;
-            if let Some(w) = weight {
-                y *= w[c];
+        for local_channel in 0..cpg {
+            let c = g * cpg + local_channel;
+            let channel_base = local_channel * spatial;
+            let channel_end = channel_base + spatial;
+            let w = weight.map(|values| values[c]);
+            let b = bias.map(|values| values[c]);
+            for i in channel_base..channel_end {
+                let mut y = (xb[i] - mean) * rstd;
+                if let Some(w) = w {
+                    y *= w;
+                }
+                if let Some(b) = b {
+                    y += b;
+                }
+                orow[i] = y;
             }
-            if let Some(b) = bias {
-                y += b[c];
-            }
-            orow[i] = y;
         }
     };
     // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
@@ -6091,16 +6100,66 @@ pub fn group_norm_forward_f32(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-        for i in 0..group_numel {
-            let c = g * cpg + i / spatial;
-            let mut y = (xb[i] - mean) * rstd;
-            if let Some(w) = weight {
-                y *= w[c];
+        let vmean = f32x8::splat(mean);
+        let vrstd = f32x8::splat(rstd);
+        for local_channel in 0..cpg {
+            let c = g * cpg + local_channel;
+            let channel_base = local_channel * spatial;
+            let channel_end = channel_base + spatial;
+            let input = &xb[channel_base..channel_end];
+            let output = &mut orow[channel_base..channel_end];
+            let mut lane = 0;
+            match (weight, bias) {
+                (Some(weights), Some(biases)) => {
+                    let vweight = f32x8::splat(weights[c]);
+                    let vbias = f32x8::splat(biases[c]);
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8].copy_from_slice(
+                            &(((values - vmean) * vrstd * vweight) + vbias).to_array(),
+                        );
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd * weights[c] + biases[c];
+                    }
+                }
+                (Some(weights), None) => {
+                    let vweight = f32x8::splat(weights[c]);
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8]
+                            .copy_from_slice(&((values - vmean) * vrstd * vweight).to_array());
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd * weights[c];
+                    }
+                }
+                (None, Some(biases)) => {
+                    let vbias = f32x8::splat(biases[c]);
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8]
+                            .copy_from_slice(&(((values - vmean) * vrstd) + vbias).to_array());
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd + biases[c];
+                    }
+                }
+                (None, None) => {
+                    while lane + 8 <= spatial {
+                        let values = f32x8::from(&input[lane..lane + 8]);
+                        output[lane..lane + 8]
+                            .copy_from_slice(&((values - vmean) * vrstd).to_array());
+                        lane += 8;
+                    }
+                    for i in lane..spatial {
+                        output[i] = (input[i] - mean) * rstd;
+                    }
+                }
             }
-            if let Some(b) = bias {
-                y += b[c];
-            }
-            orow[i] = y;
         }
     };
     // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
@@ -10014,7 +10073,7 @@ pub fn max_pool2d_backward_from_indices_f64(
 /// valid `(ic,kh,kw)` contributions `input[n,ic,iy,ix]·weight[ic,oc,kh,kw]` where
 /// `iy·sh = oy+ph-kh`, `ix·sw = ox+pw-kw` (integer & in range). Weight is
 /// `[in_ch, out_ch, kh, kw]`. Parallel over `(batch, out_ch)` output planes.
-#[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv_transpose2d_forward_f64(
     input: &[f64],
@@ -10082,7 +10141,7 @@ pub fn conv_transpose2d_forward_f64(
                             continue;
                         }
                         let yd = y_num - kr;
-                        if yd % sh != 0 {
+                        if !yd.is_multiple_of(sh) {
                             continue;
                         }
                         let iy = yd / sh;
@@ -10095,7 +10154,7 @@ pub fn conv_transpose2d_forward_f64(
                                 continue;
                             }
                             let xd = x_num - kc;
-                            if xd % sw != 0 {
+                            if !xd.is_multiple_of(sw) {
                                 continue;
                             }
                             let ix = xd / sw;
@@ -10122,7 +10181,7 @@ pub fn conv_transpose2d_forward_f64(
 /// transposed-conv stencil, parallel over `(batch,out_ch)` planes. Replaces the
 /// f32 op-graph scatter (`O(kh·kw·ih)` narrow/matmul/pad/add tensor ops) the f32
 /// no-grad path fell through to.
-#[allow(clippy::manual_is_multiple_of, clippy::too_many_arguments)]
+#[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv_transpose2d_forward_f32(
     input: &[f32],
@@ -10186,7 +10245,7 @@ pub fn conv_transpose2d_forward_f32(
                             continue;
                         }
                         let yd = y_num - kr;
-                        if yd % sh != 0 {
+                        if !yd.is_multiple_of(sh) {
                             continue;
                         }
                         let iy = yd / sh;
@@ -10199,7 +10258,7 @@ pub fn conv_transpose2d_forward_f32(
                                 continue;
                             }
                             let xd = x_num - kc;
-                            if xd % sw != 0 {
+                            if !xd.is_multiple_of(sw) {
                                 continue;
                             }
                             let ix = xd / sw;
@@ -16205,9 +16264,7 @@ fn cummaxmin_1d_contiguous_parallel_f64(
         let (cm, ci) = finals[c];
         p = if p.0.is_nan() {
             p
-        } else if cm.is_nan() {
-            (cm, ci)
-        } else if (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
+        } else if cm.is_nan() || (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
             (cm, ci)
         } else {
             p
@@ -16226,14 +16283,8 @@ fn cummaxmin_1d_contiguous_parallel_f64(
             }
             for j in 0..vc.len() {
                 let lv = vc[j];
-                if pm.is_nan() {
-                    vc[j] = pm;
-                    ic[j] = pi;
-                } else if lv.is_nan() {
-                    // NaN arose within this chunk at/before j: local already frozen — keep it.
-                } else if (is_max && lv >= pm) || (!is_max && lv <= pm) {
-                    // local extreme wins (>= / <= keeps the later index) — keep local.
-                } else {
+                let local_wins = lv.is_nan() || (is_max && lv >= pm) || (!is_max && lv <= pm);
+                if pm.is_nan() || !local_wins {
                     vc[j] = pm;
                     ic[j] = pi;
                 }
@@ -16292,9 +16343,7 @@ fn cummaxmin_1d_contiguous_parallel_f32(
         let (cm, ci) = finals[c];
         p = if p.0.is_nan() {
             p
-        } else if cm.is_nan() {
-            (cm, ci)
-        } else if (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
+        } else if cm.is_nan() || (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
             (cm, ci)
         } else {
             p
@@ -16310,12 +16359,8 @@ fn cummaxmin_1d_contiguous_parallel_f32(
             }
             for j in 0..vc.len() {
                 let lv = vc[j];
-                if pm.is_nan() {
-                    vc[j] = pm;
-                    ic[j] = pi;
-                } else if lv.is_nan() {
-                } else if (is_max && lv >= pm) || (!is_max && lv <= pm) {
-                } else {
+                let local_wins = lv.is_nan() || (is_max && lv >= pm) || (!is_max && lv <= pm);
+                if pm.is_nan() || !local_wins {
                     vc[j] = pm;
                     ic[j] = pi;
                 }
@@ -17173,8 +17218,8 @@ fn sort_radix_perm_parallel(keys: &[u64], threads: usize) -> Vec<u32> {
         }
         let mut offs = vec![[0usize; 256]; nch];
         for (c, off) in offs.iter_mut().enumerate() {
+            off.copy_from_slice(&run);
             for b in 0..256 {
-                off[b] = run[b];
                 run[b] += hists[c][b];
             }
         }
@@ -30164,8 +30209,8 @@ pub fn hardswish_tensor_contiguous_f32(
     simd_unary_f32_kernel(input, meta, hardswish_value_f32, move |a| {
         // x<=-3 -> 0 ; x>=3 -> x ; else x*(x+3)/6 (NaN flows to the mid branch -> NaN).
         let mid = (a * (a + three)) / six;
-        let r = a.simd_le(neg3).blend(zero, mid);
-        a.simd_ge(three).blend(a, r)
+        let r = a.simd_le(neg3).select(zero, mid);
+        a.simd_ge(three).select(a, r)
     })
 }
 pub fn hardsigmoid_tensor_contiguous_f32(
@@ -30180,8 +30225,8 @@ pub fn hardsigmoid_tensor_contiguous_f32(
     simd_unary_f32_kernel(input, meta, hardsigmoid_value_f32, move |a| {
         // x<=-3 -> 0 ; x>=3 -> 1 ; else (x+3)/6 (NaN flows to the mid branch -> NaN).
         let mid = (a + three) / six;
-        let r = a.simd_le(neg3).blend(zero, mid);
-        a.simd_ge(three).blend(one, r)
+        let r = a.simd_le(neg3).select(zero, mid);
+        a.simd_ge(three).select(one, r)
     })
 }
 pub fn hardtanh_tensor_contiguous_f32(
@@ -30194,7 +30239,7 @@ pub fn hardtanh_tensor_contiguous_f32(
     simd_unary_f32_kernel(input, meta, hardtanh_value_f32, move |a| {
         // clamp(a, -1, 1): min(max(a,-1),1) is bit-exact for non-NaN; clamp propagates NaN,
         // so force NaN where a is NaN.
-        (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
+        (!a.simd_eq(a)).select(nan, a.max(neg1).min(one))
     })
 }
 define_unary_f32!(
@@ -30273,7 +30318,7 @@ pub fn min_tensor_contiguous_f32(
         },
         |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
         },
     )
 }
@@ -30297,7 +30342,7 @@ pub fn max_tensor_contiguous_f32(
         },
         |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
         },
     )
 }
@@ -30313,7 +30358,7 @@ define_binary_f32!(remainder_tensor_contiguous_f32, |a: f32, b: f32| a
 // ── Comparison ops f32 ──────────────────────────────────────────────────
 
 fn f32_comparison_mask(mask: f32x8) -> f32x8 {
-    mask.blend(f32x8::ONE, f32x8::ZERO)
+    mask.select(f32x8::ONE, f32x8::ZERO)
 }
 
 pub fn eq_tensor_contiguous_f32(
@@ -30921,8 +30966,8 @@ pub fn quantize_rows_i8(x: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
 #[must_use]
 pub fn pack_int8_weights_nr4(w_i8: &[i8], n: usize, k: usize) -> Vec<i8> {
     assert_eq!(w_i8.len(), n * k, "w_i8 length must equal n*k");
-    assert_eq!(n % 4, 0, "pack_int8_weights_nr4 requires n % 4 == 0");
-    assert_eq!(k % 16, 0, "pack_int8_weights_nr4 requires k % 16 == 0");
+    assert!(n.is_multiple_of(4), "pack_int8_weights_nr4 requires n % 4 == 0");
+    assert!(k.is_multiple_of(16), "pack_int8_weights_nr4 requires k % 16 == 0");
     let mut packed = vec![0i8; n * k];
     let chunks = k / 16;
     for g in 0..(n / 4) {
@@ -31148,8 +31193,8 @@ pub fn linear_int8_dynamic_prepacked_f32(
     assert_eq!(x.len(), m * k, "x length must equal m*k");
     assert_eq!(w_packed.len(), n * k, "w_packed length must equal n*k");
     assert_eq!(w_scales.len(), n, "w_scales length must equal n");
-    assert_eq!(n % 4, 0, "prepacked requires n % 4 == 0");
-    assert_eq!(k % 16, 0, "prepacked requires k % 16 == 0");
+    assert!(n.is_multiple_of(4), "prepacked requires n % 4 == 0");
+    assert!(k.is_multiple_of(16), "prepacked requires k % 16 == 0");
     if let Some(b) = bias {
         assert_eq!(b.len(), n, "bias length must equal n");
     }
@@ -34863,8 +34908,8 @@ pub fn nonzero_tensor_contiguous_f64(
             .for_each(|(sub, &start)| {
                 let end = (start + chunk).min(numel);
                 let mut w = 0usize;
-                for flat_idx in start..end {
-                    let val = data[flat_idx];
+                for (relative_idx, &val) in data[start..end].iter().enumerate() {
+                    let flat_idx = start + relative_idx;
                     if val != 0.0 || val.is_nan() {
                         let mut remaining = flat_idx;
                         for stride in strides.iter().take(ndim) {
@@ -35847,11 +35892,11 @@ mod tests {
         };
         let max_simd = |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
         };
         let min_simd = |a: f64x4, b: f64x4| {
             let nan = f64x4::splat(f64::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
         };
         for (name, got, scalar) in [
             (
@@ -35935,11 +35980,11 @@ mod tests {
         };
         let max_simd = |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.max(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.max(b)))
         };
         let min_simd = |a: f32x8, b: f32x8| {
             let nan = f32x8::splat(f32::NAN);
-            (!b.simd_eq(b)).blend(nan, (!a.simd_eq(a)).blend(nan, a.min(b)))
+            (!b.simd_eq(b)).select(nan, (!a.simd_eq(a)).select(nan, a.min(b)))
         };
         for (name, got, scalar) in [
             (
@@ -36005,8 +36050,8 @@ mod tests {
                     let zero = f64x4::splat(0.0);
                     let neg3 = f64x4::splat(-3.0);
                     let mid = (a * (a + three)) / six;
-                    let r = a.simd_le(neg3).blend(zero, mid);
-                    a.simd_ge(three).blend(a, r)
+                    let r = a.simd_le(neg3).select(zero, mid);
+                    a.simd_ge(three).select(a, r)
                 }
                 s
             }),
@@ -36018,8 +36063,8 @@ mod tests {
                     let one = f64x4::splat(1.0);
                     let neg3 = f64x4::splat(-3.0);
                     let mid = (a + three) / six;
-                    let r = a.simd_le(neg3).blend(zero, mid);
-                    a.simd_ge(three).blend(one, r)
+                    let r = a.simd_le(neg3).select(zero, mid);
+                    a.simd_ge(three).select(one, r)
                 }
                 s
             }),
@@ -36028,7 +36073,7 @@ mod tests {
                     let neg1 = f64x4::splat(-1.0);
                     let one = f64x4::splat(1.0);
                     let nan = f64x4::splat(f64::NAN);
-                    (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
+                    (!a.simd_eq(a)).select(nan, a.max(neg1).min(one))
                 }
                 s
             }),
@@ -36088,8 +36133,8 @@ mod tests {
                     let zero = f32x8::splat(0.0f32);
                     let neg3 = f32x8::splat(-3.0f32);
                     let mid = (a * (a + three)) / six;
-                    let r = a.simd_le(neg3).blend(zero, mid);
-                    a.simd_ge(three).blend(a, r)
+                    let r = a.simd_le(neg3).select(zero, mid);
+                    a.simd_ge(three).select(a, r)
                 }
                 s
             }),
@@ -36101,8 +36146,8 @@ mod tests {
                     let one = f32x8::splat(1.0f32);
                     let neg3 = f32x8::splat(-3.0f32);
                     let mid = (a + three) / six;
-                    let r = a.simd_le(neg3).blend(zero, mid);
-                    a.simd_ge(three).blend(one, r)
+                    let r = a.simd_le(neg3).select(zero, mid);
+                    a.simd_ge(three).select(one, r)
                 }
                 s
             }),
@@ -36111,7 +36156,7 @@ mod tests {
                     let neg1 = f32x8::splat(-1.0f32);
                     let one = f32x8::splat(1.0f32);
                     let nan = f32x8::splat(f32::NAN);
-                    (!a.simd_eq(a)).blend(nan, a.max(neg1).min(one))
+                    (!a.simd_eq(a)).select(nan, a.max(neg1).min(one))
                 }
                 s
             }),
@@ -37357,10 +37402,10 @@ mod tests {
             .collect();
         // shared [seq_q, seq_k] mask (stride 0) and a per-Q-head [B*h_q, seq_q, seq_k] mask.
         let mask2d: Vec<f64> = (0..seq_q * seq_k)
-            .map(|i| if i % 3 == 0 { -0.5 } else { 0.0 })
+            .map(|i| if i.is_multiple_of(3) { -0.5 } else { 0.0 })
             .collect();
         let mask3d: Vec<f64> = (0..batch * h_q * seq_q * seq_k)
-            .map(|i| if i % 5 == 0 { -0.7 } else { 0.0 })
+            .map(|i| if i.is_multiple_of(5) { -0.7 } else { 0.0 })
             .collect();
         let scale = 1.0 / (d_k as f64).sqrt();
 
@@ -41694,7 +41739,7 @@ mod tests {
             f64::NEG_INFINITY,
             f64::NAN,
         ];
-        while edges.len() % 4 != 0 {
+        while !edges.len().is_multiple_of(4) {
             edges.push(800.0); // also out of fast range -> keeps the group on the scalar path
         }
         for chunk in edges.chunks_exact(4) {
@@ -50782,6 +50827,60 @@ mod tests {
                     "dbias mismatch for norm_size={norm_size}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn group_norm_forward_channel_blocks_match_elementwise_reference() {
+        let (batch, num_groups, cpg, spatial) = (2usize, 2usize, 3usize, 4usize);
+        let channels = num_groups * cpg;
+        let x: Vec<f32> = (0..batch * channels * spatial)
+            .map(|i| (i as f32 - 10.0) * 0.03125)
+            .collect();
+        let weight: Vec<f32> = (0..channels).map(|c| 0.5 + c as f32 * 0.125).collect();
+        let bias: Vec<f32> = (0..channels).map(|c| -0.3 + c as f32 * 0.0625).collect();
+        let group_numel = cpg * spatial;
+        let inv_m = 1.0 / group_numel as f32;
+        for (weight_arg, bias_arg) in [
+            (None, None),
+            (Some(weight.as_slice()), None),
+            (None, Some(bias.as_slice())),
+            (Some(weight.as_slice()), Some(bias.as_slice())),
+        ] {
+            let got = crate::group_norm_forward_f32(
+                &x, weight_arg, bias_arg, batch, num_groups, cpg, spatial, 1e-5,
+            );
+            let mut want = vec![0.0; x.len()];
+            for group in 0..batch * num_groups {
+                let channel_group = group % num_groups;
+                let base = group * group_numel;
+                let input = &x[base..base + group_numel];
+                let mean = input.iter().copied().sum::<f32>() * inv_m;
+                let variance = input
+                    .iter()
+                    .map(|&value| {
+                        let delta = value - mean;
+                        delta * delta
+                    })
+                    .sum::<f32>();
+                let rstd = 1.0 / (variance * inv_m + 1e-5).sqrt();
+                for i in 0..group_numel {
+                    let channel = channel_group * cpg + i / spatial;
+                    let mut value = (input[i] - mean) * rstd;
+                    if let Some(weights) = weight_arg {
+                        value *= weights[channel];
+                    }
+                    if let Some(biases) = bias_arg {
+                        value += biases[channel];
+                    }
+                    want[base + i] = value;
+                }
+            }
+            assert_eq!(
+                got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                want.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+                "f32 GroupNorm channel blocks must preserve scalar arithmetic"
+            );
         }
     }
 

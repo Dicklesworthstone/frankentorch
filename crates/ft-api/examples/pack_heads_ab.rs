@@ -21,7 +21,7 @@ fn old_pack(values: &[f64], b: usize, s: usize, h: usize, d: usize) -> Vec<f64> 
     packed
 }
 
-fn new_pack(values: &[f64], b: usize, s: usize, h: usize, d: usize) -> Vec<f64> {
+fn new_pack(values: &[f64], _b: usize, s: usize, h: usize, d: usize) -> Vec<f64> {
     let embed = h * d;
     let batch_stride = s * embed;
     let head_stride = s * d;

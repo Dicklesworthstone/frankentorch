@@ -36227,19 +36227,36 @@ impl FrankenTorchSession {
                 #[allow(clippy::cast_possible_truncation)]
                 let eps_f = eps as f32;
                 if !input_grad && !w_grad && !b_grad {
-                    let x = self.tensor_values_f32(input)?;
                     let wv = self.tensor_values_f32(w)?;
                     let bv = self.tensor_values_f32(bs)?;
-                    let sum = ft_kernel_cpu::group_norm_sum_forward_f32(
-                        &x,
-                        Some(&wv),
-                        Some(&bv),
-                        bsz,
-                        ng,
-                        cpg,
-                        sp,
-                        eps_f,
-                    );
+                    // The scalar fused kernel only reads x.  Avoid the full
+                    // tensor_values_f32 allocation/copy for contiguous layouts;
+                    // non-contiguous views keep the materialized fallback.
+                    let sum = if self.tensor_tape.tensor(input)?.meta().is_contiguous() {
+                        let input_tensor = self.tensor_tape.tensor(input)?;
+                        ft_kernel_cpu::group_norm_sum_forward_f32(
+                            input_tensor.contiguous_values_f32()?,
+                            Some(&wv),
+                            Some(&bv),
+                            bsz,
+                            ng,
+                            cpg,
+                            sp,
+                            eps_f,
+                        )
+                    } else {
+                        let x = self.tensor_values_f32(input)?;
+                        ft_kernel_cpu::group_norm_sum_forward_f32(
+                            &x,
+                            Some(&wv),
+                            Some(&bv),
+                            bsz,
+                            ng,
+                            cpg,
+                            sp,
+                            eps_f,
+                        )
+                    };
                     return self.tensor_variable_f32(vec![sum], vec![1], false);
                 }
 
@@ -142037,6 +142054,59 @@ mod tests {
         assert!(
             (got - want).abs() <= 1e-4 + 1e-5 * want.abs(),
             "scalar GroupNorm f32 sum {got} vs materialized {want}"
+        );
+    }
+
+    #[test]
+    fn functional_group_norm_f32_sum_offset_view_matches_materialized_no_grad() {
+        let (n, c, sp, groups) = (2usize, 6usize, 5usize, 3usize);
+        let source_values: Vec<f32> = (0..(n + 1) * c * sp)
+            .map(|i| (i % 17) as f32 * 0.09 - 0.7)
+            .collect();
+        let wv: Vec<f32> = (0..c).map(|j| 0.75 + (j % 4) as f32 * 0.06).collect();
+        let bv: Vec<f32> = (0..c).map(|j| (j % 5) as f32 * 0.04 - 0.08).collect();
+        let eps = 1e-5;
+
+        let run = |scalar_path: bool| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let source = session
+                .tensor_variable_f32(source_values.clone(), vec![n + 1, c, sp], false)
+                .unwrap();
+            let input = session.tensor_narrow(source, 0, 1, n).unwrap();
+            assert!(
+                session
+                    .tensor_tape
+                    .tensor(input)
+                    .unwrap()
+                    .meta()
+                    .storage_offset()
+                    > 0,
+                "narrowed input must preserve a nonzero storage offset"
+            );
+            let weight = session
+                .tensor_variable_f32(wv.clone(), vec![c], false)
+                .unwrap();
+            let bias = session
+                .tensor_variable_f32(bv.clone(), vec![c], false)
+                .unwrap();
+            let loss = if scalar_path {
+                session
+                    .functional_group_norm_sum(input, groups, Some(weight), Some(bias), eps)
+                    .unwrap()
+            } else {
+                let output = session
+                    .functional_group_norm(input, groups, Some(weight), Some(bias), eps)
+                    .unwrap();
+                session.tensor_sum(output).unwrap()
+            };
+            session.tensor_values_f32(loss).unwrap()[0]
+        };
+
+        let got = run(true);
+        let want = run(false);
+        assert!(
+            (got - want).abs() <= 1e-4 + 1e-5 * want.abs(),
+            "offset-view scalar GroupNorm f32 sum {got} vs materialized {want}"
         );
     }
 

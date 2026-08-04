@@ -12,6 +12,7 @@ use ft_core::ExecutionMode;
 
 const R: usize = 4000;
 const C: usize = 4000;
+type ReductionOp = fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> f64;
 
 fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> f64>(
     data: &[f64],
@@ -34,10 +35,7 @@ fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> f64>(
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let data: Vec<f64> = (0..R * C).map(|i| ((i % 17) as f64) - 8.0).collect();
 
-    let ops: Vec<(
-        &str,
-        fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> f64,
-    )> = vec![
+    let ops: Vec<(&str, ReductionOp)> = vec![
         ("sum", |s, x| {
             let r = s.tensor_sum(x).unwrap();
             s.tensor_values(r).unwrap()[0]

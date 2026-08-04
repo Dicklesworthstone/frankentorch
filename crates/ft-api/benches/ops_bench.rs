@@ -2360,12 +2360,8 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
             black_box(legacy_bicubic_public_path(
                 &mut session,
                 black_box(x),
-                n,
-                ch,
-                h,
-                w,
-                h * 2,
-                w * 2,
+                [n, ch, h, w],
+                [h * 2, w * 2],
                 false,
             ))
         });
@@ -2393,12 +2389,8 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
 fn legacy_bicubic_public_path(
     session: &mut FrankenTorchSession,
     input: TensorNodeId,
-    batch: usize,
-    channels: usize,
-    ih: usize,
-    iw: usize,
-    oh: usize,
-    ow: usize,
+    input_shape: [usize; 4],
+    output_shape: [usize; 2],
     align_corners: bool,
 ) -> TensorNodeId {
     #[derive(Clone, Copy)]
@@ -2407,6 +2399,8 @@ fn legacy_bicubic_public_path(
         weights: [f64; 4],
     }
 
+    let [batch, channels, ih, iw] = input_shape;
+    let [oh, ow] = output_shape;
     let storage = session.tensor_values(input).unwrap();
     let total = batch * channels * oh * ow;
     let in_plane = ih * iw;

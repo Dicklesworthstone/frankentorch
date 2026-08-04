@@ -1,6 +1,6 @@
 //! Real-op A/B: in-place tensor_maximum_ on f64. OLD = HEAD's generic path (clone BOTH + serial map
 //! + update), replicated inline; NEW = `s.tensor_maximum_` (added F64 borrow-both+parallel fast path).
-//! Same process, min-9. Run: cargo run --release -p ft-api --example inplace_maxmin_ab
+//!   Same process, min-9. Run: cargo run --release -p ft-api --example inplace_maxmin_ab
 
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;

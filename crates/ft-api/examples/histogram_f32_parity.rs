@@ -10,8 +10,8 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut a: Vec<f32> = (0..n)
         .map(|i| (((i * 2654435761usize) % 800_003) as f32) * 0.00001 - 4.0)
         .collect();
-    for k in 0..16 {
-        a[k] = -2.0 + k as f32 * 0.5;
+    for (k, value) in a.iter_mut().enumerate().take(16) {
+        *value = -2.0 + k as f32 * 0.5;
     } // exact boundaries
     a[20] = 2.0;
     a[21] = -2.0;

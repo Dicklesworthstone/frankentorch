@@ -1,7 +1,7 @@
 //! A/B for tensor_slice_scatter F64. OLD = exact replica of the pre-fix path (CLONE input via to_vec
 //! [serial memcpy] then the serial scatter); NEW = sess.tensor_slice_scatter (borrow + PARALLEL copy
 //! + scatter). NOT an apply_function op, so the clone+serial replica models the real ORIG.
-//! Run: cargo run --release -p ft-api --example slice_scatter_ab
+//!   Run: cargo run --release -p ft-api --example slice_scatter_ab
 
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;

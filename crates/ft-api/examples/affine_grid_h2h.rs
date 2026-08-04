@@ -102,8 +102,7 @@ print("V"," ".join("%.9g"%v for v in o.flatten().tolist()))
         bst
     };
     let (ta, tg) = (tadd(), tag());
-    let py_b = format!(
-        r#"
+    let py_b = r#"
 import time,torch
 torch.set_num_threads(8)
 th=(((torch.arange(16*6,dtype=torch.int64)%6).float())*0.1+0.5).reshape(16,2,3)
@@ -116,7 +115,7 @@ def tm(fn,reps=9):
 print("PT add %.4f"%tm(lambda:big+big))
 print("PT ag %.4f"%tm(lambda:torch.nn.functional.affine_grid(th,[16,3,256,256],align_corners=False)))
 "#
-    );
+    .to_string();
     let mut ch = Command::new(&python)
         .arg("-")
         .stdin(Stdio::piped())
