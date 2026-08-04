@@ -18896,3 +18896,30 @@ masked_fill_tile_matches_expanded_sameshape (tile == manually-tiled same-shape m
 [1,1,S,S]/[S,S]/[1,S,S]). Tests: ft-api + ft-conformance green. ★Both attention masking primitives —
 where(mask,x,-inf) (4af96c05) and scores.masked_fill(mask,-inf) — now fuse the broadcast mask, ~40-80x
 faster + several x faster than torch. AGENT SlateTern.
+
+## 2026-08-04 - KEEP: GroupNorm f32 SIMD and borrowed-input A/B, PyTorch oracle
+
+Workload: no-affine GroupNorm f32 `[16,256,64,64]`, `groups=32`, 31 interleaved
+repetitions; PyTorch oracle
+`/data/projects/.venvs/frankentorch-pytorch-cpu/bin/python`. The rig validates
+eight PyTorch output probes before timing and uses paired bootstrap median 95%
+CIs (2,000 resamples). It has separate A/A null gates for the scalar-vs-SIMD
+and materialized-copy-vs-borrowed axes. The executable was rebuilt under
+`RCH_REQUIRE_REMOTE=1` on compatible worker `vmi1149989`, then the exact ELF
+was executed locally against the oracle.
+
+Run output (`executing_elf_sha256=645da30d2a53d37b4e8dfc7ab9f0f988281fef5c7d1d4c15c789c23891edccbd`):
+
+- Scalar/SIMD A/A: `0.9864`, CI `[0.9447, 1.0419]`, PASS. Scalar `55.8616 ms`,
+  SIMD `8.1710 ms`: `6.8366x`, CI `[6.5775, 7.1255]`, KEEP.
+- Borrow/copy A/A: `1.0311`, CI `[0.9679, 1.0549]`, PASS. Materialized copy
+  `48.5205 ms`, borrowed contiguous input `7.9717 ms`: `6.0866x`, CI
+  `[5.9615, 6.2458]`, KEEP. Outputs are bitwise identical.
+- End-to-end no-grad API timing: FT `3.606 ms`, PyTorch `8.927 ms`, so FT is
+  `2.48x FASTER` on this host. The `cat_anchor` sanity row is FT `9.771 ms`
+  versus PyTorch `33.792 ms`.
+
+Decision: KEEP the already-landed SIMD and contiguous-borrow paths. The next
+GroupNorm performance attempt must target a different measured loss; neither
+the scalar normalization loop nor input materialization remains an acceptable
+incumbent on this workload.
