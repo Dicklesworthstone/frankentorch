@@ -30966,8 +30966,14 @@ pub fn quantize_rows_i8(x: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
 #[must_use]
 pub fn pack_int8_weights_nr4(w_i8: &[i8], n: usize, k: usize) -> Vec<i8> {
     assert_eq!(w_i8.len(), n * k, "w_i8 length must equal n*k");
-    assert!(n.is_multiple_of(4), "pack_int8_weights_nr4 requires n % 4 == 0");
-    assert!(k.is_multiple_of(16), "pack_int8_weights_nr4 requires k % 16 == 0");
+    assert!(
+        n.is_multiple_of(4),
+        "pack_int8_weights_nr4 requires n % 4 == 0"
+    );
+    assert!(
+        k.is_multiple_of(16),
+        "pack_int8_weights_nr4 requires k % 16 == 0"
+    );
     let mut packed = vec![0i8; n * k];
     let chunks = k / 16;
     for g in 0..(n / 4) {
