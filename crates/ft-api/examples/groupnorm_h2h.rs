@@ -197,6 +197,13 @@ print("PT group_norm_probe",*("%.9g"%y.flatten()[i].item() for i in indices))
     );
     let candidate = || group_norm_forward_f32(&x, None, None, N, G, CH / G, H * W, 1e-5);
     let incumbent = || scalar_group_norm_forward_f32(&x, N, G, CH / G, H * W, 1e-5);
+    // The API fast path lends contiguous tensor storage directly to the kernel.  Keep
+    // this explicit copy-arm beside it so the evidence separates compute from the
+    // full-input allocation/copy that a materializing consumer would pay.
+    let materialized = || {
+        let copied = x.clone();
+        group_norm_forward_f32(&copied, None, None, N, G, CH / G, H * W, 1e-5)
+    };
     assert_eq!(
         candidate()
             .iter()
@@ -208,25 +215,49 @@ print("PT group_norm_probe",*("%.9g"%y.flatten()[i].item() for i in indices))
             .collect::<Vec<_>>(),
         "SIMD candidate must preserve the scalar kernel exactly"
     );
+    assert_eq!(
+        candidate()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        materialized()
+            .iter()
+            .map(|value| value.to_bits())
+            .collect::<Vec<_>>(),
+        "borrowing contiguous input must preserve the materialized-copy output exactly"
+    );
     for _ in 0..4 {
         std::hint::black_box(incumbent());
         std::hint::black_box(candidate());
+        std::hint::black_box(materialized());
     }
     let mut null_a = Vec::with_capacity(REPS);
     let mut null_b = Vec::with_capacity(REPS);
     let mut old = Vec::with_capacity(REPS);
     let mut new = Vec::with_capacity(REPS);
+    let mut borrow_null_a = Vec::with_capacity(REPS);
+    let mut borrow_null_b = Vec::with_capacity(REPS);
+    let mut materialized_times = Vec::with_capacity(REPS);
+    let mut borrowed_times = Vec::with_capacity(REPS);
     for sample in 0..REPS {
         if sample.is_multiple_of(2) {
             null_a.push(elapsed_ms(candidate));
             null_b.push(elapsed_ms(candidate));
             old.push(elapsed_ms(incumbent));
             new.push(elapsed_ms(candidate));
+            borrow_null_a.push(elapsed_ms(candidate));
+            borrow_null_b.push(elapsed_ms(candidate));
+            materialized_times.push(elapsed_ms(materialized));
+            borrowed_times.push(elapsed_ms(candidate));
         } else {
             null_b.push(elapsed_ms(candidate));
             null_a.push(elapsed_ms(candidate));
             new.push(elapsed_ms(candidate));
             old.push(elapsed_ms(incumbent));
+            borrow_null_b.push(elapsed_ms(candidate));
+            borrow_null_a.push(elapsed_ms(candidate));
+            borrowed_times.push(elapsed_ms(candidate));
+            materialized_times.push(elapsed_ms(materialized));
         }
     }
     let (null_ratio, null_low, null_high) = median_ratio_ci(&null_a, &null_b);
@@ -237,12 +268,25 @@ print("PT group_norm_probe",*("%.9g"%y.flatten()[i].item() for i in indices))
     } else {
         "REJECT"
     };
+    let (borrow_null_ratio, borrow_null_low, borrow_null_high) =
+        median_ratio_ci(&borrow_null_a, &borrow_null_b);
+    let (borrow_speedup, borrow_speedup_low, borrow_speedup_high) =
+        median_ratio_ci(&materialized_times, &borrowed_times);
+    let borrow_null_pass = borrow_null_low <= 1.0 && borrow_null_high >= 1.0;
+    let borrow_decision = if borrow_null_pass && borrow_speedup_low > 1.0 {
+        "KEEP"
+    } else {
+        "REJECT"
+    };
     let kernel_report = format!(
-        "executing_elf_sha256={}\nworkload=group_norm_f32_no_affine [16,256,64,64] groups=32 reps={REPS}\na_a_median_ratio={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] gate={}\nscalar_ms={:.4} simd_ms={:.4} scalar_over_simd={speedup:.4} ci95=[{speedup_low:.4},{speedup_high:.4}] decision={decision}\n",
+        "executing_elf_sha256={}\nworkload=group_norm_f32_no_affine [16,256,64,64] groups=32 reps={REPS}\na_a_median_ratio={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] gate={}\nscalar_ms={:.4} simd_ms={:.4} scalar_over_simd={speedup:.4} ci95=[{speedup_low:.4},{speedup_high:.4}] decision={decision}\nborrow_a_a_median_ratio={borrow_null_ratio:.4} ci95=[{borrow_null_low:.4},{borrow_null_high:.4}] gate={}\nmaterialized_ms={:.4} borrowed_ms={:.4} materialized_over_borrowed={borrow_speedup:.4} ci95=[{borrow_speedup_low:.4},{borrow_speedup_high:.4}] decision={borrow_decision}\n",
         executable_sha256(),
         if null_pass { "PASS" } else { "FAIL" },
         median(old.clone()),
         median(new.clone()),
+        if borrow_null_pass { "PASS" } else { "FAIL" },
+        median(materialized_times.clone()),
+        median(borrowed_times.clone()),
     );
     if let Ok(target_dir) = std::env::var("CARGO_TARGET_DIR") {
         let _ = std::fs::write(
@@ -255,6 +299,11 @@ print("PT group_norm_probe",*("%.9g"%y.flatten()[i].item() for i in indices))
         "  f32 kernel A/A={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] {} | scalar/SIMD={speedup:.4} ci95=[{speedup_low:.4},{speedup_high:.4}] {}",
         if null_pass { "PASS" } else { "FAIL" },
         decision,
+    );
+    println!(
+        "  f32 borrow A/A={borrow_null_ratio:.4} ci95=[{borrow_null_low:.4},{borrow_null_high:.4}] {} | materialized/borrowed={borrow_speedup:.4} ci95=[{borrow_speedup_low:.4},{borrow_speedup_high:.4}] {}",
+        if borrow_null_pass { "PASS" } else { "FAIL" },
+        borrow_decision,
     );
     println!("op            FT(ms)    PT(ms)   verdict");
     // cat anchor
