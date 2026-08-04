@@ -91,6 +91,14 @@ fn ensure_state_len(
     Ok(())
 }
 
+/// Decode a state-dict field that must survive the f64 round trip exactly.
+///
+/// Deliberately strict: `usize::MAX` (2^64-1) is not representable in f64 and
+/// rounds up to 2^64, so `(usize::MAX as f64) + 1.0` is that same f64 and acts
+/// as an inclusive rejection of the saturating-cast boundary. Decoding 2^64
+/// with an `as` cast would silently yield `usize::MAX`, losing a unit, so it is
+/// refused here. Counters that should clamp rather than be refused use
+/// [`decode_saturating_usize_field`].
 fn decode_exact_usize_field(value: f64, min: usize) -> Option<usize> {
     let upper_exclusive = (usize::MAX as f64) + 1.0;
     if !value.is_finite() || value.fract() != 0.0 || value < 0.0 || value >= upper_exclusive {
@@ -98,6 +106,31 @@ fn decode_exact_usize_field(value: f64, min: usize) -> Option<usize> {
     }
     let decoded = value as usize;
     if decoded < min || decoded as f64 != value {
+        return None;
+    }
+    Some(decoded)
+}
+
+/// Decode a monotonic counter field, clamping instead of refusing.
+///
+/// `state_dict` encodes counters as `usize as f64`, which is lossy above 2^53
+/// and rounds `usize::MAX` up to 2^64. Round-tripping such a state dict through
+/// [`decode_exact_usize_field`] would refuse the value and silently leave the
+/// counter at its default, so a saved run near the counter ceiling would resume
+/// from zero. For a counter that is only ever advanced with `saturating_add`,
+/// clamping a too-large encoding to `usize::MAX` preserves the intended
+/// saturation semantics. Non-integral, negative, or non-finite values are still
+/// refused.
+fn decode_saturating_usize_field(value: f64, min: usize) -> Option<usize> {
+    if !value.is_finite() || value.fract() != 0.0 || value < 0.0 {
+        return None;
+    }
+    let decoded = if value >= usize::MAX as f64 {
+        usize::MAX
+    } else {
+        value as usize
+    };
+    if decoded < min {
         return None;
     }
     Some(decoded)
@@ -158,6 +191,10 @@ fn zero_param_gradients(
     session.tensor_zero_grads(params)
 }
 
+/// Elementwise optimizer passes fan over Rayon at/above this length; below it the
+/// serial loop runs (bit-identical, no thread-pool overhead for tiny params).
+const SGD_STEP_PAR_MIN: usize = 1 << 15;
+
 fn apply_param_update(
     session: &mut FrankenTorchSession,
     param: TensorNodeId,
@@ -168,10 +205,19 @@ fn apply_param_update(
     // `new_values` Vec, and cloning it back in. Bit-for-bit identical
     // (`*p -= u` == `new = p - u`); removes one full param clone + one alloc
     // per call. Every optimizer routed through this helper (SGD, RMSprop,
-    // Adagrad, Adadelta, Adamax, NAdam, RAdam, ...) benefits at once.
+    // Adagrad, Adadelta, Adamax, NAdam, RAdam, ...) benefits at once. The
+    // per-index `*p -= u` fans over Rayon above a threshold (bit-identical).
     session.tensor_update_param_values_f64_with(param, |param_values| {
-        for (p, u) in param_values.iter_mut().zip(update.iter()) {
-            *p -= *u;
+        if param_values.len() >= SGD_STEP_PAR_MIN {
+            use rayon::prelude::*;
+            param_values
+                .par_iter_mut()
+                .zip(update.par_iter())
+                .for_each(|(p, &u)| *p -= u);
+        } else {
+            for (p, u) in param_values.iter_mut().zip(update.iter()) {
+                *p -= *u;
+            }
         }
     })
 }
@@ -391,9 +437,10 @@ impl Optimizer for SGD {
                 session.tensor_update_param_values_f64_with_accumulated_gradient(
                     param,
                     |grad, param_values| {
-                        for ((p, &g), v) in
-                            param_values.iter_mut().zip(grad.iter()).zip(vel.iter_mut())
-                        {
+                        // Per-index-independent (each vel[i] depends only on vel[i]) so the
+                        // update fans over Rayon above a threshold — bit-for-bit identical to
+                        // the serial loop. frankentorch-sgd-step-par.
+                        let compute = |p: &mut f64, g: f64, v: &mut f64| {
                             let original = *p;
                             let mut effective_grad = if maximize { -g } else { g };
                             if weight_decay != 0.0 {
@@ -410,6 +457,20 @@ impl Optimizer for SGD {
                                 lr * *v
                             };
                             *p -= update;
+                        };
+                        if param_values.len() >= SGD_STEP_PAR_MIN {
+                            use rayon::prelude::*;
+                            param_values
+                                .par_iter_mut()
+                                .zip(grad.par_iter())
+                                .zip(vel.par_iter_mut())
+                                .for_each(|((p, &g), v)| compute(p, g, v));
+                        } else {
+                            for ((p, &g), v) in
+                                param_values.iter_mut().zip(grad.iter()).zip(vel.iter_mut())
+                            {
+                                compute(p, g, v);
+                            }
                         }
                     },
                 )?;
@@ -420,13 +481,26 @@ impl Optimizer for SGD {
                 session.tensor_update_param_values_f64_with_accumulated_gradient(
                     param,
                     |grad, param_values| {
-                        for (p, &g) in param_values.iter_mut().zip(grad.iter()) {
+                        // Per-index-independent -> Rayon above a threshold, bit-identical to
+                        // the serial loop. frankentorch-sgd-step-par.
+                        let compute = |p: &mut f64, g: f64| {
                             let original = *p;
                             let mut effective_grad = if maximize { -g } else { g };
                             if weight_decay != 0.0 {
                                 effective_grad += weight_decay * original;
                             }
                             *p -= lr * effective_grad;
+                        };
+                        if param_values.len() >= SGD_STEP_PAR_MIN {
+                            use rayon::prelude::*;
+                            param_values
+                                .par_iter_mut()
+                                .zip(grad.par_iter())
+                                .for_each(|(p, &g)| compute(p, g));
+                        } else {
+                            for (p, &g) in param_values.iter_mut().zip(grad.iter()) {
+                                compute(p, g);
+                            }
                         }
                     },
                 )?;
@@ -4445,7 +4519,10 @@ impl LRScheduler for CyclicLR {
                     }
                 }
                 "iteration" => {
-                    if let Some(iteration) = decode_exact_usize_field(*val, 0) {
+                    // Counter, not a sizing parameter: clamp a too-large
+                    // encoding to usize::MAX rather than refusing it and
+                    // silently resuming from zero.
+                    if let Some(iteration) = decode_saturating_usize_field(*val, 0) {
                         self.iteration = iteration;
                     }
                 }
@@ -6601,6 +6678,10 @@ mod tests {
 
         macro_rules! trial {
             ($name:literal, $opt:expr) => {{
+                // Bind the literal so the `{name}` captures in the assert messages
+                // resolve (was referencing an undefined local -> test module failed to
+                // compile). frankentorch-sgd-step-par.
+                let name = $name;
                 let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
                 let x = session
                     .tensor_variable(vec![1.25, -2.5, 3.75], vec![3], true)

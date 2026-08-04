@@ -1,0 +1,172 @@
+  [2m2026-06-27T00:42:36.545747Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: hz2 at root@178.104.77.29 (1 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:867 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:36.856087Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch-pearlreef-dig-20260626T0720Z (hash: c861e359979da455)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:36.856135Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:38.648823Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker hz2...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:38.648883Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:41.656699Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 3007ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:41.656779Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-api -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-api on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:43.541995Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1885ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:43.542094Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-autograd -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-autograd on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:45.450647Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1908ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:45.450728Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-conformance -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-conformance on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:47.294433Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1843ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:47.294527Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-core -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-core on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:49.169173Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1874ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:49.169255Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-data -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-data on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:51.030430Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1861ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:51.030539Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-device -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-device on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:52.898478Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1867ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:52.898557Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-dispatch -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-dispatch on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:55.010540Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2111ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:55.010642Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-kernel-cpu -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-kernel-cpu on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:56.911173Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1900ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:56.911317Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-nn -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-nn on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:58.849288Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1937ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:42:58.849368Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-optim -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-optim on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:00.682954Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1833ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:00.683085Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-runtime -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-runtime on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:02.556209Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 1873ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:02.556298Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-serialize -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-serialize on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:04.665617Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2109ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:04.665678Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 5281 files, 311647 bytes in 26008ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:486 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:16.028244Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo check -p ft-api --lib[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:16.028316Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/.rch-targets/frankentorch-cod-b -> /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/.rch-target-hz2-pool-888b256ba5e5ea5d9be42a6aa5579373[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cfg-if v1.0.4
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded bytemuck v1.25.0
+  Downloaded either v1.15.0
+  Downloaded rawpointer v0.2.1
+  Downloaded autocfg v1.5.0
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded num-complex v0.4.6
+  Downloaded quote v1.0.45
+  Downloaded num-traits v0.2.19
+  Downloaded unicode-ident v1.0.24
+  Downloaded matrixmultiply v0.3.10
+  Downloaded proc-macro2 v1.0.106
+  Downloaded rayon-core v1.13.0
+  Downloaded safe_arch v0.7.4
+  Downloaded wide v0.7.33
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded half v2.7.1
+  Downloaded libm v0.2.16
+  Downloaded rayon v1.12.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+   Compiling proc-macro2 v1.0.106
+   Compiling unicode-ident v1.0.24
+   Compiling quote v1.0.45
+   Compiling autocfg v1.5.0
+   Compiling crossbeam-utils v0.8.21
+   Compiling zerocopy v0.8.48
+   Compiling rayon-core v1.13.0
+    Checking cfg-if v1.0.4
+   Compiling libm v0.2.16
+    Checking either v1.15.0
+    Checking rawpointer v0.2.1
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+    Checking crossbeam-epoch v0.9.18
+    Checking crossbeam-deque v0.8.6
+   Compiling syn v2.0.117
+    Checking num-complex v0.4.6
+    Checking rayon v1.12.0
+   Compiling bytemuck_derive v1.10.2
+   Compiling zerocopy-derive v0.8.48
+    Checking bytemuck v1.25.0
+    Checking safe_arch v0.7.4
+    Checking wide v0.7.33
+    Checking half v2.7.1
+    Checking ft-core v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-kernel-cpu)
+    Checking ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-runtime)
+    Checking ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-dispatch)
+    Checking ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-autograd)
+    Checking ft-api v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-api)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 14.39s
+  [2m2026-06-27T00:43:32.019887Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 15991ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:653 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:32.020182Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:702 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:32.020198Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z on hz2[0m
+    [2;3mat[0m rch/src/transfer.rs:2246 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:33.993636Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 1973ms (1 files, 1180 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2301 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-27T00:43:33.993655Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 1180 bytes in 1973ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:735 [2;3mon[0m ThreadId(1)
+
+[RCH] remote hz2 (57.5s)

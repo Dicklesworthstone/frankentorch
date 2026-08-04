@@ -1,0 +1,21 @@
+[RCH] local (no admissible workers: insufficient_slots=5,hard_preflight=1)
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-maskfill-baseline-20260626T010143Z/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-maskfill-baseline-20260626T010143Z/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-maskfill-baseline-20260626T010143Z/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-maskfill-baseline-20260626T010143Z/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-maskfill-baseline-20260626T010143Z/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-maskfill-baseline-20260626T010143Z/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1m 06s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/ops_bench-a190a144acc6ac7c)
+Gnuplot not found, using plotters backend
+Benchmarking masked_fill_direct/f64_2000x2000
+Benchmarking masked_fill_direct/f64_2000x2000: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 5.7s or enable flat sampling.
+Benchmarking masked_fill_direct/f64_2000x2000: Collecting 10 samples in estimated 5.6873 s (55 iterations)
+Benchmarking masked_fill_direct/f64_2000x2000: Analyzing
+masked_fill_direct/f64_2000x2000
+                        time:   [26.281 ms 28.667 ms 31.490 ms]
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+

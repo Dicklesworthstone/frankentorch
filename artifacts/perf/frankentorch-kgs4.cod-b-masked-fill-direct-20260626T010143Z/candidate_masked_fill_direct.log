@@ -1,0 +1,17 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1,active_project_exclusion=1)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 0.07s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/ops_bench-a190a144acc6ac7c)
+Gnuplot not found, using plotters backend
+Benchmarking masked_fill_direct/f64_2000x2000
+Benchmarking masked_fill_direct/f64_2000x2000: Warming up for 1.0000 s
+
+Warning: Unable to complete 10 samples in 3.0s. You may wish to increase target time to 4.7s or enable flat sampling.
+Benchmarking masked_fill_direct/f64_2000x2000: Collecting 10 samples in estimated 4.6905 s (55 iterations)
+Benchmarking masked_fill_direct/f64_2000x2000: Analyzing
+masked_fill_direct/f64_2000x2000
+                        time:   [27.531 ms 31.574 ms 37.172 ms]
+                        change: [-20.744% -4.2864% +17.286%] (p = 0.71 > 0.05)
+                        No change in performance detected.
+Found 1 outliers among 10 measurements (10.00%)
+  1 (10.00%) high severe
+

@@ -1,0 +1,251 @@
+  [2m2026-06-26T06:13:00.083020Z[0m [32m INFO[0m [1;32mrch::hook[0m[32m: [32mSelected worker: ovh-a at ubuntu@51.222.245.56 (0 slots remaining after reservation, speed 50.0)[0m
+    [2;3mat[0m rch/src/hook.rs:867 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:00.411353Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mStarting remote compilation pipeline for frankentorch (hash: a66f74c02962d452)[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:241 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:00.411396Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mPrepared dependency sync manifest for 13 roots[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:263 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:01.247043Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSyncing project to worker ovh-a...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:323 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:01.247100Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch -> /data/projects/frankentorch on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:03.777581Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 2530ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:03.777644Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-api -> /data/projects/frankentorch/crates/ft-api on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:04.345286Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 567ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:04.345351Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-autograd -> /data/projects/frankentorch/crates/ft-autograd on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:04.843615Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 498ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:04.843681Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-conformance -> /data/projects/frankentorch/crates/ft-conformance on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:05.415208Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 571ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:05.415296Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-core -> /data/projects/frankentorch/crates/ft-core on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:05.932294Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 516ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:05.932365Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-data -> /data/projects/frankentorch/crates/ft-data on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:06.436280Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 503ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:06.436359Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-device -> /data/projects/frankentorch/crates/ft-device on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:06.943189Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 506ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:06.943263Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-dispatch -> /data/projects/frankentorch/crates/ft-dispatch on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:07.455993Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 512ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:07.456099Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-kernel-cpu -> /data/projects/frankentorch/crates/ft-kernel-cpu on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:08.027381Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 571ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:08.027464Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-nn -> /data/projects/frankentorch/crates/ft-nn on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:08.474893Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 447ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:08.474989Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-optim -> /data/projects/frankentorch/crates/ft-optim on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:09.004782Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 529ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:09.004862Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-runtime -> /data/projects/frankentorch/crates/ft-runtime on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:09.474178Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 469ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:09.474241Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSyncing /data/projects/frankentorch/crates/ft-serialize -> /data/projects/frankentorch/crates/ft-serialize on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:1528 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:09.927705Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mSync completed in 453ms[0m
+    [2;3mat[0m rch/src/transfer.rs:1592 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:09.927747Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mSync complete: 54469 files, 2027690 bytes in 8672ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:486 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:14.211882Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mExecuting command remotely: cargo run --release -p ft-api --example compare_h2h[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:529 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:13:14.211920Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRewriting CARGO_TARGET_DIR for remote execution (worker-scoped path): /data/projects/.rch-targets/frankentorch-cod-b -> /data/projects/frankentorch/.rch-target-ovh-a-pool-f9267e1ec5d1223616a90f276787c4af[0m
+    [2;3mat[0m rch/src/transfer.rs:799 [2;3mon[0m ThreadId(1)
+
+    Updating crates.io index
+ Downloading crates ...
+  Downloaded cast v0.3.0
+  Downloaded bytemuck v1.25.0
+  Downloaded autocfg v1.5.0
+  Downloaded cfg-if v1.0.4
+  Downloaded anes v0.1.6
+  Downloaded bytemuck_derive v1.10.2
+  Downloaded anstyle v1.0.14
+  Downloaded aho-corasick v1.1.4
+  Downloaded either v1.15.0
+  Downloaded itoa v1.0.18
+  Downloaded ciborium v0.2.2
+  Downloaded num-traits v0.2.19
+  Downloaded is-terminal v0.4.17
+  Downloaded plotters-backend v0.3.7
+  Downloaded criterion-plot v0.5.0
+  Downloaded crossbeam-utils v0.8.21
+  Downloaded rawpointer v0.2.1
+  Downloaded same-file v1.0.6
+  Downloaded zmij v1.0.21
+  Downloaded serde v1.0.228
+  Downloaded plotters-svg v0.3.7
+  Downloaded tinytemplate v1.2.1
+  Downloaded walkdir v2.5.0
+  Downloaded ciborium-ll v0.2.2
+  Downloaded ciborium-io v0.2.2
+  Downloaded clap_lex v1.1.0
+  Downloaded num-complex v0.4.6
+  Downloaded oorandom v11.1.5
+  Downloaded crossbeam-epoch v0.9.18
+  Downloaded proc-macro2 v1.0.106
+  Downloaded crossbeam-deque v0.8.6
+  Downloaded once_cell v1.21.4
+  Downloaded unicode-ident v1.0.24
+  Downloaded quote v1.0.45
+  Downloaded serde_derive v1.0.228
+  Downloaded wide v0.7.33
+  Downloaded matrixmultiply v0.3.10
+  Downloaded clap v4.6.1
+  Downloaded serde_core v1.0.228
+  Downloaded safe_arch v0.7.4
+  Downloaded half v2.7.1
+  Downloaded rayon-core v1.13.0
+  Downloaded zerocopy-derive v0.8.48
+  Downloaded serde_json v1.0.149
+  Downloaded memchr v2.8.0
+  Downloaded criterion v0.5.1
+  Downloaded itertools v0.10.5
+  Downloaded libm v0.2.16
+  Downloaded regex v1.12.3
+  Downloaded plotters v0.3.7
+  Downloaded rayon v1.12.0
+  Downloaded clap_builder v4.6.0
+  Downloaded zerocopy v0.8.48
+  Downloaded syn v2.0.117
+  Downloaded regex-syntax v0.8.10
+  Downloaded regex-automata v0.4.14
+  Downloaded libc v0.2.185
+   Compiling proc-macro2 v1.0.106
+   Compiling quote v1.0.45
+   Compiling unicode-ident v1.0.24
+   Compiling autocfg v1.5.0
+   Compiling zerocopy v0.8.48
+   Compiling crossbeam-utils v0.8.21
+   Compiling cfg-if v1.0.4
+   Compiling rayon-core v1.13.0
+   Compiling either v1.15.0
+   Compiling serde_core v1.0.228
+   Compiling libm v0.2.16
+   Compiling zmij v1.0.21
+   Compiling serde v1.0.228
+   Compiling rawpointer v0.2.1
+   Compiling serde_json v1.0.149
+   Compiling libc v0.2.185
+   Compiling anstyle v1.0.14
+   Compiling ciborium-io v0.2.2
+   Compiling regex-syntax v0.8.10
+   Compiling itoa v1.0.18
+   Compiling plotters-backend v0.3.7
+   Compiling clap_lex v1.1.0
+   Compiling memchr v2.8.0
+   Compiling itertools v0.10.5
+   Compiling cast v0.3.0
+   Compiling same-file v1.0.6
+   Compiling oorandom v11.1.5
+   Compiling clap_builder v4.6.0
+   Compiling num-traits v0.2.19
+   Compiling matrixmultiply v0.3.10
+   Compiling plotters-svg v0.3.7
+   Compiling walkdir v2.5.0
+   Compiling once_cell v1.21.4
+   Compiling anes v0.1.6
+   Compiling crossbeam-epoch v0.9.18
+   Compiling syn v2.0.117
+   Compiling crossbeam-deque v0.8.6
+   Compiling is-terminal v0.4.17
+   Compiling regex-automata v0.4.14
+   Compiling num-complex v0.4.6
+   Compiling plotters v0.3.7
+   Compiling rayon v1.12.0
+   Compiling criterion-plot v0.5.0
+   Compiling clap v4.6.1
+   Compiling regex v1.12.3
+   Compiling bytemuck_derive v1.10.2
+   Compiling zerocopy-derive v0.8.48
+   Compiling serde_derive v1.0.228
+   Compiling bytemuck v1.25.0
+   Compiling safe_arch v0.7.4
+   Compiling wide v0.7.33
+   Compiling tinytemplate v1.2.1
+   Compiling half v2.7.1
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling ciborium-ll v0.2.2
+   Compiling ciborium v0.2.2
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch/crates/ft-runtime)
+   Compiling criterion v0.5.1
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 54.08s
+     Running `.rch-target-ovh-a-pool-f9267e1ec5d1223616a90f276787c4af/release/examples/compare_h2h`
+Traceback (most recent call last):
+  File "<stdin>", line 2, in <module>
+ModuleNotFoundError: No module named 'torch'
+op            FT(ms)    PT(ms)   ratio(PT/FT, <1=FT slower)
+  [2m2026-06-26T06:14:15.888825Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRemote command finished: exit=0 in 61676ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:653 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:15.889149Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mRetrieving build artifacts...[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:702 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:15.889168Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankentorch on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:2246 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:16.368483Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 479ms (1 files, 1759 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2301 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:16.368505Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mArtifacts retrieved: 1 files, 1759 bytes in 479ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:735 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:16.368622Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mRetrieving artifacts from /data/projects/frankentorch/.rch-target-ovh-a-pool-f9267e1ec5d1223616a90f276787c4af on ovh-a[0m
+    [2;3mat[0m rch/src/transfer.rs:2246 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:20.720504Z[0m [32m INFO[0m [1;32mrch::transfer[0m[32m: [32mArtifacts retrieved in 4351ms (131 files, 782538 bytes)[0m
+    [2;3mat[0m rch/src/transfer.rs:2301 [2;3mon[0m ThreadId(1)
+
+  [2m2026-06-26T06:14:20.720529Z[0m [32m INFO[0m [1;32mrch::hook::transfer_orchestration[0m[32m: [32mCustom CARGO_TARGET_DIR artifacts retrieved: 131 files, 782538 bytes in 4351ms[0m
+    [2;3mat[0m rch/src/hook/transfer_orchestration.rs:859 [2;3mon[0m ThreadId(1)
+
+[RCH] remote ovh-a (80.6s)

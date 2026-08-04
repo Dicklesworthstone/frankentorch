@@ -9,7 +9,7 @@
 use std::fmt;
 
 use rayon::prelude::*;
-use wide::{f32x8, f64x4};
+use wide::{CmpEq, CmpGe, CmpGt, CmpLe, CmpLt, f32x8, f64x4};
 
 const BATCH_NORM_MIN_PAR_ROWS: usize = 8;
 
@@ -29,14 +29,18 @@ mod gemm {
     // row count, so the parallel result is bit-for-bit identical to the single
     // call (proved by `gemm_row_split_matches_single_bit_exact`).
     // Row-block parallelism pays once a block carries enough work to dwarf the
-    // rayon dispatch cost. The previous 1<<29 (~537M FMA) gate left medium GEMMs
-    // single-threaded on multi-core hosts — notably the conv2d im2col matmul
-    // (M=4096,K=576,N=64 ≈ 151M FMA) and a 512×512 matmul (134M) — so all but
-    // one core sat idle. 1<<27 (~134M) brings both under the parallel path while
-    // keeping genuinely small matmuls (≤256×256 ≈ 16.7M) serial. The split is
-    // bit-for-bit identical to the single call regardless of block count
-    // (proved by `gemm_row_split_matches_single_bit_exact`).
-    const PAR_MIN_FLOPS: u128 = 1 << 27;
+    // rayon dispatch cost. History: 1<<29 (~537M) -> 1<<27 (~134M). But 1<<27 is a
+    // 512×512×512 GEMM — while the comment's OWN stated intent was "keep ≤256×256
+    // (16.7M) serial", 1<<27 ALSO left the entire 256..512 range single-threaded on
+    // these many-core hosts. Measured (64-core worker, matrixmultiply, min-of-11,
+    // f32 AND f64) — all of these ran SERIAL under 1<<27 yet are much faster
+    // row-split: 256³ (17M) 1.5-1.7x, 320³ (33M) 2.3-2.6x, 384³ (57M) 3.2-3.9x,
+    // 1024×512×128 (67M) 4.6-8x FASTER. Corrected to 1<<24 (16.7M = 256×256×256) to
+    // match the stated intent: parallelize m·k·n ≥ 256³, keep smaller serial
+    // (192³ ≈ 7M was ~parity, 128³ ≈ 4M regressed 0.84x). The split is bit-for-bit
+    // identical to the single call regardless of block count (proved by
+    // `gemm_row_split_matches_single_bit_exact`). frankentorch-kgs4-parmin.
+    const PAR_MIN_FLOPS: u128 = 1 << 24;
     // A TALL GEMM (many rows, modest total flops) can sit below PAR_MIN_FLOPS yet
     // still split into plenty of well-sized row blocks — e.g. an attention/linear
     // projection `[batch*S, embed] @ [embed, embed]` at large S (M = batch*S).
@@ -53,6 +57,34 @@ mod gemm {
     // n2048 sgemm 0.81x). Above this K, keep the 1-D row split. K <= 1024 covers the
     // measured wins (sgemm 1.10-1.45x, sgemm_bt 1.02-1.25x). frankentorch-kgs4.48.
     const F32_2D_MAX_K: usize = 1024;
+    // The 1536 cap above was justified by "large-K square sgemm regresses (m2048 k2048
+    // n2048, 0.81x)". Re-measured 2026-07-10 on a 32-core Zen3 (x86-64-v3, 32 rayon
+    // threads, interleaved, min-of-9): that shape is **1.27x FASTER** 2-D tiled, and
+    // `[1500,5120]x[5120,1280]` (large-v3-turbo's encoder MLP fc2, the only franken
+    // shape the cap excluded) is **1.18-1.24x faster**. Both are BIT-EXACT vs the 1-D
+    // row split: every output element's full k-accumulation still happens inside ONE
+    // serial micro-kernel call, and neither the row nor the column count changes that
+    // order (same invariant as `gemm_row_split_matches_single_bit_exact`).
+    //
+    // Mechanism the old cap missed: gating on K alone is wrong. What decides whether
+    // the 1-D row split hurts is the size of B (k*n*4 bytes) that EVERY thread must
+    // re-stream — fc2's B is 26.2 MB, re-streamed 32x = 839 MB. The 2-D grid cuts that
+    // by the column-block count. K is only a proxy, and a bad one for wide-N shapes.
+    //
+    // Kill-switch: `FT_SGEMM_2D_LARGE_K=0` restores the historical 1536 bound.
+    const F32_2D_TALL_MAX_K_DEFAULT: usize = 8192;
+    const F32_2D_TALL_MAX_K_LEGACY: usize = 1536;
+
+    fn f32_2d_tall_max_k() -> usize {
+        static K: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        *K.get_or_init(|| {
+            if std::env::var("FT_SGEMM_2D_LARGE_K").is_ok_and(|v| v == "0") {
+                F32_2D_TALL_MAX_K_LEGACY
+            } else {
+                F32_2D_TALL_MAX_K_DEFAULT
+            }
+        })
+    }
 
     fn should_parallelize(m: usize, k: usize, n: usize) -> bool {
         let flops = (m as u128) * (k as u128) * (n as u128);
@@ -64,6 +96,14 @@ mod gemm {
     fn block_rows(m: usize) -> usize {
         let threads = rayon::current_num_threads().max(1);
         m.div_ceil(threads).max(MIN_BLOCK_ROWS)
+    }
+
+    fn should_use_f32_reused_output_2d_tiling(m: usize, k: usize, n: usize) -> bool {
+        n >= 2 * MIN_BLOCK_COLS
+            && k > F32_2D_MAX_K
+            && k <= f32_2d_tall_max_k()
+            && m >= TALL_MIN_ROWS
+            && n >= TALL_MIN_ROWS
     }
 
     pub fn dgemm(m: usize, k: usize, n: usize, a: &[f64], b: &[f64], c: &mut [f64]) {
@@ -756,10 +796,23 @@ mod gemm {
     // Shared M×N tile grid: ~sqrt(threads) blocks per axis (minimises B+A traffic
     // for square shapes), clamped to the GEMM block-size floors. Returns the block
     // extents and the list of (i0,j0) tile origins — disjoint rectangles tiling C.
+    /// Rows x cols of the 2-D tile grid. See [`crate::set_sgemm_tile_balanced`].
+    ///
+    /// Historical: `p = floor(sqrt(T))`, `q = ceil(T/p)` — but `p*q != T` for many T, e.g.
+    /// T=32 -> 5x7 = 35 tiles on 32 threads (a 3-tile straggler wave). Balanced: `p` = the
+    /// largest divisor of T that is <= sqrt(T), so `p*q == T`. Both are bit-exact.
+    pub(crate) fn tile_grid(threads: usize) -> (usize, usize) {
+        let lim = (threads as f64).sqrt().floor().max(1.0) as usize;
+        if crate::sgemm_tile_balanced() {
+            let p = (1..=lim).filter(|c| threads % c == 0).max().unwrap_or(1);
+            return (p, threads / p);
+        }
+        (lim, threads.div_ceil(lim))
+    }
+
     fn tile_shape(m: usize, n: usize) -> (usize, usize) {
         let threads = rayon::current_num_threads().max(1);
-        let p = (threads as f64).sqrt().floor().max(1.0) as usize; // M-blocks
-        let q = threads.div_ceil(p); // N-blocks
+        let (p, q) = tile_grid(threads);
         let mb = m.div_ceil(p).max(MIN_BLOCK_ROWS);
         let nb = n.div_ceil(q).max(MIN_BLOCK_COLS);
         (mb, nb)
@@ -940,8 +993,8 @@ mod gemm {
     mod tile_iso_tests {
         use super::{
             dgemm_2d_parallel, dgemm_block, dgemm_bt_2d_parallel, dgemm_bt_block,
-            dgemm_col_parallel, sgemm_2d_parallel, sgemm_block, sgemm_bt_2d_parallel,
-            sgemm_bt_block, sgemm_col_parallel,
+            dgemm_col_parallel, sgemm, sgemm_2d_parallel, sgemm_block, sgemm_bt_2d_parallel,
+            sgemm_bt_block, sgemm_col_parallel, sgemm_reused_output,
         };
 
         const SHAPES: &[(usize, usize, usize)] = &[
@@ -994,6 +1047,31 @@ mod gemm {
                 assert!(
                     s3.iter().zip(&t3).all(|(x, y)| x.to_bits() == y.to_bits()),
                     "sgemm_bt {m}x{k}x{n}"
+                );
+            }
+        }
+
+        #[test]
+        fn sgemm_reused_output_tall_2d_matches_standard_route() {
+            let (m, k, n) = (1024usize, 1025usize, 1024usize);
+            let a: Vec<f32> = (0..m * k)
+                .map(|i| ((i % 19) as f32 - 9.0) * 0.03125 + (i as f32) * 1e-7)
+                .collect();
+            let b: Vec<f32> = (0..k * n)
+                .map(|i| ((i % 23) as f32 - 11.0) * 0.015625 - (i as f32) * 1e-7)
+                .collect();
+
+            let mut standard = vec![0.0_f32; m * n];
+            sgemm(m, k, n, &a, &b, &mut standard);
+
+            let mut reused = vec![f32::NAN; m * n];
+            sgemm_reused_output(m, k, n, &a, &b, &mut reused);
+
+            for (idx, (s, r)) in standard.iter().zip(&reused).enumerate() {
+                assert_eq!(
+                    s.to_bits(),
+                    r.to_bits(),
+                    "reused-output sgemm diverged at {idx}: standard {s} vs reused {r}"
                 );
             }
         }
@@ -1127,6 +1205,20 @@ mod gemm {
             }
         } else {
             sgemm_block_scaled(m, k, n, alpha, a, b, c);
+        }
+    }
+
+    pub fn sgemm_reused_output(m: usize, k: usize, n: usize, a: &[f32], b: &[f32], c: &mut [f32]) {
+        if should_parallelize(m, k, n)
+            && !should_parallelize_cols(m, k, n)
+            && should_use_f32_reused_output_2d_tiling(m, k, n)
+        {
+            let a = &a[..m * k];
+            let b = &b[..k * n];
+            let c = &mut c[..m * n];
+            sgemm_2d_parallel(m, k, n, a, b, c);
+        } else {
+            sgemm(m, k, n, a, b, c);
         }
     }
 
@@ -2267,18 +2359,6 @@ fn checked_mul(lhs: usize, rhs: usize, context: &'static str) -> Result<usize, K
         .ok_or(KernelError::ShapeOverflow { context })
 }
 
-fn checked_contiguous_range(
-    outer: usize,
-    block_len: usize,
-    context: &'static str,
-) -> Result<std::ops::Range<usize>, KernelError> {
-    let start = checked_mul(outer, block_len, context)?;
-    let end = start
-        .checked_add(block_len)
-        .ok_or(KernelError::ShapeOverflow { context })?;
-    Ok(start..end)
-}
-
 fn checked_dim_loop_sizes(
     shape: &[usize],
     dim: usize,
@@ -2291,6 +2371,135 @@ fn checked_dim_loop_sizes(
 }
 
 const PARALLEL_THRESHOLD: usize = 8192;
+
+// A 1-D single-lane (contiguous, inner_size==1) cummax/cummin scan is inherently serial in
+// the naive form, but max/min are EXACTLY associative and the tie-keeps-latest + NaN-freeze
+// rule composes as a serial prefix-fold over per-chunk finals — so a 3-pass chunked scan is
+// BIT-FOR-BIT identical and 2-3.6x faster than serial (torch's 1-D cummax is single-threaded,
+// ~146ms/16M). The 3-pass overhead (2 passes over N + prefix) needs a large lane to pay:
+// measured 128K=0.34x, 256K=1.08x, 512K=2.01x, 1M=3.2x, 16M=3.6x. Gate at 512K.
+const CUM_SCAN_1D_PARALLEL_MIN: usize = 1 << 19; // 524288
+
+// Gate for PURE-COPY / broadcast-fill MATERIALIZATION (narrow, expand): these do
+// NO per-element compute (just `copy_from_slice` / `fill`), so a single thread
+// already saturates memory bandwidth — rayon adds only overhead. Measured
+// (fresh `vec![0.0;n]` + `par_chunks_mut` copy, 64t, min-21): parallel is 3-12x
+// SLOWER than serial across [8K, 4M] elems, and only WINS at >=~4M (32MB), where
+// the win is parallel FIRST-TOUCH of the lazy-`calloc` output (serial first-touch
+// is the bottleneck, not the copy). So gate these at the fault-parallelism
+// crossover, NOT the compute default `PARALLEL_THRESHOLD` (8192) which regressed
+// every medium copy. frankentorch-kgs4-copygate.
+const COPY_MATERIALIZE_PARALLEL_MIN: usize = 1 << 22; // ~4.19M elems (~32MB f64)
+
+/// Build a length-`numel` `Vec<T>` by having `fill` write EVERY element into an
+/// UNINITIALIZED buffer — no dead value/zero-init pass, so a parallel `fill` is the sole
+/// writer and also does the page FIRST-TOUCH. Generalizes the expand/transpose materialize
+/// wins to any full-overwrite fill (e.g. the permute TILE transpose, which otherwise pays a
+/// `(0..numel).into_par_iter().map(|_| src[0]).collect()` first-touch pass = a SECOND full
+/// write of the output that the fill then overwrites — `build_uninit` does N writes, not 2N).
+///
+/// CONTRACT (this is a safe fn; the caller upholds these, mirroring the shipped
+/// expand/transpose kernels that use the same `with_capacity` + `set_len` + fill pattern):
+/// - `fill` MUST write all `numel` elements before returning.
+/// - `fill` MUST NOT read from the slice before writing a given element (it is uninitialized).
+/// - `T` is a plain numeric storage element (no invalid bit patterns) — every `TensorStorage`
+///   element type (f32/f64/half/complex/i8/u8) qualifies.
+#[allow(unsafe_code)]
+pub fn build_uninit<T: Copy, F: FnOnce(&mut [T])>(numel: usize, fill: F) -> Vec<T> {
+    let mut v: Vec<T> = Vec::with_capacity(numel);
+    // SAFETY: capacity == numel; `fill` initializes all `numel` elements (contract) before `v`
+    // is observed/returned. `T: Copy` has no `Drop`, so `set_len` over previously-uninitialized
+    // slots is sound, and if `fill` panics mid-way the (Drop-free) elements are simply freed —
+    // no drop of uninitialized memory.
+    unsafe {
+        v.set_len(numel);
+    }
+    fill(&mut v);
+    v
+}
+
+/// Row-structured broadcast-expand materialization (`expand`/`broadcast_to`),
+/// building the output into an UNINITIALIZED buffer so the fill also does the
+/// page FIRST-TOUCH.
+///
+/// The old ft-autograd path did `vec![values[0]; output_numel]` (a full serial
+/// first-touch of the fresh lazy-`calloc` output) and then overwrote EVERY
+/// element with the per-row `fill`/`copy_from_slice` — so the init was 100% dead
+/// AND single-threaded, and single-threaded first-touch is the wall for these
+/// pure-copy materializations (see `COPY_MATERIALIZE_PARALLEL_MIN`). ft-autograd
+/// is `#![forbid(unsafe_code)]`, so it could not drop the init; here we allocate
+/// with `Vec::with_capacity` + `set_len` and let the fill be the sole (and, at
+/// scale, parallel) writer — parallel first-touch, no dead serial pass.
+///
+/// The output is BIT-IDENTICAL to the vec-init path (same source value at every
+/// position — see the row/inner unravel below). `T: Copy` so no Drop concerns.
+#[allow(unsafe_code)]
+pub fn expand_row_structured<T: Copy + Send + Sync>(
+    values: &[T],
+    output_numel: usize,
+    target_shape: &[usize],
+    input_strides: &[usize],
+) -> Vec<T> {
+    let nd = target_shape.len();
+    debug_assert!(nd >= 1 && !values.is_empty() && output_numel > 0);
+    let inner = target_shape[nd - 1];
+    let inner_stride = input_strides[nd - 1];
+    // Outer-space strides over the first nd-1 dims (row index r unravels into outer coords).
+    let mut outer_strides = vec![1usize; nd.saturating_sub(1)];
+    for d in (0..nd.saturating_sub(1)).rev() {
+        if d + 1 < nd - 1 {
+            outer_strides[d] = outer_strides[d + 1] * target_shape[d + 1];
+        }
+    }
+    let row_base = |r: usize| -> usize {
+        let mut idx = 0usize;
+        for d in 0..nd - 1 {
+            let c = (r / outer_strides[d]) % target_shape[d];
+            idx += c * input_strides[d];
+        }
+        idx
+    };
+    let fill_row = |r: usize, row: &mut [T]| {
+        let base = row_base(r);
+        if inner_stride == 0 {
+            row.fill(values[base]);
+        } else {
+            row.copy_from_slice(&values[base..base + inner]);
+        }
+    };
+    let mut output: Vec<T> = Vec::with_capacity(output_numel);
+    // SAFETY: capacity == output_numel. `output_numel == num_rows * inner` (inner is the
+    // last target dim), so `chunks_mut(inner)` yields exactly `num_rows` chunks that
+    // together cover every element, and `fill_row` writes each chunk in full
+    // (`fill`/`copy_from_slice` of length `inner`). Thus every element in
+    // `0..output_numel` is initialized before the Vec is read or returned. `T: Copy`
+    // has no Drop, so `set_len` over previously-uninitialized slots is sound.
+    unsafe {
+        output.set_len(output_numel);
+    }
+    if output_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        output
+            .par_chunks_mut(inner)
+            .enumerate()
+            .for_each(|(r, row)| fill_row(r, row));
+    } else {
+        for (r, row) in output.chunks_mut(inner).enumerate() {
+            fill_row(r, row);
+        }
+    }
+    output
+}
+
+// Pooling forwards (avg/max_pool2d) fan out over planes with `par_chunks_mut(oh*ow)`
+// but had NO size gate — so small CNN feature maps (e.g. ResNet 512ch x 28x28, which
+// is a REAL training shape) ran 0.32-0.81x SLOWER than serial: rayon fork/join over
+// tiny cache-resident planes costs more than the window reduces save. The per-output
+// work is a `kh*kw`-wide reduce, so the crossover tracks TOTAL INPUT READS
+// (out.len() * kh * kw), not output numel — larger kernels do more work per output and
+// parallelise sooner. Measured crossover ~2.1M reads (1.6M reads = 0.81x SLOW,
+// 3.2M reads = 1.36-2.63x FAST). Gate on `out.len() * kh * kw >= this`.
+const POOL_FWD_PARALLEL_MIN: usize = 1 << 21; // ~2.1M input reads
 
 // The SIMD unary ops (relu/sqrt/reciprocal/...) were SERIAL while the scalar-map
 // unary path (exp/tanh/...) parallelises — so relu was ~36-59x slower than torch
@@ -2351,6 +2560,20 @@ where
     unary_f64_with_threshold(input, meta, op, PARALLEL_THRESHOLD)
 }
 
+/// Like [`unary_f64`] but for the CHEAP BANDWIDTH-bound element ops (floor/ceil/round/sign/trunc/
+/// frac — a single rounding instruction or a couple of compares). Per-element cost is tiny, so the
+/// only parallel benefit is fault-parallel first-touch of the fresh output (par_iter map-collect) —
+/// a copy-tier crossover (~4M). `SCALAR_UNARY_PARALLEL_THRESHOLD` (524288, tuned for the medium
+/// transcendentals `unary_f64` also serves) is far too low here: an anchored A/B (x*x, same cheap
+/// class) measures 0.01x@512K / 0.04x@1M (100x/25x SLOWER parallel) below ~4M. So gate at
+/// `COPY_MATERIALIZE_PARALLEL_MIN`, the same tier as clamp/where/outer/pow-trivial. (BlackThrush)
+fn unary_f64_bandwidth<F>(input: &[f64], meta: &TensorMeta, op: F) -> Result<Vec<f64>, KernelError>
+where
+    F: Fn(f64) -> f64 + Sync,
+{
+    unary_f64_with_threshold(input, meta, op, COPY_MATERIALIZE_PARALLEL_MIN)
+}
+
 fn unary_f64_with_threshold<F>(
     input: &[f64],
     meta: &TensorMeta,
@@ -2381,6 +2604,7 @@ where
     }
 }
 
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn simd_unary_f64<F, S>(window: &[f64], scalar_op: F, simd_op: S) -> Vec<f64>
 where
     F: Fn(f64) -> f64 + Sync,
@@ -2811,21 +3035,21 @@ pub fn floor_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.floor())
+    unary_f64_bandwidth(input, meta, |value| value.floor())
 }
 
 pub fn ceil_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.ceil())
+    unary_f64_bandwidth(input, meta, |value| value.ceil())
 }
 
 pub fn round_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, round_ties_even_f64)
+    unary_f64_bandwidth(input, meta, round_ties_even_f64)
 }
 
 pub fn log2_tensor_contiguous_f64(
@@ -2860,21 +3084,21 @@ pub fn sign_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, torch_sign_f64)
+    unary_f64_bandwidth(input, meta, torch_sign_f64)
 }
 
 pub fn trunc_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.trunc())
+    unary_f64_bandwidth(input, meta, |value| value.trunc())
 }
 
 pub fn frac_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, |value| value.fract())
+    unary_f64_bandwidth(input, meta, |value| value.fract())
 }
 
 pub fn asin_tensor_contiguous_f64(
@@ -2964,25 +3188,52 @@ pub fn erfc_tensor_contiguous_f64(
     unary_f64_compute_bound(input, meta, erfc_value)
 }
 
+// f64 siblings of the f32 hard* SIMD kernels: route through simd_unary_f64_kernel (the f64x4
+// path relu_f64 uses) instead of the scalar unary_f64 loop. PIECEWISE-LINEAR so the SIMD op
+// reproduces the scalar value fn's EXACT f64 arithmetic + clamp branches lanewise; NaN flows to
+// the mid/clamp branch (-> NaN). wide f64x4::max/min are fmax/fmin-faithful (verified by the f64
+// max/min kernel). Bit-exactness guarded by hard_activation_f64_simd_matches_scalar.
 pub fn hardswish_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, hardswish_value)
+    let three = f64x4::splat(3.0);
+    let six = f64x4::splat(6.0);
+    let zero = f64x4::splat(0.0);
+    let neg3 = f64x4::splat(-3.0);
+    simd_unary_f64_kernel(input, meta, hardswish_value, move |a| {
+        let mid = (a * (a + three)) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(a, r)
+    })
 }
 
 pub fn hardsigmoid_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, hardsigmoid_value)
+    let three = f64x4::splat(3.0);
+    let six = f64x4::splat(6.0);
+    let zero = f64x4::splat(0.0);
+    let one = f64x4::splat(1.0);
+    let neg3 = f64x4::splat(-3.0);
+    simd_unary_f64_kernel(input, meta, hardsigmoid_value, move |a| {
+        let mid = (a + three) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(one, r)
+    })
 }
 
 pub fn hardtanh_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    unary_f64(input, meta, hardtanh_value)
+    let neg1 = f64x4::splat(-1.0);
+    let one = f64x4::splat(1.0);
+    let nan = f64x4::splat(f64::NAN);
+    simd_unary_f64_kernel(input, meta, hardtanh_value, move |a| {
+        (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+    })
 }
 
 pub fn softplus_tensor_contiguous_f64(
@@ -3042,21 +3293,43 @@ pub fn pow_tensor_contiguous_f64(
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
 
-    // powf is ~exp+log per element (compute-bound), so spread it across the
-    // rayon pool for large tensors; torch's pow is multi-threaded. The map is a
-    // pure per-element function, so the parallel result is bit-identical to the
-    // serial one (no accumulation order to disturb).
-    if numel >= PARALLEL_THRESHOLD {
-        Ok(window
-            .par_iter()
-            .map(|value| powf_torch_signed_zero_f64(*value, exponent))
-            .collect())
-    } else {
-        Ok(window
-            .iter()
-            .map(|value| powf_torch_signed_zero_f64(*value, exponent))
-            .collect())
+    // The general powf is ~exp+log per element (compute-bound → gate at PARALLEL_THRESHOLD), but
+    // the trivial-exponent elisions below (x, x*x, x*x*x, 1/x) are cheap bandwidth-bound WRITES
+    // that over-parallelize at 8192 (measured x^2 1M 0.04x = 25x SLOWER, crossover ~4M) — so each
+    // caller passes its own `parallel_min`. Pure per-element map → bit-identical serial/parallel.
+    #[inline]
+    fn run<F: Fn(f64) -> f64 + Sync>(
+        window: &[f64],
+        numel: usize,
+        parallel_min: usize,
+        f: F,
+    ) -> Vec<f64> {
+        if numel >= parallel_min {
+            window.par_iter().map(|&v| f(v)).collect()
+        } else {
+            window.iter().map(|&v| f(v)).collect()
+        }
     }
+    // Trivial-exponent elision (f64 sibling of the f32 kgs4.171 fix): torch
+    // special-cases integer exponents to repeated multiplication, and ft's powf was
+    // 1 ULP off torch for 6/20011 values at exp=2. x^1=x, x^2=x*x, x^3=x*x*x,
+    // x^-1=1/x are BIT-EXACT vs torch f64 (verified pow_f64_probe over 20k vals incl
+    // ±0/±inf/NaN/1e±300) and skip the powf cost. 0.5 is NOT elided — torch f64
+    // pow(.,0.5) != sqrt bit-for-bit (138/20k ULP diffs). frankentorch-kgs4.172.
+    let out = if exponent == 1.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v)
+    } else if exponent == 2.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v)
+    } else if exponent == 3.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v * v)
+    } else if exponent == -1.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| 1.0 / v)
+    } else {
+        run(window, numel, PARALLEL_THRESHOLD, |v| {
+            powf_torch_signed_zero_f64(v, exponent)
+        })
+    };
+    Ok(out)
 }
 
 pub fn clamp_tensor_contiguous_f64(
@@ -3075,27 +3348,35 @@ pub fn clamp_tensor_contiguous_f64(
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
 
-    Ok(window
-        .iter()
-        .map(|value| {
-            // clamp is min(max(x, min_val), max_val): lower bound first,
-            // then upper, so when min_val > max_val the upper bound wins.
-            if value.is_nan() {
-                f64::NAN
+    // clamp is min(max(x, min_val), max_val): lower bound first, then upper, so when
+    // min_val > max_val the upper bound wins. Bit-for-bit identical to the serial map (index
+    // order preserved by the indexed parallel collect). clamp is hot (clamp_min/max, logit-eps,
+    // grad clipping, norms).
+    let clamp_one = |value: &f64| -> f64 {
+        if value.is_nan() {
+            f64::NAN
+        } else {
+            let lo = if !min_val.is_nan() && *value < min_val {
+                min_val
             } else {
-                let lo = if !min_val.is_nan() && *value < min_val {
-                    min_val
-                } else {
-                    *value
-                };
-                if !max_val.is_nan() && lo > max_val {
-                    max_val
-                } else {
-                    lo
-                }
+                *value
+            };
+            if !max_val.is_nan() && lo > max_val {
+                max_val
+            } else {
+                lo
             }
-        })
-        .collect())
+        }
+    };
+    // Bandwidth-bound per-element clamp (NaN-check + 2 bound compares, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — PARALLEL_THRESHOLD(8192)
+    // over-parallelized medium clamp up to 100x (64K-256K 0.01x, 1M 0.07x, 2M 0.26x), crossover ~4M.
+    if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        Ok(window.par_iter().map(clamp_one).collect())
+    } else {
+        Ok(window.iter().map(clamp_one).collect())
+    }
 }
 
 pub fn min_tensor_contiguous_f64(
@@ -3104,13 +3385,28 @@ pub fn min_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| {
-        if l.is_nan() || r.is_nan() {
-            f64::NAN
-        } else {
-            l.min(r)
-        }
-    })
+    // SIMD-accelerated (f64x4) like add/sub/mul/div_f64; the f64 sibling of the f32 max/min
+    // SIMD win. Scalar op is the unchanged NaN-propagating fmin; the SIMD op computes the same
+    // value lanewise (f64x4::min is fmin-faithful incl. IEEE ±0 sign) then forces NaN where
+    // either operand is NaN. Strided falls back to scalar inside simd_elementwise_f64. Bit-exact
+    // is guarded by min_max_f64_simd_matches_scalar_bit_for_bit.
+    simd_elementwise_f64(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l.is_nan() || r.is_nan() {
+                f64::NAN
+            } else {
+                l.min(r)
+            }
+        },
+        |a: f64x4, b: f64x4| {
+            let nan = f64x4::splat(f64::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+        },
+    )
 }
 
 pub fn max_tensor_contiguous_f64(
@@ -3119,13 +3415,24 @@ pub fn max_tensor_contiguous_f64(
     lhs_meta: &TensorMeta,
     rhs_meta: &TensorMeta,
 ) -> Result<Vec<f64>, KernelError> {
-    elementwise_f64(lhs, rhs, lhs_meta, rhs_meta, |l, r| {
-        if l.is_nan() || r.is_nan() {
-            f64::NAN
-        } else {
-            l.max(r)
-        }
-    })
+    // SIMD-accelerated (f64x4) — see min_tensor_contiguous_f64 for the rationale.
+    simd_elementwise_f64(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l.is_nan() || r.is_nan() {
+                f64::NAN
+            } else {
+                l.max(r)
+            }
+        },
+        |a: f64x4, b: f64x4| {
+            let nan = f64x4::splat(f64::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+        },
+    )
 }
 
 pub fn atan2_tensor_contiguous_f64(
@@ -3269,7 +3576,13 @@ pub fn ge_tensor_contiguous_f64(
 /// already well within ULP precision and avoids the recursion
 /// overhead.
 #[inline]
-fn pairwise_sum_f64(values: &[f64]) -> f64 {
+/// Pairwise (cascade) summation of a contiguous slice: recursively split at the
+/// midpoint down to a 128-element sequential leaf. This is the EXACT reduction
+/// `sum_dim_tensor_contiguous_f64` applies to each output lane, so callers that
+/// want a per-lane sum bit-for-bit identical to `sum_dim` (e.g. the fused
+/// cosine_similarity f64 path in ft-api) reduce their materialized lane through
+/// this same function. Exposed for that cross-crate bit-exact reuse.
+pub fn pairwise_sum_f64(values: &[f64]) -> f64 {
     const BLOCK: usize = 128;
     if values.len() <= BLOCK {
         // Sequential is fine at small N (block fits in L1 cache).
@@ -3317,6 +3630,46 @@ fn pairwise_sum_f64_maybe_par(values: &[f64]) -> f64 {
         pairwise_sum_f64_par(values)
     } else {
         pairwise_sum_f64(values)
+    }
+}
+
+/// Fused dot-product pairwise sum: returns `sum(a[i]*b[i])` using the SAME
+/// `mid = len/2` tree as `pairwise_sum_f64(&[a[i]*b[i]])`, so it is BIT-FOR-BIT
+/// identical to building a products Vec and reducing it — but WITHOUT
+/// materializing the n-sized scratch (the collect's 16MB write + reread).
+/// Requires `a.len() == b.len()`.
+fn pairwise_dot_f64(a: &[f64], b: &[f64]) -> f64 {
+    const BLOCK: usize = 128;
+    if a.len() <= BLOCK {
+        return a.iter().zip(b).map(|(&x, &y)| x * y).sum();
+    }
+    let mid = a.len() / 2;
+    pairwise_dot_f64(&a[..mid], &b[..mid]) + pairwise_dot_f64(&a[mid..], &b[mid..])
+}
+
+/// Parallel `pairwise_dot_f64` — same midpoint tree via `rayon::join` down to
+/// PAR_BLOCK, so bit-for-bit identical to the serial fused dot.
+fn pairwise_dot_f64_par(a: &[f64], b: &[f64]) -> f64 {
+    const PAR_BLOCK: usize = 1 << 14;
+    if a.len() <= PAR_BLOCK {
+        return pairwise_dot_f64(a, b);
+    }
+    let mid = a.len() / 2;
+    let (al, ar) = a.split_at(mid);
+    let (bl, br) = b.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_dot_f64_par(al, bl),
+        || pairwise_dot_f64_par(ar, br),
+    );
+    ls + rs
+}
+
+#[inline]
+fn pairwise_dot_f64_maybe_par(a: &[f64], b: &[f64]) -> f64 {
+    if a.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_dot_f64_par(a, b)
+    } else {
+        pairwise_dot_f64(a, b)
     }
 }
 
@@ -3508,6 +3861,7 @@ pub fn mean_dim_tensor_contiguous_f64(
 
 const SIMD_WIDTH: usize = 4;
 
+#[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
 fn simd_binary_f64<F, S>(
     lhs_window: &[f64],
     rhs_window: &[f64],
@@ -3975,6 +4329,299 @@ pub fn sdpa_forward_masked_gqa_f64(
     out
 }
 
+/// Opt-in: replace [`sdpa_forward_f32`]'s scalar `libm` softmax with an 8-lane
+/// polynomial one (`FT_SDPA_POLY_EXP=1`). Probed once, cached.
+///
+/// Default OFF, so the kernel is bit-for-bit unchanged for every existing caller.
+/// The transcendental is NOT the same function, so the ON path is deliberately
+/// non-byte-exact and belongs behind a caller-side quality gate.
+///
+/// Motivation (franken_whisper, 2026-07-09, real large-v3-turbo encoder shape
+/// `num_bh=20, seq=1500, d=64`, 32 layers, min-of-7): the scalar `exp` is
+/// **124.5 ms of the kernel's 525.0 ms (23.7%)** — not the "negligible fraction"
+/// a franken-side per-head rewrite had suggested. Vectorising it recovers
+/// **111.2 ms/window (21.2% of the kernel)** at `max|delta| = 3.2e-9` vs `libm`.
+static SDPA_POLY_EXP: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Seed [`SDPA_POLY_EXP`] from `FT_SDPA_POLY_EXP` exactly once, before any read or write.
+///
+/// The setter calls this first, so an explicit [`set_sdpa_poly_exp`] always wins over
+/// the environment regardless of call order.
+fn sdpa_poly_exp_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var("FT_SDPA_POLY_EXP").is_ok_and(|val| val == "1") {
+            SDPA_POLY_EXP.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+fn sdpa_poly_exp_enabled() -> bool {
+    sdpa_poly_exp_init();
+    SDPA_POLY_EXP.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Enable/disable the 8-lane polynomial softmax inside [`sdpa_forward_f32`].
+///
+/// Default **off**; `FT_SDPA_POLY_EXP=1` turns it on for the process. This setter exists
+/// because an env var is the wrong control surface for a library: it is process-global,
+/// and a downstream crate under `#![forbid(unsafe_code)]` cannot call `std::env::set_var`
+/// (unsafe in edition 2024). A consumer that has certified the numerics for *its* model
+/// can opt in here instead.
+///
+/// **Not bit-exact.** The poly `exp` is 1 ULP (rel 1.192e-7), but the lane-wise row-sum
+/// reduction reorders the softmax denominator, so `O = P@V` moves by a vector-relative
+/// 1.425e-6 (see `sdpa_poly_exp_accuracy_budget`). Certify with a task-level gate before
+/// enabling: `franken_whisper`'s WER gate passes 4/4 on `large-v3-turbo` but does **not**
+/// certify `tiny.en`.
+///
+/// `sdpa_forward_f32` reads this once per call, so flipping it concurrently with a call
+/// in flight cannot tear a single invocation — but the flip may or may not be observed by
+/// that call. Set it during setup, not mid-inference.
+pub fn set_sdpa_poly_exp(on: bool) {
+    sdpa_poly_exp_init();
+    SDPA_POLY_EXP.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the poly softmax in [`sdpa_forward_f32`] is currently enabled.
+#[must_use]
+pub fn sdpa_poly_exp() -> bool {
+    sdpa_poly_exp_enabled()
+}
+
+/// Query-row tile size (`BR`) for [`sdpa_forward_f32`]. **Default: fixed 64** (historical).
+/// `SDPA_BR_AUTO` (0) selects [`sdpa_br_for`]'s adaptive policy; opt in via [`set_sdpa_br_auto`].
+static SDPA_BR: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(64);
+
+/// Sentinel stored in [`SDPA_BR`] meaning "choose adaptively".
+const SDPA_BR_AUTO: usize = 0;
+/// Historical tile. Also the floor: never coarsen below it.
+const SDPA_BR_SMALL: usize = 64;
+/// Coarser tile. Amortizes the per-block `kh`/`vh` repack (`matrixmultiply` has no prepack
+/// API) over 2x the query rows. MEASURED +2.29% (null-corrected, 34/41 paired wins, sign-p
+/// < 0.001, cv 4.1%, worker hz2) on the large-v3-turbo shape.
+const SDPA_BR_LARGE: usize = 128;
+/// Blocks per thread we insist on keeping before coarsening the tile.
+const SDPA_BR_TASKS_PER_THREAD: usize = 4;
+
+/// Adaptive query-row tile.
+///
+/// Coarsening `BR` amortizes the per-block B-repack, but it also **halves the number of
+/// parallel row-blocks**. When `num_bh < threads` the kernel splits a head's blocks across the
+/// pool, so with few heads the coarser tile starves the pool: MEASURED **0.9414x** (1/7 wins)
+/// at `num_bh = 4, seq_q = 1500`. So coarsen only when the block supply stays ample.
+///
+/// * `num_bh >= threads` — heads alone fill the pool, blocks run serially per head ⇒ coarsen.
+/// * otherwise coarsen only if `num_bh * ceil(seq_q / BR_LARGE) >= TASKS_PER_THREAD * threads`.
+///
+/// **Bit-exact either way**: `BR` can only change scheduling.
+fn sdpa_br_pick(seq_q: usize, num_bh: usize, threads: usize) -> usize {
+    let threads = threads.max(1);
+    if num_bh >= threads {
+        return SDPA_BR_LARGE;
+    }
+    let blocks = seq_q.div_ceil(SDPA_BR_LARGE);
+    if num_bh.saturating_mul(blocks) >= SDPA_BR_TASKS_PER_THREAD.saturating_mul(threads) {
+        SDPA_BR_LARGE
+    } else {
+        SDPA_BR_SMALL
+    }
+}
+
+fn sdpa_br_for(seq_q: usize, num_bh: usize) -> usize {
+    let explicit = SDPA_BR.load(std::sync::atomic::Ordering::Relaxed);
+    if explicit != SDPA_BR_AUTO {
+        return explicit;
+    }
+    sdpa_br_pick(seq_q, num_bh, rayon::current_num_threads())
+}
+
+fn sdpa_br_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if let Some(b) = std::env::var("FT_SDPA_BR")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .filter(|b| *b >= 8 && *b <= 512)
+        {
+            SDPA_BR.store(b, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+/// Row count above which `sdpa_forward_f32` splits a head's blocks across the pool.
+/// Deliberately a CONSTANT, not `BR`: the parallel structure must not change when the
+/// tile size is tuned, or a `BR` sweep silently measures two different schedulers.
+const SDPA_PAR_MIN_ROWS: usize = 64;
+
+/// Set the query-row tile size for [`sdpa_forward_f32`] (clamped to `[8, 512]`).
+///
+/// `kh`/`vh` are invariant across a head's `ceil(seq_q / BR)` blocks, yet `matrixmultiply`
+/// repacks them on every call (it has no prepack API), so a larger `BR` amortizes both
+/// B-packs. Counter-force: the per-block scratch is `BR * seq_k * 4` bytes and leaves L2.
+///
+/// **Bit-exact in `BR`**: `matrixmultiply`'s k-accumulation order is fixed by the
+/// micro-kernel and does not depend on the row count, and the softmax is per-row. Changing
+/// `BR` can only change scheduling, never results.
+///
+/// Exists so a bench can sweep `BR` inside **one binary** — an env var is read once per
+/// process, and an A/B split across two process invocations is not admissible.
+pub fn set_sdpa_br(br: usize) {
+    sdpa_br_init();
+    let v = if br == SDPA_BR_AUTO {
+        SDPA_BR_AUTO
+    } else {
+        br.clamp(8, 512)
+    };
+    SDPA_BR.store(v, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Restore the adaptive tile policy (the default).
+pub fn set_sdpa_br_auto() {
+    set_sdpa_br(SDPA_BR_AUTO);
+}
+
+/// Current query-row tile size for [`sdpa_forward_f32`].
+#[must_use]
+pub fn sdpa_br_current(seq_q: usize, num_bh: usize) -> usize {
+    sdpa_br_init();
+    sdpa_br_for(seq_q, num_bh)
+}
+
+static SGEMM_TILE_BALANCED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+fn sgemm_tile_balanced_init() {
+    static INIT: std::sync::OnceLock<()> = std::sync::OnceLock::new();
+    INIT.get_or_init(|| {
+        if std::env::var("FT_SGEMM_TILE_BALANCED").is_ok_and(|v| v == "1") {
+            SGEMM_TILE_BALANCED.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    });
+}
+
+/// Select the 2-D GEMM tile grid policy. **Default off** = the historical grid.
+///
+/// The historical grid is `p = floor(sqrt(T))`, `q = ceil(T/p)`, which gives `p*q != T` for
+/// many thread counts: at `T = 32` it is `5x7 = 35` tiles on 32 threads, so a straggler wave
+/// of 3 tiles runs while 29 threads idle. With this enabled, `p` is the largest **divisor**
+/// of `T` that is `<= sqrt(T)`, so `p*q == T` exactly (32 -> 4x8). Thread counts whose grid
+/// is already balanced (`T = 64 -> 8x8`, `T = 16 -> 4x4`) do not move.
+///
+/// **Both policies are bit-exact**: every output element's full k-accumulation happens inside
+/// one serial micro-kernel call, and neither the row nor the column count changes that order
+/// (the invariant behind `gemm_2d_parallel_is_bit_exact_vs_serial`). This knob therefore
+/// cannot change results — only scheduling.
+///
+/// Default off pending a keep-gate measurement on a host that can field the thread count
+/// under test; `FT_SGEMM_TILE_BALANCED=1` seeds it on at process start. This setter exists so
+/// a bench can flip the policy **inside one binary** and time the real
+/// `matmul_tensor_contiguous_f32` both ways — a bench that times a *replica* of the scheduler
+/// is not evidence about the scheduler.
+///
+/// Read once per GEMM call; set it during setup, not mid-flight.
+pub fn set_sgemm_tile_balanced(on: bool) {
+    sgemm_tile_balanced_init();
+    SGEMM_TILE_BALANCED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether the balanced 2-D tile grid policy is currently enabled.
+#[must_use]
+pub fn sgemm_tile_balanced() -> bool {
+    sgemm_tile_balanced_init();
+    SGEMM_TILE_BALANCED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `softmax(scale * row[..limit])` in place, zeroing `row[limit..]` — the 8-lane
+/// counterpart of [`sdpa_forward_f32`]'s scalar row softmax.
+///
+/// `wide`'s polynomial `exp` is ~1-2 ULP but wrongly flushes to `0.0` unless every
+/// lane is finite with `|x| < 88`, so the reduced argument is clamped to
+/// `>= -87.0` first: `exp(-87) = 1.6e-38` is already at the bottom of the normal
+/// f32 range, and the clamp only lifts terms that contribute nothing to the sum.
+/// A non-finite row max (a fully-masked row, unreachable for a bidirectional
+/// encoder) falls back to the scalar path rather than propagating `NaN`.
+///
+/// The lane-wise sum reduces in a different order than the scalar loop, so this is
+/// non-byte-exact by construction — see [`sdpa_poly_exp_enabled`].
+fn softmax_row_f32_poly(row: &mut [f32], limit: usize, scale: f32) {
+    /// Below this the reduced argument contributes nothing but would trip wide's
+    /// flush-to-zero band.
+    const LO: f32 = -87.0;
+
+    let vscale = f32x8::splat(scale);
+    let mut vmax = f32x8::splat(f32::NEG_INFINITY);
+    let mut i = 0;
+    while i + 8 <= limit {
+        let mut a = [0.0f32; 8];
+        a.copy_from_slice(&row[i..i + 8]);
+        let scaled = f32x8::from(a) * vscale;
+        row[i..i + 8].copy_from_slice(&scaled.to_array());
+        vmax = vmax.max(scaled);
+        i += 8;
+    }
+    let mut m = vmax
+        .to_array()
+        .into_iter()
+        .fold(f32::NEG_INFINITY, f32::max);
+    for s in row[i..limit].iter_mut() {
+        *s *= scale;
+        if *s > m {
+            m = *s;
+        }
+    }
+
+    if !m.is_finite() {
+        // Degenerate row: reproduce the scalar kernel's own behaviour exactly.
+        let mut sum = 0.0f32;
+        for s in row.iter_mut().take(limit) {
+            let e = (*s - m).exp();
+            *s = e;
+            sum += e;
+        }
+        for s in row.iter_mut().take(limit) {
+            *s /= sum;
+        }
+        for s in row.iter_mut().skip(limit) {
+            *s = 0.0;
+        }
+        return;
+    }
+
+    let vm = f32x8::splat(m);
+    let vlo = f32x8::splat(LO);
+    let mut vsum = f32x8::splat(0.0);
+    let mut i = 0;
+    while i + 8 <= limit {
+        let mut a = [0.0f32; 8];
+        a.copy_from_slice(&row[i..i + 8]);
+        let e = ((f32x8::from(a) - vm).max(vlo)).exp();
+        row[i..i + 8].copy_from_slice(&e.to_array());
+        vsum += e;
+        i += 8;
+    }
+    let mut sum: f32 = vsum.to_array().iter().sum();
+    for s in row[i..limit].iter_mut() {
+        let e = (*s - m).exp();
+        *s = e;
+        sum += e;
+    }
+
+    let vsum_b = f32x8::splat(sum);
+    let mut i = 0;
+    while i + 8 <= limit {
+        let mut a = [0.0f32; 8];
+        a.copy_from_slice(&row[i..i + 8]);
+        row[i..i + 8].copy_from_slice(&(f32x8::from(a) / vsum_b).to_array());
+        i += 8;
+    }
+    for s in row[i..limit].iter_mut() {
+        *s /= sum;
+    }
+    for s in row.iter_mut().skip(limit) {
+        *s = 0.0;
+    }
+}
+
 /// f32 mirror of [`sdpa_forward_f64`] (the common transformer inference dtype):
 /// same block-row flash-attention pattern, using the `sgemm_bt`/`sgemm`
 /// microkernels and f32 softmax.
@@ -3992,12 +4639,14 @@ pub fn sdpa_forward_f32(
     scale: f32,
     causal: bool,
 ) -> Vec<f32> {
-    const BR: usize = 64;
+    sdpa_br_init();
+    let br_tile = sdpa_br_for(seq_q, num_bh);
     let mut out = vec![0.0f32; num_bh * seq_q * d_v];
     let q_stride = seq_q * d_k;
     let k_stride = seq_k * d_k;
     let v_stride = seq_k * d_v;
     let o_stride = seq_q * d_v;
+    let poly = sdpa_poly_exp_enabled();
     // One independent BR-row block (f32 mirror of the f64 kernel). Blocks within a head are
     // independent, so they are the unit of both the serial loop and the parallel split.
     let block = |bh: usize, q0: usize, o_block: &mut [f32]| {
@@ -4012,6 +4661,10 @@ pub fn sdpa_forward_f32(
             let qi = q0 + r;
             let limit = if causal { (qi + 1).min(seq_k) } else { seq_k };
             let row = &mut sc[r * seq_k..(r + 1) * seq_k];
+            if poly {
+                softmax_row_f32_poly(row, limit, scale);
+                continue;
+            }
             let mut m = f32::NEG_INFINITY;
             for s in row.iter_mut().take(limit) {
                 *s *= scale;
@@ -4036,14 +4689,14 @@ pub fn sdpa_forward_f32(
     };
     // Few heads but many cores: also split each head's independent BR-row blocks across the
     // pool (same guard/rationale as the f64 kernel; head-heavy inputs keep the serial loop).
-    if num_bh < rayon::current_num_threads() && seq_q > BR {
+    if num_bh < rayon::current_num_threads() && seq_q > SDPA_PAR_MIN_ROWS {
         out.par_chunks_mut(o_stride)
             .enumerate()
             .for_each(|(bh, o_chunk)| {
                 o_chunk
-                    .par_chunks_mut(BR * d_v)
+                    .par_chunks_mut(br_tile * d_v)
                     .enumerate()
-                    .for_each(|(blk, o_block)| block(bh, blk * BR, o_block));
+                    .for_each(|(blk, o_block)| block(bh, blk * br_tile, o_block));
             });
     } else {
         out.par_chunks_mut(o_stride)
@@ -4051,7 +4704,7 @@ pub fn sdpa_forward_f32(
             .for_each(|(bh, o_chunk)| {
                 let mut q0 = 0;
                 while q0 < seq_q {
-                    let br = (q0 + BR).min(seq_q) - q0;
+                    let br = (q0 + br_tile).min(seq_q) - q0;
                     block(bh, q0, &mut o_chunk[q0 * d_v..(q0 + br) * d_v]);
                     q0 += br;
                 }
@@ -4414,6 +5067,15 @@ pub fn sdpa_backward_f32_unit_dout(
     (dq, dk, dv)
 }
 
+/// Gate for the per-row-parallel NORM forwards (layer_norm / rms_norm / ...):
+/// mean+var+normalize per row is BANDWIDTH-bound (the sqrt is 1 per `norm_size`
+/// elems), so parallelizing over rows only pays above the reduction crossover.
+/// Below it — the common SMALL-BATCH TRAINING shapes ([8..32, D]) — rayon fork
+/// overhead REGRESSES it 2-11x (measured: [8,768] 0.09x, [8,4096] 0.41x, [32,4096]
+/// 0.85x; wins from ~[128,4096]=512K up). Decode ([1,D]) is one chunk = already
+/// serial. frankentorch-kgs4-normgate.
+const NORM_FWD_PARALLEL_MIN: usize = 1 << 19; // 524288
+
 /// Fused LayerNorm forward (f64): per row of `[batch, norm_size]`, computes
 /// `y = (x - mean) / sqrt(var + eps) * weight + bias` in two streaming passes,
 /// NEVER materialising the ~14 full-size intermediates (broadcast mean/var, the
@@ -4431,32 +5093,41 @@ pub fn layer_norm_forward_f64(
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * norm_size];
     let inv_n = 1.0 / norm_size as f64;
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f64;
-            for &v in xrow {
-                sum += v;
+    let row_fn = |r: usize, orow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f64;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f64;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = (xrow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f64;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = (xrow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(b) = bias {
-                    y += b[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (see NORM_FWD_PARALLEL_MIN);
+    // small-batch training regresses parallel 2-11x. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -4475,32 +5146,41 @@ pub fn layer_norm_forward_f32(
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * norm_size];
     let inv_n = 1.0 / norm_size as f32;
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f32;
-            for &v in xrow {
-                sum += v;
+    let row_fn = |r: usize, orow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f32;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f32;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = (xrow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f32;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = (xrow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(b) = bias {
-                    y += b[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN),
+    // f32 mirror of layer_norm_forward_f64. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -4522,38 +5202,46 @@ pub fn add_layer_norm_forward_f32(
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * norm_size];
     let inv_n = 1.0 / norm_size as f32;
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let base = r * norm_size;
-            let arow = &a[base..base + norm_size];
-            let brow = &b[base..base + norm_size];
-            // Materialize a+b ONCE into the output row (also accumulating the mean
-            // sum), then normalize in place — no 3× recompute, no separate sum tensor.
-            let mut sum = 0.0f32;
-            for j in 0..norm_size {
-                let s = arow[j] + brow[j];
-                orow[j] = s;
-                sum += s;
+    let row_fn = |r: usize, orow: &mut [f32]| {
+        let base = r * norm_size;
+        let arow = &a[base..base + norm_size];
+        let brow = &b[base..base + norm_size];
+        // Materialize a+b ONCE into the output row (also accumulating the mean
+        // sum), then normalize in place — no 3× recompute, no separate sum tensor.
+        let mut sum = 0.0f32;
+        for j in 0..norm_size {
+            let s = arow[j] + brow[j];
+            orow[j] = s;
+            sum += s;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f32;
+        for &s in orow.iter() {
+            let d = s - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = (orow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f32;
-            for &s in orow.iter() {
-                let d = s - mean;
-                vsum += d * d;
+            if let Some(bb) = bias {
+                y += bb[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = (orow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(bb) = bias {
-                    y += bb[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -4570,36 +5258,46 @@ pub fn layer_norm_forward_with_stats_f64(
     let mut means = vec![0.0f64; batch];
     let mut rstds = vec![0.0f64; batch];
     let inv_n = 1.0 / norm_size as f64;
-    out.par_chunks_mut(norm_size)
-        .zip(means.par_iter_mut())
-        .zip(rstds.par_iter_mut())
-        .enumerate()
-        .for_each(|(r, ((orow, mean_slot), rstd_slot))| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f64;
-            for &v in xrow {
-                sum += v;
+    let row_fn = |r: usize, orow: &mut [f64], mean_slot: &mut f64, rstd_slot: &mut f64| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f64;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f64;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        *mean_slot = mean;
+        *rstd_slot = rstd;
+        for j in 0..norm_size {
+            let mut y = (xrow[j] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f64;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[j];
             }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            *mean_slot = mean;
-            *rstd_slot = rstd;
-            for j in 0..norm_size {
-                let mut y = (xrow[j] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                if let Some(b) = bias {
-                    y += b[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .zip(means.par_iter_mut())
+            .zip(rstds.par_iter_mut())
+            .enumerate()
+            .for_each(|(r, ((orow, m), s))| row_fn(r, orow, m, s));
+    } else {
+        out.chunks_mut(norm_size)
+            .zip(means.iter_mut())
+            .zip(rstds.iter_mut())
+            .enumerate()
+            .for_each(|(r, ((orow, m), s))| row_fn(r, orow, m, s));
+    }
     (out, means, rstds)
 }
 
@@ -4680,36 +5378,45 @@ pub fn layer_norm_backward_f64(
         return (dx, dweight, dbias);
     }
     let mut dx = vec![0.0f64; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f64;
-            for &v in xrow {
-                sum += v;
-            }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f64;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
-            let mut c1 = 0.0f64;
-            let mut c2 = 0.0f64;
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f64;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f64;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_n + eps).sqrt();
+        let mut c1 = 0.0f64;
+        let mut c2 = 0.0f64;
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN) so
+    // small-batch training backward isn't over-parallelized. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     // Affine grads: deterministic serial reduction over rows (cache-friendly,
     // run-to-run stable — a parallel float reduce would reorder the sum).
     let mut dweight = vec![0.0f64; norm_size];
@@ -4808,36 +5515,45 @@ pub fn layer_norm_backward_f32(
         return (dx, dweight, dbias);
     }
     let mut dx = vec![0.0f32; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut sum = 0.0f32;
-            for &v in xrow {
-                sum += v;
-            }
-            let mean = sum * inv_n;
-            let mut vsum = 0.0f32;
-            for &v in xrow {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0f32 / (vsum * inv_n + eps).sqrt();
-            let mut c1 = 0.0f32;
-            let mut c2 = 0.0f32;
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for j in 0..norm_size {
-                let xhat = (xrow[j] - mean) * rstd;
-                let dxhat = dyrow[j] * weight[j];
-                dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut sum = 0.0f32;
+        for &v in xrow {
+            sum += v;
+        }
+        let mean = sum * inv_n;
+        let mut vsum = 0.0f32;
+        for &v in xrow {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0f32 / (vsum * inv_n + eps).sqrt();
+        let mut c1 = 0.0f32;
+        let mut c2 = 0.0f32;
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for j in 0..norm_size {
+            let xhat = (xrow[j] - mean) * rstd;
+            let dxhat = dyrow[j] * weight[j];
+            dxrow[j] = rstd * (dxhat - (c1 + xhat * c2) * inv_n);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN),
+    // f32 mirror of layer_norm_backward_f64. Bit-identical.
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     let mut dweight = vec![0.0f32; norm_size];
     let mut dbias = vec![0.0f32; norm_size];
     for r in 0..batch {
@@ -4929,23 +5645,31 @@ pub fn rms_norm_forward_f64(
 ) -> Vec<f64> {
     let inv_n = 1.0 / norm_size as f64;
     let mut out = vec![0.0f64; batch * norm_size];
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f64;
-            for &v in xrow {
-                ss += v * v;
+    let row_fn = |r: usize, orow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f64;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = xrow[j] * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = xrow[j] * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -4962,23 +5686,31 @@ pub fn rms_norm_forward_f32(
 ) -> Vec<f32> {
     let inv_n = 1.0 / norm_size as f32;
     let mut out = vec![0.0f32; batch * norm_size];
-    out.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, orow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f32;
-            for &v in xrow {
-                ss += v * v;
+    let row_fn = |r: usize, orow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f32;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+        for j in 0..norm_size {
+            let mut y = xrow[j] * rstd;
+            if let Some(w) = weight {
+                y *= w[j];
             }
-            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
-            for j in 0..norm_size {
-                let mut y = xrow[j] * rstd;
-                if let Some(w) = weight {
-                    y *= w[j];
-                }
-                orow[j] = y;
-            }
-        });
+            orow[j] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over rows (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    } else {
+        out.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, orow)| row_fn(r, orow));
+    }
     out
 }
 
@@ -5010,27 +5742,35 @@ fn rms_norm_backward_f64_generic(
 ) -> (Vec<f64>, Option<Vec<f64>>) {
     let inv_n = 1.0 / norm_size as f64;
     let mut dx = vec![0.0f64; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f64;
-            for &v in xrow {
-                ss += v * v;
-            }
-            let rstd = 1.0 / (ss * inv_n + eps).sqrt();
-            let mut c = 0.0f64;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                c += g * xrow[j];
-            }
-            let coef = rstd * rstd * rstd * c * inv_n;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                dxrow[j] = rstd * g - coef * xrow[j];
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f64]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f64;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0 / (ss * inv_n + eps).sqrt();
+        let mut c = 0.0f64;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            c += g * xrow[j];
+        }
+        let coef = rstd * rstd * rstd * c * inv_n;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            dxrow[j] = rstd * g - coef * xrow[j];
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     let dweight = weight.map(|_| {
         let mut dw = vec![0.0f64; norm_size];
         for r in 0..batch {
@@ -5073,27 +5813,35 @@ fn rms_norm_backward_f32_generic(
 ) -> (Vec<f32>, Option<Vec<f32>>) {
     let inv_n = 1.0f32 / norm_size as f32;
     let mut dx = vec![0.0f32; batch * norm_size];
-    dx.par_chunks_mut(norm_size)
-        .enumerate()
-        .for_each(|(r, dxrow)| {
-            let xrow = &x[r * norm_size..r * norm_size + norm_size];
-            let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
-            let mut ss = 0.0f32;
-            for &v in xrow {
-                ss += v * v;
-            }
-            let rstd = 1.0f32 / (ss * inv_n + eps).sqrt();
-            let mut c = 0.0f32;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                c += g * xrow[j];
-            }
-            let coef = rstd * rstd * rstd * c * inv_n;
-            for j in 0..norm_size {
-                let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
-                dxrow[j] = rstd * g - coef * xrow[j];
-            }
-        });
+    let dx_row = |r: usize, dxrow: &mut [f32]| {
+        let xrow = &x[r * norm_size..r * norm_size + norm_size];
+        let dyrow = &dy[r * norm_size..r * norm_size + norm_size];
+        let mut ss = 0.0f32;
+        for &v in xrow {
+            ss += v * v;
+        }
+        let rstd = 1.0f32 / (ss * inv_n + eps).sqrt();
+        let mut c = 0.0f32;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            c += g * xrow[j];
+        }
+        let coef = rstd * rstd * rstd * c * inv_n;
+        for j in 0..norm_size {
+            let g = dyrow[j] * weight.map_or(1.0, |w| w[j]);
+            dxrow[j] = rstd * g - coef * xrow[j];
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per row): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * norm_size >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    } else {
+        dx.chunks_mut(norm_size)
+            .enumerate()
+            .for_each(|(r, dxrow)| dx_row(r, dxrow));
+    }
     let dweight = weight.map(|_| {
         let mut dw = vec![0.0f32; norm_size];
         for r in 0..batch {
@@ -5269,35 +6017,43 @@ pub fn group_norm_forward_f64(
     let group_numel = cpg * spatial;
     let inv_m = 1.0 / group_numel as f64;
     let mut out = vec![0.0f64; batch * num_groups * group_numel];
-    out.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, orow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let mut sum = 0.0f64;
-            for &v in xb {
-                sum += v;
+    let group_fn = |grp: usize, orow: &mut [f64]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let mut sum = 0.0f64;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f64;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let mut y = (xb[i] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[c];
             }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f64;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[c];
             }
-            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let mut y = (xb[i] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[c];
-                }
-                if let Some(b) = bias {
-                    y += b[c];
-                }
-                orow[i] = y;
-            }
-        });
+            orow[i] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    } else {
+        out.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    }
     out
 }
 
@@ -5320,35 +6076,43 @@ pub fn group_norm_forward_f32(
     let group_numel = cpg * spatial;
     let inv_m = 1.0 / group_numel as f32;
     let mut out = vec![0.0f32; batch * num_groups * group_numel];
-    out.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, orow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let mut sum = 0.0f32;
-            for &v in xb {
-                sum += v;
+    let group_fn = |grp: usize, orow: &mut [f32]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let mut sum = 0.0f32;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f32;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let mut y = (xb[i] - mean) * rstd;
+            if let Some(w) = weight {
+                y *= w[c];
             }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f32;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
+            if let Some(b) = bias {
+                y += b[c];
             }
-            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let mut y = (xb[i] - mean) * rstd;
-                if let Some(w) = weight {
-                    y *= w[c];
-                }
-                if let Some(b) = bias {
-                    y += b[c];
-                }
-                orow[i] = y;
-            }
-        });
+            orow[i] = y;
+        }
+    };
+    // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    } else {
+        out.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, orow)| group_fn(grp, orow));
+    }
     out
 }
 
@@ -5535,40 +6299,48 @@ pub fn group_norm_backward_f64(
         return (dx, dweight, dbias);
     }
     let mut dx = vec![0.0f64; batch * num_groups * group_numel];
-    dx.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, dxrow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let dyb = &dy[base..base + group_numel];
-            let mut sum = 0.0f64;
-            for &v in xb {
-                sum += v;
-            }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f64;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-            let mut c1 = 0.0f64;
-            let mut c2 = 0.0f64;
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
-            }
-        });
+    let dx_grp = |grp: usize, dxrow: &mut [f64]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let dyb = &dy[base..base + group_numel];
+        let mut sum = 0.0f64;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f64;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
+        let mut c1 = 0.0f64;
+        let mut c2 = 0.0f64;
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per group): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    } else {
+        dx.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    }
     let need_affine = weight.is_some();
     let (dweight, dbias) = if need_affine {
         let mut dw = vec![0.0f64; channels];
@@ -5625,40 +6397,48 @@ pub fn group_norm_backward_f32(
         );
     }
     let mut dx = vec![0.0f32; batch * num_groups * group_numel];
-    dx.par_chunks_mut(group_numel)
-        .enumerate()
-        .for_each(|(grp, dxrow)| {
-            let g = grp % num_groups;
-            let base = grp * group_numel;
-            let xb = &x[base..base + group_numel];
-            let dyb = &dy[base..base + group_numel];
-            let mut sum = 0.0f32;
-            for &v in xb {
-                sum += v;
-            }
-            let mean = sum * inv_m;
-            let mut vsum = 0.0f32;
-            for &v in xb {
-                let d = v - mean;
-                vsum += d * d;
-            }
-            let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
-            let mut c1 = 0.0f32;
-            let mut c2 = 0.0f32;
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                c1 += dxhat;
-                c2 += dxhat * xhat;
-            }
-            for i in 0..group_numel {
-                let c = g * cpg + i / spatial;
-                let xhat = (xb[i] - mean) * rstd;
-                let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
-                dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
-            }
-        });
+    let dx_grp = |grp: usize, dxrow: &mut [f32]| {
+        let g = grp % num_groups;
+        let base = grp * group_numel;
+        let xb = &x[base..base + group_numel];
+        let dyb = &dy[base..base + group_numel];
+        let mut sum = 0.0f32;
+        for &v in xb {
+            sum += v;
+        }
+        let mean = sum * inv_m;
+        let mut vsum = 0.0f32;
+        for &v in xb {
+            let d = v - mean;
+            vsum += d * d;
+        }
+        let rstd = 1.0f32 / (vsum * inv_m + eps).sqrt();
+        let mut c1 = 0.0f32;
+        let mut c2 = 0.0f32;
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            c1 += dxhat;
+            c2 += dxhat * xhat;
+        }
+        for i in 0..group_numel {
+            let c = g * cpg + i / spatial;
+            let xhat = (xb[i] - mean) * rstd;
+            let dxhat = dyb[i] * weight.map_or(1.0, |w| w[c]);
+            dxrow[i] = rstd * (dxhat - (c1 + xhat * c2) * inv_m);
+        }
+    };
+    // Bandwidth-bound reduce-then-scale (per group): gate (NORM_FWD_PARALLEL_MIN).
+    if batch * num_groups * group_numel >= NORM_FWD_PARALLEL_MIN {
+        dx.par_chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    } else {
+        dx.chunks_mut(group_numel)
+            .enumerate()
+            .for_each(|(grp, dxrow)| dx_grp(grp, dxrow));
+    }
     let need_affine = weight.is_some();
     let (dweight, dbias) = if need_affine {
         let mut dw = vec![0.0f32; channels];
@@ -5893,10 +6673,18 @@ pub fn conv2d_im2col_f64(
     panel
 }
 
+/// Below this batch count, `conv2d_col2im_*` parallelizes per (batch, channel)
+/// plane instead of per batch — otherwise a small batch yields too few rayon
+/// tasks (batch=1 is fully serial). Per-plane loses dpanel cache locality, so at
+/// or above this it regresses (measured 0.6-0.8x at batch>=16); gate keeps the
+/// win (5.2x @ batch=1, 1.5x @ batch=4) with zero regression. kgs4-col2im-plane.
+const COL2IM_PLANE_MAX_BATCH: usize = 8;
+
 /// col2im scatter: the transpose of [`conv2d_im2col_f64`]. Accumulates the
 /// `dpanel` columns back to a `dpadded [batch, in_ch, ph, pw]` (overlapping
 /// patches sum). Parallel over batch (disjoint regions), deterministic serial
-/// accumulation within each batch.
+/// accumulation within each batch; per-plane for small batch (see
+/// `COL2IM_PLANE_MAX_BATCH`).
 #[allow(clippy::too_many_arguments)]
 #[must_use]
 pub fn conv2d_col2im_f64(
@@ -5915,6 +6703,31 @@ pub fn conv2d_col2im_f64(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
+    // Small batch: parallelize per (batch, channel) plane (bit-identical scatter
+    // order per channel) so batch=1 isn't serial. See conv2d_col2im_f32. kgs4-col2im-plane.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded
+            .par_chunks_mut(ph * pw)
+            .enumerate()
+            .for_each(|(bc, dpc)| {
+                let b = bc / in_ch;
+                let c = bc % in_ch;
+                let pch = c * kh * kw;
+                for pc in 0..patch_count {
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let prow_off = (b * patch_count + pc) * patch_width + pch;
+                    for kr in 0..kh {
+                        let irow = (base_h + kr) * pw + base_w;
+                        let prow_k = prow_off + kr * kw;
+                        for kc in 0..kw {
+                            dpc[irow + kc] += dpanel[prow_k + kc];
+                        }
+                    }
+                }
+            });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
@@ -5958,6 +6771,36 @@ pub fn conv2d_col2im_f32(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let mut dpadded = vec![0.0f32; batch * in_ch * ph * pw];
+    // Per-batch parallelism gives only `batch` rayon tasks (fully SERIAL at
+    // batch=1). For small batch, parallelize per (batch, channel) PLANE instead:
+    // each plane dpadded[(b*in_ch+c)*ph*pw..] is disjoint and its pc-outer
+    // scatter-accumulation order is IDENTICAL to the per-batch loop restricted to
+    // channel c -> bit-for-bit identical. Wins for small batch (5.2x @ batch=1,
+    // 1.5x @ batch=4); per-batch keeps better dpanel locality at batch>=8 (per-plane
+    // regressed 0.6-0.8x there, so it's gated). kgs4-col2im-plane.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded
+            .par_chunks_mut(ph * pw)
+            .enumerate()
+            .for_each(|(bc, dpc)| {
+                let b = bc / in_ch;
+                let c = bc % in_ch;
+                let pch = c * kh * kw;
+                for pc in 0..patch_count {
+                    let base_h = (pc / ow) * sh;
+                    let base_w = (pc % ow) * sw;
+                    let prow_off = (b * patch_count + pc) * patch_width + pch;
+                    for kr in 0..kh {
+                        let irow = (base_h + kr) * pw + base_w;
+                        let prow_k = prow_off + kr * kw;
+                        for kc in 0..kw {
+                            dpc[irow + kc] += dpanel[prow_k + kc];
+                        }
+                    }
+                }
+            });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * ph * pw)
         .enumerate()
@@ -6018,17 +6861,13 @@ pub fn conv2d_backward_f32(
             }
         });
     let panel = conv2d_im2col_f32(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
-    let mut dout_t = vec![0.0f32; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel. sgemm_tb reads dout_flat [flat,out_ch] AS its
+    // transpose via strides — no [out_ch,flat] dout_t materialisation — with a
+    // K-traversal matching transpose-then-sgemm per output element, so dweight is
+    // BIT-IDENTICAL (bench maxdiff=0). Eliminates the dout_t alloc + the strided
+    // transpose pass (~110ms of a 322ms weight-grad => 1.5x). kgs4-convtb.
     let mut dweight = vec![0.0f32; out_ch * patch_width];
-    gemm::sgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     let mut dpanel = vec![0.0f32; flat * patch_width];
     gemm::sgemm(
         flat,
@@ -6740,6 +7579,47 @@ pub fn conv2d_backward_f64(
     let patch_width = in_ch * kh * kw;
     let patch_count = oh * ow;
     let flat = batch * patch_count;
+    if ph == 1
+        && kh == 1
+        && oh == 1
+        && !dout.is_empty()
+        && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+    {
+        return conv2d_backward_height1_ones_dout_f64(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            pw,
+            kw,
+            ow,
+            sw,
+            out_ch,
+            has_bias,
+        );
+    }
+    if ph > 1
+        && oh > 1
+        && kh == 3
+        && kw == 3
+        && sh == 1
+        && sw == 1
+        && !dout.is_empty()
+        && dout.iter().all(|&v| v.to_bits() == 1.0f64.to_bits())
+    {
+        return conv2d_backward_3x3_stride1_ones_dout_f64(
+            padded,
+            weight_flat,
+            batch,
+            in_ch,
+            ph,
+            pw,
+            oh,
+            ow,
+            out_ch,
+            has_bias,
+        );
+    }
     // Gather dout [N,out_ch,patch_count] -> dout_flat [flat, out_ch].
     let mut dout_flat = vec![0.0f64; flat * out_ch];
     dout_flat
@@ -6754,20 +7634,13 @@ pub fn conv2d_backward_f64(
         });
     let panel = conv2d_im2col_f64(padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
     // dweight_flat [out_ch, patch_width] = dout_flat^T @ panel.
-    // Transpose dout_flat [flat, out_ch] -> dout_t [out_ch, flat] in parallel over
-    // out_ch (each row is an independent strided gather — pure copy, so the result
-    // is identical; this was a serial O(flat*out_ch) pass). frankentorch-convbwd.
-    let mut dout_t = vec![0.0f64; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel via dgemm_tb (reads dout_flat [flat,out_ch] AS
+    // its transpose through strides) — no [out_ch,flat] dout_t materialisation, its
+    // K-traversal matches transpose-then-dgemm per output => BIT-IDENTICAL. Kills the
+    // dout_t alloc + strided transpose pass (was a serial O(flat*out_ch) pass a prior
+    // fix parallelized; now eliminated). frankentorch-convbwd / kgs4-convtb.
     let mut dweight = vec![0.0f64; out_ch * patch_width];
-    gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     // dpanel [flat, patch_width] = dout_flat @ weight_flat.
     let mut dpanel = vec![0.0f64; flat * patch_width];
     gemm::dgemm(
@@ -6801,6 +7674,176 @@ pub fn conv2d_backward_f64(
     (dpadded, dweight, dbias)
 }
 
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_height1_ones_dout_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    pw: usize,
+    kw: usize,
+    ow: usize,
+    sw: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let patch_width = in_ch * kw;
+    let flat = batch * ow;
+
+    let mut dweight_row = vec![0.0f64; patch_width];
+    dweight_row
+        .par_chunks_mut(kw)
+        .enumerate()
+        .for_each(|(c, dw)| {
+            for (kc, slot) in dw.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for n in 0..batch {
+                    let base = (n * in_ch + c) * pw + kc;
+                    for ox in 0..ow {
+                        acc += padded[base + ox * sw];
+                    }
+                }
+                *slot = acc;
+            }
+        });
+
+    let mut dweight = vec![0.0f64; out_ch * patch_width];
+    dweight
+        .par_chunks_mut(patch_width)
+        .for_each(|row| row.copy_from_slice(&dweight_row));
+
+    let mut dpanel_row = vec![0.0f64; patch_width];
+    dpanel_row
+        .par_chunks_mut(kw)
+        .enumerate()
+        .for_each(|(c, dp)| {
+            let pch = c * kw;
+            for (kc, slot) in dp.iter_mut().enumerate() {
+                let mut acc = 0.0f64;
+                for oc in 0..out_ch {
+                    acc += weight_flat[oc * patch_width + pch + kc];
+                }
+                *slot = acc;
+            }
+        });
+
+    let mut dpadded = vec![0.0f64; batch * in_ch * pw];
+    dpadded
+        .par_chunks_mut(pw)
+        .enumerate()
+        .for_each(|(plane, dp)| {
+            let c = plane % in_ch;
+            let row = &dpanel_row[c * kw..(c + 1) * kw];
+            for ox in 0..ow {
+                let base = ox * sw;
+                for kc in 0..kw {
+                    dp[base + kc] += row[kc];
+                }
+            }
+        });
+
+    let dbias = if has_bias {
+        Some(vec![flat as f64; out_ch])
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
+#[allow(clippy::too_many_arguments)]
+#[must_use]
+fn conv2d_backward_3x3_stride1_ones_dout_f64(
+    padded: &[f64],
+    weight_flat: &[f64],
+    batch: usize,
+    in_ch: usize,
+    ph: usize,
+    pw: usize,
+    oh: usize,
+    ow: usize,
+    out_ch: usize,
+    has_bias: bool,
+) -> (Vec<f64>, Vec<f64>, Option<Vec<f64>>) {
+    let kh = 3usize;
+    let kw = 3usize;
+    let patch_width = in_ch * kh * kw;
+    let flat = batch * oh * ow;
+
+    let mut dweight_row = vec![0.0f64; patch_width];
+    dweight_row
+        .par_chunks_mut(kh * kw)
+        .enumerate()
+        .for_each(|(c, dwc)| {
+            for kr in 0..kh {
+                for kc in 0..kw {
+                    let mut acc = 0.0f64;
+                    for n in 0..batch {
+                        let ch_off = (n * in_ch + c) * ph * pw;
+                        for oy in 0..oh {
+                            let irow = ch_off + (oy + kr) * pw + kc;
+                            for ox in 0..ow {
+                                acc += padded[irow + ox];
+                            }
+                        }
+                    }
+                    dwc[kr * kw + kc] = acc;
+                }
+            }
+        });
+
+    let mut dweight = vec![0.0f64; out_ch * patch_width];
+    dweight
+        .par_chunks_mut(patch_width)
+        .for_each(|row| row.copy_from_slice(&dweight_row));
+
+    let mut dpanel_row = vec![0.0f64; patch_width];
+    dpanel_row
+        .par_chunks_mut(kh * kw)
+        .enumerate()
+        .for_each(|(c, dpc)| {
+            let pch = c * kh * kw;
+            for kr in 0..kh {
+                for kc in 0..kw {
+                    let kidx = pch + kr * kw + kc;
+                    let mut acc = 0.0f64;
+                    for oc in 0..out_ch {
+                        acc += weight_flat[oc * patch_width + kidx];
+                    }
+                    dpc[kr * kw + kc] = acc;
+                }
+            }
+        });
+
+    let patch_count = oh * ow;
+    let mut dpadded = vec![0.0f64; batch * in_ch * ph * pw];
+    dpadded
+        .par_chunks_mut(ph * pw)
+        .enumerate()
+        .for_each(|(plane, dp)| {
+            let c = plane % in_ch;
+            let pch = c * kh * kw;
+            for pc in 0..patch_count {
+                let base_h = pc / ow;
+                let base_w = pc % ow;
+                for kr in 0..kh {
+                    let irow = (base_h + kr) * pw + base_w;
+                    let prow_off = pch + kr * kw;
+                    for kc in 0..kw {
+                        dp[irow + kc] += dpanel_row[prow_off + kc];
+                    }
+                }
+            }
+        });
+
+    let dbias = if has_bias {
+        Some(vec![flat as f64; out_ch])
+    } else {
+        None
+    };
+    (dpadded, dweight, dbias)
+}
+
 /// Fused cdist forward (f64): pairwise `p`-norm distances between rows of `x1`
 /// `[batch, p_dim, m]` and `x2` `[batch, r_dim, m]`, returning `[batch, p_dim,
 /// r_dim]`. For each output `(b, i, j)` it streams the `m` feature differences
@@ -6812,6 +7855,28 @@ pub fn conv2d_backward_f64(
 /// `p == +inf` reduces by max-abs; finite `p > 0` accumulates `Σ|Δ|^p` then takes
 /// the `1/p` power. (`p == 0` / `p == 2` are handled by their own paths.)
 #[must_use]
+/// Per-element power matching `pow_tensor_contiguous_f64`'s integer-exponent elision
+/// (kgs4.172): `x^1=x`, `x^2=x*x`, `x^3=x*x*x`, `x^-1=1/x` are BIT-EXACT vs torch f64
+/// (libm `powf` is 1 ULP off torch for those), else libm `powf`. The fused cdist/pdist
+/// p-norm paths must use this for BOTH the per-element `|Δ|^p` AND the final `Σ^(1/p)`
+/// so they stay bit-identical to the broadcast op-graph (which goes through `tensor_pow`)
+/// and to torch — `powf` alone was 1 ULP off for integer `p` (e.g. p=3) and integer `1/p`
+/// (e.g. p=0.5 -> 1/p=2), which broke the cdist/pdist isomorphism tests.
+#[inline]
+fn pow_p_elide_int(x: f64, p: f64) -> f64 {
+    if p == 1.0 {
+        x
+    } else if p == 2.0 {
+        x * x
+    } else if p == 3.0 {
+        x * x * x
+    } else if p == -1.0 {
+        1.0 / x
+    } else {
+        x.powf(p)
+    }
+}
+
 pub fn cdist_forward_f64(
     x1: &[f64],
     x2: &[f64],
@@ -6858,9 +7923,9 @@ pub fn cdist_forward_f64(
                 } else {
                     for k in 0..m {
                         let diff = (x1[x1_base + k] - x2[x2_row + k]).abs();
-                        dist += diff.powf(p);
+                        dist += pow_p_elide_int(diff, p);
                     }
-                    dist = dist.powf(inv_p);
+                    dist = pow_p_elide_int(dist, inv_p);
                 }
                 *slot = dist;
             }
@@ -6914,9 +7979,9 @@ pub fn pdist_forward_f64(input: &[f64], n: usize, m: usize, p: f64) -> Vec<f64> 
                 } else {
                     for k in 0..m {
                         let diff = (input[i_base + k] - input[j_base + k]).abs();
-                        dist += diff.powf(p);
+                        dist += pow_p_elide_int(diff, p);
                     }
-                    dist = dist.powf(inv_p);
+                    dist = pow_p_elide_int(dist, inv_p);
                 }
                 row.push(dist);
             }
@@ -7054,34 +8119,41 @@ pub fn max_pool3d_forward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * od * oh * ow];
-    out.par_chunks_mut(od * oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * id * ih * iw;
-            for oz in 0..od {
-                let bd = oz * sd;
-                for oy in 0..oh {
-                    let bh = oy * sh;
-                    for ox in 0..ow {
-                        let bw = ox * sw;
-                        let mut m = f64::NEG_INFINITY;
-                        for kdd in 0..kd {
-                            let dz = ibase + (bd + kdd) * ih * iw;
-                            for kr in 0..kh {
-                                let irow = dz + (bh + kr) * iw + bw;
-                                for kc in 0..kw {
-                                    let v = input[irow + kc];
-                                    if v > m {
-                                        m = v;
-                                    }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * id * ih * iw;
+        for oz in 0..od {
+            let bd = oz * sd;
+            for oy in 0..oh {
+                let bh = oy * sh;
+                for ox in 0..ow {
+                    let bw = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    for kdd in 0..kd {
+                        let dz = ibase + (bd + kdd) * ih * iw;
+                        for kr in 0..kh {
+                            let irow = dz + (bh + kr) * iw + bw;
+                            for kc in 0..kw {
+                                let v = input[irow + kc];
+                                if v > m {
+                                    m = v;
                                 }
                             }
                         }
-                        orow[(oz * oh + oy) * ow + ox] = m;
                     }
+                    orow[(oz * oh + oy) * ow + ox] = m;
                 }
             }
-        });
+        }
+    };
+    if out.len() * kd * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(od * oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(od * oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -7109,39 +8181,47 @@ pub fn max_pool3d_forward_with_indices_f64(
 ) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; batch * ch * od * oh * ow];
     let mut arg_offsets = vec![0.0f64; batch * ch * od * oh * ow];
-    out.par_chunks_mut(od * oh * ow)
-        .zip(arg_offsets.par_chunks_mut(od * oh * ow))
-        .enumerate()
-        .for_each(|(plane, (orow, arow))| {
-            let ibase = plane * id * ih * iw;
-            for oz in 0..od {
-                let bd = oz * sd;
-                for oy in 0..oh {
-                    let bh = oy * sh;
-                    for ox in 0..ow {
-                        let bw = ox * sw;
-                        let mut m = f64::NEG_INFINITY;
-                        let mut arg = 0usize;
-                        for kdd in 0..kd {
-                            let dz = (bd + kdd) * ih * iw;
-                            for kr in 0..kh {
-                                let loc = dz + (bh + kr) * iw + bw;
-                                for kc in 0..kw {
-                                    let v = input[ibase + loc + kc];
-                                    if v > m {
-                                        m = v;
-                                        arg = loc + kc;
-                                    }
+    let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
+        let ibase = plane * id * ih * iw;
+        for oz in 0..od {
+            let bd = oz * sd;
+            for oy in 0..oh {
+                let bh = oy * sh;
+                for ox in 0..ow {
+                    let bw = ox * sw;
+                    let mut m = f64::NEG_INFINITY;
+                    let mut arg = 0usize;
+                    for kdd in 0..kd {
+                        let dz = (bd + kdd) * ih * iw;
+                        for kr in 0..kh {
+                            let loc = dz + (bh + kr) * iw + bw;
+                            for kc in 0..kw {
+                                let v = input[ibase + loc + kc];
+                                if v > m {
+                                    m = v;
+                                    arg = loc + kc;
                                 }
                             }
                         }
-                        let oidx = (oz * oh + oy) * ow + ox;
-                        orow[oidx] = m;
-                        arow[oidx] = arg as f64;
                     }
+                    let oidx = (oz * oh + oy) * ow + ox;
+                    orow[oidx] = m;
+                    arow[oidx] = arg as f64;
                 }
             }
-        });
+        }
+    };
+    if out.len() * kd * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(od * oh * ow)
+            .zip(arg_offsets.par_chunks_mut(od * oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    } else {
+        out.chunks_mut(od * oh * ow)
+            .zip(arg_offsets.chunks_mut(od * oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    }
     (out, arg_offsets)
 }
 
@@ -7545,34 +8625,41 @@ pub fn max_pool3d_forward_f32(
     sw: usize,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * ch * od * oh * ow];
-    out.par_chunks_mut(od * oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * id * ih * iw;
-            for oz in 0..od {
-                let bd = oz * sd;
-                for oy in 0..oh {
-                    let bh = oy * sh;
-                    for ox in 0..ow {
-                        let bw = ox * sw;
-                        let mut m = f32::NEG_INFINITY;
-                        for kdd in 0..kd {
-                            let dz = ibase + (bd + kdd) * ih * iw;
-                            for kr in 0..kh {
-                                let irow = dz + (bh + kr) * iw + bw;
-                                for kc in 0..kw {
-                                    let v = input[irow + kc];
-                                    if v > m {
-                                        m = v;
-                                    }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let ibase = plane * id * ih * iw;
+        for oz in 0..od {
+            let bd = oz * sd;
+            for oy in 0..oh {
+                let bh = oy * sh;
+                for ox in 0..ow {
+                    let bw = ox * sw;
+                    let mut m = f32::NEG_INFINITY;
+                    for kdd in 0..kd {
+                        let dz = ibase + (bd + kdd) * ih * iw;
+                        for kr in 0..kh {
+                            let irow = dz + (bh + kr) * iw + bw;
+                            for kc in 0..kw {
+                                let v = input[irow + kc];
+                                if v > m {
+                                    m = v;
                                 }
                             }
                         }
-                        orow[(oz * oh + oy) * ow + ox] = m;
                     }
+                    orow[(oz * oh + oy) * ow + ox] = m;
                 }
             }
-        });
+        }
+    };
+    if out.len() * kd * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(od * oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(od * oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -7839,34 +8926,41 @@ pub fn avg_pool2d_forward_f64(
         return avg_pool2d_forward_2x2s2_f64(padded, batch, ch, ih, iw, oh, ow);
     }
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let pbase = plane * ph * pw;
-            for oy in 0..oh {
-                let rs = oy * sh;
-                let re = (rs + kh).min(ph);
-                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-                for ox in 0..ow {
-                    let cs = ox * sw;
-                    let ce = (cs + kw).min(pw);
-                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                    let mut sum = 0.0f64;
-                    for r in rs..re {
-                        let irow = pbase + r * pw;
-                        for c in cs..ce {
-                            sum += padded[irow + c];
-                        }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let pbase = plane * ph * pw;
+        for oy in 0..oh {
+            let rs = oy * sh;
+            let re = (rs + kh).min(ph);
+            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+            for ox in 0..ow {
+                let cs = ox * sw;
+                let ce = (cs + kw).min(pw);
+                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                let mut sum = 0.0f64;
+                for r in rs..re {
+                    let irow = pbase + r * pw;
+                    for c in cs..ce {
+                        sum += padded[irow + c];
                     }
-                    let div = if count_include_pad {
-                        ((re - rs) * (ce - cs)) as f64
-                    } else {
-                        (vrlen * vclen) as f64
-                    };
-                    orow[oy * ow + ox] = sum / div;
                 }
+                let div = if count_include_pad {
+                    ((re - rs) * (ce - cs)) as f64
+                } else {
+                    (vrlen * vclen) as f64
+                };
+                orow[oy * ow + ox] = sum / div;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -7880,23 +8974,31 @@ fn avg_pool2d_forward_2x2s2_f64(
     ow: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let r0 = (oy * 2) * iw;
-                let r1 = r0 + iw;
-                for ox in 0..ow {
-                    let c0 = ox * 2;
-                    let v00 = input[ibase + r0 + c0];
-                    let v01 = input[ibase + r0 + c0 + 1];
-                    let v10 = input[ibase + r1 + c0];
-                    let v11 = input[ibase + r1 + c0 + 1];
-                    orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
-                }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let r0 = (oy * 2) * iw;
+            let r1 = r0 + iw;
+            for ox in 0..ow {
+                let c0 = ox * 2;
+                let v00 = input[ibase + r0 + c0];
+                let v01 = input[ibase + r0 + c0 + 1];
+                let v10 = input[ibase + r1 + c0];
+                let v11 = input[ibase + r1 + c0 + 1];
+                orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
             }
-        });
+        }
+    };
+    // 2x2 window => 4 input reads per output.
+    if out.len() * 4 >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -7938,34 +9040,41 @@ pub fn avg_pool2d_forward_f32(
         return avg_pool2d_forward_2x2s2_f32(padded, batch, ch, ih, iw, oh, ow);
     }
     let mut out = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let pbase = plane * ph * pw;
-            for oy in 0..oh {
-                let rs = oy * sh;
-                let re = (rs + kh).min(ph);
-                let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
-                for ox in 0..ow {
-                    let cs = ox * sw;
-                    let ce = (cs + kw).min(pw);
-                    let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
-                    let mut sum = 0.0f32;
-                    for r in rs..re {
-                        let irow = pbase + r * pw;
-                        for c in cs..ce {
-                            sum += padded[irow + c];
-                        }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let pbase = plane * ph * pw;
+        for oy in 0..oh {
+            let rs = oy * sh;
+            let re = (rs + kh).min(ph);
+            let vrlen = re.min(pad_h + ih).saturating_sub(rs.max(pad_h));
+            for ox in 0..ow {
+                let cs = ox * sw;
+                let ce = (cs + kw).min(pw);
+                let vclen = ce.min(pad_w + iw).saturating_sub(cs.max(pad_w));
+                let mut sum = 0.0f32;
+                for r in rs..re {
+                    let irow = pbase + r * pw;
+                    for c in cs..ce {
+                        sum += padded[irow + c];
                     }
-                    let div = if count_include_pad {
-                        ((re - rs) * (ce - cs)) as f32
-                    } else {
-                        (vrlen * vclen) as f32
-                    };
-                    orow[oy * ow + ox] = sum / div;
                 }
+                let div = if count_include_pad {
+                    ((re - rs) * (ce - cs)) as f32
+                } else {
+                    (vrlen * vclen) as f32
+                };
+                orow[oy * ow + ox] = sum / div;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -7979,23 +9088,31 @@ fn avg_pool2d_forward_2x2s2_f32(
     ow: usize,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let r0 = (oy * 2) * iw;
-                let r1 = r0 + iw;
-                for ox in 0..ow {
-                    let c0 = ox * 2;
-                    let v00 = input[ibase + r0 + c0];
-                    let v01 = input[ibase + r0 + c0 + 1];
-                    let v10 = input[ibase + r1 + c0];
-                    let v11 = input[ibase + r1 + c0 + 1];
-                    orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
-                }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let r0 = (oy * 2) * iw;
+            let r1 = r0 + iw;
+            for ox in 0..ow {
+                let c0 = ox * 2;
+                let v00 = input[ibase + r0 + c0];
+                let v01 = input[ibase + r0 + c0 + 1];
+                let v10 = input[ibase + r1 + c0];
+                let v11 = input[ibase + r1 + c0 + 1];
+                orow[oy * ow + ox] = (((v00 + v01) + v10) + v11) / 4.0;
             }
-        });
+        }
+    };
+    // 2x2 window => 4 input reads per output.
+    if out.len() * 4 >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8259,20 +9376,27 @@ pub fn avg_pool1d_forward_f64(
     stride: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * output_len];
-    out.par_chunks_mut(output_len)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * len;
-            let div = kernel as f64;
-            for (ox, slot) in orow.iter_mut().enumerate() {
-                let start = ox * stride;
-                let mut sum = 0.0f64;
-                for kx in 0..kernel {
-                    sum += input[ibase + start + kx];
-                }
-                *slot = sum / div;
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * len;
+        let div = kernel as f64;
+        for (ox, slot) in orow.iter_mut().enumerate() {
+            let start = ox * stride;
+            let mut sum = 0.0f64;
+            for kx in 0..kernel {
+                sum += input[ibase + start + kx];
             }
-        });
+            *slot = sum / div;
+        }
+    };
+    if out.len() * kernel >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(output_len)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(output_len)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8460,22 +9584,29 @@ pub fn max_pool1d_forward_f64(
     stride: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * output_len];
-    out.par_chunks_mut(output_len)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * len;
-            for (ox, slot) in orow.iter_mut().enumerate() {
-                let start = ox * stride;
-                let mut m = f64::NEG_INFINITY;
-                for kx in 0..kernel {
-                    let v = input[ibase + start + kx];
-                    if v > m {
-                        m = v;
-                    }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * len;
+        for (ox, slot) in orow.iter_mut().enumerate() {
+            let start = ox * stride;
+            let mut m = f64::NEG_INFINITY;
+            for kx in 0..kernel {
+                let v = input[ibase + start + kx];
+                if v > m {
+                    m = v;
                 }
-                *slot = m;
             }
-        });
+            *slot = m;
+        }
+    };
+    if out.len() * kernel >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(output_len)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(output_len)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8493,27 +9624,35 @@ pub fn max_pool1d_forward_with_indices_f64(
 ) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; batch * ch * output_len];
     let mut arg_offsets = vec![0.0f64; batch * ch * output_len];
-    out.par_chunks_mut(output_len)
-        .zip(arg_offsets.par_chunks_mut(output_len))
-        .enumerate()
-        .for_each(|(plane, (orow, arow))| {
-            let ibase = plane * len;
-            for ox in 0..output_len {
-                let start = ox * stride;
-                let mut m = f64::NEG_INFINITY;
-                let mut arg = start;
-                for kx in 0..kernel {
-                    let loc = start + kx;
-                    let v = input[ibase + loc];
-                    if v > m {
-                        m = v;
-                        arg = loc;
-                    }
+    let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
+        let ibase = plane * len;
+        for ox in 0..output_len {
+            let start = ox * stride;
+            let mut m = f64::NEG_INFINITY;
+            let mut arg = start;
+            for kx in 0..kernel {
+                let loc = start + kx;
+                let v = input[ibase + loc];
+                if v > m {
+                    m = v;
+                    arg = loc;
                 }
-                orow[ox] = m;
-                arow[ox] = arg as f64;
             }
-        });
+            orow[ox] = m;
+            arow[ox] = arg as f64;
+        }
+    };
+    if out.len() * kernel >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(output_len)
+            .zip(arg_offsets.par_chunks_mut(output_len))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    } else {
+        out.chunks_mut(output_len)
+            .zip(arg_offsets.chunks_mut(output_len))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    }
     (out, arg_offsets)
 }
 
@@ -8562,28 +9701,35 @@ pub fn max_pool2d_forward_f64(
     sw: usize,
 ) -> Vec<f64> {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f64::NEG_INFINITY;
-                    for kr in 0..kh {
-                        let irow = ibase + (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[irow + kc];
-                            if v > m {
-                                m = v;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f64]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f64::NEG_INFINITY;
+                for kr in 0..kh {
+                    let irow = ibase + (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[irow + kc];
+                        if v > m {
+                            m = v;
                         }
                     }
-                    orow[oy * ow + ox] = m;
                 }
+                orow[oy * ow + ox] = m;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -8607,33 +9753,41 @@ pub fn max_pool2d_forward_with_indices_f64(
 ) -> (Vec<f64>, Vec<f64>) {
     let mut out = vec![0.0f64; batch * ch * oh * ow];
     let mut arg_offsets = vec![0.0f64; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .zip(arg_offsets.par_chunks_mut(oh * ow))
-        .enumerate()
-        .for_each(|(plane, (orow, arow))| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f64::NEG_INFINITY;
-                    let mut arg = 0usize;
-                    for kr in 0..kh {
-                        let loc = (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[ibase + loc + kc];
-                            if v > m {
-                                m = v;
-                                arg = loc + kc;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f64], arow: &mut [f64]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f64::NEG_INFINITY;
+                let mut arg = 0usize;
+                for kr in 0..kh {
+                    let loc = (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[ibase + loc + kc];
+                        if v > m {
+                            m = v;
+                            arg = loc + kc;
                         }
                     }
-                    let oidx = oy * ow + ox;
-                    orow[oidx] = m;
-                    arow[oidx] = arg as f64;
                 }
+                let oidx = oy * ow + ox;
+                orow[oidx] = m;
+                arow[oidx] = arg as f64;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .zip(arg_offsets.par_chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .zip(arg_offsets.chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    }
     (out, arg_offsets)
 }
 
@@ -8657,33 +9811,41 @@ pub fn max_pool2d_forward_with_indices_f32(
 ) -> (Vec<f32>, Vec<f32>) {
     let mut out = vec![0.0f32; batch * ch * oh * ow];
     let mut arg_offsets = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .zip(arg_offsets.par_chunks_mut(oh * ow))
-        .enumerate()
-        .for_each(|(plane, (orow, arow))| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f32::NEG_INFINITY;
-                    let mut arg = 0usize;
-                    for kr in 0..kh {
-                        let loc = (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[ibase + loc + kc];
-                            if v > m {
-                                m = v;
-                                arg = loc + kc;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f32], arow: &mut [f32]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f32::NEG_INFINITY;
+                let mut arg = 0usize;
+                for kr in 0..kh {
+                    let loc = (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[ibase + loc + kc];
+                        if v > m {
+                            m = v;
+                            arg = loc + kc;
                         }
                     }
-                    let oidx = oy * ow + ox;
-                    orow[oidx] = m;
-                    arow[oidx] = arg as f32;
                 }
+                let oidx = oy * ow + ox;
+                orow[oidx] = m;
+                arow[oidx] = arg as f32;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .zip(arg_offsets.par_chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .zip(arg_offsets.chunks_mut(oh * ow))
+            .enumerate()
+            .for_each(|(plane, (orow, arow))| plane_fn(plane, orow, arow));
+    }
     (out, arg_offsets)
 }
 
@@ -8736,28 +9898,35 @@ pub fn max_pool2d_forward_f32(
     sw: usize,
 ) -> Vec<f32> {
     let mut out = vec![0.0f32; batch * ch * oh * ow];
-    out.par_chunks_mut(oh * ow)
-        .enumerate()
-        .for_each(|(plane, orow)| {
-            let ibase = plane * ih * iw;
-            for oy in 0..oh {
-                let base_h = oy * sh;
-                for ox in 0..ow {
-                    let base_w = ox * sw;
-                    let mut m = f32::NEG_INFINITY;
-                    for kr in 0..kh {
-                        let irow = ibase + (base_h + kr) * iw + base_w;
-                        for kc in 0..kw {
-                            let v = input[irow + kc];
-                            if v > m {
-                                m = v;
-                            }
+    let plane_fn = |plane: usize, orow: &mut [f32]| {
+        let ibase = plane * ih * iw;
+        for oy in 0..oh {
+            let base_h = oy * sh;
+            for ox in 0..ow {
+                let base_w = ox * sw;
+                let mut m = f32::NEG_INFINITY;
+                for kr in 0..kh {
+                    let irow = ibase + (base_h + kr) * iw + base_w;
+                    for kc in 0..kw {
+                        let v = input[irow + kc];
+                        if v > m {
+                            m = v;
                         }
                     }
-                    orow[oy * ow + ox] = m;
                 }
+                orow[oy * ow + ox] = m;
             }
-        });
+        }
+    };
+    if out.len() * kh * kw >= POOL_FWD_PARALLEL_MIN {
+        out.par_chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    } else {
+        out.chunks_mut(oh * ow)
+            .enumerate()
+            .for_each(|(plane, orow)| plane_fn(plane, orow));
+    }
     out
 }
 
@@ -9422,6 +10591,37 @@ pub fn conv3d_col2im_f64(
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let mut dpadded = vec![0.0f64; batch * in_ch * pd * ph * pw];
+    // Small batch: per (batch,channel) plane (bit-identical scatter order per
+    // channel) so batch=1 isn't serial. See conv2d_col2im / conv3d_col2im_f32. kgs4-col2im-plane.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded
+            .par_chunks_mut(pd * ph * pw)
+            .enumerate()
+            .for_each(|(bc, dpc)| {
+                let b = bc / in_ch;
+                let c = bc % in_ch;
+                let pch = c * kd * kh * kw;
+                for pc in 0..patch_count {
+                    let base_d = (pc / (oh * ow)) * sd;
+                    let rem = pc % (oh * ow);
+                    let base_h = (rem / ow) * sh;
+                    let base_w = (rem % ow) * sw;
+                    let prow = (b * patch_count + pc) * patch_width + pch;
+                    for kdd in 0..kd {
+                        let d_off = (base_d + kdd) * ph * pw;
+                        let pkd = kdd * kh * kw;
+                        for kr in 0..kh {
+                            let irow = d_off + (base_h + kr) * pw + base_w;
+                            let prow_off = prow + pkd + kr * kw;
+                            for kc in 0..kw {
+                                dpc[irow + kc] += dpanel[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * pd * ph * pw)
         .enumerate()
@@ -9754,6 +10954,39 @@ pub fn conv3d_col2im_f32(
     let patch_width = in_ch * kd * kh * kw;
     let patch_count = od * oh * ow;
     let mut dpadded = vec![0.0f32; batch * in_ch * pd * ph * pw];
+    // Small batch: parallelize per (batch, channel) plane (each disjoint, its
+    // pc-outer scatter order identical to the per-batch loop restricted to channel
+    // c -> bit-identical) so batch=1 isn't serial. Mirrors conv2d_col2im. gated by
+    // COL2IM_PLANE_MAX_BATCH (per-plane regresses at large batch). kgs4-col2im-plane.
+    if batch < COL2IM_PLANE_MAX_BATCH {
+        dpadded
+            .par_chunks_mut(pd * ph * pw)
+            .enumerate()
+            .for_each(|(bc, dpc)| {
+                let b = bc / in_ch;
+                let c = bc % in_ch;
+                let pch = c * kd * kh * kw;
+                for pc in 0..patch_count {
+                    let base_d = (pc / (oh * ow)) * sd;
+                    let rem = pc % (oh * ow);
+                    let base_h = (rem / ow) * sh;
+                    let base_w = (rem % ow) * sw;
+                    let prow = (b * patch_count + pc) * patch_width + pch;
+                    for kdd in 0..kd {
+                        let d_off = (base_d + kdd) * ph * pw;
+                        let pkd = kdd * kh * kw;
+                        for kr in 0..kh {
+                            let irow = d_off + (base_h + kr) * pw + base_w;
+                            let prow_off = prow + pkd + kr * kw;
+                            for kc in 0..kw {
+                                dpc[irow + kc] += dpanel[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            });
+        return dpadded;
+    }
     dpadded
         .par_chunks_mut(in_ch * pd * ph * pw)
         .enumerate()
@@ -9827,17 +11060,10 @@ pub fn conv3d_backward_f32(
     let panel = conv3d_im2col_f32(
         padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
-    let mut dout_t = vec![0.0f32; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel via sgemm_tb (strided-transpose read of
+    // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     let mut dweight = vec![0.0f32; out_ch * patch_width];
-    gemm::sgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::sgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     let mut dpanel = vec![0.0f32; flat * patch_width];
     gemm::sgemm(
         flat,
@@ -10050,20 +11276,10 @@ fn conv3d_backward_generic_f64(
     let panel = conv3d_im2col_f64(
         padded, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
     );
-    // Transpose dout_flat [flat, out_ch] -> dout_t [out_ch, flat] in parallel over
-    // out_ch (independent strided gather — pure copy, bit-identical; was a serial
-    // O(flat*out_ch) pass). Mirrors the conv2d fix. frankentorch-convbwd.
-    let mut dout_t = vec![0.0f64; out_ch * flat];
-    dout_t
-        .par_chunks_exact_mut(flat)
-        .enumerate()
-        .for_each(|(oc, row)| {
-            for (r, slot) in row.iter_mut().enumerate() {
-                *slot = dout_flat[r * out_ch + oc];
-            }
-        });
+    // dweight = dout_flat^T @ panel via dgemm_tb (strided-transpose read of
+    // dout_flat) — no dout_t materialisation; bit-identical (conv2d twin). kgs4-convtb.
     let mut dweight = vec![0.0f64; out_ch * patch_width];
-    gemm::dgemm(out_ch, flat, patch_width, &dout_t, &panel, &mut dweight);
+    gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut dweight);
     let mut dpanel = vec![0.0f64; flat * patch_width];
     gemm::dgemm(
         flat,
@@ -10429,27 +11645,46 @@ pub fn batch_norm_apply_f64(
         shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
     }
     let mut out = vec![0.0f64; x.len()];
+    // Pure fma-copy (out = x*scale + shift, stats precomputed): BANDWIDTH-bound like
+    // a scaled copy, so parallel only pays above the fault-parallelism crossover
+    // (~4M); below it (the common CNN train shapes [b8..64, C, HW]) rayon overhead
+    // regresses it 0.1-0.8x. Gate at the copy tier, not the compute default. Bit-exact.
+    let parallel = x.len() >= COPY_MATERIALIZE_PARALLEL_MIN;
     if spatial == 1 {
-        out.par_chunks_mut(channels)
-            .enumerate()
-            .for_each(|(n, row)| {
-                let base = n * channels;
-                for c in 0..channels {
-                    row[c] = x[base + c] * scale[c] + shift[c];
-                }
-            });
+        let row_fn = |n: usize, row: &mut [f64]| {
+            let base = n * channels;
+            for c in 0..channels {
+                row[c] = x[base + c] * scale[c] + shift[c];
+            }
+        };
+        if parallel {
+            out.par_chunks_mut(channels)
+                .enumerate()
+                .for_each(|(n, row)| row_fn(n, row));
+        } else {
+            out.chunks_mut(channels)
+                .enumerate()
+                .for_each(|(n, row)| row_fn(n, row));
+        }
     } else {
-        out.par_chunks_mut(spatial)
-            .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
-            .enumerate()
-            .for_each(|(idx, orow)| {
-                let c = idx % channels;
-                let base = idx * spatial;
-                let (sc, sh) = (scale[c], shift[c]);
-                for s in 0..spatial {
-                    orow[s] = x[base + s] * sc + sh;
-                }
-            });
+        let row_fn = |idx: usize, orow: &mut [f64]| {
+            let c = idx % channels;
+            let base = idx * spatial;
+            let (sc, sh) = (scale[c], shift[c]);
+            for s in 0..spatial {
+                orow[s] = x[base + s] * sc + sh;
+            }
+        };
+        if parallel {
+            out.par_chunks_mut(spatial)
+                .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+                .enumerate()
+                .for_each(|(idx, orow)| row_fn(idx, orow));
+        } else {
+            out.chunks_mut(spatial)
+                .enumerate()
+                .for_each(|(idx, orow)| row_fn(idx, orow));
+        }
     }
     out
 }
@@ -10553,17 +11788,26 @@ pub fn batch_norm_apply_f32(
         shift[c] = bias.map_or(0.0, |b| b[c]) - mean[c] * scale[c];
     }
     let mut out = vec![0.0f32; x.len()];
-    out.par_chunks_mut(spatial)
-        .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
-        .enumerate()
-        .for_each(|(idx, orow)| {
-            let c = idx % channels;
-            let base = idx * spatial;
-            let (sc, sh) = (scale[c], shift[c]);
-            for s in 0..spatial {
-                orow[s] = x[base + s] * sc + sh;
-            }
-        });
+    // Pure fma-copy: gate at the copy tier (COPY_MATERIALIZE_PARALLEL_MIN), not the
+    // compute default — small-batch CNN train regresses parallel 0.1-0.8x. Bit-exact.
+    let row_fn = |idx: usize, orow: &mut [f32]| {
+        let c = idx % channels;
+        let base = idx * spatial;
+        let (sc, sh) = (scale[c], shift[c]);
+        for s in 0..spatial {
+            orow[s] = x[base + s] * sc + sh;
+        }
+    };
+    if x.len() >= COPY_MATERIALIZE_PARALLEL_MIN {
+        out.par_chunks_mut(spatial)
+            .with_min_len(BATCH_NORM_MIN_PAR_ROWS)
+            .enumerate()
+            .for_each(|(idx, orow)| row_fn(idx, orow));
+    } else {
+        out.chunks_mut(spatial)
+            .enumerate()
+            .for_each(|(idx, orow)| row_fn(idx, orow));
+    }
     out
 }
 
@@ -10938,10 +12182,21 @@ pub fn linear_tensor_f64(
     let mut y = vec![0.0f64; batch * out_features];
     gemm::dgemm_bt(batch, in_features, out_features, x, weight, &mut y);
     if let Some(b) = bias {
-        for row in y.chunks_exact_mut(out_features) {
+        // Row-parallel bias add: each output row is independent and its adds are a
+        // pure per-element `+= b[j]` (order-invariant) -> bit-identical to serial.
+        // This is a bandwidth-bound SERIAL TAIL after the parallel GEMM (measured
+        // ~2.0-2.6x parallel at [batch,out] >= 34M); parallelize large outputs,
+        // keep small ones serial (rayon fan-out > gain). kgs4-linbias.
+        use rayon::prelude::*;
+        let add_row = |row: &mut [f64]| {
             for (yj, bj) in row.iter_mut().zip(b.iter()) {
                 *yj += *bj;
             }
+        };
+        if y.len() >= 1 << 16 {
+            y.par_chunks_exact_mut(out_features).for_each(add_row);
+        } else {
+            y.chunks_exact_mut(out_features).for_each(add_row);
         }
     }
     y
@@ -10972,18 +12227,16 @@ pub fn linear_backward_f64(
     // dx = dy @ weight : [batch,out] @ [out,in] -> [batch,in].
     let mut dx = vec![0.0f64; batch * in_features];
     gemm::dgemm(batch, out_features, in_features, dy, weight, &mut dx);
-    // dweight = dy^T @ x : materialise dy^T [out,batch] (grad-sized, contiguous
-    // write — far smaller/cheaper than the 8MB strided weight transpose this
-    // whole path exists to avoid), then [out,batch] @ [batch,in] -> [out,in].
-    let mut dyt = vec![0.0f64; out_features * batch];
-    for b in 0..batch {
-        let row = &dy[b * out_features..(b + 1) * out_features];
-        for (o, &v) in row.iter().enumerate() {
-            dyt[o * batch + b] = v;
-        }
-    }
+    // dweight = dy^T @ x. `dgemm_tb` reads dy [batch,out] AS dy^T via strides
+    // (rsa=1, csa=out) — it needs no [out,batch] transpose materialisation, and
+    // its K traversal matches the materialise-transpose-then-`dgemm` path for
+    // every output element, so dweight is BIT-IDENTICAL to the old code. The old
+    // inline transpose was a cache-thrashing strided scatter (`dyt[o*batch+b]`)
+    // that DOMINATED this backward — measured 327ms at [8192,4096], larger than
+    // either GEMM; eliminating it (both the alloc and the copy) is the whole win.
+    // kgs4-linbwd-tb.
     let mut dweight = vec![0.0f64; out_features * in_features];
-    gemm::dgemm(out_features, batch, in_features, &dyt, x, &mut dweight);
+    gemm::dgemm_tb(out_features, batch, in_features, dy, x, &mut dweight);
     // dbias = sum over the batch rows of dy.
     let dbias = if need_bias {
         let mut db = vec![0.0f64; out_features];
@@ -11013,10 +12266,19 @@ pub fn linear_tensor_f32(
     let mut y = vec![0.0f32; batch * out_features];
     gemm::sgemm_bt(batch, in_features, out_features, x, weight, &mut y);
     if let Some(b) = bias {
-        for row in y.chunks_exact_mut(out_features) {
+        // Row-parallel bias add (f32 mirror of linear_tensor_f64): independent rows,
+        // pure per-element add -> bit-identical to serial; parallelize the
+        // bandwidth-bound serial tail for large outputs. kgs4-linbias.
+        use rayon::prelude::*;
+        let add_row = |row: &mut [f32]| {
             for (yj, bj) in row.iter_mut().zip(b.iter()) {
                 *yj += *bj;
             }
+        };
+        if y.len() >= 1 << 16 {
+            y.par_chunks_exact_mut(out_features).for_each(add_row);
+        } else {
+            y.chunks_exact_mut(out_features).for_each(add_row);
         }
     }
     y
@@ -11163,10 +12425,21 @@ pub fn lerp_tensor_contiguous_f64(
     }
     let s = &start[offset..offset + numel];
     let e = &end[offset..offset + numel];
-    Ok(s.iter()
-        .zip(e.iter())
-        .map(|(&sv, &ev)| sv + weight * (ev - sv))
-        .collect())
+    // Pure per-element map → parallel above PARALLEL_THRESHOLD (bit-identical to the serial
+    // zip-map; indexed parallel collect preserves order). The no-grad ft-api lerp is already
+    // fast-pathed; this parallelizes the kernel for the grad path / direct callers.
+    if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        Ok(s.par_iter()
+            .zip(e.par_iter())
+            .map(|(&sv, &ev)| sv + weight * (ev - sv))
+            .collect())
+    } else {
+        Ok(s.iter()
+            .zip(e.iter())
+            .map(|(&sv, &ev)| sv + weight * (ev - sv))
+            .collect())
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -11242,12 +12515,24 @@ pub fn addmm_tensor_contiguous_f64(
         &mut gemm_out,
     );
 
-    // Apply: out = beta * input + alpha * (mat1 @ mat2)
-    let out: Vec<f64> = gemm_out
-        .iter()
-        .enumerate()
-        .map(|(i, &g)| beta * input_at(i) + alpha * g)
-        .collect();
+    // Apply: out = beta * input + alpha * (mat1 @ mat2). Each element is an
+    // independent `beta*input_at(i) + alpha*gemm_out[i]` -> parallel (indexed
+    // collect preserves order) is bit-identical to the serial map. This is a
+    // bandwidth-bound serial tail after the parallel GEMM; parallelize large
+    // outputs (e.g. an LM-head addmm [batch,vocab]). kgs4-linbias.
+    let out: Vec<f64> = if out_numel >= 1 << 16 {
+        use rayon::prelude::*;
+        (0..gemm_out.len())
+            .into_par_iter()
+            .map(|i| beta * input_at(i) + alpha * gemm_out[i])
+            .collect()
+    } else {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| beta * input_at(i) + alpha * g)
+            .collect()
+    };
 
     Ok(out)
 }
@@ -11306,20 +12591,28 @@ pub fn addmv_tensor_contiguous_f64(
     let mat_start = mat_meta.storage_offset();
     let vec_start = vec_meta.storage_offset();
 
-    // Push-based output skips the m-cell zero-init memset
-    // (frankentorch-u04j); same row-major contract as matmul.
-    let mut out = Vec::with_capacity(m);
-    // Pairwise dot product per row. Same pattern as matmul; for K
-    // typical of LM head linear projections (vocab >= 32k) the
-    // sequential drift was visible in inference logits.
-    let mut scratch = vec![0.0_f64; k];
-    for row in 0..m {
-        for (col, scratch_slot) in scratch.iter_mut().enumerate() {
-            *scratch_slot = mat[mat_start + row * k + col] * vec_data[vec_start + col];
-        }
-        let acc = pairwise_sum_f64(&scratch);
-        out.push(beta * input[input_start + row] + alpha * acc);
-    }
+    // GEMV per row. `pairwise_dot_f64(mat_row, vec)` is BIT-FOR-BIT the
+    // `pairwise_sum_f64(&[mat_row[c]*vec[c]])` the old scratch loop computed
+    // (same mid=len/2 tree, same 128-elem serial leaf) but skips the k-scratch.
+    // Rows are INDEPENDENT and each is reduced identically regardless of thread,
+    // so the row-parallel path is bit-for-bit identical to the serial one — GEMV
+    // is bandwidth-bound (streams the whole matrix once), so spreading rows over
+    // the pool uses more memory channels (measured 6-7.5x internal at LM-head
+    // shapes, flipping ~3-4x SLOWER -> 2-3.7x FASTER vs torch's addmv). Gate on
+    // total work so tiny GEMVs (rayon split/join > gain) stay serial (measured
+    // crossover ~262144: below, par regresses; at/above, 2.5-15x). kgs4-addmv-par.
+    const ADDMV_PARALLEL_MIN_WORK: usize = 1 << 18; // 262144
+    let vec_slice = &vec_data[vec_start..vec_start + k];
+    let row_val = |row: usize| -> f64 {
+        let mrow = &mat[mat_start + row * k..mat_start + row * k + k];
+        beta * input[input_start + row] + alpha * pairwise_dot_f64(mrow, vec_slice)
+    };
+    let out: Vec<f64> = if m > 1 && m.saturating_mul(k) >= ADDMV_PARALLEL_MIN_WORK {
+        use rayon::prelude::*;
+        (0..m).into_par_iter().map(row_val).collect()
+    } else {
+        (0..m).map(row_val).collect()
+    };
     Ok(out)
 }
 
@@ -11359,12 +12652,13 @@ pub fn dot_tensor_contiguous_f64(
     // preserve. Same O(log N · ε) precision contract — collect
     // builds a contiguous Vec that pairwise_sum_f64 reads as a
     // slice. Tracked under frankentorch-cunc.
-    let scratch: Vec<f64> = lhs_slice
-        .iter()
-        .zip(rhs_slice)
-        .map(|(&l, &r)| l * r)
-        .collect();
-    Ok(pairwise_sum_f64(&scratch))
+    //
+    // Fused parallel dot: `pairwise_dot_f64_maybe_par` reduces sum(l*r) over the
+    // same mid=len/2 tree as the old `pairwise_sum_f64(&products)` (bit-for-bit
+    // identical) but WITHOUT the n-sized products scratch (no 16MB write+reread)
+    // and parallel via rayon::join for large N. The serial dot was the whole op's
+    // wall (~739x SLOWER than torch's BLAS dot at 4M).
+    Ok(pairwise_dot_f64_maybe_par(lhs_slice, rhs_slice))
 }
 
 pub fn outer_tensor_contiguous_f64(
@@ -11398,7 +12692,12 @@ pub fn outer_tensor_contiguous_f64(
     // out[i*n + j] = lhs[i] * rhs[j]. Each row is independent and writes a disjoint
     // chunk, so distribute the rows across the rayon pool (par_chunks_mut → no aliasing).
     // Bit-identical to the serial fill. frankentorch-kgs4.104.
-    if out_numel >= PARALLEL_THRESHOLD {
+    // Bandwidth-bound pure write (one multiply/elem, no reduce): the parallel path's only
+    // benefit is parallel FIRST-TOUCH of the fresh output alloc, which needs the copy-tier
+    // fault-parallelism crossover (~4M/32MB). The old PARALLEL_THRESHOLD(8192) gate massively
+    // over-parallelized medium outer products (1024x1024=1M measured 0.13x = 8x SLOWER, 256K
+    // 0.07x); crossover ~4M (2048x2048 6.5x). Gate at COPY_MATERIALIZE_PARALLEL_MIN. (BlackThrush)
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         let mut out = vec![0.0_f64; out_numel];
         out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
             let l = lhs_slice[i];
@@ -11551,6 +12850,80 @@ pub fn prod_dim_tensor_contiguous_f64(
     let offset = meta.storage_offset();
     let data = &input[offset..];
 
+    // GLOBAL/near-global reduce fast path (mirrors var_dim): when there are too few
+    // output lanes to fill the cores (`tensor_prod` flattens to [numel] then reduces
+    // dim 0 → a single lane) and each lane's column is contiguous (`inner_size == 1`),
+    // the per-lane serial product is fully SERIAL over a huge reduce dim. Reduce WITHIN
+    // each lane in parallel (rayon tree product). The multiply grouping differs from the
+    // serial left-to-right product, but reduction parity is tolerance-based (1e-5).
+    // Small/strided reduces keep the bit-exact lane-parallel loop below.
+    if inner_size == 1
+        && out_numel <= rayon::current_num_threads()
+        && reduce_size >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let output: Vec<f64> = (0..out_numel)
+            .map(|out_idx| {
+                data[out_idx * reduce_size..out_idx * reduce_size + reduce_size]
+                    .par_iter()
+                    .copied()
+                    .product::<f64>()
+            })
+            .collect();
+        return Ok(output);
+    }
+
+    // CACHE-BLOCKED strided-reduction fast path (inner_size > 1, i.e. dim=0 or a middle dim).
+    // The per-lane loop below reads each column with a stride of `inner_size` elements — every
+    // access is a fresh cache line, so at large inner (32KB-8MB stride) it is DRAM-latency bound.
+    // Instead sweep the input in ROW-MAJOR (contiguous) order, accumulating a block of `BLK`
+    // columns into a small cache-resident accumulator: for each row `r`, multiply the contiguous
+    // `[c0..c0+w]` slice into `acc[..w]`. The per-column multiply order is still r=0,1,2,… (L-to-R),
+    // so this is BIT-FOR-BIT identical to the strided lane loop — only the memory traversal changes.
+    // Measured (dim=0, f64, 64t): 2.3-5.9x faster than the strided path across [4000²…16×1M] shapes.
+    // frankentorch (BlackThrush).
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let mut output = vec![1.0f64; out_numel];
+        let threads = rayon::current_num_threads();
+        // Enough blocks to fill the pool for the outer_size==1 case, but keep each block's
+        // accumulator L1-resident (BLK f64 <= a few KB).
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, acc: &mut [f64]| {
+            let w = acc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for (a, &v) in acc.iter_mut().zip(row.iter()) {
+                    *a *= v;
+                }
+            }
+        };
+        if outer_size == 1 {
+            output
+                .par_chunks_mut(blk)
+                .enumerate()
+                .for_each(|(bi, acc)| {
+                    sweep(0, bi * blk, acc);
+                });
+        } else {
+            // One output row per `outer`; block the inner sweep within each (serial blocks,
+            // parallel over outers). `outer` supplies the pool parallelism here.
+            output
+                .par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, out_row)| {
+                    let obase = outer * reduce_size * inner_size;
+                    out_row.chunks_mut(blk).enumerate().for_each(|(bi, acc)| {
+                        sweep(obase, bi * blk, acc);
+                    });
+                });
+        }
+        return Ok(output);
+    }
+
     // Each output lane is an independent sequential product of a strided column;
     // the per-lane left-to-right multiply order is unchanged by scheduling, so
     // per-lane parallelism is BIT-FOR-BIT equal to the serial double loop (and the
@@ -11609,6 +12982,34 @@ pub fn var_dim_tensor_contiguous_f64(
     let correction = (reduce_size - 1) as f64; // Bessel's correction
     #[allow(clippy::cast_precision_loss)]
     let n_div = reduce_size as f64;
+
+    // GLOBAL/near-global reduce fast path: when there are too few output lanes to
+    // fill the cores (e.g. `tensor_var`/`tensor_std` flatten to [numel] then reduce
+    // dim 0 → a single lane) and each lane's column is contiguous (`inner_size == 1`),
+    // the per-lane two-pass loop is fully SERIAL over a huge reduce dim. Parallelize
+    // WITHIN each lane via the same `pairwise_sum_map_f64_maybe_par` reducer that
+    // `norm`/`sum`/`mean` already use. The accumulation order differs from the serial
+    // scratch reduction, but reduction parity is tolerance-based (1e-5), so this stays
+    // within parity while turning a serial 16M reduce into a parallel one. Small/strided
+    // reduces (the common dim-reduction case) keep the bit-exact lane-parallel loop.
+    if inner_size == 1
+        && out_numel <= rayon::current_num_threads()
+        && reduce_size >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let output: Vec<f64> = (0..out_numel)
+            .map(|out_idx| {
+                let col = &data[out_idx * reduce_size..out_idx * reduce_size + reduce_size];
+                let mean = pairwise_sum_map_f64_maybe_par(col, |x| x) / n_div;
+                let var_sum = pairwise_sum_map_f64_maybe_par(col, |x| {
+                    let d = x - mean;
+                    d * d
+                });
+                var_sum / correction
+            })
+            .collect();
+        return Ok(output);
+    }
 
     // Each output lane is an INDEPENDENT two-pass reduction: gather the strided
     // column into contiguous scratch, pairwise-sum the mean, then pairwise-sum the
@@ -11671,28 +13072,53 @@ pub fn norm_tensor_contiguous_f64(
     let data = &input[offset..offset + numel];
 
     if p == f64::INFINITY {
-        // norm(inf) = max(|x|). f64::max silently drops NaN, but PyTorch's
-        // max reduction propagates it, so fold with explicit NaN checks.
-        Ok(data.iter().fold(0.0_f64, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
+        // norm(inf) = max(|x|). f64::max silently drops NaN, but PyTorch's max
+        // reduction propagates it, so combine with explicit NaN checks. Parallel
+        // reduce for large N: max is associative/commutative and 0.0 is its identity
+        // over non-negative |x|, so the result is BIT-IDENTICAL to the serial fold.
+        let combine = |a: f64, b: f64| {
+            if a.is_nan() || b.is_nan() {
                 f64::NAN
             } else {
-                acc.max(a)
+                a.max(b)
             }
-        }))
+        };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data
+                .par_iter()
+                .map(|&x| x.abs())
+                .reduce(|| 0.0_f64, combine))
+        } else {
+            Ok(data.iter().fold(0.0_f64, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == f64::NEG_INFINITY {
-        Ok(data.iter().fold(f64::INFINITY, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
+        let combine = |a: f64, b: f64| {
+            if a.is_nan() || b.is_nan() {
                 f64::NAN
             } else {
-                acc.min(a)
+                a.min(b)
             }
-        }))
+        };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data
+                .par_iter()
+                .map(|&x| x.abs())
+                .reduce(|| f64::INFINITY, combine))
+        } else {
+            Ok(data
+                .iter()
+                .fold(f64::INFINITY, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == 0.0 {
         // L0 "norm": count of non-zero elements
-        Ok(data.iter().filter(|&&x| x != 0.0).count() as f64)
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().filter(|&&x| x != 0.0).count() as f64)
+        } else {
+            Ok(data.iter().filter(|&&x| x != 0.0).count() as f64)
+        }
     } else if p == 1.0 {
         Ok(pairwise_sum_map_f64_maybe_par(data, |x| x.abs()))
     } else if p == 2.0 {
@@ -11783,25 +13209,44 @@ pub fn norm_dim_tensor_contiguous_f64(
             }
         }
     } else if p == 1.0 {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum = 0.0;
-                for r in 0..reduce_size {
-                    sum += data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
-                }
-                output.push(sum);
+        // Per-output o = outer*inner_size + inner; each output sums its own lane,
+        // so par_iter().collect() is bit-identical to the serial push. p=1/p=2 were
+        // SERIAL — for a large output (small reduce dim, big tensor) that strands
+        // millions of independent lane-reductions on one core (measured 3.18x SLOWER
+        // than torch at [4096,2048,2] dim=2). Sibling of the f32 fix (d248f167).
+        let compute = |o: usize| -> f64 {
+            let outer = o / inner_size;
+            let inner = o % inner_size;
+            let mut sum = 0.0;
+            for r in 0..reduce_size {
+                sum += data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
             }
+            sum
+        };
+        if checked_mul(out_numel, reduce_size, "norm_dim work").unwrap_or(usize::MAX)
+            >= PARALLEL_THRESHOLD
+        {
+            output = (0..out_numel).into_par_iter().map(compute).collect();
+        } else {
+            output.extend((0..out_numel).map(compute));
         }
     } else if p == 2.0 {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum_sq = 0.0;
-                for r in 0..reduce_size {
-                    let v = data[outer * reduce_size * inner_size + r * inner_size + inner];
-                    sum_sq += v * v;
-                }
-                output.push(sum_sq.sqrt());
+        let compute = |o: usize| -> f64 {
+            let outer = o / inner_size;
+            let inner = o % inner_size;
+            let mut sum_sq = 0.0;
+            for r in 0..reduce_size {
+                let v = data[outer * reduce_size * inner_size + r * inner_size + inner];
+                sum_sq += v * v;
             }
+            sum_sq.sqrt()
+        };
+        if checked_mul(out_numel, reduce_size, "norm_dim work").unwrap_or(usize::MAX)
+            >= PARALLEL_THRESHOLD
+        {
+            output = (0..out_numel).into_par_iter().map(compute).collect();
+        } else {
+            output.extend((0..out_numel).map(compute));
         }
     } else {
         // General fractional p: one `powf` per element + a final `powf` per
@@ -12166,6 +13611,57 @@ pub fn argmax_dim_tensor_contiguous_f64(
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
 
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmax
+    // INDEX. first-strict-extremum (`>`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f64]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f64::NEG_INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f64::NAN;
+                            out_idx[c] = r as f64;
+                        } else if val > acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f64;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output
+                .par_chunks_mut(blk)
+                .enumerate()
+                .for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output
+                .par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, orow)| {
+                    let obase = outer * reduce_size * inner_size;
+                    orow.chunks_mut(blk)
+                        .enumerate()
+                        .for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+                });
+        }
+        return Ok(output);
+    }
+
     // Each output lane (outer,inner) reduces an independent strided column of
     // `reduce_size` elements; the per-lane scan (first strict-max wins, NaN
     // short-circuits) is identical regardless of scheduling, so parallelizing over
@@ -12233,6 +13729,57 @@ pub fn argmin_dim_tensor_contiguous_f64(
     let mut output = vec![0.0; out_numel];
     let data = &input[offset..];
 
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmin
+    // INDEX. first-strict-extremum (`<`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f64]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f64::INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f64::NAN;
+                            out_idx[c] = r as f64;
+                        } else if val < acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f64;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output
+                .par_chunks_mut(blk)
+                .enumerate()
+                .for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output
+                .par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, orow)| {
+                    let obase = outer * reduce_size * inner_size;
+                    orow.chunks_mut(blk)
+                        .enumerate()
+                        .for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+                });
+        }
+        return Ok(output);
+    }
+
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.50.
     let argmin = |out_idx: usize| -> f64 {
         let outer = out_idx / inner_size;
@@ -12298,6 +13845,61 @@ pub fn max_dim_tensor_contiguous_f64(
     let mut indices = vec![0.0; out_numel];
     let data = &input[offset..];
 
+    // CACHE-BLOCKED strided-reduction fast path (inner_size > 1, i.e. dim=0 / middle dim): the
+    // per-lane loop below reads each column strided by `inner_size` (a fresh cache line per access,
+    // DRAM-latency-bound at large inner). Instead sweep the input ROW-MAJOR (contiguous),
+    // accumulating a BLK-column block of (max, argmax) in an L1-resident buffer. `max` is exactly
+    // associative and the "first strict-max wins + NaN-freeze" rule is order-independent — a column
+    // freezes once it hits NaN (detected via `!vacc[c].is_nan()`, equivalent to the serial `break`),
+    // and `> vacc[c]` keeps the earliest max. BIT-FOR-BIT identical to the strided lane loop; only
+    // the memory traversal changes. Same lever as prod_dim (measured 2.3-5.9x). (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, vacc: &mut [f64], iacc: &mut [f64]| {
+            let w = vacc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !vacc[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            vacc[c] = f64::NAN;
+                            iacc[c] = r as f64;
+                        } else if val > vacc[c] {
+                            vacc[c] = val;
+                            iacc[c] = r as f64;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            values
+                .par_chunks_mut(blk)
+                .zip(indices.par_chunks_mut(blk))
+                .enumerate()
+                .for_each(|(bi, (vacc, iacc))| sweep(0, bi * blk, vacc, iacc));
+        } else {
+            values
+                .par_chunks_mut(inner_size)
+                .zip(indices.par_chunks_mut(inner_size))
+                .enumerate()
+                .for_each(|(outer, (vrow, irow))| {
+                    let obase = outer * reduce_size * inner_size;
+                    vrow.chunks_mut(blk)
+                        .zip(irow.chunks_mut(blk))
+                        .enumerate()
+                        .for_each(|(bi, (vacc, iacc))| sweep(obase, bi * blk, vacc, iacc));
+                });
+        }
+        return Ok((values, indices));
+    }
+
     // Each output lane (outer,inner) reduces an independent strided column; the
     // per-lane scan (first strict-max wins, NaN short-circuits to its index) is
     // unchanged by scheduling, so per-lane parallelism is BIT-FOR-BIT equal to the
@@ -12335,6 +13937,239 @@ pub fn max_dim_tensor_contiguous_f64(
     Ok((values, indices))
 }
 
+/// f32-native combined (values, indices) max-reduction along `dim` — ONE pass per lane (vs the
+/// 2-pass extremum+argmax fast path). Mirrors `max_dim_tensor_contiguous_f64`'s lane rule exactly
+/// (first strict-max wins, NaN short-circuits to its index) on f32 values, so it is BIT-EXACT with
+/// the f64 kernel (f32->f64 is order-preserving). Values stay f32; indices are f32 (exact for
+/// reduce_size < 2^24).
+pub fn max_dim_values_indices_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+) -> Result<(Vec<f32>, Vec<f32>), KernelError> {
+    ensure_unary_layout_and_storage_f32(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let reduce_size = shape[dim];
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "max_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "max_dim shape multiplication overflow",
+    )?;
+    if out_numel == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if reduce_size == 0 {
+        return Err(KernelError::EmptyReductionDim { dim });
+    }
+    let offset = meta.storage_offset();
+    let mut values = vec![f32::NEG_INFINITY; out_numel];
+    let mut indices = vec![0.0_f32; out_numel];
+    let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (f32 mirror of max_dim_tensor_contiguous_f64):
+    // sweep row-major contiguous slices into an L1-resident block of (max, argmax) instead of
+    // striding each column by inner_size. `max` is exactly associative; first-strict-max (`>`)
+    // + NaN-freeze (`!vacc[c].is_nan()` == the serial break) are order-independent => BIT-FOR-BIT
+    // identical to the strided lane loop (values AND f32 indices). (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, vacc: &mut [f32], iacc: &mut [f32]| {
+            let w = vacc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !vacc[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            vacc[c] = f32::NAN;
+                            iacc[c] = r as f32;
+                        } else if val > vacc[c] {
+                            vacc[c] = val;
+                            iacc[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            values
+                .par_chunks_mut(blk)
+                .zip(indices.par_chunks_mut(blk))
+                .enumerate()
+                .for_each(|(bi, (vacc, iacc))| sweep(0, bi * blk, vacc, iacc));
+        } else {
+            values
+                .par_chunks_mut(inner_size)
+                .zip(indices.par_chunks_mut(inner_size))
+                .enumerate()
+                .for_each(|(outer, (vrow, irow))| {
+                    let obase = outer * reduce_size * inner_size;
+                    vrow.chunks_mut(blk)
+                        .zip(irow.chunks_mut(blk))
+                        .enumerate()
+                        .for_each(|(bi, (vacc, iacc))| sweep(obase, bi * blk, vacc, iacc));
+                });
+        }
+        return Ok((values, indices));
+    }
+    let lane = |out_idx: usize, v: &mut f32, ix: &mut f32| {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for r in 0..reduce_size {
+            let val = data[base + r * inner_size];
+            if val.is_nan() {
+                *v = f32::NAN;
+                *ix = r as f32;
+                break;
+            } else if val > *v {
+                *v = val;
+                *ix = r as f32;
+            }
+        }
+    };
+    if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        values
+            .par_iter_mut()
+            .zip(indices.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, ix))| lane(i, v, ix));
+    } else {
+        for (i, (v, ix)) in values.iter_mut().zip(indices.iter_mut()).enumerate() {
+            lane(i, v, ix);
+        }
+    }
+    Ok((values, indices))
+}
+
+/// f32-native combined (values, indices) min-reduction along `dim` — sibling of
+/// [`max_dim_values_indices_contiguous_f32`] (first strict-min `<` wins, NaN short-circuits).
+pub fn min_dim_values_indices_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+) -> Result<(Vec<f32>, Vec<f32>), KernelError> {
+    ensure_unary_layout_and_storage_f32(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let reduce_size = shape[dim];
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "min_dim shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "min_dim shape multiplication overflow",
+    )?;
+    if out_numel == 0 {
+        return Ok((Vec::new(), Vec::new()));
+    }
+    if reduce_size == 0 {
+        return Err(KernelError::EmptyReductionDim { dim });
+    }
+    let offset = meta.storage_offset();
+    let mut values = vec![f32::INFINITY; out_numel];
+    let mut indices = vec![0.0_f32; out_numel];
+    let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (f32 mirror of min_dim_tensor_contiguous_f64):
+    // sweep row-major contiguous slices into an L1-resident block of (min, argmax) instead of
+    // striding each column by inner_size. `min` is exactly associative; first-strict-min (`<`)
+    // + NaN-freeze (`!vacc[c].is_nan()` == the serial break) are order-independent => BIT-FOR-BIT
+    // identical to the strided lane loop (values AND f32 indices). (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, vacc: &mut [f32], iacc: &mut [f32]| {
+            let w = vacc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !vacc[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            vacc[c] = f32::NAN;
+                            iacc[c] = r as f32;
+                        } else if val < vacc[c] {
+                            vacc[c] = val;
+                            iacc[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            values
+                .par_chunks_mut(blk)
+                .zip(indices.par_chunks_mut(blk))
+                .enumerate()
+                .for_each(|(bi, (vacc, iacc))| sweep(0, bi * blk, vacc, iacc));
+        } else {
+            values
+                .par_chunks_mut(inner_size)
+                .zip(indices.par_chunks_mut(inner_size))
+                .enumerate()
+                .for_each(|(outer, (vrow, irow))| {
+                    let obase = outer * reduce_size * inner_size;
+                    vrow.chunks_mut(blk)
+                        .zip(irow.chunks_mut(blk))
+                        .enumerate()
+                        .for_each(|(bi, (vacc, iacc))| sweep(obase, bi * blk, vacc, iacc));
+                });
+        }
+        return Ok((values, indices));
+    }
+    let lane = |out_idx: usize, v: &mut f32, ix: &mut f32| {
+        let outer = out_idx / inner_size;
+        let inner = out_idx % inner_size;
+        let base = outer * reduce_size * inner_size + inner;
+        for r in 0..reduce_size {
+            let val = data[base + r * inner_size];
+            if val.is_nan() {
+                *v = f32::NAN;
+                *ix = r as f32;
+                break;
+            } else if val < *v {
+                *v = val;
+                *ix = r as f32;
+            }
+        }
+    };
+    if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        values
+            .par_iter_mut()
+            .zip(indices.par_iter_mut())
+            .enumerate()
+            .for_each(|(i, (v, ix))| lane(i, v, ix));
+    } else {
+        for (i, (v, ix)) in values.iter_mut().zip(indices.iter_mut()).enumerate() {
+            lane(i, v, ix);
+        }
+    }
+    Ok((values, indices))
+}
+
 pub fn min_dim_tensor_contiguous_f64(
     input: &[f64],
     meta: &TensorMeta,
@@ -12364,6 +14199,56 @@ pub fn min_dim_tensor_contiguous_f64(
     let mut values = vec![f64::INFINITY; out_numel];
     let mut indices = vec![0.0; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (mirror of max_dim_f64; `min` is exactly
+    // associative, first-strict-min wins via `< vacc[c]`, NaN-freeze via `!vacc[c].is_nan()`).
+    // BIT-FOR-BIT identical to the strided lane loop; only the memory traversal changes.
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, vacc: &mut [f64], iacc: &mut [f64]| {
+            let w = vacc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !vacc[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            vacc[c] = f64::NAN;
+                            iacc[c] = r as f64;
+                        } else if val < vacc[c] {
+                            vacc[c] = val;
+                            iacc[c] = r as f64;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            values
+                .par_chunks_mut(blk)
+                .zip(indices.par_chunks_mut(blk))
+                .enumerate()
+                .for_each(|(bi, (vacc, iacc))| sweep(0, bi * blk, vacc, iacc));
+        } else {
+            values
+                .par_chunks_mut(inner_size)
+                .zip(indices.par_chunks_mut(inner_size))
+                .enumerate()
+                .for_each(|(outer, (vrow, irow))| {
+                    let obase = outer * reduce_size * inner_size;
+                    vrow.chunks_mut(blk)
+                        .zip(irow.chunks_mut(blk))
+                        .enumerate()
+                        .for_each(|(bi, (vacc, iacc))| sweep(obase, bi * blk, vacc, iacc));
+                });
+        }
+        return Ok((values, indices));
+    }
 
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.51.
     let lane = |out_idx: usize, v: &mut f64, ix: &mut f64| {
@@ -12565,6 +14450,196 @@ pub fn extremum_dim_values_contiguous_f64(
     Ok(values)
 }
 
+// ── f32 companions to the extremum-dim kernel above ────────────────────────
+// f32 amax/amin over a dim previously upcast f32->f64 then ran a SERIAL scalar
+// triple loop in apply_function (~122x SLOWER than torch). These are a mechanical
+// f32 transcription of the f64 SIMD+parallel kernel: bit-identical selection (the
+// extremum is one input element, so f32-native == f64-upcast-then-round), same NaN
+// propagation + sign-of-zero tie repair. frankentorch-kgs4.168.
+fn extremum_lastdim_value_simd_f32(row: &[f32], is_max: bool) -> f32 {
+    let seed = if is_max {
+        f32::NEG_INFINITY
+    } else {
+        f32::INFINITY
+    };
+    let simd_len = row.len() / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+    let mut acc = f32x8::splat(seed);
+    let mut last_nan = None;
+    let mut r = 0usize;
+    while r < simd_len {
+        let mut has_nan = false;
+        for k in 0..SIMD_WIDTH_F32 {
+            if row[r + k].is_nan() {
+                last_nan = Some(row[r + k]);
+                has_nan = true;
+            }
+        }
+        if has_nan {
+            r += SIMD_WIDTH_F32;
+            continue;
+        }
+        let lanes = f32x8::new([
+            row[r],
+            row[r + 1],
+            row[r + 2],
+            row[r + 3],
+            row[r + 4],
+            row[r + 5],
+            row[r + 6],
+            row[r + 7],
+        ]);
+        acc = if is_max {
+            acc.max(lanes)
+        } else {
+            acc.min(lanes)
+        };
+        r += SIMD_WIDTH_F32;
+    }
+
+    let lanes = acc.to_array();
+    let mut best = lanes[0];
+    for &v in &lanes[1..] {
+        if (is_max && v > best) || (!is_max && v < best) {
+            best = v;
+        }
+    }
+    for &v in &row[simd_len..] {
+        if v.is_nan() {
+            last_nan = Some(v);
+            continue;
+        }
+        if (is_max && v > best) || (!is_max && v < best) {
+            best = v;
+        }
+    }
+    if let Some(v) = last_nan {
+        return v;
+    }
+
+    // maxps/minps may pick either sign of zero on a tie; the scalar API keeps the
+    // first zero's bit pattern (strict comparisons don't replace ties), so repair.
+    if best == 0.0 {
+        for &v in row {
+            if v == 0.0 {
+                return v;
+            }
+        }
+    }
+    best
+}
+
+const EXTREMUM_F32_STREAM_MIN_COL_BLOCK: usize = SIMD_WIDTH_F32 * 16;
+
+pub fn extremum_dim_values_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    is_max: bool,
+) -> Result<Vec<f32>, KernelError> {
+    ensure_unary_layout_and_storage_f32(input, meta)?;
+    let shape = meta.shape();
+    let ndim = shape.len();
+    if dim >= ndim {
+        return Err(KernelError::InvalidDimension { dim, ndim });
+    }
+    let reduce_size = shape[dim];
+    let (outer_size, inner_size, _) =
+        checked_dim_loop_sizes(shape, dim, "extremum_dim_values shape volume overflow")?;
+    let out_numel = checked_mul(
+        outer_size,
+        inner_size,
+        "extremum_dim_values shape multiplication overflow",
+    )?;
+    if out_numel == 0 {
+        return Ok(Vec::new());
+    }
+    if reduce_size == 0 {
+        return Err(KernelError::EmptyReductionDim { dim });
+    }
+    let offset = meta.storage_offset();
+    let data = &input[offset..];
+    let mut values = vec![0.0_f32; out_numel];
+
+    if inner_size == 1 && reduce_size >= SIMD_WIDTH_F32 {
+        let lane = |out_idx: usize, value: &mut f32| {
+            let start = out_idx * reduce_size;
+            *value = extremum_lastdim_value_simd_f32(&data[start..start + reduce_size], is_max);
+        };
+        if out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+            && rayon::current_num_threads() > 1
+        {
+            values
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(out_idx, value)| lane(out_idx, value));
+        } else {
+            for (out_idx, value) in values.iter_mut().enumerate() {
+                lane(out_idx, value);
+            }
+        }
+    } else {
+        // Strided reduce (inner_size > 1): the prior per-output scalar gather strided
+        // each lane by inner_size, missing cache on EVERY reduce step
+        // (amax dim0 of [4000,4000] measured ~6.5x SLOWER than torch). Stream the rows
+        // instead — init each output from row 0, then fold rows IN ORDER — cache-friendly
+        // (sequential row reads) and BIT-IDENTICAL to the scalar gather (same per-output
+        // r-order, same NaN-propagate + strict-compare ±0-tie-keeps-first rule).
+        // frankentorch-kgs4.174.
+        let stream = |out_block: &mut [f32], outer: usize, col0: usize| {
+            let n = out_block.len();
+            let base = outer * reduce_size * inner_size + col0;
+            out_block.copy_from_slice(&data[base..base + n]);
+            for r in 1..reduce_size {
+                let row_off = base + r * inner_size;
+                let row = &data[row_off..row_off + n];
+                for i in 0..n {
+                    let v = row[i];
+                    let best = &mut out_block[i];
+                    if v.is_nan() || (is_max && v > *best) || (!is_max && v < *best) {
+                        *best = v;
+                    }
+                }
+            }
+        };
+        let parallel = out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+            && rayon::current_num_threads() > 1;
+        if outer_size == 1 {
+            // Single output row: parallelise over column blocks (each streams all rows).
+            if parallel {
+                let tiny_morsel = inner_size
+                    .div_ceil(rayon::current_num_threads().saturating_mul(4))
+                    .max(1);
+                let col_block = if inner_size >= EXTREMUM_F32_STREAM_MIN_COL_BLOCK * 2 {
+                    tiny_morsel.max(EXTREMUM_F32_STREAM_MIN_COL_BLOCK)
+                } else {
+                    tiny_morsel
+                };
+                values
+                    .par_chunks_mut(col_block)
+                    .enumerate()
+                    .for_each(|(b, out_block)| stream(out_block, 0, b * col_block));
+            } else {
+                stream(&mut values, 0, 0);
+            }
+        } else {
+            // One inner-row per outer: parallelise over outer (each chunk = one outer).
+            if parallel {
+                values
+                    .par_chunks_mut(inner_size)
+                    .enumerate()
+                    .for_each(|(o, out_block)| stream(out_block, o, 0));
+            } else {
+                for o in 0..outer_size {
+                    let s = o * inner_size;
+                    stream(&mut values[s..s + inner_size], o, 0);
+                }
+            }
+        }
+    }
+
+    Ok(values)
+}
+
 pub fn cat_tensor_contiguous_f64(
     inputs: &[(&[f64], &TensorMeta)],
     dim: usize,
@@ -12621,21 +14696,67 @@ pub fn cat_tensor_contiguous_f64(
     if out_numel == 0 {
         return Ok(Vec::new());
     }
-    let mut output = Vec::with_capacity(out_numel);
-
-    for outer in 0..outer_size {
-        for (data, meta) in inputs {
-            let shape = meta.shape();
-            let cat_size = shape[dim];
-            if cat_size == 0 {
-                continue;
-            }
-            let offset = meta.storage_offset();
-            let d = &data[offset..];
-            let block_len = checked_mul(cat_size, inner_size, "cat slice range overflow")?;
-            let range = checked_contiguous_range(outer, block_len, "cat slice range overflow")?;
-            output.extend_from_slice(&d[range]);
+    // Precompute each input's per-outer block (offset window + block_len), then build the
+    // output by PARALLELIZING over outer rows: each outer owns a disjoint `out_row_len`
+    // output region into which every input's contiguous block is copied. Bit-identical to the
+    // serial extend (same bytes at the same offsets). The serial form left grad/large cat
+    // single-threaded.
+    let out_row_len = total_cat_size * inner_size;
+    let mut blocks: Vec<(&[f64], usize)> = Vec::with_capacity(inputs.len());
+    for (data, meta) in inputs {
+        let cat_size = meta.shape()[dim];
+        if cat_size == 0 {
+            // Skip empty inputs WITHOUT slicing (an empty input may have an offset past
+            // data.len()); they contribute nothing, exactly like the serial `continue`.
+            continue;
         }
+        let offset = meta.storage_offset();
+        let block_len = checked_mul(cat_size, inner_size, "cat slice range overflow")?;
+        blocks.push((&data[offset..], block_len));
+    }
+    let mut output = vec![0.0_f64; out_numel];
+    // Cumulative start offset of each (non-empty) block within a row.
+    let mut cum: Vec<usize> = Vec::with_capacity(blocks.len());
+    let mut acc = 0usize;
+    for &(_, block_len) in &blocks {
+        cum.push(acc);
+        acc += block_len;
+    }
+    // Fill a flat global output range by walking block segments — bit-identical to the
+    // serial nested copy but parallel for ANY outer_size (the old `outer_size > 1` gate
+    // left the common dim=0 / 1-D cat single-threaded at first-touch-fault speed).
+    let fill_range = |g0: usize, oc: &mut [f64]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let b = match cum.binary_search(&w) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            let (window, block_len) = blocks[b];
+            let within = w - cum[b];
+            let copy = (block_len - within).min(end - g);
+            let src_base = outer * block_len + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&window[src_base..src_base + copy]);
+            g += copy;
+        }
+    };
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems: good load balance
+        output
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
+    } else {
+        fill_range(0, &mut output);
     }
 
     Ok(output)
@@ -12686,15 +14807,48 @@ pub fn stack_tensor_contiguous_f64(
     if out_numel == 0 {
         return Ok(Vec::new());
     }
-    let mut output = Vec::with_capacity(out_numel);
-
-    for outer in 0..outer_size {
-        for (data, meta) in inputs {
-            let offset = meta.storage_offset();
-            let d = &data[offset..];
-            let range = checked_contiguous_range(outer, inner_size, "stack slice range overflow")?;
-            output.extend_from_slice(&d[range]);
+    // Parallelize over outer rows (sibling of cat): each outer owns a disjoint
+    // `num_inputs*inner_size` output region into which every input's `inner_size` block is
+    // copied. All inputs share the (validated, non-empty when out_numel>0) shape, so the per-
+    // input block is uniformly `inner_size` and `data[offset..]` is always valid — no empty-
+    // input edge case. Bit-identical to the serial extend (same bytes at the same offsets).
+    let out_row_len = checked_mul(num_inputs, inner_size, "stack row length overflow")?;
+    let windows: Vec<&[f64]> = inputs
+        .iter()
+        .map(|(data, meta)| &data[meta.storage_offset()..])
+        .collect();
+    let mut output = vec![0.0_f64; out_numel];
+    // Flat-chunk parallel fill (uniform block_len == inner_size). Bit-identical to the
+    // serial nested copy but parallel for ANY outer_size — the old `outer_size > 1` gate
+    // left stack(dim=0) (outer_size==1) single-threaded at first-touch-fault speed.
+    let fill_range = |g0: usize, oc: &mut [f64]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let k = w / inner_size;
+            let within = w - k * inner_size;
+            let copy = (inner_size - within).min(end - g);
+            let src_base = outer * inner_size + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&windows[k][src_base..src_base + copy]);
+            g += copy;
         }
+    };
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems: good load balance
+        output
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
+    } else {
+        fill_range(0, &mut output);
     }
 
     Ok(output)
@@ -12747,14 +14901,34 @@ pub fn narrow_tensor_contiguous_f64(
     }
     let offset = meta.storage_offset();
     let data = &input[offset..];
-    let mut output = Vec::with_capacity(out_numel);
-
-    for outer in 0..outer_size {
-        for r in 0..length {
-            for inner in 0..inner_size {
-                let idx = outer * dim_size * inner_size + (start + r) * inner_size + inner;
-                output.push(data[idx]);
-            }
+    // For each `outer`, the narrowed slice is a CONTIGUOUS run of `length*inner_size` elements
+    // (the original (start+r)*inner_size + inner walk over r,inner is contiguous from
+    // start*inner_size). So narrow = `outer_size` independent contiguous block copies — copy each
+    // via copy_from_slice (memcpy, not the old per-element push) and PARALLELIZE over outer rows.
+    // Bit-identical to the serial push (same elements in the same order).
+    let out_row = length * inner_size;
+    let src_stride = dim_size * inner_size;
+    let src_start = start * inner_size;
+    let mut output = vec![0.0_f64; out_numel];
+    let fill_row = |outer: usize, orow: &mut [f64]| {
+        let base = outer * src_stride + src_start;
+        orow.copy_from_slice(&data[base..base + out_row]);
+    };
+    // Pure-copy materialization: gate at the fault-parallelism crossover, not the
+    // compute default (see COPY_MATERIALIZE_PARALLEL_MIN) — parallel regressed every
+    // medium narrow 3-12x. Bit-identical either way (same elements, same order).
+    if outer_size > 1
+        && out_numel >= COPY_MATERIALIZE_PARALLEL_MIN
+        && rayon::current_num_threads() > 1
+    {
+        use rayon::prelude::*;
+        output
+            .par_chunks_mut(out_row)
+            .enumerate()
+            .for_each(|(outer, orow)| fill_row(outer, orow));
+    } else {
+        for (outer, orow) in output.chunks_mut(out_row).enumerate() {
+            fill_row(outer, orow);
         }
     }
 
@@ -12884,27 +15058,52 @@ pub fn expand_tensor_contiguous_f64(
     let input_strides = broadcast_strides(shape, target_shape, "expand input strides overflow")?;
     let offset = meta.storage_offset();
 
-    // Row-major output strides so each flat index `i` unravels its coords
-    // independently (no sequential coords state) → the gather parallelizes. The
-    // per-element div/mod index math dominates the single read, so it scales like
-    // the broadcast path. Index order preserved → bit-identical. frankentorch-kgs4.94.
-    let mut out_strides = vec![1usize; ndim];
+    // ROW-STRUCTURED broadcast (was: per-element ndim div/mod gather, frankentorch-kgs4.94). The
+    // innermost output dim of a contiguous expand is either BROADCAST (input stride 0 → the whole
+    // `inner`-length row is one repeated value → fill) or COPIED (input stride 1 → the row is a
+    // contiguous slice of `input` → copy_from_slice). So unravel the OUTER coords ONCE PER ROW
+    // (not per element) to get the row's input base, then fill/copy the inner run — turning 16M
+    // per-element div/mod into out_numel/inner per-row unravels + vectorized fill/copy. Bit-
+    // identical to the per-element gather (same value at every output position). frankentorch-kgs4.
+    let inner = target_shape[ndim - 1];
+    let inner_stride = input_strides[ndim - 1]; // 0 (broadcast) or 1 (copy) for a contiguous input
+    // Outer-space strides over the first ndim-1 dims (row index r unravels into outer coords).
+    let mut outer_strides = vec![1usize; ndim.saturating_sub(1)];
     for d in (0..ndim.saturating_sub(1)).rev() {
-        out_strides[d] = out_strides[d + 1] * target_shape[d + 1];
+        if d + 1 < ndim - 1 {
+            outer_strides[d] = outer_strides[d + 1] * target_shape[d + 1];
+        }
     }
-    let eval = |i: usize| {
+    let row_base = |r: usize| -> usize {
         let mut idx = offset;
-        for d in 0..ndim {
-            let c = (i / out_strides[d]) % target_shape[d];
+        for d in 0..ndim - 1 {
+            let c = (r / outer_strides[d]) % target_shape[d];
             idx += c * input_strides[d];
         }
-        input[idx]
+        idx
     };
-    let output: Vec<f64> = if out_numel >= PARALLEL_THRESHOLD {
-        (0..out_numel).into_par_iter().map(eval).collect()
+    let mut output = vec![0.0_f64; out_numel];
+    let fill_row = |r: usize, row: &mut [f64]| {
+        let base = row_base(r);
+        if inner_stride == 0 {
+            row.fill(input[base]);
+        } else {
+            row.copy_from_slice(&input[base..base + inner]);
+        }
+    };
+    // Pure broadcast-fill/copy: gate at the fault-parallelism crossover, not the
+    // compute default (see COPY_MATERIALIZE_PARALLEL_MIN) — same bandwidth-bound
+    // regression as narrow. Bit-identical either way.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        output
+            .par_chunks_mut(inner)
+            .enumerate()
+            .for_each(|(r, row)| fill_row(r, row));
     } else {
-        (0..out_numel).map(eval).collect()
-    };
+        for (r, row) in output.chunks_mut(inner).enumerate() {
+            fill_row(r, row);
+        }
+    }
 
     Ok(output)
 }
@@ -13360,11 +15559,23 @@ pub fn masked_fill_tensor_contiguous_f64(
     }
 
     let data = &input[offset..offset + numel];
-    let output = data
-        .iter()
-        .zip(mask[offset..offset + numel].iter())
-        .map(|(&d, &m)| if m != 0.0 { value } else { d })
-        .collect();
+    let mask_w = &mask[offset..offset + numel];
+    // masked_fill_ is hot in attention causal-masking; bit-identical to the serial zip-map.
+    // Bandwidth-bound select-WRITE (read data+mask, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — measured PARALLEL_THRESHOLD
+    // (8192) over-parallelized medium masked_fill 0.02-0.56x (up to 50x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        data.par_iter()
+            .zip(mask_w.par_iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    } else {
+        data.iter()
+            .zip(mask_w.iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    };
 
     Ok(output)
 }
@@ -13402,12 +15613,25 @@ pub fn where_tensor_contiguous_f64(
     let x_data = &x[offset..offset + numel];
     let y_data = &y[offset..offset + numel];
 
-    let output = cond
-        .iter()
-        .zip(x_data.iter())
-        .zip(y_data.iter())
-        .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
-        .collect();
+    // Pure per-element select; bit-identical to the serial zip-map (indexed parallel collect
+    // preserves order). The no-grad equal-shape path is fast-pathed in ft-api.
+    // Bandwidth-bound select-WRITE (read cond+x+y, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover — PARALLEL_THRESHOLD(8192) over-parallelized medium
+    // where 0.04-0.91x (up to 25x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        cond.par_iter()
+            .zip(x_data.par_iter())
+            .zip(y_data.par_iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    } else {
+        cond.iter()
+            .zip(x_data.iter())
+            .zip(y_data.iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    };
 
     Ok(output)
 }
@@ -13625,6 +15849,34 @@ pub fn cummax_dim_tensor_contiguous_f64(
                     inner_size,
                 );
             });
+    } else if outer_size > 1 && numel >= PARALLEL_THRESHOLD && rayon::current_num_threads() > 1 {
+        // Each `outer` lane block is INDEPENDENT (disjoint values/indices slices), so fan the
+        // per-lane serial scan over the rayon pool. Bit-for-bit identical (per-lane scan order
+        // unchanged; disjoint par_chunks_mut). This is the last-dim case (large outer, e.g.
+        // [N, M] cummax along dim=-1) that the leading-dim transpose trick above doesn't cover.
+        values
+            .par_chunks_mut(lane)
+            .zip(indices.par_chunks_mut(lane))
+            .enumerate()
+            .for_each(|(outer, (vchunk, ichunk))| {
+                let base = outer * lane;
+                cummax_dim_lane_block_f64(
+                    &data[base..base + lane],
+                    vchunk,
+                    ichunk,
+                    dim_size,
+                    inner_size,
+                );
+            });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummax): the serial else below runs one scan over the whole
+        // lane. max is exactly associative → chunked parallel scan, bit-exact (see helper).
+        cummaxmin_1d_contiguous_parallel_f64(
+            &data[..dim_size],
+            &mut values[..],
+            &mut indices[..],
+            true,
+        );
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -13789,6 +16041,15 @@ pub fn cummin_dim_tensor_contiguous_f64(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummin): min is exactly associative → chunked parallel
+        // scan, bit-exact to the serial lane scan (see helper).
+        cummaxmin_1d_contiguous_parallel_f64(
+            &data[..dim_size],
+            &mut values[..],
+            &mut indices[..],
+            false,
+        );
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -13885,6 +16146,183 @@ fn cummin_dim_lane_block_f64(
     }
 }
 
+/// Chunked PARALLEL 1-D (contiguous, `inner_size==1`) cumulative max (`is_max`) / min. `max`/`min`
+/// are EXACTLY associative and the tie-keeps-latest (`>=`/`<=`) + NaN-freeze rule composes as a
+/// serial prefix fold over per-chunk finals, so this is BIT-FOR-BIT identical to the serial
+/// [`cummax_dim_lane_block_f64`]/[`cummin_dim_lane_block_f64`] scan (values AND indices). Three
+/// passes: (1) parallel per-chunk fresh local scan (global indices) recording each chunk's final
+/// state, (2) cheap serial prefix fold of the finals, (3) parallel fold of the prefix into each
+/// chunk's local result. torch's 1-D cummax/cummin is single-threaded (~146ms/16M). (BlackThrush)
+fn cummaxmin_1d_contiguous_parallel_f64(
+    lane: &[f64],
+    vals: &mut [f64],
+    idxs: &mut [f64],
+    is_max: bool,
+) {
+    let n = lane.len();
+    let nthreads = rayon::current_num_threads().max(1);
+    let grain = (n / (nthreads * 4)).max(4096);
+    let nchunks = n.div_ceil(grain);
+    let init = if is_max {
+        f64::NEG_INFINITY
+    } else {
+        f64::INFINITY
+    };
+    // Pass 1: each chunk's fresh local cummax/min (global indices) + its final (extreme, idx).
+    let finals: Vec<(f64, f64)> = vals
+        .par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .map(|(c, (vc, ic))| {
+            let s = c * grain;
+            let mut acc = init;
+            let mut ai = 0.0f64;
+            let mut nan = false;
+            for j in 0..vc.len() {
+                let v = lane[s + j];
+                if !nan {
+                    if v.is_nan() {
+                        nan = true;
+                        acc = v;
+                        ai = (s + j) as f64;
+                    } else if (is_max && v >= acc) || (!is_max && v <= acc) {
+                        acc = v;
+                        ai = (s + j) as f64;
+                    }
+                }
+                vc[j] = acc;
+                ic[j] = ai;
+            }
+            (acc, ai)
+        })
+        .collect();
+    // Pass 2 (serial, nchunks elems): running (extreme, idx) BEFORE each chunk. NaN absorbs
+    // (earliest NaN wins), else `>=`/`<=` keeps the later index (matching the serial scan).
+    let mut prefix = vec![(init, 0.0f64); nchunks];
+    let mut p = (init, 0.0f64);
+    for (c, pf) in prefix.iter_mut().enumerate() {
+        *pf = p;
+        let (cm, ci) = finals[c];
+        p = if p.0.is_nan() {
+            p
+        } else if cm.is_nan() {
+            (cm, ci)
+        } else if (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
+            (cm, ci)
+        } else {
+            p
+        };
+    }
+    // Pass 3: fold the prefix state into each chunk's local result.
+    vals.par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .for_each(|(c, (vc, ic))| {
+            let (pm, pi) = prefix[c];
+            // pm == init (no prior extreme, and not NaN) => local scan is already final for
+            // every position (local extreme always ties-or-beats init, keeping the later idx).
+            if pm == init {
+                return;
+            }
+            for j in 0..vc.len() {
+                let lv = vc[j];
+                if pm.is_nan() {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                } else if lv.is_nan() {
+                    // NaN arose within this chunk at/before j: local already frozen — keep it.
+                } else if (is_max && lv >= pm) || (!is_max && lv <= pm) {
+                    // local extreme wins (>= / <= keeps the later index) — keep local.
+                } else {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                }
+            }
+        });
+}
+
+/// f32 mirror of [`cummaxmin_1d_contiguous_parallel_f64`] — values f32, indices f64. Bit-for-bit
+/// identical to the serial [`cummax_dim_lane_block_f32`]/[`cummin_dim_lane_block_f32`]. (BlackThrush)
+fn cummaxmin_1d_contiguous_parallel_f32(
+    lane: &[f32],
+    vals: &mut [f32],
+    idxs: &mut [f64],
+    is_max: bool,
+) {
+    let n = lane.len();
+    let nthreads = rayon::current_num_threads().max(1);
+    let grain = (n / (nthreads * 4)).max(4096);
+    let nchunks = n.div_ceil(grain);
+    let init = if is_max {
+        f32::NEG_INFINITY
+    } else {
+        f32::INFINITY
+    };
+    let finals: Vec<(f32, f64)> = vals
+        .par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .map(|(c, (vc, ic))| {
+            let s = c * grain;
+            let mut acc = init;
+            let mut ai = 0.0f64;
+            let mut nan = false;
+            for j in 0..vc.len() {
+                let v = lane[s + j];
+                if !nan {
+                    if v.is_nan() {
+                        nan = true;
+                        acc = v;
+                        ai = (s + j) as f64;
+                    } else if (is_max && v >= acc) || (!is_max && v <= acc) {
+                        acc = v;
+                        ai = (s + j) as f64;
+                    }
+                }
+                vc[j] = acc;
+                ic[j] = ai;
+            }
+            (acc, ai)
+        })
+        .collect();
+    let mut prefix = vec![(init, 0.0f64); nchunks];
+    let mut p = (init, 0.0f64);
+    for (c, pf) in prefix.iter_mut().enumerate() {
+        *pf = p;
+        let (cm, ci) = finals[c];
+        p = if p.0.is_nan() {
+            p
+        } else if cm.is_nan() {
+            (cm, ci)
+        } else if (is_max && cm >= p.0) || (!is_max && cm <= p.0) {
+            (cm, ci)
+        } else {
+            p
+        };
+    }
+    vals.par_chunks_mut(grain)
+        .zip(idxs.par_chunks_mut(grain))
+        .enumerate()
+        .for_each(|(c, (vc, ic))| {
+            let (pm, pi) = prefix[c];
+            if pm == init {
+                return;
+            }
+            for j in 0..vc.len() {
+                let lv = vc[j];
+                if pm.is_nan() {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                } else if lv.is_nan() {
+                } else if (is_max && lv >= pm) || (!is_max && lv <= pm) {
+                } else {
+                    vc[j] = pm;
+                    ic[j] = pi;
+                }
+            }
+        });
+}
+
 /// f32 mirror of [`cummax_dim_tensor_contiguous_f64`] — values f32, indices f64. (BlackThrush)
 pub fn cummax_dim_tensor_contiguous_f32(
     input: &[f32],
@@ -13946,6 +16384,14 @@ pub fn cummax_dim_tensor_contiguous_f32(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummax f32): chunked parallel scan, bit-exact (see helper).
+        cummaxmin_1d_contiguous_parallel_f32(
+            &data[..dim_size],
+            &mut values[..],
+            &mut indices[..],
+            true,
+        );
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -14100,6 +16546,14 @@ pub fn cummin_dim_tensor_contiguous_f32(
                     inner_size,
                 );
             });
+    } else if outer_size == 1 && inner_size == 1 && dim_size >= CUM_SCAN_1D_PARALLEL_MIN {
+        // Single contiguous lane (1-D cummin f32): chunked parallel scan, bit-exact (see helper).
+        cummaxmin_1d_contiguous_parallel_f32(
+            &data[..dim_size],
+            &mut values[..],
+            &mut indices[..],
+            false,
+        );
     } else {
         for outer in 0..outer_size {
             let base = outer * lane;
@@ -14642,6 +17096,264 @@ fn sort_radix_perm(keys: &[u64], perm: &mut Vec<u32>, scratch: &mut Vec<u32>) {
     }
 }
 
+/// A lane shorter than this keeps the SERIAL [`sort_radix_perm`]: the parallel
+/// radix's per-pass histogram-merge + offset bookkeeping only pays off on a long
+/// single lane (the multi-lane case is already parallel over lanes).
+const PARALLEL_RADIX_LANE_MIN: usize = 1 << 16;
+
+/// `*mut u32` carrier so the parallel-radix scatter can write a shared output
+/// buffer from several Rayon workers. Safe because each worker writes a DISJOINT
+/// set of slots (every output index is produced exactly once across all chunks).
+#[derive(Clone, Copy)]
+struct RadixScatterPtr(*mut u32);
+impl RadixScatterPtr {
+    /// By-value accessor so a closure captures the whole (Send+Sync) wrapper
+    /// rather than disjointly capturing the bare `*mut u32` field.
+    #[inline]
+    fn ptr(self) -> *mut u32 {
+        self.0
+    }
+}
+// SAFETY: shared only for provably-disjoint index writes (see `sort_radix_perm_parallel`).
+#[allow(unsafe_code)]
+unsafe impl Sync for RadixScatterPtr {}
+// SAFETY: the raw pointer is only used for disjoint per-slot writes across workers.
+#[allow(unsafe_code)]
+unsafe impl Send for RadixScatterPtr {}
+
+/// Parallel stable LSD radix that returns the SAME permutation as the serial
+/// [`sort_radix_perm`] bit-for-bit. Splits the current `perm` into equal input
+/// chunks (perfect load balance, distribution-independent), histograms them in
+/// parallel, derives chunk-major per-bucket offsets (so within a bucket the
+/// chunk order — i.e. the current `perm` order — is preserved, exactly as the
+/// serial scatter does), then scatters all chunks concurrently into disjoint
+/// output slots. Same single-bucket skip rule, so f32 keys (high 32 bits zero)
+/// still run in 4 effective passes.
+fn sort_radix_perm_parallel(keys: &[u64], threads: usize) -> Vec<u32> {
+    use rayon::prelude::*;
+    let n = keys.len();
+    let mut perm: Vec<u32> = (0..n as u32).collect();
+    if n < 2 {
+        return perm;
+    }
+    let mut scratch: Vec<u32> = vec![0u32; n];
+    let p = threads.max(1).min(n);
+    let chunk = n.div_ceil(p);
+    for pass in 0..8 {
+        let shift = pass * 8;
+        // Per-chunk local histograms of the current ordering.
+        let hists: Vec<[usize; 256]> = perm
+            .par_chunks(chunk)
+            .map(|ch| {
+                let mut h = [0usize; 256];
+                for &pp in ch {
+                    h[((keys[pp as usize] >> shift) & 0xFF) as usize] += 1;
+                }
+                h
+            })
+            .collect();
+        let nch = hists.len();
+        let mut total = [0usize; 256];
+        for h in &hists {
+            for (b, &c) in h.iter().enumerate() {
+                total[b] += c;
+            }
+        }
+        // Single-bucket pass contributes no ordering — skip (matches serial).
+        if total.contains(&n) {
+            continue;
+        }
+        // Exclusive prefix over buckets, then chunk-major running offsets so that
+        // chunk 0's bucket-b elements land before chunk 1's, etc. (stable).
+        let mut run = [0usize; 256];
+        let mut sum = 0usize;
+        for b in 0..256 {
+            run[b] = sum;
+            sum += total[b];
+        }
+        let mut offs = vec![[0usize; 256]; nch];
+        for (c, off) in offs.iter_mut().enumerate() {
+            for b in 0..256 {
+                off[b] = run[b];
+                run[b] += hists[c][b];
+            }
+        }
+        // Concurrent scatter into disjoint slots.
+        let sptr = RadixScatterPtr(scratch.as_mut_ptr());
+        perm.par_chunks(chunk)
+            .zip(offs.par_iter())
+            .for_each(|(ch, off)| {
+                let base = sptr.ptr();
+                let mut local = *off;
+                for &pp in ch {
+                    let b = ((keys[pp as usize] >> shift) & 0xFF) as usize;
+                    // SAFETY: `local[b]` is unique across all chunks for this pass
+                    // (chunk-major offsets partition 0..n), so no two workers write
+                    // the same slot. `base` is valid for `n` u32 (scratch len == n).
+                    #[allow(unsafe_code)]
+                    unsafe {
+                        *base.add(local[b]) = pp;
+                    }
+                    local[b] += 1;
+                }
+            });
+        std::mem::swap(&mut perm, &mut scratch);
+    }
+    perm
+}
+
+/// Parallel-radix fast path for a single large contiguous f64 lane. Returns
+/// `None` (caller falls back to the comparison sort) when the lane contains NaN —
+/// the radix keys can't reproduce PyTorch's "NaN is greatest" placement. On
+/// success fills `out_vals`/`out_idx` with the ascending stable sort, bit-for-bit
+/// identical to the serial radix path.
+fn try_parallel_radix_sort_lane_f64(
+    data: &[f64],
+    n: usize,
+    descending: bool,
+    out_vals: &mut [f64],
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f64(x);
+            if descending { !k } else { k }
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_vals
+        .par_iter_mut()
+        .zip(out_idx.par_iter_mut())
+        .zip(perm.par_iter())
+        .for_each(|((v, idx), &pp)| {
+            *v = data[pp as usize];
+            *idx = pp as usize;
+        });
+    Some(())
+}
+
+/// Indices-only sibling of [`try_parallel_radix_sort_lane_f64`] for argsort.
+fn try_parallel_radix_argsort_lane_f64(
+    data: &[f64],
+    n: usize,
+    descending: bool,
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f64(x);
+            if descending { !k } else { k }
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_idx
+        .par_iter_mut()
+        .zip(perm.par_iter())
+        .for_each(|(idx, &pp)| *idx = pp as usize);
+    Some(())
+}
+
+/// f32 analogue of [`try_parallel_radix_sort_lane_f64`]. Keys are built exactly
+/// as the serial f32 path (`u64::from(if descending { !k } else { k })`, k from
+/// [`sort_radix_key_f32`]) so the high 32 bits stay zero (4 effective passes).
+fn try_parallel_radix_sort_lane_f32(
+    data: &[f32],
+    n: usize,
+    descending: bool,
+    out_vals: &mut [f32],
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f32(x);
+            u64::from(if descending { !k } else { k })
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_vals
+        .par_iter_mut()
+        .zip(out_idx.par_iter_mut())
+        .zip(perm.par_iter())
+        .for_each(|((v, idx), &pp)| {
+            *v = data[pp as usize];
+            *idx = pp as usize;
+        });
+    Some(())
+}
+
+/// Indices-only sibling of [`try_parallel_radix_sort_lane_f32`] for argsort.
+fn try_parallel_radix_argsort_lane_f32(
+    data: &[f32],
+    n: usize,
+    descending: bool,
+    out_idx: &mut [usize],
+    threads: usize,
+) -> Option<()> {
+    use rayon::prelude::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let has_nan = AtomicBool::new(false);
+    let keys: Vec<u64> = (0..n)
+        .into_par_iter()
+        .map(|i| {
+            let x = data[i];
+            if x.is_nan() {
+                has_nan.store(true, Ordering::Relaxed);
+                return 0;
+            }
+            let k = sort_radix_key_f32(x);
+            u64::from(if descending { !k } else { k })
+        })
+        .collect();
+    if has_nan.load(Ordering::Relaxed) {
+        return None;
+    }
+    let perm = sort_radix_perm_parallel(&keys, threads);
+    out_idx
+        .par_iter_mut()
+        .zip(perm.par_iter())
+        .for_each(|(idx, &pp)| *idx = pp as usize);
+    Some(())
+}
+
 /// Sort transpose trick for a leading sort dim (small outer, large inner): the plain block sorts
 /// its `inner_size` columns serially. Here each column sorts on its own rayon lane — gather the
 /// strided column, run the SAME radix-or-comparison sort as
@@ -14780,6 +17492,28 @@ pub fn sort_tensor_contiguous_f64(
                 use_radix,
             );
         }
+        return Ok((sorted_values, indices));
+    }
+    // Single large contiguous lane (the sort dim is the whole tensor, e.g. a 1-D
+    // sort): the outer-block fan-out can't parallelize a lone lane, so it would
+    // run a SERIAL radix (measured ~2x slower than torch at 16M). Sort it with a
+    // PARALLEL radix that yields the bit-identical stable permutation; NaN lanes
+    // return None and fall through to the comparison path.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_sort_lane_f64(
+            data,
+            numel,
+            descending,
+            &mut sorted_values,
+            &mut indices,
+            threads,
+        )
+        .is_some()
+    {
         return Ok((sorted_values, indices));
     }
     sorted_values
@@ -14950,6 +17684,18 @@ pub fn argsort_tensor_contiguous_f64(
                 use_radix,
             );
         }
+        return Ok(indices);
+    }
+    // Single large contiguous lane (e.g. a 1-D argsort): parallel radix for the
+    // bit-identical stable permutation (NaN lanes fall through). See sort f64.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_argsort_lane_f64(data, numel, descending, &mut indices, threads)
+            .is_some()
+    {
         return Ok(indices);
     }
     indices
@@ -26558,6 +29304,56 @@ where
     output
 }
 
+/// Parallel companion to `simd_unary_f32`: fan SIMD-width-aligned chunks across
+/// the rayon pool, each running the same `f32x8` op. The single-core serial SIMD
+/// path is DRAM-bandwidth-capped (~3x below a threaded relu); spreading chunks
+/// across cores approaches the aggregate-bandwidth wall.
+///
+/// Bit-identical to `simd_unary_f32`: the per-element op is order-independent, and
+/// the chunk size is a multiple of `SIMD_WIDTH_F32` so every chunk but the last is
+/// fully SIMD (the last chunk's scalar tail covers exactly the same trailing
+/// `numel % SIMD_WIDTH_F32` lanes the serial path handles scalar). For the current
+/// callers (neg/abs/sqrt/reciprocal/relu) the scalar and SIMD forms agree exactly,
+/// so even a boundary lane that flips SIMD<->scalar is bit-for-bit unchanged.
+fn simd_unary_f32_parallel<F, S>(window: &[f32], scalar_op: F, simd_op: S) -> Vec<f32>
+where
+    F: Fn(f32) -> f32 + Sync,
+    S: Fn(f32x8) -> f32x8 + Sync,
+{
+    // 16384 elems (64 KiB) per chunk: large enough to amortise rayon dispatch on a
+    // bandwidth-bound map, small enough to load-balance 16M elems across the pool.
+    const CHUNK: usize = 1 << 14;
+    let numel = window.len();
+    let mut output = vec![0.0f32; numel];
+    output
+        .par_chunks_mut(CHUNK)
+        .zip(window.par_chunks(CHUNK))
+        .for_each(|(out_chunk, in_chunk)| {
+            let n = in_chunk.len();
+            let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+            let mut i = 0;
+            while i < simd_len {
+                let a = f32x8::new([
+                    in_chunk[i],
+                    in_chunk[i + 1],
+                    in_chunk[i + 2],
+                    in_chunk[i + 3],
+                    in_chunk[i + 4],
+                    in_chunk[i + 5],
+                    in_chunk[i + 6],
+                    in_chunk[i + 7],
+                ]);
+                let result = simd_op(a);
+                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array_ref());
+                i += SIMD_WIDTH_F32;
+            }
+            for j in simd_len..n {
+                out_chunk[j] = scalar_op(in_chunk[j]);
+            }
+        });
+    output
+}
+
 fn simd_binary_f32<F, S>(
     lhs_window: &[f32],
     rhs_window: &[f32],
@@ -26604,6 +29400,71 @@ where
     output
 }
 
+/// Parallel companion to `simd_binary_f32` (the add/sub/mul/div f32 path): fan
+/// SIMD-width-aligned chunks across rayon, each running the same `f32x8` op. The
+/// serial single-core SIMD path is DRAM-bandwidth-capped (~3x below torch's
+/// threaded add/sub/mul/div); spreading chunks across cores approaches the
+/// aggregate-bandwidth wall.
+///
+/// Bit-identical to `simd_binary_f32`: per-element and order-independent, and the
+/// chunk size is a multiple of `SIMD_WIDTH_F32` so every chunk but the last is
+/// fully SIMD (the last chunk's scalar tail covers exactly the same trailing
+/// `numel % SIMD_WIDTH_F32` lanes the serial path handles scalar). For add/sub/
+/// mul/div the scalar and SIMD forms are the same correctly-rounded IEEE op, so
+/// a boundary lane that flips SIMD<->scalar is bit-for-bit unchanged too.
+fn simd_binary_f32_parallel<F, S>(
+    lhs_window: &[f32],
+    rhs_window: &[f32],
+    scalar_op: F,
+    simd_op: S,
+) -> Vec<f32>
+where
+    F: Fn(f32, f32) -> f32 + Sync,
+    S: Fn(f32x8, f32x8) -> f32x8 + Sync,
+{
+    const CHUNK: usize = 1 << 14;
+    let numel = lhs_window.len();
+    let mut output = vec![0.0f32; numel];
+    output
+        .par_chunks_mut(CHUNK)
+        .zip(lhs_window.par_chunks(CHUNK))
+        .zip(rhs_window.par_chunks(CHUNK))
+        .for_each(|((out_chunk, lhs_chunk), rhs_chunk)| {
+            let n = out_chunk.len();
+            let simd_len = n / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+            let mut i = 0;
+            while i < simd_len {
+                let a = f32x8::new([
+                    lhs_chunk[i],
+                    lhs_chunk[i + 1],
+                    lhs_chunk[i + 2],
+                    lhs_chunk[i + 3],
+                    lhs_chunk[i + 4],
+                    lhs_chunk[i + 5],
+                    lhs_chunk[i + 6],
+                    lhs_chunk[i + 7],
+                ]);
+                let b = f32x8::new([
+                    rhs_chunk[i],
+                    rhs_chunk[i + 1],
+                    rhs_chunk[i + 2],
+                    rhs_chunk[i + 3],
+                    rhs_chunk[i + 4],
+                    rhs_chunk[i + 5],
+                    rhs_chunk[i + 6],
+                    rhs_chunk[i + 7],
+                ]);
+                let result = simd_op(a, b);
+                out_chunk[i..i + SIMD_WIDTH_F32].copy_from_slice(result.as_array_ref());
+                i += SIMD_WIDTH_F32;
+            }
+            for j in simd_len..n {
+                out_chunk[j] = scalar_op(lhs_chunk[j], rhs_chunk[j]);
+            }
+        });
+    output
+}
+
 fn unary_contiguous_f32<F>(
     input: &[f32],
     meta: &TensorMeta,
@@ -26637,8 +29498,8 @@ fn simd_unary_f32_kernel<F, S>(
     simd_op: S,
 ) -> Result<Vec<f32>, KernelError>
 where
-    F: Fn(f32) -> f32,
-    S: Fn(f32x8) -> f32x8,
+    F: Fn(f32) -> f32 + Sync,
+    S: Fn(f32x8) -> f32x8 + Sync,
 {
     ensure_unary_layout_and_storage_f32(input, meta)?;
     let numel = meta.numel();
@@ -26647,7 +29508,16 @@ where
     }
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
-    Ok(simd_unary_f32(window, scalar_op, simd_op))
+    // Bandwidth-bound SIMD unaries (neg/abs/sqrt/reciprocal/relu) ran serial
+    // single-core SIMD — one core's DRAM bandwidth caps them ~3x below torch's
+    // threaded relu (act_f32_h2h: relu 41ms vs torch 13ms). Above the cheap-op gate
+    // (524288), fan SIMD-width-aligned chunks across rayon. Bit-identical to the
+    // serial SIMD path (per-element, order-independent). frankentorch-kgs4.166.
+    if numel >= SCALAR_UNARY_PARALLEL_THRESHOLD {
+        Ok(simd_unary_f32_parallel(window, scalar_op, simd_op))
+    } else {
+        Ok(simd_unary_f32(window, scalar_op, simd_op))
+    }
 }
 
 fn elementwise_contiguous_f32<F>(
@@ -26701,8 +29571,8 @@ fn simd_elementwise_f32<F, S>(
     simd_op: S,
 ) -> Result<Vec<f32>, KernelError>
 where
-    F: Fn(f32, f32) -> f32,
-    S: Fn(f32x8, f32x8) -> f32x8,
+    F: Fn(f32, f32) -> f32 + Sync,
+    S: Fn(f32x8, f32x8) -> f32x8 + Sync,
 {
     ensure_meta_shape_and_dtype(lhs_meta, rhs_meta)?;
     ensure_storage_len_f32(lhs, lhs_meta, "lhs")?;
@@ -26715,7 +29585,18 @@ where
     let rhs_start = rhs_meta.storage_offset();
     let lhs_window = &lhs[lhs_start..lhs_start + numel];
     let rhs_window = &rhs[rhs_start..rhs_start + numel];
-    Ok(simd_binary_f32(lhs_window, rhs_window, scalar_op, simd_op))
+    // add/sub/mul/div f32 ran serial single-core SIMD — one core's DRAM bandwidth
+    // caps these (the hottest elementwise ops) ~3x below torch's threaded kernels
+    // (binops_simd_f32_h2h: add/sub/mul/div 37ms vs torch ~12ms). Above the cheap-op
+    // gate, fan SIMD-width-aligned chunks across rayon; bit-identical to the serial
+    // SIMD path (per-element, order-independent). frankentorch-kgs4.167.
+    if numel >= SCALAR_UNARY_PARALLEL_THRESHOLD {
+        Ok(simd_binary_f32_parallel(
+            lhs_window, rhs_window, scalar_op, simd_op,
+        ))
+    } else {
+        Ok(simd_binary_f32(lhs_window, rhs_window, scalar_op, simd_op))
+    }
 }
 
 /// Least-squares solve `min ||A·X - B||` for an overdetermined, full-rank
@@ -27151,6 +30032,11 @@ fn mish_value_f32(x: f32) -> f32 {
     x * softplus_value_f32(x).tanh()
 }
 
+/// Round to nearest integer with half-way values rounded to the even integer.
+/// This matches the `.focrq` converter contract and keeps dynamic activation
+/// quantization deterministic at exact tie boundaries.
+#[inline]
+#[must_use]
 fn round_ties_even_f32(value: f32) -> f32 {
     value.round_ties_even()
 }
@@ -27170,8 +30056,9 @@ fn torch_sign_f32(value: f32) -> f32 {
 // ── Macro-generated simple f32 unary kernels ────────────────────────────
 
 macro_rules! define_unary_f32 {
-    // Cheap ops (sign/round/clamp/…): keep the high cheap-op gate so a small input
-    // never eats rayon dispatch overhead.
+    // Default arm = medium ops at SCALAR_UNARY_PARALLEL_THRESHOLD. The TRULY cheap bandwidth ops
+    // (floor/ceil/round/sign/trunc/frac) pass COPY_MATERIALIZE_PARALLEL_MIN explicitly (3-arg form):
+    // a single instruction per elem crosses at ~4M, not 524288 (anchored A/B, see unary_f64_bandwidth).
     ($name:ident, $op:expr) => {
         define_unary_f32!($name, $op, SCALAR_UNARY_PARALLEL_THRESHOLD);
     };
@@ -27201,16 +30088,40 @@ define_unary_f32!(tanh_tensor_contiguous_f32, f32::tanh, PARALLEL_THRESHOLD);
 define_unary_f32!(sin_tensor_contiguous_f32, f32::sin, PARALLEL_THRESHOLD);
 define_unary_f32!(cos_tensor_contiguous_f32, f32::cos, PARALLEL_THRESHOLD);
 define_unary_f32!(tan_tensor_contiguous_f32, f32::tan, PARALLEL_THRESHOLD);
-define_unary_f32!(floor_tensor_contiguous_f32, f32::floor);
-define_unary_f32!(ceil_tensor_contiguous_f32, f32::ceil);
-define_unary_f32!(round_tensor_contiguous_f32, round_ties_even_f32);
+define_unary_f32!(
+    floor_tensor_contiguous_f32,
+    f32::floor,
+    COPY_MATERIALIZE_PARALLEL_MIN
+);
+define_unary_f32!(
+    ceil_tensor_contiguous_f32,
+    f32::ceil,
+    COPY_MATERIALIZE_PARALLEL_MIN
+);
+define_unary_f32!(
+    round_tensor_contiguous_f32,
+    round_ties_even_f32,
+    COPY_MATERIALIZE_PARALLEL_MIN
+);
 define_unary_f32!(log2_tensor_contiguous_f32, f32::log2, PARALLEL_THRESHOLD);
 define_unary_f32!(log10_tensor_contiguous_f32, f32::log10, PARALLEL_THRESHOLD);
 define_unary_f32!(log1p_tensor_contiguous_f32, f32::ln_1p, PARALLEL_THRESHOLD);
 define_unary_f32!(expm1_tensor_contiguous_f32, f32::exp_m1, PARALLEL_THRESHOLD);
-define_unary_f32!(sign_tensor_contiguous_f32, torch_sign_f32);
-define_unary_f32!(trunc_tensor_contiguous_f32, f32::trunc);
-define_unary_f32!(frac_tensor_contiguous_f32, f32::fract);
+define_unary_f32!(
+    sign_tensor_contiguous_f32,
+    torch_sign_f32,
+    COPY_MATERIALIZE_PARALLEL_MIN
+);
+define_unary_f32!(
+    trunc_tensor_contiguous_f32,
+    f32::trunc,
+    COPY_MATERIALIZE_PARALLEL_MIN
+);
+define_unary_f32!(
+    frac_tensor_contiguous_f32,
+    f32::fract,
+    COPY_MATERIALIZE_PARALLEL_MIN
+);
 define_unary_f32!(asin_tensor_contiguous_f32, f32::asin, PARALLEL_THRESHOLD);
 define_unary_f32!(acos_tensor_contiguous_f32, f32::acos, PARALLEL_THRESHOLD);
 define_unary_f32!(atan_tensor_contiguous_f32, f32::atan, PARALLEL_THRESHOLD);
@@ -27235,9 +30146,57 @@ define_unary_f32!(
     erfc_value_f32,
     PARALLEL_THRESHOLD
 );
-define_unary_f32!(hardswish_tensor_contiguous_f32, hardswish_value_f32);
-define_unary_f32!(hardsigmoid_tensor_contiguous_f32, hardsigmoid_value_f32);
-define_unary_f32!(hardtanh_tensor_contiguous_f32, hardtanh_value_f32);
+// hardswish/hardsigmoid/hardtanh f32: SIMD-accelerated via simd_unary_f32_kernel (the same
+// path relu/neg/abs/sqrt use, 633cb51e) instead of the scalar define_unary loop. These are
+// PIECEWISE-LINEAR (no transcendental, no reduction) so the SIMD op reproduces the scalar
+// value fn's EXACT f32 arithmetic lanewise (same add/mul/div order + clamp), and NaN is forced
+// where the input is NaN (the scalar piecewise falls into the `else`/clamp branch, which yields
+// NaN). wide f32x8::max/min are fmax/fmin-faithful (incl. ±0 sign, see the max/min kernel).
+// Bit-exactness (incl. ±0/±inf/NaN/subnormal) is guarded by hard_activation_f32_simd_matches_scalar.
+pub fn hardswish_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    let three = f32x8::splat(3.0f32);
+    let six = f32x8::splat(6.0f32);
+    let zero = f32x8::splat(0.0f32);
+    let neg3 = f32x8::splat(-3.0f32);
+    simd_unary_f32_kernel(input, meta, hardswish_value_f32, move |a| {
+        // x<=-3 -> 0 ; x>=3 -> x ; else x*(x+3)/6 (NaN flows to the mid branch -> NaN).
+        let mid = (a * (a + three)) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(a, r)
+    })
+}
+pub fn hardsigmoid_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    let three = f32x8::splat(3.0f32);
+    let six = f32x8::splat(6.0f32);
+    let zero = f32x8::splat(0.0f32);
+    let one = f32x8::splat(1.0f32);
+    let neg3 = f32x8::splat(-3.0f32);
+    simd_unary_f32_kernel(input, meta, hardsigmoid_value_f32, move |a| {
+        // x<=-3 -> 0 ; x>=3 -> 1 ; else (x+3)/6 (NaN flows to the mid branch -> NaN).
+        let mid = (a + three) / six;
+        let r = a.cmp_le(neg3).blend(zero, mid);
+        a.cmp_ge(three).blend(one, r)
+    })
+}
+pub fn hardtanh_tensor_contiguous_f32(
+    input: &[f32],
+    meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    let neg1 = f32x8::splat(-1.0f32);
+    let one = f32x8::splat(1.0f32);
+    let nan = f32x8::splat(f32::NAN);
+    simd_unary_f32_kernel(input, meta, hardtanh_value_f32, move |a| {
+        // clamp(a, -1, 1): min(max(a,-1),1) is bit-exact for non-NaN; clamp propagates NaN,
+        // so force NaN where a is NaN.
+        (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+    })
+}
 define_unary_f32!(
     softplus_tensor_contiguous_f32,
     softplus_value_f32,
@@ -27286,20 +30245,62 @@ macro_rules! define_binary_f32 {
     };
 }
 
-define_binary_f32!(min_tensor_contiguous_f32, |l: f32, r: f32| {
-    if l.is_nan() || r.is_nan() {
-        f32::NAN
-    } else {
-        l.min(r)
-    }
-});
-define_binary_f32!(max_tensor_contiguous_f32, |l: f32, r: f32| {
-    if l.is_nan() || r.is_nan() {
-        f32::NAN
-    } else {
-        l.max(r)
-    }
-});
+// min/max f32: SIMD-accelerated via simd_elementwise_f32 (same parallel-SIMD path as
+// add/sub/mul/div, kgs4.167) instead of the scalar elementwise loop (was ~1.3-1.6x SLOWER
+// than torch). The scalar op is unchanged (NaN-propagating fmax/fmin); the SIMD op computes
+// the SAME result lanewise: f32x8::max/min for the non-NaN value, then any lane where either
+// operand is NaN is forced to NaN (torch + the scalar path propagate NaN). The simd<->scalar
+// boundary lane is bit-identical because both forms compute the same per-lane value. An
+// exhaustive ±0/±inf/NaN/subnormal parity test (min_max_f32_simd_matches_scalar_bit_for_bit)
+// guards the bit-exactness (incl. the IEEE sign-of-zero on ±0 ties).
+pub fn min_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l: f32, r: f32| {
+            if l.is_nan() || r.is_nan() {
+                f32::NAN
+            } else {
+                l.min(r)
+            }
+        },
+        |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+        },
+    )
+}
+pub fn max_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l: f32, r: f32| {
+            if l.is_nan() || r.is_nan() {
+                f32::NAN
+            } else {
+                l.max(r)
+            }
+        },
+        |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+        },
+    )
+}
 define_binary_f32!(
     atan2_tensor_contiguous_f32,
     |y: f32, x: f32| y.atan2(x),
@@ -27311,36 +30312,117 @@ define_binary_f32!(remainder_tensor_contiguous_f32, |a: f32, b: f32| a
 
 // ── Comparison ops f32 ──────────────────────────────────────────────────
 
-define_binary_f32!(eq_tensor_contiguous_f32, |l: f32, r: f32| if l == r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(ne_tensor_contiguous_f32, |l: f32, r: f32| if l != r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(lt_tensor_contiguous_f32, |l: f32, r: f32| if l < r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(gt_tensor_contiguous_f32, |l: f32, r: f32| if l > r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(le_tensor_contiguous_f32, |l: f32, r: f32| if l <= r {
-    1.0f32
-} else {
-    0.0f32
-});
-define_binary_f32!(ge_tensor_contiguous_f32, |l: f32, r: f32| if l >= r {
-    1.0f32
-} else {
-    0.0f32
-});
+fn f32_comparison_mask(mask: f32x8) -> f32x8 {
+    mask.blend(f32x8::ONE, f32x8::ZERO)
+}
+
+pub fn eq_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l == r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_eq(b)),
+    )
+}
+
+pub fn ne_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l != r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(!a.cmp_eq(b)),
+    )
+}
+
+pub fn lt_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l < r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_lt(b)),
+    )
+}
+
+pub fn gt_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l > r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_gt(b)),
+    )
+}
+
+pub fn le_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l <= r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_le(b)),
+    )
+}
+
+pub fn ge_tensor_contiguous_f32(
+    lhs: &[f32],
+    rhs: &[f32],
+    lhs_meta: &TensorMeta,
+    rhs_meta: &TensorMeta,
+) -> Result<Vec<f32>, KernelError> {
+    simd_elementwise_f32(
+        lhs,
+        rhs,
+        lhs_meta,
+        rhs_meta,
+        |l, r| {
+            if l >= r { 1.0f32 } else { 0.0f32 }
+        },
+        |a, b| f32_comparison_mask(a.cmp_ge(b)),
+    )
+}
 
 // ── Hand-written complex f32 kernels ────────────────────────────────────
 
@@ -27356,19 +30438,44 @@ pub fn pow_tensor_contiguous_f32(
     }
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
-    // See `pow_tensor_contiguous_f64`: compute-bound, pure per-element map, so
-    // par_iter is bit-identical to the serial map.
-    if numel >= PARALLEL_THRESHOLD {
-        Ok(window
-            .par_iter()
-            .map(|value| powf_torch_signed_zero_f32(*value, exponent))
-            .collect())
-    } else {
-        Ok(window
-            .iter()
-            .map(|value| powf_torch_signed_zero_f32(*value, exponent))
-            .collect())
+    // Pure per-element map (bit-identical serial/parallel). General powf is compute-bound (gate
+    // at PARALLEL_THRESHOLD); the trivial-exponent elisions below are cheap bandwidth-bound writes
+    // that over-parallelize at 8192 (~4M crossover, f64 sibling measured) → each passes parallel_min.
+    #[inline]
+    fn run<F: Fn(f32) -> f32 + Sync>(
+        window: &[f32],
+        numel: usize,
+        parallel_min: usize,
+        f: F,
+    ) -> Vec<f32> {
+        if numel >= parallel_min {
+            window.par_iter().map(|&v| f(v)).collect()
+        } else {
+            window.iter().map(|&v| f(v)).collect()
+        }
     }
+    // Trivial-exponent elision: `powf_torch_signed_zero_f32` is an expensive
+    // transcendental per element (pow2 measured 114ms = ~11x SLOWER than torch),
+    // AND it is 1 ULP off torch for ~0.1% of x at exp=2 (torch special-cases
+    // integer exponents to repeated multiplication). x^1=x, x^2=x*x, x^3=x*x*x,
+    // x^-1=1/x are BIT-EXACT vs torch f32 pow (verified pow2_parity_probe +
+    // pow_trivial_probe over 20k values incl ±0/±inf/NaN/subnormal) and avoid the
+    // powf cost. 0.5 is NOT elided — torch pow(.,0.5) != sqrt bit-for-bit (1535/20k
+    // ULP diffs). frankentorch-kgs4.171.
+    let out = if exponent == 1.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v)
+    } else if exponent == 2.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v)
+    } else if exponent == 3.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| v * v * v)
+    } else if exponent == -1.0 {
+        run(window, numel, COPY_MATERIALIZE_PARALLEL_MIN, |v| 1.0 / v)
+    } else {
+        run(window, numel, PARALLEL_THRESHOLD, |v| {
+            powf_torch_signed_zero_f32(v, exponent)
+        })
+    };
+    Ok(out)
 }
 
 pub fn clamp_tensor_contiguous_f32(
@@ -27384,27 +30491,32 @@ pub fn clamp_tensor_contiguous_f32(
     }
     let start = meta.storage_offset();
     let window = &input[start..start + numel];
-    Ok(window
-        .iter()
-        .map(|value| {
-            // clamp is min(max(x, min_val), max_val): lower bound first,
-            // then upper, so when min_val > max_val the upper bound wins.
-            if value.is_nan() {
-                f32::NAN
+    // Bit-identical to the serial map (f32 companion of clamp_tensor_contiguous_f64).
+    let clamp_one = |value: &f32| -> f32 {
+        if value.is_nan() {
+            f32::NAN
+        } else {
+            let lo = if !min_val.is_nan() && *value < min_val {
+                min_val
             } else {
-                let lo = if !min_val.is_nan() && *value < min_val {
-                    min_val
-                } else {
-                    *value
-                };
-                if !max_val.is_nan() && lo > max_val {
-                    max_val
-                } else {
-                    lo
-                }
+                *value
+            };
+            if !max_val.is_nan() && lo > max_val {
+                max_val
+            } else {
+                lo
             }
-        })
-        .collect())
+        }
+    };
+    // Bandwidth-bound per-element clamp (NaN-check + 2 bound compares, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — PARALLEL_THRESHOLD(8192)
+    // over-parallelized medium clamp up to 100x (64K-256K 0.01x, 1M 0.07x, 2M 0.26x), crossover ~4M.
+    if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        Ok(window.par_iter().map(clamp_one).collect())
+    } else {
+        Ok(window.iter().map(clamp_one).collect())
+    }
 }
 
 /// F32 companion to `pairwise_sum_f64` — see that function for the
@@ -27421,6 +30533,68 @@ fn pairwise_sum_f32(values: &[f32]) -> f32 {
     pairwise_sum_f32(&values[..mid]) + pairwise_sum_f32(&values[mid..])
 }
 
+/// Parallel `pairwise_sum_f32` for large FULL reductions. It uses the same
+/// midpoint split tree as `pairwise_sum_f32`, so the final `left + right`
+/// sequence is bit-for-bit identical while spreading large reductions across
+/// the rayon pool.
+fn pairwise_sum_f32_par(values: &[f32]) -> f32 {
+    const PAR_BLOCK: usize = 1 << 14;
+    if values.len() <= PAR_BLOCK {
+        return pairwise_sum_f32(values);
+    }
+    let mid = values.len() / 2;
+    let (left, right) = values.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_sum_f32_par(left),
+        || pairwise_sum_f32_par(right),
+    );
+    ls + rs
+}
+
+#[inline]
+fn pairwise_sum_f32_maybe_par(values: &[f32]) -> f32 {
+    if values.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_sum_f32_par(values)
+    } else {
+        pairwise_sum_f32(values)
+    }
+}
+
+/// F32 companion to `pairwise_dot_f64`. Bit-for-bit identical to building the
+/// products Vec and calling `pairwise_sum_f32`, but without the scratch.
+fn pairwise_dot_f32(a: &[f32], b: &[f32]) -> f32 {
+    const BLOCK: usize = 128;
+    if a.len() <= BLOCK {
+        return a.iter().zip(b).map(|(&x, &y)| x * y).sum();
+    }
+    let mid = a.len() / 2;
+    pairwise_dot_f32(&a[..mid], &b[..mid]) + pairwise_dot_f32(&a[mid..], &b[mid..])
+}
+
+fn pairwise_dot_f32_par(a: &[f32], b: &[f32]) -> f32 {
+    const PAR_BLOCK: usize = 1 << 14;
+    if a.len() <= PAR_BLOCK {
+        return pairwise_dot_f32(a, b);
+    }
+    let mid = a.len() / 2;
+    let (al, ar) = a.split_at(mid);
+    let (bl, br) = b.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_dot_f32_par(al, bl),
+        || pairwise_dot_f32_par(ar, br),
+    );
+    ls + rs
+}
+
+#[inline]
+fn pairwise_dot_f32_maybe_par(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_dot_f32_par(a, b)
+    } else {
+        pairwise_dot_f32(a, b)
+    }
+}
+
 /// F32 companion to `pairwise_sum_map_f64` — see that function for
 /// the precision-correctness rationale.
 fn pairwise_sum_map_f32<F>(values: &[f32], f: F) -> f32
@@ -27435,6 +30609,38 @@ where
     pairwise_sum_map_f32(&values[..mid], f) + pairwise_sum_map_f32(&values[mid..], f)
 }
 
+/// Parallel `pairwise_sum_map_f32` (mirror of `pairwise_sum_map_f64_par`): same
+/// midpoint tree via `rayon::join` down to PAR_BLOCK, so BIT-FOR-BIT identical to
+/// the serial map sum while spreading large FULL reductions across the pool.
+fn pairwise_sum_map_f32_par<F>(values: &[f32], f: F) -> f32
+where
+    F: Fn(f32) -> f32 + Copy + Sync,
+{
+    const PAR_BLOCK: usize = 1 << 14;
+    if values.len() <= PAR_BLOCK {
+        return pairwise_sum_map_f32(values, f);
+    }
+    let mid = values.len() / 2;
+    let (left, right) = values.split_at(mid);
+    let (ls, rs) = rayon::join(
+        || pairwise_sum_map_f32_par(left, f),
+        || pairwise_sum_map_f32_par(right, f),
+    );
+    ls + rs
+}
+
+#[inline]
+fn pairwise_sum_map_f32_maybe_par<F>(values: &[f32], f: F) -> f32
+where
+    F: Fn(f32) -> f32 + Copy + Sync,
+{
+    if values.len() >= SUM_PARALLEL_THRESHOLD {
+        pairwise_sum_map_f32_par(values, f)
+    } else {
+        pairwise_sum_map_f32(values, f)
+    }
+}
+
 pub fn sum_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f32, KernelError> {
     ensure_unary_layout_and_storage_f32(input, meta)?;
     let numel = meta.numel();
@@ -27442,7 +30648,7 @@ pub fn sum_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f32
         return Ok(0.0);
     }
     let offset = meta.storage_offset();
-    Ok(pairwise_sum_f32(&input[offset..offset + numel]))
+    Ok(pairwise_sum_f32_maybe_par(&input[offset..offset + numel]))
 }
 
 pub fn mean_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f32, KernelError> {
@@ -27452,7 +30658,7 @@ pub fn mean_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f3
     if numel == 0 {
         return Ok(f32::NAN);
     }
-    let sum = pairwise_sum_f32(&input[offset..offset + numel]);
+    let sum = pairwise_sum_f32_maybe_par(&input[offset..offset + numel]);
     #[allow(clippy::cast_precision_loss)]
     let n = numel as f32;
     Ok(sum / n)
@@ -27593,6 +30799,7 @@ pub fn matmul_tensor_contiguous_f32_into(
     ensure_storage_len_f32(rhs, rhs_meta, "rhs")?;
     let lhs_start = lhs_meta.storage_offset();
     let rhs_start = rhs_meta.storage_offset();
+    let reused_output = out.len() == out_numel;
 
     // Size `out` to exactly out_numel WITHOUT re-zeroing the region that is
     // already there. `resize` only writes the fill value into newly-added tail
@@ -27609,8 +30816,14 @@ pub fn matmul_tensor_contiguous_f32_into(
         out.resize(out_numel, 0.0f32);
     }
 
-    // Use optimized GEMM via matrixmultiply crate
-    gemm::sgemm(m, k, n, &lhs[lhs_start..], &rhs[rhs_start..], out);
+    // Use optimized GEMM via matrixmultiply crate. A resident output buffer
+    // marks the steady-state transformer projection path; it can use the wider
+    // f32 2-D tiling gate without penalizing the fresh-allocation API.
+    if reused_output {
+        gemm::sgemm_reused_output(m, k, n, &lhs[lhs_start..], &rhs[rhs_start..], out);
+    } else {
+        gemm::sgemm(m, k, n, &lhs[lhs_start..], &rhs[rhs_start..], out);
+    }
 
     Ok(())
 }
@@ -27619,36 +30832,54 @@ pub fn matmul_tensor_contiguous_f32_into(
 /// `[out_features, in_features]`) to symmetric per-output-channel int8.
 ///
 /// For each output channel `o`, `scale[o] = max(|w[o, :]|) / 127` (or `1.0`
-/// when the whole row is zero), and `w_i8[o, i] = clamp(round(w[o,i]/scale[o]),
-/// -127, 127)`. Zero-point is implicitly 0 (symmetric). Returns `(w_i8,
-/// scales)` ready to feed [`linear_int8_dynamic_f32`]. Pure, deterministic,
-/// allocation-only — does not touch any existing f32/f64 path.
+/// when the whole row is zero), and
+/// `w_i8[o, i] = clamp(round_ties_even(w[o,i] / scale[o]), -127, 127)`.
+/// Zero-point is implicitly 0 (symmetric). Returns `(w_i8, scales)` ready to
+/// feed [`linear_int8_dynamic_f32`]. Pure, deterministic, allocation-only —
+/// does not touch any existing f32/f64 path.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn quantize_per_output_channel_i8(w: &[f32], out: usize, in_: usize) -> (Vec<i8>, Vec<f32>) {
+    use rayon::prelude::*;
     assert_eq!(w.len(), out * in_, "weight length must equal out*in_");
     let mut w_i8 = vec![0i8; out * in_];
     let mut scales = vec![0f32; out];
-    for o in 0..out {
-        let row = &w[o * in_..(o + 1) * in_];
+    // Each OUTPUT CHANNEL owns a disjoint [in_] weight row + one scale slot and is
+    // computed independently (amax -> scale -> quantize), so serial-vs-parallel is
+    // bit-identical (same amax fold, same round/clamp per element, order-invariant).
+    // Mirrors the parallelized sibling `quantize_rows_i8` (same gate) — the per-row
+    // divide+round is compute-bound, so this parallelizes ~linearly (measured
+    // 10-23x at Linear/LM-head weight shapes: [32000,4096] 322ms -> 14ms). Small
+    // weights stay serial (rayon fan-out > gain). kgs4-qchan-par.
+    let quant_channel = |dst: &mut [i8], scale_slot: &mut f32, row: &[f32]| {
         let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
         let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let inv = 1.0 / scale;
-        let dst = &mut w_i8[o * in_..(o + 1) * in_];
-        for i in 0..in_ {
-            dst[i] = (row[i] * inv).round().clamp(-127.0, 127.0) as i8;
+        for (d, &v) in dst.iter_mut().zip(row.iter()) {
+            *d = round_ties_even_f32(v / scale).clamp(-127.0, 127.0) as i8;
         }
-        scales[o] = scale;
+        *scale_slot = scale;
+    };
+    if out >= 8 && out * in_ >= 8192 && rayon::current_num_threads() > 1 {
+        w_i8.par_chunks_mut(in_)
+            .zip(scales.par_iter_mut())
+            .zip(w.par_chunks(in_))
+            .for_each(|((dst, scale_slot), row)| quant_channel(dst, scale_slot, row));
+    } else {
+        w_i8.chunks_mut(in_)
+            .zip(scales.iter_mut())
+            .zip(w.chunks(in_))
+            .for_each(|((dst, scale_slot), row)| quant_channel(dst, scale_slot, row));
     }
     (w_i8, scales)
 }
 
 /// Per-row symmetric int8 dynamic quantization of `[m, k]` activations: returns
 /// `(x_i8, a_scales)` with `a_scale[s] = max(|x[s,:]|)/127` (or `1.0` for an
-/// all-zero row) and `x_i8[s,i] = round(x[s,i]/a_scale[s])`. Each row is
-/// independent, so the result is bit-identical serial-vs-parallel; rows are
-/// quantized across rayon when the input is large enough to amortize the fan-out.
-/// Shared by the row-major and pre-packed int8 GEMM kernels.
+/// all-zero row) and
+/// `x_i8[s,i] = round_ties_even(x[s,i] / a_scale[s])`. Each row is independent,
+/// so the result is bit-identical serial-vs-parallel; rows are quantized across
+/// rayon when the input is large enough to amortize the fan-out. Shared by the
+/// row-major and pre-packed int8 GEMM kernels.
 #[must_use]
 #[allow(clippy::cast_precision_loss, clippy::cast_possible_truncation)]
 pub fn quantize_rows_i8(x: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
@@ -27659,9 +30890,8 @@ pub fn quantize_rows_i8(x: &[f32], m: usize, k: usize) -> (Vec<i8>, Vec<f32>) {
     let quant_row = |dst: &mut [i8], a_scale: &mut f32, row: &[f32]| {
         let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
         let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
-        let inv = 1.0 / scale;
         for (d, &v) in dst.iter_mut().zip(row.iter()) {
-            *d = (v * inv).round().clamp(-127.0, 127.0) as i8;
+            *d = round_ties_even_f32(v / scale).clamp(-127.0, 127.0) as i8;
         }
         *a_scale = scale;
     };
@@ -27816,6 +31046,7 @@ pub fn linear_int8_dynamic_f32(
     unsafe_code,
     unsafe_op_in_unsafe_fn,
     clippy::too_many_arguments,
+    clippy::needless_range_loop,
     clippy::cast_precision_loss
 )]
 unsafe fn gemm_block4_sdot(
@@ -27985,6 +31216,7 @@ pub fn linear_int8_dynamic_prepacked_f32(
     unsafe_code,
     unsafe_op_in_unsafe_fn,
     clippy::too_many_arguments,
+    clippy::needless_range_loop,
     clippy::cast_precision_loss
 )]
 unsafe fn gemm_block4_sdot_packed(
@@ -28210,12 +31442,12 @@ pub fn dot_tensor_contiguous_f32(
     // zip+map+collect mirrors the f64 fix (frankentorch-cunc):
     // skip the zero-init memset since the scratch is single-use
     // and every cell is unconditionally overwritten.
-    let scratch: Vec<f32> = lhs_slice
-        .iter()
-        .zip(rhs_slice)
-        .map(|(&l, &r)| l * r)
-        .collect();
-    Ok(pairwise_sum_f32(&scratch))
+    //
+    // Fused parallel dot (mirrors the f64 path): reduces sum(l*r) over the same
+    // mid=len/2 tree as the old `pairwise_sum_f32(&products)` (bit-for-bit
+    // identical) but WITHOUT the n-sized products scratch, parallel via
+    // rayon::join for large N.
+    Ok(pairwise_dot_f32_maybe_par(lhs_slice, rhs_slice))
 }
 
 pub fn outer_tensor_contiguous_f32(
@@ -28241,8 +31473,10 @@ pub fn outer_tensor_contiguous_f32(
     let lhs_slice = &lhs[lhs_start..lhs_start + m];
     let rhs_slice = &rhs[rhs_start..rhs_start + n];
     // Disjoint independent rows → distribute across the rayon pool (par_chunks_mut).
-    // Bit-identical to the serial fill. frankentorch-kgs4.104.
-    if out_numel >= PARALLEL_THRESHOLD {
+    // Bit-identical to the serial fill. frankentorch-kgs4.104. Bandwidth-bound pure write:
+    // gate at the copy-tier fault-parallelism crossover, NOT the compute default — the old
+    // PARALLEL_THRESHOLD(8192) over-parallelized medium outer products 8-14x (see f64). (BlackThrush)
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
         let mut out = vec![0.0_f32; out_numel];
         out.par_chunks_mut(n).enumerate().for_each(|(i, row)| {
             let l = lhs_slice[i];
@@ -28527,6 +31761,37 @@ pub fn trace_tensor_contiguous_f32(input: &[f32], meta: &TensorMeta) -> Result<f
     Ok(acc)
 }
 
+const PROD_F32_SIMD_CHUNK: usize = 1 << 14;
+
+fn product_f32_simd_contiguous(values: &[f32]) -> f32 {
+    let simd_len = values.len() / SIMD_WIDTH_F32 * SIMD_WIDTH_F32;
+    let mut acc = f32x8::splat(1.0f32);
+    let mut i = 0usize;
+    while i < simd_len {
+        let lanes = f32x8::new([
+            values[i],
+            values[i + 1],
+            values[i + 2],
+            values[i + 3],
+            values[i + 4],
+            values[i + 5],
+            values[i + 6],
+            values[i + 7],
+        ]);
+        acc *= lanes;
+        i += SIMD_WIDTH_F32;
+    }
+
+    let mut prod = 1.0f32;
+    for &lane in acc.as_array_ref() {
+        prod *= lane;
+    }
+    for &value in &values[simd_len..] {
+        prod *= value;
+    }
+    prod
+}
+
 pub fn prod_dim_tensor_contiguous_f32(
     input: &[f32],
     meta: &TensorMeta,
@@ -28549,6 +31814,64 @@ pub fn prod_dim_tensor_contiguous_f32(
     }
     let offset = meta.storage_offset();
     let data = &input[offset..];
+    // GLOBAL/near-global reduce fast path (f32 mirror of prod_dim_f64): too few output
+    // lanes to fill the cores + contiguous columns (inner_size==1) -> reduce WITHIN each
+    // lane in parallel (rayon tree product). Tolerance-parity (1e-5), not bit-exact.
+    if inner_size == 1
+        && out_numel <= rayon::current_num_threads()
+        && reduce_size >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let output: Vec<f32> = (0..out_numel)
+            .map(|out_idx| {
+                data[out_idx * reduce_size..out_idx * reduce_size + reduce_size]
+                    .par_chunks(PROD_F32_SIMD_CHUNK)
+                    .map(product_f32_simd_contiguous)
+                    .product::<f32>()
+            })
+            .collect();
+        return Ok(output);
+    }
+    // CACHE-BLOCKED strided-reduction fast path (f32 mirror of prod_dim_f64): sweep row-major
+    // contiguous slices into a cache-resident block accumulator instead of striding each column
+    // by `inner_size`. Per-column multiply order is unchanged (L-to-R) => BIT-FOR-BIT identical.
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let mut output = vec![1.0f32; out_numel];
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, acc: &mut [f32]| {
+            let w = acc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for (a, &v) in acc.iter_mut().zip(row.iter()) {
+                    *a *= v;
+                }
+            }
+        };
+        if outer_size == 1 {
+            output
+                .par_chunks_mut(blk)
+                .enumerate()
+                .for_each(|(bi, acc)| {
+                    sweep(0, bi * blk, acc);
+                });
+        } else {
+            output
+                .par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, out_row)| {
+                    let obase = outer * reduce_size * inner_size;
+                    out_row.chunks_mut(blk).enumerate().for_each(|(bi, acc)| {
+                        sweep(obase, bi * blk, acc);
+                    });
+                });
+        }
+        return Ok(output);
+    }
     // Per-lane parallel; bit-exact vs the serial sequential product. frankentorch-kgs4.52.
     let lane = |out_idx: usize| -> f32 {
         let outer = out_idx / inner_size;
@@ -28596,6 +31919,31 @@ pub fn var_dim_tensor_contiguous_f32(
     let correction = (reduce_size - 1) as f32;
     #[allow(clippy::cast_precision_loss)]
     let n_div = reduce_size as f32;
+
+    // GLOBAL/near-global reduce fast path (f32 mirror of var_dim_f64): too few lanes to
+    // fill the cores + contiguous columns -> reduce WITHIN each lane in parallel.
+    // Tolerance-parity (1e-5), not bit-exact.
+    if inner_size == 1
+        && out_numel <= rayon::current_num_threads()
+        && reduce_size >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let output: Vec<f32> = (0..out_numel)
+            .map(|out_idx| {
+                let col = &data[out_idx * reduce_size..out_idx * reduce_size + reduce_size];
+                let mean = col.par_iter().copied().sum::<f32>() / n_div;
+                let var_sum = col
+                    .par_iter()
+                    .map(|&x| {
+                        let d = x - mean;
+                        d * d
+                    })
+                    .sum::<f32>();
+                var_sum / correction
+            })
+            .collect();
+        return Ok(output);
+    }
 
     // F32 mirror of the parallel var_dim_f64 (frankentorch-kgs4.53): per-lane
     // gather + pairwise mean + pairwise squared-deviation; parallelized over lanes
@@ -28653,34 +32001,56 @@ pub fn norm_tensor_contiguous_f32(
     }
     let data = &input[offset..offset + numel];
     if p == f32::INFINITY {
-        // norm(inf) = max(|x|). f32::max silently drops NaN, but PyTorch's
-        // max reduction propagates it, so fold with explicit NaN checks.
-        Ok(data.iter().fold(0.0f32, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
+        // norm(inf) = max(|x|). f32::max silently drops NaN, but PyTorch's max
+        // reduction propagates it, so combine with explicit NaN checks. Parallel
+        // reduce for large N: max is associative/commutative and 0.0 is its identity
+        // over non-negative |x|, so the result is BIT-IDENTICAL to the serial fold.
+        let combine = |a: f32, b: f32| {
+            if a.is_nan() || b.is_nan() {
                 f32::NAN
             } else {
-                acc.max(a)
+                a.max(b)
             }
-        }))
+        };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().map(|&x| x.abs()).reduce(|| 0.0f32, combine))
+        } else {
+            Ok(data.iter().fold(0.0f32, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == f32::NEG_INFINITY {
-        Ok(data.iter().fold(f32::INFINITY, |acc, &x| {
-            let a = x.abs();
-            if acc.is_nan() || a.is_nan() {
+        let combine = |a: f32, b: f32| {
+            if a.is_nan() || b.is_nan() {
                 f32::NAN
             } else {
-                acc.min(a)
+                a.min(b)
             }
-        }))
+        };
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data
+                .par_iter()
+                .map(|&x| x.abs())
+                .reduce(|| f32::INFINITY, combine))
+        } else {
+            Ok(data
+                .iter()
+                .fold(f32::INFINITY, |acc, &x| combine(acc, x.abs())))
+        }
     } else if p == 0.0f32 {
-        Ok(data.iter().filter(|&&x| x != 0.0f32).count() as f32)
+        if numel >= SUM_PARALLEL_THRESHOLD {
+            use rayon::prelude::*;
+            Ok(data.par_iter().filter(|&&x| x != 0.0f32).count() as f32)
+        } else {
+            Ok(data.iter().filter(|&&x| x != 0.0f32).count() as f32)
+        }
     } else if p == 1.0f32 {
-        Ok(pairwise_sum_map_f32(data, |x| x.abs()))
+        Ok(pairwise_sum_map_f32_maybe_par(data, |x| x.abs()))
     } else if p == 2.0f32 {
-        let sum_sq = pairwise_sum_map_f32(data, |x| x * x);
+        let sum_sq = pairwise_sum_map_f32_maybe_par(data, |x| x * x);
         Ok(sum_sq.sqrt())
     } else {
-        let sum_pow = pairwise_sum_map_f32(data, |x| x.abs().powf(p));
+        let sum_pow = pairwise_sum_map_f32_maybe_par(data, |x| x.abs().powf(p));
         Ok(sum_pow.powf(1.0f32 / p))
     }
 }
@@ -28756,30 +32126,48 @@ pub fn norm_dim_tensor_contiguous_f32(
             }
         }
     } else if p == 1.0f32 {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum = 0.0f32;
-                for r in 0..reduce_size {
-                    sum += data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
-                }
-                output.push(sum);
+        // Per-output index o = outer*inner_size + inner (same order as the serial
+        // push); each output sums its own lane independently, so par_iter().collect()
+        // is bit-for-bit identical to the serial loop. The p=1/p=2 branches were
+        // SERIAL — for a large output (reducing a small dim of a big tensor) that is
+        // millions of independent lane-reductions left on one core (~39ms vs ~6ms).
+        let compute = |o: usize| -> f32 {
+            let outer = o / inner_size;
+            let inner = o % inner_size;
+            let mut sum = 0.0f32;
+            for r in 0..reduce_size {
+                sum += data[outer * reduce_size * inner_size + r * inner_size + inner].abs();
             }
+            sum
+        };
+        if checked_mul(out_numel, reduce_size, "norm_dim_f32 work").unwrap_or(usize::MAX)
+            >= PARALLEL_THRESHOLD
+        {
+            output = (0..out_numel).into_par_iter().map(compute).collect();
+        } else {
+            output.extend((0..out_numel).map(compute));
         }
     } else if p == 2.0f32 {
-        for outer in 0..outer_size {
-            for inner in 0..inner_size {
-                let mut sum_sq = 0.0f32;
-                for r in 0..reduce_size {
-                    let v = data[outer * reduce_size * inner_size + r * inner_size + inner];
-                    sum_sq += v * v;
-                }
-                output.push(sum_sq.sqrt());
+        let compute = |o: usize| -> f32 {
+            let outer = o / inner_size;
+            let inner = o % inner_size;
+            let mut sum_sq = 0.0f32;
+            for r in 0..reduce_size {
+                let v = data[outer * reduce_size * inner_size + r * inner_size + inner];
+                sum_sq += v * v;
             }
+            sum_sq.sqrt()
+        };
+        if checked_mul(out_numel, reduce_size, "norm_dim_f32 work").unwrap_or(usize::MAX)
+            >= PARALLEL_THRESHOLD
+        {
+            output = (0..out_numel).into_par_iter().map(compute).collect();
+        } else {
+            output.extend((0..out_numel).map(compute));
         }
     } else {
         // General fractional p is COMPUTE-bound (powf per element); parallelise
-        // over independent output rows, bit-exact (see the f64 twin). The cheap
-        // p=1/2/inf branches stay serial (bandwidth-bound).
+        // over independent output rows, bit-exact (see the f64 twin).
         let compute = |o: usize| -> f32 {
             let outer = o / inner_size;
             let inner = o % inner_size;
@@ -29075,6 +32463,57 @@ pub fn argmax_dim_tensor_contiguous_f32(
     let offset = meta.storage_offset();
     let mut output = vec![0.0f32; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmax
+    // INDEX. first-strict-extremum (`>`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f32]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f32::NEG_INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f32::NAN;
+                            out_idx[c] = r as f32;
+                        } else if val > acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output
+                .par_chunks_mut(blk)
+                .enumerate()
+                .for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output
+                .par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, orow)| {
+                    let obase = outer * reduce_size * inner_size;
+                    orow.chunks_mut(blk)
+                        .enumerate()
+                        .for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+                });
+        }
+        return Ok(output);
+    }
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.50.
     let argmax = |out_idx: usize| -> f32 {
         let outer = out_idx / inner_size;
@@ -29132,6 +32571,57 @@ pub fn argmin_dim_tensor_contiguous_f32(
     let offset = meta.storage_offset();
     let mut output = vec![0.0f32; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (mirror of the max/min_dim cache-block, index-only).
+    // Sweep row-major CONTIGUOUS slices, tracking a scratch column extremum + writing the argmin
+    // INDEX. first-strict-extremum (`<`) + NaN-freeze via acc_v=NaN sentinel (== serial break) are
+    // order-independent => BIT-FOR-BIT identical to the strided lane loop. Wins when the constant
+    // stride's prefetch is bandwidth-starved (contention — the shared-box/scorecard norm — or data
+    // exceeding L3): measured 4-8x under contention, ~neutral to +1.8-2.4x(>256MB) at idle. (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, out_idx: &mut [f32]| {
+            let w = out_idx.len();
+            let mut acc_v = vec![f32::INFINITY; w];
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !acc_v[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            acc_v[c] = f32::NAN;
+                            out_idx[c] = r as f32;
+                        } else if val < acc_v[c] {
+                            acc_v[c] = val;
+                            out_idx[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            output
+                .par_chunks_mut(blk)
+                .enumerate()
+                .for_each(|(bi, oi)| sweep(0, bi * blk, oi));
+        } else {
+            output
+                .par_chunks_mut(inner_size)
+                .enumerate()
+                .for_each(|(outer, orow)| {
+                    let obase = outer * reduce_size * inner_size;
+                    orow.chunks_mut(blk)
+                        .enumerate()
+                        .for_each(|(bi, oi)| sweep(obase, bi * blk, oi));
+                });
+        }
+        return Ok(output);
+    }
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.50.
     let argmin = |out_idx: usize| -> f32 {
         let outer = out_idx / inner_size;
@@ -29190,6 +32680,58 @@ pub fn max_dim_tensor_contiguous_f32(
     let mut values = vec![f32::NEG_INFINITY; out_numel];
     let mut indices = vec![0.0f32; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (f32 mirror of max_dim_tensor_contiguous_f64):
+    // sweep row-major contiguous slices into an L1-resident block of (max, argmax) instead of
+    // striding each column by inner_size. `max` is exactly associative; first-strict-max (`>`)
+    // + NaN-freeze (`!vacc[c].is_nan()` == the serial break) are order-independent => BIT-FOR-BIT
+    // identical to the strided lane loop (values AND f32 indices). (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, vacc: &mut [f32], iacc: &mut [f32]| {
+            let w = vacc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !vacc[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            vacc[c] = f32::NAN;
+                            iacc[c] = r as f32;
+                        } else if val > vacc[c] {
+                            vacc[c] = val;
+                            iacc[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            values
+                .par_chunks_mut(blk)
+                .zip(indices.par_chunks_mut(blk))
+                .enumerate()
+                .for_each(|(bi, (vacc, iacc))| sweep(0, bi * blk, vacc, iacc));
+        } else {
+            values
+                .par_chunks_mut(inner_size)
+                .zip(indices.par_chunks_mut(inner_size))
+                .enumerate()
+                .for_each(|(outer, (vrow, irow))| {
+                    let obase = outer * reduce_size * inner_size;
+                    vrow.chunks_mut(blk)
+                        .zip(irow.chunks_mut(blk))
+                        .enumerate()
+                        .for_each(|(bi, (vacc, iacc))| sweep(obase, bi * blk, vacc, iacc));
+                });
+        }
+        return Ok((values, indices));
+    }
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.51.
     let lane = |out_idx: usize, v: &mut f32, ix: &mut f32| {
         let outer = out_idx / inner_size;
@@ -29247,6 +32789,58 @@ pub fn min_dim_tensor_contiguous_f32(
     let mut values = vec![f32::INFINITY; out_numel];
     let mut indices = vec![0.0f32; out_numel];
     let data = &input[offset..];
+
+    // CACHE-BLOCKED strided-reduction fast path (f32 mirror of min_dim_tensor_contiguous_f64):
+    // sweep row-major contiguous slices into an L1-resident block of (min, argmax) instead of
+    // striding each column by inner_size. `min` is exactly associative; first-strict-min (`<`)
+    // + NaN-freeze (`!vacc[c].is_nan()` == the serial break) are order-independent => BIT-FOR-BIT
+    // identical to the strided lane loop (values AND f32 indices). (BlackThrush)
+    if inner_size > 1
+        && out_numel.saturating_mul(reduce_size) >= PARALLEL_THRESHOLD
+        && rayon::current_num_threads() > 1
+    {
+        let threads = rayon::current_num_threads();
+        let blk = (inner_size / (threads * 4)).clamp(64, 4096);
+        let sweep = |obase: usize, c0: usize, vacc: &mut [f32], iacc: &mut [f32]| {
+            let w = vacc.len();
+            for r in 0..reduce_size {
+                let rbase = obase + r * inner_size + c0;
+                let row = &data[rbase..rbase + w];
+                for c in 0..w {
+                    if !vacc[c].is_nan() {
+                        let val = row[c];
+                        if val.is_nan() {
+                            vacc[c] = f32::NAN;
+                            iacc[c] = r as f32;
+                        } else if val < vacc[c] {
+                            vacc[c] = val;
+                            iacc[c] = r as f32;
+                        }
+                    }
+                }
+            }
+        };
+        if outer_size == 1 {
+            values
+                .par_chunks_mut(blk)
+                .zip(indices.par_chunks_mut(blk))
+                .enumerate()
+                .for_each(|(bi, (vacc, iacc))| sweep(0, bi * blk, vacc, iacc));
+        } else {
+            values
+                .par_chunks_mut(inner_size)
+                .zip(indices.par_chunks_mut(inner_size))
+                .enumerate()
+                .for_each(|(outer, (vrow, irow))| {
+                    let obase = outer * reduce_size * inner_size;
+                    vrow.chunks_mut(blk)
+                        .zip(irow.chunks_mut(blk))
+                        .enumerate()
+                        .for_each(|(bi, (vacc, iacc))| sweep(obase, bi * blk, vacc, iacc));
+                });
+        }
+        return Ok((values, indices));
+    }
     // Per-lane parallel; bit-exact vs the serial double loop. frankentorch-kgs4.51.
     let lane = |out_idx: usize, v: &mut f32, ix: &mut f32| {
         let outer = out_idx / inner_size;
@@ -29329,20 +32923,70 @@ pub fn cat_tensor_contiguous_f32(
     if out_numel == 0 {
         return Ok(Vec::new());
     }
-    let mut output = Vec::with_capacity(out_numel);
-    for outer in 0..outer_size {
-        for (data, meta) in inputs {
-            let cat_size = meta.shape()[dim];
-            if cat_size == 0 {
-                continue;
-            }
-            let offset = meta.storage_offset();
-            let d = &data[offset..];
-            let block_len = checked_mul(cat_size, inner_size, "cat_f32 slice range overflow")?;
-            let range = checked_contiguous_range(outer, block_len, "cat_f32 slice range overflow")?;
-            output.extend_from_slice(&d[range]);
+    // f32 mirror of cat_tensor_contiguous_f64: precompute each input's per-outer block, then
+    // PARALLELIZE over outer rows (each outer owns a disjoint out_row_len region). Bit-identical
+    // to the serial extend (same bytes at the same offsets); empty inputs are skipped WITHOUT
+    // slicing (an empty input may have an offset past data.len()), matching the serial `continue`.
+    let out_row_len = total_cat_size * inner_size;
+    let mut blocks: Vec<(&[f32], usize)> = Vec::with_capacity(inputs.len());
+    for (data, meta) in inputs {
+        let cat_size = meta.shape()[dim];
+        if cat_size == 0 {
+            continue;
         }
+        let offset = meta.storage_offset();
+        let block_len = checked_mul(cat_size, inner_size, "cat_f32 slice range overflow")?;
+        blocks.push((&data[offset..], block_len));
     }
+    let mut output = vec![0.0_f32; out_numel];
+    // Cumulative start offset of each (non-empty) block within a row.
+    let mut cum: Vec<usize> = Vec::with_capacity(blocks.len());
+    let mut acc = 0usize;
+    for &(_, block_len) in &blocks {
+        cum.push(acc);
+        acc += block_len;
+    }
+    // Fill a flat global output range [g0, g0+oc.len()) by walking block segments.
+    // Bit-identical to the serial nested (outer, block) copy: same source bytes at
+    // the same output offsets. Crucially this parallelizes for ANY outer_size — the
+    // old `outer_size > 1` gate left the dominant dim=0 / 1-D case (outer_size==1,
+    // one huge row) SERIAL, so a 64MB cat ran single-threaded at ~2 GB/s (first-touch
+    // page faults), 2.3x SLOWER than torch. Splitting the output across cores
+    // distributes the faults+copy and beats torch.
+    let fill_range = |g0: usize, oc: &mut [f32]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let b = match cum.binary_search(&w) {
+                Ok(i) => i,
+                Err(i) => i - 1,
+            };
+            let (window, block_len) = blocks[b];
+            let within = w - cum[b];
+            let copy = (block_len - within).min(end - g);
+            let src_base = outer * block_len + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&window[src_base..src_base + copy]);
+            g += copy;
+        }
+    };
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems = 256KB per task: good load balance
+        output
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
+    } else {
+        fill_range(0, &mut output);
+    }
+
     Ok(output)
 }
 
@@ -29384,16 +33028,48 @@ pub fn stack_tensor_contiguous_f32(
     if out_numel == 0 {
         return Ok(Vec::new());
     }
-    let mut output = Vec::with_capacity(out_numel);
-    for outer in 0..outer_size {
-        for (data, meta) in inputs {
-            let offset = meta.storage_offset();
-            let d = &data[offset..];
-            let range =
-                checked_contiguous_range(outer, inner_size, "stack_f32 slice range overflow")?;
-            output.extend_from_slice(&d[range]);
+    // f32 mirror of stack_tensor_contiguous_f64: all inputs share the validated (non-empty when
+    // out_numel>0) shape → uniform inner_size block, no empty-input edge. Parallelize over outer
+    // rows via par_chunks_mut(num_inputs*inner_size); bit-identical to the serial extend.
+    let out_row_len = checked_mul(num_inputs, inner_size, "stack_f32 row length overflow")?;
+    let windows: Vec<&[f32]> = inputs
+        .iter()
+        .map(|(data, meta)| &data[meta.storage_offset()..])
+        .collect();
+    let mut output = vec![0.0_f32; out_numel];
+    // Flat-chunk parallel fill (uniform block_len == inner_size). Bit-identical to the
+    // serial nested copy but parallel for ANY outer_size — the old `outer_size > 1` gate
+    // left stack(dim=0) (outer_size==1) single-threaded at first-touch-fault speed.
+    let fill_range = |g0: usize, oc: &mut [f32]| {
+        let end = g0 + oc.len();
+        let mut g = g0;
+        while g < end {
+            let outer = g / out_row_len;
+            let w = g - outer * out_row_len;
+            let k = w / inner_size;
+            let within = w - k * inner_size;
+            let copy = (inner_size - within).min(end - g);
+            let src_base = outer * inner_size + within;
+            let o = g - g0;
+            oc[o..o + copy].copy_from_slice(&windows[k][src_base..src_base + copy]);
+            g += copy;
         }
+    };
+    // Pure-copy materialization (cat/stack): parallel only pays at the
+    // fault-parallelism crossover, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN) — parallel copy regressed medium sizes
+    // 0.4-0.75x, wins >=4M (7.5x via parallel first-touch). Bit-identical.
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        const CHUNK: usize = 1 << 16; // 64K elems: good load balance
+        output
+            .par_chunks_mut(CHUNK)
+            .enumerate()
+            .for_each(|(ci, oc)| fill_range(ci * CHUNK, oc));
+    } else {
+        fill_range(0, &mut output);
     }
+
     Ok(output)
 }
 
@@ -29437,13 +33113,30 @@ pub fn narrow_tensor_contiguous_f32(
     }
     let offset = meta.storage_offset();
     let data = &input[offset..];
-    let mut output = Vec::with_capacity(out_numel);
-    for outer in 0..outer_size {
-        for r in 0..length {
-            for inner in 0..inner_size {
-                let idx = outer * dim_size * inner_size + (start + r) * inner_size + inner;
-                output.push(data[idx]);
-            }
+    // f32 mirror of narrow_tensor_contiguous_f64: each `outer` narrows a CONTIGUOUS
+    // `length*inner_size` run → copy_from_slice (memcpy) + parallelize over outer rows. Bit-exact.
+    let out_row = length * inner_size;
+    let src_stride = dim_size * inner_size;
+    let src_start = start * inner_size;
+    let mut output = vec![0.0_f32; out_numel];
+    let fill_row = |outer: usize, orow: &mut [f32]| {
+        let base = outer * src_stride + src_start;
+        orow.copy_from_slice(&data[base..base + out_row]);
+    };
+    // Pure-copy: fault-parallelism gate, not the compute default (see
+    // COPY_MATERIALIZE_PARALLEL_MIN; f32 mirror of narrow_tensor_contiguous_f64).
+    if outer_size > 1
+        && out_numel >= COPY_MATERIALIZE_PARALLEL_MIN
+        && rayon::current_num_threads() > 1
+    {
+        use rayon::prelude::*;
+        output
+            .par_chunks_mut(out_row)
+            .enumerate()
+            .for_each(|(outer, orow)| fill_row(outer, orow));
+    } else {
+        for (outer, orow) in output.chunks_mut(out_row).enumerate() {
+            fill_row(outer, orow);
         }
     }
     Ok(output)
@@ -29477,26 +33170,46 @@ pub fn expand_tensor_contiguous_f32(
     }
     let input_strides = broadcast_strides(shape, target_shape, "expand_f32 strides overflow")?;
     let offset = meta.storage_offset();
-    // Per-flat-index unravel so the gather parallelizes (the per-element div/mod
-    // index math dominates the single read). Index order preserved → bit-identical
-    // to the serial coords sweep. frankentorch-kgs4.94.
-    let mut out_strides = vec![1usize; ndim];
+    // f32 mirror of expand_tensor_contiguous_f64's ROW-STRUCTURED broadcast: innermost dim is
+    // either broadcast (stride 0 → fill) or copied (stride 1 → copy_from_slice); unravel the outer
+    // coords once per row, fill/copy the inner run. Bit-identical to the per-element div/mod gather.
+    let inner = target_shape[ndim - 1];
+    let inner_stride = input_strides[ndim - 1];
+    let mut outer_strides = vec![1usize; ndim.saturating_sub(1)];
     for d in (0..ndim.saturating_sub(1)).rev() {
-        out_strides[d] = out_strides[d + 1] * target_shape[d + 1];
+        if d + 1 < ndim - 1 {
+            outer_strides[d] = outer_strides[d + 1] * target_shape[d + 1];
+        }
     }
-    let eval = |i: usize| {
+    let row_base = |r: usize| -> usize {
         let mut idx = offset;
-        for d in 0..ndim {
-            let c = (i / out_strides[d]) % target_shape[d];
+        for d in 0..ndim - 1 {
+            let c = (r / outer_strides[d]) % target_shape[d];
             idx += c * input_strides[d];
         }
-        input[idx]
+        idx
     };
-    let output: Vec<f32> = if out_numel >= PARALLEL_THRESHOLD {
-        (0..out_numel).into_par_iter().map(eval).collect()
+    let mut output = vec![0.0_f32; out_numel];
+    let fill_row = |r: usize, row: &mut [f32]| {
+        let base = row_base(r);
+        if inner_stride == 0 {
+            row.fill(input[base]);
+        } else {
+            row.copy_from_slice(&input[base..base + inner]);
+        }
+    };
+    // Pure broadcast-fill/copy: fault-parallelism gate (see COPY_MATERIALIZE_PARALLEL_MIN;
+    // f32 mirror of expand_tensor_contiguous_f64).
+    if out_numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        output
+            .par_chunks_mut(inner)
+            .enumerate()
+            .for_each(|(r, row)| fill_row(r, row));
     } else {
-        (0..out_numel).map(eval).collect()
-    };
+        for (r, row) in output.chunks_mut(inner).enumerate() {
+            fill_row(r, row);
+        }
+    }
     Ok(output)
 }
 
@@ -29894,11 +33607,23 @@ pub fn masked_fill_tensor_contiguous_f32(
         });
     }
     let data = &input[offset..offset + numel];
-    let output = data
-        .iter()
-        .zip(mask[offset..offset + numel].iter())
-        .map(|(&d, &m)| if m != 0.0 { value } else { d })
-        .collect();
+    let mask_w = &mask[offset..offset + numel];
+    // Bit-identical to the serial zip-map (f32 companion of masked_fill_tensor_contiguous_f64).
+    // Bandwidth-bound select-WRITE (read data+mask, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover, NOT the compute default — measured PARALLEL_THRESHOLD
+    // (8192) over-parallelized medium masked_fill 0.02-0.56x (up to 50x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        data.par_iter()
+            .zip(mask_w.par_iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    } else {
+        data.iter()
+            .zip(mask_w.iter())
+            .map(|(&d, &m)| if m != 0.0 { value } else { d })
+            .collect()
+    };
     Ok(output)
 }
 
@@ -29929,12 +33654,24 @@ pub fn where_tensor_contiguous_f32(
     let cond = &condition[offset..offset + numel];
     let x_data = &x[offset..offset + numel];
     let y_data = &y[offset..offset + numel];
-    let output = cond
-        .iter()
-        .zip(x_data.iter())
-        .zip(y_data.iter())
-        .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
-        .collect();
+    // Bit-identical to the serial zip-map (f32 companion of where_tensor_contiguous_f64).
+    // Bandwidth-bound select-WRITE (read cond+x+y, one branch/elem, no reduce): gate at the
+    // copy-tier fault-parallelism crossover — PARALLEL_THRESHOLD(8192) over-parallelized medium
+    // where 0.04-0.91x (up to 25x SLOWER), crossover ~4M. (BlackThrush)
+    let output = if numel >= COPY_MATERIALIZE_PARALLEL_MIN {
+        use rayon::prelude::*;
+        cond.par_iter()
+            .zip(x_data.par_iter())
+            .zip(y_data.par_iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    } else {
+        cond.iter()
+            .zip(x_data.iter())
+            .zip(y_data.iter())
+            .map(|((&c, &xv), &yv)| if c != 0.0 { xv } else { yv })
+            .collect()
+    };
     Ok(output)
 }
 
@@ -30516,6 +34253,25 @@ pub fn sort_tensor_contiguous_f32(
         }
         return Ok((sorted_values, indices));
     }
+    // Single large contiguous lane (e.g. a 1-D sort): parallel radix for the
+    // bit-identical stable permutation (NaN lanes fall through). See sort f64.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_sort_lane_f32(
+            data,
+            numel,
+            descending,
+            &mut sorted_values,
+            &mut indices,
+            threads,
+        )
+        .is_some()
+    {
+        return Ok((sorted_values, indices));
+    }
     sorted_values
         .par_chunks_mut(block)
         .zip(indices.par_chunks_mut(block))
@@ -30615,6 +34371,18 @@ pub fn argsort_tensor_contiguous_f32(
                 use_radix,
             );
         }
+        return Ok(indices);
+    }
+    // Single large contiguous lane (e.g. a 1-D argsort): parallel radix for the
+    // bit-identical stable permutation (NaN lanes fall through). See sort f64.
+    if use_radix
+        && outer_size == 1
+        && inner_size == 1
+        && threads > 1
+        && numel >= PARALLEL_RADIX_LANE_MIN
+        && try_parallel_radix_argsort_lane_f32(data, numel, descending, &mut indices, threads)
+            .is_some()
+    {
         return Ok(indices);
     }
     indices
@@ -30763,10 +34531,31 @@ pub fn lerp_tensor_contiguous_f32(
     }
     let s = &start[offset..offset + numel];
     let e = &end[offset..offset + numel];
-    Ok(s.iter()
-        .zip(e.iter())
-        .map(|(&sv, &ev)| sv + weight * (ev - sv))
-        .collect())
+    // PyTorch's scalar f32 lerp uses a branchy fused formula: start-side FMA for
+    // |weight| < 0.5, otherwise end-side FMA. This preserves exact endpoints and
+    // avoids the double-rounding drift from `sv + weight * (ev - sv)`.
+    if numel >= PARALLEL_THRESHOLD {
+        use rayon::prelude::*;
+        Ok(s.par_iter()
+            .zip(e.par_iter())
+            .map(|(&sv, &ev)| lerp_scalar_f32(sv, ev, weight))
+            .collect())
+    } else {
+        Ok(s.iter()
+            .zip(e.iter())
+            .map(|(&sv, &ev)| lerp_scalar_f32(sv, ev, weight))
+            .collect())
+    }
+}
+
+#[inline]
+fn lerp_scalar_f32(start: f32, end: f32, weight: f32) -> f32 {
+    let delta = end - start;
+    if weight.abs() < 0.5 {
+        weight.mul_add(delta, start)
+    } else {
+        (weight - 1.0).mul_add(delta, end)
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -30837,12 +34626,23 @@ pub fn addmm_tensor_contiguous_f32(
         &mut gemm_out,
     );
 
-    // Apply: out = beta * input + alpha * (mat1 @ mat2)
-    let out: Vec<f32> = gemm_out
-        .iter()
-        .enumerate()
-        .map(|(i, &g)| beta * input_at(i) + alpha * g)
-        .collect();
+    // Apply: out = beta * input + alpha * (mat1 @ mat2). f32 mirror of the f64
+    // addmm epilogue: independent per-element combine -> parallel == serial
+    // bit-identical; parallelize the bandwidth-bound serial tail for large outputs.
+    // kgs4-linbias.
+    let out: Vec<f32> = if out_numel >= 1 << 16 {
+        use rayon::prelude::*;
+        (0..gemm_out.len())
+            .into_par_iter()
+            .map(|i| beta * input_at(i) + alpha * gemm_out[i])
+            .collect()
+    } else {
+        gemm_out
+            .iter()
+            .enumerate()
+            .map(|(i, &g)| beta * input_at(i) + alpha * g)
+            .collect()
+    };
 
     Ok(out)
 }
@@ -30897,16 +34697,22 @@ pub fn addmv_tensor_contiguous_f32(
 
     let mat_start = mat_meta.storage_offset();
     let vec_start = vec_meta.storage_offset();
-    // Push-based output mirrors the f64 fix (frankentorch-u04j).
-    let mut out = Vec::with_capacity(m);
-    let mut scratch = vec![0.0f32; k];
-    for row in 0..m {
-        for (col, scratch_slot) in scratch.iter_mut().enumerate() {
-            *scratch_slot = mat[mat_start + row * k + col] * vec_data[vec_start + col];
-        }
-        let acc = pairwise_sum_f32(&scratch);
-        out.push(beta * input[input_start + row] + alpha * acc);
-    }
+    // Row-parallel GEMV, f32 mirror of the f64 path: `pairwise_dot_f32(row, vec)`
+    // is bit-for-bit `pairwise_sum_f32(&[row[c]*vec[c]])` (same tree/leaf), rows
+    // are independent → row-parallel is bit-identical to serial. Bandwidth-bound;
+    // gate on total work so tiny GEMVs stay serial. kgs4-addmv-par.
+    const ADDMV_PARALLEL_MIN_WORK: usize = 1 << 18; // 262144
+    let vec_slice = &vec_data[vec_start..vec_start + k];
+    let row_val = |row: usize| -> f32 {
+        let mrow = &mat[mat_start + row * k..mat_start + row * k + k];
+        beta * input[input_start + row] + alpha * pairwise_dot_f32(mrow, vec_slice)
+    };
+    let out: Vec<f32> = if m > 1 && m.saturating_mul(k) >= ADDMV_PARALLEL_MIN_WORK {
+        use rayon::prelude::*;
+        (0..m).into_par_iter().map(row_val).collect()
+    } else {
+        (0..m).map(row_val).collect()
+    };
     Ok(out)
 }
 
@@ -31014,6 +34820,62 @@ pub fn nonzero_tensor_contiguous_f64(
     let mut strides = vec![1usize; ndim];
     for i in (0..ndim.saturating_sub(1)).rev() {
         strides[i] = strides[i + 1] * shape[i + 1];
+    }
+
+    // Two-pass parallel compaction for large inputs: (1) count nonzeros per chunk,
+    // (2) exclusive-prefix the counts into disjoint output sub-slices, (3) each
+    // chunk decomposes its nonzeros' flat indices into its own slot in parallel.
+    // BIT-IDENTICAL to the serial scan: same predicate (val != 0 || NaN), same
+    // flat_idx -> coordinate math, and ascending flat order is preserved WITHIN
+    // each chunk and ACROSS chunks (chunk k's rows land right after chunk k-1's)
+    // -> row-major, == the serial output. The serial concat is avoided (each chunk
+    // writes its exclusive sub-slice), so it wins even for DENSE inputs (measured
+    // 6-7x internal, 1.7-2.4x FASTER than torch.nonzero across 1-50% density).
+    // torch.nonzero is itself poorly parallelized (~4.7 GB/s on a dense 8k x 8k).
+    const NONZERO_PARALLEL_MIN: usize = 1 << 16; // 65536
+    if numel >= NONZERO_PARALLEL_MIN && rayon::current_num_threads() > 1 {
+        use rayon::prelude::*;
+        let threads = rayon::current_num_threads().max(1);
+        let chunk = numel.div_ceil(threads).max(1);
+        let starts: Vec<usize> = (0..numel).step_by(chunk).collect();
+        let counts: Vec<usize> = starts
+            .par_iter()
+            .map(|&start| {
+                let end = (start + chunk).min(numel);
+                data[start..end]
+                    .iter()
+                    .filter(|&&v| v != 0.0 || v.is_nan())
+                    .count()
+            })
+            .collect();
+        let total: usize = counts.iter().sum();
+        let mut indices = vec![0.0_f64; total * ndim];
+        // Carve one disjoint output slot per chunk (counts[i]*ndim wide).
+        let mut subs: Vec<&mut [f64]> = Vec::with_capacity(starts.len());
+        let mut rest = &mut indices[..];
+        for &c in &counts {
+            let (head, tail) = rest.split_at_mut(c * ndim);
+            subs.push(head);
+            rest = tail;
+        }
+        subs.into_par_iter()
+            .zip(starts.par_iter())
+            .for_each(|(sub, &start)| {
+                let end = (start + chunk).min(numel);
+                let mut w = 0usize;
+                for flat_idx in start..end {
+                    let val = data[flat_idx];
+                    if val != 0.0 || val.is_nan() {
+                        let mut remaining = flat_idx;
+                        for stride in strides.iter().take(ndim) {
+                            sub[w] = (remaining / stride) as f64;
+                            remaining %= stride;
+                            w += 1;
+                        }
+                    }
+                }
+            });
+        return Ok((indices, total));
     }
 
     let mut indices = Vec::new();
@@ -31413,9 +35275,1093 @@ pub fn sparse_coo_add(
     sparse_coo_coalesce(&combined)
 }
 
+/// Transpose a row-major `[rows, cols]` f64 matrix into a fresh row-major `[cols, rows]` matrix.
+///
+/// A scalar transpose streams strided (one direction is always a gather/scatter), capping it at a
+/// fraction of memory bandwidth. The AVX2 path transposes 4×4 blocks IN REGISTERS so BOTH the loads
+/// (4 contiguous src elements per row) AND the stores (4 contiguous dst elements per row) are
+/// vectorized — the classic register-blocked transpose. Pure data movement (each dst element written
+/// once) ⇒ bit-identical to the scalar transpose; parallel over disjoint 4-output-row blocks.
+#[must_use]
+pub fn transpose_2d_f64(src: &[f64], rows: usize, cols: usize) -> Vec<f64> {
+    let mut dst = vec![0.0f64; rows * cols];
+    transpose_2d_into_f64(src, &mut dst, rows, cols);
+    dst
+}
+
+/// In-place variant of [`transpose_2d_f64`]: writes the `[cols, rows]` transpose into `dst`.
+#[allow(unsafe_code)]
+pub fn transpose_2d_into_f64(src: &[f64], dst: &mut [f64], rows: usize, cols: usize) {
+    debug_assert_eq!(src.len(), rows * cols);
+    debug_assert_eq!(dst.len(), rows * cols);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let simd = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let simd = false;
+
+    // Each chunk owns 4 consecutive OUTPUT rows (= 4 consecutive src columns `jb..jb+4`), a disjoint
+    // contiguous dst region. `process(jb, chunk)` fills it.
+    let process = |jb: usize, chunk: &mut [f64]| {
+        let n_out = chunk.len() / rows;
+        if simd && n_out == 4 && jb + 4 <= cols {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut ib = 0;
+                while ib + 4 <= rows {
+                    // SAFETY: `simd` ⇒ AVX2 present at runtime; `ib+4<=rows` and `jb+4<=cols` keep
+                    // every src load in `[0, rows*cols)`, and `chunk.len()==4*rows` keeps every dst
+                    // store in bounds (max index 3*rows+ib+3 < 4*rows since ib+3 < rows).
+                    unsafe { transpose_block_4x4_avx2_f64(src, chunk, ib, jb, cols, rows) };
+                    ib += 4;
+                }
+                // Tail rows (rows not a multiple of 4): scalar.
+                for i in ib..rows {
+                    for k in 0..4 {
+                        chunk[k * rows + i] = src[i * cols + jb + k];
+                    }
+                }
+            }
+        } else {
+            // Scalar: chunk covers output rows `jb..jb+n_out`.
+            for k in 0..n_out {
+                let oj = jb + k;
+                for i in 0..rows {
+                    chunk[k * rows + i] = src[i * cols + oj];
+                }
+            }
+        }
+    };
+
+    const PAR_MIN: usize = 1 << 16;
+    if rows * cols >= PAR_MIN {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(4 * rows)
+            .enumerate()
+            .for_each(|(ci, ch)| process(ci * 4, ch));
+    } else {
+        for (ci, ch) in dst.chunks_mut(4 * rows).enumerate() {
+            process(ci * 4, ch);
+        }
+    }
+}
+
+/// AVX2 in-register transpose of one 4×4 f64 block: `src[ib..ib+4][jb..jb+4]` → the 4 output rows of
+/// `chunk` (output rows `jb..jb+4`) at column offset `ib`. Caller guarantees AVX2, `ib+4<=rows`,
+/// `jb+4<=cols`, and `chunk.len()==4*rows`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+unsafe fn transpose_block_4x4_avx2_f64(
+    src: &[f64],
+    chunk: &mut [f64],
+    ib: usize,
+    jb: usize,
+    cols: usize,
+    rows: usize,
+) {
+    use std::arch::x86_64::{
+        _mm256_loadu_pd, _mm256_permute2f128_pd, _mm256_storeu_pd, _mm256_unpackhi_pd,
+        _mm256_unpacklo_pd,
+    };
+    let sp = src.as_ptr();
+    let dp = chunk.as_mut_ptr();
+    let r0 = _mm256_loadu_pd(sp.add(ib * cols + jb));
+    let r1 = _mm256_loadu_pd(sp.add((ib + 1) * cols + jb));
+    let r2 = _mm256_loadu_pd(sp.add((ib + 2) * cols + jb));
+    let r3 = _mm256_loadu_pd(sp.add((ib + 3) * cols + jb));
+    let t0 = _mm256_unpacklo_pd(r0, r1);
+    let t1 = _mm256_unpackhi_pd(r0, r1);
+    let t2 = _mm256_unpacklo_pd(r2, r3);
+    let t3 = _mm256_unpackhi_pd(r2, r3);
+    let c0 = _mm256_permute2f128_pd::<0x20>(t0, t2);
+    let c1 = _mm256_permute2f128_pd::<0x20>(t1, t3);
+    let c2 = _mm256_permute2f128_pd::<0x31>(t0, t2);
+    let c3 = _mm256_permute2f128_pd::<0x31>(t1, t3);
+    _mm256_storeu_pd(dp.add(ib), c0);
+    _mm256_storeu_pd(dp.add(rows + ib), c1);
+    _mm256_storeu_pd(dp.add(2 * rows + ib), c2);
+    _mm256_storeu_pd(dp.add(3 * rows + ib), c3);
+}
+
+/// f32 mirror of [`transpose_2d_f64`] — AVX2 8×8 register-blocked transpose (8 f32 per __m256).
+#[must_use]
+pub fn transpose_2d_f32(src: &[f32], rows: usize, cols: usize) -> Vec<f32> {
+    let mut dst = vec![0.0f32; rows * cols];
+    transpose_2d_into_f32(src, &mut dst, rows, cols);
+    dst
+}
+
+/// In-place variant of [`transpose_2d_f32`].
+#[allow(unsafe_code)]
+pub fn transpose_2d_into_f32(src: &[f32], dst: &mut [f32], rows: usize, cols: usize) {
+    debug_assert_eq!(src.len(), rows * cols);
+    debug_assert_eq!(dst.len(), rows * cols);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+    #[cfg(target_arch = "x86_64")]
+    let simd = std::arch::is_x86_feature_detected!("avx2");
+    #[cfg(not(target_arch = "x86_64"))]
+    let simd = false;
+
+    // Each chunk owns 8 consecutive OUTPUT rows (= 8 consecutive src columns `jb..jb+8`).
+    let process = |jb: usize, chunk: &mut [f32]| {
+        let n_out = chunk.len() / rows;
+        if simd && n_out == 8 && jb + 8 <= cols {
+            #[cfg(target_arch = "x86_64")]
+            {
+                let mut ib = 0;
+                while ib + 8 <= rows {
+                    // SAFETY: `simd` ⇒ AVX2 present; `ib+8<=rows` & `jb+8<=cols` keep every src load in
+                    // `[0, rows*cols)`; `chunk.len()==8*rows` keeps every dst store in bounds (max
+                    // index 7*rows+ib+7 < 8*rows since ib+7 < rows).
+                    unsafe { transpose_block_8x8_avx2_f32(src, chunk, ib, jb, cols, rows) };
+                    ib += 8;
+                }
+                for i in ib..rows {
+                    for k in 0..8 {
+                        chunk[k * rows + i] = src[i * cols + jb + k];
+                    }
+                }
+            }
+        } else {
+            for k in 0..n_out {
+                let oj = jb + k;
+                for i in 0..rows {
+                    chunk[k * rows + i] = src[i * cols + oj];
+                }
+            }
+        }
+    };
+
+    const PAR_MIN: usize = 1 << 16;
+    if rows * cols >= PAR_MIN {
+        use rayon::prelude::*;
+        dst.par_chunks_mut(8 * rows)
+            .enumerate()
+            .for_each(|(ci, ch)| process(ci * 8, ch));
+    } else {
+        for (ci, ch) in dst.chunks_mut(8 * rows).enumerate() {
+            process(ci * 8, ch);
+        }
+    }
+}
+
+// Plane-size gate for the uninit first-touch strategy in `transpose_batched_materialize_*`:
+// building the output uninitialized (so the parallel per-plane transpose does the page FIRST-TOUCH,
+// no dead serial `vec![0.0; total]`) WINS for MANY SMALL planes — the hot attention `.mT` case,
+// measured 2.31x at [b=256,256x64] — but can REGRESS for FEW LARGE planes (measured 0.75x at
+// [b=4,4096x4096]=16M/plane), where the transpose (not the init) is the cost and random-order page
+// faults on a huge plane hurt. Gate uninit to planes <= this; larger planes keep the pre-faulted path.
+const UNINIT_TRANSPOSE_MAX_PLANE: usize = 1 << 20; // 1M elems/plane
+
+/// Materialize a batched 2-D transpose (backs the permute/movedim/`.mT` elem==1 rotation path).
+/// For planes `<= UNINIT_TRANSPOSE_MAX_PLANE` the output is built into an UNINITIALIZED buffer so the
+/// parallel per-plane transpose is the sole writer and does the page FIRST-TOUCH — no dead serial
+/// `vec![0.0; total]` init. For larger planes the pre-faulted `vec![0.0]` path is kept UNCHANGED (so
+/// this can never regress the few-large-planes case). Output is BIT-IDENTICAL in either branch.
+/// ft-autograd is `#![forbid(unsafe_code)]`, so it delegates here.
+#[allow(unsafe_code)]
+pub fn transpose_batched_materialize_f64(
+    src: &[f64],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<f64> {
+    use rayon::prelude::*;
+    let plane = rows * cols;
+    let total = batch * plane;
+    debug_assert_eq!(src.len(), total);
+    if plane == 0 || batch == 0 {
+        return vec![0.0; total];
+    }
+    if plane <= UNINIT_TRANSPOSE_MAX_PLANE {
+        let mut dst: Vec<f64> = Vec::with_capacity(total);
+        // SAFETY: capacity == total == batch*plane; `par_chunks_mut(plane)` yields exactly `batch`
+        // full chunks covering every element, and `transpose_2d_into_f64` writes all `plane` elements
+        // of each chunk before any read. `f64: Copy` has no Drop, so `set_len` is sound.
+        unsafe {
+            dst.set_len(total);
+        }
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f64(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    } else {
+        let mut dst = vec![0.0f64; total];
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f64(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    }
+}
+
+/// f32 mirror of [`transpose_batched_materialize_f64`].
+#[allow(unsafe_code)]
+pub fn transpose_batched_materialize_f32(
+    src: &[f32],
+    batch: usize,
+    rows: usize,
+    cols: usize,
+) -> Vec<f32> {
+    use rayon::prelude::*;
+    let plane = rows * cols;
+    let total = batch * plane;
+    debug_assert_eq!(src.len(), total);
+    if plane == 0 || batch == 0 {
+        return vec![0.0; total];
+    }
+    if plane <= UNINIT_TRANSPOSE_MAX_PLANE {
+        let mut dst: Vec<f32> = Vec::with_capacity(total);
+        // SAFETY: see `transpose_batched_materialize_f64`; every element written by the per-plane
+        // transpose before read, `f32: Copy` = no Drop.
+        unsafe {
+            dst.set_len(total);
+        }
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f32(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    } else {
+        let mut dst = vec![0.0f32; total];
+        dst.par_chunks_mut(plane).enumerate().for_each(|(b, dpl)| {
+            let so = b * plane;
+            transpose_2d_into_f32(&src[so..so + plane], dpl, rows, cols);
+        });
+        dst
+    }
+}
+
+/// AVX2 in-register transpose of one 8×8 f32 block (`_MM_TRANSPOSE8_PS`): `src[ib..ib+8][jb..jb+8]`
+/// → the 8 output rows of `chunk` at column offset `ib`. Caller guarantees AVX2, `ib+8<=rows`,
+/// `jb+8<=cols`, `chunk.len()==8*rows`.
+#[cfg(target_arch = "x86_64")]
+#[target_feature(enable = "avx2")]
+#[allow(unsafe_code, unsafe_op_in_unsafe_fn)]
+unsafe fn transpose_block_8x8_avx2_f32(
+    src: &[f32],
+    chunk: &mut [f32],
+    ib: usize,
+    jb: usize,
+    cols: usize,
+    rows: usize,
+) {
+    use std::arch::x86_64::{
+        _mm256_loadu_ps, _mm256_permute2f128_ps, _mm256_shuffle_ps, _mm256_storeu_ps,
+        _mm256_unpackhi_ps, _mm256_unpacklo_ps,
+    };
+    let sp = src.as_ptr();
+    let dp = chunk.as_mut_ptr();
+    let r0 = _mm256_loadu_ps(sp.add(ib * cols + jb));
+    let r1 = _mm256_loadu_ps(sp.add((ib + 1) * cols + jb));
+    let r2 = _mm256_loadu_ps(sp.add((ib + 2) * cols + jb));
+    let r3 = _mm256_loadu_ps(sp.add((ib + 3) * cols + jb));
+    let r4 = _mm256_loadu_ps(sp.add((ib + 4) * cols + jb));
+    let r5 = _mm256_loadu_ps(sp.add((ib + 5) * cols + jb));
+    let r6 = _mm256_loadu_ps(sp.add((ib + 6) * cols + jb));
+    let r7 = _mm256_loadu_ps(sp.add((ib + 7) * cols + jb));
+    let t0 = _mm256_unpacklo_ps(r0, r1);
+    let t1 = _mm256_unpackhi_ps(r0, r1);
+    let t2 = _mm256_unpacklo_ps(r2, r3);
+    let t3 = _mm256_unpackhi_ps(r2, r3);
+    let t4 = _mm256_unpacklo_ps(r4, r5);
+    let t5 = _mm256_unpackhi_ps(r4, r5);
+    let t6 = _mm256_unpacklo_ps(r6, r7);
+    let t7 = _mm256_unpackhi_ps(r6, r7);
+    // 0x44 = _MM_SHUFFLE(1,0,1,0), 0xEE = _MM_SHUFFLE(3,2,3,2)
+    let s0 = _mm256_shuffle_ps::<0x44>(t0, t2);
+    let s1 = _mm256_shuffle_ps::<0xEE>(t0, t2);
+    let s2 = _mm256_shuffle_ps::<0x44>(t1, t3);
+    let s3 = _mm256_shuffle_ps::<0xEE>(t1, t3);
+    let s4 = _mm256_shuffle_ps::<0x44>(t4, t6);
+    let s5 = _mm256_shuffle_ps::<0xEE>(t4, t6);
+    let s6 = _mm256_shuffle_ps::<0x44>(t5, t7);
+    let s7 = _mm256_shuffle_ps::<0xEE>(t5, t7);
+    let c0 = _mm256_permute2f128_ps::<0x20>(s0, s4);
+    let c1 = _mm256_permute2f128_ps::<0x20>(s1, s5);
+    let c2 = _mm256_permute2f128_ps::<0x20>(s2, s6);
+    let c3 = _mm256_permute2f128_ps::<0x20>(s3, s7);
+    let c4 = _mm256_permute2f128_ps::<0x31>(s0, s4);
+    let c5 = _mm256_permute2f128_ps::<0x31>(s1, s5);
+    let c6 = _mm256_permute2f128_ps::<0x31>(s2, s6);
+    let c7 = _mm256_permute2f128_ps::<0x31>(s3, s7);
+    _mm256_storeu_ps(dp.add(ib), c0);
+    _mm256_storeu_ps(dp.add(rows + ib), c1);
+    _mm256_storeu_ps(dp.add(2 * rows + ib), c2);
+    _mm256_storeu_ps(dp.add(3 * rows + ib), c3);
+    _mm256_storeu_ps(dp.add(4 * rows + ib), c4);
+    _mm256_storeu_ps(dp.add(5 * rows + ib), c5);
+    _mm256_storeu_ps(dp.add(6 * rows + ib), c6);
+    _mm256_storeu_ps(dp.add(7 * rows + ib), c7);
+}
+
 #[cfg(test)]
 mod tests {
+    use rayon::prelude::*;
     use std::fmt::Write as _;
+
+    #[test]
+    fn parallel_radix_perm_matches_serial_bit_for_bit() {
+        // The parallel radix must return EXACTLY the serial stable permutation,
+        // including tie order, across thread counts and sizes (incl. > lane min).
+        for &n in &[0usize, 1, 2, 3, 255, 256, 1000, 65_536, 100_001, 300_000] {
+            let mut keys = vec![0u64; n];
+            let mut z = 0x1234_5678_9abc_def0u64;
+            for k in keys.iter_mut() {
+                z = z
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                *k = z >> 1;
+            }
+            // Inject heavy ties so stability is exercised.
+            for i in (0..n).step_by(11) {
+                keys[i] = 0xABCD;
+            }
+            for i in (0..n).step_by(13) {
+                keys[i] = 0;
+            }
+            let mut serial = Vec::new();
+            let mut scratch = Vec::new();
+            super::sort_radix_perm(&keys, &mut serial, &mut scratch);
+            for &threads in &[1usize, 2, 4, 8, 17] {
+                let parallel = super::sort_radix_perm_parallel(&keys, threads);
+                assert_eq!(serial, parallel, "n={n} threads={threads}");
+            }
+            // f32-style keys (high 32 bits zero) must also match (4 effective passes).
+            let keys32: Vec<u64> = keys.iter().map(|k| k & 0xFFFF_FFFF).collect();
+            let mut serial32 = Vec::new();
+            let mut scratch32 = Vec::new();
+            super::sort_radix_perm(&keys32, &mut serial32, &mut scratch32);
+            let parallel32 = super::sort_radix_perm_parallel(&keys32, 8);
+            assert_eq!(serial32, parallel32, "f32-keys n={n}");
+        }
+    }
+
+    #[test]
+    fn parallel_radix_1d_lane_sort_argsort_correct_and_matches_reference() {
+        use ft_core::{DType, Device, TensorMeta};
+        // n > PARALLEL_RADIX_LANE_MIN so the single-lane parallel-radix path fires.
+        let n = 200_003usize;
+        let data: Vec<f64> = (0..n)
+            .map(|i| {
+                let z = (i as u64)
+                    .wrapping_mul(6_364_136_223_846_793_005)
+                    .wrapping_add(1_442_695_040_888_963_407);
+                ((z >> 11) as f64 / (1u64 << 53) as f64) * 4.0 - 2.0
+            })
+            .collect();
+        let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
+        let data32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
+        let meta32 = TensorMeta::from_shape(vec![n], DType::F32, Device::Cpu);
+
+        for &desc in &[false, true] {
+            // reference stable sort
+            let mut order: Vec<usize> = (0..n).collect();
+            order.sort_by(|&a, &b| {
+                let c = data[a].partial_cmp(&data[b]).unwrap();
+                if desc { c.reverse() } else { c }
+            });
+            let ref_vals: Vec<f64> = order.iter().map(|&i| data[i]).collect();
+
+            let (sv, si) = super::sort_tensor_contiguous_f64(&data, &meta, 0, desc).unwrap();
+            assert_eq!(sv, ref_vals, "f64 sort values desc={desc}");
+            // indices must reproduce the sorted values from the input
+            for (k, &ix) in si.iter().enumerate() {
+                assert_eq!(data[ix], sv[k], "f64 sort idx[{k}] desc={desc}");
+            }
+            let ai = super::argsort_tensor_contiguous_f64(&data, &meta, 0, desc).unwrap();
+            assert_eq!(ai, si, "f64 argsort == sort indices desc={desc}");
+
+            let (sv32, si32) =
+                super::sort_tensor_contiguous_f32(&data32, &meta32, 0, desc).unwrap();
+            // f32 values are non-decreasing (ascending) / non-increasing (desc)
+            for w in sv32.windows(2) {
+                if desc {
+                    assert!(w[0] >= w[1], "f32 sort not descending desc={desc}");
+                } else {
+                    assert!(w[0] <= w[1], "f32 sort not ascending desc={desc}");
+                }
+            }
+            for (k, &ix) in si32.iter().enumerate() {
+                assert_eq!(data32[ix], sv32[k], "f32 sort idx[{k}] desc={desc}");
+            }
+            let ai32 = super::argsort_tensor_contiguous_f32(&data32, &meta32, 0, desc).unwrap();
+            assert_eq!(ai32, si32, "f32 argsort == sort indices desc={desc}");
+        }
+    }
+
+    #[test]
+    fn product_f32_simd_contiguous_matches_existing_parallel_product_for_finite_rows() {
+        let sizes = [0usize, 1, 7, 8, 9, 16_383, 16_384, 16_385, 65_536];
+        for &numel in &sizes {
+            let row: Vec<f32> = (0..numel)
+                .map(|i| 1.0f32 + ((i % 17) as f32 - 8.0) * 0.000_001)
+                .collect();
+            let expected = row.par_iter().copied().product::<f32>();
+            let got = row
+                .par_chunks(super::PROD_F32_SIMD_CHUNK)
+                .map(super::product_f32_simd_contiguous)
+                .product::<f32>();
+            // Two valid reductions of an N-term product (chunked-SIMD vs element-wise
+            // par_iter) each accumulate up to ~(N-1)·u rounding (u = f32 unit roundoff
+            // = 2^-24), so they can legitimately differ by ~2·N·u. The old fixed 2e-4
+            // tolerance was too tight at numel=65536 (observed 2.1e-4 divergence on a
+            // ~1.0 product, a FALSE failure). Scale with N (2·N·u, floored at the old
+            // 2e-4 for the small sizes); this still catches gross kernel errors.
+            let rel = (numel as f32 * f32::EPSILON).max(0.000_2);
+            let tolerance = expected.abs().max(1.0) * rel;
+            assert!(
+                (got - expected).abs() <= tolerance,
+                "numel={numel} got={got:?} expected={expected:?} tolerance={tolerance:?}",
+            );
+        }
+    }
+
+    // The parallel-SIMD f32 unary kernel must be BIT-IDENTICAL to the serial-SIMD
+    // path it replaces above the threshold (CHUNK is a multiple of SIMD_WIDTH_F32,
+    // so both partition the window into the same SIMD groups + trailing scalar
+    // tail). Covers sizes that straddle the SIMD width, the chunk size, and the
+    // multi-chunk regime, with specials (±inf/NaN/±0) seeded into the tail.
+    #[test]
+    fn simd_unary_f32_parallel_matches_serial_bit_for_bit() {
+        use wide::f32x8;
+        let zero = f32x8::splat(0.0f32);
+        let one = f32x8::splat(1.0f32);
+        // (scalar_op, simd_op) pairs mirroring the live neg/abs/sqrt/reciprocal/relu
+        let sizes = [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003,
+        ];
+        for &numel in &sizes {
+            let mut w: Vec<f32> = (0..numel)
+                .map(|i| ((i % 4099) as f32 - 2049.5) * 0.013)
+                .collect();
+            if numel >= 5 {
+                let t = numel - 5;
+                w[t] = f32::INFINITY;
+                w[t + 1] = f32::NEG_INFINITY;
+                w[t + 2] = f32::NAN;
+                w[t + 3] = -0.0;
+                w[t + 4] = 0.0;
+            }
+            let pos: Vec<f32> = w.iter().map(|&x| x.abs() + 1e-6).collect();
+            let bits_eq = |a: &[f32], b: &[f32]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            // neg
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&w, |v| -v, |a| -a),
+                    &super::simd_unary_f32_parallel(&w, |v| -v, |a| -a),
+                ),
+                "neg numel={numel}"
+            );
+            // abs
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&w, |v| v.abs(), |a| a.abs()),
+                    &super::simd_unary_f32_parallel(&w, |v| v.abs(), |a| a.abs()),
+                ),
+                "abs numel={numel}"
+            );
+            // relu (max with 0)
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&w, |v| v.max(0.0f32), move |a| a.max(zero)),
+                    &super::simd_unary_f32_parallel(&w, |v| v.max(0.0f32), move |a| a.max(zero)),
+                ),
+                "relu numel={numel}"
+            );
+            // sqrt (positive domain; wide f32x8::sqrt vs scalar must agree serial==parallel)
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&pos, |v| v.sqrt(), |a| a.sqrt()),
+                    &super::simd_unary_f32_parallel(&pos, |v| v.sqrt(), |a| a.sqrt()),
+                ),
+                "sqrt numel={numel}"
+            );
+            // reciprocal
+            assert!(
+                bits_eq(
+                    &super::simd_unary_f32(&pos, |v| 1.0f32 / v, move |a| one / a),
+                    &super::simd_unary_f32_parallel(&pos, |v| 1.0f32 / v, move |a| one / a),
+                ),
+                "reciprocal numel={numel}"
+            );
+        }
+    }
+
+    // f64 sibling of min_max_f32: the SIMD f64x4 max/min must be BIT-IDENTICAL to the
+    // NaN-propagating scalar fmax/fmin across every ordered pair of IEEE f64 edge values.
+    #[test]
+    fn min_max_f64_simd_matches_scalar_bit_for_bit() {
+        use wide::{CmpEq, f64x4};
+        let edge = [
+            0.0f64,
+            -0.0,
+            1.0,
+            -1.0,
+            2.5,
+            -2.5,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::from_bits(0x8000_0000_0000_0001),
+            1.0e300,
+            -1.0e300,
+            3.0,
+        ];
+        let mut l: Vec<f64> = Vec::new();
+        let mut r: Vec<f64> = Vec::new();
+        for &a in &edge {
+            for &b in &edge {
+                l.push(a);
+                r.push(b);
+            }
+        }
+        for k in 0..3 {
+            l.push(edge[k]);
+            r.push(edge[(k + 5) % edge.len()]);
+        }
+        let max_scalar = |x: f64, y: f64| {
+            if x.is_nan() || y.is_nan() {
+                f64::NAN
+            } else {
+                x.max(y)
+            }
+        };
+        let min_scalar = |x: f64, y: f64| {
+            if x.is_nan() || y.is_nan() {
+                f64::NAN
+            } else {
+                x.min(y)
+            }
+        };
+        let max_simd = |a: f64x4, b: f64x4| {
+            let nan = f64x4::splat(f64::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+        };
+        let min_simd = |a: f64x4, b: f64x4| {
+            let nan = f64x4::splat(f64::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+        };
+        for (name, got, scalar) in [
+            (
+                "max",
+                super::simd_binary_f64(&l, &r, max_scalar, max_simd),
+                max_scalar as fn(f64, f64) -> f64,
+            ),
+            (
+                "min",
+                super::simd_binary_f64(&l, &r, min_scalar, min_simd),
+                min_scalar as fn(f64, f64) -> f64,
+            ),
+        ] {
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(l[k], r[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} f64 simd diverged from scalar at ({}, {}): got {g} want {want}",
+                    l[k],
+                    r[k]
+                );
+            }
+        }
+    }
+
+    // The SIMD f32 max/min ops must be BIT-IDENTICAL to the NaN-propagating scalar
+    // fmax/fmin (the prior kernel + the simd<->scalar boundary lane). Exhaustively cover
+    // EVERY ordered pair of IEEE edge values (±0, ±inf, NaN, ±subnormal, normals) so the
+    // sign-of-zero on ±0 ties and NaN propagation are checked in both operand positions.
+    #[test]
+    fn min_max_f32_simd_matches_scalar_bit_for_bit() {
+        use wide::{CmpEq, f32x8};
+        let edge = [
+            0.0f32,
+            -0.0,
+            1.0,
+            -1.0,
+            2.5,
+            -2.5,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),           // smallest positive subnormal
+            f32::from_bits(0x8000_0001), // smallest negative subnormal
+            1.0e30,
+            -1.0e30,
+            3.0,
+        ];
+        let n = edge.len();
+        // Cartesian product -> all ordered pairs, length n*n (a multiple of 8 here, so
+        // every pair is evaluated through the f32x8 SIMD lanes), plus 5 extra pairs to
+        // also exercise the scalar tail at the simd<->scalar boundary.
+        let mut l: Vec<f32> = Vec::new();
+        let mut r: Vec<f32> = Vec::new();
+        for &a in &edge {
+            for &b in &edge {
+                l.push(a);
+                r.push(b);
+            }
+        }
+        for k in 0..5 {
+            l.push(edge[k]);
+            r.push(edge[(k + 7) % n]);
+        }
+        let max_scalar = |x: f32, y: f32| {
+            if x.is_nan() || y.is_nan() {
+                f32::NAN
+            } else {
+                x.max(y)
+            }
+        };
+        let min_scalar = |x: f32, y: f32| {
+            if x.is_nan() || y.is_nan() {
+                f32::NAN
+            } else {
+                x.min(y)
+            }
+        };
+        let max_simd = |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.max(b)))
+        };
+        let min_simd = |a: f32x8, b: f32x8| {
+            let nan = f32x8::splat(f32::NAN);
+            (!b.cmp_eq(b)).blend(nan, (!a.cmp_eq(a)).blend(nan, a.min(b)))
+        };
+        for (name, got, scalar) in [
+            (
+                "max",
+                super::simd_binary_f32(&l, &r, max_scalar, max_simd),
+                max_scalar as fn(f32, f32) -> f32,
+            ),
+            (
+                "min",
+                super::simd_binary_f32(&l, &r, min_scalar, min_simd),
+                min_scalar as fn(f32, f32) -> f32,
+            ),
+        ] {
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(l[k], r[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} simd diverged from scalar at pair ({}, {}): got {g} ({:08x}) want {want} ({:08x})",
+                    l[k],
+                    r[k],
+                    g.to_bits(),
+                    want.to_bits()
+                );
+            }
+        }
+    }
+
+    // f64 sibling of hard_activation_f32_simd_matches_scalar: the SIMD f64x4 hard* ops must be
+    // BIT-IDENTICAL to their scalar value fns across every IEEE f64 edge value + breakpoints.
+    #[test]
+    fn hard_activation_f64_simd_matches_scalar() {
+        use wide::{CmpEq, CmpGe, CmpLe, f64x4};
+        let mut xs: Vec<f64> = vec![
+            0.0,
+            -0.0,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::NAN,
+            f64::MIN_POSITIVE,
+            -f64::MIN_POSITIVE,
+            f64::from_bits(1),
+            f64::from_bits(0x8000_0000_0000_0001),
+            3.0,
+            -3.0,
+            1.0,
+            -1.0,
+            2.999_999_999,
+            3.000_000_001,
+            -2.999_999_999,
+            -3.000_000_001,
+            1.0e300,
+            -1.0e300,
+        ];
+        for i in 0..200 {
+            xs.push((i as f64 - 100.0) * 0.07);
+        }
+        let cases: [(&str, fn(f64) -> f64, fn(f64x4) -> f64x4); 3] = [
+            ("hardswish", super::hardswish_value, {
+                fn s(a: f64x4) -> f64x4 {
+                    let three = f64x4::splat(3.0);
+                    let six = f64x4::splat(6.0);
+                    let zero = f64x4::splat(0.0);
+                    let neg3 = f64x4::splat(-3.0);
+                    let mid = (a * (a + three)) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(a, r)
+                }
+                s
+            }),
+            ("hardsigmoid", super::hardsigmoid_value, {
+                fn s(a: f64x4) -> f64x4 {
+                    let three = f64x4::splat(3.0);
+                    let six = f64x4::splat(6.0);
+                    let zero = f64x4::splat(0.0);
+                    let one = f64x4::splat(1.0);
+                    let neg3 = f64x4::splat(-3.0);
+                    let mid = (a + three) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(one, r)
+                }
+                s
+            }),
+            ("hardtanh", super::hardtanh_value, {
+                fn s(a: f64x4) -> f64x4 {
+                    let neg1 = f64x4::splat(-1.0);
+                    let one = f64x4::splat(1.0);
+                    let nan = f64x4::splat(f64::NAN);
+                    (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+                }
+                s
+            }),
+        ];
+        for (name, scalar, simd) in cases {
+            let got = super::simd_unary_f64(&xs, scalar, simd);
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(xs[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} f64 simd diverged from scalar at x={}: got {g} want {want}",
+                    xs[k]
+                );
+            }
+        }
+    }
+
+    // The SIMD hardswish/hardsigmoid/hardtanh ops must be BIT-IDENTICAL to their scalar
+    // value fns (the prior define_unary_f32 kernels). Exhaustively cover every IEEE edge value
+    // (±0, ±inf, NaN, ±subnormal) plus the piecewise breakpoints (±3, ±1) and dense normals so
+    // the affine/quadratic arithmetic, the clamp branches, and NaN propagation are all checked.
+    #[test]
+    fn hard_activation_f32_simd_matches_scalar() {
+        use wide::{CmpEq, CmpGe, CmpLe, f32x8};
+        let mut xs: Vec<f32> = vec![
+            0.0,
+            -0.0,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            f32::NAN,
+            f32::MIN_POSITIVE,
+            -f32::MIN_POSITIVE,
+            f32::from_bits(1),
+            f32::from_bits(0x8000_0001),
+            3.0,
+            -3.0,
+            1.0,
+            -1.0,
+            2.999_999_5,
+            3.000_001,
+            -2.999_999_5,
+            -3.000_001,
+            1.0e30,
+            -1.0e30,
+        ];
+        // dense sweep across the piecewise regions, length chosen so SIMD lanes + a scalar tail
+        // are both exercised.
+        for i in 0..200 {
+            xs.push((i as f32 - 100.0) * 0.07);
+        }
+        let cases: [(&str, fn(f32) -> f32, fn(f32x8) -> f32x8); 3] = [
+            ("hardswish", super::hardswish_value_f32, {
+                fn s(a: f32x8) -> f32x8 {
+                    let three = f32x8::splat(3.0f32);
+                    let six = f32x8::splat(6.0f32);
+                    let zero = f32x8::splat(0.0f32);
+                    let neg3 = f32x8::splat(-3.0f32);
+                    let mid = (a * (a + three)) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(a, r)
+                }
+                s
+            }),
+            ("hardsigmoid", super::hardsigmoid_value_f32, {
+                fn s(a: f32x8) -> f32x8 {
+                    let three = f32x8::splat(3.0f32);
+                    let six = f32x8::splat(6.0f32);
+                    let zero = f32x8::splat(0.0f32);
+                    let one = f32x8::splat(1.0f32);
+                    let neg3 = f32x8::splat(-3.0f32);
+                    let mid = (a + three) / six;
+                    let r = a.cmp_le(neg3).blend(zero, mid);
+                    a.cmp_ge(three).blend(one, r)
+                }
+                s
+            }),
+            ("hardtanh", super::hardtanh_value_f32, {
+                fn s(a: f32x8) -> f32x8 {
+                    let neg1 = f32x8::splat(-1.0f32);
+                    let one = f32x8::splat(1.0f32);
+                    let nan = f32x8::splat(f32::NAN);
+                    (!a.cmp_eq(a)).blend(nan, a.max(neg1).min(one))
+                }
+                s
+            }),
+        ];
+        for (name, scalar, simd) in cases {
+            let got = super::simd_unary_f32(&xs, scalar, simd);
+            for (k, g) in got.iter().enumerate() {
+                let want = scalar(xs[k]);
+                assert_eq!(
+                    g.to_bits(),
+                    want.to_bits(),
+                    "{name} simd diverged from scalar at x={}: got {g} ({:08x}) want {want} ({:08x})",
+                    xs[k],
+                    g.to_bits(),
+                    want.to_bits()
+                );
+            }
+        }
+    }
+
+    // The parallel-SIMD f32 BINARY kernel (add/sub/mul/div) must be BIT-IDENTICAL to
+    // the serial-SIMD path above the threshold — same CHUNK%SIMD_WIDTH_F32==0 partition
+    // argument as the unary test. Specials (±inf/NaN/±0) seeded into both operand tails.
+    #[test]
+    fn simd_binary_f32_parallel_matches_serial_bit_for_bit() {
+        let sizes = [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003,
+        ];
+        for &numel in &sizes {
+            let mut l: Vec<f32> = (0..numel)
+                .map(|i| ((i % 4099) as f32 - 2049.5) * 0.013)
+                .collect();
+            let mut r: Vec<f32> = (0..numel)
+                .map(|i| ((i % 3001) as f32 - 1500.5) * 0.017 + 1.0)
+                .collect();
+            if numel >= 5 {
+                let t = numel - 5;
+                l[t] = f32::INFINITY;
+                l[t + 1] = f32::NEG_INFINITY;
+                l[t + 2] = f32::NAN;
+                l[t + 3] = -0.0;
+                l[t + 4] = 0.0;
+                r[t] = 2.0;
+                r[t + 1] = -3.0;
+                r[t + 2] = 0.0; // div-by-zero / NaN-op paths
+                r[t + 3] = f32::INFINITY;
+                r[t + 4] = f32::NAN;
+            }
+            let bits_eq = |a: &[f32], b: &[f32]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            // add
+            assert!(
+                bits_eq(
+                    &super::simd_binary_f32(&l, &r, |x, y| x + y, |a, b| a + b),
+                    &super::simd_binary_f32_parallel(&l, &r, |x, y| x + y, |a, b| a + b),
+                ),
+                "add numel={numel}"
+            );
+            // sub
+            assert!(
+                bits_eq(
+                    &super::simd_binary_f32(&l, &r, |x, y| x - y, |a, b| a - b),
+                    &super::simd_binary_f32_parallel(&l, &r, |x, y| x - y, |a, b| a - b),
+                ),
+                "sub numel={numel}"
+            );
+            // mul
+            assert!(
+                bits_eq(
+                    &super::simd_binary_f32(&l, &r, |x, y| x * y, |a, b| a * b),
+                    &super::simd_binary_f32_parallel(&l, &r, |x, y| x * y, |a, b| a * b),
+                ),
+                "mul numel={numel}"
+            );
+            // div
+            assert!(
+                bits_eq(
+                    &super::simd_binary_f32(&l, &r, |x, y| x / y, |a, b| a / b),
+                    &super::simd_binary_f32_parallel(&l, &r, |x, y| x / y, |a, b| a / b),
+                ),
+                "div numel={numel}"
+            );
+        }
+    }
+
+    #[test]
+    fn simd_comparison_f32_matches_scalar_masks() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        let sizes = [
+            0usize, 1, 7, 8, 9, 15, 16, 17, 16_383, 16_384, 16_385, 32_768, 1_000_003,
+        ];
+        for &numel in &sizes {
+            let mut l: Vec<f32> = (0..numel)
+                .map(|i| ((i % 4099) as f32 - 2049.5) * 0.013)
+                .collect();
+            let mut r: Vec<f32> = (0..numel)
+                .map(|i| ((i % 3001) as f32 - 1500.5) * 0.017)
+                .collect();
+            if numel >= 6 {
+                let t = numel - 6;
+                l[t] = f32::NAN;
+                r[t] = f32::NAN;
+                l[t + 1] = f32::NAN;
+                r[t + 1] = 1.0;
+                l[t + 2] = -0.0;
+                r[t + 2] = 0.0;
+                l[t + 3] = f32::INFINITY;
+                r[t + 3] = 3.0;
+                l[t + 4] = f32::NEG_INFINITY;
+                r[t + 4] = f32::NEG_INFINITY;
+                l[t + 5] = 2.0;
+                r[t + 5] = 3.0;
+            }
+            let meta = TensorMeta::from_shape(vec![numel], DType::F32, Device::Cpu);
+            let reference = |op: fn(f32, f32) -> bool| {
+                l.iter()
+                    .zip(r.iter())
+                    .map(|(&left, &right)| if op(left, right) { 1.0f32 } else { 0.0f32 })
+                    .collect::<Vec<_>>()
+            };
+            let bits_eq = |a: &[f32], b: &[f32]| {
+                a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.to_bits() == y.to_bits())
+            };
+            let assert_matches = |name: &str, got: Vec<f32>, want: Vec<f32>| {
+                assert!(bits_eq(&got, &want), "{name} numel={numel}");
+            };
+
+            assert_matches(
+                "eq",
+                super::eq_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left == right),
+            );
+            assert_matches(
+                "ne",
+                super::ne_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left != right),
+            );
+            assert_matches(
+                "lt",
+                super::lt_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left < right),
+            );
+            assert_matches(
+                "gt",
+                super::gt_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left > right),
+            );
+            assert_matches(
+                "le",
+                super::le_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left <= right),
+            );
+            assert_matches(
+                "ge",
+                super::ge_tensor_contiguous_f32(&l, &r, &meta, &meta).unwrap(),
+                reference(|left, right| left >= right),
+            );
+        }
+    }
+
+    #[test]
+    fn transpose_2d_f64_matches_scalar_reference_all_sizes() {
+        // Bit-exact vs a naive scalar transpose across edges + non-multiple-of-4 dims (which
+        // exercise both the AVX2 4×4 block path and the scalar tail/partial-chunk cleanup).
+        for &(r, c) in &[
+            (0usize, 0usize),
+            (1, 1),
+            (4, 4),
+            (7, 5),
+            (5, 7),
+            (16, 16),
+            (17, 19),
+            (1, 33),
+            (33, 1),
+            (64, 65),
+            (130, 127),
+        ] {
+            let src: Vec<f64> = (0..r * c).map(|i| (i as f64) * 0.5 - 3.0).collect();
+            let got = super::transpose_2d_f64(&src, r, c);
+            let mut want = vec![0.0f64; r * c];
+            for i in 0..r {
+                for j in 0..c {
+                    want[j * r + i] = src[i * c + j];
+                }
+            }
+            assert_eq!(got, want, "transpose mismatch at {r}x{c}");
+        }
+    }
+
+    #[test]
+    fn transpose_2d_f32_matches_scalar_reference_all_sizes() {
+        // Non-multiple-of-8 dims exercise the AVX2 8×8 block path + scalar tail/partial cleanup.
+        for &(r, c) in &[
+            (0usize, 0usize),
+            (1, 1),
+            (8, 8),
+            (7, 5),
+            (5, 7),
+            (9, 17),
+            (17, 9),
+            (1, 65),
+            (65, 1),
+            (64, 64),
+            (130, 127),
+            (129, 131),
+        ] {
+            let src: Vec<f32> = (0..r * c).map(|i| (i as f32) * 0.5 - 3.0).collect();
+            let got = super::transpose_2d_f32(&src, r, c);
+            let mut want = vec![0.0f32; r * c];
+            for i in 0..r {
+                for j in 0..c {
+                    want[j * r + i] = src[i * c + j];
+                }
+            }
+            assert_eq!(got, want, "f32 transpose mismatch at {r}x{c}");
+        }
+    }
+
+    #[test]
+    fn lerp_tensor_contiguous_f32_matches_pytorch_scalar_branch_bits() {
+        let start = [1.0_f32, -2.0, 1000.25, -1000.25];
+        let end = [5.0_f32, 6.0, -999.75, 999.75];
+        let meta =
+            ft_core::TensorMeta::from_shape(vec![4], ft_core::DType::F32, ft_core::Device::Cpu);
+        for &(weight, want_bits) in &[
+            (
+                0.25_f32,
+                &[0x4000_0000, 0x0000_0000, 0x43fa_2000, 0xc3fa_2000][..],
+            ),
+            (
+                0.5_f32,
+                &[0x4040_0000, 0x4000_0000, 0x3e80_0000, 0xbe80_0000][..],
+            ),
+            (
+                -0.75_f32,
+                &[0xc000_0000, 0xc100_0000, 0x451c_4400, 0xc51c_4400][..],
+            ),
+            (
+                1.25_f32,
+                &[0x40c0_0000, 0x4100_0000, 0xc4bb_7800, 0x44bb_7800][..],
+            ),
+        ] {
+            let got = super::lerp_tensor_contiguous_f32(&start, &end, weight, &meta)
+                .expect("valid lerp inputs");
+            let got_bits: Vec<u32> = got.iter().map(|v| v.to_bits()).collect();
+            assert_eq!(got_bits, want_bits, "weight={weight}");
+        }
+    }
 
     // ── int8 dynamic-quantized linear (additive, inference-only) ──
     #[test]
@@ -31492,6 +36438,565 @@ mod tests {
     }
 
     #[test]
+    fn int8_quantizers_round_signed_ties_to_even() {
+        let ties = [-127.0f32, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.0];
+        let expected = [-127i8, -2, -2, 0, 0, 2, 2, 127];
+
+        let (w_i8, w_scales) = super::quantize_per_output_channel_i8(&ties, 1, ties.len());
+        assert_eq!(w_scales, vec![1.0]);
+        assert_eq!(
+            w_i8, expected,
+            "weight quant must use round_ties_even, not round-half-away"
+        );
+
+        let (x_i8, a_scales) = super::quantize_rows_i8(&ties, 1, ties.len());
+        assert_eq!(a_scales, vec![1.0]);
+        assert_eq!(
+            x_i8, expected,
+            "activation quant must use round_ties_even, not round-half-away"
+        );
+    }
+
+    #[test]
+    fn activation_quant_is_byte_identical_across_serial_and_parallel_sized_rows() {
+        let tie_row = [-127.0f32, -2.5, -1.5, -0.5, 0.5, 1.5, 2.5, 127.0];
+        let expected = [-127i8, -2, -2, 0, 0, 2, 2, 127];
+
+        let (serial_i8, serial_scales) = super::quantize_rows_i8(&tie_row, 1, tie_row.len());
+        assert_eq!(serial_scales, vec![1.0]);
+        assert_eq!(serial_i8, expected);
+
+        let k = 1024usize;
+        let m = 8usize;
+        let mut large = Vec::with_capacity(m * k);
+        for row in 0..m {
+            for col in 0..k {
+                let v = match col % 8 {
+                    0 => -127.0,
+                    1 => -2.5,
+                    2 => -1.5,
+                    3 => -0.5,
+                    4 => 0.5,
+                    5 => 1.5,
+                    6 => 2.5,
+                    _ => 127.0,
+                };
+                large.push(if row == m - 1 { 0.0 } else { v });
+            }
+        }
+
+        let (first_i8, first_scales) = super::quantize_rows_i8(&large, m, k);
+        let (second_i8, second_scales) = super::quantize_rows_i8(&large, m, k);
+        assert_eq!(
+            first_i8, second_i8,
+            "dynamic activation quant must be byte-identical"
+        );
+        assert_eq!(
+            first_scales, second_scales,
+            "activation scales must be byte-identical"
+        );
+
+        for row in 0..m - 1 {
+            assert_eq!(first_scales[row], 1.0);
+            assert_eq!(&first_i8[row * k..row * k + expected.len()], &expected);
+        }
+        assert_eq!(first_scales[m - 1], 1.0);
+        assert!(
+            first_i8[(m - 1) * k..m * k].iter().all(|&q| q == 0),
+            "all-zero activation row must stay all-zero with finite unit scale"
+        );
+    }
+
+    #[test]
+    fn weight_per_channel_quant_parallel_matches_serial_reference_bit_exact() {
+        // out=64, in_=256 => out*in_ = 16384 >= 8192 and out >= 8, so the
+        // parallel per-channel path fires. Lock it byte-for-byte against an
+        // independent inline serial reference (the pre-parallel per-channel loop).
+        let (out, in_) = (64usize, 256usize);
+        let w: Vec<f32> = (0..out * in_)
+            .map(|i| ((i % 2039) as f32) * 1e-3 - 1.0)
+            .collect();
+        let (got_i8, got_scales) = super::quantize_per_output_channel_i8(&w, out, in_);
+
+        let mut want_i8 = vec![0i8; out * in_];
+        let mut want_scales = vec![0f32; out];
+        for o in 0..out {
+            let row = &w[o * in_..(o + 1) * in_];
+            let amax = row.iter().fold(0f32, |acc, &v| acc.max(v.abs()));
+            let scale = if amax > 0.0 { amax / 127.0 } else { 1.0 };
+            for i in 0..in_ {
+                want_i8[o * in_ + i] =
+                    super::round_ties_even_f32(row[i] / scale).clamp(-127.0, 127.0) as i8;
+            }
+            want_scales[o] = scale;
+        }
+        assert_eq!(
+            got_i8, want_i8,
+            "per-channel quant i8 must be bit-exact serial-vs-parallel"
+        );
+        assert_eq!(
+            got_scales, want_scales,
+            "per-channel quant scales must be bit-exact"
+        );
+    }
+
+    #[test]
+    fn nonzero_two_pass_parallel_matches_serial_reference_bit_exact() {
+        // numel = 512*256 = 131072 >= NONZERO_PARALLEL_MIN (65536) -> the two-pass
+        // parallel path fires. Lock it against an independent serial reference,
+        // covering mixed density, an exact NaN (torch counts NaN as nonzero), and
+        // negative values.
+        let (m, n) = (512usize, 256usize);
+        let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+        let data: Vec<f64> = (0..m * n)
+            .map(|i| match i % 7 {
+                0 => 0.0,
+                1 => 0.0,
+                2 => f64::NAN,
+                3 => -3.5,
+                _ => (i % 13) as f64,
+            })
+            .collect();
+
+        let (got, got_n) = super::nonzero_tensor_contiguous_f64(&data, &meta).unwrap();
+
+        // Independent serial reference.
+        let strides = [n, 1usize];
+        let mut want = Vec::new();
+        for (flat, &v) in data.iter().enumerate() {
+            if v != 0.0 || v.is_nan() {
+                let mut r = flat;
+                for &s in &strides {
+                    want.push((r / s) as f64);
+                    r %= s;
+                }
+            }
+        }
+        assert_eq!(got_n, want.len() / 2, "num_nonzero must match serial");
+        assert_eq!(
+            got, want,
+            "two-pass nonzero must be bit-exact vs serial (row-major order + NaN)"
+        );
+    }
+
+    #[test]
+    fn linear_backward_dgemm_tb_dweight_matches_materialized_transpose_bit_exact() {
+        // linear_backward_f64 now computes dweight = dy^T @ x via dgemm_tb (reads
+        // dy as dy^T through strides), replacing a materialize-transpose + dgemm.
+        // Lock dweight byte-for-byte against the OLD path (explicit dy^T + dgemm)
+        // to prove the transpose-elision is bit-exact for a non-square shape.
+        let (batch, in_f, out_f) = (96usize, 40usize, 72usize);
+        let dy: Vec<f64> = (0..batch * out_f)
+            .map(|i| ((i % 101) as f64) * 0.01 - 0.5)
+            .collect();
+        let x: Vec<f64> = (0..batch * in_f)
+            .map(|i| ((i % 89) as f64) * 0.02 - 0.7)
+            .collect();
+        let weight: Vec<f64> = (0..out_f * in_f)
+            .map(|i| ((i % 53) as f64) * 0.03 - 0.4)
+            .collect();
+
+        let (_dx, dweight, dbias) =
+            super::linear_backward_f64(&dy, &x, &weight, batch, in_f, out_f, true);
+
+        // Old reference: materialise dy^T [out,batch] then dgemm [out,batch]@[batch,in].
+        let mut dyt = vec![0.0f64; out_f * batch];
+        for b in 0..batch {
+            for o in 0..out_f {
+                dyt[o * batch + b] = dy[b * out_f + o];
+            }
+        }
+        let mut ref_dweight = vec![0.0f64; out_f * in_f];
+        super::gemm::dgemm(out_f, batch, in_f, &dyt, &x, &mut ref_dweight);
+        assert_eq!(
+            dweight.len(),
+            ref_dweight.len(),
+            "dweight shape must match old path"
+        );
+        for (g, w) in dweight.iter().zip(ref_dweight.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "dgemm_tb dweight must be bit-exact vs transpose+dgemm"
+            );
+        }
+        // dbias = Σ over batch rows of dy (unchanged).
+        let mut ref_db = vec![0.0f64; out_f];
+        for b in 0..batch {
+            for o in 0..out_f {
+                ref_db[o] += dy[b * out_f + o];
+            }
+        }
+        assert_eq!(dbias.unwrap(), ref_db, "dbias must be unchanged");
+    }
+
+    #[test]
+    fn sgemm_tb_matches_materialized_transpose_bit_exact() {
+        // conv2d/3d_backward_f32 now compute dweight = dout_flat^T @ panel via
+        // sgemm_tb (strided-transpose read of dout_flat), replacing a materialize-
+        // transpose + sgemm. Lock the substitution bit-for-bit on a conv-like
+        // [out_ch, flat] @ [flat, patch_width] shape (out_ch != flat != patch_width).
+        let (out_ch, flat, pw) = (72usize, 96usize, 40usize);
+        let dout_flat: Vec<f32> = (0..flat * out_ch)
+            .map(|i| ((i % 101) as f32) * 0.01 - 0.5)
+            .collect();
+        let panel: Vec<f32> = (0..flat * pw)
+            .map(|i| ((i % 89) as f32) * 0.02 - 0.7)
+            .collect();
+
+        let mut got = vec![0.0f32; out_ch * pw];
+        super::gemm::sgemm_tb(out_ch, flat, pw, &dout_flat, &panel, &mut got);
+
+        // Reference: materialise dout_t [out_ch, flat] then sgemm.
+        let mut dout_t = vec![0.0f32; out_ch * flat];
+        for oc in 0..out_ch {
+            for r in 0..flat {
+                dout_t[oc * flat + r] = dout_flat[r * out_ch + oc];
+            }
+        }
+        let mut want = vec![0.0f32; out_ch * pw];
+        super::gemm::sgemm(out_ch, flat, pw, &dout_t, &panel, &mut want);
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "sgemm_tb must be bit-exact vs transpose+sgemm"
+            );
+        }
+    }
+
+    #[test]
+    fn conv2d_col2im_small_batch_per_plane_matches_per_batch_bit_exact() {
+        // batch=2 < COL2IM_PLANE_MAX_BATCH -> the per-(batch,channel)-plane path
+        // fires. Lock it byte-for-byte against a serial per-batch reference (the
+        // pre-gate loop) for f32 and f64. Overlapping patches (stride 1, k=3)
+        // exercise the scatter-accumulation order.
+        let (batch, in_ch, kh, kw, sh, sw) = (2usize, 5usize, 3usize, 3usize, 1usize, 1usize);
+        let (oh, ow) = (7usize, 6usize);
+        let (ph, pw) = (oh + 2, ow + 2);
+        let patch_width = in_ch * kh * kw;
+        let dpanel: Vec<f64> = (0..batch * oh * ow * patch_width)
+            .map(|i| ((i % 97) as f64) * 0.013 - 0.5)
+            .collect();
+
+        // Serial per-batch reference.
+        let mut want = vec![0.0f64; batch * in_ch * ph * pw];
+        for b in 0..batch {
+            let dpb = &mut want[b * in_ch * ph * pw..(b + 1) * in_ch * ph * pw];
+            for pc in 0..oh * ow {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow = (b * (oh * ow) + pc) * patch_width;
+                for c in 0..in_ch {
+                    for kr in 0..kh {
+                        let irow = c * ph * pw + (base_h + kr) * pw + base_w;
+                        let prow_off = prow + c * kh * kw + kr * kw;
+                        for kc in 0..kw {
+                            dpb[irow + kc] += dpanel[prow_off + kc];
+                        }
+                    }
+                }
+            }
+        }
+
+        let got64 = super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        assert_eq!(got64.len(), want.len());
+        for (g, w) in got64.iter().zip(want.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "conv2d_col2im_f64 per-plane must match per-batch"
+            );
+        }
+        let dpanel_f: Vec<f32> = dpanel.iter().map(|&v| v as f32).collect();
+        let got32 =
+            super::conv2d_col2im_f32(&dpanel_f, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        // f32 reference from the same serial per-batch loop.
+        let mut want_f = vec![0.0f32; batch * in_ch * ph * pw];
+        for b in 0..batch {
+            let dpb = &mut want_f[b * in_ch * ph * pw..(b + 1) * in_ch * ph * pw];
+            for pc in 0..oh * ow {
+                let base_h = (pc / ow) * sh;
+                let base_w = (pc % ow) * sw;
+                let prow = (b * (oh * ow) + pc) * patch_width;
+                for c in 0..in_ch {
+                    for kr in 0..kh {
+                        let irow = c * ph * pw + (base_h + kr) * pw + base_w;
+                        let prow_off = prow + c * kh * kw + kr * kw;
+                        for kc in 0..kw {
+                            dpb[irow + kc] += dpanel_f[prow_off + kc];
+                        }
+                    }
+                }
+            }
+        }
+        for (g, w) in got32.iter().zip(want_f.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "conv2d_col2im_f32 per-plane must match per-batch"
+            );
+        }
+    }
+
+    #[test]
+    fn conv2d_height1_ones_dout_backward_matches_generic_reference() {
+        let (batch, in_ch, out_ch, pw, kw, ow, sw) =
+            (3usize, 4usize, 5usize, 19usize, 3usize, 17usize, 1usize);
+        let patch_width = in_ch * kw;
+        let padded: Vec<f64> = (0..batch * in_ch * pw)
+            .map(|i| ((i * 17 % 101) as f64 - 50.0) * 0.03125)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 97) as f64 - 48.0) * 0.015625)
+            .collect();
+        let dout = vec![1.0f64; batch * out_ch * ow];
+
+        let panel = super::conv2d_im2col_f64(&padded, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw);
+        let mut dout_flat = vec![0.0f64; batch * ow * out_ch];
+        for row in 0..batch * ow {
+            let n = row / ow;
+            let p = row % ow;
+            for oc in 0..out_ch {
+                dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * ow + p];
+            }
+        }
+        let mut want_dw = vec![0.0f64; out_ch * patch_width];
+        super::gemm::dgemm_tb(
+            out_ch,
+            batch * ow,
+            patch_width,
+            &dout_flat,
+            &panel,
+            &mut want_dw,
+        );
+        let mut dpanel = vec![0.0f64; batch * ow * patch_width];
+        super::gemm::dgemm(
+            batch * ow,
+            out_ch,
+            patch_width,
+            &dout_flat,
+            &weight,
+            &mut dpanel,
+        );
+        let want_dp = super::conv2d_col2im_f64(&dpanel, batch, in_ch, 1, pw, 1, kw, 1, ow, 1, sw);
+        let want_db = vec![(batch * ow) as f64; out_ch];
+
+        let (got_dp, got_dw, got_db) = super::conv2d_backward_height1_ones_dout_f64(
+            &padded, &weight, batch, in_ch, pw, kw, ow, sw, out_ch, true,
+        );
+        for (i, (&g, &w)) in got_dp.iter().zip(want_dp.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1.0e-12,
+                "dpadded[{i}] direct {g} vs generic {w}"
+            );
+        }
+        for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
+            assert!(
+                (g - w).abs() <= 1.0e-12,
+                "dweight[{i}] direct {g} vs generic {w}"
+            );
+        }
+        assert_eq!(got_db.unwrap(), want_db);
+    }
+
+    #[test]
+    fn conv2d_3x3_stride1_ones_dout_backward_matches_generic_reference() {
+        let (batch, in_ch, out_ch) = (2usize, 3usize, 4usize);
+        let (ph, pw, kh, kw, oh, ow, sh, sw) = (
+            7usize, 8usize, 3usize, 3usize, 5usize, 6usize, 1usize, 1usize,
+        );
+        let patch_width = in_ch * kh * kw;
+        let patch_count = oh * ow;
+        let flat = batch * patch_count;
+        let padded: Vec<f64> = (0..batch * in_ch * ph * pw)
+            .map(|i| ((i * 17 % 31) as f64 - 15.0) / 1024.0)
+            .collect();
+        let weight: Vec<f64> = (0..out_ch * patch_width)
+            .map(|i| ((i * 29 % 37) as f64 - 18.0) / 2048.0)
+            .collect();
+        let dout = vec![1.0f64; batch * out_ch * patch_count];
+
+        let mut dout_flat = vec![0.0f64; flat * out_ch];
+        for row in 0..flat {
+            let n = row / patch_count;
+            let p = row % patch_count;
+            for oc in 0..out_ch {
+                dout_flat[row * out_ch + oc] = dout[(n * out_ch + oc) * patch_count + p];
+            }
+        }
+        let panel = super::conv2d_im2col_f64(&padded, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        let mut want_dw = vec![0.0f64; out_ch * patch_width];
+        super::gemm::dgemm_tb(out_ch, flat, patch_width, &dout_flat, &panel, &mut want_dw);
+        let mut dpanel = vec![0.0f64; flat * patch_width];
+        super::gemm::dgemm(flat, out_ch, patch_width, &dout_flat, &weight, &mut dpanel);
+        let want_dp =
+            super::conv2d_col2im_f64(&dpanel, batch, in_ch, ph, pw, kh, kw, oh, ow, sh, sw);
+        let want_db = vec![flat as f64; out_ch];
+
+        let (got_dp, got_dw, got_db) = super::conv2d_backward_3x3_stride1_ones_dout_f64(
+            &padded, &weight, batch, in_ch, ph, pw, oh, ow, out_ch, true,
+        );
+        for (i, (&g, &w)) in got_dp.iter().zip(want_dp.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "dpadded[{i}] direct {g} vs generic {w}"
+            );
+        }
+        for (i, (&g, &w)) in got_dw.iter().zip(want_dw.iter()).enumerate() {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "dweight[{i}] direct {g} vs generic {w}"
+            );
+        }
+        assert_eq!(got_db.unwrap(), want_db);
+    }
+
+    #[test]
+    fn conv3d_col2im_small_batch_per_plane_matches_per_batch_bit_exact() {
+        // batch=2 < COL2IM_PLANE_MAX_BATCH -> per-(batch,channel)-plane path fires.
+        // Lock f32+f64 vs a serial per-batch reference (overlapping patches, k=3, s=1).
+        let (batch, in_ch, kd, kh, kw) = (2usize, 4usize, 3usize, 3usize, 3usize);
+        let (sd, sh, sw) = (1usize, 1usize, 1usize);
+        let (od, oh, ow) = (3usize, 4usize, 5usize);
+        let (pd, ph, pw) = (od + 2, oh + 2, ow + 2);
+        let patch_width = in_ch * kd * kh * kw;
+        let patch_count = od * oh * ow;
+        let dpanel: Vec<f64> = (0..batch * patch_count * patch_width)
+            .map(|i| ((i % 89) as f64) * 0.017 - 0.5)
+            .collect();
+
+        // Serial per-batch reference (f64).
+        let mut want = vec![0.0f64; batch * in_ch * pd * ph * pw];
+        for b in 0..batch {
+            let dpb = &mut want[b * in_ch * pd * ph * pw..(b + 1) * in_ch * pd * ph * pw];
+            for pc in 0..patch_count {
+                let base_d = (pc / (oh * ow)) * sd;
+                let rem = pc % (oh * ow);
+                let base_h = (rem / ow) * sh;
+                let base_w = (rem % ow) * sw;
+                let prow = (b * patch_count + pc) * patch_width;
+                for c in 0..in_ch {
+                    for kdd in 0..kd {
+                        for kr in 0..kh {
+                            let irow = c * pd * ph * pw
+                                + (base_d + kdd) * ph * pw
+                                + (base_h + kr) * pw
+                                + base_w;
+                            let prow_off = prow + c * kd * kh * kw + kdd * kh * kw + kr * kw;
+                            for kc in 0..kw {
+                                dpb[irow + kc] += dpanel[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let got64 = super::conv3d_col2im_f64(
+            &dpanel, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        assert_eq!(got64.len(), want.len());
+        for (g, w) in got64.iter().zip(want.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "conv3d_col2im_f64 per-plane must match per-batch"
+            );
+        }
+        let dpanel_f: Vec<f32> = dpanel.iter().map(|&v| v as f32).collect();
+        let got32 = super::conv3d_col2im_f32(
+            &dpanel_f, batch, in_ch, pd, ph, pw, kd, kh, kw, od, oh, ow, sd, sh, sw,
+        );
+        let want_f: Vec<f32> = want.iter().map(|&v| v as f32).collect();
+        // recompute f32 reference natively to avoid f64->f32 rounding mismatch
+        let mut want_f2 = vec![0.0f32; batch * in_ch * pd * ph * pw];
+        for b in 0..batch {
+            let dpb = &mut want_f2[b * in_ch * pd * ph * pw..(b + 1) * in_ch * pd * ph * pw];
+            for pc in 0..patch_count {
+                let base_d = (pc / (oh * ow)) * sd;
+                let rem = pc % (oh * ow);
+                let base_h = (rem / ow) * sh;
+                let base_w = (rem % ow) * sw;
+                let prow = (b * patch_count + pc) * patch_width;
+                for c in 0..in_ch {
+                    for kdd in 0..kd {
+                        for kr in 0..kh {
+                            let irow = c * pd * ph * pw
+                                + (base_d + kdd) * ph * pw
+                                + (base_h + kr) * pw
+                                + base_w;
+                            let prow_off = prow + c * kd * kh * kw + kdd * kh * kw + kr * kw;
+                            for kc in 0..kw {
+                                dpb[irow + kc] += dpanel_f[prow_off + kc];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        let _ = want_f;
+        for (g, w) in got32.iter().zip(want_f2.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "conv3d_col2im_f32 per-plane must match per-batch"
+            );
+        }
+    }
+
+    #[test]
+    fn linear_bias_add_parallel_path_matches_serial_bit_exact() {
+        // batch*out = 256*256 = 65536 == the parallel-bias gate, so the
+        // par_chunks_exact_mut path fires. Lock it vs the same GEMM + a serial
+        // bias add (f64 and f32).
+        let (batch, inf, outf) = (256usize, 40usize, 256usize);
+        let x: Vec<f64> = (0..batch * inf)
+            .map(|i| ((i % 89) as f64) * 0.02 - 0.7)
+            .collect();
+        let w: Vec<f64> = (0..outf * inf)
+            .map(|i| ((i % 53) as f64) * 0.03 - 0.4)
+            .collect();
+        let b: Vec<f64> = (0..outf).map(|i| (i as f64) * 1e-3 - 0.5).collect();
+
+        let with_bias = super::linear_tensor_f64(&x, &w, Some(&b), batch, inf, outf);
+        let mut want = super::linear_tensor_f64(&x, &w, None, batch, inf, outf);
+        for row in want.chunks_exact_mut(outf) {
+            for (yj, bj) in row.iter_mut().zip(b.iter()) {
+                *yj += *bj;
+            }
+        }
+        assert_eq!(with_bias.len(), want.len());
+        for (g, wv) in with_bias.iter().zip(want.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                wv.to_bits(),
+                "parallel bias add f64 must be bit-exact"
+            );
+        }
+
+        let xf: Vec<f32> = x.iter().map(|&v| v as f32).collect();
+        let wf: Vec<f32> = w.iter().map(|&v| v as f32).collect();
+        let bf: Vec<f32> = b.iter().map(|&v| v as f32).collect();
+        let with_bias_f = super::linear_tensor_f32(&xf, &wf, Some(&bf), batch, inf, outf);
+        let mut want_f = super::linear_tensor_f32(&xf, &wf, None, batch, inf, outf);
+        for row in want_f.chunks_exact_mut(outf) {
+            for (yj, bj) in row.iter_mut().zip(bf.iter()) {
+                *yj += *bj;
+            }
+        }
+        for (g, wv) in with_bias_f.iter().zip(want_f.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                wv.to_bits(),
+                "parallel bias add f32 must be bit-exact"
+            );
+        }
+    }
+
+    #[test]
     fn linear_int8_prepacked_matches_rowmajor_bit_identical() {
         // The NR=4 pre-packed kernel only reorders the weight bytes, so it must
         // produce byte-identical output to the row-major kernel — the contract the
@@ -31556,6 +37061,240 @@ mod tests {
                 assert!(rel < 1e-9, "batch {bi}: {g} vs {w} (rel {rel:.2e})");
             }
         }
+    }
+
+    /// Published accuracy budget for the `FT_SDPA_POLY_EXP` path, asserted so a
+    /// future `wide` bump cannot silently widen it. Run with `--nocapture` to
+    /// print the measured numbers for the ledger.
+    ///
+    /// Three levels, each the input to the next:
+    ///   1. `exp` itself, over the clamped domain `[-87, 0]` the softmax feeds it.
+    ///   2. the softmax probabilities `P` a row produces.
+    ///   3. the attention output `O = P @ V`, which is what the encoder consumes.
+    ///
+    /// Budget (measured, with headroom): `exp` <= 2 ULP; `P` max|delta| <= 1e-7 and
+    /// max relative error <= 1e-6; `O` max relative error <= 1e-6.
+    #[test]
+    /// The adaptive `BR` policy is pure logic — verify its SELECTIONS deterministically,
+    /// host-independently, with no timing. Timing evidence lives in the ledger.
+    #[test]
+    fn sdpa_br_policy_picks_the_measured_tile() {
+        // heads alone fill the pool -> blocks run serially per head -> coarsen freely
+        assert_eq!(crate::sdpa_br_pick(1500, 64, 16), crate::SDPA_BR_LARGE);
+        assert_eq!(crate::sdpa_br_pick(1500, 32, 32), crate::SDPA_BR_LARGE);
+        // large-v3-turbo encoder at franken's 32-thread cap: 20 * ceil(1500/128) = 240 >= 128
+        assert_eq!(crate::sdpa_br_pick(1500, 20, 32), crate::SDPA_BR_LARGE);
+        // few heads + nested split: coarsening starves the pool. MEASURED 0.9414x at nbh=4.
+        assert_eq!(crate::sdpa_br_pick(1500, 4, 16), crate::SDPA_BR_SMALL);
+        // short sequences never coarsen below the floor
+        assert_eq!(crate::sdpa_br_pick(96, 4, 16), crate::SDPA_BR_SMALL);
+    }
+
+    fn sdpa_poly_exp_accuracy_budget() {
+        use wide::f32x8;
+
+        /// ULP distance between two finite, same-signed f32.
+        fn ulp_diff(a: f32, b: f32) -> i64 {
+            i64::from(a.to_bits()) - i64::from(b.to_bits())
+        }
+
+        // --- level 1: exp over the domain the clamp guarantees -------------
+        const N: usize = 2_000_000;
+        let mut max_ulp = 0i64;
+        let mut max_rel_exp = 0.0f64;
+        let mut i = 0;
+        while i + 8 <= N {
+            let mut a = [0.0f32; 8];
+            for (lane, slot) in a.iter_mut().enumerate() {
+                let t = (i + lane) as f32 / N as f32; // 0..1
+                *slot = -87.0 * t; // sweep [-87, 0]
+            }
+            let got = f32x8::from(a).exp().to_array();
+            for lane in 0..8 {
+                let want = a[lane].exp();
+                assert!(got[lane].is_finite() && got[lane] > 0.0, "exp underflowed");
+                max_ulp = max_ulp.max(ulp_diff(got[lane], want).abs());
+                let rel = f64::from((got[lane] - want).abs()) / f64::from(want);
+                max_rel_exp = max_rel_exp.max(rel);
+            }
+            i += 8;
+        }
+
+        // --- level 2: softmax probabilities --------------------------------
+        fn scalar_softmax(row: &mut [f32], limit: usize, scale: f32) {
+            let mut m = f32::NEG_INFINITY;
+            for s in row.iter_mut().take(limit) {
+                *s *= scale;
+                if *s > m {
+                    m = *s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for s in row.iter_mut().take(limit) {
+                let e = (*s - m).exp();
+                *s = e;
+                sum += e;
+            }
+            for s in row.iter_mut().take(limit) {
+                *s /= sum;
+            }
+            for s in row.iter_mut().skip(limit) {
+                *s = 0.0;
+            }
+        }
+
+        // Encoder shape: seq_k = 1500, scores ~ N(0, 64/3) before the 1/8 scale.
+        let (seq_k, d_v, rows) = (1500usize, 64usize, 64usize);
+        let scale = 0.125f32;
+        let mut seed = 0x2545_F491_4F6C_DD1Du64;
+        let mut rnd = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed >> 40) as f32 / 8_388_608.0 - 1.0
+        };
+
+        let mut max_abs_p = 0.0f32;
+        let mut max_rel_p = 0.0f64;
+        let mut max_rel_o = 0.0f64;
+        let vmat: Vec<f32> = (0..seq_k * d_v).map(|_| rnd()).collect();
+
+        for _ in 0..rows {
+            let src: Vec<f32> = (0..seq_k).map(|_| rnd() * 4.6).collect();
+            let mut p_ref = src.clone();
+            let mut p_poly = src.clone();
+            scalar_softmax(&mut p_ref, seq_k, scale);
+            super::softmax_row_f32_poly(&mut p_poly, seq_k, scale);
+
+            for (r, g) in p_ref.iter().zip(&p_poly) {
+                max_abs_p = max_abs_p.max((r - g).abs());
+                if *r > 1e-12 {
+                    max_rel_p = max_rel_p.max(f64::from((r - g).abs()) / f64::from(*r));
+                }
+            }
+
+            // Level 3: one output row O = P @ V, the quantity the encoder sees.
+            //
+            // Measured as the VECTOR relative error ||delta_o||_2 / ||o||_2 over the
+            // d_v-dim row, not per-component. `O` is a probability-weighted mean of
+            // zero-mean `V` rows, so individual components sit near zero and their
+            // per-component relative error is dominated by catastrophic cancellation
+            // in the reference itself, not by the poly. The vector norm is both the
+            // standard measure and the one the next layer actually responds to.
+            let (mut num, mut den) = (0.0f64, 0.0f64);
+            for c in 0..d_v {
+                let (mut o_ref, mut o_poly) = (0.0f64, 0.0f64);
+                for j in 0..seq_k {
+                    o_ref += f64::from(p_ref[j]) * f64::from(vmat[j * d_v + c]);
+                    o_poly += f64::from(p_poly[j]) * f64::from(vmat[j * d_v + c]);
+                }
+                num += (o_ref - o_poly).powi(2);
+                den += o_ref.powi(2);
+            }
+            max_rel_o = max_rel_o.max((num / den.max(1e-30)).sqrt());
+        }
+
+        println!(
+            "FT_SDPA_POLY_EXP accuracy budget (measured)\n  \
+             exp over [-87,0]: max {max_ulp} ULP, max rel {max_rel_exp:.3e}\n  \
+             softmax P:        max|delta| {max_abs_p:.3e}, max rel {max_rel_p:.3e}\n  \
+             output O = P@V:   vector rel ||do||/||o|| {max_rel_o:.3e}"
+        );
+
+        // Budgets = measured worst case with ~2-6x headroom. The dominant term is
+        // NOT the poly `exp` (1 ULP) but the lane-wise row-sum reduction, which
+        // rescales a whole row nearly uniformly -- hence P's relative error is ~1e-6
+        // while its absolute error is ~1e-9.
+        assert!(max_ulp <= 2, "exp ULP budget exceeded: {max_ulp}");
+        assert!(
+            max_rel_exp <= 1e-6,
+            "exp rel budget exceeded: {max_rel_exp:e}"
+        );
+        assert!(
+            max_abs_p <= 1e-8,
+            "softmax abs budget exceeded: {max_abs_p:e}"
+        );
+        assert!(
+            max_rel_p <= 4e-6,
+            "softmax rel budget exceeded: {max_rel_p:e}"
+        );
+        assert!(
+            max_rel_o <= 4e-6,
+            "output rel budget exceeded: {max_rel_o:e}"
+        );
+    }
+
+    /// The `FT_SDPA_POLY_EXP` row softmax must agree with the scalar one it
+    /// replaces to well within f32 softmax tolerance, normalize exactly, respect
+    /// the causal `limit` (zeroing the tail), and never emit `NaN` on a
+    /// fully-masked row.
+    #[test]
+    fn softmax_row_f32_poly_matches_scalar_softmax() {
+        fn scalar(row: &mut [f32], limit: usize, scale: f32) {
+            let mut m = f32::NEG_INFINITY;
+            for s in row.iter_mut().take(limit) {
+                *s *= scale;
+                if *s > m {
+                    m = *s;
+                }
+            }
+            let mut sum = 0.0f32;
+            for s in row.iter_mut().take(limit) {
+                let e = (*s - m).exp();
+                *s = e;
+                sum += e;
+            }
+            for s in row.iter_mut().take(limit) {
+                *s /= sum;
+            }
+            for s in row.iter_mut().skip(limit) {
+                *s = 0.0;
+            }
+        }
+
+        let scale = 0.125f32;
+        // Widths straddling the 8-lane body/tail split; limits exercise the
+        // causal masking path (limit < len) and the bidirectional one (== len).
+        for len in [1usize, 7, 8, 9, 16, 100, 1500] {
+            for &limit in &[len, len.div_ceil(2), 1] {
+                let src: Vec<f32> = (0..len)
+                    .map(|i| ((i * 37 % 101) as f32 - 50.0) * 0.31)
+                    .collect();
+                let mut a = src.clone();
+                let mut b = src.clone();
+                scalar(&mut a, limit, scale);
+                super::softmax_row_f32_poly(&mut b, limit, scale);
+
+                let maxabs = a
+                    .iter()
+                    .zip(&b)
+                    .map(|(x, y)| (x - y).abs())
+                    .fold(0.0f32, f32::max);
+                assert!(
+                    maxabs < 1e-6,
+                    "len={len} limit={limit}: max|delta| = {maxabs:e}"
+                );
+                let sum: f32 = b[..limit].iter().sum();
+                assert!(
+                    (sum - 1.0).abs() < 1e-5,
+                    "len={len} limit={limit}: sum={sum}"
+                );
+                assert!(
+                    b[limit..].iter().all(|v| *v == 0.0),
+                    "len={len} limit={limit}: masked tail not zeroed"
+                );
+                assert!(b.iter().all(|v| v.is_finite()), "non-finite output");
+            }
+        }
+
+        // Fully-masked row: the scalar kernel produces NaN here; the poly path
+        // must reproduce that rather than silently diverging.
+        let mut row = vec![f32::NEG_INFINITY; 16];
+        super::softmax_row_f32_poly(&mut row, 16, scale);
+        assert!(
+            row.iter().all(|v| v.is_nan()),
+            "degenerate row must match scalar NaN"
+        );
     }
 
     #[test]
@@ -31807,6 +37546,94 @@ mod tests {
             strided_min[1].to_bits(),
             strided_max[5 * inner + 2].to_bits()
         );
+    }
+
+    // The f32 extremum-dim kernel (kgs4.168) must be BIT-IDENTICAL to a serial f32
+    // scalar reference (== torch f32 amax/amin: the extremum is one input element).
+    // Covers the SIMD last-dim path (inner=1) + the strided scalar path (inner>1),
+    // with NaN propagation + ±0 ties seeded in.
+    #[test]
+    fn extremum_dim_values_contiguous_f32_matches_serial_bits() {
+        use ft_core::{DType, Device, TensorMeta};
+
+        fn serial_extremum_f32(
+            data: &[f32],
+            shape: &[usize],
+            dim: usize,
+            is_max: bool,
+        ) -> Vec<f32> {
+            let reduce_size = shape[dim];
+            let outer_size: usize = shape[..dim].iter().product();
+            let inner_size: usize = shape[dim + 1..].iter().product();
+            let mut out = vec![0.0f32; outer_size * inner_size];
+            for outer in 0..outer_size {
+                for inner in 0..inner_size {
+                    let base = outer * reduce_size * inner_size + inner;
+                    let mut best = data[base];
+                    for r in 1..reduce_size {
+                        let v = data[base + r * inner_size];
+                        if v.is_nan() || (is_max && v > best) || (!is_max && v < best) {
+                            best = v;
+                        }
+                    }
+                    out[outer * inner_size + inner] = best;
+                }
+            }
+            out
+        }
+        let bits = |values: &[f32]| -> Vec<u32> { values.iter().map(|v| v.to_bits()).collect() };
+        let nan_a = f32::from_bits(0x7fc0_1234);
+        let nan_b = f32::from_bits(0x7fc0_5678);
+
+        // last-dim (inner=1) -> SIMD path; size 211 not multiple of 8 -> scalar tail
+        let (rows, cols) = (96usize, 211usize);
+        let mut lastdim: Vec<f32> = (0..rows * cols)
+            .map(|i| (((i * 37) % 211) as f32 - 105.0) * 0.25)
+            .collect();
+        for c in 0..cols {
+            lastdim[c] = -1.0;
+            lastdim[cols + c] = 1.0;
+        }
+        lastdim[0] = -0.0;
+        lastdim[1] = 0.0;
+        lastdim[cols] = 0.0;
+        lastdim[cols + 1] = -0.0;
+        lastdim[3 * cols + 5] = nan_a;
+        lastdim[3 * cols + 6] = nan_b;
+        let lm = TensorMeta::from_shape(vec![rows, cols], DType::F32, Device::Cpu);
+        for &is_max in &[true, false] {
+            assert_eq!(
+                bits(&super::extremum_dim_values_contiguous_f32(&lastdim, &lm, 1, is_max).unwrap()),
+                bits(&serial_extremum_f32(&lastdim, &[rows, cols], 1, is_max)),
+                "f32 last-dim is_max={is_max} differs from serial"
+            );
+        }
+
+        // strided (inner>1) -> scalar path
+        let (outer, red, inner) = (48usize, 64usize, 3usize);
+        let mut strided: Vec<f32> = (0..outer * red * inner)
+            .map(|i| (((i * 53) % 257) as f32 - 128.0) * 0.125)
+            .collect();
+        strided[0] = -0.0;
+        strided[inner] = 0.0;
+        strided[1] = 0.0;
+        strided[inner + 1] = -0.0;
+        let nb = 5 * red * inner + 2;
+        strided[nb + 9 * inner] = nan_a;
+        strided[nb + 10 * inner] = nan_b;
+        let sm = TensorMeta::from_shape(vec![outer, red, inner], DType::F32, Device::Cpu);
+        for &is_max in &[true, false] {
+            assert_eq!(
+                bits(&super::extremum_dim_values_contiguous_f32(&strided, &sm, 1, is_max).unwrap()),
+                bits(&serial_extremum_f32(
+                    &strided,
+                    &[outer, red, inner],
+                    1,
+                    is_max
+                )),
+                "f32 strided is_max={is_max} differs from serial"
+            );
+        }
     }
 
     // The parallel gather (frankentorch-kgs4.54) must match a serial reference
@@ -32518,6 +38345,14 @@ mod tests {
                 super::pairwise_sum_map_f64(&data, sq).to_bits(),
                 super::pairwise_sum_map_f64_par(&data, sq).to_bits(),
                 "parallel pairwise sum_map diverged from serial at n={n}"
+            );
+            let data32: Vec<f32> = (0..n)
+                .map(|i| ((i * 31 + 7) % 1009) as f32 * 0.013 - 6.5)
+                .collect();
+            assert_eq!(
+                super::pairwise_sum_f32(&data32).to_bits(),
+                super::pairwise_sum_f32_par(&data32).to_bits(),
+                "parallel f32 pairwise sum diverged from serial at n={n}"
             );
         }
     }
@@ -35811,6 +41646,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(unknown_lints, clippy::chunks_exact_to_as_chunks)]
     fn exp_f64x4_matches_scalar_within_tolerance() {
         use wide::f64x4;
         // Proof obligation 1 — fast-range accuracy. Chunks fully inside
@@ -36195,6 +42031,82 @@ mod tests {
         )
         .expect("alpha-zero f32 addmv should scale input");
         assert_eq!(out_f32, vec![-9.0, 15.0]);
+    }
+
+    #[test]
+    fn addmv_row_parallel_matches_serial_reference_bit_exact() {
+        // m*k = 1024*512 = 524288 >= ADDMV_PARALLEL_MIN_WORK (262144) -> the
+        // row-parallel path fires. Lock it bit-for-bit against an independent
+        // serial reference that replicates the old scratch+pairwise_sum per row.
+        let (m, k) = (1024usize, 512usize);
+        let input: Vec<f64> = (0..m).map(|i| ((i % 97) as f64) * 1e-2 - 0.3).collect();
+        let mat: Vec<f64> = (0..m * k)
+            .map(|i| ((i % 1009) as f64) * 1e-3 - 0.5)
+            .collect();
+        let vec_data: Vec<f64> = (0..k).map(|i| ((i % 733) as f64) * 2e-3 - 0.7).collect();
+        let (beta, alpha) = (0.75_f64, 1.25_f64);
+
+        let input_meta = TensorMeta::from_shape(vec![m], DType::F64, Device::Cpu);
+        let mat_meta = TensorMeta::from_shape(vec![m, k], DType::F64, Device::Cpu);
+        let vec_meta = TensorMeta::from_shape(vec![k], DType::F64, Device::Cpu);
+        let got = super::addmv_tensor_contiguous_f64(
+            &input,
+            &mat,
+            &vec_data,
+            &input_meta,
+            &mat_meta,
+            &vec_meta,
+            beta,
+            alpha,
+        )
+        .expect("row-parallel addmv");
+
+        // Independent serial reference (the pre-parallel scratch loop).
+        let mut want = Vec::with_capacity(m);
+        let mut scratch = vec![0.0_f64; k];
+        for row in 0..m {
+            for (col, s) in scratch.iter_mut().enumerate() {
+                *s = mat[row * k + col] * vec_data[col];
+            }
+            want.push(beta * input[row] + alpha * super::pairwise_sum_f64(&scratch));
+        }
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want.iter()) {
+            assert_eq!(
+                g.to_bits(),
+                w.to_bits(),
+                "row-parallel addmv f64 must be bit-exact"
+            );
+        }
+
+        // f32 mirror.
+        let matf: Vec<f32> = mat.iter().map(|&v| v as f32).collect();
+        let vecf: Vec<f32> = vec_data.iter().map(|&v| v as f32).collect();
+        let inpf: Vec<f32> = input.iter().map(|&v| v as f32).collect();
+        let (betaf, alphaf) = (beta as f32, alpha as f32);
+        let gotf = super::addmv_tensor_contiguous_f32(
+            &inpf,
+            &matf,
+            &vecf,
+            &TensorMeta::from_shape(vec![m], DType::F32, Device::Cpu),
+            &TensorMeta::from_shape(vec![m, k], DType::F32, Device::Cpu),
+            &TensorMeta::from_shape(vec![k], DType::F32, Device::Cpu),
+            betaf,
+            alphaf,
+        )
+        .expect("row-parallel addmv f32");
+        let mut scratchf = vec![0.0_f32; k];
+        for row in 0..m {
+            for (col, s) in scratchf.iter_mut().enumerate() {
+                *s = matf[row * k + col] * vecf[col];
+            }
+            let w = betaf * inpf[row] + alphaf * super::pairwise_sum_f32(&scratchf);
+            assert_eq!(
+                gotf[row].to_bits(),
+                w.to_bits(),
+                "row-parallel addmv f32 bit-exact"
+            );
+        }
     }
 
     #[test]
@@ -36898,6 +42810,79 @@ mod tests {
     }
 
     #[test]
+    fn prod_dim_cache_blocked_matches_strided_lane_bit_exact() {
+        // Large dim=0 (inner_size>1, out_numel*reduce_size >= PARALLEL_THRESHOLD) hits the
+        // cache-blocked path. Its per-column L-to-R product must be BIT-FOR-BIT identical to a
+        // naive strided lane reference (values near 1 to avoid overflow / to stress low bits).
+        // Also covers a middle dim (outer_size>1) and the f32 mirror.
+        let strided_ref_f64 =
+            |data: &[f64], r_size: usize, inner: usize, outer: usize| -> Vec<f64> {
+                let mut out = vec![0.0f64; outer * inner];
+                for o in 0..outer {
+                    for i in 0..inner {
+                        let base = o * r_size * inner + i;
+                        let mut p = 1.0f64;
+                        for r in 0..r_size {
+                            p *= data[base + r * inner];
+                        }
+                        out[o * inner + i] = p;
+                    }
+                }
+                out
+            };
+        // dim=0: [reduce=300, inner=200] -> out_numel*reduce = 200*300 = 60000 >= 8192.
+        let (r0, i0) = (300usize, 200usize);
+        let data: Vec<f64> = (0..r0 * i0)
+            .map(|k| 1.0 + (((k as u64).wrapping_mul(2654435761)) % 97) as f64 * 1e-4)
+            .collect();
+        let meta = TensorMeta::from_shape(vec![r0, i0], DType::F64, Device::Cpu);
+        let out = prod_dim_tensor_contiguous_f64(&data, &meta, 0).expect("prod dim0");
+        let refv = strided_ref_f64(&data, r0, i0, 1);
+        for k in 0..out.len() {
+            assert_eq!(
+                out[k].to_bits(),
+                refv[k].to_bits(),
+                "f64 dim0 blocked bits at {k}"
+            );
+        }
+        // middle dim: [outer=4, reduce=64, inner=128] -> reduce over dim=1, inner=128, outer=4.
+        let (o1, r1, i1) = (4usize, 64usize, 128usize);
+        let data2: Vec<f64> = (0..o1 * r1 * i1)
+            .map(|k| 1.0 + (((k as u64).wrapping_mul(40503)) % 89) as f64 * 1e-4)
+            .collect();
+        let meta2 = TensorMeta::from_shape(vec![o1, r1, i1], DType::F64, Device::Cpu);
+        let out2 = prod_dim_tensor_contiguous_f64(&data2, &meta2, 1).expect("prod dim1");
+        let ref2 = strided_ref_f64(&data2, r1, i1, o1);
+        for k in 0..out2.len() {
+            assert_eq!(
+                out2[k].to_bits(),
+                ref2[k].to_bits(),
+                "f64 middle-dim blocked bits at {k}"
+            );
+        }
+        // f32 dim=0 mirror.
+        let data_f32: Vec<f32> = data.iter().map(|&x| x as f32).collect();
+        let meta_f32 = TensorMeta::from_shape(vec![r0, i0], DType::F32, Device::Cpu);
+        let out_f32 =
+            super::prod_dim_tensor_contiguous_f32(&data_f32, &meta_f32, 0).expect("prod dim0 f32");
+        let mut ref_f32 = vec![0.0f32; i0];
+        for i in 0..i0 {
+            let mut p = 1.0f32;
+            for r in 0..r0 {
+                p *= data_f32[i + r * i0];
+            }
+            ref_f32[i] = p;
+        }
+        for k in 0..out_f32.len() {
+            assert_eq!(
+                out_f32[k].to_bits(),
+                ref_f32[k].to_bits(),
+                "f32 dim0 blocked bits at {k}"
+            );
+        }
+    }
+
+    #[test]
     fn prod_dim_invalid_dim_returns_error() {
         let meta = TensorMeta::from_shape(vec![2, 3], DType::F64, Device::Cpu);
         let input = vec![1.0, 2.0, 3.0, 4.0, 5.0, 6.0];
@@ -37057,6 +43042,282 @@ mod tests {
             err,
             KernelError::InvalidDimension { dim: 2, ndim: 2 }
         ));
+    }
+
+    #[test]
+    fn max_min_dim_cache_blocked_matches_strided_lane_bit_exact() {
+        // Large dim=0 / middle dim (inner_size>1, out_numel*reduce >= PARALLEL_THRESHOLD) hits the
+        // cache-blocked path. Must be BIT-FOR-BIT identical to a naive strided lane reference
+        // (first-strict-extremum wins, NaN short-circuits to its row). Data includes ties (integer
+        // plateaus so `>`/`<` skip equal later rows) and NaNs at various rows.
+        let strided_ref = |data: &[f64],
+                           r_size: usize,
+                           inner: usize,
+                           outer: usize,
+                           is_max: bool|
+         -> (Vec<f64>, Vec<f64>) {
+            let mut v = vec![
+                if is_max {
+                    f64::NEG_INFINITY
+                } else {
+                    f64::INFINITY
+                };
+                outer * inner
+            ];
+            let mut ix = vec![0.0f64; outer * inner];
+            for o in 0..outer {
+                for i in 0..inner {
+                    let base = o * r_size * inner + i;
+                    let (mut cv, mut ci) = (
+                        if is_max {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        },
+                        0.0f64,
+                    );
+                    for r in 0..r_size {
+                        let val = data[base + r * inner];
+                        if val.is_nan() {
+                            cv = f64::NAN;
+                            ci = r as f64;
+                            break;
+                        } else if (is_max && val > cv) || (!is_max && val < cv) {
+                            cv = val;
+                            ci = r as f64;
+                        }
+                    }
+                    v[o * inner + i] = cv;
+                    ix[o * inner + i] = ci;
+                }
+            }
+            (v, ix)
+        };
+        // dim=0 [300, 200]; middle dim [4, 64, 128].
+        let mk = |n: usize, mul: u64| -> Vec<f64> {
+            (0..n)
+                .map(|k| {
+                    let h = (k as u64).wrapping_mul(mul) % 211;
+                    if h == 7 { f64::NAN } else { (h as f64) - 100.0 }
+                })
+                .collect()
+        };
+        for &is_max in &[true, false] {
+            let (r0, i0) = (300usize, 200usize);
+            let d0 = mk(r0 * i0, 2654435761);
+            let m0 = TensorMeta::from_shape(vec![r0, i0], DType::F64, Device::Cpu);
+            let (v, ix) = if is_max {
+                max_dim_tensor_contiguous_f64(&d0, &m0, 0)
+            } else {
+                min_dim_tensor_contiguous_f64(&d0, &m0, 0)
+            }
+            .unwrap();
+            let (rv, ri) = strided_ref(&d0, r0, i0, 1, is_max);
+            for k in 0..v.len() {
+                assert_eq!(
+                    v[k].to_bits(),
+                    rv[k].to_bits(),
+                    "dim0 val bits at {k} is_max={is_max}"
+                );
+                assert_eq!(
+                    ix[k].to_bits(),
+                    ri[k].to_bits(),
+                    "dim0 idx bits at {k} is_max={is_max}"
+                );
+            }
+            let (o1, r1, i1) = (4usize, 64usize, 128usize);
+            let d1 = mk(o1 * r1 * i1, 40503);
+            let m1 = TensorMeta::from_shape(vec![o1, r1, i1], DType::F64, Device::Cpu);
+            let (v1, ix1) = if is_max {
+                max_dim_tensor_contiguous_f64(&d1, &m1, 1)
+            } else {
+                min_dim_tensor_contiguous_f64(&d1, &m1, 1)
+            }
+            .unwrap();
+            let (rv1, ri1) = strided_ref(&d1, r1, i1, o1, is_max);
+            for k in 0..v1.len() {
+                assert_eq!(
+                    v1[k].to_bits(),
+                    rv1[k].to_bits(),
+                    "mid val bits at {k} is_max={is_max}"
+                );
+                assert_eq!(
+                    ix1[k].to_bits(),
+                    ri1[k].to_bits(),
+                    "mid idx bits at {k} is_max={is_max}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn max_min_dim_cache_blocked_f32_matches_strided_lane_bit_exact() {
+        // f32 mirror: both f32 entry points (values_indices + tensor) for max & min, dim=0 large,
+        // with NaN + integer-plateau ties. Bit-exact (f32 values + f32 indices) vs strided reference.
+        let strided_ref =
+            |data: &[f32], r_size: usize, inner: usize, is_max: bool| -> (Vec<f32>, Vec<f32>) {
+                let mut v = vec![
+                    if is_max {
+                        f32::NEG_INFINITY
+                    } else {
+                        f32::INFINITY
+                    };
+                    inner
+                ];
+                let mut ix = vec![0.0f32; inner];
+                for i in 0..inner {
+                    let (mut cv, mut ci) = (
+                        if is_max {
+                            f32::NEG_INFINITY
+                        } else {
+                            f32::INFINITY
+                        },
+                        0.0f32,
+                    );
+                    for r in 0..r_size {
+                        let val = data[i + r * inner];
+                        if val.is_nan() {
+                            cv = f32::NAN;
+                            ci = r as f32;
+                            break;
+                        } else if (is_max && val > cv) || (!is_max && val < cv) {
+                            cv = val;
+                            ci = r as f32;
+                        }
+                    }
+                    v[i] = cv;
+                    ix[i] = ci;
+                }
+                (v, ix)
+            };
+        let (r0, i0) = (300usize, 200usize);
+        let data: Vec<f32> = (0..r0 * i0)
+            .map(|k| {
+                let h = (k as u64).wrapping_mul(2654435761) % 211;
+                if h == 7 { f32::NAN } else { (h as f32) - 100.0 }
+            })
+            .collect();
+        let meta = TensorMeta::from_shape(vec![r0, i0], DType::F32, Device::Cpu);
+        for is_max in [true, false] {
+            let (rv, ri) = strided_ref(&data, r0, i0, is_max);
+            let vi = if is_max {
+                super::max_dim_values_indices_contiguous_f32(&data, &meta, 0)
+            } else {
+                super::min_dim_values_indices_contiguous_f32(&data, &meta, 0)
+            }
+            .unwrap();
+            let tn = if is_max {
+                super::max_dim_tensor_contiguous_f32(&data, &meta, 0)
+            } else {
+                super::min_dim_tensor_contiguous_f32(&data, &meta, 0)
+            }
+            .unwrap();
+            for (out, tag) in [(vi, "values_indices"), (tn, "tensor")] {
+                for k in 0..out.0.len() {
+                    assert_eq!(
+                        out.0[k].to_bits(),
+                        rv[k].to_bits(),
+                        "{tag} val bits at {k} is_max={is_max}"
+                    );
+                    assert_eq!(
+                        out.1[k].to_bits(),
+                        ri[k].to_bits(),
+                        "{tag} idx bits at {k} is_max={is_max}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn argmax_argmin_dim_cache_blocked_matches_strided_lane_bit_exact() {
+        // Blocked argmax/argmin (index-only) must match a strided lane reference: first-strict
+        // extremum wins, NaN short-circuits to its row. dim=0 large + middle dim, NaN + int-ties.
+        let strided_ref =
+            |data: &[f64], r_size: usize, inner: usize, outer: usize, is_max: bool| -> Vec<f64> {
+                let mut ix = vec![0.0f64; outer * inner];
+                for o in 0..outer {
+                    for i in 0..inner {
+                        let base = o * r_size * inner + i;
+                        let mut bi = 0usize;
+                        let mut bv = if is_max {
+                            f64::NEG_INFINITY
+                        } else {
+                            f64::INFINITY
+                        };
+                        for r in 0..r_size {
+                            let val = data[base + r * inner];
+                            if val.is_nan() {
+                                bi = r;
+                                break;
+                            } else if (is_max && val > bv) || (!is_max && val < bv) {
+                                bv = val;
+                                bi = r;
+                            }
+                        }
+                        ix[o * inner + i] = bi as f64;
+                    }
+                }
+                ix
+            };
+        let mk64 = |n: usize, mul: u64| -> Vec<f64> {
+            (0..n)
+                .map(|k| {
+                    let h = (k as u64).wrapping_mul(mul) % 211;
+                    if h == 7 { f64::NAN } else { (h as f64) - 100.0 }
+                })
+                .collect()
+        };
+        let (r0, i0) = (300usize, 200usize);
+        let d0 = mk64(r0 * i0, 2654435761);
+        let m0 = TensorMeta::from_shape(vec![r0, i0], DType::F64, Device::Cpu);
+        let (o1, r1, i1) = (4usize, 64usize, 128usize);
+        let d1 = mk64(o1 * r1 * i1, 40503);
+        let m1 = TensorMeta::from_shape(vec![o1, r1, i1], DType::F64, Device::Cpu);
+        let d0_f32: Vec<f32> = d0.iter().map(|&x| x as f32).collect();
+        let m0_f32 = TensorMeta::from_shape(vec![r0, i0], DType::F32, Device::Cpu);
+        for &is_max in &[true, false] {
+            let got0 = if is_max {
+                argmax_dim_tensor_contiguous_f64(&d0, &m0, 0)
+            } else {
+                argmin_dim_tensor_contiguous_f64(&d0, &m0, 0)
+            }
+            .unwrap();
+            let ref0 = strided_ref(&d0, r0, i0, 1, is_max);
+            for k in 0..got0.len() {
+                assert_eq!(
+                    got0[k].to_bits(),
+                    ref0[k].to_bits(),
+                    "f64 dim0 arg at {k} is_max={is_max}"
+                );
+            }
+            let got1 = if is_max {
+                argmax_dim_tensor_contiguous_f64(&d1, &m1, 1)
+            } else {
+                argmin_dim_tensor_contiguous_f64(&d1, &m1, 1)
+            }
+            .unwrap();
+            let ref1 = strided_ref(&d1, r1, i1, o1, is_max);
+            for k in 0..got1.len() {
+                assert_eq!(
+                    got1[k].to_bits(),
+                    ref1[k].to_bits(),
+                    "f64 mid arg at {k} is_max={is_max}"
+                );
+            }
+            let gotf = if is_max {
+                super::argmax_dim_tensor_contiguous_f32(&d0_f32, &m0_f32, 0)
+            } else {
+                super::argmin_dim_tensor_contiguous_f32(&d0_f32, &m0_f32, 0)
+            }
+            .unwrap();
+            for k in 0..gotf.len() {
+                assert_eq!(
+                    gotf[k], ref0[k] as f32,
+                    "f32 dim0 arg at {k} is_max={is_max}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -39277,6 +45538,81 @@ mod tests {
             }
         }
         (v, idx)
+    }
+
+    #[test]
+    fn cummax_cummin_1d_large_parallel_bit_exact() {
+        // Exercise the >= CUM_SCAN_1D_PARALLEL_MIN single-lane 1-D chunked parallel scan against
+        // the serial per-lane reference. Values: integer plateaus (ties), ascents and descents,
+        // plus a NaN mid-lane — covers tie-keeps-latest + NaN-freeze on the parallel path. Size is
+        // > threshold and non-power-of-two so chunks (grain = n/(threads*4)) straddle boundaries.
+        let n: usize = super::CUM_SCAN_1D_PARALLEL_MIN + 12345;
+        let mut input: Vec<f64> = (0..n)
+            .map(|k| (((k as u64).wrapping_mul(2654435761)) % 4096) as f64 - 2048.0)
+            .collect();
+        input[n / 2] = f64::NAN;
+        let meta = TensorMeta::from_shape(vec![n], DType::F64, Device::Cpu);
+        for is_max in [true, false] {
+            let (v, i) = if is_max {
+                super::cummax_dim_tensor_contiguous_f64(&input, &meta, 0).unwrap()
+            } else {
+                super::cummin_dim_tensor_contiguous_f64(&input, &meta, 0).unwrap()
+            };
+            let (rv, ri) = cummaxmin_ref_f64(&input, n, 1, is_max);
+            for k in 0..n {
+                assert_eq!(
+                    v[k].to_bits(),
+                    rv[k].to_bits(),
+                    "f64 value bits differ at {k} is_max={is_max}"
+                );
+                assert_eq!(i[k], ri[k], "f64 index differs at {k} is_max={is_max}");
+            }
+        }
+        // f32 mirror (values f32, indices f64) against an inline serial reference.
+        let input_f32: Vec<f32> = input.iter().map(|&x| x as f32).collect();
+        let meta_f32 = TensorMeta::from_shape(vec![n], DType::F32, Device::Cpu);
+        let ref_f32 = |data: &[f32], is_max: bool| -> (Vec<f32>, Vec<f64>) {
+            let mut acc = if is_max {
+                f32::NEG_INFINITY
+            } else {
+                f32::INFINITY
+            };
+            let mut ai = 0.0f64;
+            let mut nan = false;
+            let mut v = vec![0.0f32; data.len()];
+            let mut idx = vec![0.0f64; data.len()];
+            for (d, &x) in data.iter().enumerate() {
+                if !nan {
+                    if x.is_nan() {
+                        nan = true;
+                        acc = x;
+                        ai = d as f64;
+                    } else if (is_max && x >= acc) || (!is_max && x <= acc) {
+                        acc = x;
+                        ai = d as f64;
+                    }
+                }
+                v[d] = acc;
+                idx[d] = ai;
+            }
+            (v, idx)
+        };
+        for is_max in [true, false] {
+            let (v, i) = if is_max {
+                super::cummax_dim_tensor_contiguous_f32(&input_f32, &meta_f32, 0).unwrap()
+            } else {
+                super::cummin_dim_tensor_contiguous_f32(&input_f32, &meta_f32, 0).unwrap()
+            };
+            let (rv, ri) = ref_f32(&input_f32, is_max);
+            for k in 0..n {
+                assert_eq!(
+                    v[k].to_bits(),
+                    rv[k].to_bits(),
+                    "f32 value bits differ at {k} is_max={is_max}"
+                );
+                assert_eq!(i[k], ri[k], "f32 index differs at {k} is_max={is_max}");
+            }
+        }
     }
 
     #[test]

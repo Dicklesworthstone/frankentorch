@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 39.24s
+     Running `/data/projects/.rch-targets/frankentorch-bt-verify/release/examples/sort_bounded_h2h`
+sort(x, dim=1) [4096,4096] f64 bounded-int no-grad, 6 iters MIN:
+  FrankenTorch :  200.799 ms   chk 5.284824e9
+  PyTorch      :  105.632 ms   chk 5.284824e9  (weighted-sum rel 0.0e0)
+  => FT 1.90x SLOWER

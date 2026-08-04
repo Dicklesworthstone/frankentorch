@@ -4789,15 +4789,32 @@ impl MultiheadAttention {
         head_dim: usize,
         embed_dim: usize,
     ) -> Vec<f64> {
+        // Parallel over OUTPUT planes [batch, head] (each `seq_len*head_dim` contiguous in `packed`),
+        // gathering the per-seq head_dim block from the input at stride `embed_dim`. Sequential write
+        // per plane + block-contiguous strided reads → parallelizes cleanly (inverse of
+        // concat_attention_heads; same block-contiguous property, ~2.9x vs the serial nested loop).
+        // Bit-identical (same src->dst index map). Serial fallback below 32K elems. frankentorch (BlackThrush).
         let mut packed = vec![0.0; values.len()];
         let batch_stride = seq_len * embed_dim;
         let head_stride = seq_len * head_dim;
-        for (batch, batch_values) in values.chunks_exact(batch_stride).enumerate() {
-            for (seq, token_values) in batch_values.chunks_exact(embed_dim).enumerate() {
-                for (head, head_values) in token_values.chunks_exact(head_dim).enumerate() {
-                    let dst = (batch * num_heads + head) * head_stride + seq * head_dim;
-                    packed[dst..dst + head_dim].copy_from_slice(head_values);
-                }
+        let fill_plane = |bh: usize, plane: &mut [f64]| {
+            let batch = bh / num_heads;
+            let head = bh % num_heads;
+            for seq in 0..seq_len {
+                let src_off = batch * batch_stride + seq * embed_dim + head * head_dim;
+                plane[seq * head_dim..seq * head_dim + head_dim]
+                    .copy_from_slice(&values[src_off..src_off + head_dim]);
+            }
+        };
+        if values.len() >= 1 << 15 {
+            use rayon::prelude::*;
+            packed
+                .par_chunks_mut(head_stride)
+                .enumerate()
+                .for_each(|(bh, plane)| fill_plane(bh, plane));
+        } else {
+            for (bh, plane) in packed.chunks_mut(head_stride).enumerate() {
+                fill_plane(bh, plane);
             }
         }
         packed
@@ -4811,17 +4828,32 @@ impl MultiheadAttention {
         head_dim: usize,
         embed_dim: usize,
     ) -> Vec<f64> {
+        // Parallel over OUTPUT rows [batch, seq] (each embed_dim contiguous, gathered from the
+        // num_heads contiguous head_dim blocks). The reads are strided but BLOCK-contiguous
+        // (head_dim*8 B per head — bandwidth-efficient, unlike element-scatter) and the writes are
+        // sequential per row, so this parallelizes cleanly (~2.9x vs the serial nested loop; measured
+        // in examples/concat_heads_ab). Bit-identical to the serial sweep (same src->dst index map).
+        // Attention head-merge is hot (every attention layer). frankentorch (BlackThrush).
         let mut concat = vec![0.0; batch_size * seq_len * embed_dim];
         let head_stride = seq_len * head_dim;
-        let batch_stride = seq_len * embed_dim;
-        for batch in 0..batch_size {
+        let fill_row = |row: usize, orow: &mut [f64]| {
+            let batch = row / seq_len;
+            let seq = row % seq_len;
             for head in 0..num_heads {
-                let src_head = &values[(batch * num_heads + head) * head_stride
-                    ..(batch * num_heads + head + 1) * head_stride];
-                for (seq, head_values) in src_head.chunks_exact(head_dim).enumerate() {
-                    let dst = batch * batch_stride + seq * embed_dim + head * head_dim;
-                    concat[dst..dst + head_dim].copy_from_slice(head_values);
-                }
+                let src_off = (batch * num_heads + head) * head_stride + seq * head_dim;
+                orow[head * head_dim..head * head_dim + head_dim]
+                    .copy_from_slice(&values[src_off..src_off + head_dim]);
+            }
+        };
+        if batch_size * seq_len * embed_dim >= 1 << 15 {
+            use rayon::prelude::*;
+            concat
+                .par_chunks_mut(embed_dim)
+                .enumerate()
+                .for_each(|(row, orow)| fill_row(row, orow));
+        } else {
+            for (row, orow) in concat.chunks_mut(embed_dim).enumerate() {
+                fill_row(row, orow);
             }
         }
         concat
@@ -35082,8 +35114,10 @@ mod tests {
         let indices = session
             .tensor_variable(vec![0.0, 1.0, 2.0], vec![3], false)
             .unwrap();
+        // Start at 0 (the zero-offset check, added later in 708d46ad, fires first
+        // otherwise) so this actually exercises the non-decreasing rejection: 0 -> 2 -> 1.
         let decreasing = session
-            .tensor_variable(vec![2.0, 1.0], vec![2], false)
+            .tensor_variable(vec![0.0, 2.0, 1.0], vec![3], false)
             .unwrap();
         let err = eb
             .forward_with_offsets(&mut session, indices, decreasing, None)

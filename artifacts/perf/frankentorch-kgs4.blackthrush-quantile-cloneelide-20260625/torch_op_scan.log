@@ -1,0 +1,4 @@
+torch scan [4000,4000] dim=1 (8 threads):
+median 15.85ms / nanmedian 17.73ms (introselect-fast, walled)
+quantile 124.66ms / nanquantile 152.80ms (sort-slow)
+sort 124.32ms / argsort 116.44ms

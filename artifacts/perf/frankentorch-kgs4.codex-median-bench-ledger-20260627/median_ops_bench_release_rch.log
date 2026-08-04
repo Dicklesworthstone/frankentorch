@@ -1,0 +1,18 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1)
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-api)
+    Finished `release` profile [optimized] target(s) in 1m 38s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/ops_bench-66c60df717ea54ec)
+Gnuplot not found, using plotters backend
+Benchmarking median/bounded_i9973_f64_4000x4000_nograd
+Benchmarking median/bounded_i9973_f64_4000x4000_nograd: Warming up for 3.0000 s
+Benchmarking median/bounded_i9973_f64_4000x4000_nograd: Collecting 10 samples in estimated 2.5126 s (20 iterations)
+Benchmarking median/bounded_i9973_f64_4000x4000_nograd: Analyzing
+median/bounded_i9973_f64_4000x4000_nograd
+                        time:   [100.45 ms 104.11 ms 108.08 ms]
+                        thrpt:  [148.04 Melem/s 153.69 Melem/s 159.28 Melem/s]
+

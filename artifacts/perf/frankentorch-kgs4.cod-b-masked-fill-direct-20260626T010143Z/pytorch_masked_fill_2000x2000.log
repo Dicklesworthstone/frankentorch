@@ -1,0 +1,7 @@
+torch=2.12.0+cpu
+threads=8
+shape=2000x2000 dtype=f64 masked_fill value=0.0
+min_ms=4.047852
+p50_ms=4.994658
+p95_ms=10.675736
+checksum=-8.000000

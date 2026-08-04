@@ -3391,6 +3391,15 @@ pub struct TensorPowDispatchOutcome {
     pub decision: PowDispatchDecision,
 }
 
+/// Native-f32 pow outcome: keeps the f32 kernel result as `Vec<f32>` instead of the
+/// f64 round-trip the f64-typed outcome forces (the typed wrapper downcasts it back).
+/// frankentorch-kgs4.171.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorPowDispatchOutcomeF32 {
+    pub values: Vec<f32>,
+    pub decision: PowDispatchDecision,
+}
+
 pub fn dispatch_scalar_pow(
     mode: ExecutionMode,
     input: &ScalarTensor,
@@ -3787,6 +3796,15 @@ pub struct ClampDispatchOutcome {
 #[derive(Debug, Clone, PartialEq)]
 pub struct TensorClampDispatchOutcome {
     pub values: Vec<f64>,
+    pub decision: ClampDispatchDecision,
+}
+
+/// Native-f32 clamp outcome: keeps the f32 kernel result as `Vec<f32>` instead of
+/// the f64 round-trip the f64-typed `TensorClampDispatchOutcome` forces. Used by the
+/// typed F32/F16/BF16 clamp arms to avoid an f32->f64->f32 churn. frankentorch-kgs4.170.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TensorClampDispatchOutcomeF32 {
+    pub values: Vec<f32>,
     pub decision: ClampDispatchDecision,
 }
 
@@ -4621,6 +4639,90 @@ pub fn dispatch_tensor_reduction_dim_contiguous_f32(
     })
 }
 
+/// F32-native dim-reduction dispatch: returns the kernel's f32 output DIRECTLY,
+/// without the f32->f64->f32 round-trip the f64-valued
+/// `dispatch_tensor_reduction_dim_contiguous_f32` forces (same class as the softmax
+/// fix, 56765cdd). For a reduction whose OUTPUT is large (reducing a small dim of a
+/// big tensor, e.g. mean over the last size-2/3 dim), the round-trip's f64 widen +
+/// f32 narrow of the full output dominates — measured mean[4096,2048,2] dim=2 at
+/// ~5.5x SLOWER than torch. Bit-identical (`(x as f64) as f32 == x`), zero parity risk.
+#[allow(clippy::type_complexity)]
+fn dispatch_tensor_reduction_dim_contiguous_f32_native(
+    op: ReductionOp,
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<(Vec<f32>, ReductionDimDispatchDecision), DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, ReductionOp::Sum) => (
+            sum_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::sum_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Sum) => (
+            sum_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::sum_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Mean) => (
+            mean_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::mean_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Mean) => (
+            mean_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::mean_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Prod) => (
+            prod_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::prod_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Prod) => (
+            prod_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::prod_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Var) => (
+            var_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::var_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Var) => (
+            var_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::var_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, ReductionOp::Std) => (
+            std_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::std_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, ReductionOp::Std) => (
+            std_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::std_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor dim reduction f32 ops",
+            }
+            .into());
+        }
+    };
+
+    Ok((
+        values,
+        ReductionDimDispatchDecision {
+            op,
+            dim,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    ))
+}
+
 pub fn dispatch_tensor_pow_contiguous_f32(
     mode: ExecutionMode,
     input: &[f32],
@@ -4656,6 +4758,52 @@ pub fn dispatch_tensor_pow_contiguous_f32(
     };
 
     Ok(TensorPowDispatchOutcome {
+        values,
+        decision: PowDispatchDecision {
+            mode,
+            kernel,
+            exponent,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+/// Native-f32 pow: returns the f32 kernel result directly (no `.map(f64::from)`
+/// upcast that the typed wrapper then downcasts) — the f32->f64->f32 round-trip is
+/// 2 extra full passes over numel. Bit-identical (f32 round-trips exactly).
+/// frankentorch-kgs4.171.
+pub fn dispatch_tensor_pow_contiguous_f32_native(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    exponent: f64,
+    requires_grad: bool,
+) -> Result<TensorPowDispatchOutcomeF32, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            pow_tensor_contiguous_f32(input, meta, exponent as f32)?,
+            "autograd_cpu::pow_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            pow_tensor_contiguous_f32(input, meta, exponent as f32)?,
+            "cpu::pow_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor pow f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorPowDispatchOutcomeF32 {
         values,
         decision: PowDispatchDecision {
             mode,
@@ -4705,6 +4853,56 @@ pub fn dispatch_tensor_clamp_contiguous_f32(
     };
 
     Ok(TensorClampDispatchOutcome {
+        values,
+        decision: ClampDispatchDecision {
+            mode,
+            kernel,
+            min_val,
+            max_val,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    })
+}
+
+/// Native-f32 clamp: identical to `dispatch_tensor_clamp_contiguous_f32` but returns
+/// the f32 kernel result directly (no `.map(f64::from)` upcast). The f64-typed variant
+/// forced f32 clamp through an f32->f64->f32 round-trip (the typed wrapper downcast it
+/// back) = 2 extra full passes over numel + ~3x the allocation, measured ~11x SLOWER
+/// than torch at [4000,4000]. Bit-identical: f32->f64->f32 round-trips an f32 value
+/// exactly, so the dropped conversions change no bits. frankentorch-kgs4.170.
+pub fn dispatch_tensor_clamp_contiguous_f32_native(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    min_val: f64,
+    max_val: f64,
+    requires_grad: bool,
+) -> Result<TensorClampDispatchOutcomeF32, DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            clamp_tensor_contiguous_f32(input, meta, min_val as f32, max_val as f32)?,
+            "autograd_cpu::clamp_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            clamp_tensor_contiguous_f32(input, meta, min_val as f32, max_val as f32)?,
+            "cpu::clamp_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor clamp f32 op",
+            }
+            .into());
+        }
+    };
+
+    Ok(TensorClampDispatchOutcomeF32 {
         values,
         decision: ClampDispatchDecision {
             mode,
@@ -4809,6 +5007,52 @@ pub fn dispatch_tensor_norm_dim_contiguous_f32(
             fallback_used,
         },
     })
+}
+
+/// F32-native norm-dim dispatch: returns the kernel f32 output DIRECTLY (no
+/// f32->f64->f32 round-trip; same softmax-class fix, 56765cdd/92b423fd). Paired
+/// with the p=1/p=2 kernel parallelization, large-output norm-dim flips to a win.
+/// Bit-identical (`(x as f64) as f32 == x`), zero parity risk.
+fn dispatch_tensor_norm_dim_contiguous_f32_native(
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    p: f64,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<(Vec<f32>, NormDispatchDecision), DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+    let (values, kernel) = match effective_key {
+        DispatchKey::AutogradCPU => (
+            norm_dim_tensor_contiguous_f32(input, meta, p as f32, dim)?,
+            "autograd_cpu::norm_dim_tensor_contiguous_f32",
+        ),
+        DispatchKey::CPU => (
+            norm_dim_tensor_contiguous_f32(input, meta, p as f32, dim)?,
+            "cpu::norm_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason:
+                    "resolved dispatch key is unsupported for contiguous tensor norm dim f32 op",
+            }
+            .into());
+        }
+    };
+    Ok((
+        values,
+        NormDispatchDecision {
+            mode,
+            kernel,
+            p,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    ))
 }
 
 pub fn dispatch_tensor_scan_dim_contiguous_f32(
@@ -4925,6 +5169,65 @@ pub fn dispatch_tensor_normalize_dim_contiguous_f32(
             fallback_used,
         },
     })
+}
+
+/// F32-native normalize-dim dispatch: returns the kernel's f32 output DIRECTLY,
+/// without the f32->f64->f32 round-trip that the f64-valued
+/// `dispatch_tensor_normalize_dim_contiguous_f32` outcome forces. INSTRUMENTED
+/// MEASUREMENT: for softmax[8192,4096] f32 the round-trip (268MB f64 widen +
+/// 134MB f32 narrow, cold-allocated) is ~273ms of a ~297ms dispatch — the kernel
+/// itself is only ~24ms. The f32 values are bit-identical (f32->f64->f32 is the
+/// identity for representable f32), so this is pure overhead elimination, ~10x.
+fn dispatch_tensor_normalize_dim_contiguous_f32_native(
+    op: NormalizeOp,
+    mode: ExecutionMode,
+    input: &[f32],
+    meta: &TensorMeta,
+    dim: usize,
+    requires_grad: bool,
+) -> Result<(Vec<f32>, NormalizeDimDispatchDecision), DispatchError> {
+    let keyset = dispatch_keyset_for_single_tensor_meta(meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, NormalizeOp::Softmax) => (
+            softmax_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::softmax_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, NormalizeOp::LogSoftmax) => (
+            log_softmax_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "autograd_cpu::log_softmax_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, NormalizeOp::Softmax) => (
+            softmax_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::softmax_dim_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, NormalizeOp::LogSoftmax) => (
+            log_softmax_dim_tensor_contiguous_f32(input, meta, dim)?,
+            "cpu::log_softmax_dim_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor normalize dim f32 ops",
+            }
+            .into());
+        }
+    };
+
+    Ok((
+        values,
+        NormalizeDimDispatchDecision {
+            op,
+            dim,
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    ))
 }
 
 pub fn dispatch_tensor_sort_contiguous_f32(
@@ -5088,6 +5391,70 @@ pub fn dispatch_tensor_join_contiguous_f32(
             fallback_used,
         },
     })
+}
+
+/// F32-native join (cat/stack) dispatch: returns the kernel f32 output DIRECTLY
+/// (no f32->f64->f32 round-trip; same softmax-class fix). join is a pure copy, so
+/// the output is bit-identical; this only removes the f64 widen+narrow of the FULL
+/// concatenated output (~3x the data movement for a large cat).
+fn dispatch_tensor_join_contiguous_f32_native(
+    op: JoinOp,
+    mode: ExecutionMode,
+    inputs: &[(&[f32], &TensorMeta)],
+    dim: usize,
+    requires_grad: bool,
+) -> Result<(Vec<f32>, JoinDispatchDecision), DispatchError> {
+    if inputs.is_empty() {
+        return Err(DispatchKeyError::IncompatibleSet {
+            reason: "join op requires at least one input",
+        }
+        .into());
+    }
+    let first_meta = inputs[0].1;
+    for &(_, meta) in &inputs[1..] {
+        ensure_tensor_meta_compatible(first_meta, meta)?;
+    }
+    let keyset = dispatch_keyset_for_single_tensor_meta(first_meta, requires_grad);
+    let (selected_key, backend_key, effective_key, fallback_used) =
+        resolve_dispatch_keys(mode, keyset)?;
+    let (values, kernel) = match (effective_key, op) {
+        (DispatchKey::AutogradCPU, JoinOp::Cat) => (
+            cat_tensor_contiguous_f32(inputs, dim)?,
+            "autograd_cpu::cat_tensor_contiguous_f32",
+        ),
+        (DispatchKey::AutogradCPU, JoinOp::Stack) => (
+            stack_tensor_contiguous_f32(inputs, dim)?,
+            "autograd_cpu::stack_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, JoinOp::Cat) => (
+            cat_tensor_contiguous_f32(inputs, dim)?,
+            "cpu::cat_tensor_contiguous_f32",
+        ),
+        (DispatchKey::CPU, JoinOp::Stack) => (
+            stack_tensor_contiguous_f32(inputs, dim)?,
+            "cpu::stack_tensor_contiguous_f32",
+        ),
+        _ => {
+            return Err(DispatchKeyError::IncompatibleSet {
+                reason: "resolved dispatch key is unsupported for contiguous tensor join f32 ops",
+            }
+            .into());
+        }
+    };
+    Ok((
+        values,
+        JoinDispatchDecision {
+            op,
+            dim,
+            num_inputs: inputs.len(),
+            mode,
+            kernel,
+            selected_key,
+            backend_key,
+            keyset_bits: keyset.bits(),
+            fallback_used,
+        },
+    ))
 }
 
 pub fn dispatch_tensor_lerp_contiguous_f32(
@@ -5392,7 +5759,8 @@ pub fn dispatch_tensor_reduction_dim_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome = dispatch_tensor_reduction_dim_contiguous_f32(
+            // f32-native (no f32->f64->f32 round-trip); bit-identical kernel output.
+            let (values, decision) = dispatch_tensor_reduction_dim_contiguous_f32_native(
                 op,
                 mode,
                 data,
@@ -5401,17 +5769,14 @@ pub fn dispatch_tensor_reduction_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedReductionDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_reduction_dim_contiguous_f32(
+            let (values, decision) = dispatch_tensor_reduction_dim_contiguous_f32_native(
                 op,
                 mode,
                 &promoted,
@@ -5420,11 +5785,8 @@ pub fn dispatch_tensor_reduction_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedReductionDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
@@ -5472,20 +5834,23 @@ pub fn dispatch_tensor_pow_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome =
-                dispatch_tensor_pow_contiguous_f32(mode, data, meta, exponent, requires_grad)?;
+            // Native f32: no f32->f64->f32 round-trip. frankentorch-kgs4.171.
+            let outcome = dispatch_tensor_pow_contiguous_f32_native(
+                mode,
+                data,
+                meta,
+                exponent,
+                requires_grad,
+            )?;
             Ok(TypedPowOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_pow_contiguous_f32(
+            let outcome = dispatch_tensor_pow_contiguous_f32_native(
                 mode,
                 &promoted,
                 &promoted_meta,
@@ -5493,10 +5858,7 @@ pub fn dispatch_tensor_pow_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedPowOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }
@@ -5553,7 +5915,8 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome = dispatch_tensor_clamp_contiguous_f32(
+            // Native f32: no f32->f64->f32 round-trip (was ~11x SLOWER). frankentorch-kgs4.170.
+            let outcome = dispatch_tensor_clamp_contiguous_f32_native(
                 mode,
                 data,
                 meta,
@@ -5562,17 +5925,14 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedClampOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_clamp_contiguous_f32(
+            let outcome = dispatch_tensor_clamp_contiguous_f32_native(
                 mode,
                 &promoted,
                 &promoted_meta,
@@ -5581,10 +5941,7 @@ pub fn dispatch_tensor_clamp_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedClampOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
+                storage: narrow_f32_to_storage_dtype(storage, outcome.values),
                 decision: outcome.decision,
             })
         }
@@ -5695,20 +6052,24 @@ pub fn dispatch_tensor_norm_dim_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome =
-                dispatch_tensor_norm_dim_contiguous_f32(mode, data, meta, p, dim, requires_grad)?;
+            // f32-native (no f32->f64->f32 round-trip); bit-identical kernel output.
+            let (values, decision) = dispatch_tensor_norm_dim_contiguous_f32_native(
+                mode,
+                data,
+                meta,
+                p,
+                dim,
+                requires_grad,
+            )?;
             Ok(TypedNormDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_norm_dim_contiguous_f32(
+            let (values, decision) = dispatch_tensor_norm_dim_contiguous_f32_native(
                 mode,
                 &promoted,
                 &promoted_meta,
@@ -5717,11 +6078,8 @@ pub fn dispatch_tensor_norm_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedNormDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
@@ -5848,7 +6206,9 @@ pub fn dispatch_tensor_normalize_dim_contiguous_typed(
             })
         }
         TensorStorage::F32(data) => {
-            let outcome = dispatch_tensor_normalize_dim_contiguous_f32(
+            // Use the f32-native dispatch (no f32->f64->f32 round-trip); the kernel
+            // output is bit-identical, this only removes ~273ms of conversion/alloc.
+            let (values, decision) = dispatch_tensor_normalize_dim_contiguous_f32_native(
                 op,
                 mode,
                 data,
@@ -5857,17 +6217,14 @@ pub fn dispatch_tensor_normalize_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedNormalizeDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::F16(_) | TensorStorage::BF16(_) => {
             let promoted: Vec<f32> = storage.to_f32_vec();
             let promoted_meta = meta.clone().with_dtype(DType::F32);
-            let outcome = dispatch_tensor_normalize_dim_contiguous_f32(
+            let (values, decision) = dispatch_tensor_normalize_dim_contiguous_f32_native(
                 op,
                 mode,
                 &promoted,
@@ -5876,11 +6233,8 @@ pub fn dispatch_tensor_normalize_dim_contiguous_typed(
                 requires_grad,
             )?;
             Ok(TypedNormalizeDimOutcome {
-                storage: narrow_f32_to_storage_dtype(
-                    storage,
-                    outcome.values.iter().map(|&v| v as f32).collect(),
-                ),
-                decision: outcome.decision,
+                storage: narrow_f32_to_storage_dtype(storage, values),
+                decision,
             })
         }
         TensorStorage::Complex64(_) | TensorStorage::Complex128(_) => {
@@ -6144,8 +6498,8 @@ pub fn dispatch_tensor_join_contiguous_typed(
             .collect();
         let refs: Vec<(&[f32], &TensorMeta)> =
             f32_inputs.iter().map(|(d, m)| (d.as_slice(), *m)).collect();
-        let outcome = dispatch_tensor_join_contiguous_f32(op, mode, &refs, dim, requires_grad)?;
-        let values: Vec<f32> = outcome.values.iter().map(|&v| v as f32).collect();
+        let (values, decision) =
+            dispatch_tensor_join_contiguous_f32_native(op, mode, &refs, dim, requires_grad)?;
         // Preserve a shared half dtype: cat/stack of all-f16 (or all-bf16) inputs
         // stays f16/bf16 (torch parity), matching the binary/lerp half-narrowing.
         // join is a pure copy, so the f16->f32->f16 round-trip is lossless. Mixed
@@ -6161,10 +6515,7 @@ pub fn dispatch_tensor_join_contiguous_typed(
         } else {
             TensorStorage::F32(Arc::new(values))
         };
-        Ok(TypedJoinOutcome {
-            storage,
-            decision: outcome.decision,
-        })
+        Ok(TypedJoinOutcome { storage, decision })
     }
 }
 

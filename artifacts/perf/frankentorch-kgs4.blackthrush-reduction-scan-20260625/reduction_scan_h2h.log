@@ -1,0 +1,16 @@
+op             FT(ms)
+  sum              2.299
+  mean             2.299
+  prod            82.174
+  var            166.142
+  std            172.117
+  norm_p2          2.241
+  count_nonzero    3.933
+op             FT(ms)   PT(ms)   ratio(PT/FT, <1 = FT slower)
+  sum              2.241    1.534   FT 1.46x SLOWER
+  mean             2.308    1.852   FT 1.25x SLOWER
+  prod            86.703    1.835   FT 47.24x SLOWER
+  var            168.757    3.437   FT 49.10x SLOWER
+  std            156.106    3.409   FT 45.80x SLOWER
+  norm_p2          2.236    7.696   FT 3.44x FASTER
+  count_nonzero    3.240    2.443   FT 1.33x SLOWER

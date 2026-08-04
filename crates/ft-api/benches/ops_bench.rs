@@ -2,11 +2,21 @@ use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };
 use ft_api::FrankenTorchSession;
+use ft_autograd::TensorNodeId;
 use ft_core::ExecutionMode;
+use std::time::Duration;
+
+const PARALLEL_ELEMENTWISE_MIN: usize = 8192;
 
 fn deterministic_values(n: usize, shift: f64) -> Vec<f64> {
     (0..n)
         .map(|i| (((i as f64) * 0.017 + shift).sin()) * 0.2)
+        .collect()
+}
+
+fn patterned_f32_values(n: usize, scale: f32, shift: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| (((i as f32) * scale + shift).sin()) * 0.25)
         .collect()
 }
 
@@ -431,6 +441,26 @@ fn bench_sum(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_median(c: &mut Criterion) {
+    let mut group = c.benchmark_group("median");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(2));
+
+    let (rows, cols) = (4000usize, 4000usize);
+    let data: Vec<f64> = (0..rows * cols)
+        .map(|i| ((i.wrapping_mul(2_654_435_761) % 9973) as f64) - 4986.0)
+        .collect();
+    group.throughput(Throughput::Elements((rows * cols) as u64));
+    group.bench_function("bounded_i9973_f64_4000x4000_nograd", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(data.clone(), vec![rows, cols], false)
+            .unwrap();
+        b.iter(|| black_box(session.tensor_median(black_box(x)).unwrap()));
+    });
+    group.finish();
+}
+
 fn bench_amax_amin(c: &mut Criterion) {
     let mut group = c.benchmark_group("amax_amin");
     {
@@ -515,6 +545,17 @@ fn bench_norm(c: &mut Criterion) {
             b.iter(|| black_box(session.tensor_norm(x, 2.0).unwrap()));
         });
     }
+
+    let (rows, cols) = (4000usize, 4000usize);
+    group.throughput(Throughput::Elements((rows * cols) as u64));
+    group.bench_function("normalize_f32_4000x4000_dim1_nograd", |b| {
+        let values: Vec<f32> = (0..rows * cols).map(|i| (i % 17) as f32 - 8.0).collect();
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(values, vec![rows, cols], false)
+            .unwrap();
+        b.iter(|| black_box(session.tensor_normalize(x, 2.0, 1, 1e-12).unwrap()));
+    });
     group.finish();
 }
 
@@ -582,6 +623,29 @@ fn bench_sigmoid(c: &mut Criterion) {
     group.finish();
 }
 
+fn bench_logit(c: &mut Criterion) {
+    let mut group = c.benchmark_group("logit");
+
+    for &size in &[4096usize, 16_384, 1 << 20] {
+        let values: Vec<f64> = (0..size)
+            .map(|i| {
+                let bucket = ((i.wrapping_mul(37) % 997) as f64 + 0.5) / 997.0;
+                0.01 + bucket * 0.98
+            })
+            .collect();
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_with_input(BenchmarkId::new("f64_nograd", size), &size, |b, &size| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let x = session
+                .tensor_variable(values.clone(), vec![size], false)
+                .unwrap();
+            b.iter(|| black_box(session.tensor_logit(x, None).unwrap()));
+        });
+    }
+
+    group.finish();
+}
+
 fn bench_pow(c: &mut Criterion) {
     let mut group = c.benchmark_group("pow");
 
@@ -612,6 +676,190 @@ fn bench_add(c: &mut Criterion) {
             b.iter(|| black_box(session.tensor_add(x, y).unwrap()));
         });
     }
+    group.finish();
+}
+
+fn bench_scalar_map(c: &mut Criterion) {
+    let mut group = c.benchmark_group("scalar_map");
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(5));
+
+    for &size in &[4096usize, 65_536, 1 << 20, 1 << 22] {
+        group.throughput(Throughput::Elements(size as u64));
+
+        group.bench_with_input(
+            BenchmarkId::new("f64_mul_scalar", size),
+            &size,
+            |b, &size| {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let values = deterministic_values(size, 0.17);
+                let x = session.tensor_variable(values, vec![size], false).unwrap();
+                b.iter(|| black_box(session.mul_scalar(black_box(x), 2.5).unwrap()));
+            },
+        );
+
+        group.bench_with_input(
+            BenchmarkId::new("f32_mul_scalar", size),
+            &size,
+            |b, &size| {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let values = patterned_f32_values(size, 0.000_019, 0.37);
+                let x = session
+                    .tensor_variable_f32(values, vec![size], false)
+                    .unwrap();
+                b.iter(|| black_box(session.mul_scalar(black_box(x), 2.5).unwrap()));
+            },
+        );
+    }
+
+    group.finish();
+}
+
+fn bench_addcmul(c: &mut Criterion) {
+    let mut group = c.benchmark_group("addcmul");
+    let rows = 4000usize;
+    let cols = 4000usize;
+    let n = rows * cols;
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(12));
+    group.throughput(Throughput::Elements(n as u64));
+    let input_values = patterned_f32_values(n, 0.000_017, 0.13);
+    let t1_values = patterned_f32_values(n, 0.000_019, 0.29);
+    let t2_values = patterned_f32_values(n, 0.000_023, 0.47);
+
+    group.bench_function("f32_4000x4000_nograd", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let input = session
+                    .tensor_variable_f32(input_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                let t1 = session
+                    .tensor_variable_f32(t1_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                let t2 = session
+                    .tensor_variable_f32(t2_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                (session, input, t1, t2)
+            },
+            |(mut session, input, t1, t2)| {
+                black_box(session.tensor_addcmul(input, t1, t2, 0.5).unwrap())
+            },
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn bench_threshold(c: &mut Criterion) {
+    let mut group = c.benchmark_group("threshold");
+    for &size in &[4096usize, 65_536, 1 << 20] {
+        let input_values: Vec<f32> = (0..size)
+            .map(|i| {
+                let v = ((i % 2000) as f32 - 1000.0) * 0.01;
+                if i % 997 == 0 { f32::NAN } else { v }
+            })
+            .collect();
+        group.throughput(Throughput::Elements(size as u64));
+        group.bench_with_input(BenchmarkId::new("f32_nograd", size), &size, |b, &size| {
+            let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+            let input = session
+                .tensor_variable_f32(input_values.clone(), vec![size], false)
+                .unwrap();
+            b.iter(|| {
+                black_box(
+                    session
+                        .tensor_threshold(black_box(input), 0.0, -1.0)
+                        .unwrap(),
+                )
+            });
+        });
+    }
+
+    let rows = 4000usize;
+    let cols = 4000usize;
+    let n = rows * cols;
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(8));
+    group.throughput(Throughput::Elements(n as u64));
+    let input_values: Vec<f32> = (0..n)
+        .map(|i| {
+            let v = ((i % 2000) as f32 - 1000.0) * 0.01;
+            if i % 997 == 0 { f32::NAN } else { v }
+        })
+        .collect();
+
+    group.bench_function("f32_4000x4000_nograd", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let input = session
+                    .tensor_variable_f32(input_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                (session, input)
+            },
+            |(mut session, input)| black_box(session.tensor_threshold(input, 0.0, -1.0).unwrap()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn bench_lerp(c: &mut Criterion) {
+    let mut group = c.benchmark_group("lerp");
+    let rows = 4000usize;
+    let cols = 4000usize;
+    let n = rows * cols;
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(4));
+    group.throughput(Throughput::Elements(n as u64));
+    let start_values = patterned_f32_values(n, 0.000_017, 0.13);
+    let end_values = patterned_f32_values(n, 0.000_023, 0.47);
+
+    group.bench_function("f32_4000x4000_nograd", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let start = session
+                    .tensor_variable_f32(start_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                let end = session
+                    .tensor_variable_f32(end_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                (session, start, end)
+            },
+            |(mut session, start, end)| black_box(session.tensor_lerp(start, end, 0.3).unwrap()),
+            BatchSize::LargeInput,
+        );
+    });
+    group.finish();
+}
+
+fn bench_pad(c: &mut Criterion) {
+    let mut group = c.benchmark_group("pad");
+    let rows = 4000usize;
+    let cols = 4000usize;
+    let n = rows * cols;
+    group.sample_size(10);
+    group.measurement_time(Duration::from_secs(4));
+    group.throughput(Throughput::Elements(((rows + 16) * (cols + 16)) as u64));
+    let input_values = patterned_f32_values(n, 0.000_017, 0.13);
+
+    group.bench_function("f32_4000x4000_pad8_value2_nograd", |b| {
+        b.iter_batched(
+            || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let input = session
+                    .tensor_variable_f32(input_values.clone(), vec![rows, cols], false)
+                    .unwrap();
+                (session, input)
+            },
+            |(mut session, input)| {
+                black_box(session.tensor_pad(input, &[8, 8, 8, 8], 2.0).unwrap())
+            },
+            BatchSize::LargeInput,
+        );
+    });
     group.finish();
 }
 
@@ -1165,6 +1413,52 @@ fn bench_smooth_l1(c: &mut Criterion) {
             let t = s.tensor_randn(vec![n], false).unwrap();
             let loss = s.tensor_smooth_l1_loss(x, t, "mean", 1.0).unwrap();
             black_box(s.tensor_backward(loss).unwrap())
+        });
+    });
+    group.finish();
+}
+
+fn bench_soft_margin(c: &mut Criterion) {
+    let mut group = c.benchmark_group("soft_margin");
+    let n = 4096 * 2048usize;
+    let xv: Vec<f32> = (0..n)
+        .map(|i| -2.0 + (i % 257) as f32 * (4.0 / 257.0))
+        .collect();
+    let tv: Vec<f32> = (0..n)
+        .map(|i| if i % 2 == 0 { 1.0 } else { -1.0 })
+        .collect();
+    group.bench_function("nograd_f32_8m", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s.tensor_variable_f32(xv.clone(), vec![n], false).unwrap();
+        let t = s.tensor_variable_f32(tv.clone(), vec![n], false).unwrap();
+        b.iter(|| black_box(s.tensor_soft_margin_loss(x, t, "mean").unwrap()));
+    });
+    group.finish();
+}
+
+fn bench_multilabel_soft_margin(c: &mut Criterion) {
+    let mut group = c.benchmark_group("multilabel_soft_margin");
+    let (rows, cols) = (65_536usize, 128usize);
+    let n = rows * cols;
+    let xv: Vec<f64> = (0..n)
+        .map(|i| -2.0 + (i % 257) as f64 * (4.0 / 257.0))
+        .collect();
+    let tv: Vec<f64> = (0..n)
+        .map(|i| if (i + i / cols) % 3 == 0 { 1.0 } else { 0.0 })
+        .collect();
+    group.bench_function("nograd_f64_65536x128_mean", |b| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = s
+            .tensor_variable(xv.clone(), vec![rows, cols], false)
+            .unwrap();
+        let t = s
+            .tensor_variable(tv.clone(), vec![rows, cols], false)
+            .unwrap();
+        b.iter(|| {
+            black_box(
+                s.tensor_multilabel_soft_margin_loss(x, t, None, "mean")
+                    .unwrap(),
+            )
         });
     });
     group.finish();
@@ -1830,7 +2124,32 @@ fn bench_sinusoidal_pe(c: &mut Criterion) {
     // element -> compute-bound, parallel over positions.
     let (seq_len, d_model) = (4096usize, 1024usize);
     group.throughput(Throughput::Elements((seq_len * d_model) as u64));
-    group.bench_function("4096x1024", |b| {
+    group.bench_function("legacy_original_4096x1024", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        b.iter(|| {
+            let mut encoding = vec![0.0_f64; seq_len * d_model];
+            let denominators: Vec<f64> = (0..d_model)
+                .map(|i| (10000_f64).powf((2 * (i / 2)) as f64 / d_model as f64))
+                .collect();
+            let fill_row = |pos: usize, row: &mut [f64]| {
+                for (i, slot) in row.iter_mut().enumerate() {
+                    let angle = (pos as f64) / denominators[i];
+                    *slot = if i % 2 == 0 { angle.sin() } else { angle.cos() };
+                }
+            };
+            use rayon::prelude::*;
+            encoding
+                .par_chunks_mut(d_model)
+                .enumerate()
+                .for_each(|(pos, row)| fill_row(pos, row));
+            black_box(
+                session
+                    .tensor_variable(encoding, vec![seq_len, d_model], false)
+                    .unwrap(),
+            )
+        });
+    });
+    group.bench_function("paired_angle_4096x1024", |b| {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         b.iter(|| {
             black_box(
@@ -2034,6 +2353,23 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
     // element, so it is compute-bound and parallelizes over output rows.
     let (n, ch, h, w) = (8usize, 32usize, 64usize, 64usize);
     group.throughput(Throughput::Elements((n * ch * h * 2 * w * 2) as u64));
+    group.bench_function("legacy_original_8x32x64x64_2x", |b| {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_randn(vec![n, ch, h, w], false).unwrap();
+        b.iter(|| {
+            black_box(legacy_bicubic_public_path(
+                &mut session,
+                black_box(x),
+                n,
+                ch,
+                h,
+                w,
+                h * 2,
+                w * 2,
+                false,
+            ))
+        });
+    });
     group.bench_function("8x32x64x64_2x", |b| {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session.tensor_randn(vec![n, ch, h, w], false).unwrap();
@@ -2052,6 +2388,100 @@ fn bench_interpolate_bicubic(c: &mut Criterion) {
         });
     });
     group.finish();
+}
+
+fn legacy_bicubic_public_path(
+    session: &mut FrankenTorchSession,
+    input: TensorNodeId,
+    batch: usize,
+    channels: usize,
+    ih: usize,
+    iw: usize,
+    oh: usize,
+    ow: usize,
+    align_corners: bool,
+) -> TensorNodeId {
+    #[derive(Clone, Copy)]
+    struct CubicPlan {
+        indices: [usize; 4],
+        weights: [f64; 4],
+    }
+
+    let storage = session.tensor_values(input).unwrap();
+    let total = batch * channels * oh * ow;
+    let in_plane = ih * iw;
+    let mut values = vec![0.0_f64; total];
+    let build_plan = |out_size: usize, in_size: usize| -> Vec<CubicPlan> {
+        (0..out_size)
+            .map(|out_idx| {
+                let src = if align_corners && out_size > 1 {
+                    out_idx as f64 * (in_size - 1) as f64 / (out_size - 1) as f64
+                } else {
+                    (out_idx as f64 + 0.5) * in_size as f64 / out_size as f64 - 0.5
+                };
+                let base = src.floor() as i64;
+                let frac = src - base as f64;
+                let mut indices = [0usize; 4];
+                let mut weights = [0.0_f64; 4];
+                for (slot, offset) in (-1..=2_i64).enumerate() {
+                    indices[slot] = (base + offset).clamp(0, in_size as i64 - 1) as usize;
+                    weights[slot] = legacy_cubic_weight(frac - offset as f64);
+                }
+                CubicPlan { indices, weights }
+            })
+            .collect()
+    };
+    let y_plan = build_plan(oh, ih);
+    let x_plan = build_plan(ow, iw);
+
+    let fill_row = |r: usize, out_row: &mut [f64]| {
+        let plane = r / oh;
+        let oy = r % oh;
+        let base = plane * in_plane;
+        let y = y_plan[oy];
+        for (ox, slot) in out_row.iter_mut().enumerate() {
+            let x = x_plan[ox];
+            let mut val = 0.0;
+            for dy in 0..4 {
+                let wy = y.weights[dy];
+                let sy = y.indices[dy];
+                for dx in 0..4 {
+                    let wx = x.weights[dx];
+                    let sx = x.indices[dx];
+                    val += wy * wx * storage[base + sy * iw + sx];
+                }
+            }
+            *slot = val;
+        }
+    };
+
+    if total >= PARALLEL_ELEMENTWISE_MIN {
+        use rayon::prelude::*;
+        values
+            .par_chunks_mut(ow)
+            .enumerate()
+            .for_each(|(r, out_row)| fill_row(r, out_row));
+    } else {
+        values
+            .chunks_mut(ow)
+            .enumerate()
+            .for_each(|(r, out_row)| fill_row(r, out_row));
+    }
+    session
+        .tensor_variable(values, vec![batch, channels, oh, ow], false)
+        .unwrap()
+}
+
+fn legacy_cubic_weight(x: f64) -> f64 {
+    let a = -0.75;
+    let abs_x = x.abs();
+    if abs_x <= 1.0 {
+        (a + 2.0) * abs_x * abs_x * abs_x - (a + 3.0) * abs_x * abs_x + 1.0
+    } else if abs_x <= 2.0 {
+        a * abs_x * abs_x * abs_x - 5.0 * a * abs_x * abs_x + 8.0 * a * abs_x - 4.0 * a
+    } else {
+        0.0
+    }
 }
 
 fn bench_lstsq(c: &mut Criterion) {
@@ -2225,11 +2655,29 @@ fn bench_histogramdd(c: &mut Criterion) {
     let data: Vec<f64> = (0..samples * dims)
         .map(|i| ((i.wrapping_mul(1_103_515_245).wrapping_add(12_345)) & 0xffff) as f64 / 65535.0)
         .collect();
+    let data_f32: Vec<f32> = data.iter().map(|&v| v as f32).collect();
     group.throughput(Throughput::Elements(samples as u64));
     group.bench_function("f64_1m_3d_16bins", |bch| {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
         let t = s
             .tensor_variable(data.clone(), vec![samples, dims], false)
+            .unwrap();
+        bch.iter(|| {
+            black_box(
+                s.tensor_histogramdd(
+                    black_box(t),
+                    black_box(bins.as_slice()),
+                    Some(black_box(ranges.as_slice())),
+                    false,
+                )
+                .unwrap(),
+            )
+        });
+    });
+    group.bench_function("f32_1m_3d_16bins", |bch| {
+        let mut s = FrankenTorchSession::new(ExecutionMode::Strict);
+        let t = s
+            .tensor_variable_f32(data_f32.clone(), vec![samples, dims], false)
             .unwrap();
         bch.iter(|| {
             black_box(
@@ -2266,6 +2714,7 @@ criterion_group!(
     bench_max_pool3d,
     bench_pool1d_ct1d,
     bench_sum,
+    bench_median,
     bench_amax_amin,
     bench_cumsum,
     bench_cumprod,
@@ -2274,8 +2723,14 @@ criterion_group!(
     bench_relu,
     bench_exp,
     bench_sigmoid,
+    bench_logit,
     bench_pow,
     bench_add,
+    bench_scalar_map,
+    bench_addcmul,
+    bench_threshold,
+    bench_lerp,
+    bench_pad,
     bench_backward_matmul,
     bench_linear_train,
     bench_recurrent_forward,
@@ -2286,6 +2741,8 @@ criterion_group!(
     bench_group_norm,
     bench_batch_norm,
     bench_smooth_l1,
+    bench_soft_margin,
+    bench_multilabel_soft_margin,
     bench_gaussian_nll,
     bench_linear_forward,
     bench_interpolate_bicubic,

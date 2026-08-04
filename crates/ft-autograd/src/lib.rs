@@ -5285,7 +5285,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5324,7 +5331,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5363,7 +5377,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5402,7 +5423,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5441,7 +5469,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5480,7 +5515,14 @@ impl TensorTape {
             (requires_grad, outcome)
         };
 
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5518,7 +5560,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5555,7 +5604,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5592,7 +5648,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5629,7 +5692,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5666,7 +5736,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5703,7 +5780,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5740,7 +5824,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5777,7 +5868,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5814,7 +5912,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5851,7 +5956,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5888,7 +6000,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5925,7 +6044,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5962,7 +6088,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -5999,7 +6132,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6036,7 +6176,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6073,7 +6220,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6110,7 +6264,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6147,7 +6308,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6184,7 +6352,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6221,7 +6396,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6258,7 +6440,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6295,7 +6484,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6332,7 +6528,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6369,7 +6572,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -6406,7 +6616,14 @@ impl TensorTape {
             .map_err(AutogradError::Dispatch)?;
             (requires_grad, outcome)
         };
-        let input_meta = self.nodes[input.0].tensor.meta().clone();
+        // Build the output meta CONTIGUOUS from the input's shape/dtype/device — NOT a clone of the
+        // input meta, which for a NARROW/slice (storage-offset) view carries the offset + base-size
+        // strides and would mismatch the fresh contiguous `outcome.storage` (InsufficientStorage /
+        // wrong strides). Mirrors the sigmoid/tanh path (from_shape). Identical for contiguous inputs.
+        let input_meta = {
+            let m = self.nodes[input.0].tensor.meta();
+            ft_core::TensorMeta::from_shape(m.shape().to_vec(), m.dtype(), m.device())
+        };
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
             tensor: DenseTensor::from_typed_storage(input_meta, outcome.storage)?,
@@ -9552,7 +9769,7 @@ impl TensorTape {
         input: TensorNodeId,
         new_shape: Vec<usize>,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, original_shape, dtype, device) = {
+        let (requires_grad, tensor, original_shape) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let input_numel = meta.numel();
@@ -9566,21 +9783,14 @@ impl TensorTape {
                     },
                 )));
             }
-            let storage = Self::compact_typed_storage(&input_node.tensor)?;
-            let dtype = storage.dtype();
-            (
-                input_node.requires_grad,
-                storage,
-                meta.shape().to_vec(),
-                dtype,
-                meta.device(),
-            )
+            let original_shape = meta.shape().to_vec();
+            let tensor = Self::view_reshaped_sharing_storage(&input_node.tensor, new_shape)?;
+            (input_node.requires_grad, tensor, original_shape)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Reshape {
                 input,
@@ -9595,7 +9805,7 @@ impl TensorTape {
         input: TensorNodeId,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, new_shape, dtype, device) = {
+        let (requires_grad, tensor) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let shape = meta.shape();
@@ -9614,21 +9824,13 @@ impl TensorTape {
                     new_shape.push(1);
                 }
             }
-            let storage = Self::compact_typed_storage(&input_node.tensor)?;
-            let dtype = storage.dtype();
-            (
-                input_node.requires_grad,
-                storage,
-                new_shape,
-                dtype,
-                meta.device(),
-            )
+            let tensor = Self::view_reshaped_sharing_storage(&input_node.tensor, new_shape)?;
+            (input_node.requires_grad, tensor)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Squeeze { input, dim },
         });
@@ -9640,7 +9842,7 @@ impl TensorTape {
         input: TensorNodeId,
         dim: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, new_shape, dtype, device) = {
+        let (requires_grad, tensor) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let shape = meta.shape();
@@ -9654,21 +9856,13 @@ impl TensorTape {
             }
             let mut new_shape = shape.to_vec();
             new_shape.insert(dim, 1);
-            let storage = Self::compact_typed_storage(&input_node.tensor)?;
-            let dtype = storage.dtype();
-            (
-                input_node.requires_grad,
-                storage,
-                new_shape,
-                dtype,
-                meta.device(),
-            )
+            let tensor = Self::view_reshaped_sharing_storage(&input_node.tensor, new_shape)?;
+            (input_node.requires_grad, tensor)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Unsqueeze { input, dim },
         });
@@ -9888,31 +10082,68 @@ impl TensorTape {
         start: usize,
         length: usize,
     ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, storage, new_shape, original_shape, dtype, device) = {
+        let (requires_grad, tensor, original_shape) = {
             let input_node = self.node(input)?;
             let meta = input_node.tensor.meta();
             let shape = meta.shape();
             let original_shape = shape.to_vec();
-            let storage = Self::narrow_typed_storage(&input_node.tensor, dim, start, length)?;
-            let dtype = storage.dtype();
-
+            let dtype = meta.dtype();
+            let device = meta.device();
             let mut new_shape = shape.to_vec();
-            new_shape[dim] = length;
 
-            (
-                input_node.requires_grad,
-                storage,
-                new_shape,
-                original_shape,
-                dtype,
-                meta.device(),
-            )
+            // O(1) OFFSET-VIEW fast path for a dim-0 narrow of a contiguous tensor: the sub-range
+            // is itself contiguous at `storage_offset + start*inner`, so SHARE the storage Arc and
+            // set the offset (a refcount bump) instead of copying `length*inner` elements
+            // (torch narrows are O(1) views; FT was O(n) — e.g. 32MB copy = ~24ms, 17000x SLOWER).
+            // Value semantics are preserved: the shared storage is immutable through the read path,
+            // and any in-place write goes through Arc::make_mut (copy-on-write), so a mutation of
+            // the view clones THEN and does NOT propagate to the source — exactly as the old copy.
+            let view = if dim == 0 && length > 0 && !shape.is_empty() && meta.is_contiguous() {
+                let inner: usize = shape[1..].iter().product();
+                match start
+                    .checked_mul(inner)
+                    .and_then(|off| meta.storage_offset().checked_add(off))
+                {
+                    Some(new_offset)
+                        if start
+                            .checked_add(length)
+                            .map(|e| e <= shape[0])
+                            .unwrap_or(false) =>
+                    {
+                        new_shape[0] = length;
+                        let new_meta =
+                            ft_core::TensorMeta::from_shape(new_shape.clone(), dtype, device)
+                                .with_storage_offset(new_offset);
+                        // Arc-level clone of the storage enum (refcount bump, no data copy).
+                        Some(DenseTensor::from_typed_storage(
+                            new_meta,
+                            input_node.tensor.typed_storage().clone(),
+                        )?)
+                    }
+                    _ => None,
+                }
+            } else {
+                None
+            };
+
+            let tensor = match view {
+                Some(t) => t,
+                None => {
+                    let storage =
+                        Self::narrow_typed_storage(&input_node.tensor, dim, start, length)?;
+                    let mut ns = shape.to_vec();
+                    ns[dim] = length;
+                    let new_meta = ft_core::TensorMeta::from_shape(ns, dtype, device);
+                    DenseTensor::from_typed_storage(new_meta, storage)?
+                }
+            };
+
+            (input_node.requires_grad, tensor, original_shape)
         };
 
-        let new_meta = ft_core::TensorMeta::from_shape(new_shape, dtype, device);
         let out = TensorNodeId(self.nodes.len());
         self.nodes.push(TensorNode {
-            tensor: DenseTensor::from_typed_storage(new_meta, storage)?,
+            tensor,
             requires_grad,
             op: TensorNodeOp::Narrow {
                 input,
@@ -9988,18 +10219,53 @@ impl TensorTape {
 
         let original_shape = shape.clone();
         let mut outputs = Vec::with_capacity(split_sizes.len());
-        let mut start = 0;
+        let mut start = 0usize;
+        // For a dim-0 split of a contiguous tensor, each chunk is a contiguous sub-range at
+        // `storage_offset + start*inner` → emit an O(1) OFFSET-VIEW (shared Arc + offset) instead
+        // of copying each chunk (chunk/split of a 64MB tensor was ~48ms, 20000x SLOWER than torch's
+        // views). COW (Arc::make_mut) preserves value semantics on in-place writes. See narrow().
+        let inner: usize = original_shape
+            .get(1..)
+            .map(|t| t.iter().product())
+            .unwrap_or(1);
 
         for (chunk_index, &sz) in split_sizes.iter().enumerate() {
-            let chunk_storage =
-                Self::narrow_typed_storage(&self.node(input)?.tensor, dim, start, sz)?;
-
             let mut chunk_shape = original_shape.clone();
             chunk_shape[dim] = sz;
-            let chunk_meta = ft_core::TensorMeta::from_shape(chunk_shape, dtype, device);
+            let tensor = {
+                let in_node = self.node(input)?;
+                let in_meta = in_node.tensor.meta();
+                let view = if dim == 0 && sz > 0 && in_meta.is_contiguous() {
+                    start
+                        .checked_mul(inner)
+                        .and_then(|o| in_meta.storage_offset().checked_add(o))
+                        .map(|new_offset| {
+                            let chunk_meta =
+                                ft_core::TensorMeta::from_shape(chunk_shape.clone(), dtype, device)
+                                    .with_storage_offset(new_offset);
+                            DenseTensor::from_typed_storage(
+                                chunk_meta,
+                                in_node.tensor.typed_storage().clone(),
+                            )
+                        })
+                        .transpose()?
+                } else {
+                    None
+                };
+                match view {
+                    Some(t) => t,
+                    None => {
+                        let chunk_storage =
+                            Self::narrow_typed_storage(&in_node.tensor, dim, start, sz)?;
+                        let chunk_meta =
+                            ft_core::TensorMeta::from_shape(chunk_shape, dtype, device);
+                        DenseTensor::from_typed_storage(chunk_meta, chunk_storage)?
+                    }
+                }
+            };
             let out = TensorNodeId(self.nodes.len());
             self.nodes.push(TensorNode {
-                tensor: DenseTensor::from_typed_storage(chunk_meta, chunk_storage)?,
+                tensor,
                 requires_grad,
                 op: TensorNodeOp::Split {
                     input,
@@ -10084,6 +10350,91 @@ impl TensorTape {
                 storage_offset: start,
                 numel: meta.numel(),
             })?;
+        // Pure 2-D transpose [1,0] of an f64 matrix → the AVX2 register-blocked transpose kernel
+        // (~3x the generic cache-blocked scalar transpose, which streams strided and caps at a
+        // fraction of memory bandwidth). Same values written ⇒ transparent to autograd (the tape
+        // Permute node owns the backward). frankentorch-kgs4.
+        if perm.len() == 2 && perm[0] == 1 && perm[1] == 0 {
+            let rows = meta.shape()[0];
+            let cols = meta.shape()[1];
+            match tensor.typed_storage() {
+                TensorStorage::F64(values) => {
+                    let slice = Self::checked_storage_slice(values, start, end)?;
+                    return Ok(TensorStorage::F64(Arc::new(
+                        ft_kernel_cpu::transpose_2d_f64(slice, rows, cols),
+                    )));
+                }
+                TensorStorage::F32(values) => {
+                    let slice = Self::checked_storage_slice(values, start, end)?;
+                    return Ok(TensorStorage::F32(Arc::new(
+                        ft_kernel_cpu::transpose_2d_f32(slice, rows, cols),
+                    )));
+                }
+                _ => {}
+            }
+        }
+        // ROTATION permute with a SCALAR element (elem == 1): perm fixes an identity prefix +
+        // suffix and left-rotates the middle dims — which is EXACTLY `batch` independent [a, b]
+        // matrix transposes (dst[b·A + a] = src[a·B + b], matching permute_slice's rotation path).
+        // Covers `.mT` / transpose(-1,-2), movedim, and NCHW<->NHWC-style layout swaps. Route each
+        // plane to the AVX2 `transpose_2d_into` kernel (~3x the generic cache-blocked SCALAR
+        // transpose permute_slice would run) in parallel over batches. f64/f32; bit-identical (same
+        // kernel the 2-D [1,0] path uses; the index map is the rotation path's, verified).
+        let ndim = perm.len();
+        if ndim >= 3
+            && matches!(
+                tensor.typed_storage(),
+                TensorStorage::F64(_) | TensorStorage::F32(_)
+            )
+        {
+            let shape = meta.shape();
+            let mut prefix = 0;
+            while prefix < ndim && perm[prefix] == prefix {
+                prefix += 1;
+            }
+            let mut suffix = 0;
+            while suffix < ndim - prefix && perm[ndim - 1 - suffix] == ndim - 1 - suffix {
+                suffix += 1;
+            }
+            let mid = ndim - prefix - suffix;
+            let rotation = if mid >= 2 {
+                (1..mid).find(|&s| (0..mid).all(|k| perm[prefix + k] == prefix + (s + k) % mid))
+            } else {
+                None
+            };
+            if let Some(s) = rotation {
+                let a_dim: usize = shape[prefix..prefix + s].iter().product();
+                let b_dim: usize = shape[prefix + s..prefix + mid].iter().product();
+                let elem: usize = shape[prefix + mid..ndim].iter().product();
+                let batch: usize = shape[..prefix].iter().product();
+                let plane = a_dim.saturating_mul(b_dim);
+                let total = batch.saturating_mul(plane);
+                if elem == 1 && plane > 0 && total == meta.numel() {
+                    // Batched transpose materialize: for many-small-planes (attention `.mT`) the
+                    // kernel builds the output uninitialized so the parallel per-plane transpose does
+                    // the page first-touch (no dead serial `vec![0.0; total]`); few-large-planes keep
+                    // the pre-faulted path unchanged (plane-size gated → can't regress). See
+                    // ft_kernel_cpu::transpose_batched_materialize_f64.
+                    match tensor.typed_storage() {
+                        TensorStorage::F64(values) => {
+                            let src = Self::checked_storage_slice(values, start, end)?;
+                            let dst = ft_kernel_cpu::transpose_batched_materialize_f64(
+                                src, batch, a_dim, b_dim,
+                            );
+                            return Ok(TensorStorage::F64(Arc::new(dst)));
+                        }
+                        TensorStorage::F32(values) => {
+                            let src = Self::checked_storage_slice(values, start, end)?;
+                            let dst = ft_kernel_cpu::transpose_batched_materialize_f32(
+                                src, batch, a_dim, b_dim,
+                            );
+                            return Ok(TensorStorage::F32(Arc::new(dst)));
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
         Ok(match tensor.typed_storage() {
             TensorStorage::F32(values) => TensorStorage::F32(Arc::new(Self::permute_slice(
                 Self::checked_storage_slice(values, start, end)?,
@@ -10137,7 +10488,7 @@ impl TensorTape {
         })
     }
 
-    fn permute_slice<T: Clone + Send + Sync>(
+    fn permute_slice<T: Copy + Send + Sync>(
         src: &[T],
         src_shape: &[usize],
         perm: &[usize],
@@ -10194,78 +10545,114 @@ impl TensorTape {
             // Contiguous element = the fixed suffix dims (empty product = 1).
             let elem: usize = src_shape[prefix + mid..ndim].iter().product();
             let plane = a_dim * b_dim * elem;
-            let mut dst = vec![src[0].clone(); numel];
-            // 16×16 (~2 KB f64) fits L1, minimizing the transpose's destination
-            // write cache-misses — a TILE sweep showed 16 clearly beats 32/64/128
-            // (2.2x vs 1.2x at 2048², and large tiles regress as the working set
-            // spills L1).
+            // The TILE transpose writes EVERY dst element exactly once (pure data movement, no
+            // reads of dst) → factor it so both allocation strategies below share it. 16×16
+            // (~2 KB f64) TILE fits L1 (sweep: 16 beats 32/64/128; 2.2x vs 1.2x at 2048²).
             const TILE: usize = 16;
-            if let Some(batch) = numel.checked_div(plane) {
-                use rayon::prelude::*;
-                // One plane's cache-blocked [a_dim, b_dim] transpose of elem-runs.
-                let transpose_plane = |sgn: &[T], dgn: &mut [T]| {
-                    let mut ii = 0;
-                    while ii < a_dim {
-                        let i_end = (ii + TILE).min(a_dim);
-                        let mut jj = 0;
-                        while jj < b_dim {
-                            let j_end = (jj + TILE).min(b_dim);
-                            for i in ii..i_end {
-                                for j in jj..j_end {
-                                    let s_off = (i * b_dim + j) * elem;
-                                    let d_off = (j * a_dim + i) * elem;
-                                    dgn[d_off..d_off + elem]
-                                        .clone_from_slice(&sgn[s_off..s_off + elem]);
-                                }
-                            }
-                            jj += TILE;
-                        }
-                        ii += TILE;
-                    }
-                };
-                // The transpose is pure data movement — each dst element is written
-                // exactly once, so any disjoint-chunk parallel split is bit-for-bit
-                // identical to the serial sweep. Fan out above PAR_MIN (tiny permutes
-                // keep serial so rayon split/join doesn't dominate). frankentorch-permpar.
-                const PAR_MIN: usize = 1 << 16;
-                if numel < PAR_MIN {
-                    for bi in 0..batch {
-                        let base = bi * plane;
-                        transpose_plane(&src[base..base + plane], &mut dst[base..base + plane]);
-                    }
-                } else if batch >= 2 {
-                    // Independent planes → disjoint contiguous dst chunks (covers the
-                    // batched attention/conv-layout permutes where batch = leading dims).
-                    dst.par_chunks_mut(plane)
-                        .zip(src[..numel].par_chunks(plane))
-                        .for_each(|(dgn, sgn)| transpose_plane(sgn, dgn));
-                } else {
-                    // Single large plane (e.g. a plain 2-D transpose): parallelize the
-                    // output row-tiles. A TILE block of output rows j ∈ [jj, j_end) owns
-                    // the contiguous dst region [jj·a_dim·elem .. j_end·a_dim·elem),
-                    // reading scattered src — disjoint writes, so still bit-exact.
-                    let row = a_dim * elem;
-                    dst.par_chunks_mut(row * TILE)
-                        .enumerate()
-                        .for_each(|(blk, dblk)| {
-                            let jj = blk * TILE;
-                            let j_end = jj + dblk.len() / row;
-                            let mut ii = 0;
-                            while ii < a_dim {
-                                let i_end = (ii + TILE).min(a_dim);
-                                for j in jj..j_end {
+            let do_transpose = |dst: &mut [T]| {
+                if let Some(batch) = numel.checked_div(plane) {
+                    use rayon::prelude::*;
+                    // One plane's cache-blocked [a_dim, b_dim] transpose of elem-runs.
+                    let transpose_plane = |sgn: &[T], dgn: &mut [T]| {
+                        let mut ii = 0;
+                        while ii < a_dim {
+                            let i_end = (ii + TILE).min(a_dim);
+                            let mut jj = 0;
+                            while jj < b_dim {
+                                let j_end = (jj + TILE).min(b_dim);
+                                if elem == 1 {
+                                    // SCALAR fast path for the pure transpose (no suffix dims — the
+                                    // dominant 2-D / matrix_transpose case). A direct element move is
+                                    // ~3x faster than `clone_from_slice` of a 1-element slice, which
+                                    // pays a call + 4 range-bounds checks PER ELEMENT (16M of them at
+                                    // 4k×4k). Bit-identical (same single value moved).
                                     for i in ii..i_end {
-                                        let s_off = (i * b_dim + j) * elem;
-                                        let d_off = ((j - jj) * a_dim + i) * elem;
-                                        dblk[d_off..d_off + elem]
-                                            .clone_from_slice(&src[s_off..s_off + elem]);
+                                        for j in jj..j_end {
+                                            dgn[j * a_dim + i] = sgn[i * b_dim + j].clone();
+                                        }
+                                    }
+                                } else {
+                                    for i in ii..i_end {
+                                        for j in jj..j_end {
+                                            let s_off = (i * b_dim + j) * elem;
+                                            let d_off = (j * a_dim + i) * elem;
+                                            dgn[d_off..d_off + elem]
+                                                .clone_from_slice(&sgn[s_off..s_off + elem]);
+                                        }
                                     }
                                 }
-                                ii += TILE;
+                                jj += TILE;
                             }
-                        });
+                            ii += TILE;
+                        }
+                    };
+                    // The transpose is pure data movement — each dst element is written
+                    // exactly once, so any disjoint-chunk parallel split is bit-for-bit
+                    // identical to the serial sweep. Fan out above PAR_MIN (tiny permutes
+                    // keep serial so rayon split/join doesn't dominate). frankentorch-permpar.
+                    const PAR_MIN: usize = 1 << 16;
+                    if numel < PAR_MIN {
+                        for bi in 0..batch {
+                            let base = bi * plane;
+                            transpose_plane(&src[base..base + plane], &mut dst[base..base + plane]);
+                        }
+                    } else if batch >= 2 {
+                        // Independent planes → disjoint contiguous dst chunks (covers the
+                        // batched attention/conv-layout permutes where batch = leading dims).
+                        dst.par_chunks_mut(plane)
+                            .zip(src[..numel].par_chunks(plane))
+                            .for_each(|(dgn, sgn)| transpose_plane(sgn, dgn));
+                    } else {
+                        // Single large plane (e.g. a plain 2-D transpose): parallelize the
+                        // output row-tiles. A TILE block of output rows j ∈ [jj, j_end) owns
+                        // the contiguous dst region [jj·a_dim·elem .. j_end·a_dim·elem),
+                        // reading scattered src — disjoint writes, so still bit-exact.
+                        let row = a_dim * elem;
+                        dst.par_chunks_mut(row * TILE)
+                            .enumerate()
+                            .for_each(|(blk, dblk)| {
+                                let jj = blk * TILE;
+                                let j_end = jj + dblk.len() / row;
+                                let mut ii = 0;
+                                while ii < a_dim {
+                                    let i_end = (ii + TILE).min(a_dim);
+                                    if elem == 1 {
+                                        for j in jj..j_end {
+                                            for i in ii..i_end {
+                                                dblk[(j - jj) * a_dim + i] =
+                                                    src[i * b_dim + j].clone();
+                                            }
+                                        }
+                                    } else {
+                                        for j in jj..j_end {
+                                            for i in ii..i_end {
+                                                let s_off = (i * b_dim + j) * elem;
+                                                let d_off = ((j - jj) * a_dim + i) * elem;
+                                                dblk[d_off..d_off + elem]
+                                                    .clone_from_slice(&src[s_off..s_off + elem]);
+                                            }
+                                        }
+                                    }
+                                    ii += TILE;
+                                }
+                            });
+                    }
                 }
-            }
+            };
+            // Plane-size gate: uninit first-touch wins for MANY SMALL planes (measured 1.25-1.29x)
+            // but the STRIDED transpose faults pages in random order on FEW HUGE planes, where a
+            // sequential par-collect pre-fault is cheaper (measured 0.92x at plane=4.2M) — so use
+            // uninit only for planes <= this, else the pre-faulted par-collect path. Bit-identical
+            // either way (the transpose is the value-producing writer in both).
+            const UNINIT_PERMUTE_MAX_PLANE: usize = 1 << 21; // 2M elems/plane
+            let dst: Vec<T> = if plane <= UNINIT_PERMUTE_MAX_PLANE {
+                ft_kernel_cpu::build_uninit(numel, do_transpose)
+            } else {
+                use rayon::prelude::*;
+                let mut dst: Vec<T> = (0..numel).into_par_iter().map(|_| src[0]).collect();
+                do_transpose(&mut dst);
+                dst
+            };
             return Ok(dst);
         }
 
@@ -10338,6 +10725,36 @@ impl TensorTape {
         let output_strides = ft_core::contiguous_strides(target_shape);
         let input_strides =
             Self::broadcast_input_strides(shape, target_shape, "expand input strides overflow")?;
+        // Fast path: ROW-STRUCTURED broadcast for the hot float dtypes. The innermost target dim is
+        // either broadcast (input stride 0 → the whole inner row is one repeated value → fill) or
+        // copied (stride 1 → the row is a contiguous slice of the input → copy_from_slice). Unravel
+        // the OUTER coords ONCE PER ROW instead of running the full per-element div/mod gather over
+        // all output_numel elements. Bit-identical to the generic map_typed_storage gather below
+        // (same source value at every output position). Backs expand/broadcast materialization —
+        // meshgrid + every broadcasted bias/mean/var in norm op-graphs.
+        let nd = target_shape.len();
+        if output_numel > 0 && nd >= 1 && input_strides[nd - 1] <= 1 {
+            let fast = match &storage {
+                TensorStorage::F64(v) if !v.is_empty() => Some(TensorStorage::F64(Arc::new(
+                    Self::expand_row_structured(v, output_numel, target_shape, &input_strides),
+                ))),
+                TensorStorage::F64Inline4(v) if !v.as_slice().is_empty() => {
+                    Some(TensorStorage::F64(Arc::new(Self::expand_row_structured(
+                        v.as_slice(),
+                        output_numel,
+                        target_shape,
+                        &input_strides,
+                    ))))
+                }
+                TensorStorage::F32(v) if !v.is_empty() => Some(TensorStorage::F32(Arc::new(
+                    Self::expand_row_structured(v, output_numel, target_shape, &input_strides),
+                ))),
+                _ => None,
+            };
+            if let Some(out) = fast {
+                return Ok(out);
+            }
+        }
         Self::map_typed_storage(&storage, output_numel, |flat| {
             let mut remaining = flat;
             let mut src_flat = 0usize;
@@ -10348,6 +10765,25 @@ impl TensorTape {
             }
             Ok(src_flat)
         })
+    }
+
+    /// Row-structured broadcast materialization for a contiguous expand (see `expand_typed_storage`).
+    /// The innermost target dim is broadcast (`input_strides[last] == 0` → fill) or copied
+    /// (`== 1` → copy_from_slice); the outer coords are unravelled once per row. Bit-identical to the
+    /// per-element gather. Caller guarantees `values` non-empty, `output_numel > 0`, `inner_stride<=1`.
+    fn expand_row_structured<T: Copy + Send + Sync>(
+        values: &[T],
+        output_numel: usize,
+        target_shape: &[usize],
+        input_strides: &[usize],
+    ) -> Vec<T> {
+        // Delegate to ft-kernel-cpu, which builds the output into an UNINITIALIZED
+        // buffer (this crate is `#![forbid(unsafe_code)]`). The old body here did
+        // `vec![values[0]; output_numel]` — a serial first-touch of the fresh output
+        // that the per-row fill then fully overwrote (100% dead + single-threaded);
+        // single-threaded first-touch is the wall for pure-copy materializations. The
+        // kernel lets the (at-scale parallel) fill do the first-touch. Bit-identical.
+        ft_kernel_cpu::expand_row_structured(values, output_numel, target_shape, input_strides)
     }
 
     fn broadcast_input_strides(
@@ -11134,8 +11570,21 @@ impl TensorTape {
                     }
                 }
                 TensorNodeOp::Add { lhs, rhs } => {
-                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
-                    Self::accumulate_tensor_gradient(rhs, &mut grads[rhs.0], &incoming)?;
+                    // d(a+b)/da = d(a+b)/db = 1: add `incoming` to both operand grad slots.
+                    // Parallel per-index accumulate (bit-identical to the serial borrowed
+                    // accumulate; universal binary-op hot path). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
+                        lhs,
+                        &mut grads[lhs.0],
+                        incoming.len(),
+                        |index| incoming[index],
+                    )?;
+                    Self::accumulate_tensor_gradient_par_with(
+                        rhs,
+                        &mut grads[rhs.0],
+                        incoming.len(),
+                        |index| incoming[index],
+                    )?;
 
                     Self::complete_dependency(&mut pending, lhs, &mut queue)?;
                     Self::complete_dependency(&mut pending, rhs, &mut queue)?;
@@ -11147,9 +11596,15 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sub { lhs, rhs } => {
-                    Self::accumulate_tensor_gradient(lhs, &mut grads[lhs.0], &incoming)?;
-                    // rhs grad = -incoming, accumulated inline (no scratch Vec).
-                    Self::accumulate_tensor_gradient_with(
+                    // d(a-b)/da = 1 ; d(a-b)/db = -1. Parallel per-index accumulate
+                    // (bit-identical to the serial form). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
+                        lhs,
+                        &mut grads[lhs.0],
+                        incoming.len(),
+                        |index| incoming[index],
+                    )?;
+                    Self::accumulate_tensor_gradient_par_with(
                         rhs,
                         &mut grads[rhs.0],
                         incoming.len(),
@@ -11173,14 +11628,15 @@ impl TensorTape {
 
                     // d(a/b)/da = 1/b ; d(a/b)/db = -a/b^2. Same per-element f64
                     // expressions and ascending order as before, accumulated inline
-                    // (no lhs/rhs contrib Vecs; operands borrowed zero-copy for f64).
-                    Self::accumulate_tensor_gradient_with(
+                    // (no lhs/rhs contrib Vecs; operands borrowed zero-copy for f64) and
+                    // fanned over Rayon (bit-identical). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
                         lhs,
                         &mut grads[lhs.0],
                         incoming.len(),
                         |index| incoming[index] / rhs_values[index],
                     )?;
-                    Self::accumulate_tensor_gradient_with(
+                    Self::accumulate_tensor_gradient_par_with(
                         rhs,
                         &mut grads[rhs.0],
                         incoming.len(),
@@ -11207,14 +11663,15 @@ impl TensorTape {
 
                     // d(a*b)/da = b ; d(a*b)/db = a. Same per-element f64 products
                     // and ascending order as before, accumulated inline (no lhs/rhs
-                    // contrib Vecs; operands borrowed zero-copy for f64).
-                    Self::accumulate_tensor_gradient_with(
+                    // contrib Vecs; operands borrowed zero-copy for f64) and fanned over
+                    // Rayon (bit-identical). frankentorch-binop-bwd-par.
+                    Self::accumulate_tensor_gradient_par_with(
                         lhs,
                         &mut grads[lhs.0],
                         incoming.len(),
                         |index| incoming[index] * rhs_values[index],
                     )?;
-                    Self::accumulate_tensor_gradient_with(
+                    Self::accumulate_tensor_gradient_par_with(
                         rhs,
                         &mut grads[rhs.0],
                         incoming.len(),
@@ -11607,15 +12064,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Exp { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; output borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-
-                    let exp_contrib = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(grad, out_val)| grad * out_val)
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &exp_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |grad, out_val| grad * out_val,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11626,15 +12085,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Log { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let log_contrib = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(grad, val)| grad / val)
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &log_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, val| grad / val,
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11645,23 +12106,25 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Relu { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let relu_contrib = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(grad, val)| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, val| {
                             if val.is_nan() {
                                 f64::NAN
-                            } else if *val > 0.0 {
-                                *grad
+                            } else if val > 0.0 {
+                                grad
                             } else {
                                 0.0
                             }
-                        })
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &relu_contrib)?;
+                        },
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11672,15 +12135,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sigmoid { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; output borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-
-                    let sigmoid_contrib = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(grad, s)| grad * s * (1.0 - s))
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sigmoid_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |grad, s| grad * s * (1.0 - s),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11691,15 +12156,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Tanh { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; output borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-
-                    let tanh_contrib = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(grad, t)| grad * (1.0 - t * t))
-                        .collect::<Vec<_>>();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &tanh_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |grad, t| grad * (1.0 - t * t),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11710,14 +12177,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sin { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let sin_contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |grad, x| {
-                            grad * x.cos()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &sin_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, x| grad * x.cos(),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11728,14 +12198,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Cos { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-
-                    let cos_contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |grad, x| {
-                            grad * (-x.sin())
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &cos_contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |grad, x| grad * (-x.sin()),
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -11878,14 +12351,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Asin { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx asin(x) = 1/sqrt(1-x^2)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g / (1.0 - x * x).sqrt()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx asin(x) = 1/sqrt(1-x^2). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g / (1.0 - x * x).sqrt(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -11894,14 +12369,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Acos { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx acos(x) = -1/sqrt(1-x^2)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            -g / (1.0 - x * x).sqrt()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx acos(x) = -1/sqrt(1-x^2). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| -g / (1.0 - x * x).sqrt(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -11910,15 +12387,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Atan { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx atan(x) = 1/(1+x^2)
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(input_values.iter())
-                        .map(|(g, x)| g / (1.0 + x * x))
-                        .collect();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx atan(x) = 1/(1+x^2). Fused parallel map (was a serial map +
+                    // serial accumulate) into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g / (1.0 + x * x),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -11927,14 +12406,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Sinh { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx sinh(x) = cosh(x)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g * x.cosh()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx sinh(x) = cosh(x). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g * x.cosh(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -11943,14 +12424,16 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Cosh { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    // d/dx cosh(x) = sinh(x)
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g * x.sinh()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    // d/dx cosh(x) = sinh(x). Fused parallel map into the grad slot.
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g * x.sinh(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -11983,14 +12466,22 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Silu { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fuse the parallel derivative map straight into the grad slot (no scratch
+                    // Vec, no serial accumulate) and borrow the input zero-copy. Bit-for-bit
+                    // identical to the prior tensor_backward_zip_map + accumulate_tensor_gradient.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| {
                             let s = 1.0 / (1.0 + (-x).exp());
                             g * s * (1.0 + x * (1.0 - s))
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        },
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12015,14 +12506,20 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Elu { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| {
                             let derivative = if x <= 0.0 { x.exp() } else { 1.0 };
                             g * derivative
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        },
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12031,14 +12528,17 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Rsqrt { input } => {
-                    let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map (was a fully SERIAL map + serial accumulate) into the
+                    // grad slot; output borrowed zero-copy. frankentorch-act-bwd-fused.
+                    let output_values = Self::operand_values_cow(&self.nodes[node_id.0].tensor)?;
                     Self::ensure_tensor_len(node_id, output_values.len(), incoming.len())?;
-                    let contrib: Vec<f64> = incoming
-                        .iter()
-                        .zip(output_values.iter())
-                        .map(|(g, y)| g * (-0.5 * y * y * y))
-                        .collect();
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        output_values.as_ref(),
+                        |g, y| g * (-0.5 * y * y * y),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12047,14 +12547,18 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Erf { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
                     let coeff = 2.0 / std::f64::consts::PI.sqrt();
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
-                            g * coeff * (-x * x).exp()
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| g * coeff * (-x * x).exp(),
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12141,18 +12645,24 @@ impl TensorTape {
                     });
                 }
                 TensorNodeOp::Softplus { input } => {
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    // Fused parallel map into the grad slot; input borrowed zero-copy.
+                    // frankentorch-act-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
                     Self::ensure_tensor_len(input, input_values.len(), incoming.len())?;
-                    let contrib =
-                        Self::tensor_backward_zip_map(&incoming, &input_values, |g, x| {
+                    Self::accumulate_tensor_gradient_zip_map(
+                        input,
+                        &mut grads[input.0],
+                        &incoming,
+                        input_values.as_ref(),
+                        |g, x| {
                             let grad = if x > 20.0 {
                                 1.0
                             } else {
                                 1.0 / (1.0 + (-x).exp())
                             };
                             g * grad
-                        });
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
+                        },
+                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
                     steps.push(TensorBackwardStep {
                         node: node_id,
@@ -12500,9 +13010,12 @@ impl TensorTape {
                     // contribution only to read it back once — that buffer is pure
                     // alloc+fill+read traffic on the universal `loss.backward()`
                     // reduction. Bit-identical to the prior form: same ascending
-                    // index order, same `target[i] += grad_scalar` f64 op.
-                    // frankentorch-96e5d.
-                    Self::accumulate_tensor_gradient_with(
+                    // index order, same `target[i] += grad_scalar` f64 op. Parallelized:
+                    // the broadcast fill/accumulate fans over Rayon (bit-identical to the
+                    // serial form — constant contribution, ascending order, below-threshold
+                    // fallback stays serial). This is the universal `loss.backward()` hot
+                    // path, so the serial 16.7M fill dominated it. frankentorch-96e5d.
+                    Self::accumulate_tensor_gradient_par_with(
                         input,
                         &mut grads[input.0],
                         input_numel,
@@ -12528,9 +13041,10 @@ impl TensorTape {
                     // `grad_scalar * scale` lazily rather than materializing a full
                     // `mean_contrib` Vec. `contrib_val` is computed once so the f64
                     // product is bit-identical to the prior per-slot fill, then added
-                    // in the same ascending index order. frankentorch-96e5d.
+                    // in the same ascending index order (Rayon-parallel, below-threshold
+                    // fallback stays serial). frankentorch-96e5d.
                     let contrib_val = grad_scalar * scale;
-                    Self::accumulate_tensor_gradient_with(
+                    Self::accumulate_tensor_gradient_par_with(
                         input,
                         &mut grads[input.0],
                         input_numel,
@@ -12649,44 +13163,55 @@ impl TensorTape {
                         "prod_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
-                    let mut prod_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let out_idx = outer * inner_size + inner;
-                            let grad_val = incoming[out_idx];
-                            let prod_val = output_values[out_idx];
-                            // Count zeros in this slice
-                            let mut zero_count = 0;
-                            let mut prod_no_zero = 1.0;
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let v = input_values[idx];
-                                if v == 0.0 {
-                                    zero_count += 1;
-                                } else {
-                                    prod_no_zero *= v;
+                    // Fused single Rayon pass. Precompute each lane's (zero_count,
+                    // prod_no_zero) once — parallel across lanes, but the within-lane product
+                    // keeps the original serial r-order so `prod_no_zero` is bit-for-bit
+                    // identical — then write each dx_i straight into the grad slot. No scratch
+                    // Vec, no serial accumulate, input borrowed zero-copy. Bit-for-bit
+                    // identical to the prior serial path. frankentorch-normp-bwd-fused.
+                    let lane_info: Vec<(usize, f64)> = {
+                        use rayon::prelude::*;
+                        (0..expected_incoming)
+                            .into_par_iter()
+                            .map(|oi| {
+                                let outer = oi / inner_size;
+                                let inner = oi % inner_size;
+                                let base = outer * reduce_size * inner_size + inner;
+                                let mut zero_count = 0usize;
+                                let mut prod_no_zero = 1.0;
+                                for r in 0..reduce_size {
+                                    let v = iv[base + r * inner_size];
+                                    if v == 0.0 {
+                                        zero_count += 1;
+                                    } else {
+                                        prod_no_zero *= v;
+                                    }
                                 }
-                            }
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let v = input_values[idx];
-                                prod_dim_contrib[idx] = if zero_count == 0 {
-                                    grad_val * prod_val / v
-                                } else if zero_count == 1 && v == 0.0 {
-                                    grad_val * prod_no_zero
-                                } else {
-                                    0.0
-                                };
-                            }
-                        }
-                    }
-                    Self::accumulate_tensor_gradient(
+                                (zero_count, prod_no_zero)
+                            })
+                            .collect()
+                    };
+                    Self::accumulate_tensor_gradient_par_with(
                         input,
                         &mut grads[input.0],
-                        &prod_dim_contrib,
+                        input_numel,
+                        |idx| {
+                            let inner = idx % inner_size;
+                            let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                            let (zero_count, prod_no_zero) = lane_info[oi];
+                            let v = iv[idx];
+                            if zero_count == 0 {
+                                incoming[oi] * output_values[oi] / v
+                            } else if zero_count == 1 && v == 0.0 {
+                                incoming[oi] * prod_no_zero
+                            } else {
+                                0.0
+                            }
+                        },
                     )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -12714,32 +13239,47 @@ impl TensorTape {
                         "var_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let correction = if reduce_size > 1 {
                         (reduce_size - 1) as f64
                     } else {
                         1.0
                     };
-                    let mut var_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let grad_val = incoming[outer * inner_size + inner];
-                            // Compute mean along dim
-                            let mut sum = 0.0;
-                            for r in 0..reduce_size {
-                                sum += input_values
-                                    [outer * reduce_size * inner_size + r * inner_size + inner];
-                            }
-                            let mean = sum / reduce_size as f64;
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let diff = input_values[idx] - mean;
-                                var_dim_contrib[idx] = grad_val * 2.0 * diff / correction;
-                            }
-                        }
-                    }
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &var_dim_contrib)?;
+                    // Fused single Rayon pass. Precompute each reduction lane's mean once
+                    // (parallel over lanes; the within-lane sum keeps the original serial
+                    // r-order so the mean is bit-for-bit identical), then write each
+                    // dx_i = grad * 2 * (x_i - mean_lane) / correction straight into the grad
+                    // slot — no scratch Vec, no serial accumulate, input borrowed zero-copy.
+                    // Bit-for-bit identical to the prior serial fill + accumulate.
+                    // frankentorch-normp-bwd-fused.
+                    let means: Vec<f64> = {
+                        use rayon::prelude::*;
+                        (0..expected_incoming)
+                            .into_par_iter()
+                            .map(|oi| {
+                                let outer = oi / inner_size;
+                                let inner = oi % inner_size;
+                                let base = outer * reduce_size * inner_size + inner;
+                                let mut sum = 0.0;
+                                for r in 0..reduce_size {
+                                    sum += iv[base + r * inner_size];
+                                }
+                                sum / reduce_size as f64
+                            })
+                            .collect()
+                    };
+                    Self::accumulate_tensor_gradient_par_with(
+                        input,
+                        &mut grads[input.0],
+                        input_numel,
+                        |idx| {
+                            let inner = idx % inner_size;
+                            let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                            incoming[oi] * 2.0 * (iv[idx] - means[oi]) / correction
+                        },
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12766,39 +13306,51 @@ impl TensorTape {
                         "std_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
                     let correction = if reduce_size > 1 {
                         (reduce_size - 1) as f64
                     } else {
                         1.0
                     };
-                    let mut std_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let out_idx = outer * inner_size + inner;
-                            let grad_val = incoming[out_idx];
-                            let std_val = output_values[out_idx];
-                            // Compute mean along dim
-                            let mut sum = 0.0;
-                            for r in 0..reduce_size {
-                                sum += input_values
-                                    [outer * reduce_size * inner_size + r * inner_size + inner];
+                    // Fused single Rayon pass (see VarDim above). Per-lane mean precomputed
+                    // once with the original serial within-lane sum order (bit-identical),
+                    // then dx_i = grad * (x_i - mean_lane) / (correction * std_lane) written
+                    // straight into the grad slot; std_lane == 0 yields 0 exactly as before.
+                    // frankentorch-normp-bwd-fused.
+                    let means: Vec<f64> = {
+                        use rayon::prelude::*;
+                        (0..expected_incoming)
+                            .into_par_iter()
+                            .map(|oi| {
+                                let outer = oi / inner_size;
+                                let inner = oi % inner_size;
+                                let base = outer * reduce_size * inner_size + inner;
+                                let mut sum = 0.0;
+                                for r in 0..reduce_size {
+                                    sum += iv[base + r * inner_size];
+                                }
+                                sum / reduce_size as f64
+                            })
+                            .collect()
+                    };
+                    Self::accumulate_tensor_gradient_par_with(
+                        input,
+                        &mut grads[input.0],
+                        input_numel,
+                        |idx| {
+                            let inner = idx % inner_size;
+                            let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                            let std_val = output_values[oi];
+                            if std_val != 0.0 {
+                                incoming[oi] * (iv[idx] - means[oi]) / (correction * std_val)
+                            } else {
+                                0.0
                             }
-                            let mean = sum / reduce_size as f64;
-                            for r in 0..reduce_size {
-                                let idx = outer * reduce_size * inner_size + r * inner_size + inner;
-                                let diff = input_values[idx] - mean;
-                                std_dim_contrib[idx] = if std_val != 0.0 {
-                                    grad_val * diff / (correction * std_val)
-                                } else {
-                                    0.0
-                                };
-                            }
-                        }
-                    }
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &std_dim_contrib)?;
+                        },
+                    )?;
 
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
@@ -12814,47 +13366,89 @@ impl TensorTape {
                     input_numel,
                 } => {
                     let grad_scalar = incoming[0];
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
                     let norm_val = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?[0];
-                    let mut norm_contrib = vec![0.0; input_numel];
 
+                    // Backward of a full-tensor p-norm: each dx_i depends only on x_i,
+                    // grad_scalar and the scalar norm_val (no cross-element coupling), so the
+                    // whole contribution fuses into the gradient slot in ONE Rayon pass — no
+                    // 128MB input clone (borrow via operand_values_cow), no zero-init scratch
+                    // `Vec`, no separate serial accumulate loop. Bit-for-bit identical to the
+                    // prior clone+scratch+serial-accumulate path: same per-element formula,
+                    // ascending index order, and IEEE-commutative `0.0 + c` / `+= c` writes.
+                    // frankentorch-normp-bwd-fused.
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     if p == 2.0 {
                         // d/dx_i = x_i / norm
                         if norm_val != 0.0 {
-                            for i in 0..input_numel {
-                                norm_contrib[i] = grad_scalar * input_values[i] / norm_val;
-                            }
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |i| grad_scalar * iv[i] / norm_val,
+                            )?;
+                        } else {
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |_| 0.0,
+                            )?;
                         }
                     } else if p == 1.0 {
                         // d/dx_i = sign(x_i)
-                        for i in 0..input_numel {
-                            norm_contrib[i] = grad_scalar * Self::torch_sign(input_values[i]);
-                        }
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |i| grad_scalar * Self::torch_sign(iv[i]),
+                        )?;
                     } else if p.is_infinite() {
-                        // Gradient flows to the element(s) achieving the extremum
-                        // For inf-norm: the element with max |x_i|
-                        // For -inf-norm: the element with min |x_i|
+                        // Gradient flows to the element(s) achieving the extremum:
+                        // inf-norm -> max |x_i|, -inf-norm -> min |x_i|.
                         if norm_val != 0.0 {
-                            for i in 0..input_numel {
-                                if input_values[i].abs() == norm_val {
-                                    norm_contrib[i] =
-                                        grad_scalar * Self::torch_sign(input_values[i]);
-                                }
-                            }
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |i| {
+                                    if iv[i].abs() == norm_val {
+                                        grad_scalar * Self::torch_sign(iv[i])
+                                    } else {
+                                        0.0
+                                    }
+                                },
+                            )?;
+                        } else {
+                            Self::accumulate_tensor_gradient_par_with(
+                                input,
+                                &mut grads[input.0],
+                                input_numel,
+                                |_| 0.0,
+                            )?;
                         }
                     } else if p != 0.0 && norm_val != 0.0 {
                         // General p-norm: d/dx_i = sign(x_i) * |x_i|^(p-1) / norm^(p-1)
                         let norm_pow = norm_val.powf(p - 1.0);
-                        for i in 0..input_numel {
-                            norm_contrib[i] = grad_scalar
-                                * Self::torch_sign(input_values[i])
-                                * input_values[i].abs().powf(p - 1.0)
-                                / norm_pow;
-                        }
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |i| {
+                                grad_scalar * Self::torch_sign(iv[i]) * iv[i].abs().powf(p - 1.0)
+                                    / norm_pow
+                            },
+                        )?;
+                    } else {
+                        // p == 0 (non-differentiable) or degenerate norm: zero gradient,
+                        // matching the original all-zero `norm_contrib` accumulate.
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |_| 0.0,
+                        )?;
                     }
-                    // p == 0: gradient is zero (non-differentiable)
-
-                    Self::accumulate_tensor_gradient(input, &mut grads[input.0], &norm_contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -12881,63 +13475,97 @@ impl TensorTape {
                         "norm_dim backward shape multiplication overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, expected_incoming, incoming.len())?;
-                    let input_values = self.nodes[input.0].tensor.contiguous_values_as_f64()?;
+                    let input_values = Self::operand_values_cow(&self.nodes[input.0].tensor)?;
+                    let iv = input_values.as_ref();
                     let output_values = self.nodes[node_id.0].tensor.contiguous_values_as_f64()?;
-                    let mut norm_dim_contrib = vec![0.0; input_numel];
 
-                    for outer in 0..outer_size {
-                        for inner in 0..inner_size {
-                            let out_idx = outer * inner_size + inner;
-                            let grad_val = incoming[out_idx];
-                            let norm_val = output_values[out_idx];
-
-                            if p == 2.0 {
+                    // Fused single Rayon pass: each input index `idx` maps to its reduction
+                    // lane `oi = outer*inner_size + inner` (inner = idx % inner_size,
+                    // outer = idx / inner_size / reduce_size). The per-element gradient is a
+                    // pure fn of iv[idx] and the lane's norm_val/grad_val — no cross-element
+                    // coupling — so it writes straight into the grad slot with no scratch
+                    // `Vec` and no separate serial accumulate. Bit-for-bit identical to the
+                    // prior nested-serial-fill + accumulate path (same per-lane norm^(p-1),
+                    // same formula, ascending index order). frankentorch-normp-bwd-fused.
+                    if p == 2.0 {
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                let norm_val = output_values[oi];
                                 if norm_val != 0.0 {
-                                    for r in 0..reduce_size {
-                                        let idx = outer * reduce_size * inner_size
-                                            + r * inner_size
-                                            + inner;
-                                        norm_dim_contrib[idx] =
-                                            grad_val * input_values[idx] / norm_val;
-                                    }
+                                    incoming[oi] * iv[idx] / norm_val
+                                } else {
+                                    0.0
                                 }
-                            } else if p == 1.0 {
-                                for r in 0..reduce_size {
-                                    let idx =
-                                        outer * reduce_size * inner_size + r * inner_size + inner;
-                                    norm_dim_contrib[idx] =
-                                        grad_val * Self::torch_sign(input_values[idx]);
+                            },
+                        )?;
+                    } else if p == 1.0 {
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                incoming[oi] * Self::torch_sign(iv[idx])
+                            },
+                        )?;
+                    } else if p.is_infinite() {
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                let norm_val = output_values[oi];
+                                if norm_val != 0.0 && iv[idx].abs() == norm_val {
+                                    incoming[oi] * Self::torch_sign(iv[idx])
+                                } else {
+                                    0.0
                                 }
-                            } else if p.is_infinite() {
+                            },
+                        )?;
+                    } else if p != 0.0 {
+                        // General p: precompute per-lane norm^(p-1) exactly once (matches the
+                        // serial `norm_pow` bit-for-bit); the 0.0 placeholder for zero lanes is
+                        // never divided by (guarded on norm_val != 0.0 in the closure).
+                        let norm_pow: Vec<f64> = output_values
+                            .iter()
+                            .map(|&nv| if nv != 0.0 { nv.powf(p - 1.0) } else { 0.0 })
+                            .collect();
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |idx| {
+                                let inner = idx % inner_size;
+                                let oi = (idx / inner_size / reduce_size) * inner_size + inner;
+                                let norm_val = output_values[oi];
                                 if norm_val != 0.0 {
-                                    for r in 0..reduce_size {
-                                        let idx = outer * reduce_size * inner_size
-                                            + r * inner_size
-                                            + inner;
-                                        if input_values[idx].abs() == norm_val {
-                                            norm_dim_contrib[idx] =
-                                                grad_val * Self::torch_sign(input_values[idx]);
-                                        }
-                                    }
+                                    incoming[oi]
+                                        * Self::torch_sign(iv[idx])
+                                        * iv[idx].abs().powf(p - 1.0)
+                                        / norm_pow[oi]
+                                } else {
+                                    0.0
                                 }
-                            } else if p != 0.0 && norm_val != 0.0 {
-                                let norm_pow = norm_val.powf(p - 1.0);
-                                for r in 0..reduce_size {
-                                    let idx =
-                                        outer * reduce_size * inner_size + r * inner_size + inner;
-                                    norm_dim_contrib[idx] = grad_val
-                                        * Self::torch_sign(input_values[idx])
-                                        * input_values[idx].abs().powf(p - 1.0)
-                                        / norm_pow;
-                                }
-                            }
-                        }
+                            },
+                        )?;
+                    } else {
+                        // p == 0: gradient is zero (non-differentiable), matching the original
+                        // all-zero `norm_dim_contrib` accumulate.
+                        Self::accumulate_tensor_gradient_par_with(
+                            input,
+                            &mut grads[input.0],
+                            input_numel,
+                            |_| 0.0,
+                        )?;
                     }
-                    Self::accumulate_tensor_gradient(
-                        input,
-                        &mut grads[input.0],
-                        &norm_dim_contrib,
-                    )?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
 
                     steps.push(TensorBackwardStep {
@@ -13512,34 +14140,67 @@ impl TensorTape {
                         "expand backward output shape volume overflow",
                     )?;
                     Self::ensure_tensor_len(node_id, out_numel, incoming.len())?;
-                    let mut contrib = vec![0.0; orig_numel];
-
+                    // Bit-exact PARALLEL broadcast-reduction. Instead of the serial
+                    // scatter-add `contrib[orig_idx] += incoming[k]` over all out_numel
+                    // outputs, compute each contrib[o] INDEPENDENTLY by gathering its
+                    // contributing incoming elements in ascending output-flat order — a
+                    // mixed-radix odometer over the broadcast dims with the leftmost
+                    // (most-significant / largest-stride) dim first. Ascending flat order
+                    // == the serial visit order for a fixed reduced index, so the f64 sum
+                    // is bit-for-bit identical; parallelizing over `o` has no write
+                    // contention. Gated on out_numel (the work), not orig_numel (lane
+                    // count, often small e.g. a bias vector). frankentorch-expand-bwd-par.
                     let grad_strides = ft_core::contiguous_strides(&output_shape);
                     let orig_strides = ft_core::contiguous_strides(original_shape);
-                    let mut coords = vec![0usize; ndim];
-
-                    for _ in 0..out_numel {
-                        let mut orig_idx = 0usize;
-                        let mut grad_idx = 0usize;
-                        for d in 0..ndim {
-                            grad_idx += coords[d] * grad_strides[d];
-                            if d >= prefix {
-                                let input_dim = d - prefix;
-                                if original_shape[input_dim] != 1 {
-                                    orig_idx += coords[d] * orig_strides[input_dim];
-                                }
+                    // Split the output dims into KEPT (coord taken from o) and BROADCAST
+                    // (summed over). A dim is broadcast if it is a leading prefix dim, or
+                    // the corresponding input dim has extent 1.
+                    let mut kept: Vec<(usize, usize)> = Vec::new(); // (input_dim, grad_stride)
+                    let mut bcast: Vec<(usize, usize)> = Vec::new(); // (extent, grad_stride), ascending d
+                    for d in 0..ndim {
+                        if d >= prefix {
+                            let input_dim = d - prefix;
+                            if original_shape[input_dim] != 1 {
+                                kept.push((input_dim, grad_strides[d]));
+                                continue;
                             }
                         }
-                        contrib[orig_idx] += incoming[grad_idx];
-
-                        for d in (0..ndim).rev() {
-                            coords[d] += 1;
-                            if coords[d] < output_shape[d] {
-                                break;
-                            }
-                            coords[d] = 0;
-                        }
+                        bcast.push((output_shape[d], grad_strides[d]));
                     }
+                    // Suffix products so the flat combo index j decodes with the first
+                    // (leftmost) broadcast dim most-significant -> incrementing j walks the
+                    // gathered offsets in ascending output-flat order.
+                    let mut bcast_suffix = vec![1usize; bcast.len()];
+                    for i in (0..bcast.len().saturating_sub(1)).rev() {
+                        bcast_suffix[i] = bcast_suffix[i + 1] * bcast[i + 1].0;
+                    }
+                    // 1 for no broadcast dims; 0 if any output dim has extent 0 (=> no
+                    // contributions, matching the serial loop's zero iterations).
+                    let bcast_count: usize = bcast.iter().map(|&(e, _)| e).product();
+                    let incoming_ref: &[f64] = &incoming;
+                    let compute = |o: usize| -> f64 {
+                        let mut base = 0usize;
+                        for &(input_dim, gstride) in &kept {
+                            let c = (o / orig_strides[input_dim]) % original_shape[input_dim];
+                            base += c * gstride;
+                        }
+                        let mut sum = 0.0;
+                        for j in 0..bcast_count {
+                            let mut off = base;
+                            for (bi, &(_, gstride)) in bcast.iter().enumerate() {
+                                let coord = (j / bcast_suffix[bi]) % bcast[bi].0;
+                                off += coord * gstride;
+                            }
+                            sum += incoming_ref[off];
+                        }
+                        sum
+                    };
+                    let contrib: Vec<f64> = if out_numel >= (1 << 15) {
+                        use rayon::prelude::*;
+                        (0..orig_numel).into_par_iter().map(compute).collect()
+                    } else {
+                        (0..orig_numel).map(compute).collect()
+                    };
 
                     Self::accumulate_tensor_gradient(input, &mut grads[input.0], &contrib)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -19181,57 +19842,58 @@ impl TensorTape {
         let dim_size = shape[dim];
         let dim_size_i = isize::try_from(dim_size)
             .map_err(|_| Self::shape_overflow_error("roll dimension size exceeds isize range"))?;
+        // dim_size > 0 is guaranteed here: `numel == 0` already returned above, and `numel` is a
+        // product that includes `shape[dim] = dim_size`, so `numel > 0` implies `dim_size > 0`.
+        let shift_mod =
+            Self::normalized_roll_shift(shift, dim_size_i, "roll shift normalization overflow")?;
+        // Output-driven parallel gather: dst_coord[dim] = (src + shift) mod n,
+        // so src_coord[dim] = (dst + n - shift) mod n. Each output written once
+        // → bit-for-bit identical to the serial scatter. frankentorch-permpar.
+        const PAR_MIN: usize = 1 << 16;
+        if numel >= PAR_MIN {
+            use rayon::prelude::*;
+            let inv_shift = (dim_size - shift_mod) % dim_size;
+            let result = (0..numel)
+                .into_par_iter()
+                .map(|flat_out| {
+                    let mut rem = flat_out;
+                    let mut src_flat = 0usize;
+                    for (d, &stride) in strides.iter().enumerate() {
+                        let oc = rem / stride;
+                        rem %= stride;
+                        let sc = if d == dim {
+                            Self::add_normalized_roll_shift(oc, inv_shift, dim_size)
+                        } else {
+                            oc
+                        };
+                        src_flat += sc * stride;
+                    }
+                    values[src_flat].clone()
+                })
+                .collect();
+            return Ok(result);
+        }
+        // Serial scatter for SMALL rolls only: allocate the destination HERE. The parallel path
+        // above builds + returns its OWN buffer, so a top-level `vec![values[0]; numel]` was DEAD
+        // WEIGHT for every large roll — a wasted serial first-touch of the whole output (~30ms at
+        // 64MB) that was immediately shadowed. (Large rolls reach roll_slice via tensor_roll's grad
+        // / non-f32-f64 fallback; the no-grad float roll has its own parallel fast path in ft-api.)
         let mut result = vec![values[0].clone(); numel];
-
-        if dim_size > 0 {
-            let shift_mod = Self::normalized_roll_shift(
-                shift,
-                dim_size_i,
-                "roll shift normalization overflow",
-            )?;
-            // Output-driven parallel gather: dst_coord[dim] = (src + shift) mod n,
-            // so src_coord[dim] = (dst + n - shift) mod n. Each output written once
-            // → bit-for-bit identical to the serial scatter. frankentorch-permpar.
-            const PAR_MIN: usize = 1 << 16;
-            if numel >= PAR_MIN {
-                use rayon::prelude::*;
-                let inv_shift = (dim_size - shift_mod) % dim_size;
-                let result = (0..numel)
-                    .into_par_iter()
-                    .map(|flat_out| {
-                        let mut rem = flat_out;
-                        let mut src_flat = 0usize;
-                        for (d, &stride) in strides.iter().enumerate() {
-                            let oc = rem / stride;
-                            rem %= stride;
-                            let sc = if d == dim {
-                                Self::add_normalized_roll_shift(oc, inv_shift, dim_size)
-                            } else {
-                                oc
-                            };
-                            src_flat += sc * stride;
-                        }
-                        values[src_flat].clone()
-                    })
-                    .collect();
-                return Ok(result);
+        for (flat, value) in values.iter().enumerate().take(numel) {
+            let mut remaining = flat;
+            let mut coords = vec![0usize; ndim];
+            for d in 0..ndim {
+                coords[d] = remaining / strides[d];
+                remaining %= strides[d];
             }
-            for (flat, value) in values.iter().enumerate().take(numel) {
-                let mut remaining = flat;
-                let mut coords = vec![0usize; ndim];
-                for d in 0..ndim {
-                    coords[d] = remaining / strides[d];
-                    remaining %= strides[d];
-                }
 
-                coords[dim] = Self::add_normalized_roll_shift(coords[dim], shift_mod, dim_size);
+            coords[dim] = Self::add_normalized_roll_shift(coords[dim], shift_mod, dim_size);
 
-                let mut dst_flat = 0;
-                for d in 0..ndim {
-                    dst_flat += coords[d] * strides[d];
-                }
-                result[dst_flat] = value.clone();
+            let mut dst_flat = 0;
+            for d in 0..ndim {
+                dst_flat += coords[d] * strides[d];
             }
+            result[dst_flat] = value.clone();
         }
         Ok(result)
     }
@@ -19550,39 +20212,94 @@ impl TensorTape {
         })
     }
 
+    /// Slice a shared storage buffer. When the requested range covers the WHOLE
+    /// buffer — the common `reshape`/`squeeze`/`unsqueeze`/`flatten` case for a
+    /// contiguous, non-offset tensor — share the `Arc` (an O(1) refcount bump)
+    /// instead of copying every element. A genuine sub-slice (offset > 0 or a
+    /// narrowed span) still copies. Sharing is SAFE because in-place mutation goes
+    /// through `Arc::make_mut` (copy-on-write): a later write to either the input
+    /// or the reshaped view clones then, so the storages never alias destructively.
+    /// This matches torch, where these ops return a view over the same storage.
+    /// Build a reshaped/squeezed/unsqueezed tensor that SHARES the input's storage Arc and
+    /// PRESERVES its `storage_offset`. These ops only add/remove size-1 dims or relayout a
+    /// contiguous buffer — a pure metadata change, no data movement — so compacting to a fresh
+    /// offset-0 buffer (the old `compact_typed_storage` path) needlessly copies whenever the input
+    /// is itself an offset-view (e.g. a dim-0 `narrow` result). Sharing keeps such views zero-copy
+    /// (the last copy in `unbind` = narrow + squeeze). Caller must preserve numel. Contiguous input
+    /// required. COW (`Arc::make_mut`) preserves value semantics on any later in-place write.
+    fn view_reshaped_sharing_storage(
+        tensor: &DenseTensor,
+        new_shape: Vec<usize>,
+    ) -> Result<DenseTensor, AutogradError> {
+        let meta = tensor.meta();
+        if !meta.is_contiguous() {
+            return Err(AutogradError::DenseTensor(
+                DenseTensorError::UnsupportedLayout,
+            ));
+        }
+        let new_meta = ft_core::TensorMeta::from_shape(new_shape, meta.dtype(), meta.device())
+            .with_storage_offset(meta.storage_offset());
+        Ok(DenseTensor::from_typed_storage(
+            new_meta,
+            tensor.typed_storage().clone(),
+        )?)
+    }
+
+    fn slice_or_share_arc<T: Clone>(
+        values: &Arc<Vec<T>>,
+        start: usize,
+        end: usize,
+    ) -> Result<Arc<Vec<T>>, AutogradError> {
+        if start > end || end > values.len() {
+            return Err(AutogradError::DenseTensor(
+                DenseTensorError::InsufficientStorage {
+                    needed: end,
+                    actual: values.len(),
+                },
+            ));
+        }
+        if start == 0 && end == values.len() {
+            Ok(Arc::clone(values))
+        } else {
+            Ok(Arc::new(values[start..end].to_vec()))
+        }
+    }
+
     fn slice_typed_storage(
         storage: &TensorStorage,
         start: usize,
         end: usize,
     ) -> Result<TensorStorage, AutogradError> {
         match storage {
-            TensorStorage::F32(values) => Ok(TensorStorage::F32(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
-            TensorStorage::F64(values) => Ok(TensorStorage::F64(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
+            TensorStorage::F32(values) => Ok(TensorStorage::F32(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::F64(values) => Ok(TensorStorage::F64(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            // Inline storage has no Arc to share; it is at most 4 elements, so the
+            // copy is negligible.
             TensorStorage::F64Inline4(values) => Ok(TensorStorage::F64(Arc::new(
                 Self::checked_storage_slice(values.as_slice(), start, end)?.to_vec(),
             ))),
-            TensorStorage::F16(values) => Ok(TensorStorage::F16(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
-            TensorStorage::BF16(values) => Ok(TensorStorage::BF16(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
-            TensorStorage::Complex64(values) => Ok(TensorStorage::Complex64(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
-            TensorStorage::Complex128(values) => Ok(TensorStorage::Complex128(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
-            TensorStorage::QInt8(values) => Ok(TensorStorage::QInt8(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
-            TensorStorage::QUInt8(values) => Ok(TensorStorage::QUInt8(Arc::new(
-                Self::checked_storage_slice(values, start, end)?.to_vec(),
-            ))),
+            TensorStorage::F16(values) => Ok(TensorStorage::F16(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::BF16(values) => Ok(TensorStorage::BF16(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::Complex64(values) => Ok(TensorStorage::Complex64(
+                Self::slice_or_share_arc(values, start, end)?,
+            )),
+            TensorStorage::Complex128(values) => Ok(TensorStorage::Complex128(
+                Self::slice_or_share_arc(values, start, end)?,
+            )),
+            TensorStorage::QInt8(values) => Ok(TensorStorage::QInt8(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
+            TensorStorage::QUInt8(values) => Ok(TensorStorage::QUInt8(Self::slice_or_share_arc(
+                values, start, end,
+            )?)),
         }
     }
 
@@ -19741,17 +20458,39 @@ impl TensorTape {
         target: &mut TensorGradientSlot,
         contribution: &[f64],
     ) -> Result<(), AutogradError> {
+        // The single most-called gradient accumulator (~95 backward arms). Fan the
+        // fill/accumulate over Rayon above a threshold — bit-for-bit identical to the
+        // serial form (empty slot: ordered `0.0 + value` collect; non-empty:
+        // index-aligned `target[i] += contribution[i]`; below-threshold serial
+        // fallback keeps small-shape callers deterministic). frankentorch-accum-par.
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
-            target.values.reserve(contribution.len());
-            for &value in contribution {
-                target.values.push(0.0 + value);
+            if contribution.len() >= PAR_MIN {
+                use rayon::prelude::*;
+                target.values = contribution.par_iter().map(|&value| 0.0 + value).collect();
+            } else {
+                target.values.reserve(contribution.len());
+                for &value in contribution {
+                    target.values.push(0.0 + value);
+                }
             }
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution.len())?;
-        for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
-            *target_value += value;
+        if contribution.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .values
+                .par_iter_mut()
+                .zip(contribution.par_iter())
+                .for_each(|(target_value, &value)| {
+                    *target_value += value;
+                });
+        } else {
+            for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
+                *target_value += value;
+            }
         }
         Ok(())
     }
@@ -19771,20 +20510,35 @@ impl TensorTape {
         target: &mut TensorGradientSlot,
         mut contribution: Vec<f64>,
     ) -> Result<(), AutogradError> {
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
             // Canonicalize -0.0 -> +0.0 in place to match the borrowed path's
             // `0.0 + value` bit-for-bit (`x += 0.0` == `0.0 + x` by IEEE add
             // commutativity), then move the buffer in with no fresh allocation.
-            for value in contribution.iter_mut() {
-                *value += 0.0;
+            if contribution.len() >= PAR_MIN {
+                use rayon::prelude::*;
+                contribution.par_iter_mut().for_each(|value| *value += 0.0);
+            } else {
+                for value in contribution.iter_mut() {
+                    *value += 0.0;
+                }
             }
             target.values = contribution;
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution.len())?;
-        for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
-            *target_value += value;
+        if contribution.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .values
+                .par_iter_mut()
+                .zip(contribution.par_iter())
+                .for_each(|(target_value, &value)| *target_value += value);
+        } else {
+            for (target_value, value) in target.values.iter_mut().zip(contribution.iter()) {
+                *target_value += value;
+            }
         }
         Ok(())
     }
@@ -19794,9 +20548,18 @@ impl TensorTape {
         target: &mut [f64],
         contribution: &[f64],
     ) -> Result<(), AutogradError> {
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.len(), contribution.len())?;
-        for (target_value, value) in target.iter_mut().zip(contribution.iter()) {
-            *target_value += value;
+        if contribution.len() >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .par_iter_mut()
+                .zip(contribution.par_iter())
+                .for_each(|(target_value, &value)| *target_value += value);
+        } else {
+            for (target_value, value) in target.iter_mut().zip(contribution.iter()) {
+                *target_value += value;
+            }
         }
         Ok(())
     }
@@ -19877,30 +20640,53 @@ impl TensorTape {
         Ok(())
     }
 
-    /// Accumulate a per-element gradient contribution computed lazily, without
-    /// materialising it into an intermediate `Vec`. `contribution(i)` yields the
-    /// i-th contribution; the running sum `target[i] += contribution(i)` is the
-    /// bit-for-bit identical operation to the prior
-    /// `accumulate_tensor_gradient(node, target, &collected)` form (same ascending
-    /// index order, same f64 arithmetic), it just skips the allocation + the
-    /// write-then-read round trip through the scratch buffer.
-    fn accumulate_tensor_gradient_with<F: FnMut(usize) -> f64>(
+    /// Accumulate a per-index gradient contribution `contribution(i)` directly into
+    /// the target slot in ONE Rayon pass — no intermediate `Vec`, no zero-init, no
+    /// separate accumulate loop. The empty-slot arm collects `0.0 + contribution(i)`
+    /// in ascending index order, the accumulate arm indexes `target[i] +=
+    /// contribution(i)` (per-index independent, order-preserving), and both fall back
+    /// to a serial body below the threshold so small-shape callers stay deterministic
+    /// — so the result is bit-for-bit identical to the equivalent serial fill +
+    /// `accumulate_tensor_gradient`. The contribution closure must be pure (each `i`
+    /// depends only on read-only captured state); callers whose per-element gradient
+    /// couples across indices must NOT use this. frankentorch-normp-bwd-fused.
+    fn accumulate_tensor_gradient_par_with<F: Fn(usize) -> f64 + Sync + Send>(
         node: TensorNodeId,
         target: &mut TensorGradientSlot,
         contribution_len: usize,
-        mut contribution: F,
+        contribution: F,
     ) -> Result<(), AutogradError> {
+        const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution_len)?;
         if target.values.is_empty() {
-            target.values.reserve(contribution_len);
-            for index in 0..contribution_len {
-                target.values.push(0.0 + contribution(index));
+            if contribution_len >= PAR_MIN {
+                use rayon::prelude::*;
+                target.values = (0..contribution_len)
+                    .into_par_iter()
+                    .map(|index| 0.0 + contribution(index))
+                    .collect();
+            } else {
+                target.values.reserve(contribution_len);
+                for index in 0..contribution_len {
+                    target.values.push(0.0 + contribution(index));
+                }
             }
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution_len)?;
-        for (index, target_value) in target.values.iter_mut().enumerate() {
-            *target_value += contribution(index);
+        if contribution_len >= PAR_MIN {
+            use rayon::prelude::*;
+            target
+                .values
+                .par_iter_mut()
+                .enumerate()
+                .for_each(|(index, target_value)| {
+                    *target_value += contribution(index);
+                });
+        } else {
+            for (index, target_value) in target.values.iter_mut().enumerate() {
+                *target_value += contribution(index);
+            }
         }
         Ok(())
     }
@@ -28283,6 +29069,76 @@ mod tests {
         }
     }
 
+    // Locks the DIM-0 offset-view path (narrow/split share the storage Arc + set storage_offset
+    // instead of copying — 4ac5aeff) for the HALF dtypes: the existing f16/bf16 shape-op tests
+    // narrow along dim 2 (the copy path) and read RAW storage, so they never exercise an
+    // offset > 0 view. Here we narrow/split along dim 0 (which produces a shared offset-view for
+    // ALL dtypes) and assert the LOGICAL values via contiguous_values_as_f64() — the accessor
+    // that honors storage_offset — so a half-dtype reader that ignored the offset would fail.
+    #[test]
+    fn dim0_offset_view_half_dtypes_read_logical_values() {
+        for half in [DType::F16, DType::BF16] {
+            let mut tape = TensorTape::new();
+            // [4, 2] = rows [1,2],[3,4],[5,6],[7,8]
+            let src: Vec<f32> = (1..=8).map(|i| i as f32).collect();
+            let tensor = if half == DType::F16 {
+                DenseTensor::from_contiguous_values_f16(
+                    src.iter().map(|&x| Float16::from_f32(x)).collect(),
+                    vec![4, 2],
+                    Device::Cpu,
+                )
+                .unwrap()
+            } else {
+                DenseTensor::from_contiguous_values_bf16(
+                    src.iter().map(|&x| BFloat16::from_f32(x)).collect(),
+                    vec![4, 2],
+                    Device::Cpu,
+                )
+                .unwrap()
+            };
+            let a = tape.leaf_tensor(tensor, false);
+
+            // narrow rows [2, 4) -> [2, 2] at storage_offset 4; read LOGICAL values.
+            let nw = tape.narrow(a, 0, 2, 2).unwrap();
+            assert_eq!(tape.dtype(nw).unwrap(), half);
+            let nv = tape
+                .node(nw)
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
+            assert_eq!(nv, vec![5.0, 6.0, 7.0, 8.0], "narrow dim0 {half:?}");
+
+            // squeeze/unsqueeze/reshape of the offset-view must preserve the logical values.
+            let un = tape.unsqueeze(nw, 0).unwrap(); // [1,2,2]
+            let rs = tape.reshape(un, vec![4]).unwrap();
+            let rv = tape
+                .node(rs)
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
+            assert_eq!(rv, vec![5.0, 6.0, 7.0, 8.0], "reshape offset-view {half:?}");
+
+            // split along dim 0 -> two offset-views; each reads its own logical rows.
+            let parts = tape.split(a, &[1, 3], 0).unwrap();
+            let p0 = tape
+                .node(parts[0])
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
+            let p1 = tape
+                .node(parts[1])
+                .unwrap()
+                .tensor
+                .contiguous_values_as_f64()
+                .unwrap();
+            assert_eq!(p0, vec![1.0, 2.0], "split[0] {half:?}");
+            assert_eq!(p1, vec![3.0, 4.0, 5.0, 6.0, 7.0, 8.0], "split[1] {half:?}");
+        }
+    }
+
     #[test]
     fn complex_shape_ops_preserve_dtype_and_imaginary_values() {
         let mut tape = TensorTape::new();
@@ -28392,11 +29248,16 @@ mod tests {
         }
 
         let parts = tape.split(a, &[1, 1], 0).unwrap();
-        let storage = tape.node(parts[0]).unwrap().tensor.typed_storage();
+        let node = tape.node(parts[0]).unwrap();
+        let off = node.tensor.meta().storage_offset();
+        let numel = node.tensor.meta().numel();
+        let storage = node.tensor.typed_storage();
         assert!(matches!(storage, TensorStorage::Complex64(_)));
         if let TensorStorage::Complex64(values) = storage {
+            // split now returns an O(1) offset-view sharing the source storage, so the raw
+            // buffer spans the whole input; assert the LOGICAL slice [offset, offset+numel).
             assert_eq!(
-                values.as_slice(),
+                &values.as_slice()[off..off + numel],
                 &[Complex64::new(1.0, -1.0), Complex64::new(2.0, -2.0)]
             );
         }

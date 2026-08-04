@@ -1,0 +1,75 @@
+    Checking ft-core v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-core)
+    Checking ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-kernel-cpu)
+    Checking ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-runtime)
+    Checking ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-dispatch)
+    Checking ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-autograd)
+    Checking ft-api v0.1.0 (/data/projects/.scratch/frankentorch-codex-median-bench-ledger-20260627/crates/ft-api)
+error: using `chunks_exact` with a constant chunk size
+    --> crates/ft-api/src/lib.rs:1968:26
+     |
+1968 |                         .chunks_exact(2)
+     |                          ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<2>().0.iter()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#chunks_exact_to_as_chunks
+     = note: `-D clippy::chunks-exact-to-as-chunks` implied by `-D warnings`
+     = help: to override `-D warnings` add `#[allow(clippy::chunks_exact_to_as_chunks)]`
+
+error: using `chunks_exact` with a constant chunk size
+    --> crates/ft-api/src/lib.rs:1977:26
+     |
+1977 |                         .chunks_exact(2)
+     |                          ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<2>().0.iter()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#chunks_exact_to_as_chunks
+
+error: using `chunks_exact` with a constant chunk size
+    --> crates/ft-api/src/lib.rs:1986:26
+     |
+1986 |                         .chunks_exact(2)
+     |                          ^^^^^^^^^^^^^^^ help: consider using `as_chunks` instead: `as_chunks::<2>().0.iter()`
+     |
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#chunks_exact_to_as_chunks
+
+error: using `chunks_exact` with a constant chunk size
+    --> crates/ft-api/src/lib.rs:8711:40
+     |
+8711 |                 let mut chunks = bytes.chunks_exact(8);
+     |                                        ^^^^^^^^^^^^^^^
+     |
+help: consider using `as_chunks::<8>()` instead
+    --> crates/ft-api/src/lib.rs:8711:40
+     |
+8711 |                 let mut chunks = bytes.chunks_exact(8);
+     |                                        ^^^^^^^^^^^^^^^
+     = note: you can access the chunks using `chunks.0.iter()`, and the remainder using `chunks.1`
+     = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#chunks_exact_to_as_chunks
+
+error: using `chunks_exact` with a constant chunk size
+     --> crates/ft-api/src/lib.rs:53414:33
+      |
+53414 |         let mut chunks = values.chunks_exact(8);
+      |                                 ^^^^^^^^^^^^^^^
+      |
+help: consider using `as_chunks::<8>()` instead
+     --> crates/ft-api/src/lib.rs:53414:33
+      |
+53414 |         let mut chunks = values.chunks_exact(8);
+      |                                 ^^^^^^^^^^^^^^^
+      = note: you can access the chunks using `chunks.0.iter()`, and the remainder using `chunks.1`
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#chunks_exact_to_as_chunks
+
+error: using `chunks_exact` with a constant chunk size
+     --> crates/ft-api/src/lib.rs:53450:33
+      |
+53450 |         let mut chunks = values.chunks_exact(16);
+      |                                 ^^^^^^^^^^^^^^^^
+      |
+help: consider using `as_chunks::<16>()` instead
+     --> crates/ft-api/src/lib.rs:53450:33
+      |
+53450 |         let mut chunks = values.chunks_exact(16);
+      |                                 ^^^^^^^^^^^^^^^^
+      = note: you can access the chunks using `chunks.0.iter()`, and the remainder using `chunks.1`
+      = help: for further information visit https://rust-lang.github.io/rust-clippy/master/index.html#chunks_exact_to_as_chunks
+
+error: could not compile `ft-api` (lib) due to 6 previous errors

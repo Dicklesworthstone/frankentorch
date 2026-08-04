@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 36.96s
+     Running `/data/projects/.rch-targets/frankentorch-bt-verify/release/examples/quantile_bounded_h2h`
+quantile(x, 0.5, dim=1) [4000,4000] f64 bounded-int no-grad, 6 iters MIN:
+  FrankenTorch :    6.878 ms   chk 4.200000e5
+  PyTorch      :  126.543 ms   chk 4.200000e5  (value-sum rel 0.0e0)
+  => FT 18.40x FASTER

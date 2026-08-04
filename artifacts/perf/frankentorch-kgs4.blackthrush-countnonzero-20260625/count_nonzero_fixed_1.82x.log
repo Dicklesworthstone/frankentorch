@@ -1,0 +1,5 @@
+     Running `/data/projects/.rch-targets/frankentorch-bt-verify/release/examples/count_nonzero_h2h`
+count_nonzero(x) [4000,4000] f64 no-grad, 8 iters MIN:
+  FrankenTorch :    3.373 ms   chk 8.000000e6
+  PyTorch      :    1.851 ms   chk 8.000000e6  (count rel 0.0e0)
+  => FT 1.82x SLOWER

@@ -1,0 +1,4 @@
+test tests::count_nonzero_all_zero ... ok
+test tests::count_nonzero_basic ... ok
+test tests::count_nonzero_f32 ... ok
+test result: ok. 2380 passed; 0 failed; 1 ignored; 0 measured; 0 filtered out; finished in 0.23s

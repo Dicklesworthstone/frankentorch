@@ -41,6 +41,9 @@ a.out
 # Per-job target shards created by `rch` when multiple cargo invocations
 # run concurrently (suffix is target-set + job-id + nanos + retry counter).
 .rch-target-*/
+# The shared pool is plural with no separator, so neither pattern above matches
+# it. It is a symlink into /data/tmp/rch-targets-pool.
+.rch-targets/
 .rch-deploy-root/
 rch-bin/
 rch-install/

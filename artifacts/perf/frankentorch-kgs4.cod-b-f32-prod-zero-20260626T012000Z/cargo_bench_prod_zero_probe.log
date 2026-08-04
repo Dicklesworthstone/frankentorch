@@ -1,0 +1,12 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 53.48s
+     Running benches/ops_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/ops_bench-a190a144acc6ac7c)
+Gnuplot not found, using plotters backend
+Benchmarking prod_zero_probe/f32_4000x4000
+Benchmarking prod_zero_probe/f32_4000x4000: Warming up for 1.0000 s
+Benchmarking prod_zero_probe/f32_4000x4000: Collecting 10 samples in estimated 5.8056 s (110 iterations)
+Benchmarking prod_zero_probe/f32_4000x4000: Analyzing
+prod_zero_probe/f32_4000x4000
+                        time:   [13.960 ms 14.909 ms 15.849 ms]
+

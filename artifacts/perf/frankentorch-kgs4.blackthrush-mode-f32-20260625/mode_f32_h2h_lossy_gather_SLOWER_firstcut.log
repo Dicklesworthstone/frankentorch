@@ -1,0 +1,6 @@
+    Finished `release` profile [optimized] target(s) in 0.74s
+     Running `/data/projects/.rch-targets/frankentorch-bt-verify/release/examples/mode_f32_h2h`
+mode(x, dim=-1) [4096,4096] f32 no-grad, 8 iters MIN:
+  FrankenTorch :   99.677 ms   chk 7.859000e3
+  PyTorch      :   69.111 ms   chk 7.859000e3  (value-sum rel 0.0e0)
+  => FT 1.44x SLOWER

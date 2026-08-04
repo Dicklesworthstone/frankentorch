@@ -1,0 +1,21 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1,active_project_exclusion=1)
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling ft-core v0.1.0 (/data/projects/frankentorch/crates/ft-core)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/frankentorch/crates/ft-runtime)
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1m 00s
+     Running benches/cdist_bench.rs (/data/projects/.rch-targets/frankentorch-cod-b/release/deps/cdist_bench-659f6d43b8e09062)
+Gnuplot not found, using plotters backend
+Benchmarking pdist_f32_p2_mm/512x64
+Benchmarking pdist_f32_p2_mm/512x64: Warming up for 1.0000 s
+Benchmarking pdist_f32_p2_mm/512x64: Collecting 10 samples in estimated 3.0037 s (3905 iterations)
+Benchmarking pdist_f32_p2_mm/512x64: Analyzing
+pdist_f32_p2_mm/512x64  time:   [779.99 µs 799.19 µs 820.08 µs]
+                        change: [+10.973% +14.624% +18.816%] (p = 0.00 < 0.05)
+                        Performance has regressed.
+

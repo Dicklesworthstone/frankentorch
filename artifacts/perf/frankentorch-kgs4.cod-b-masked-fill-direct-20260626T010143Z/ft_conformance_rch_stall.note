@@ -1,0 +1,1 @@
+RCH conformance wrapper produced no output for ~4 minutes and was interrupted with Ctrl-C before cargo started; rerunning direct cargo test with the same CARGO_TARGET_DIR.

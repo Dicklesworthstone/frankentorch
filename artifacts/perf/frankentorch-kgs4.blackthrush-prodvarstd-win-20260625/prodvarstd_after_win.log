@@ -1,0 +1,7 @@
+  sum              2.208    1.513   FT 1.46x SLOWER
+  mean             2.346    1.271   FT 1.85x SLOWER
+  prod             3.139    1.867   FT 1.68x SLOWER
+  var              3.992    4.411   FT 1.10x FASTER
+  std              4.249    4.722   FT 1.11x FASTER
+  norm_p2          2.295    9.245   FT 4.03x FASTER
+  count_nonzero    3.770    2.732   FT 1.38x SLOWER

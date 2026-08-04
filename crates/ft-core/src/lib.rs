@@ -3038,10 +3038,10 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BFloat16, DType, DenseBoolTensor, DenseI32Tensor, DenseI64Tensor, DenseTensor,
-        DenseTensorError, Device, Float16, QuantizationParams, ScalarTensor, SparseCOOTensor,
-        SparseCSRTensor, SparseTensorError, TensorMeta, TensorMetaError, TensorStorage,
-        contiguous_strides, ensure_compatible,
+        BFloat16, Complex64, Complex128, DType, DenseBoolTensor, DenseI32Tensor, DenseI64Tensor,
+        DenseTensor, DenseTensorError, Device, Float16, QuantizationParams, ScalarTensor,
+        SparseCOOTensor, SparseCSRTensor, SparseTensorError, TensorMeta, TensorMetaError,
+        TensorStorage, contiguous_strides, ensure_compatible,
     };
 
     fn det_seed(parts: &[usize]) -> u64 {

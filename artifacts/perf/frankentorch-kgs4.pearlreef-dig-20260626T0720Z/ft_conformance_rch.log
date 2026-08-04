@@ -1,0 +1,557 @@
+[RCH] local (no admissible workers: insufficient_slots=4,active_project_exclusion=1)
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+    Blocking waiting for file lock on package cache
+   Compiling libc v0.2.185
+   Compiling typenum v1.20.0
+   Compiling version_check v0.9.5
+   Compiling subtle v2.6.1
+   Compiling num-traits v0.2.19
+   Compiling cpufeatures v0.2.17
+   Compiling either v1.15.0
+   Compiling getrandom v0.3.4
+   Compiling semver v1.0.28
+   Compiling base64ct v1.8.3
+   Compiling bitflags v2.11.1
+   Compiling rustix v1.1.4
+   Compiling linux-raw-sys v0.12.1
+   Compiling cmov v0.5.3
+   Compiling serde_json v1.0.149
+   Compiling opaque-debug v0.3.1
+   Compiling const-oid v0.9.6
+   Compiling memchr v2.8.0
+   Compiling fastrand v2.4.1
+   Compiling const-oid v0.10.2
+   Compiling anyhow v1.0.102
+   Compiling memoffset v0.9.1
+   Compiling parking_lot_core v0.9.12
+   Compiling equivalent v1.0.2
+   Compiling cfg_aliases v0.2.1
+   Compiling allocator-api2 v0.2.21
+   Compiling smallvec v1.15.1
+   Compiling log v0.4.29
+   Compiling foldhash v0.2.0
+   Compiling getrandom v0.4.2
+   Compiling scopeguard v1.2.0
+   Compiling crc32fast v1.5.0
+   Compiling thiserror v2.0.18
+   Compiling lazy_static v1.5.0
+   Compiling virtue-next v0.1.3
+   Compiling pin-project-lite v0.2.17
+   Compiling signal-hook v0.4.4
+   Compiling cpufeatures v0.3.0
+   Compiling thread_local v1.1.9
+   Compiling futures-core v0.3.32
+   Compiling bytes v1.11.1
+   Compiling parking v2.2.1
+   Compiling nu-ansi-term v0.50.3
+   Compiling futures-io v0.3.32
+   Compiling unty-next v0.1.1
+   Compiling data-encoding v2.11.0
+   Compiling base64 v0.22.1
+   Compiling slab v0.4.12
+   Compiling hex v0.4.3
+   Compiling allocation-counter v0.8.1
+   Compiling tracing-core v0.1.36
+   Compiling bit-vec v0.8.0
+   Compiling quick-error v1.2.3
+   Compiling fnv v1.0.7
+   Compiling unarray v0.1.4
+   Compiling regex-syntax v0.8.10
+   Compiling syn v2.0.117
+   Compiling crossbeam-queue v0.3.12
+   Compiling rayon v1.12.0
+   Compiling generic-array v0.14.7
+   Compiling pem-rfc7468 v0.7.0
+   Compiling rustc_version v0.4.1
+   Compiling ctutils v0.4.2
+   Compiling itertools v0.10.5
+   Compiling bit-set v0.8.0
+   Compiling sharded-slab v0.1.7
+   Compiling nix v0.31.2
+   Compiling futures-lite v2.6.1
+   Compiling hashbrown v0.17.0
+   Compiling hashbrown v0.16.1
+   Compiling lock_api v0.4.14
+   Compiling tracing-log v0.2.0
+   Compiling curve25519-dalek v4.1.3
+   Compiling bincode_derive-next v2.1.0
+   Compiling tracing-subscriber v0.3.23
+   Compiling num-complex v0.4.6
+   Compiling rmp v0.8.15
+   Compiling hybrid-array v0.4.10
+   Compiling crypto-common v0.2.1
+   Compiling block-buffer v0.12.0
+   Compiling block-buffer v0.10.4
+   Compiling inout v0.1.4
+   Compiling getrandom v0.2.17
+   Compiling errno v0.3.14
+   Compiling socket2 v0.6.3
+   Compiling wait-timeout v0.2.1
+   Compiling signal-hook-registry v1.4.8
+   Compiling rand_core v0.6.4
+   Compiling rand_core v0.9.5
+   Compiling parking_lot v0.12.5
+   Compiling crypto-common v0.1.7
+   Compiling rand v0.9.4
+   Compiling rand_xorshift v0.4.0
+   Compiling digest v0.11.2
+   Compiling digest v0.10.7
+   Compiling universal-hash v0.5.1
+   Compiling aead v0.5.2
+   Compiling sysinfo v0.33.1
+   Compiling polyval v0.6.2
+   Compiling poly1305 v0.8.0
+   Compiling sha1 v0.11.0
+   Compiling hmac v0.13.0
+   Compiling sha2 v0.11.0
+   Compiling signature v2.2.0
+   Compiling sha2 v0.10.9
+   Compiling hmac v0.12.1
+   Compiling ghash v0.5.1
+   Compiling ed25519 v2.2.3
+   Compiling hkdf v0.12.4
+   Compiling tempfile v3.27.0
+   Compiling polling v3.11.0
+   Compiling rusty-fork v0.3.1
+   Compiling zerocopy-derive v0.8.48
+   Compiling zeroize_derive v1.4.3
+   Compiling bytemuck_derive v1.10.2
+   Compiling serde_derive v1.0.228
+   Compiling curve25519-dalek-derive v0.1.1
+   Compiling thiserror-impl v2.0.18
+   Compiling tracing-attributes v0.1.31
+   Compiling prost-derive v0.14.4
+   Compiling pin-project-internal v1.1.11
+   Compiling visibility v0.1.1
+   Compiling zeroize v1.8.2
+   Compiling cipher v0.4.4
+   Compiling der v0.7.10
+   Compiling ctr v0.9.2
+   Compiling chacha20 v0.9.1
+   Compiling aes v0.8.4
+   Compiling pin-project v1.1.11
+   Compiling tracing v0.1.44
+   Compiling chacha20poly1305 v0.10.1
+   Compiling bytemuck v1.25.0
+   Compiling zerocopy v0.8.48
+   Compiling safe_arch v0.7.4
+   Compiling aes-gcm v0.10.3
+   Compiling prost v0.14.4
+   Compiling ed25519-dalek v2.2.0
+   Compiling wide v0.7.33
+   Compiling spki v0.7.3
+   Compiling pkcs8 v0.10.2
+   Compiling signatory v0.27.1
+   Compiling serde v1.0.228
+   Compiling franken-evidence v0.3.4
+   Compiling franken-kernel v0.3.4
+   Compiling rmp-serde v1.3.1
+   Compiling safetensors v0.7.0
+   Compiling bincode-next v2.1.0
+   Compiling franken-decision v0.3.4
+   Compiling half v2.7.1
+   Compiling ppv-lite86 v0.2.21
+   Compiling ft-core v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-core)
+   Compiling rand_chacha v0.3.1
+   Compiling rand_chacha v0.9.0
+   Compiling proptest v1.11.0
+   Compiling rand v0.8.6
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-kernel-cpu)
+   Compiling ft-runtime v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-runtime)
+   Compiling nkeys v0.4.5
+   Compiling asupersync v0.3.4
+   Compiling ft-dispatch v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-api)
+warning: unused variable: `a_rows`
+    --> crates/ft-api/src/lib.rs:6991:18
+     |
+6991 |             let (a_rows, a_cols) = (a_aligned[0], a_aligned[1]);
+     |                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_a_rows`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+   Compiling ft-data v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-data)
+   Compiling ft-optim v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-optim)
+   Compiling ft-nn v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-nn)
+warning: `ft-api` (lib) generated 1 warning (run `cargo fix --lib -p ft-api` to apply 1 suggestion)
+   Compiling ft-serialize v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-serialize)
+   Compiling ft-conformance v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-conformance)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 22s
+     Running unittests src/lib.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/ft_conformance-7763515686fdbac4)
+
+running 199 tests
+test perf_slo::tests::distribution_summary_orders_percentiles ... ok
+test perf_slo::tests::regression_pct_handles_zero_baseline ... ok
+test tests::conv_transpose_nd_init_fan_in_matches_pytorch_weight_shape_contract ... ok
+test tests::default_oracle_root_falls_back_to_repo_local_mirror ... ok
+test tests::default_oracle_root_uses_override_when_present ... ok
+test tests::allowlist_contains_known_hardened_deviations ... ok
+test tests::device_guard_dispatch_fixture_has_ft_p2c_007_coverage ... ok
+test tests::device_guard_dispatch_cases_are_green_in_both_modes ... ok
+test tests::e2e_matrix_packet_filter_includes_autograd_scheduler_packet_entries ... ok
+test tests::e2e_matrix_packet_filter_limits_output ... ok
+test tests::e2e_matrix_packet_filter_includes_op_schema_packet_entries ... ok
+test tests::e2e_matrix_packet_filter_includes_optimizer_packet_entries ... ok
+test tests::e2e_matrix_packet_filter_includes_oracle_timeout_envelope ... ok
+test tests::format_legacy_oracle_exit_error_bounds_stderr_diagnostic ... ok
+test tests::ft_p2c_005_projection_strips_shadowed_flatten_keys ... ok
+test tests::e2e_matrix_packet_filter_includes_device_guard_packet_entries ... ok
+test tests::ft_p2c_007_projection_strips_shadowed_flatten_keys ... ok
+test tests::hardened_scheduler_conformance_is_green ... ok
+test tests::hardened_scalar_conformance_is_green ... ok
+test tests::hardened_op_schema_conformance_is_green ... ok
+test tests::fuzz_corpus_manifest_covers_g4_packets_and_valid_fixtures ... ok
+test tests::hardened_dispatch_conformance_is_green ... ok
+test tests::hardened_optimizer_conformance_is_green ... ok
+test tests::hardened_nn_state_conformance_is_green ... ok
+test tests::legacy_oracle_failure_reason_code_classifies_timeout_separately ... ok
+test tests::hardened_tensor_meta_conformance_is_green ... ok
+test tests::legacy_oracle_timeout_e2e_forensics_log_models_bounded_kill_path ... ok
+test tests::microbench_produces_percentiles ... ok
+test tests::nn_state_property_key_validation_stays_fail_closed ... ok
+test tests::linalg_det_backward_matches_central_finite_difference ... ok
+test tests::linalg_slogdet_logabsdet_backward_matches_central_finite_difference ... ok
+test tests::op_schema_symbolic_shape_gap_marker_is_fail_closed ... ok
+test tests::packet_e2e_microbench_legacy_temp_path_is_thread_scoped ... ok
+test tests::parse_legacy_oracle_stdout_rejects_oversized_line_fail_closed ... ok
+test tests::e2e_matrix_packet_filter_includes_nn_state_packet_entries ... ok
+test tests::parser_rejection_diagnostics_bound_oversized_tokens ... ok
+test tests::read_stream_capped_buffers_all_bytes_within_cap ... ok
+test tests::nn_state_property_export_excludes_non_persistent_buffers ... ok
+test tests::custom_function_layer_trains_end_to_end_with_adam ... ok
+test tests::load_fixture_rejects_oversized_files_fail_closed ... ok
+test tests::nn_state_logs_include_packet_008_contract_fields ... ok
+test tests::strict_dispatch_conformance_is_green ... ok
+test tests::e2e_matrix_packet_filter_includes_cpu_kernel_packet_entries ... ok
+test tests::read_stream_capped_truncates_buffer_and_marks_overflow ... ok
+test tests::parse_legacy_oracle_stdout_bounds_parse_error_diagnostic ... ok
+test tests::parse_legacy_oracle_stdout_uses_last_non_empty_line ... ok
+test tests::hardened_serialization_conformance_is_green ... ok
+test tests::scheduler_logs_include_packet_004_telemetry_fields ... ok
+test tests::e2e_matrix_packet_filter_includes_serialization_packet_entries ... ok
+test tests::strict_op_schema_conformance_is_green ... ok
+test tests::strict_scheduler_conformance_is_green ... ok
+test tests::strict_optimizer_conformance_is_green ... ok
+test tests::strict_scalar_forensics_include_runtime_evidence ... ok
+test tests::strict_scalar_conformance_is_green ... ok
+test tests::strict_nn_state_conformance_is_green ... ok
+test tests::strict_tensor_meta_conformance_is_green ... ok
+test tests::terminate_and_reap_child_reaps_running_process ... ok
+test tests::structured_logs_include_replay_contract_fields ... ok
+test tests::strict_serialization_conformance_is_green ... ok
+test tests::torch_adaptive_avg_pool2d_f32_output_shape_subprocess_conformance ... ok
+test tests::strict_serialization_expected_error_logs_runtime_durability_summary ... ok
+test tests::hardened_tensor_binary_conformance_is_green ... ok
+test tests::linalg_inv_backward_matches_central_finite_difference ... ok
+test tests::conv_transpose1d_output_padding_matches_pytorch_reference_values ... ok
+test tests::strict_tensor_binary_conformance_is_green ... ok
+test tests::run_legacy_oracle_script_times_out_fail_closed ... ok
+test tests::run_legacy_oracle_script_rejects_empty_stdout_fail_closed ... ok
+test tests::run_legacy_oracle_script_rejects_non_utf8_stdout_fail_closed ... ok
+test tests::smoke_harness_reports_fixture_coverage_without_requiring_oracle_checkout ... ok
+test tests::e2e_matrix_writer_emits_jsonl ... ok
+test tests::e2e_matrix_unfiltered_keeps_ft_p2c_005_projection_entries ... ok
+test tests::run_legacy_oracle_script_rejects_oversized_stderr_fail_closed ... ok
+test tests::quantized_linear_packed_weight_oracle_matches_torch ... ok
+test tests::run_legacy_oracle_script_timeout_does_not_join_inherited_pipe_reader ... ok
+test tests::torch_conv1d_f32_output_shape_subprocess_conformance ... ok
+test tests::run_legacy_oracle_script_rejects_oversized_output_line_fail_closed ... ok
+test tests::run_legacy_oracle_script_rejects_oversized_stdout_fail_closed ... ok
+test tests::embedding_mean_linear_classifier_trains_end_to_end_with_adam ... ok
+test tests::embedding_bag_classifier_trains_end_to_end_with_adam ... ok
+test tests::torch_fmod_remainder_sign_matrix_conformance ... ok
+test tests::torch_conv2d_f32_output_shape_subprocess_conformance ... ok
+test tests::batch_norm1d_linear_regressor_trains_end_to_end_with_adam ... ok
+test tests::torch_fmod_remainder_zero_divisor_returns_nan ... ok
+test tests::torch_conv3d_f32_output_shape_subprocess_conformance ... ok
+test tests::torch_atan2_ieee754_subprocess_conformance ... ok
+test tests::torch_conv_transpose3d_f32_output_shape_subprocess_conformance ... ok
+test tests::torch_exp10_subprocess_conformance ... ok
+test tests::conv1d_trains_end_to_end_with_adam ... ok
+test tests::torch_angle_subprocess_conformance ... ok
+test tests::sequential_mlp_trains_end_to_end_with_adam ... ok
+test tests::torch_conv_transpose1d_f32_output_shape_subprocess_conformance ... ok
+test tests::conv_transpose1d_bias_shape_matches_pytorch_parameter_contract ... ok
+test tests::torch_hyperbolic_libm_subprocess_conformance ... ok
+test tests::torch_erf_erfc_libm_subprocess_conformance ... ok
+test tests::torch_conv_transpose2d_output_shape_subprocess_conformance ... ok
+test tests::torch_expm1_log1p_libm_subprocess_conformance ... ok
+test tests::lstm_final_hidden_state_trains_end_to_end_with_adam ... ok
+test tests::conv2d_bilinear_upsampler_trains_end_to_end_with_adam ... ok
+test tests::conv2d_pixel_shuffle_super_resolution_trains_end_to_end_with_adam ... ok
+test tests::layer_norm_linear_block_trains_end_to_end_with_adam ... ok
+test tests::torch_exp_log_libm_subprocess_conformance ... ok
+test tests::packet_e2e_microbench_autograd_scheduler_produces_percentiles ... ok
+test tests::torch_fmax_fmin_subprocess_conformance ... ok
+test tests::conv_transpose1d_upsampler_trains_end_to_end_with_adam ... ok
+test tests::rnn_final_hidden_state_trains_end_to_end_with_adam ... ok
+test tests::torch_gelu_exact_libm_subprocess_conformance ... ok
+test tests::packet_e2e_microbench_optimizer_produces_percentiles ... ok
+test tests::torch_logaddexp2_subprocess_conformance ... ok
+test tests::torch_clamp_tensor_subprocess_conformance ... ok
+test tests::packet_e2e_microbench_op_schema_produces_percentiles ... ok
+test tests::packet_e2e_microbench_cpu_kernel_produces_percentiles ... ok
+test tests::packet_e2e_microbench_device_guard_produces_percentiles ... ok
+test tests::torch_round_half_even_public_api_conformance ... ok
+test tests::torch_hypot_libm_subprocess_conformance ... ok
+test tests::torch_diag_subprocess_conformance ... ok
+test tests::gru_final_hidden_state_trains_end_to_end_with_adam ... ok
+test tests::torch_fft_numpy_subprocess_conformance ... ok
+test tests::torch_diff_numpy_subprocess_conformance ... ok
+test tests::packet_e2e_microbench_nn_state_produces_percentiles ... ok
+test tests::torch_nextafter_subprocess_conformance ... ok
+test tests::torch_round_decimals_subprocess_conformance ... ok
+test tests::torch_frac_subprocess_conformance ... ok
+test tests::torch_shape_ops_preserve_float32_dtype_subprocess_conformance ... ok
+test tests::torch_floor_divide_subprocess_conformance ... ok
+test tests::conv_transpose2d_upsampler_trains_end_to_end_with_adam ... ok
+test tests::cnn_classifier_head_trains_end_to_end_with_adam ... ok
+test tests::torch_diag_embed_numpy_subprocess_conformance ... ok
+test tests::torch_nan_to_num_f32_subprocess_conformance ... ok
+test tests::torch_lgamma_libm_subprocess_conformance ... ok
+test tests::torch_pow_ieee754_subprocess_conformance ... ok
+test tests::torch_float_power_subprocess_conformance ... ok
+test tests::validate_legacy_oracle_stdin_bounds_allows_exact_cap ... ok
+test tests::validate_legacy_oracle_stdin_bounds_rejects_oversized_stdin ... ok
+test tests::validate_legacy_oracle_stream_bounds_rejects_oversized_stderr ... ok
+test tests::validate_legacy_oracle_stream_bounds_rejects_oversized_stdout ... ok
+test tests::reflection_pad2d_conv2d_trains_end_to_end_with_adam ... ok
+test tests::wait_for_legacy_oracle_exit_times_out_fail_closed ... ok
+test tests::multihead_attention_trains_end_to_end_with_adam ... ok
+test tests::torch_ieee754_unary_edge_cases_subprocess_conformance ... ok
+test tests::packet_e2e_microbench_serialization_produces_percentiles ... ok
+test tests::torch_max_pool2d_f32_output_shape_subprocess_conformance ... ok
+test tests::weight_norm_linear_trains_end_to_end_with_adam ... ok
+test tests::torch_special_log_ndtr_subprocess_conformance ... ok
+test tests::torch_index_rearrange_ops_preserve_float32_dtype_subprocess_conformance ... ok
+test tests::torch_special_ndtri_subprocess_conformance ... ok
+test tests::torch_linalg_slogdet_numpy_subprocess_conformance ... ok
+test tests::conv2d_global_avg_pool_classifier_trains_end_to_end_with_adam ... ok
+test tests::torch_linalg_qr_numpy_subprocess_conformance ... ok
+test tests::torch_softplus_libm_subprocess_conformance ... ok
+test tests::torch_layernorm_f32_output_shape_subprocess_conformance ... ok
+test tests::torch_linalg_solve_numpy_subprocess_conformance ... ok
+test tests::torch_linalg_inv_numpy_subprocess_conformance ... ok
+test tests::torch_linalg_lstsq_numpy_subprocess_conformance ... ok
+test tests::torch_linalg_det_numpy_subprocess_conformance ... ok
+test tests::conv2d_groupnorm_block_trains_end_to_end_with_adam ... ok
+test tests::packet_e2e_microbench_device_guard_legacy_vs_optimized_profiles ... ok
+test tests::torch_histc_numpy_subprocess_conformance ... ok
+test tests::torch_windows_subprocess_conformance ... ok
+test tests::torch_linalg_eigh_numpy_subprocess_conformance ... ok
+test tests::torch_special_i0_i0e_subprocess_conformance ... ok
+test tests::torch_special_i1_i1e_subprocess_conformance ... ok
+test tests::packet_e2e_microbench_nn_state_legacy_vs_optimized_profiles ... ok
+test tests::torch_linalg_pinv_numpy_subprocess_conformance ... ok
+test tests::torch_threshold_subprocess_conformance ... ok
+test tests::torch_linalg_cholesky_numpy_subprocess_conformance ... ok
+test tests::torch_special_ndtr_subprocess_conformance ... ok
+test tests::torch_matrix_norm_numpy_subprocess_conformance ... ok
+test tests::torch_trig_libm_subprocess_conformance ... ok
+test tests::torch_linalg_svd_numpy_subprocess_conformance ... ok
+test tests::torch_activations_scipy_subprocess_conformance ... ok
+test tests::torch_sinc_numpy_subprocess_conformance ... ok
+test tests::functional_conv3d_trains_end_to_end_with_adam ... ok
+test tests::torch_entr_scipy_subprocess_conformance ... ok
+test tests::transformer_encoder_layer_trains_end_to_end_with_adam ... ok
+test tests::packet_e2e_microbench_cpu_kernel_legacy_vs_optimized_profiles ... ok
+test tests::torch_vector_norm_numpy_subprocess_conformance ... ok
+test tests::torch_logaddexp_numpy_subprocess_conformance ... ok
+test tests::transformer_decoder_layer_trains_end_to_end_with_adam ... ok
+test tests::torch_logit_scipy_subprocess_conformance ... ok
+test tests::torch_softmax_scipy_subprocess_conformance ... ok
+test tests::torch_digamma_scipy_subprocess_conformance ... ok
+test tests::triplet_margin_metric_learning_trains_end_to_end_with_adam ... ok
+test tests::torch_erfinv_scipy_subprocess_conformance ... ok
+test tests::torch_xlog1py_scipy_subprocess_conformance ... ok
+test tests::torch_multigammaln_scipy_subprocess_conformance ... ok
+test tests::torch_xlogy_scipy_subprocess_conformance ... ok
+test tests::torch_polygamma_scipy_subprocess_conformance ... ok
+test tests::transformer_encoder_two_layers_trains_end_to_end_with_adam ... ok
+test tests::differential_dispatch_adds_metamorphic_and_adversarial_checks ... ok
+test tests::differential_tensor_meta_adds_metamorphic_and_adversarial_checks ... ok
+test tests::differential_report_writer_emits_json ... ok
+test tests::differential_op_schema_adds_metamorphic_and_adversarial_checks ... ok
+test tests::differential_autograd_scheduler_adds_metamorphic_and_adversarial_checks ... ok
+test tests::differential_serialization_adds_metamorphic_and_adversarial_checks ... ok
+test tests::differential_report_packet_filter_limits_output ... ok
+test tests::differential_harness_emits_sorted_checks ... ok
+test tests::differential_optimizer_adds_oracle_and_metamorphic_checks ... ok
+test tests::differential_report_packet_filter_projects_ft_p2c_005 ... ok
+test tests::differential_nn_state_adds_metamorphic_and_adversarial_checks ... ok
+
+test result: ok. 199 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 18.59s
+
+     Running unittests src/bin/build_failure_forensics_index.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/build_failure_forensics_index-fa21ec5601e7334d)
+
+running 6 tests
+test tests::det_hash_is_stable ... ok
+test tests::failure_envelope_carries_replay_and_environment_fields ... ok
+test tests::packet_raptorq_paths_include_expected_suffixes ... ok
+test tests::runtime_durability_index_links_are_categorized ... ok
+test tests::runtime_durability_paths_include_global_and_packet_entries ... ok
+test tests::suite_templates_include_op_schema_contract_evidence ... ok
+
+test result: ok. 6 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/check_benchmark_regression.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/check_benchmark_regression-da5219c35f421b80)
+
+running 3 tests
+test tests::compare_metrics_marks_values_above_threshold ... ok
+test tests::compare_metrics_treats_exact_threshold_as_non_regression ... ok
+test tests::regression_pct_reports_positive_for_slowdown ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/check_perf_slos.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/check_perf_slos-2c8d5e80258b7579)
+
+running 1 test
+test tests::status_strings_are_stable ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/check_reliability_budgets.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/check_reliability_budgets-bae94a7f17e6781b)
+
+running 3 tests
+test tests::flake_detection_finds_conflicting_outcomes ... ok
+test tests::known_reason_code_classifier_is_broad_but_bounded ... ok
+test tests::unknown_reason_collection_is_deduplicated ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/bin/emit_packet_sidecar.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/emit_packet_sidecar-1f3e58dce803e8a6)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+     Running unittests src/bin/run_differential_report.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/run_differential_report-004757865a0eca2a)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/run_e2e_matrix.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/run_e2e_matrix-259c3f5d0fb5b9dd)
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/run_perf_slos.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/run_perf_slos-213707dfe29420a9)
+
+running 5 tests
+test tests::checkpoint_budget_math_is_stable ... ok
+test tests::percentile_f64_uses_same_index_rule ... ok
+test tests::percentile_u128_matches_existing_harness_rule ... ok
+test tests::parse_kib_field_extracts_value ... ok
+test tests::regression_helpers_report_zero_for_equal_values ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/bin/run_raptorq_durability_pipeline.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/run_raptorq_durability_pipeline-d378cce596fbc973)
+
+running 2 tests
+test tests::packet_targets_write_into_packet_dir ... ok
+test tests::det_hash64_is_stable ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.01s
+
+     Running unittests src/bin/triage_forensics_failures.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/triage_forensics_failures-ef2f83dfbc047a4e)
+
+running 3 tests
+test tests::det_hash_is_deterministic ... ok
+test tests::reason_code_classification_is_stable ... ok
+test tests::severity_order_matches_priority ... ok
+
+test result: ok. 3 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running unittests src/bin/validate_phase2c_artifacts.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/validate_phase2c_artifacts-c14435c851c6d522)
+
+running 7 tests
+test tests::markdown_validation_requires_packet_id_and_content ... ok
+test tests::packet_worker_count_clamps_to_packet_count ... ok
+test tests::packet_worker_count_defaults_to_available_parallelism ... ok
+test tests::packet_worker_count_disable_env_wins_over_cap ... ok
+test tests::packet_worker_count_honors_explicit_positive_cap ... ok
+test tests::packet_worker_count_ignores_invalid_cap_values ... ok
+test tests::required_key_check_reports_missing_fields ... ok
+
+test result: ok. 7 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s
+
+     Running tests/e2e_training.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/e2e_training-51bb83af3f26ee80)
+
+running 5 tests
+test e2e_dataloader_epoch_reset_and_shuffle ... ok
+test e2e_model_save_load_produces_identical_predictions ... ok
+test e2e_no_grad_eval_does_not_corrupt_gradient_state ... ok
+test e2e_mlp_regression_training_with_dataloader ... ok
+test e2e_classification_with_cross_entropy ... ok
+
+test result: ok. 5 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/pytorch_avg_pool2d_conformance.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/pytorch_avg_pool2d_conformance-2bd2672eeb5acc29)
+
+running 2 tests
+test avg_pool2d_padding_divisor_matches_pytorch_known_fixtures ... ok
+test pytorch_avg_pool2d_subprocess_conformance ... ok
+
+test result: ok. 2 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.27s
+
+     Running tests/pytorch_ldexp_conformance.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/pytorch_ldexp_conformance-43de7385ae97755e)
+
+running 1 test
+test pytorch_ldexp_subprocess_conformance ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.18s
+
+     Running tests/smoke.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/smoke-00ff743c0bbdf4cb)
+
+running 39 tests
+test op_schema_fixture_executes_in_both_modes ... ok
+test runtime_records_durability_evidence_for_decode_failure ... ok
+test scheduler_fixture_executes_in_both_modes ... ok
+test scalar_fixture_executes_in_strict_mode ... ok
+test tensor_comparison_fixture_executes_in_both_modes ... ok
+test optimizer_fixture_executes_in_both_modes ... ok
+test tensor_factory_fixture_executes_in_both_modes ... ok
+test tensor_elementwise_cmp_fixture_executes_in_both_modes ... ok
+test tensor_init_fixture_executes_in_both_modes ... ok
+test nn_state_fixture_executes_in_both_modes ... ok
+test dispatch_fixture_executes_in_both_modes ... ok
+test tensor_join_fixture_executes_in_both_modes ... ok
+test tensor_meta_fixture_executes_in_both_modes ... ok
+test tensor_inplace_fixture_executes_in_both_modes ... ok
+test tensor_random_fixture_executes_in_both_modes ... ok
+test tensor_searchsorted_fixture_executes_in_both_modes ... ok
+test tensor_reduction_fixture_executes_in_both_modes ... ok
+test tensor_session_fails_closed_on_device_mismatch ... ok
+test tensor_session_path_executes_in_strict_mode ... ok
+test tensor_session_div_path_executes_in_strict_mode ... ok
+test tensor_session_supports_non_contiguous_input ... ok
+test serialization_fixture_executes_in_both_modes ... ok
+test tensor_session_mul_path_executes_in_strict_mode ... ok
+test tensor_linalg_fixture_executes_in_both_modes ... ok
+test tensor_shape_fixture_executes_in_both_modes ... ok
+test tensor_fft_fixture_executes_in_both_modes ... ok
+test tensor_pool_fixture_executes_in_both_modes ... ok
+test tensor_normalize_fixture_executes_in_both_modes ... ok
+test tensor_scan_fixture_executes_in_both_modes ... ok
+test tensor_sort_fixture_executes_in_both_modes ... ok
+test tensor_indexing_fixture_executes_in_both_modes ... ok
+test tensor_einsum_fixture_executes_in_both_modes ... ok
+test tensor_unary_fixture_executes_in_both_modes ... ok
+test tensor_conv_fixture_executes_in_both_modes ... ok
+test tensor_advanced_fixture_executes_in_both_modes ... ok
+test tensor_loss_fixture_executes_in_both_modes ... ok
+test smoke_report_is_stable ... ok
+test rust_fixtures_do_not_use_placeholder_checkpoint_hashes ... ok
+test production_code_contains_no_forbidden_stub_or_panic_macros ... ok
+
+test result: ok. 39 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 1.96s
+
+   Doc-tests ft_conformance
+
+running 0 tests
+
+test result: ok. 0 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.00s

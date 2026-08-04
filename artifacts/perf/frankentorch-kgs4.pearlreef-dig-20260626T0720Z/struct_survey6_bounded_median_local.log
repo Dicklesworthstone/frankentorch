@@ -1,0 +1,23 @@
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-api)
+warning: unused variable: `a_rows`
+    --> crates/ft-api/src/lib.rs:6991:18
+     |
+6991 |             let (a_rows, a_cols) = (a_aligned[0], a_aligned[1]);
+     |                  ^^^^^^ help: if this is intentional, prefix it with an underscore: `_a_rows`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: `ft-api` (lib) generated 1 warning (run `cargo fix --lib -p ft-api` to apply 1 suggestion)
+    Finished `release` profile [optimized] target(s) in 43.19s
+     Running `/data/projects/.rch-targets/frankentorch-cod-b/release/examples/struct_survey6_h2h`
+/data/projects/.venvs/frankentorch-pytorch-cpu/lib/python3.13/site-packages/torch/_subclasses/functional_tensor.py:362: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+op            FT(ms)    PT(ms)   verdict
+  cat_anchor     11.782   50.226   FT 4.26x FASTER
+  topk            5.172    3.982   FT 1.30x SLOWER
+  median         71.780   91.020   FT 1.27x FASTER
+  prod            7.203    1.826   FT 3.94x SLOWER
+  amax            2.723    1.435   FT 1.90x SLOWER
+  logsumexp       9.739   48.593   FT 4.99x FASTER
+  var             5.271    3.534   FT 1.49x SLOWER
+  kthvalue        0.001  158.976   FT 180449.04x FASTER

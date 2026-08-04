@@ -1,0 +1,19 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-pearlreef-dig-20260626T0720Z/crates/ft-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 38.33s
+     Running unittests src/lib.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/ft_api-4fa2327a283f58d8)
+
+running 11 tests
+test tests::session_tensor_median_even ... ok
+test tests::session_tensor_median_fractional_fallback_and_signed_zero ... ok
+test tests::session_tensor_median_odd ... ok
+test tests::nanmedian_backward_scatters_to_selected_element_and_value_parity ... ok
+test tests::session_tensor_median_backward_unique_values ... ok
+test tests::session_tensor_median_rejects_empty ... ok
+test tests::test_nanmedian_basic ... ok
+test tests::session_tensor_median_single ... ok
+test tests::test_nanmedian_all_nan ... ok
+test tests::median_var_std_full_golden_matches_torch ... ok
+test tests::quantile_median ... ok
+
+test result: ok. 11 passed; 0 failed; 0 ignored; 0 measured; 2378 filtered out; finished in 0.01s

@@ -1,0 +1,13 @@
+[RCH] local (no admissible workers: insufficient_slots=5,hard_preflight=1)
+   Compiling ft-api v0.1.0 (/data/projects/.scratch/frankentorch-blackthrush-boldverify-20260625T210520Z/crates/ft-api)
+    Finished `bench` profile [optimized + debuginfo] target(s) in 1m 00s
+     Running benches/cdist_bench.rs (/data/projects/.rch-targets/frankentorch-cod-a/release/deps/cdist_bench-659f6d43b8e09062)
+Gnuplot not found, using plotters backend
+Benchmarking pdist_f32_p2_mm/512x64
+Benchmarking pdist_f32_p2_mm/512x64: Warming up for 1.0000 s
+Benchmarking pdist_f32_p2_mm/512x64: Collecting 10 samples in estimated 3.0245 s (2750 iterations)
+Benchmarking pdist_f32_p2_mm/512x64: Analyzing
+pdist_f32_p2_mm/512x64  time:   [993.67 µs 1.0117 ms 1.0317 ms]
+                        change: [+0.4751% +3.2916% +5.9250%] (p = 0.04 < 0.05)
+                        Change within noise threshold.
+

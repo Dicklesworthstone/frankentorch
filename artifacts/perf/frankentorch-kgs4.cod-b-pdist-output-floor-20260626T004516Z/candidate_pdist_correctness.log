@@ -1,0 +1,13 @@
+[RCH] local (no admissible workers: insufficient_slots=4,hard_preflight=1,active_project_exclusion=1)
+   Compiling ft-kernel-cpu v0.1.0 (/data/projects/frankentorch/crates/ft-kernel-cpu)
+   Compiling ft-dispatch v0.1.0 (/data/projects/frankentorch/crates/ft-dispatch)
+   Compiling ft-autograd v0.1.0 (/data/projects/frankentorch/crates/ft-autograd)
+   Compiling ft-api v0.1.0 (/data/projects/frankentorch/crates/ft-api)
+    Finished `test` profile [unoptimized + debuginfo] target(s) in 48.60s
+     Running unittests src/lib.rs (/data/projects/.rch-targets/frankentorch-cod-b/debug/deps/ft_api-4fa2327a283f58d8)
+
+running 1 test
+test tests::pdist_p2_f32_fused_nograd_matches_composed_path ... ok
+
+test result: ok. 1 passed; 0 failed; 0 ignored; 0 measured; 2383 filtered out; finished in 0.01s
+
