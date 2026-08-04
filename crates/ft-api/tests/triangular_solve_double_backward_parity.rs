@@ -87,7 +87,12 @@ fn triangular_solve_hessian_over_a_matches_torch() {
 #[test]
 fn cholesky_solve_over_b_hessian_is_zero() {
     let mut s = sess();
-    let lvals = vec![std::f64::consts::SQRT_2, 0.0, 0.353553391, 1.17260394];
+    let lvals = vec![
+        std::f64::consts::SQRT_2,
+        0.0,
+        std::f64::consts::FRAC_1_SQRT_2 / 2.0,
+        1.17260394,
+    ];
     let l = s.tensor_variable(lvals, vec![2, 2], false).unwrap();
     let b = s.tensor_variable(vec![1.0, 2.0], vec![2, 1], true).unwrap();
     let x = s.tensor_cholesky_solve(b, l, false).unwrap();

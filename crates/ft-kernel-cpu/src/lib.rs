@@ -6032,16 +6032,22 @@ pub fn group_norm_forward_f64(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-        for i in 0..group_numel {
-            let c = g * cpg + i / spatial;
-            let mut y = (xb[i] - mean) * rstd;
-            if let Some(w) = weight {
-                y *= w[c];
+        for local_channel in 0..cpg {
+            let c = g * cpg + local_channel;
+            let channel_base = local_channel * spatial;
+            let channel_end = channel_base + spatial;
+            let w = weight.map(|values| values[c]);
+            let b = bias.map(|values| values[c]);
+            for i in channel_base..channel_end {
+                let mut y = (xb[i] - mean) * rstd;
+                if let Some(w) = w {
+                    y *= w;
+                }
+                if let Some(b) = b {
+                    y += b;
+                }
+                orow[i] = y;
             }
-            if let Some(b) = bias {
-                y += b[c];
-            }
-            orow[i] = y;
         }
     };
     // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
@@ -6091,16 +6097,22 @@ pub fn group_norm_forward_f32(
             vsum += d * d;
         }
         let rstd = 1.0 / (vsum * inv_m + eps).sqrt();
-        for i in 0..group_numel {
-            let c = g * cpg + i / spatial;
-            let mut y = (xb[i] - mean) * rstd;
-            if let Some(w) = weight {
-                y *= w[c];
+        for local_channel in 0..cpg {
+            let c = g * cpg + local_channel;
+            let channel_base = local_channel * spatial;
+            let channel_end = channel_base + spatial;
+            let w = weight.map(|values| values[c]);
+            let b = bias.map(|values| values[c]);
+            for i in channel_base..channel_end {
+                let mut y = (xb[i] - mean) * rstd;
+                if let Some(w) = w {
+                    y *= w;
+                }
+                if let Some(b) = b {
+                    y += b;
+                }
+                orow[i] = y;
             }
-            if let Some(b) = bias {
-                y += b[c];
-            }
-            orow[i] = y;
         }
     };
     // Bandwidth-bound reduce-then-scale: gate over groups (NORM_FWD_PARALLEL_MIN).
@@ -50783,6 +50795,52 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn group_norm_forward_channel_blocks_match_elementwise_reference() {
+        let (batch, num_groups, cpg, spatial) = (2usize, 2usize, 3usize, 4usize);
+        let channels = num_groups * cpg;
+        let x: Vec<f32> = (0..batch * channels * spatial)
+            .map(|i| (i as f32 - 10.0) * 0.03125)
+            .collect();
+        let weight: Vec<f32> = (0..channels).map(|c| 0.5 + c as f32 * 0.125).collect();
+        let bias: Vec<f32> = (0..channels).map(|c| -0.3 + c as f32 * 0.0625).collect();
+        let got = crate::group_norm_forward_f32(
+            &x,
+            Some(&weight),
+            Some(&bias),
+            batch,
+            num_groups,
+            cpg,
+            spatial,
+            1e-5,
+        );
+        let group_numel = cpg * spatial;
+        let inv_m = 1.0 / group_numel as f32;
+        let mut want = vec![0.0; x.len()];
+        for group in 0..batch * num_groups {
+            let channel_group = group % num_groups;
+            let base = group * group_numel;
+            let input = &x[base..base + group_numel];
+            let mean = input.iter().copied().sum::<f32>() * inv_m;
+            let variance = input
+                .iter()
+                .map(|&value| {
+                    let delta = value - mean;
+                    delta * delta
+                })
+                .sum::<f32>();
+            let rstd = 1.0 / (variance * inv_m + 1e-5).sqrt();
+            for i in 0..group_numel {
+                let channel = channel_group * cpg + i / spatial;
+                want[base + i] = (input[i] - mean) * rstd * weight[channel] + bias[channel];
+            }
+        }
+        assert_eq!(
+            got.iter().map(|value| value.to_bits()).collect::<Vec<_>>(),
+            want.iter().map(|value| value.to_bits()).collect::<Vec<_>>()
+        );
     }
 
     #[test]
