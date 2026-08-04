@@ -7,7 +7,7 @@ use std::time::Instant;
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
     let (rows, cols, k) = (4096usize, 1024usize, 2048usize);
-    let value = 3.14159_f64;
+    let value = std::f64::consts::PI;
     let input: Vec<f32> = (0..rows * cols)
         .map(|i| ((i % 9973) as f32 - 5000.0) * 0.001)
         .collect();

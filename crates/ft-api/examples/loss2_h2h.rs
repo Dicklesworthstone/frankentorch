@@ -20,7 +20,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .collect();
     let anc: Vec<f64> = (0..R * C).map(|i| (i % 7) as f64).collect();
 
-    let bench = |mut f: Box<dyn FnMut() -> ()>| -> f64 {
+    let bench = |mut f: Box<dyn FnMut()>| -> f64 {
         let mut best = f64::INFINITY;
         for _ in 0..7 {
             let t = Instant::now();

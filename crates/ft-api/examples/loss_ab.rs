@@ -12,7 +12,7 @@ use ft_core::ExecutionMode;
 const R: usize = 4000;
 const C: usize = 4000;
 
-fn best<F: FnMut() -> ()>(mut f: F, n: usize) -> f64 {
+fn best<F: FnMut()>(mut f: F, n: usize) -> f64 {
     let mut b = f64::INFINITY;
     for _ in 0..n {
         let t = Instant::now();

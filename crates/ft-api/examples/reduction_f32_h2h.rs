@@ -14,10 +14,7 @@ const C: usize = 4000;
 
 type UnaryOp = fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId);
 
-fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> ()>(
-    data: &[f32],
-    f: F,
-) -> f64 {
+fn time_ft<F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId)>(data: &[f32], f: F) -> f64 {
     let mut best = f64::INFINITY;
     for _ in 0..6 {
         let mut s = FrankenTorchSession::new(ExecutionMode::Strict);

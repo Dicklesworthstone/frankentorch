@@ -11,6 +11,12 @@ use ft_core::ExecutionMode;
 
 const R: usize = 4000;
 const C: usize = 4000;
+type TernaryOp = dyn Fn(
+    &mut FrankenTorchSession,
+    ft_autograd::TensorNodeId,
+    ft_autograd::TensorNodeId,
+    ft_autograd::TensorNodeId,
+);
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let a: Vec<f64> = (0..R * C).map(|i| ((i % 17) as f64) - 8.0).collect();
@@ -46,17 +52,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         best
     };
 
-    let names: Vec<(
-        &str,
-        Box<
-            dyn Fn(
-                &mut FrankenTorchSession,
-                ft_autograd::TensorNodeId,
-                ft_autograd::TensorNodeId,
-                ft_autograd::TensorNodeId,
-            ),
-        >,
-    )> = vec![
+    let names: Vec<(&str, Box<TernaryOp>)> = vec![
         (
             "cat_anchor",
             Box::new(|s, x, _y, _z| {

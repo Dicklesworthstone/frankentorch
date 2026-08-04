@@ -1,7 +1,7 @@
 //! A/B for tensor_quantize_per_channel F64. OLD = exact replica of the pre-fix path (CLONE input via
 //! to_vec then the SERIAL nested quantize loop); NEW = sess.tensor_quantize_per_channel (borrow input
 //! + parallel per-element). NOT an apply_function op, so the clone+serial replica faithfully models the
-//! real ORIG. bitmatch verifies. Run: cargo run --release -p ft-api --example quantize_pc_ab
+//!   real ORIG. bitmatch verifies. Run: cargo run --release -p ft-api --example quantize_pc_ab
 
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
@@ -14,13 +14,12 @@ fn old_quant(
     stride_before: usize,
     channel_size: usize,
     stride_after: usize,
-    qmin: i64,
-    qmax: i64,
+    bounds: (i64, i64),
 ) -> Vec<f64> {
     let cloned = input.to_vec(); // pre-fix path materialized input via tensor_values
     let mut out = vec![0.0; cloned.len()];
-    let qmin_f = qmin as f64;
-    let qmax_f = qmax as f64;
+    let qmin_f = bounds.0 as f64;
+    let qmax_f = bounds.1 as f64;
     for before in 0..stride_before {
         for c in 0..channel_size {
             let inv_scale = 1.0 / scales[c];
@@ -33,6 +32,26 @@ fn old_quant(
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::old_quant;
+
+    #[test]
+    fn old_quant_keeps_channel_mapping_and_bounds_grouped() {
+        let values = old_quant(
+            &[-1.0, 1.0, 4.0, -4.0],
+            &[2.0, 0.5],
+            &[0, 1],
+            1,
+            2,
+            2,
+            (-2, 2),
+        );
+
+        assert_eq!(values, vec![0.0, 0.0, 2.0, -2.0]);
+    }
 }
 
 fn bench<F: FnMut() -> usize>(mut f: F) -> f64 {
@@ -76,11 +95,11 @@ fn main() {
             .tensor_quantize_per_channel(it, &scales, &zps, 1, qmin, qmax)
             .unwrap();
         let new_out = sess.tensor_values(out).unwrap();
-        let old_out = old_quant(&input, &scales, &zps, before, channels, after, qmin, qmax);
+        let old_out = old_quant(&input, &scales, &zps, before, channels, after, (qmin, qmax));
         let bitmatch = new_out == old_out;
 
         let old_ms =
-            bench(|| old_quant(&input, &scales, &zps, before, channels, after, qmin, qmax).len());
+            bench(|| old_quant(&input, &scales, &zps, before, channels, after, (qmin, qmax)).len());
         let new_ms = bench(|| {
             sess.tensor_quantize_per_channel(it, &scales, &zps, 1, qmin, qmax)
                 .unwrap()
