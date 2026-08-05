@@ -26338,6 +26338,224 @@ enum SvdVOp {
     Neg(usize),
 }
 
+// ---------------------------------------------------------------------------
+// Blocked bidiagonalization (LAPACK `dgebrd` shape). frankentorch-svd-blocked-bidiag-r7jdo.
+//
+// `golub_reinsch_svd_impl` below reduces to bidiagonal form with a BLAS-2
+// rank-1 trailing update per column: O(n) passes over O(mn) data with no cache
+// reuse, which is why FT svd measured 189x slower than LAPACK at N=256 and did
+// not finish at N>=512. LAPACK instead reduces a panel of `nb` columns/rows at
+// a time, accumulating the deferred updates into two blocks `X` and `Y`, then
+// applies them to the trailing submatrix with two GEMMs.
+//
+// This section builds that in two layers. `bidiag_unblocked_f64` is the
+// `dgebd2` equivalent: correct, self-contained, and the reference the blocked
+// panel is validated against. Reflectors are stored in LAPACK convention — the
+// column reflector for step i lives below the diagonal in column i with an
+// implicit leading 1, the row reflector lives right of the superdiagonal in
+// row i — so `tauq`/`taup` plus the packed vectors fully determine Q and P.
+//
+// Per the ratified tolerance-parity policy (`frankentorch-qgce4`), SVD vector
+// outputs are compared by reconstruction/orthogonality within 1e-9 rather than
+// bit-exactly, which is what makes a rounding-reordering rewrite admissible
+// here at all.
+
+mod bidiag {
+    //! Staged reduction primitives. The unblocked path here is complete and
+    //! tested; it is not yet routed from `golub_reinsch_svd_impl`, which still
+    //! runs its own in-place Numerical-Recipes reduction. Wiring happens with
+    //! the blocked panel, so that the switch is a single reviewable change
+    //! against a reference that is already proven.
+    #![allow(dead_code)]
+
+    use core::ops::Range;
+
+    /// Sign convention matching LAPACK `dlarfg`: treats `+0.0` as positive.
+    fn house_sign_f64(alpha: f64) -> f64 {
+        if alpha < 0.0 { -1.0 } else { 1.0 }
+    }
+
+    /// `dlarfg`: generate a Householder reflector over a strided vector.
+    ///
+    /// The vector starts at `a[start]` and advances by `stride` for `len` entries.
+    /// On return `a[start]` holds `beta`, the trailing entries hold the tail of `v`
+    /// (whose leading entry is an implicit 1), and the returned `tau` satisfies
+    /// `(I - tau * v * v^T) x == beta * e_1`. Returns `tau == 0` when the vector is
+    /// already a multiple of `e_1`, in which case nothing is modified.
+    fn house_gen_strided_f64(a: &mut [f64], start: usize, len: usize, stride: usize) -> f64 {
+        if len <= 1 {
+            return 0.0;
+        }
+        let alpha = a[start];
+        let mut tail_sq = 0.0f64;
+        for k in 1..len {
+            let value = a[start + k * stride];
+            tail_sq += value * value;
+        }
+        if tail_sq == 0.0 {
+            return 0.0;
+        }
+        let beta = -house_sign_f64(alpha) * alpha.hypot(tail_sq.sqrt());
+        let tau = (beta - alpha) / beta;
+        let inv = 1.0 / (alpha - beta);
+        for k in 1..len {
+            a[start + k * stride] *= inv;
+        }
+        a[start] = beta;
+        tau
+    }
+
+    /// Apply `I - tau * v * v^T` from the LEFT to `a[rows, cols]`, where `v` is the
+    /// implicit-unit column reflector packed in column `vcol` starting at `row0`.
+    fn house_apply_left_f64(
+        a: &mut [f64],
+        lda: usize,
+        rows: Range<usize>,
+        cols: Range<usize>,
+        vcol: usize,
+        tau: f64,
+    ) {
+        if tau == 0.0 || rows.is_empty() || cols.is_empty() {
+            return;
+        }
+        let row0 = rows.start;
+        for c in cols {
+            let mut dot = a[row0 * lda + c];
+            for r in (row0 + 1)..rows.end {
+                dot += a[r * lda + vcol] * a[r * lda + c];
+            }
+            let f = tau * dot;
+            if f == 0.0 {
+                continue;
+            }
+            a[row0 * lda + c] -= f;
+            for r in (row0 + 1)..rows.end {
+                a[r * lda + c] -= f * a[r * lda + vcol];
+            }
+        }
+    }
+
+    /// Apply `I - tau * v * v^T` from the RIGHT to `a[rows, cols]`, where `v` is the
+    /// implicit-unit row reflector packed in row `vrow` starting at `col0`.
+    fn house_apply_right_f64(
+        a: &mut [f64],
+        lda: usize,
+        rows: Range<usize>,
+        cols: Range<usize>,
+        vrow: usize,
+        tau: f64,
+    ) {
+        if tau == 0.0 || rows.is_empty() || cols.is_empty() {
+            return;
+        }
+        let col0 = cols.start;
+        for r in rows {
+            let mut dot = a[r * lda + col0];
+            for c in (col0 + 1)..cols.end {
+                dot += a[r * lda + c] * a[vrow * lda + c];
+            }
+            let f = tau * dot;
+            if f == 0.0 {
+                continue;
+            }
+            a[r * lda + col0] -= f;
+            for c in (col0 + 1)..cols.end {
+                a[r * lda + c] -= f * a[vrow * lda + c];
+            }
+        }
+    }
+
+    /// `dgebd2`: unblocked reduction of a row-major `m x n` matrix (`m >= n`) to
+    /// upper bidiagonal form, in place.
+    ///
+    /// Returns `(d, e, tauq, taup)`: `d` is the length-`n` diagonal, `e` the
+    /// length-`n` superdiagonal (`e[n-1]` unused, held at 0), and `tauq`/`taup` the
+    /// reflector scalars for Q and P respectively. Reflector vectors are left
+    /// packed in `a` in LAPACK convention.
+    fn bidiag_unblocked_f64(
+        a: &mut [f64],
+        m: usize,
+        n: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut d = vec![0.0f64; n];
+        let mut e = vec![0.0f64; n];
+        let mut tauq = vec![0.0f64; n];
+        let mut taup = vec![0.0f64; n];
+
+        for i in 0..n {
+            // Column reflector annihilating a[i+1.., i], then applied to the
+            // trailing columns from the left.
+            tauq[i] = house_gen_strided_f64(a, i * n + i, m - i, n);
+            d[i] = a[i * n + i];
+            house_apply_left_f64(a, n, i..m, (i + 1)..n, i, tauq[i]);
+
+            if i + 1 < n {
+                // Row reflector annihilating a[i, i+2..], then applied to the
+                // trailing rows from the right.
+                taup[i] = house_gen_strided_f64(a, i * n + i + 1, n - i - 1, 1);
+                e[i] = a[i * n + i + 1];
+                house_apply_right_f64(a, n, (i + 1)..m, (i + 1)..n, i, taup[i]);
+            }
+        }
+
+        (d, e, tauq, taup)
+    }
+
+    /// Materialise `Q` (`m x n`, the first `n` columns) from the packed column
+    /// reflectors left by [`bidiag_unblocked_f64`]. Test/verification helper for
+    /// the reconstruction invariant `Q * B * P^T == A`.
+    fn bidiag_form_q_f64(packed: &[f64], m: usize, n: usize, tauq: &[f64]) -> Vec<f64> {
+        let mut q = vec![0.0f64; m * n];
+        for (i, row) in q.chunks_exact_mut(n).enumerate().take(n.min(m)) {
+            row[i] = 1.0;
+        }
+        for i in (0..n).rev() {
+            if tauq[i] == 0.0 {
+                continue;
+            }
+            for c in 0..n {
+                let mut dot = q[i * n + c];
+                for r in (i + 1)..m {
+                    dot += packed[r * n + i] * q[r * n + c];
+                }
+                let f = tauq[i] * dot;
+                q[i * n + c] -= f;
+                for r in (i + 1)..m {
+                    q[r * n + c] -= f * packed[r * n + i];
+                }
+            }
+        }
+        q
+    }
+
+    /// Materialise `P` (`n x n`) from the packed row reflectors left by
+    /// [`bidiag_unblocked_f64`], such that `A == Q * B * P^T`.
+    fn bidiag_form_p_f64(packed: &[f64], n: usize, taup: &[f64]) -> Vec<f64> {
+        let mut p = vec![0.0f64; n * n];
+        for (i, row) in p.chunks_exact_mut(n).enumerate() {
+            row[i] = 1.0;
+        }
+        for i in (0..n).rev() {
+            if i + 1 >= n || taup[i] == 0.0 {
+                continue;
+            }
+            let vrow = i;
+            for c in 0..n {
+                let mut dot = p[(i + 1) * n + c];
+                for r in (i + 2)..n {
+                    dot += packed[vrow * n + r] * p[r * n + c];
+                }
+                let f = taup[i] * dot;
+                p[(i + 1) * n + c] -= f;
+                for r in (i + 2)..n {
+                    p[r * n + c] -= f * packed[vrow * n + r];
+                }
+            }
+        }
+        p
+    }
+} // mod bidiag
+
 fn golub_reinsch_svd_impl(
     a: &mut [f64],
     m: usize,
@@ -51660,5 +51878,143 @@ mod tests {
         let meta = TensorMeta::from_shape(vec![numel], DType::F64, Device::Cpu);
         let nrm = super::norm_tensor_contiguous_f64(&v, &meta, 2.0).expect("norm");
         assert_eq!(nrm.to_bits(), serial.sqrt().to_bits());
+    }
+
+    // --- blocked bidiagonalization (frankentorch-svd-blocked-bidiag-r7jdo) ---
+
+    /// Deterministic, reproducible test matrix with no special structure.
+    fn bidiag_test_matrix(m: usize, n: usize, seed: u64) -> Vec<f64> {
+        let mut state = seed.wrapping_mul(6_364_136_223_846_793_005).wrapping_add(1);
+        let mut out = vec![0.0f64; m * n];
+        for slot in &mut out {
+            state = state
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            // map to roughly [-1, 1)
+            #[allow(clippy::cast_precision_loss)]
+            let unit = ((state >> 11) as f64) / ((1u64 << 53) as f64);
+            *slot = unit.mul_add(2.0, -1.0);
+        }
+        out
+    }
+
+    /// Dense row-major product `a (m x k) * b (k x n)`.
+    fn bidiag_matmul(a: &[f64], b: &[f64], m: usize, k: usize, n: usize) -> Vec<f64> {
+        let mut c = vec![0.0f64; m * n];
+        for i in 0..m {
+            for p in 0..k {
+                let av = a[i * k + p];
+                if av == 0.0 {
+                    continue;
+                }
+                for j in 0..n {
+                    c[i * n + j] += av * b[p * n + j];
+                }
+            }
+        }
+        c
+    }
+
+    /// `Q * B * P^T` must reproduce the original matrix. This is the defining
+    /// contract of the reduction: it catches a wrong reflector convention, a
+    /// wrong sign, or a missed trailing update, none of which a "runs without
+    /// panicking" check would notice.
+    #[test]
+    fn bidiag_unblocked_reconstructs_original_matrix() {
+        for &(m, n) in &[(6usize, 6usize), (8, 5), (5, 5), (12, 4), (1, 1), (3, 1)] {
+            let original = bidiag_test_matrix(m, n, 0x5EED ^ (m * 31 + n) as u64);
+            let mut packed = original.clone();
+            let (d, e, tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+
+            let q = super::bidiag::bidiag_form_q_f64(&packed, m, n, &tauq);
+            let p = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+
+            // Explicit bidiagonal B (n x n).
+            let mut b = vec![0.0f64; n * n];
+            for i in 0..n {
+                b[i * n + i] = d[i];
+                if i + 1 < n {
+                    b[i * n + i + 1] = e[i];
+                }
+            }
+
+            // Q * B * P^T
+            let qb = bidiag_matmul(&q, &b, m, n, n);
+            let mut pt = vec![0.0f64; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    pt[i * n + j] = p[j * n + i];
+                }
+            }
+            let recon = bidiag_matmul(&qb, &pt, m, n, n);
+
+            for (idx, (got, want)) in recon.iter().zip(original.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "[{m}x{n}] reconstruction mismatch at {idx}: {got} vs {want}"
+                );
+            }
+        }
+    }
+
+    /// Q must be orthonormal (`Q^T Q == I`), otherwise the reduction has
+    /// silently rescaled the space even if some reconstruction happens to fit.
+    #[test]
+    fn bidiag_unblocked_q_columns_are_orthonormal() {
+        let (m, n) = (9usize, 6usize);
+        let mut packed = bidiag_test_matrix(m, n, 0xA11CE);
+        let (_d, _e, tauq, _taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+        let q = super::bidiag::bidiag_form_q_f64(&packed, m, n, &tauq);
+
+        for c1 in 0..n {
+            for c2 in 0..n {
+                let mut dot = 0.0f64;
+                for r in 0..m {
+                    dot += q[r * n + c1] * q[r * n + c2];
+                }
+                let want = if c1 == c2 { 1.0 } else { 0.0 };
+                assert!(
+                    (dot - want).abs() < 1e-9,
+                    "Q^T Q [{c1},{c2}] = {dot}, expected {want}"
+                );
+            }
+        }
+    }
+
+    /// The reduction is only useful if the form really is bidiagonal: every
+    /// entry outside the diagonal and superdiagonal of `Q^T A P` must vanish.
+    /// A naive implementation that skips the right-hand reflectors still passes
+    /// reconstruction, but fails this.
+    #[test]
+    fn bidiag_unblocked_zeroes_outside_two_diagonals() {
+        let (m, n) = (7usize, 7usize);
+        let original = bidiag_test_matrix(m, n, 0xB1D1A6);
+        let mut packed = original.clone();
+        let (_d, _e, tauq, taup) = super::bidiag::bidiag_unblocked_f64(&mut packed, m, n);
+        let q = super::bidiag::bidiag_form_q_f64(&packed, m, n, &tauq);
+        let p = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+
+        // B = Q^T * A * P
+        let mut qt = vec![0.0f64; n * m];
+        for r in 0..m {
+            for c in 0..n {
+                qt[c * m + r] = q[r * n + c];
+            }
+        }
+        let qta = bidiag_matmul(&qt, &original, n, m, n);
+        let b = bidiag_matmul(&qta, &p, n, n, n);
+
+        for i in 0..n {
+            for j in 0..n {
+                if i == j || i + 1 == j {
+                    continue;
+                }
+                assert!(
+                    b[i * n + j].abs() < 1e-9,
+                    "Q^T A P is not bidiagonal at [{i},{j}]: {}",
+                    b[i * n + j]
+                );
+            }
+        }
     }
 }
