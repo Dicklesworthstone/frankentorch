@@ -26361,14 +26361,110 @@ enum SvdVOp {
 // here at all.
 
 mod bidiag {
-    //! Staged reduction primitives. The unblocked path here is complete and
-    //! tested; it is not yet routed from `golub_reinsch_svd_impl`, which still
-    //! runs its own in-place Numerical-Recipes reduction. Wiring happens with
-    //! the blocked panel, so that the switch is a single reviewable change
-    //! against a reference that is already proven.
+    //! `dgebrd`-shaped reduction to bidiagonal form, plus `dorgbr`-shaped
+    //! materialisation of `Q` and `P`. `golub_reinsch_svd_impl` routes here
+    //! above [`super::svd_use_blocked_bidiag`]; the unblocked sweep remains as
+    //! the blocked panel's correctness oracle and as the small-`n` fallback.
     #![allow(dead_code)]
 
     use core::ops::Range;
+    use rayon::prelude::*;
+
+    /// Work (rows x cols) below which rayon dispatch costs more than the sweep.
+    const PARALLEL_GATE: u64 = 1 << 14;
+
+    /// Rows per task in [`reduce_scaled_rows_f64`]. Fixed (not derived from the
+    /// thread count) so the partial-sum tree — and therefore the result — is
+    /// identical on every machine and every run.
+    const REDUCE_CHUNK_ROWS: usize = 64;
+
+    /// `acc[c] += Σ_r v[r] · block[r][col0 + c]` over a row-major block whose
+    /// row `r` starts at `block[r * lda]`.
+    ///
+    /// Row-outer/column-inner, so each row segment is read contiguously — the
+    /// transposed form (column-outer) strides by `lda` and is what made the
+    /// staged `bidiag_form_*` helpers memory-bound. The parallel arm splits the
+    /// rows on a FIXED chunk boundary and combines the partial vectors in index
+    /// order, so it is deterministic; it is not bit-identical to the serial arm,
+    /// which the ratified SVD tolerance-parity policy (`frankentorch-qgce4`)
+    /// permits for singular-vector outputs.
+    fn reduce_scaled_rows_f64(
+        block: &[f64],
+        lda: usize,
+        col0: usize,
+        ncols: usize,
+        v: &[f64],
+        acc: &mut [f64],
+    ) {
+        let nrows = v.len();
+        if nrows == 0 || ncols == 0 {
+            return;
+        }
+        let block = &block[..nrows * lda];
+        if (nrows as u64) * (ncols as u64) < PARALLEL_GATE || rayon::current_num_threads() <= 1 {
+            for (row, &vr) in block.chunks_exact(lda).zip(v) {
+                let seg = &row[col0..col0 + ncols];
+                for c in 0..ncols {
+                    acc[c] += vr * seg[c];
+                }
+            }
+            return;
+        }
+        let partials: Vec<Vec<f64>> = block
+            .par_chunks(REDUCE_CHUNK_ROWS * lda)
+            .zip(v.par_chunks(REDUCE_CHUNK_ROWS))
+            .map(|(rows, vs)| {
+                let mut local = vec![0.0f64; ncols];
+                for (row, &vr) in rows.chunks_exact(lda).zip(vs) {
+                    let seg = &row[col0..col0 + ncols];
+                    for c in 0..ncols {
+                        local[c] += vr * seg[c];
+                    }
+                }
+                local
+            })
+            .collect();
+        for local in &partials {
+            for c in 0..ncols {
+                acc[c] += local[c];
+            }
+        }
+    }
+
+    /// `block[r][col0 + c] -= v[r] · acc[c]` — the rank-1 half of a Householder
+    /// application. Every row is independent, so the parallel arm is bit-exact.
+    fn apply_scaled_rank1_f64(
+        block: &mut [f64],
+        lda: usize,
+        col0: usize,
+        ncols: usize,
+        v: &[f64],
+        acc: &[f64],
+    ) {
+        let nrows = v.len();
+        if nrows == 0 || ncols == 0 {
+            return;
+        }
+        let block = &mut block[..nrows * lda];
+        if (nrows as u64) * (ncols as u64) < PARALLEL_GATE || rayon::current_num_threads() <= 1 {
+            for (row, &vr) in block.chunks_exact_mut(lda).zip(v) {
+                let seg = &mut row[col0..col0 + ncols];
+                for c in 0..ncols {
+                    seg[c] -= vr * acc[c];
+                }
+            }
+            return;
+        }
+        block
+            .par_chunks_mut(lda)
+            .zip(v.par_iter())
+            .for_each(|(row, &vr)| {
+                let seg = &mut row[col0..col0 + ncols];
+                for c in 0..ncols {
+                    seg[c] -= vr * acc[c];
+                }
+            });
+    }
 
     /// Sign convention matching LAPACK `dlarfg`: treats `+0.0` as positive.
     fn house_sign_f64(alpha: f64) -> f64 {
@@ -26532,6 +26628,10 @@ mod bidiag {
         let ldy = nb;
         // Index of submatrix entry (r, c) inside the full matrix.
         let at = |r: usize, c: usize| (off + r) * lda + (off + c);
+        // Reflector scratch for the two O(m_sub * n_sub) matvecs, steps (3) and
+        // (12). Every other step in the panel is O(m_sub * nb) and stays serial.
+        let mut u = vec![0.0f64; m_sub];
+        let mut acc = vec![0.0f64; n_sub];
 
         for i in 0..nb {
             // (1) Apply the accumulated updates to column i before reducing it.
@@ -26553,12 +26653,30 @@ mod bidiag {
 
             if i + 1 < n_sub {
                 // (3) y[i+1.., i] = A[i.., i+1..]^T * u
-                for c in (i + 1)..n_sub {
-                    let mut s = 0.0;
-                    for r in i..m_sub {
-                        s += a[at(r, c)] * a[at(r, i)];
-                    }
-                    y[c * ldy + i] = s;
+                //
+                // The naive form walks column c down the rows, striding by
+                // `lda` on every read; folding it into a row-contiguous
+                // accumulation is what lets this — the panel's dominant term —
+                // run in parallel.
+                let urows = m_sub - i;
+                let ncols = n_sub - i - 1;
+                for (r, slot) in u[..urows].iter_mut().enumerate() {
+                    *slot = a[at(i + r, i)];
+                }
+                acc[..ncols].fill(0.0);
+                reduce_scaled_rows_f64(
+                    // Row start, NOT `at(i, 0)`: `col0` below is an absolute
+                    // column index into the row, so the block must begin at the
+                    // start of row `off + i`.
+                    &a[(off + i) * lda..],
+                    lda,
+                    off + i + 1,
+                    ncols,
+                    &u[..urows],
+                    &mut acc[..ncols],
+                );
+                for (t, &value) in acc[..ncols].iter().enumerate() {
+                    y[(i + 1 + t) * ldy + i] = value;
                 }
                 // (4) stash A[i.., 0..i]^T * u in the unused head of column i
                 for p in 0..i {
@@ -26615,12 +26733,40 @@ mod bidiag {
                 a[at(i, i + 1)] = 1.0;
 
                 // (12) x[i+1.., i] = A[i+1.., i+1..] * v
-                for r in (i + 1)..m_sub {
-                    let mut s = 0.0;
-                    for c in (i + 1)..n_sub {
-                        s += a[at(r, c)] * a[at(i, c)];
+                //
+                // Each output row is an independent contiguous dot product, so
+                // the parallel arm here is bit-exact with the serial one.
+                let vlen = n_sub - i - 1;
+                let xrows = m_sub - i - 1;
+                let a_ro: &[f64] = a;
+                let vstart = at(i, i + 1);
+                let vrow = &a_ro[vstart..vstart + vlen];
+                if (xrows as u64) * (vlen as u64) >= PARALLEL_GATE
+                    && rayon::current_num_threads() > 1
+                {
+                    x.par_chunks_mut(ldx)
+                        .enumerate()
+                        .skip(i + 1)
+                        .take(xrows)
+                        .for_each(|(r, xrow)| {
+                            let start = at(r, i + 1);
+                            let arow = &a_ro[start..start + vlen];
+                            let mut s = 0.0;
+                            for c in 0..vlen {
+                                s += arow[c] * vrow[c];
+                            }
+                            xrow[i] = s;
+                        });
+                } else {
+                    for r in (i + 1)..m_sub {
+                        let start = at(r, i + 1);
+                        let arow = &a_ro[start..start + vlen];
+                        let mut s = 0.0;
+                        for c in 0..vlen {
+                            s += arow[c] * vrow[c];
+                        }
+                        x[r * ldx + i] = s;
                     }
-                    x[r * ldx + i] = s;
                 }
                 // (13) stash y[i+1.., 0..=i]^T * v
                 for p in 0..=i {
@@ -26758,59 +26904,162 @@ mod bidiag {
     }
 
     /// Materialise `Q` (`m x n`, the first `n` columns) from the packed column
-    /// reflectors left by [`bidiag_unblocked_f64`]. Test/verification helper for
-    /// the reconstruction invariant `Q * B * P^T == A`.
+    /// reflectors left by [`bidiag_unblocked_f64`], so that `A == Q * B * P^T`.
+    ///
+    /// `dorgbr('Q')`. Reflector `i` touches rows `i..m`, and `Q` is built from
+    /// the identity walking `i` downwards, so at step `i` every column below `i`
+    /// is still `e_c` with its lone 1 above row `i`: those columns are provably
+    /// untouched and are skipped, halving the work. The remaining update is one
+    /// `reduce` + one rank-1 `apply` per reflector, both row-contiguous.
     pub(crate) fn bidiag_form_q_f64(packed: &[f64], m: usize, n: usize, tauq: &[f64]) -> Vec<f64> {
         let mut q = vec![0.0f64; m * n];
         for (i, row) in q.chunks_exact_mut(n).enumerate().take(n.min(m)) {
             row[i] = 1.0;
         }
+        let mut acc = vec![0.0f64; n];
+        let mut v = vec![0.0f64; m];
         for i in (0..n).rev() {
-            if tauq[i] == 0.0 {
+            let tau = tauq[i];
+            if tau == 0.0 || i >= m {
                 continue;
             }
-            for c in 0..n {
-                let mut dot = q[i * n + c];
-                for r in (i + 1)..m {
-                    dot += packed[r * n + i] * q[r * n + c];
-                }
-                let f = tauq[i] * dot;
-                q[i * n + c] -= f;
-                for r in (i + 1)..m {
-                    q[r * n + c] -= f * packed[r * n + i];
-                }
+            let nrows = m - i;
+            let ncols = n - i;
+            v[0] = 1.0;
+            for r in 1..nrows {
+                v[r] = packed[(i + r) * n + i];
             }
+            acc[..ncols].fill(0.0);
+            reduce_scaled_rows_f64(&q[i * n..], n, i, ncols, &v[..nrows], &mut acc[..ncols]);
+            for value in &mut acc[..ncols] {
+                *value *= tau;
+            }
+            apply_scaled_rank1_f64(&mut q[i * n..], n, i, ncols, &v[..nrows], &acc[..ncols]);
         }
         q
     }
 
     /// Materialise `P` (`n x n`) from the packed row reflectors left by
     /// [`bidiag_unblocked_f64`], such that `A == Q * B * P^T`.
+    ///
+    /// `dorgbr('P')`. Reflector `i` lives in row `i` right of the superdiagonal
+    /// and touches rows `i+1..n`; by the same identity argument as
+    /// [`bidiag_form_q_f64`] only columns `i+1..n` can be nonzero there.
     pub(crate) fn bidiag_form_p_f64(packed: &[f64], n: usize, taup: &[f64]) -> Vec<f64> {
         let mut p = vec![0.0f64; n * n];
         for (i, row) in p.chunks_exact_mut(n).enumerate() {
             row[i] = 1.0;
         }
+        let mut acc = vec![0.0f64; n];
+        let mut v = vec![0.0f64; n];
         for i in (0..n).rev() {
-            if i + 1 >= n || taup[i] == 0.0 {
+            let tau = taup[i];
+            if i + 1 >= n || tau == 0.0 {
                 continue;
             }
-            let vrow = i;
-            for c in 0..n {
-                let mut dot = p[(i + 1) * n + c];
-                for r in (i + 2)..n {
-                    dot += packed[vrow * n + r] * p[r * n + c];
-                }
-                let f = taup[i] * dot;
-                p[(i + 1) * n + c] -= f;
-                for r in (i + 2)..n {
-                    p[r * n + c] -= f * packed[vrow * n + r];
-                }
+            let row0 = i + 1;
+            let nrows = n - row0;
+            v[0] = 1.0;
+            for r in 1..nrows {
+                v[r] = packed[i * n + row0 + r];
             }
+            acc[..nrows].fill(0.0);
+            reduce_scaled_rows_f64(&p[row0 * n..], n, row0, nrows, &v[..nrows], &mut acc[..nrows]);
+            for value in &mut acc[..nrows] {
+                *value *= tau;
+            }
+            apply_scaled_rank1_f64(
+                &mut p[row0 * n..],
+                n,
+                row0,
+                nrows,
+                &v[..nrows],
+                &acc[..nrows],
+            );
         }
         p
     }
 } // mod bidiag
+
+/// Panel width for the blocked bidiagonalization. Measured on the shared
+/// workers at `N = 256` and `N = 512`: 16 beat 32 and 64 at both sizes once the
+/// panel's two matvecs were parallelized, because a narrower panel keeps the
+/// deferred `X`/`Y` blocks in cache and hands more of the flops to the GEMM.
+fn svd_bidiag_block_size() -> usize {
+    16
+}
+
+/// Whether to reduce via the blocked (`dgebrd`) path rather than the in-place
+/// Numerical-Recipes sweep.
+///
+/// The blocked path replaces the NR reduction AND its back-accumulation with
+/// `dgebrd` + `dorgbr`, which only pays once the trailing submatrix is big
+/// enough for the two panel GEMMs to dominate; below that the NR sweep's single
+/// in-place pass wins on constants. `m >= n` is the reduction's precondition.
+fn svd_use_blocked_bidiag(m: usize, n: usize) -> bool {
+    // `FT_SVD_FORCE_NR` restores the incumbent reduction. The perf ledger
+    // requires the incumbent arm to be measured live against the same build on
+    // the same worker, and the reduction is chosen deep inside the kernel with
+    // no caller-visible knob. Read once, so steady-state cost is a load.
+    static FORCE_NR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let force_nr = *FORCE_NR.get_or_init(|| std::env::var_os("FT_SVD_FORCE_NR").is_some());
+    !force_nr && n >= 64 && m >= n
+}
+
+/// Blocked (`dgebrd` + `dorgbr`) replacement for the Numerical-Recipes prologue.
+///
+/// Produces exactly what [`svd_bidiag_qr_f64`] consumes: the bidiagonal `(w,
+/// rv1)`, the right-vector accumulator `v`, and `anorm`; and, when `track_left`,
+/// leaves `a` holding the left-vector accumulator `Q`.
+///
+/// INDEX CONVENTION — this is the one place the two formulations disagree.
+/// LAPACK holds the superdiagonal as `e[i]` at `(i, i+1)`; Numerical Recipes
+/// holds it as `rv1[i]` at `(i-1, i)` with `rv1[0]` unused. So `rv1` is `e`
+/// shifted up by one, and getting that wrong yields a plausible-looking but
+/// silently wrong spectrum.
+fn svd_blocked_bidiag_prologue(
+    a: &mut [f64],
+    m: usize,
+    n: usize,
+    track_left: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, f64) {
+    let (d, e, tauq, taup) = bidiag::bidiag_blocked_f64(a, m, n, svd_bidiag_block_size());
+
+    // P must be read out of the packed reflectors BEFORE `a` is overwritten with Q.
+    let v = bidiag::bidiag_form_p_f64(a, n, &taup);
+    if track_left {
+        let q = bidiag::bidiag_form_q_f64(a, m, n, &tauq);
+        a[..m * n].copy_from_slice(&q);
+    }
+
+    let (w, rv1, anorm) = svd_bidiag_to_nr_indexing(d, &e);
+    (w, rv1, v, anorm)
+}
+
+/// The reduction half of [`svd_blocked_bidiag_prologue`], for the values-only
+/// entry point: no reflectors are materialised, so `a` is left packed.
+fn svd_blocked_bidiag_values(a: &mut [f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, f64) {
+    let (d, e, _tauq, _taup) = bidiag::bidiag_blocked_f64(a, m, n, svd_bidiag_block_size());
+    svd_bidiag_to_nr_indexing(d, &e)
+}
+
+/// Convert a LAPACK-indexed bidiagonal into the Numerical-Recipes indexing the
+/// QR sweep expects, and compute the sweep's convergence bound.
+///
+/// LAPACK holds the superdiagonal as `e[i]` at `(i, i+1)`; NR holds it as
+/// `rv1[i]` at `(i-1, i)` with `rv1[0]` unused. The shift is the whole
+/// conversion, and getting it wrong yields a plausible-looking but silently
+/// wrong spectrum rather than an obvious failure.
+fn svd_bidiag_to_nr_indexing(d: Vec<f64>, e: &[f64]) -> (Vec<f64>, Vec<f64>, f64) {
+    let n = d.len();
+    let mut rv1 = vec![0.0f64; n];
+    rv1[1..n].copy_from_slice(&e[..n - 1]);
+    let mut anorm = 0.0f64;
+    for i in 0..n {
+        anorm = anorm.max(d[i].abs() + rv1[i].abs());
+    }
+    (d, rv1, anorm)
+}
 
 fn golub_reinsch_svd_impl(
     a: &mut [f64],
@@ -26818,15 +27067,44 @@ fn golub_reinsch_svd_impl(
     n: usize,
     track_left: bool,
 ) -> Result<(Vec<f64>, Vec<f64>), KernelError> {
+    golub_reinsch_svd_with_reduction(a, m, n, track_left, svd_use_blocked_bidiag(m, n))
+}
+
+/// [`golub_reinsch_svd_impl`] with the reduction chosen explicitly rather than
+/// by [`svd_use_blocked_bidiag`]. The two reductions produce different — both
+/// valid — bidiagonal forms, so this seam is what lets one matrix be pushed
+/// through both and the results compared.
+fn golub_reinsch_svd_with_reduction(
+    a: &mut [f64],
+    m: usize,
+    n: usize,
+    track_left: bool,
+    blocked: bool,
+) -> Result<(Vec<f64>, Vec<f64>), KernelError> {
+    let (mut w, mut rv1, mut v, anorm) = if blocked {
+        svd_blocked_bidiag_prologue(a, m, n, track_left)
+    } else {
+        svd_nr_bidiag_prologue(a, m, n, track_left)
+    };
+    svd_bidiag_qr_f64(a, &mut v, &mut w, &mut rv1, n, anorm, track_left)?;
+    Ok((w, v))
+}
+
+/// Numerical-Recipes in-place Householder reduction to bidiagonal form.
+///
+/// Returns `(w, rv1, anorm)` — the diagonal, the superdiagonal in NR indexing
+/// (`rv1[i]` sits at `(i-1, i)`, `rv1[0]` unused), and the norm bound the QR
+/// sweep's convergence test uses — and leaves the reflectors packed in `a`.
+/// Shared by the full SVD and the values-only entry point, which ran textually
+/// identical copies of this loop.
+fn svd_nr_reduce_f64(a: &mut [f64], m: usize, n: usize) -> (Vec<f64>, Vec<f64>, f64) {
     let mut w = vec![0.0f64; n];
-    let mut v = vec![0.0f64; n * n];
     let mut rv1 = vec![0.0f64; n];
 
     let mut g = 0.0f64;
     let mut scale = 0.0f64;
     let mut anorm = 0.0f64;
 
-    // --- Householder reduction to bidiagonal form ---
     for i in 0..n {
         let l = i + 1;
         rv1[i] = scale * g;
@@ -26926,6 +27204,21 @@ fn golub_reinsch_svd_impl(
         anorm = anorm.max(w[i].abs() + rv1[i].abs());
     }
 
+    (w, rv1, anorm)
+}
+
+/// Numerical-Recipes reduction plus the `V` (and, when `track_left`, `U`)
+/// back-accumulation. Returns `(w, rv1, v, anorm)`.
+fn svd_nr_bidiag_prologue(
+    a: &mut [f64],
+    m: usize,
+    n: usize,
+    track_left: bool,
+) -> (Vec<f64>, Vec<f64>, Vec<f64>, f64) {
+    let (w, rv1, anorm) = svd_nr_reduce_f64(a, m, n);
+    let mut v = vec![0.0f64; n * n];
+    let mut g = 0.0f64;
+
     // --- Accumulation of right-hand transformations (V) ---
     for i in (0..n).rev() {
         let l = i + 1;
@@ -26998,25 +27291,44 @@ fn golub_reinsch_svd_impl(
         }
     }
 
-    // --- Diagonalization of the bidiagonal form: QR with implicit shifts ---
-    // PERF NOTE: this implicit-QR sweep is the DOMINANT cost of the full SVD — a
-    // long sequence of BLAS-1 Givens rotations applied to U (m rows) and V (n
-    // rows). An earlier attempt row-parallelized each rotation individually (2
-    // elements/row/fork-join) and regressed: memory-bound, O(n^2) fork/joins.
-    // Transposing U/V also regressed (~1.4x): the two rotated columns are adjacent
-    // (j, j+1) and already share a cache line in row-major; transposing splits
-    // them `stride` apart.
-    //
-    // LEVER (bit-exact, DEFERRED whole-stream replay): the entire recurrence
-    // (singular values + split/convergence decisions) reads only w/rv1, never U
-    // or V. So log the COMPLETE ordered operation stream first, then replay it
-    // across rows in a SINGLE parallel pass each — two fork/joins for the whole
-    // O(n^3) back-transform, not one per rotation (the regressing attempt) or per
-    // sweep (still O(n) fork/joins, ~1.1x net). Each of the n (m) rows independently
-    // replays the whole log in order, so every entry is bit-for-bit identical to
-    // the inline form. V's stream is rotations + convergence sign-flips; U's is the
-    // cancellation + main-chase rotations (its own (c,s), distinct columns).
-    // Same-worker RAYON A/B @256: full_matrices=true 2.26x, deferred-left 2.15x.
+    (w, rv1, v, anorm)
+}
+
+/// Diagonalize the bidiagonal `(w, rv1)` by implicit-shift QR, replaying the
+/// rotation streams onto `v` (and onto `a`, holding `U`, when `track_left`).
+///
+/// Shared by both prologues: the recurrence reads only `w`/`rv1`, so it is
+/// indifferent to which reduction produced them.
+///
+/// PERF NOTE: with the reduction blocked (`frankentorch-svd-blocked-bidiag-r7jdo`)
+/// this sweep is the dominant remaining cost of the full SVD — a long sequence of
+/// BLAS-1 Givens rotations applied to U (m rows) and V (n rows). An earlier
+/// attempt row-parallelized each rotation individually (2 elements/row/fork-join)
+/// and regressed: memory-bound, O(n^2) fork/joins. Transposing U/V also regressed
+/// (~1.4x): the two rotated columns are adjacent (j, j+1) and already share a
+/// cache line in row-major; transposing splits them `stride` apart.
+///
+/// LEVER (bit-exact, DEFERRED whole-stream replay): the entire recurrence
+/// (singular values + split/convergence decisions) reads only w/rv1, never U or
+/// V. So log the COMPLETE ordered operation stream first, then replay it across
+/// rows in a SINGLE parallel pass each — two fork/joins for the whole O(n^3)
+/// back-transform, not one per rotation (the regressing attempt) or per sweep
+/// (still O(n) fork/joins, ~1.1x net). Each of the n (m) rows independently
+/// replays the whole log in order, so every entry is bit-for-bit identical to the
+/// inline form. V's stream is rotations + convergence sign-flips; U's is the
+/// cancellation + main-chase rotations (its own (c,s), distinct columns).
+/// Same-worker RAYON A/B @256: full_matrices=true 2.26x, deferred-left 2.15x.
+#[allow(clippy::too_many_arguments)]
+fn svd_bidiag_qr_f64(
+    a: &mut [f64],
+    v: &mut [f64],
+    w: &mut [f64],
+    rv1: &mut [f64],
+    n: usize,
+    anorm: f64,
+    track_left: bool,
+) -> Result<(), KernelError> {
+    let mut g;
     let mut v_ops: Vec<SvdVOp> = Vec::new();
     let mut u_ops: Vec<(usize, usize, f64, f64)> = Vec::new();
     for k in (0..n).rev() {
@@ -27169,7 +27481,7 @@ fn golub_reinsch_svd_impl(
         });
     }
 
-    Ok((w, v))
+    Ok(())
 }
 
 /// Singular VALUES only of a real `m x n` matrix with `m >= n`, row-major.
@@ -27187,111 +27499,16 @@ fn golub_reinsch_singular_values(
     m: usize,
     n: usize,
 ) -> Result<Vec<f64>, KernelError> {
-    let mut w = vec![0.0f64; n];
-    let mut rv1 = vec![0.0f64; n];
-    let mut g = 0.0f64;
-    let mut scale = 0.0f64;
-    let mut anorm = 0.0f64;
-
-    // --- Householder reduction to bidiagonal form (identical to the full SVD) ---
-    for i in 0..n {
-        let l = i + 1;
-        rv1[i] = scale * g;
-        g = 0.0;
-        let mut s = 0.0;
-        scale = 0.0;
-        if i < m {
-            for k in i..m {
-                scale += a[k * n + i].abs();
-            }
-            if scale != 0.0 {
-                for k in i..m {
-                    a[k * n + i] /= scale;
-                    s += a[k * n + i] * a[k * n + i];
-                }
-                let f = a[i * n + i];
-                g = -nr_sign(s.sqrt(), f);
-                let h = f * g - s;
-                a[i * n + i] = f - g;
-                // Apply the reflector to the trailing columns [l,n). Each column is an
-                // INDEPENDENT dot+axpy, so parallelise (bit-exact) when the work is
-                // large enough; the gate falls back to the serial sweep for small
-                // panels where the rayon overhead would dominate. frankentorch-kgs4.72.
-                if (n - l) as u64 * (m - i) as u64 >= (1 << 14) && rayon::current_num_threads() > 1
-                {
-                    gemm::bidiag_col_reflector_apply_f64(a, n, i, m, l, h);
-                } else {
-                    for j in l..n {
-                        let mut s2 = 0.0;
-                        for k in i..m {
-                            s2 += a[k * n + i] * a[k * n + j];
-                        }
-                        let f2 = s2 / h;
-                        for k in i..m {
-                            a[k * n + j] += f2 * a[k * n + i];
-                        }
-                    }
-                }
-                for k in i..m {
-                    a[k * n + i] *= scale;
-                }
-            }
-        }
-        w[i] = scale * g;
-        g = 0.0;
-        s = 0.0;
-        scale = 0.0;
-        if i < m && i != n - 1 {
-            for k in l..n {
-                scale += a[i * n + k].abs();
-            }
-            if scale != 0.0 {
-                for k in l..n {
-                    a[i * n + k] /= scale;
-                    s += a[i * n + k] * a[i * n + k];
-                }
-                let f = a[i * n + l];
-                g = -nr_sign(s.sqrt(), f);
-                let h = f * g - s;
-                a[i * n + l] = f - g;
-                for k in l..n {
-                    rv1[k] = a[i * n + k] / h;
-                }
-                // Apply the reflector to the trailing rows [l,m). Each row is an
-                // INDEPENDENT dot+axpy and is contiguous; row i (< l) is read-only,
-                // so split it off and parallelise over the trailing rows (bit-exact)
-                // when the work is large enough. frankentorch-kgs4.72.
-                if (m - l) as u64 * (n - l) as u64 >= (1 << 14) && rayon::current_num_threads() > 1
-                {
-                    let (head, tail) = a.split_at_mut(l * n);
-                    let row_i = &head[i * n..i * n + n];
-                    tail.par_chunks_mut(n).for_each(|row_j| {
-                        let mut s2 = 0.0;
-                        for k in l..n {
-                            s2 += row_j[k] * row_i[k];
-                        }
-                        for k in l..n {
-                            row_j[k] += s2 * rv1[k];
-                        }
-                    });
-                } else {
-                    for j in l..m {
-                        let mut s2 = 0.0;
-                        for k in l..n {
-                            s2 += a[j * n + k] * a[i * n + k];
-                        }
-                        for k in l..n {
-                            a[j * n + k] += s2 * rv1[k];
-                        }
-                    }
-                }
-                for k in l..n {
-                    a[i * n + k] *= scale;
-                }
-            }
-        }
-        anorm = anorm.max(w[i].abs() + rv1[i].abs());
-    }
+    // The reduction MUST follow the same branch as `golub_reinsch_svd_impl`:
+    // `svd_tall` takes the full SVD's singular values from this same `w`
+    // recurrence and documents the two as bit-identical, so a values-only path
+    // reducing differently would silently break that contract.
+    let (mut w, mut rv1, anorm) = if svd_use_blocked_bidiag(m, n) {
+        svd_blocked_bidiag_values(a, m, n)
+    } else {
+        svd_nr_reduce_f64(a, m, n)
+    };
+    let mut g;
 
     // --- Diagonalize the bidiagonal form, tracking only w / rv1 (no U, no V) ---
     for k in (0..n).rev() {
@@ -52358,6 +52575,113 @@ mod tests {
                     "[{m}x{n} nb={nb}] blocked reconstruction mismatch at {idx}: {got} vs {want}"
                 );
             }
+        }
+    }
+
+    /// The blocked reduction and the Numerical-Recipes reduction produce
+    /// DIFFERENT bidiagonal forms (different reflector signs, different
+    /// superdiagonal indexing), so the only meaningful cross-check is that the
+    /// full SVD built on either one recovers the same spectrum. This is the
+    /// oracle comparison for wiring the blocked path into
+    /// `golub_reinsch_svd_impl` (frankentorch-svd-blocked-bidiag-r7jdo), and it
+    /// is what catches the LAPACK-`e[i]`-vs-NR-`rv1[i]` off-by-one: shifting the
+    /// superdiagonal the wrong way still yields a plausible descending spectrum.
+    #[test]
+    fn svd_blocked_reduction_matches_nr_reduction_spectrum() {
+        for &(m, n) in &[(64usize, 64usize), (96, 96), (128, 96), (70, 65)] {
+            let original = bidiag_test_matrix(m, n, 0x5EED ^ ((m * 31 + n) as u64));
+
+            let mut nr = original.clone();
+            let (nr_w, _nr_v) =
+                super::golub_reinsch_svd_with_reduction(&mut nr, m, n, true, false).unwrap();
+            let mut blocked = original.clone();
+            let (bl_w, _bl_v) =
+                super::golub_reinsch_svd_with_reduction(&mut blocked, m, n, true, true).unwrap();
+
+            let mut nr_s = nr_w.clone();
+            let mut bl_s = bl_w.clone();
+            nr_s.sort_by(|lhs, rhs| rhs.total_cmp(lhs));
+            bl_s.sort_by(|lhs, rhs| rhs.total_cmp(lhs));
+            let scale = nr_s[0].max(1.0);
+            for (idx, (got, want)) in bl_s.iter().zip(nr_s.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() <= 1e-9 * scale,
+                    "[{m}x{n}] singular value {idx} differs: blocked {got} vs NR {want}"
+                );
+            }
+        }
+    }
+
+    /// The blocked path must satisfy the SVD's defining identities, not merely
+    /// agree with the incumbent: `A == U diag(s) V^T` with `U`/`V` orthonormal.
+    /// Reconstruction alone passes even if both factors are silently rescaled,
+    /// so orthonormality is asserted separately. Sizes straddle the
+    /// `svd_use_blocked_bidiag` gate (n >= 64) and the `nb = 16` panel remainder.
+    #[test]
+    fn svd_blocked_path_reconstructs_and_is_orthonormal() {
+        for &(m, n) in &[(64usize, 64usize), (100, 67), (128, 96)] {
+            assert!(
+                super::svd_use_blocked_bidiag(m, n),
+                "[{m}x{n}] test size must exercise the blocked path"
+            );
+            let original = bidiag_test_matrix(m, n, 0xA11CE ^ ((m * 13 + n) as u64));
+            let mut work = original.clone();
+            let (w, v) = super::golub_reinsch_svd_with_reduction(&mut work, m, n, true, true)
+                .unwrap();
+            // `work` now holds the reduced (m x n) left singular vectors.
+
+            for i in 0..m {
+                for j in 0..n {
+                    let mut acc = 0.0f64;
+                    for k in 0..n {
+                        acc += work[i * n + k] * w[k] * v[j * n + k];
+                    }
+                    assert!(
+                        (acc - original[i * n + j]).abs() < 1e-9,
+                        "[{m}x{n}] reconstruction mismatch at ({i},{j}): {acc} vs {}",
+                        original[i * n + j]
+                    );
+                }
+            }
+
+            for (matrix, rows, label) in [(&work, m, "U"), (&v, n, "V")] {
+                for c1 in 0..n {
+                    for c2 in c1..n {
+                        let mut dot = 0.0f64;
+                        for r in 0..rows {
+                            dot += matrix[r * n + c1] * matrix[r * n + c2];
+                        }
+                        let want = if c1 == c2 { 1.0 } else { 0.0 };
+                        assert!(
+                            (dot - want).abs() < 1e-9,
+                            "[{m}x{n}] {label}^T {label} ({c1},{c2}) = {dot}, want {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `svd_tall` documents its singular values as bit-identical to the
+    /// dedicated values-only entry point. Both reductions must therefore follow
+    /// the SAME branch; wiring only one of them would break this silently, since
+    /// the two spectra still agree to working precision.
+    #[test]
+    fn svdvals_is_bit_identical_to_svd_on_the_blocked_path() {
+        let (m, n) = (96usize, 96usize);
+        assert!(super::svd_use_blocked_bidiag(m, n));
+        let a = bidiag_test_matrix(m, n, 0xBEEF);
+        let meta = TensorMeta::from_shape(vec![m, n], DType::F64, Device::Cpu);
+
+        let full = super::svd_contiguous_f64(&a, &meta, false).unwrap();
+        let values = super::svdvals_contiguous_f64(&a, &meta).unwrap();
+
+        assert_eq!(full.s.len(), values.len());
+        for (idx, (lhs, rhs)) in full.s.iter().zip(values.iter()).enumerate() {
+            assert!(
+                lhs.to_bits() == rhs.to_bits(),
+                "singular value {idx} not bit-identical: svd {lhs} vs svdvals {rhs}"
+            );
         }
     }
 }
