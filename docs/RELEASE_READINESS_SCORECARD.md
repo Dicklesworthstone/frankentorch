@@ -72,12 +72,27 @@ but the default PyTorch-thread row is noisy and flips at the median (FT `34.885 
 `21.628 ms`, `1.61x` slower). BOUND (measured, NEGATIVE_EVIDENCE 2026-06-21aa and 2026-06-22):
 the win is **f64-specific** and **layout/thread-config-sensitive**; f32 SDPA is a ~2.1-2.3x LOSS because
 PyTorch's CPU flash-attn covers f32/bf16/f16. The RMSNorm scalar-sum comparator remains neutral.
+
+**SDPA layout correction** (`frankentorch-sdpa-3d-layout-artifact-9bdsd`, measured 2026-06-21,
+ledger 21at/21au, `examples/sdpa_4d_headtohead.rs`). Every SDPA figure above dated 2026-06-21 was
+taken on the flattened 3-D `[BH,seq,d]=[16,512,64]` lane and does not carry to the 4-D layout real
+transformers use. At identical `bh=16`, `seq=512` and identical FLOPs, PyTorch f64 SDPA unmasked
+runs `22.96 ms` at 3-D `[16,512,64]` but `4.53 ms` at 4-D `[2,8,512,64]` — i.e. PyTorch *has* a
+fast f64 SDPA path, selected by layout, so the earlier "PyTorch CPU has no f64 flash" premise was
+wrong and the 3-D wins are layout artifacts. Direct 4-D head-to-head: FT `9.78 ms` vs PyTorch
+`6.20 ms` = **FT 1.58x slower**. The gauntlet lane itself was corrected to 4-D
+`[B,H,seq,d]=[2,8,512,64]` in `69fa348a`; both arms now use that shape
+(`SDPA_BATCH/HEADS/SEQ/D = 2/8/512/64` in `pytorch_gauntlet_bench.rs`, `BATCH/HEADS/SEQ/D` in
+`pytorch_sdpa_grad.py`). 4-D SDPA perf is deliberately not chased: it is vendor-walled behind
+MKL GEMM plus PyTorch's fast 4-D path. The shipped 3-D masked branches remain correct and still
+win at 3-D.
 The default-off fair allocator gauntlet switch adds allocator-normalized avg_pool1d
 evidence (`2W / 1L / 1N` across two RCH workers), but it is not counted as a
 default product-speed win because the same-worker system-vs-fair A/B did not land.
 
 ★ FULL-LANE fair-alloc head-to-head (BlackThrush, 2026-06-21, `--features fair-alloc`,
-all key lanes): **1 WIN (sdpa ~2.3x, FT 24.5ms vs PyTorch ~50-56ms) / 2 PARITY (max_pool1d
+all key lanes): **1 WIN (sdpa ~2.3x, FT 24.5ms vs PyTorch ~50-56ms — SUPERSEDED, 3-D lane; see
+"SDPA layout correction" below) / 2 PARITY (max_pool1d
 23.5ms~25ms, linear 8.9ms~6-10ms) / 3 narrowed losses (avg_pool1d-fused ~1.5x, batch_norm2d-
 scalar ~1.7x, conv3d ~2.3x)** — from the original 0W / 12-28x losses. conv3d is the lone real
 wall (oneDNN direct conv; mimalloc doesn't help — GEMM/im2col-bound). See NEGATIVE_EVIDENCE
@@ -87,14 +102,16 @@ allocator playing field is level.
 ★ 2026-06-21 re-measure (after the 9-lever autograd-allocation campaign landed): the
 GENERIC engine levers (cbe4t/96e5d/0w3ns/mbitj/20q7c/kwarf/pwjrs/rdgt6+cuqzu+create_graph/05upk)
 narrowed EVERY gauntlet lane massively — the per-bead ratios below (12-28x) are STALE.
-Current head-to-head (clean-arm): sdpa ~2.0x FASTER (WIN); linear ~parity; max_pool1d ~1.57x;
+Current head-to-head (clean-arm): sdpa ~2.0x FASTER (SUPERSEDED, 3-D lane; see "SDPA layout
+correction" below); linear ~parity; max_pool1d ~1.57x;
 avg_pool2d ~3.3x; avg_pool1d ~5x; batch_norm2d f32 28.14x -> ~5.7x. See NEGATIVE_EVIDENCE
 2026-06-21p for the full table + contention caveats.
 
 ★★ 2026-06-21 RADICAL FINDING — the residual losses are the ALLOCATOR gap, not FT compute.
 The gauntlet is UNFAIR (PyTorch's time includes its caching allocator; FT was on the system
 allocator). Giving FT's arm a caching allocator (mimalloc, measurement-only) shows FT is
-NEAR-PARITY-to-WINNING on every lane: sdpa ~2.0x FASTER (WIN), batch_norm2d-scalar ~1.1x,
+NEAR-PARITY-to-WINNING on every lane: sdpa ~2.0x FASTER (SUPERSEDED, 3-D lane; see "SDPA layout
+correction" below), batch_norm2d-scalar ~1.1x,
 max_pool1d ~1.13x, avg_pool1d-fused ~1.27x, avg_pool1d-std ~1.9x, batch_norm2d-std ~2.0x,
 avg_pool2d ~3.0x. The system-allocator gap was 40-73% of FT's time on alloc-bound lanes
 (batch_norm2d-scalar 35->9.6 ms = 73% allocator). FT's pure-Rust compute is competitive with
