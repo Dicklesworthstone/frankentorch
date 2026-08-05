@@ -118,6 +118,17 @@ storage.sqlite3-wal.corrupt-*
 .beads/beads.db.rebuild_c*
 .beads/beads.db.vacuum_c*
 
+# Beads recovery snapshots taken before a repair attempt. Kept on disk
+# deliberately (they are the rollback path) but never committed: each is a
+# full copy of the 15 MB DB family plus the 2 MB JSONL.
+.beads/*.corrupt_*
+.beads/recovery_2026*/
+
+# br's fsqlite-ns VFS sidecars — per-machine runtime state, like the -wal/-shm
+# files. br reads the DB *through* this layer, so these are not optional
+# scratch, but they are local-only and must not be committed.
+.beads/beads.db-fsqlite-ns-*
+
 # Beads recovery scratch databases and probe directories
 artifacts/beads_recovery/
 .env
