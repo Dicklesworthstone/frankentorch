@@ -26964,7 +26964,14 @@ mod bidiag {
                 v[r] = packed[i * n + row0 + r];
             }
             acc[..nrows].fill(0.0);
-            reduce_scaled_rows_f64(&p[row0 * n..], n, row0, nrows, &v[..nrows], &mut acc[..nrows]);
+            reduce_scaled_rows_f64(
+                &p[row0 * n..],
+                n,
+                row0,
+                nrows,
+                &v[..nrows],
+                &mut acc[..nrows],
+            );
             for value in &mut acc[..nrows] {
                 *value *= tau;
             }
@@ -52626,8 +52633,8 @@ mod tests {
             );
             let original = bidiag_test_matrix(m, n, 0xA11CE ^ ((m * 13 + n) as u64));
             let mut work = original.clone();
-            let (w, v) = super::golub_reinsch_svd_with_reduction(&mut work, m, n, true, true)
-                .unwrap();
+            let (w, v) =
+                super::golub_reinsch_svd_with_reduction(&mut work, m, n, true, true).unwrap();
             // `work` now holds the reduced (m x n) left singular vectors.
 
             for i in 0..m {
