@@ -26472,7 +26472,7 @@ mod bidiag {
     /// length-`n` superdiagonal (`e[n-1]` unused, held at 0), and `tauq`/`taup` the
     /// reflector scalars for Q and P respectively. Reflector vectors are left
     /// packed in `a` in LAPACK convention.
-    fn bidiag_unblocked_f64(
+    pub(crate) fn bidiag_unblocked_f64(
         a: &mut [f64],
         m: usize,
         n: usize,
@@ -26504,7 +26504,7 @@ mod bidiag {
     /// Materialise `Q` (`m x n`, the first `n` columns) from the packed column
     /// reflectors left by [`bidiag_unblocked_f64`]. Test/verification helper for
     /// the reconstruction invariant `Q * B * P^T == A`.
-    fn bidiag_form_q_f64(packed: &[f64], m: usize, n: usize, tauq: &[f64]) -> Vec<f64> {
+    pub(crate) fn bidiag_form_q_f64(packed: &[f64], m: usize, n: usize, tauq: &[f64]) -> Vec<f64> {
         let mut q = vec![0.0f64; m * n];
         for (i, row) in q.chunks_exact_mut(n).enumerate().take(n.min(m)) {
             row[i] = 1.0;
@@ -26530,7 +26530,7 @@ mod bidiag {
 
     /// Materialise `P` (`n x n`) from the packed row reflectors left by
     /// [`bidiag_unblocked_f64`], such that `A == Q * B * P^T`.
-    fn bidiag_form_p_f64(packed: &[f64], n: usize, taup: &[f64]) -> Vec<f64> {
+    pub(crate) fn bidiag_form_p_f64(packed: &[f64], n: usize, taup: &[f64]) -> Vec<f64> {
         let mut p = vec![0.0f64; n * n];
         for (i, row) in p.chunks_exact_mut(n).enumerate() {
             row[i] = 1.0;
