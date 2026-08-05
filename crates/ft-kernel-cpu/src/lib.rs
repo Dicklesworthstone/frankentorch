@@ -26501,6 +26501,262 @@ mod bidiag {
         (d, e, tauq, taup)
     }
 
+    /// `dlabrd`: reduce the leading `nb` columns and rows of the trailing
+    /// submatrix `a[off.., off..]` to bidiagonal form, accumulating the
+    /// deferred updates into `x` (`m_sub x nb`) and `y` (`n_sub x nb`).
+    ///
+    /// This is the whole point of the blocked algorithm: the trailing
+    /// submatrix is NOT touched here. Instead every rank-1 update that the
+    /// unblocked path would have applied immediately is folded into `x`/`y`,
+    /// so the caller can discharge all `nb` of them with two GEMMs.
+    ///
+    /// On return the reflectors are packed into `a` with EXPLICIT unit entries
+    /// at `a[i][i]` and `a[i][i+1]` (they are operands of the trailing GEMMs);
+    /// the caller restores the real `d`/`e` values afterwards.
+    #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+    fn dlabrd_panel_f64(
+        a: &mut [f64],
+        lda: usize,
+        off: usize,
+        m_sub: usize,
+        n_sub: usize,
+        nb: usize,
+        x: &mut [f64],
+        y: &mut [f64],
+        d: &mut [f64],
+        e: &mut [f64],
+        tauq: &mut [f64],
+        taup: &mut [f64],
+    ) {
+        let ldx = nb;
+        let ldy = nb;
+        // Index of submatrix entry (r, c) inside the full matrix.
+        let at = |r: usize, c: usize| (off + r) * lda + (off + c);
+
+        for i in 0..nb {
+            // (1) Apply the accumulated updates to column i before reducing it.
+            for r in i..m_sub {
+                let mut s = 0.0;
+                for p in 0..i {
+                    s += a[at(r, p)] * y[i * ldy + p];
+                }
+                for p in 0..i {
+                    s += x[r * ldx + p] * a[at(p, i)];
+                }
+                a[at(r, i)] -= s;
+            }
+
+            // (2) Column reflector over a[i.., i].
+            tauq[off + i] = house_gen_strided_f64(a, at(i, i), m_sub - i, lda);
+            d[off + i] = a[at(i, i)];
+            a[at(i, i)] = 1.0;
+
+            if i + 1 < n_sub {
+                // (3) y[i+1.., i] = A[i.., i+1..]^T * u
+                for c in (i + 1)..n_sub {
+                    let mut s = 0.0;
+                    for r in i..m_sub {
+                        s += a[at(r, c)] * a[at(r, i)];
+                    }
+                    y[c * ldy + i] = s;
+                }
+                // (4) stash A[i.., 0..i]^T * u in the unused head of column i
+                for p in 0..i {
+                    let mut s = 0.0;
+                    for r in i..m_sub {
+                        s += a[at(r, p)] * a[at(r, i)];
+                    }
+                    y[p * ldy + i] = s;
+                }
+                // (5) y[i+1.., i] -= y[i+1.., 0..i] * stash
+                for c in (i + 1)..n_sub {
+                    let mut s = 0.0;
+                    for p in 0..i {
+                        s += y[c * ldy + p] * y[p * ldy + i];
+                    }
+                    y[c * ldy + i] -= s;
+                }
+                // (6) restash with X^T * u
+                for p in 0..i {
+                    let mut s = 0.0;
+                    for r in i..m_sub {
+                        s += x[r * ldx + p] * a[at(r, i)];
+                    }
+                    y[p * ldy + i] = s;
+                }
+                // (7) y[i+1.., i] -= A[0..i, i+1..]^T * stash
+                for c in (i + 1)..n_sub {
+                    let mut s = 0.0;
+                    for p in 0..i {
+                        s += a[at(p, c)] * y[p * ldy + i];
+                    }
+                    y[c * ldy + i] -= s;
+                }
+                // (8) scale
+                for c in (i + 1)..n_sub {
+                    y[c * ldy + i] *= tauq[off + i];
+                }
+
+                // (9)+(10) apply the accumulated updates to row i.
+                for c in (i + 1)..n_sub {
+                    let mut s = 0.0;
+                    for p in 0..=i {
+                        s += y[c * ldy + p] * a[at(i, p)];
+                    }
+                    for p in 0..i {
+                        s += a[at(p, c)] * x[i * ldx + p];
+                    }
+                    a[at(i, c)] -= s;
+                }
+
+                // (11) Row reflector over a[i, i+1..].
+                taup[off + i] = house_gen_strided_f64(a, at(i, i + 1), n_sub - i - 1, 1);
+                e[off + i] = a[at(i, i + 1)];
+                a[at(i, i + 1)] = 1.0;
+
+                // (12) x[i+1.., i] = A[i+1.., i+1..] * v
+                for r in (i + 1)..m_sub {
+                    let mut s = 0.0;
+                    for c in (i + 1)..n_sub {
+                        s += a[at(r, c)] * a[at(i, c)];
+                    }
+                    x[r * ldx + i] = s;
+                }
+                // (13) stash y[i+1.., 0..=i]^T * v
+                for p in 0..=i {
+                    let mut s = 0.0;
+                    for c in (i + 1)..n_sub {
+                        s += y[c * ldy + p] * a[at(i, c)];
+                    }
+                    x[p * ldx + i] = s;
+                }
+                // (14) x[i+1.., i] -= A[i+1.., 0..=i] * stash
+                for r in (i + 1)..m_sub {
+                    let mut s = 0.0;
+                    for p in 0..=i {
+                        s += a[at(r, p)] * x[p * ldx + i];
+                    }
+                    x[r * ldx + i] -= s;
+                }
+                // (15) restash A[0..i, i+1..] * v
+                for p in 0..i {
+                    let mut s = 0.0;
+                    for c in (i + 1)..n_sub {
+                        s += a[at(p, c)] * a[at(i, c)];
+                    }
+                    x[p * ldx + i] = s;
+                }
+                // (16) x[i+1.., i] -= x[i+1.., 0..i] * stash
+                for r in (i + 1)..m_sub {
+                    let mut s = 0.0;
+                    for p in 0..i {
+                        s += x[r * ldx + p] * x[p * ldx + i];
+                    }
+                    x[r * ldx + i] -= s;
+                }
+                // (17) scale
+                for r in (i + 1)..m_sub {
+                    x[r * ldx + i] *= taup[off + i];
+                }
+            }
+        }
+    }
+
+    /// `dgebrd`: blocked reduction of a row-major `m x n` matrix (`m >= n`) to
+    /// upper bidiagonal form.
+    ///
+    /// Identical contract and packing to [`bidiag_unblocked_f64`], which is its
+    /// correctness oracle. Each panel of `nb` columns is reduced by
+    /// [`dlabrd_panel_f64`], then the whole panel's deferred work is discharged
+    /// against the trailing submatrix with two accumulate-GEMMs —
+    /// `A22 -= U * Y2^T` and `A22 -= X2 * V` — which is the BLAS-2 -> BLAS-3
+    /// step the 189x gap comes from. The tail below one panel falls back to the
+    /// unblocked sweep.
+    pub(crate) fn bidiag_blocked_f64(
+        a: &mut [f64],
+        m: usize,
+        n: usize,
+        nb: usize,
+    ) -> (Vec<f64>, Vec<f64>, Vec<f64>, Vec<f64>) {
+        let mut d = vec![0.0f64; n];
+        let mut e = vec![0.0f64; n];
+        let mut tauq = vec![0.0f64; n];
+        let mut taup = vec![0.0f64; n];
+
+        if nb == 0 || n <= nb || m <= nb {
+            return bidiag_unblocked_f64(a, m, n);
+        }
+
+        let lda = n;
+        let mut i = 0usize;
+        while n - i > nb && m - i > nb {
+            let m_sub = m - i;
+            let n_sub = n - i;
+            let mut x = vec![0.0f64; m_sub * nb];
+            let mut y = vec![0.0f64; n_sub * nb];
+
+            dlabrd_panel_f64(
+                a, lda, i, m_sub, n_sub, nb, &mut x, &mut y, &mut d, &mut e, &mut tauq, &mut taup,
+            );
+
+            let m2 = m_sub - nb;
+            let n2 = n_sub - nb;
+            if m2 > 0 && n2 > 0 {
+                // U = A[i+nb.., i..i+nb] (strided) and V = A[i..i+nb, i+nb..]
+                // (strided) both need contiguous copies for the GEMM calls.
+                let mut u = vec![0.0f64; m2 * nb];
+                for r in 0..m2 {
+                    let src = (i + nb + r) * lda + i;
+                    u[r * nb..r * nb + nb].copy_from_slice(&a[src..src + nb]);
+                }
+                let mut v = vec![0.0f64; nb * n2];
+                for p in 0..nb {
+                    let src = (i + p) * lda + i + nb;
+                    v[p * n2..p * n2 + n2].copy_from_slice(&a[src..src + n2]);
+                }
+
+                let off22 = (i + nb) * lda + (i + nb);
+                // A22 -= U * Y2^T   (Y2 = rows nb.. of y, already contiguous)
+                super::gemm::dgemm_bt_sub_into(m2, nb, n2, &u, &y[nb * nb..], a, off22, lda);
+                // A22 -= X2 * V     (X2 = rows nb.. of x, already contiguous)
+                super::gemm::dgemm_sub_into(m2, nb, n2, &x[nb * nb..], &v, a, off22, lda);
+            }
+
+            // Restore the true diagonal/superdiagonal over the unit entries the
+            // panel left behind for the GEMM operands.
+            for p in 0..nb {
+                a[(i + p) * lda + (i + p)] = d[i + p];
+                if i + p + 1 < n {
+                    a[(i + p) * lda + (i + p) + 1] = e[i + p];
+                }
+            }
+
+            i += nb;
+        }
+
+        // Tail: reduce the remaining trailing submatrix without blocking.
+        if i < n {
+            let m_sub = m - i;
+            let n_sub = n - i;
+            let mut tail = vec![0.0f64; m_sub * n_sub];
+            for r in 0..m_sub {
+                let src = (i + r) * lda + i;
+                tail[r * n_sub..r * n_sub + n_sub].copy_from_slice(&a[src..src + n_sub]);
+            }
+            let (td, te, ttauq, ttaup) = bidiag_unblocked_f64(&mut tail, m_sub, n_sub);
+            for r in 0..m_sub {
+                let dst = (i + r) * lda + i;
+                a[dst..dst + n_sub].copy_from_slice(&tail[r * n_sub..r * n_sub + n_sub]);
+            }
+            d[i..i + n_sub].copy_from_slice(&td);
+            e[i..i + n_sub].copy_from_slice(&te);
+            tauq[i..i + n_sub].copy_from_slice(&ttauq);
+            taup[i..i + n_sub].copy_from_slice(&ttaup);
+        }
+
+        (d, e, tauq, taup)
+    }
+
     /// Materialise `Q` (`m x n`, the first `n` columns) from the packed column
     /// reflectors left by [`bidiag_unblocked_f64`]. Test/verification helper for
     /// the reconstruction invariant `Q * B * P^T == A`.
@@ -52013,6 +52269,93 @@ mod tests {
                     b[i * n + j].abs() < 1e-9,
                     "Q^T A P is not bidiagonal at [{i},{j}]: {}",
                     b[i * n + j]
+                );
+            }
+        }
+    }
+
+    /// The blocked panel must reproduce the unblocked reduction. `d`/`e` are the
+    /// invariant part (reflector SIGNS can differ between formulations, so the
+    /// packed vectors are not compared elementwise); agreement here plus the
+    /// reconstruction test below pins the result.
+    #[test]
+    fn bidiag_blocked_matches_unblocked_oracle() {
+        // nb deliberately spans: divides n, does not divide n (remainder tail),
+        // equals n, and exceeds n (falls back to unblocked).
+        for &(m, n, nb) in &[
+            (16usize, 16usize, 4usize),
+            (16, 16, 5),
+            (20, 12, 3),
+            (12, 12, 8),
+            (9, 7, 2),
+            (10, 10, 10),
+            (10, 10, 32),
+            (33, 17, 4),
+        ] {
+            let original = bidiag_test_matrix(m, n, 0xB10C ^ ((m * 131 + n * 17 + nb) as u64));
+
+            let mut a_ref = original.clone();
+            let (d_ref, e_ref, _, _) = super::bidiag::bidiag_unblocked_f64(&mut a_ref, m, n);
+
+            let mut a_blk = original.clone();
+            let (d_blk, e_blk, _, _) = super::bidiag::bidiag_blocked_f64(&mut a_blk, m, n, nb);
+
+            for i in 0..n {
+                assert!(
+                    (d_ref[i].abs() - d_blk[i].abs()).abs() < 1e-9,
+                    "[{m}x{n} nb={nb}] d[{i}] blocked {} vs unblocked {}",
+                    d_blk[i],
+                    d_ref[i]
+                );
+                assert!(
+                    (e_ref[i].abs() - e_blk[i].abs()).abs() < 1e-9,
+                    "[{m}x{n} nb={nb}] e[{i}] blocked {} vs unblocked {}",
+                    e_blk[i],
+                    e_ref[i]
+                );
+            }
+        }
+    }
+
+    /// The blocked output must satisfy the same defining contract as the
+    /// reference: `Q * B * P^T == A`. This is what proves the two GEMM trailing
+    /// updates discharged exactly the work the panel deferred — a wrong sign or
+    /// a transposed operand still produces plausible `d`/`e` but fails here.
+    #[test]
+    fn bidiag_blocked_reconstructs_original_matrix() {
+        for &(m, n, nb) in &[
+            (16usize, 16usize, 4usize),
+            (20, 12, 5),
+            (33, 17, 4),
+            (9, 7, 3),
+        ] {
+            let original = bidiag_test_matrix(m, n, 0xC0FFEE ^ ((m * 7 + n) as u64));
+            let mut packed = original.clone();
+            let (d, e, tauq, taup) = super::bidiag::bidiag_blocked_f64(&mut packed, m, n, nb);
+
+            let q = super::bidiag::bidiag_form_q_f64(&packed, m, n, &tauq);
+            let p = super::bidiag::bidiag_form_p_f64(&packed, n, &taup);
+
+            let mut b = vec![0.0f64; n * n];
+            for i in 0..n {
+                b[i * n + i] = d[i];
+                if i + 1 < n {
+                    b[i * n + i + 1] = e[i];
+                }
+            }
+            let qb = bidiag_matmul(&q, &b, m, n, n);
+            let mut pt = vec![0.0f64; n * n];
+            for i in 0..n {
+                for j in 0..n {
+                    pt[i * n + j] = p[j * n + i];
+                }
+            }
+            let recon = bidiag_matmul(&qb, &pt, m, n, n);
+
+            for (idx, (got, want)) in recon.iter().zip(original.iter()).enumerate() {
+                assert!(
+                    (got - want).abs() < 1e-9,
+                    "[{m}x{n} nb={nb}] blocked reconstruction mismatch at {idx}: {got} vs {want}"
                 );
             }
         }
