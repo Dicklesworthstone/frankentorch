@@ -347,12 +347,14 @@ fn record_incumbent_version(label: &str, version: &str) {
             );
             *guard = Some((version.to_owned(), label.to_owned()));
         }
-        Some((seen, first_label)) if seen != version => fail(format!(
-            "PyTorch arms disagree on their version: `{first_label}` reported {seen} but \
-             `{label}` reported {version}. Every row in this table would be measured against \
-             a different incumbent, so none of them is quotable."
-        )),
-        Some(_) => {}
+        Some((seen, first_label)) => {
+            if let Some(message) = ft_api::harness_provenance::version_disagreement(
+                (seen.as_str(), first_label.as_str()),
+                (version, label),
+            ) {
+                fail(message);
+            }
+        }
     }
 }
 

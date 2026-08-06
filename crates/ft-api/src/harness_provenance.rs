@@ -98,6 +98,32 @@ pub fn payload_line(stdout: &str) -> Option<&str> {
         .find(|line| !line.is_empty() && !line.starts_with(VERSION_MARKER))
 }
 
+/// Check that a newly-observed arm agrees with the first arm's version.
+///
+/// A harness that launches one process per lane (the gauntlet bench launches
+/// nine) has no structural guarantee they were the same interpreter: a
+/// `PYTORCH_PYTHON` change mid-run, a stale venv on one path, or a rebuilt
+/// environment between lanes all produce a table whose rows are measured against
+/// **different incumbents** while each row still looks internally consistent.
+///
+/// Returns `None` when they agree, or the message to fail with when they do not.
+#[must_use]
+pub fn version_disagreement(
+    first: (&str, &str),
+    observed: (&str, &str),
+) -> Option<String> {
+    let (first_version, first_label) = first;
+    let (version, label) = observed;
+    if first_version == version {
+        return None;
+    }
+    Some(format!(
+        "PyTorch arms disagree on their version: `{first_label}` reported {first_version} but \
+         `{label}` reported {version}. Every row in this table would be measured against a \
+         different incumbent, so none of them is quotable."
+    ))
+}
+
 /// The PyTorch arm ran but never said which PyTorch it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MissingIncumbentVersion;
@@ -220,6 +246,43 @@ mod tests {
     fn payload_line_tolerates_blank_lines_and_ordering() {
         assert_eq!(payload_line("\n\nPT_TORCH_VERSION 2.12.1\n\n1.5\n"), Some("1.5"));
         assert_eq!(payload_line("1.5\nPT_TORCH_VERSION 2.12.1\n"), Some("1.5"));
+    }
+
+    #[test]
+    fn matching_arm_versions_are_not_a_disagreement() {
+        assert_eq!(
+            version_disagreement(("2.12.1+cpu", "PyTorch max_pool1d"), ("2.12.1+cpu", "PyTorch conv3d")),
+            None
+        );
+    }
+
+    /// NEGATIVE CASE: the multi-process defect. Two lanes on different
+    /// interpreters must be caught, and the message must name BOTH lanes or it
+    /// is not actionable — you cannot fix what you cannot locate.
+    #[test]
+    fn differing_arm_versions_are_caught_and_both_lanes_named() {
+        let message = version_disagreement(
+            ("2.12.1+cpu", "PyTorch max_pool1d"),
+            ("2.13.0+cpu", "PyTorch conv3d"),
+        )
+        .expect("differing versions must be a disagreement");
+        assert!(message.contains("2.12.1+cpu"), "{message}");
+        assert!(message.contains("2.13.0+cpu"), "{message}");
+        assert!(message.contains("max_pool1d"), "{message}");
+        assert!(message.contains("conv3d"), "{message}");
+        assert!(message.contains("different incumbent"), "{message}");
+        assert!(message.contains("quotable"), "{message}");
+    }
+
+    /// The exact pair this session measured. 2.12.1 vs 2.13.0 moved two lanes'
+    /// ratios by ~1.9x with no code change, so this is the substitution the
+    /// check exists to stop.
+    #[test]
+    fn the_observed_version_pair_is_a_disagreement() {
+        assert!(
+            version_disagreement(("2.12.1+cpu", "a"), ("2.13.0+cpu", "b")).is_some(),
+            "the two oracles measured this session must not be silently mixed"
+        );
     }
 
     #[test]
