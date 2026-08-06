@@ -116,6 +116,35 @@ fn frankentorch_step(base: &[f64]) -> (f64, f64) {
     (started.elapsed().as_secs_f64() * 1_000.0, checksum)
 }
 
+/// Per-phase split of one compose step, so the next lever aims at the dominant
+/// term instead of the most obvious one. Returns (materialise, forward, backward)
+/// in ms. Measured under whichever allocator this build selected — which matters,
+/// because `frankentorch-3i7c0` showed the materialise term is the one the
+/// allocator moves.
+fn frankentorch_phase_split(base: &[f64]) -> (f64, f64, f64) {
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+
+    let started = Instant::now();
+    let x = session
+        .tensor_variable(base.to_vec(), vec![N, C, L], true)
+        .expect("leaf");
+    let materialise = started.elapsed().as_secs_f64() * 1_000.0;
+
+    let started = Instant::now();
+    let pooled = session
+        .functional_avg_pool1d(x, KERNEL, STRIDE)
+        .expect("avg_pool1d");
+    let loss = session.tensor_sum(pooled).expect("sum");
+    let forward = started.elapsed().as_secs_f64() * 1_000.0;
+
+    let started = Instant::now();
+    let report = session.tensor_backward(loss).expect("backward");
+    std::hint::black_box(report.gradient(x).expect("grad").iter().sum::<f64>());
+    let backward = started.elapsed().as_secs_f64() * 1_000.0;
+
+    (materialise, forward, backward)
+}
+
 /// The same train step through the **fused** scalar-loss API. This is the arm the
 /// gauntlet calls `frankentorch_kgs4_134_fused_sum_loss`, and it is the ceiling of
 /// the "route `tensor_sum(avg_pool1d(x))` to the fused path automatically" lever:
@@ -279,6 +308,31 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     };
     println!(
         "compose_ms={frankentorch_ms:.4} fused_ms={fused_ms:.4} compose_over_fused={fused_ratio:.4} ci95=[{fused_low:.4},{fused_high:.4}] {lever_decision}"
+    );
+
+    // Where the compose step's time actually goes, so the next lever targets the
+    // dominant term. Median of REPS splits, taken after the timing loop so the
+    // process is warm.
+    let mut materialise = Vec::with_capacity(REPS);
+    let mut forward = Vec::with_capacity(REPS);
+    let mut backward = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let (m, f, b) = frankentorch_phase_split(&base);
+        materialise.push(m);
+        forward.push(f);
+        backward.push(b);
+    }
+    let (materialise_ms, forward_ms, backward_ms) = (
+        median(materialise),
+        median(forward),
+        median(backward),
+    );
+    let phase_total = materialise_ms + forward_ms + backward_ms;
+    println!(
+        "phase_split materialise={materialise_ms:.3}ms ({:.0}%) forward={forward_ms:.3}ms ({:.0}%) backward={backward_ms:.3}ms ({:.0}%) total={phase_total:.3}ms",
+        100.0 * materialise_ms / phase_total,
+        100.0 * forward_ms / phase_total,
+        100.0 * backward_ms / phase_total,
     );
 
     println!("op            FT(ms)    PT(ms)   verdict");

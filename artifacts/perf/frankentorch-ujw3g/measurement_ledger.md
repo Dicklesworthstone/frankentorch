@@ -93,6 +93,49 @@ avoids is therefore *not* the dominant cost of this lane. With the fused arm sti
 materialisation, which both arms pay and which the earlier phase-timing put at
 ~43% of the step. A future lever should target that, not the pooling backward.
 
+## Where the time actually goes — this redirects the lever
+
+Same harness, same invocation, under `--features fair-alloc`
+(`executing_elf_sha256=bf81cc37…`, A/A null `1.0089 ci95=[0.9724,1.0518]` PASS):
+
+```
+phase_split materialise=18.232ms (57%) forward=3.176ms (10%) backward=10.747ms (33%) total=32.155ms
+compose_ms=31.2110 fused_ms=28.6522 compose_over_fused=1.0893 ci95=[1.0414,1.1369]
+avg_pool1d  FT 31.211 ms  PT 17.586 ms
+```
+
+| phase | ms | share |
+|---|---|---|
+| **materialise the input leaf** | **18.232** | **57%** |
+| pooling forward + sum | 3.176 | 10% |
+| backward + gradient read | 10.747 | 33% |
+
+**FrankenTorch spends longer materialising the input (18.232 ms) than PyTorch
+spends on the entire train step (17.586 ms).** That single comparison is the whole
+story of this row: even a *free* pool forward and a *free* backward would leave
+FrankenTorch behind on this workload.
+
+The pooling forward — the thing "avg_pool1d is slow" would lead you to optimize —
+is **10%** of the step. The fused-routing lever targets the backward, so its
+ceiling is bounded by 33%, and it measures 1.09x–1.15x across two independent
+runs. Both are the smaller half.
+
+### Is that comparison fair?
+
+Yes, and it is worth being explicit because it is the crux. Both arms rebuild
+their input every step: the PyTorch script does
+`base.detach().clone().requires_grad_(True)`, this harness does `base.to_vec()`
+into `tensor_variable`. Both copy the same 32 MiB. The difference is what that
+copy *costs*: FrankenTorch's runs at roughly 1.8 GB/s, which is about 5x off
+memcpy speed for a buffer that size, and is the signature of first-touch page
+faults on freshly-obtained pages. PyTorch's caching allocator hands back a warm
+block and never pays them.
+
+Note this persists **under mimalloc**. `frankentorch-3i7c0` established that
+swapping the allocator buys 1.95x on a rebuild-shaped lane, and this measurement
+is already taking that win — 18.232 ms is the *post-mimalloc* number. So the
+residual is not "we should use a better allocator"; that lever is already pulled.
+
 ## The lead this exposes
 
 `functional_avg_pool1d_sum` already exists (`crates/ft-api/src/lib.rs:32466`,
@@ -109,10 +152,26 @@ kernel it would route to is already written, already tested
 (`functional_avg_pool1d_sum_matches_pool_sum_backward_bits`), and already
 bit-exact against the compose.
 
-**Not yet attempted, and deliberately not claimed.** Recorded as the lead so the
-next agent starts from the routing question rather than re-profiling the kernel —
-and note the prior root-cause finding that the pooling kernel itself is only
-~1.4x off parity, so a kernel-aimed lever is chasing the smaller half of the gap.
+**Not attempted, and now DEPRIORITISED on the phase split above.** It is a real
+effect (1.09x–1.15x across two runs, CI lower bound clears 1.0, bit-exact) and it
+is cheap, but it targets the backward — 33% of the step — while 57% sits in leaf
+materialisation. Building it first would be attacking the smaller half of a gap
+whose larger half is now measured and named.
+
+Recommended order for whoever takes this next:
+
+1. **Leaf materialisation (57%).** This is the one that matters and it is bigger
+   than PyTorch's whole step. The mechanism to attack is first-touch page-fault
+   cost on freshly-obtained large buffers — note the allocator lever is already
+   spent (this is the post-mimalloc number), so the remaining move is on the
+   FrankenTorch side of leaf creation, not the allocator.
+2. **Fused routing (33% ceiling, 1.09x–1.15x measured).** Worth landing as a
+   gap-close once the big term is addressed, since it makes the idiomatic path
+   (`tensor_sum(avg_pool1d(x))`) as fast as the expert path without the user
+   having to know a second API name. It is a routing change and the kernel it
+   routes to is already written, already tested, and already bit-exact.
+3. **The pooling forward is 10%.** Do not start here, whatever the bead title
+   says.
 
 ## Reproducing
 
