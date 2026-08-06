@@ -78,3 +78,58 @@ quote the arm and the CI bound, not the headline.
 the tree. FT arm is `frankentorch_kgs4_134_fused_sum_loss` at 32.283 ms; there
 is already a phase-timing probe at
 `crates/ft-api/examples/avgpool1d_phase_timing.rs` to start from.
+
+## Follow-up: the avg_pool1d gap is mostly NOT avg_pool1d
+
+Root-causing the one confirmed row before choosing a lever, via the existing
+`crates/ft-api/examples/avgpool1d_phase_timing.rs`. Per-iteration split of the
+`[8,64,8192]` f64 train step:
+
+| phase | per-iter | share |
+|---|---|---|
+| `tensor_variable` (materialise input) | **22 677 us** | **43%** |
+| forward | 13 247 us | 25% |
+| backward | 9 566 us | 18% |
+| sum | 474 us | 1% |
+| session_new | 0.6 us | ~0% |
+| TOTAL | 53 081 us | |
+
+The gauntlet's FT arm builds its input INSIDE `b.iter` — `values.clone()` plus
+`session.tensor_variable(...)` — so tensor materialisation is inside the measured
+region. For the fused arm the bench actually timed (32.283 ms), `tensor_variable`
+is roughly **70%** of the number, and the pooling work is roughly 30%.
+
+**This is not automatically unfair**: the PyTorch script
+(`benches/pytorch_avg_pool1d_grad.py`) also rebuilds its input inside its loop
+via `base.detach().clone().requires_grad_(True)`. Both sides pay for setup. The
+point is what the setup COSTS on each side. Splitting PyTorch the same way, same
+34 MB, `torch.set_num_threads(8)`:
+
+| | FrankenTorch | PyTorch | ratio |
+|---|---|---|---|
+| materialise input | 22 677 us | 6 022 us | **~3.8x slower** |
+| pool fwd + sum + bwd | ~9 600 us (fused arm) | 6 960 us | **~1.4x slower** |
+
+Caveat, stated because it bounds the claim: PyTorch was pinned to 8 threads here
+while the FT phase probe used the box default, and the gauntlet gives PyTorch 32
+threads (`FT_TORCH_THREADS` defaults to `32`), which is why its in-bench total
+(6.5 ms) is below the 13.0 ms measured at 8 threads. So treat these as
+indicative shares, not certified ratios.
+
+The conclusion survives that caveat comfortably: **the avg_pool1d row is
+dominated by input materialisation, and the pooling kernel itself is close to
+parity.** Optimizing `avg_pool1d` would move ~30% of the number; optimizing
+`tensor_variable` would move ~70% of it.
+
+`tensor_variable` is not an avg_pool1d cost. Every gauntlet lane that builds its
+input inside `b.iter` pays it — `avg_pool2d` and `batch_norm2d` are written the
+same way — so this is a shared term sitting inside several "op losses",
+including the BatchNorm2d row confirmed above. That makes it the higher-leverage
+target of the two, and it means the remaining confirmed op-level gaps are
+smaller than the gauntlet's headline numbers suggest.
+
+At 34 MB in 22.7 ms, `tensor_variable` sustains ~1.5 GB/s, which is far below
+memcpy speed for a copy of that size — consistent with an extra copy and/or a
+serial first-touch fill, the same anti-pattern already fixed once in
+`expand`/`broadcast_to` (`vec![v; numel]` serial first-touch, replaced by an
+uninit buffer whose parallel fill does the first touch). Filed as its own bead.
