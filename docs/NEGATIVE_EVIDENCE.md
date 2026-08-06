@@ -1,5 +1,53 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## STANDING RULE FOR EVERY LEVER: SPLIT THE PHASE BEFORE YOU CHOOSE THE LEVER
+
+**Do not pick an optimization target by reading the source. Split the work into
+phases, measure each, and aim at the largest one.** This is the single most
+transferable finding in this ledger, and it is at the top because every entry
+below inherits it.
+
+It is stated as a rule because it has now been paid for three times in one
+lineage, each time by a target that looked obvious in the code and turned out to
+be the *smaller half*:
+
+| the obvious target | what a phase split actually found | bead |
+|---|---|---|
+| "the `avg_pool1d` pooling kernel is slow" | the pooling forward was **10–14%** of the step | `ujw3g` |
+| "then it's leaf materialisation, 57% of the step" | that phase was **100% the caller's buffer copy and 0% FrankenTorch** — `tensor_variable` costs 5 µs | `ujw3g` |
+| "then it's the `max_pool3d` backward scatter loop" | the scatter is **16%** of the backward; 84% is materialising the dense gradient | `87sz8` |
+
+Each of those was a plausible reading of real code. Each would have produced a
+correct, well-tested, carefully-benchmarked change to something that was not the
+problem. The third one was explicitly labelled "inferred from source, not
+profiled" when it was written down — and profiling still refuted it. **A labelled
+guess is still a guess.**
+
+Practical form of the rule:
+
+1. **Split first.** Forward vs backward; kernel vs tape; allocation vs compute;
+   callee vs caller. One probe that attributes time to phases is worth more than
+   any amount of code reading.
+2. **Bound the phase you intend to attack.** Measure its floor — what the phase
+   costs if its logic were free. If the floor is already above your target, the
+   lever is dead before you write it, and you have saved the whole implementation.
+   (`87sz8`: a free scatter still left the backward at ~2x PyTorch's entire op.)
+3. **A floor is a floor for the implementation you measured**, not a proven
+   optimum. Say which. `zoqws` records ~6.3 GB/s as the floor for *a* dense-write
+   pattern, not as an inherent limit — establishing the true achievable number is
+   the first step of that bead, before any kernel is touched.
+4. **Attribution beats intuition even when intuition is expert.** The prior in
+   this repo that "avg/max pool are bandwidth-bound, <2x" was reasonable and
+   wrong for 3-D shapes; a gate calibrated on 2-D feature maps stranded
+   `max_pool3d` at half its threshold and ran it single-threaded.
+
+Corollary for measurement hygiene, learned the same way: **a ratio is only as
+good as the arm beside it.** Do not compare ratios across runs — in this lineage
+an *untouched* lane's PyTorch arm moved 1.833 → 1.155 ms between two runs, making
+its ratio look 40% worse for free. Quote same-invocation pairings, and make A/A
+null gates balanced (an odd rep count with parity-assigned arms leaks position
+bias straight into the null; see `svabf`).
+
 ## 2026-07-09 - REJECTED: cross_entropy f64 backward logsumexp sidecar (ft-api/ft-kernel-cpu) - 0.972x vs ORIG same-worker
 
 Agent `BlackThrush`. Negative-evidence pass ruled out the current Conv2d/Conv1d direct no-panel
