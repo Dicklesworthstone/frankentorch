@@ -140209,7 +140209,9 @@ mod tests {
             .collect();
 
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = session.tensor_variable(values, vec![2, 3, 17], true).unwrap();
+        let x = session
+            .tensor_variable(values, vec![2, 3, 17], true)
+            .unwrap();
         let pooled = session.functional_avg_pool1d(x, 5, 3).unwrap();
         session.tensor_retain_grad(pooled).unwrap();
         let loss = session.tensor_sum(pooled).unwrap();

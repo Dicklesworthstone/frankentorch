@@ -363,11 +363,8 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
         leaf_only.push(LEAF_MS.with(std::cell::Cell::get));
     }
     let (copy_ms, leaf_ms) = (median(copy_only), median(leaf_only));
-    let (materialise_ms, forward_ms, backward_ms) = (
-        median(materialise),
-        median(forward),
-        median(backward),
-    );
+    let (materialise_ms, forward_ms, backward_ms) =
+        (median(materialise), median(forward), median(backward));
     let phase_total = materialise_ms + forward_ms + backward_ms;
     println!(
         "phase_split materialise={materialise_ms:.3}ms ({:.0}%) forward={forward_ms:.3}ms ({:.0}%) backward={backward_ms:.3}ms ({:.0}%) total={phase_total:.3}ms",
@@ -377,7 +374,8 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     );
     // The attribution that decides whether a FrankenTorch-side lever exists here.
     #[allow(clippy::cast_precision_loss)]
-    let copied_gib_per_s = (N * C * L * 8) as f64 / (copy_ms / 1_000.0) / (1024.0 * 1024.0 * 1024.0);
+    let copied_gib_per_s =
+        (N * C * L * 8) as f64 / (copy_ms / 1_000.0) / (1024.0 * 1024.0 * 1024.0);
     println!(
         "materialise_split caller_buffer_copy={copy_ms:.3}ms ({:.0}% of materialise, {copied_gib_per_s:.2} GiB/s) ft_leaf_construction={leaf_ms:.3}ms ({:.0}%)",
         100.0 * copy_ms / materialise_ms,
