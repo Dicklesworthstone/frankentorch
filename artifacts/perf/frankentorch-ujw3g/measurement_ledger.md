@@ -1,5 +1,20 @@
 # frankentorch-ujw3g — avg_pool1d vs PyTorch, measured
 
+> **FINAL VERDICT: THIS IS NOT AN `avg_pool1d` LOSS.** Splitting both sides
+> like-for-like, with the input built outside the timed region on *both* arms:
+>
+> | term | FrankenTorch | PyTorch | ratio |
+> |---|---|---|---|
+> | **the actual pooling work** (fwd + bwd) | 13.626 ms | 11.515 ms | **1.18x slower — near parity** |
+> | **the 32 MiB input buffer copy** | 17.774 ms | 5.725 ms | **3.10x slower** |
+> | FrankenTorch leaf construction (`tensor_variable`) | **0.005 ms** | — | 0% of the step |
+>
+> Medians of 3 clean reps (A/A gates 1.0179 / 1.0168 / 1.0120, all CIs bracketing
+> 1.0). The op is at parity. **The whole of this row's apparent 1.5x–2.0x loss is
+> a large-buffer copy**, which FrankenTorch's library does not perform and does
+> not control — `tensor_variable` moves the `Vec` into an `Arc` and costs five
+> microseconds. Read the correction section before quoting anything above it.
+
 ## Why a new harness
 
 The canonical lane (`pytorch_gauntlet_bench -- avg_pool1d`) **cannot produce a
@@ -190,20 +205,72 @@ is cheap, but it targets the backward — 33% of the step — while 57% sits in 
 materialisation. Building it first would be attacking the smaller half of a gap
 whose larger half is now measured and named.
 
-Recommended order for whoever takes this next:
+## CORRECTION: "attack leaf materialisation" was wrong, and here is the split
 
-1. **Leaf materialisation (57%).** This is the one that matters and it is bigger
-   than PyTorch's whole step. The mechanism to attack is first-touch page-fault
-   cost on freshly-obtained large buffers — note the allocator lever is already
-   spent (this is the post-mimalloc number), so the remaining move is on the
-   FrankenTorch side of leaf creation, not the allocator.
-2. **Fused routing (33% ceiling, 1.09x–1.15x measured).** Worth landing as a
-   gap-close once the big term is addressed, since it makes the idiomatic path
-   (`tensor_sum(avg_pool1d(x))`) as fast as the expert path without the user
-   having to know a second API name. It is a routing change and the kernel it
-   routes to is already written, already tested, and already bit-exact.
-3. **The pooling forward is 10%.** Do not start here, whatever the bead title
-   says.
+The previous revision named leaf materialisation (57% of the step) as the target
+to attack. **That recommendation is withdrawn.** Splitting the phase one level
+further shows it contains no FrankenTorch work at all:
+
+```
+materialise_split caller_buffer_copy=17.774ms (100% of materialise, 1.76 GiB/s) ft_leaf_construction=0.005ms (0%)
+```
+
+`tensor_variable` moves the `Vec` into an `Arc`; it copies nothing and costs
+**5 microseconds**. The entire 57% is the *caller's* `base.to_vec()` — the
+harness's own 32 MiB buffer copy, which exists only because the PyTorch script it
+mirrors also rebuilds its input each step. There is no FrankenTorch-side lever in
+that phase, so pointing the next agent at it would have sent them to optimize
+code that does not exist.
+
+This is the second time in this bead that the obvious target was the wrong one.
+Recording both so the pattern is visible: the phase split refuted "optimize the
+pooling kernel", and the sub-split then refuted "optimize leaf materialisation".
+
+## The like-for-like comparison, which settles it
+
+Timing PyTorch the same way — leaf built outside the timed region on both sides —
+separates the two terms cleanly. Three clean reps of the same binary
+(`bb726a87…`), medians:
+
+| term | FrankenTorch | PyTorch | ratio |
+|---|---|---|---|
+| pooling work (forward + backward) | 13.626 ms | 11.515 ms | **1.18x slower** |
+| 32 MiB buffer copy | 17.774 ms | 5.725 ms | **3.10x slower** |
+
+Per-rep pooling ratios 1.14x / 1.28x / 1.15x; per-rep copy ratios 3.82x / 3.06x /
+3.10x. A/A gates 1.0179 / 1.0168 / 1.0120, all bracketing 1.0.
+
+**The op is at parity; the copy is the loss.** FrankenTorch's copy runs at
+1.76 GiB/s against PyTorch's ~5.5 GiB/s for the identical 32 MiB — a pure
+allocator/page-fault difference, PyTorch's caching allocator handing back a warm
+block where Rust's returns freshly-faulted pages. That is the same mechanism
+`frankentorch-1ji9l` and `frankentorch-3i7c0` already adjudicated, and the
+decision there was **option C**: FrankenTorch's library must not impose a
+process-global allocator on its consumers, and `fair-alloc` stays opt-in for
+FrankenTorch's own binaries. This measurement is already *under* `fair-alloc`.
+
+One contended run is excluded from the medians and named here so the exclusion is
+not silent: ELF `bb726a87…` first execution read `compose_ms=47.5619`,
+`backward=17.913ms` and an A/A CI of `[0.8845, 1.1537]` — roughly 50% inflated
+against every other run of the same binary, with the A/A interval three times
+wider. It reported the pooling term as 2.00x rather than ~1.18x. Its own A/A gate
+still "passed", which is worth noting: a passing null gate bounds noise, it does
+not certify a quiet machine.
+
+## What is actually left here
+
+1. **Nothing at the op level worth a campaign lever.** 1.18x on the pooling work,
+   against a harness that reruns setup both sides. Calling this "the last real
+   loss" was wrong; the bead's own premise does not survive its measurement.
+2. **The fused-routing lever remains available** as a small gap-close
+   (1.09x–1.15x measured, bit-exact, kernel already written and tested). It would
+   take the pooling term from ~1.18x toward parity. It is a routing change, worth
+   doing on ergonomics grounds — the idiomatic `tensor_sum(avg_pool1d(x))` should
+   not be slower than knowing to call a second API name — but it is not a
+   perf-campaign headline.
+3. **The buffer-copy term is closed by prior decision, not open work.** It is
+   allocator-shaped, it lives in caller code, and option C already settled how
+   FrankenTorch treats it.
 
 ## Reproducing
 

@@ -41,6 +41,13 @@ const ANCHOR: usize = 4000;
 const REPS: usize = 21;
 const BOOTSTRAP_REPS: usize = 2_000;
 
+thread_local! {
+    /// Sub-split of the materialise phase, set by `frankentorch_phase_split`:
+    /// the caller's 32 MiB buffer copy vs FrankenTorch's leaf construction.
+    static COPY_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+    static LEAF_MS: std::cell::Cell<f64> = const { std::cell::Cell::new(0.0) };
+}
+
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
@@ -125,10 +132,21 @@ fn frankentorch_phase_split(base: &[f64]) -> (f64, f64, f64) {
     let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
 
     let started = Instant::now();
+    let owned = base.to_vec();
+    let copy_only = started.elapsed().as_secs_f64() * 1_000.0;
+
+    let started = Instant::now();
     let x = session
-        .tensor_variable(base.to_vec(), vec![N, C, L], true)
+        .tensor_variable(owned, vec![N, C, L], true)
         .expect("leaf");
-    let materialise = started.elapsed().as_secs_f64() * 1_000.0;
+    let leaf_only = started.elapsed().as_secs_f64() * 1_000.0;
+    let materialise = copy_only + leaf_only;
+    // Attribution matters here: `tensor_variable` moves the Vec into an Arc and
+    // copies nothing, so if `copy_only` dominates then the cost is the caller's
+    // 32 MiB buffer, not FrankenTorch's leaf construction — and there is no
+    // FrankenTorch-side lever in this phase at all.
+    COPY_MS.with(|c| c.set(copy_only));
+    LEAF_MS.with(|c| c.set(leaf_only));
 
     let started = Instant::now();
     let pooled = session
@@ -190,8 +208,26 @@ def t(fn,n=7):
     for _ in range(n):
         s=time.perf_counter(); fn(); ts.append((time.perf_counter()-s)*1e3)
     return min(ts)
+def clone_only():
+    return base.detach().clone().requires_grad_(True)
+def pool_only(x):
+    y=Fn.avg_pool1d(x,K,S)
+    y.sum().backward()
+    return x.grad
+def t_pool(n=7):
+    # Time pool+backward ONLY, on a leaf built outside the timed region, so the
+    # PyTorch side splits the same way the FrankenTorch side does.
+    for _ in range(4):
+        pool_only(clone_only())
+    ts=[]
+    for _ in range(n):
+        x=clone_only()
+        s=time.perf_counter(); pool_only(x); ts.append((time.perf_counter()-s)*1e3)
+    return min(ts)
 print("PT cat_anchor %.4f"%t(lambda: torch.cat([m,m],1)))
 print("PT avg_pool1d %.4f"%t(step))
+print("PT clone_only %.4f"%t(clone_only))
+print("PT pool_only %.4f"%t_pool())
 g=step()
 print("PT grad_sum %.12g"%g.sum().item())
 print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)))
@@ -316,12 +352,17 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     let mut materialise = Vec::with_capacity(REPS);
     let mut forward = Vec::with_capacity(REPS);
     let mut backward = Vec::with_capacity(REPS);
+    let mut copy_only = Vec::with_capacity(REPS);
+    let mut leaf_only = Vec::with_capacity(REPS);
     for _ in 0..REPS {
         let (m, f, b) = frankentorch_phase_split(&base);
         materialise.push(m);
         forward.push(f);
         backward.push(b);
+        copy_only.push(COPY_MS.with(std::cell::Cell::get));
+        leaf_only.push(LEAF_MS.with(std::cell::Cell::get));
     }
+    let (copy_ms, leaf_ms) = (median(copy_only), median(leaf_only));
     let (materialise_ms, forward_ms, backward_ms) = (
         median(materialise),
         median(forward),
@@ -334,6 +375,30 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
         100.0 * forward_ms / phase_total,
         100.0 * backward_ms / phase_total,
     );
+    // The attribution that decides whether a FrankenTorch-side lever exists here.
+    #[allow(clippy::cast_precision_loss)]
+    let copied_gib_per_s = (N * C * L * 8) as f64 / (copy_ms / 1_000.0) / (1024.0 * 1024.0 * 1024.0);
+    println!(
+        "materialise_split caller_buffer_copy={copy_ms:.3}ms ({:.0}% of materialise, {copied_gib_per_s:.2} GiB/s) ft_leaf_construction={leaf_ms:.3}ms ({:.0}%)",
+        100.0 * copy_ms / materialise_ms,
+        100.0 * leaf_ms / materialise_ms,
+    );
+    // The comparison that decides whether this row is an op loss or a buffer-copy
+    // artifact: FrankenTorch's pooling work against PyTorch's pooling work, both
+    // with the input built OUTSIDE the timed region.
+    if let (Some(pt_clone), Some(pt_pool)) = (pt_value("clone_only"), pt_value("pool_only")) {
+        let ft_pool = forward_ms + backward_ms;
+        let pool_ratio = pt_pool / ft_pool;
+        let copy_ratio = copy_ms / pt_clone;
+        println!(
+            "like_for_like  ft_pool_work={ft_pool:.3}ms pt_pool_work={pt_pool:.3}ms -> FT {}   |   ft_buffer_copy={copy_ms:.3}ms pt_buffer_copy={pt_clone:.3}ms -> FT {copy_ratio:.2}x slower to copy",
+            if pool_ratio >= 1.0 {
+                format!("{pool_ratio:.2}x FASTER at the actual pooling")
+            } else {
+                format!("{:.2}x SLOWER at the actual pooling", 1.0 / pool_ratio)
+            },
+        );
+    }
 
     println!("op            FT(ms)    PT(ms)   verdict");
     // Anchor: a landed win reading its known value, so a bad measurement window is
