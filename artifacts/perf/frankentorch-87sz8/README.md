@@ -86,6 +86,13 @@ post-change standing measured against its own in-run incumbent.
 
 ## Current standing after the fix
 
+> **SUPERSEDED 2026-08-06.** The single-run figure below was taken at `REPS=15`
+> with no ELF recorded. The certified standing is now
+> **7.45x SLOWER [5.85–8.53], median of 18 same-ELF runs** against torch 2.12.1
+> — see `artifacts/perf/frankentorch-lane-sweep-reps16/`. The 7.31x below
+> reproduces inside that range, so this section's *conclusion* stands; only its
+> precision was overstated.
+
 `max_pool3d` op work: FT 4.678 ms vs PyTorch 0.640 ms = **7.31x slower**, A/A
 gate PASS `[0.765,1.181]`, gradient parity match. Still a large loss — the
 forward is no longer the reason.
@@ -103,3 +110,12 @@ first time: `max_pool1d` **2.24x**, `conv3d` **3.49x**. It also means the harnes
 is machine-quiet-dependent rather than broken — `frankentorch-svabf` should stay
 open until the arm-order randomisation lands, because a gate that passes only on
 a quiet host is not yet a reliable gate.
+
+> **Update 2026-08-06 (`lane-sweep-reps16`).** Both single-run digits above
+> reproduce inside the certified ranges (`max_pool1d` 2.43x [1.14–3.18],
+> `conv3d` 3.77x [3.19–4.42], 18 runs, torch 2.12.1). But the inference that a
+> PASSing gate means the host was quiet is **backwards**: the A/A null is
+> FT-vs-FT, so contention *widens* its CI and a wider CI brackets 1.0 more
+> easily. A run reading 29.22x on `max_pool3d` passed its gate. Read CI width,
+> not bracketing. Also: `max_pool1d`'s ratio is version-sensitive — it reads
+> 1.29x against torch 2.13.0 purely because PyTorch regressed 1.93x on that op.

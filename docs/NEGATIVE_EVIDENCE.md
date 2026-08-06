@@ -48,6 +48,70 @@ its ratio look 40% worse for free. Quote same-invocation pairings, and make A/A
 null gates balanced (an odd rep count with parity-assigned arms leaks position
 bias straight into the null; see `svabf`).
 
+Two further corollaries, both established by the 36-run two-oracle re-bank below
+(`lane-sweep-reps16`):
+
+- **The incumbent's *version* is part of the arm, and belongs in provenance.**
+  On one unchanged ELF, `max_pool1d` reads 2.43x against torch 2.12.1 and 1.29x
+  against torch 2.13.0, because PyTorch itself got 1.93x slower on that op. Our
+  arm moved <3%. Upgrading the oracle would have "won" 1.9x on two lanes with no
+  code change. Record the torch version beside the host, thread count, and ELF.
+- **A passing A/A null gate does not certify a quiet host, and gets *easier* to
+  pass as the host gets noisier.** The null is FT-vs-FT, so any disturbance that
+  scales both arms cancels; what contention does is *widen* the CI, and a wider
+  CI brackets 1.0 more easily. A run whose ratio was 3.8x its own median passed
+  its gate on a CI 78% wider than the clean run's. Read CI **width**, not just
+  bracketing, as the quiet-host signal — and never read an A/A PASS as saying
+  anything about the PyTorch arm, which is not in the null.
+
+## 2026-08-06 - CERTIFIED: four gauntlet loss lanes re-banked at REPS=16, 36 runs, two oracles
+
+Agent `BeigeSummit`. The circulating loss-lane digits (`max_pool3d` 7.31x,
+`avg_pool2d` 6.00x, `conv3d` 3.49x, `max_pool1d` 2.24x) were each a **single run
+at `REPS=15`** — the rep count `svabf` proved position-biased — with **no ELF
+recorded**. Re-banked as a fresh set on the fixed harness; not differenced
+against the old digits.
+
+`crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, `REPS=16`,
+`executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c`
+(self-reported from inside the process, identical across all 36 runs), mimalloc
+`--features fair-alloc`, op work only (leaf outside the timer on both sides), 64
+cores, governor `performance`, PyTorch live in the same invocation at 8 threads.
+Full artifact and raw logs: `artifacts/perf/frankentorch-lane-sweep-reps16/`.
+
+**Banked set — oracle torch 2.12.1 (the repo's standing oracle), 18 runs, median
+[range]:**
+
+- `max_pool3d` FT 5.309 ms vs PT 0.718 ms = **7.45x SLOWER** [5.85–8.53], spread 1.46x
+- `avg_pool2d` FT 8.011 ms vs PT 1.149 ms = **6.87x SLOWER** [3.09–8.07], spread 2.61x
+- `conv3d` FT 21.049 ms vs PT 5.530 ms = **3.77x SLOWER** [3.19–4.42], spread 1.39x
+- `max_pool1d` FT 17.413 ms vs PT 6.976 ms = **2.43x SLOWER** [1.14–3.18], spread 2.79x
+
+Gradient parity 36/36 `match`. A/A gates 70/72 PASS (both FAILs under load
+average 47–68). `max_pool3d` is still the largest confirmed loss in the tree;
+it and `conv3d` are the only two *decidable* lanes.
+
+**All four prior digits reproduce inside the fresh range.** The REPS-15 bias and
+missing ELF made them uncertifiable, not wrong. They are now certified.
+
+**Finding — two lanes move with the PyTorch version, not with our code.** Same
+ELF against torch 2.13.0: `max_pool1d` 1.29x (was 2.43x) and `avg_pool2d` 4.21x
+(was 6.87x), because PyTorch 2.13.0 is 1.93x and 1.82x *slower* than 2.12.1 on
+those ops here. FT's own medians moved <3% across the two oracles.
+`max_pool3d` (7.45→7.78x) and `conv3d` (3.77→3.89x) are version-robust.
+
+**Finding — the A/A null gate is anti-conservative under contention.** One run
+read `max_pool3d` at 29.22x (FT spiked to 19.186 ms, PT normal at 0.657 ms) and
+its gate **PASSED** on CI `[0.528,1.359]` — 78% wider than the clean run's
+`[0.798,1.266]`. Noise widens the null, and a wider null brackets 1.0 more
+easily. Both observations are promoted to the ledger header.
+
+**Decision.** Quote the medians with ranges and the torch version. Do not quote
+a single run of this harness — 10+ runs and a median is the minimum. The gate
+defect is recorded as an observed defect class, deliberately **not** fixed in
+this change, so that this artifact's ELF remains the one that produced these
+numbers; a gate edit needs its own before/after integrity check.
+
 ## 2026-07-09 - REJECTED: cross_entropy f64 backward logsumexp sidecar (ft-api/ft-kernel-cpu) - 0.972x vs ORIG same-worker
 
 Agent `BlackThrush`. Negative-evidence pass ruled out the current Conv2d/Conv1d direct no-panel

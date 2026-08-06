@@ -1,0 +1,63 @@
+########## SWEEP RUN 1 ##########
+pre_loadavg=8.72 17.46 25.32 8/8070 3649037
+pre_top=1570 python3
+pre_utc=2026-08-06T08:21:32Z
+/data/tmp/claude-1000/-data-projects-frankentorch/a91d554f-03e9-4d98-9e34-c625c1e106bf/scratchpad/torchvenv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+reps=16, PyTorch min-of-7 after 4 warmups, torch threads=8
+
+lane          FT(ms)    PT(ms)   standing            A/A gate           parity
+  max_pool1d     16.758   11.289   FT 1.48x SLOWER     PASS [0.950,1.114] 1.062 match
+  avg_pool2d      8.051    1.005   FT 8.01x SLOWER     PASS [0.765,1.192] 0.955 match
+  max_pool3d      5.193    0.658   FT 7.89x SLOWER     PASS [0.798,1.266] 1.078 match
+  conv3d         22.259    5.487   FT 4.06x SLOWER     PASS [0.900,1.124] 1.037 match
+
+Quote a lane only if its A/A gate PASSed and parity is `match`. Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+post_loadavg=8.51 17.27 25.21 5/8018 3649791
+post_top=95.3 rustc
+########## SWEEP RUN 2 ##########
+pre_loadavg=8.51 17.27 25.21 10/8017 3649797
+pre_top=6933 python3
+pre_utc=2026-08-06T08:21:36Z
+/data/tmp/claude-1000/-data-projects-frankentorch/a91d554f-03e9-4d98-9e34-c625c1e106bf/scratchpad/torchvenv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+reps=16, PyTorch min-of-7 after 4 warmups, torch threads=8
+
+lane          FT(ms)    PT(ms)   standing            A/A gate           parity
+  max_pool1d     17.281   12.412   FT 1.39x SLOWER     PASS [0.927,1.088] 0.995 match
+  avg_pool2d      7.960    1.878   FT 4.24x SLOWER     PASS [0.648,1.001] 0.943 match
+  max_pool3d      5.470    0.655   FT 8.35x SLOWER     PASS [0.696,1.245] 0.894 match
+  conv3d         22.195    5.375   FT 4.13x SLOWER     PASS [0.816,1.167] 0.989 match
+
+Quote a lane only if its A/A gate PASSed and parity is `match`. Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+post_loadavg=9.27 17.29 25.17 8/8123 3650796
+post_top=1836 python3
+########## SWEEP RUN 3 ##########
+pre_loadavg=9.27 17.29 25.17 8/8121 3650801
+pre_top=1456 python3
+pre_utc=2026-08-06T08:21:41Z
+/data/tmp/claude-1000/-data-projects-frankentorch/a91d554f-03e9-4d98-9e34-c625c1e106bf/scratchpad/torchvenv/lib/python3.12/site-packages/torch/_subclasses/functional_tensor.py:368: UserWarning: Failed to initialize NumPy: No module named 'numpy' (Triggered internally at /__w/pytorch/pytorch/torch/csrc/utils/tensor_numpy.cpp:84.)
+  cpu = _conversion_method_template(device=torch.device("cpu"))
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+allocator=mimalloc (--features fair-alloc)
+measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)
+reps=16, PyTorch min-of-7 after 4 warmups, torch threads=8
+
+lane          FT(ms)    PT(ms)   standing            A/A gate           parity
+  max_pool1d     17.835   12.399   FT 1.44x SLOWER     PASS [0.884,1.100] 0.991 match
+  avg_pool2d      7.841    2.306   FT 3.40x SLOWER     PASS [0.925,1.178] 1.058 match
+  max_pool3d      5.380    0.682   FT 7.89x SLOWER     PASS [0.968,1.273] 1.157 match
+  conv3d         20.542    5.447   FT 3.77x SLOWER     PASS [0.925,1.200] 1.000 match
+
+Quote a lane only if its A/A gate PASSed and parity is `match`. Op-work ratios are NOT
+comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild.
+post_loadavg=14.13 18.16 25.42 5/8105 3651597
+post_top=1248 python3
