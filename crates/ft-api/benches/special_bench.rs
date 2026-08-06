@@ -4,6 +4,10 @@
 //!   baseline:  rch exec -- env RAYON_NUM_THREADS=1 cargo bench -p ft-api --bench special_bench
 //!   optimized: rch exec -- cargo bench -p ft-api --bench special_bench
 
+#[cfg(feature = "fair-alloc")]
+#[global_allocator]
+static FAIR_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;

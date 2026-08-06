@@ -24,7 +24,7 @@ use std::path::PathBuf;
 use std::process::{Command, exit};
 use std::time::Duration;
 
-use criterion::{BatchSize, Criterion, black_box, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, black_box, criterion_group};
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
 
@@ -1025,4 +1025,38 @@ criterion_group!(
     bench_linear_train_hidden_2048,
     bench_sdpa_grad_2x8x512x64
 );
-criterion_main!(benches);
+/// Which allocator produced the numbers below.
+///
+/// This is not decoration. Under the system allocator, every lane that rebuilds
+/// a large input inside `b.iter` pays `mmap`/`munmap` page-fault churn that
+/// PyTorch's caching allocator does not, and the FrankenTorch arm absorbs all of
+/// it. Measured on the 32 MB-input lanes, that inflated the reported
+/// FrankenTorch-vs-PyTorch ratio by up to ~4x — while the PyTorch arms moved
+/// less than 10%. Numbers published without saying which allocator produced them
+/// therefore overstate FrankenTorch's losses, silently and by a lot
+/// (`frankentorch-ug4ep`, `frankentorch-1ji9l`).
+fn print_allocator_provenance() {
+    let allocator = if cfg!(feature = "fair-alloc") {
+        "mimalloc (built with --features fair-alloc)"
+    } else {
+        "system (glibc malloc)"
+    };
+    println!("gauntlet allocator: {allocator}");
+    if !cfg!(feature = "fair-alloc") {
+        println!(
+            "gauntlet WARNING: these FrankenTorch-vs-PyTorch ratios include per-iteration \
+             mmap/munmap churn on each lane's input rebuild, which PyTorch's caching allocator \
+             does not pay. They OVERSTATE FrankenTorch's losses — by up to ~4x on the 32 MB-input \
+             lanes. Re-run with --features fair-alloc before quoting any ratio from this bench."
+        );
+    }
+}
+
+fn main() {
+    // Printed before Criterion runs, so the provenance is attached to the
+    // numbers in any captured log rather than being something a reader has to
+    // reconstruct from the build command.
+    print_allocator_provenance();
+    benches();
+    Criterion::default().configure_from_args().final_summary();
+}

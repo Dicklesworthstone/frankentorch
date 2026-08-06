@@ -17,6 +17,19 @@ wide = "1.5"
 
 [features]
 default = []
+# Opt-in caching allocator (mimalloc) for FrankenTorch's OWN measurement
+# binaries — benches and perf examples. It is deliberately NOT wired into the
+# library and must never be: `#[global_allocator]` is a process-global choice,
+# only one may exist per binary, and a library that sets it takes that choice
+# away from every downstream consumer and breaks anyone who sets their own.
+# Option C of frankentorch-1ji9l; option B (default-on) was rejected for exactly
+# that reason.
+#
+# It exists because the system allocator serves large buffers via mmap/munmap,
+# so any lane that rebuilds a large input per iteration re-faults every page —
+# a cost PyTorch's caching allocator does not pay, and which lands entirely on
+# the FrankenTorch arm. Quote vs-PyTorch ratios from `--features fair-alloc`;
+# the benches print which allocator produced their numbers either way.
 fair-alloc = ["dep:mimalloc"]
 
 [dev-dependencies]

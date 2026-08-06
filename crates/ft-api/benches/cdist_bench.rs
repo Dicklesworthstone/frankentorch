@@ -6,6 +6,10 @@
 //! `cdist_broadcast/PxRxM` reproduces the pre-change op graph; `cdist_mm/PxRxM`
 //! drives the production tensor_cdist (now the matmul fast path).
 
+#[cfg(feature = "fair-alloc")]
+#[global_allocator]
+static FAIR_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;

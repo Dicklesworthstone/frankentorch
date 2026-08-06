@@ -1,3 +1,7 @@
+#[cfg(feature = "fair-alloc")]
+#[global_allocator]
+static FAIR_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use criterion::{
     BatchSize, BenchmarkId, Criterion, Throughput, black_box, criterion_group, criterion_main,
 };

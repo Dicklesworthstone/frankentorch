@@ -6,6 +6,10 @@
 //! drives the production `tensor_fft` (which now routes non-power-of-two N
 //! through Bluestein). Score = naive_time / bluestein_time.
 
+#[cfg(feature = "fair-alloc")]
+#[global_allocator]
+static FAIR_ALLOC: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use criterion::{Criterion, black_box, criterion_group, criterion_main};
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
