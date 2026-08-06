@@ -29,7 +29,15 @@ use std::time::Instant;
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
 
-const REPS: usize = 15;
+/// MUST BE EVEN (`frankentorch-svabf`). Each iteration runs two timed calls and
+/// assigns them to the A/A arms by iteration parity, which cancels a constant
+/// first-call-vs-second-call offset *only if the two positions are used equally
+/// often*. At the previous odd value of 15, arm `a` took the first position 8
+/// times and the second 7 — a 1-in-15 imbalance that leaks the position effect
+/// straight into the null ratio. That is what made `max_pool1d` and `conv3d`
+/// report A/A CIs excluding 1.0 (`[0.843,0.986]`, `[0.770,0.992]`) on a busy host
+/// while identical code ran in both arms.
+const REPS: usize = 16;
 const BOOTSTRAP_REPS: usize = 2_000;
 
 // Shapes lifted verbatim from pytorch_gauntlet_bench.
@@ -129,6 +137,13 @@ where
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The A/A null gate is only meaningful if the two arms use the first- and
+    // second-call positions equally often; see the note on REPS.
+    assert!(
+        REPS.is_multiple_of(2),
+        "REPS must be even or the A/A arms are position-imbalanced and the null gate leaks bias"
+    );
+
     let mp1 = seq(MP1_N * MP1_C * MP1_L);
     let ap2 = seq(AP2_N * AP2_C * AP2_H * AP2_W);
     let c3x = seq(C3_N * C3_CI * C3_D * C3_H * C3_W);

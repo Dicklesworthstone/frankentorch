@@ -38,7 +38,10 @@ const STRIDE: usize = 2;
 /// known-value sanity check on the measurement environment.
 const ANCHOR: usize = 4000;
 
-const REPS: usize = 21;
+/// MUST BE EVEN (`frankentorch-svabf`): the A/A arms are assigned by iteration
+/// parity, so an odd count gives one arm the first-call position once more than
+/// the other and leaks that position's bias into the null ratio.
+const REPS: usize = 20;
 const BOOTSTRAP_REPS: usize = 2_000;
 
 thread_local! {
