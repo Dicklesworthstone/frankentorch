@@ -73,6 +73,32 @@ measurement** — that is exactly what produced the digits being replaced.
 `max_pool3d` remains the largest confirmed vs-PyTorch loss in the tree, and it
 and `conv3d` are the two *decidable* lanes (ratio spread 1.46x and 1.39x).
 
+### Caveat on every range above: these were collected UNDER CONTENTION
+
+All 36 runs were sampled on a host shared with a live agent swarm. A neighbouring
+project's oracle cycled between idle and 4000–6900% CPU throughout, and load
+average moved between 6 and 69. **The ranges are therefore wider than this code
+warrants** — a meaningful part of each spread is the host, not the lane, and none
+of it is separable after the fact.
+
+Read that asymmetrically, because it does not cut both ways:
+
+- **The medians are the robust part.** That is what 18 repetitions buy.
+- **The ranges are upper bounds on this code's variability, not estimates of
+  it.** A quieter host would narrow them; nothing here says by how much.
+- **A later run landing OUTSIDE a range is therefore expected, not anomalous.**
+  It has already happened: a probe run on a genuinely quiet host (load ~6, the
+  calmest window of the session) read `avg_pool2d` at **2.79x**, below the
+  banked 3.09–8.07x. By the rule above, one run is not a measurement and does
+  not refute the bank — but it is direct evidence that the banked range is
+  contention-inflated, and that this lane's true floor is lower than 3.09x.
+
+This is why `avg_pool2d` and `max_pool1d` are called the wide lanes rather than
+the *variable* lanes: their width has two independent sources — a bimodal
+PyTorch arm (see below) and a contended host — and neither is a property of
+FrankenTorch. Re-measure both on a quiet host before scoping any lever off their
+numbers.
+
 ## The old digits were not wrong — they were measured on this oracle
 
 | lane | old single-run digit | oracle B median [range] | verdict |

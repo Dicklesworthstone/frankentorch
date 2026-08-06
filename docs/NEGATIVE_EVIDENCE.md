@@ -128,6 +128,20 @@ its gate **PASSED** on CI `[0.528,1.359]` — 78% wider than the clean run's
 `[0.798,1.266]`. Noise widens the null, and a wider null brackets 1.0 more
 easily. Both observations are promoted to the ledger header.
 
+**Standing caveat on the ranges — they were collected UNDER CONTENTION.** All 36
+runs shared the host with a live agent swarm; a neighbouring project's oracle
+cycled between idle and 4000–6900% CPU and load average moved between 6 and 69.
+So each range is an **upper bound on this code's variability, not an estimate of
+it** — part of every spread is the host, and it is not separable after the fact.
+The medians are the robust part; that is what 18 repetitions buy. A later run
+landing outside a range is therefore expected rather than anomalous, and one
+already has: the `wnku0` probe on the quietest window of the session (load ~6)
+read `avg_pool2d` at **2.79x**, below the banked 3.09–8.07x. One run is not a
+measurement and does not refute the bank — but it broke out *downward, on a quiet
+host*, exactly as a contention-widened range predicts, so `avg_pool2d`'s true
+floor is below 3.09x. Re-measure the two wide lanes on a quiet host before
+scoping a lever off them.
+
 **Standing caveat on this harness — the arms are NOT interleaved.** The whole
 PyTorch arm completes before the first FT lane starts
 (`gauntlet_lane_sweep_h2h.rs:196` vs `:264`), so the two arms are sampled tens of
