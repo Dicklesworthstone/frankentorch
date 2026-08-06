@@ -1,5 +1,24 @@
 # frankentorch-ug4ep - loss-list re-baseline vs PyTorch
 
+> **READ THE LAST TABLE, NOT THE FIRST ONE.** This ledger was written as the
+> investigation progressed, so the tables below supersede each other. The only
+> figures anyone should quote are in
+> [Final answer for this bead](#final-answer-for-this-bead). Every earlier table
+> is kept for provenance and is marked with what replaced it.
+>
+> | if you are about to quote | quote this instead |
+> |---|---|
+> | any "listed" figure (GroupNorm 19x, linear 10.6-12.3x, conv2d 4-6x, BatchNorm2d 10x, avg_pool1d 4-7x) | the final table - **not one of the five survived re-measurement at its listed size** |
+> | the `## Result` table (first table below) | the final table; its `avg_pool1d` and `BatchNorm2d` rows are **default-allocator** numbers, superseded by the fair-alloc rows |
+> | "conv2d UNVERIFIABLE, no harness" | [conv2d lane built](#conv2d-lane-built--and-the-row-is-stale-too) - the harness now exists and conv2d is **1.27x FASTER** |
+> | any default-allocator ratio | its `--features fair-alloc` counterpart; the default number includes per-iteration `mmap`/`munmap` churn PyTorch's caching allocator never pays |
+>
+> Independently replicated since (2026-08-06, separate session, fresh binary,
+> A/A null gate PASS `1.0226 ci95=[0.9541,1.0605]`, `cat_anchor` reading its
+> known value, `executing_elf_sha256=2ab0c47174cb48ac21f414c6b3ee028d1738b1e139701f3aa7ae36e2773cd583`):
+> **GroupNorm f32 = 2.97x FASTER**, against the 2.94x recorded here. See
+> `artifacts/perf/frankentorch-3i7c0/step0_gate_ledger.md`.
+
 ## Claim
 
 Of the five vs-PyTorch losses driving perf priority, **two are stale (one is now
@@ -10,6 +29,15 @@ The top perf target is no longer GroupNorm or linear. It is **`avg_pool1d` grad,
 ~5.0x slower**, which is the only row that reproduced at roughly its listed size.
 
 ## Result
+
+> **SUPERSEDED — do not quote this table.** Its `avg_pool1d` (4.96x slower) and
+> `BatchNorm2d` (3.75x slower) rows are **default-allocator** measurements, later
+> shown to include per-iteration `mmap`/`munmap` churn; they are replaced by the
+> fair-alloc rows in
+> [Correction: it is the ALLOCATOR](#correction-it-is-the-allocator-not-tensor_variable)
+> (1.92x and 1.21x). Its `conv2d` row ("UNVERIFIABLE") is replaced by
+> [conv2d lane built](#conv2d-lane-built--and-the-row-is-stale-too) (1.27x FASTER).
+> Kept for provenance.
 
 Harness: `cargo bench -p ft-api --bench pytorch_gauntlet_bench` — the canonical
 one, which runs the FrankenTorch and PyTorch arms inside the same Criterion
@@ -74,12 +102,24 @@ quote the arm and the CI bound, not the headline.
 
 ## Next target
 
+> **SUPERSEDED.** The "~5.0x" here is the default-allocator number. Under
+> `--features fair-alloc` the same row is **1.92x**, and root-causing below shows
+> most of even that is input materialisation rather than pooling. `avg_pool1d` is
+> still the largest remaining gap, but at ~1.9x, not ~5x.
+
 `avg_pool1d` grad, ~5.0x slower — now the largest confirmed vs-PyTorch gap in
 the tree. FT arm is `frankentorch_kgs4_134_fused_sum_loss` at 32.283 ms; there
 is already a phase-timing probe at
 `crates/ft-api/examples/avgpool1d_phase_timing.rs` to start from.
 
 ## Follow-up: the avg_pool1d gap is mostly NOT avg_pool1d
+
+> **PARTLY SUPERSEDED.** The phase split below is sound, but its attribution of
+> 22 677 us to `tensor_variable` is **refuted by the next section** — that call is
+> a move into an `Arc` and copies nothing. Read
+> [Correction: it is the ALLOCATOR](#correction-it-is-the-allocator-not-tensor_variable)
+> before using any number here. The *shares* still hold; only the name on the
+> dominant term changes.
 
 Root-causing the one confirmed row before choosing a lever, via the existing
 `crates/ft-api/examples/avgpool1d_phase_timing.rs`. Per-iteration split of the
@@ -168,6 +208,11 @@ alone, exactly as the mechanism predicts.
 
 ## Final re-baseline
 
+> **SUPERSEDED by [Final answer for this bead](#final-answer-for-this-bead)**,
+> which replaces this table's `conv2d` row ("no harness — unverifiable") with the
+> measured **1.27x FASTER** once the lane was built. All other rows are unchanged
+> between the two tables.
+
 | row | listed | true standing |
 |---|---|---|
 | GroupNorm f32 | 19x slower | **2.94x FASTER** |
@@ -185,6 +230,16 @@ that the default-allocator number includes per-iteration `mmap`/`munmap` churn
 that PyTorch's caching allocator avoids.
 
 ## Open question worth a decision, not a lever
+
+> **ANSWERED — do not re-litigate.** The decision was taken on
+> `frankentorch-1ji9l` (CLOSED): **option C**, `fair-alloc` stays opt-in and
+> confined to FrankenTorch's own binaries, benches and examples, and is never
+> wired into the library — a library must not take a process-global allocator
+> choice away from its consumer. Landed in `7f57fce3`, which also makes the
+> gauntlet print which allocator produced its numbers. The remaining engineering
+> question, whether to pool large buffers inside the session, is
+> `frankentorch-3i7c0` and is gated on
+> `artifacts/perf/frankentorch-3i7c0/step0_gate_ledger.md`.
 
 Should FrankenTorch ship a caching allocator by default? PyTorch effectively
 does. Today `fair-alloc` is opt-in and off in normal builds, so **real users get
@@ -234,6 +289,9 @@ share of the number. The allocator effect appears exactly where the mechanism
 predicts it should.
 
 ## Final answer for this bead
+
+> **THIS IS THE CANONICAL TABLE.** It supersedes every table above. Ratios are
+> the fair-allocator figures where the allocator moves the lane; quote these.
 
 | row | listed | true standing |
 |---|---|---|

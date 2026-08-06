@@ -10568,7 +10568,7 @@ impl TensorTape {
                                     // 4k×4k). Bit-identical (same single value moved).
                                     for i in ii..i_end {
                                         for j in jj..j_end {
-                                            dgn[j * a_dim + i] = sgn[i * b_dim + j].clone();
+                                            dgn[j * a_dim + i] = sgn[i * b_dim + j];
                                         }
                                     }
                                 } else {
@@ -10619,8 +10619,7 @@ impl TensorTape {
                                     if elem == 1 {
                                         for j in jj..j_end {
                                             for i in ii..i_end {
-                                                dblk[(j - jj) * a_dim + i] =
-                                                    src[i * b_dim + j].clone();
+                                                dblk[(j - jj) * a_dim + i] = src[i * b_dim + j];
                                             }
                                         }
                                     } else {
@@ -10673,7 +10672,7 @@ impl TensorTape {
                 remaining %= dst_strides[d];
                 flat_src += coord * src_perm_strides[d];
             }
-            src[flat_src].clone()
+            src[flat_src]
         };
 
         const PAR_MIN: usize = 1 << 16;
