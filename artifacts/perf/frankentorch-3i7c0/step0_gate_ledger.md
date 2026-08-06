@@ -1,16 +1,20 @@
 # frankentorch-3i7c0 STEP 0 — is the large-buffer allocation churn real?
 
-> **STATUS: CRITERION (a) ONLY. THIS IS NOT A GATE VERDICT, AND IT DOES NOT OPEN
-> STEP 1.** The bead's gate has two criteria and only the first has been
-> measured:
+> **STATUS: SPLIT VERDICT — (a) PASSES, (b) FAILS. The gate requires both, so the
+> reading is REJECT.**
 >
 > - **(a) does large-buffer traffic persist across steps when inputs are reused?**
->   Measured. Reads **PASS** — the churn does not vanish. 3i7c0 therefore cannot
->   be rejected on the "it is only a benchmark artifact" ground.
-> - **(b) does the allocator swap move the loop measurably?** **NOT RUN.** The
->   `--features fair-alloc` arm compiles clean but has not been executed.
+>   **PASS.** It does — 64 MiB/step in the pooling lane and 58 MiB/step in the
+>   parameterised training lane, with allocations and frees exactly balanced.
+> - **(b) does the allocator swap move the loop measurably?** **FAIL on every
+>   realistic lane.** mimalloc moves the harness-shaped rebuild lane **1.95x**
+>   (disjoint ranges over 3 interleaved reps) and moves neither reuse lane at all
+>   (1.03x and 0.97x, ranges overlapping).
 >
-> STEP 1 opens only when both pass. Nothing here authorises writing a pool.
+> The two together say something sharper than either alone: **the churn is real,
+> but it is not costing anything.** A pool would be built to remove traffic that
+> the measurement says is already effectively free in steady state. STEP 1 does
+> not open.
 
 ## Why this gate exists
 
@@ -77,17 +81,106 @@ invocation. **2.97x FASTER**, against the ledger's 2.94x — the row listed as
 
 ## Result — arm 1 of 2, system allocator
 
+Measured on the **fixed** binary (the earlier pre-fix table is preserved below for
+provenance).
+
 ```
-executing_elf_sha256 37b39d68de74483c48a9a234d662ec24534fcd8e0badc25b6b0bc0c97d416507
+executing_elf_sha256 2df11ebbd376837ba2d6250625536478fca31291fe1e29c0e74c74aa79f0c838
 allocator            system (default build)
 large-block threshold 1048576 bytes | steps 24 (first 6 discarded)
 ```
 
 | lane | step ms | steady-state large blocks/step |
 |---|---|---|
-| `pool_rebuild` | 31.379 | 4 alloc, **96.00 MiB** |
-| `pool_reuse` | 17.873 | 3 alloc, **64.00 MiB** (step 0: 4 / 96.00 MiB — the one-time input build) |
-| `mlp_reuse` | 64.040 | 15 alloc, **58.12 MiB** |
+| `pool_rebuild` | 32.238 | 4 alloc, **96.00 MiB** — frees not in window, see caveat |
+| `pool_reuse` | 22.489 | 3 alloc **64.00 MiB**, 3 free **64.00 MiB** |
+| `mlp_reuse` | 64.430 | 15 alloc **58.12 MiB**, 15 free **58.12 MiB** |
+
+With the generation-free now inside the measured window, the two reuse lanes show
+**allocations and frees exactly balanced every step** — 64.00 MiB out and 64.00 MiB
+back, 58.12 MiB out and 58.12 MiB back. That balance is the definition of churn:
+in steady state each step takes the same large buffers from the allocator and
+hands them straight back. It is a stronger reading of criterion (a) than the
+alloc column alone, because it rules out the alternative explanation that the
+allocations are cumulative growth rather than turnover.
+
+Caveat, stated because the two lanes are not symmetric: `pool_rebuild` still
+reports zero frees. Its session is a local that drops when the step function
+returns, which is after the closing snapshot, so its frees fall outside the
+window. Its **alloc** column is correct, and the gate reads on the reuse lanes,
+so this does not affect the verdict — but do not read `pool_rebuild`'s free
+column as "it never frees".
+
+## Result — arm 2 of 2, mimalloc, and the criterion (b) verdict
+
+```
+executing_elf_sha256 0fb3fff532cb8430c61ce86077e6792d4326e7e13fabfbcccb2833d650d2313e
+allocator            mimalloc (--features fair-alloc)
+```
+
+Same host, same shapes, same step count. The two arms are distinct binaries with
+distinct self-reported ELF SHAs and distinct self-reported allocator names, so
+neither can be silently measured against itself.
+
+Both binaries were preserved and run **interleaved, 3 reps each, alternating
+arms on the same host in one sitting** (`system, mimalloc, system, mimalloc, …`),
+so neither arm owns a warm or a cold slot. Medians below, with the full observed
+range, because the range is what makes the verdict readable:
+
+| lane | system (`a0df1848…`) | mimalloc (`0fb3fff5…`) | ratio | ranges |
+|---|---|---|---|---|
+| `pool_rebuild` (harness-shaped) | **32.466 ms** | **16.647 ms** | **1.95x faster** | `[31.955, 32.644]` vs `[16.293, 17.033]` — **disjoint** |
+| `pool_reuse` (realistic) | **22.130 ms** | **21.393 ms** | 1.03x | `[21.416, 22.291]` vs `[20.866, 21.544]` — **overlapping** |
+| `mlp_reuse` (realistic) | **63.640 ms** | **65.398 ms** | 0.97x (mimalloc slower) | `[63.504, 65.145]` vs `[65.100, 65.400]` — **overlapping** |
+
+Large-block traffic is byte-identical on both arms in every lane (4/96.00 MiB,
+3/64.00 MiB, 15/58.12 MiB), which is the control: the allocator swap changed how
+the same allocations are served, not how many there are.
+
+The separation on `pool_rebuild` is not a judgement call — the two arms' ranges do
+not touch, and the gap between them is twenty times the width of either range. The
+two reuse lanes' ranges **overlap**, so their 3% and -3% are not resolvable
+differences at all; on `mlp_reuse` mimalloc is if anything marginally slower.
+
+**Criterion (b) fails on every realistic lane.** The allocator swap is worth 1.87x
+on the lane that rebuilds its input every iteration — the gauntlet's shape, and
+the shape every number motivating this bead came from — and is worth nothing at
+all on the two lanes that reuse their inputs the way training does.
+
+### What the two criteria say together
+
+They are not in tension; read jointly they are sharper than either alone.
+
+The churn is **real** — the reuse lanes hand back 64 MiB and 58 MiB of large
+blocks every step, allocations and frees exactly balanced. Criterion (a) was
+right to pass. But that churn is **not costing anything**: swapping in an
+allocator specifically designed to make repeated large-block traffic cheap
+changes those lanes by 3% and -2%, which is noise.
+
+So the original hypothesis was half right in a way that matters. The 2.79x and
+3.96x figures that motivated pooling were real measurements of a real effect —
+but the effect belongs to the harness's **per-iteration input rebuild**, not to
+the steady-state churn of a training step. Reusing the input removes the
+allocator's leverage entirely while leaving the churn volume untouched. That is
+the cleanest possible demonstration that volume of allocation traffic is the
+wrong proxy for cost.
+
+The most likely mechanism, stated as a hypothesis and not as a measured claim:
+glibc's `malloc` adapts its `mmap` threshold upward when it observes repeated
+large frees, so a steady-state loop that recycles the same handful of buffer
+sizes stops being served by `mmap`/`munmap` and starts being served from the
+heap — i.e. glibc converges on caching behaviour by itself. Whatever the
+mechanism, the decision does not depend on it: the measurement is that there is
+no headroom left for a pool to recover.
+
+### Superseded: the pre-fix run
+
+Kept so the correction is auditable. Same lanes, binary
+`37b39d68de74483c…`, whose free column was structurally zero because the
+generation-free ran outside the window: `pool_rebuild` 31.379 ms / 4 alloc /
+96.00 MiB; `pool_reuse` 17.873 ms / 3 alloc / 64.00 MiB; `mlp_reuse` 64.040 ms /
+15 alloc / 58.12 MiB. The alloc columns agree exactly with the fixed run, which
+is the evidence that the defect touched only the free accounting.
 
 **The churn does not vanish when inputs are reused.** Rebuilding the input costs
 96 MiB of `>= 1 MiB` blocks per step; reusing it still costs 64 MiB per step. The
@@ -116,18 +209,30 @@ read `0.00 MiB` on all three lanes. Freeing a step's graph generation is part of
 the step, and it now runs inside the window.
 
 The alloc column — which is what the gate turns on, because allocation is what
-faults pages — was unaffected, which is why criterion (a) is still readable from
-the table above.
+faults pages — was unaffected, and the fixed run's alloc figures match the pre-fix
+run's exactly, which confirms the defect touched only free accounting.
 
-**The table above is from the PRE-FIX binary** (`executing_elf_sha256`
-`37b39d68…`), and the fixed source has not yet produced a run. An attempt to
-re-run it did not do what it looked like it did: the rebuild was issued inside an
-`rch exec -- sh -c "…"` wrapper, which suppressed rch's artifact sync, so the
-local binary was never replaced and the "re-run" executed the same stale ELF —
-the identical SHA and the still-zero free column are the tell. Re-issued as a
-direct `rch exec -- cargo build`. Recorded because a self-A/B that silently
-measures the same binary twice is exactly the failure mode this campaign's
-ELF-SHA rule exists to catch, and here the rule caught it.
+**Getting the fixed binary to actually run took three attempts, and the first two
+silently ran the old one.** Recorded in full because a self-A/B that measures the
+same binary twice is precisely the failure this campaign's ELF-SHA rule exists to
+catch, and here it caught it twice:
+
+1. The rebuild was issued inside `rch exec -- sh -c "…"`. That compiles on the
+   worker and reports success, but **suppresses rch's artifact sync**, so the
+   local binary was never replaced. The "re-run" executed the same ELF —
+   identical `executing_elf_sha256` and a still-zero free column were the tell.
+2. Re-issued as a bare `rch exec -- cargo build`, it failed with
+   `error: couldn't find file crates/ft-api/examples/training_loop_alloc_profile.rs`
+   on two different workers, for a path that exists locally, is git-tracked and is
+   not ignored — a stale worker-side sync manifest from when the file was still
+   untracked.
+3. `rch sync --worker <id> --force` (the tool's own remedy for a stale worker
+   cache, 14 cache entries removed) cleared it; the next build produced a new SHA
+   `2df11ebb…` and the free column populated.
+
+Operational rule worth carrying: when you need the built artifact back on the
+local box, issue a **bare** `rch exec -- cargo build` — no `sh -c`, no pipes — and
+compare the in-process ELF SHA across arms before believing any ratio.
 
 ## A blocker cleared on the way
 
@@ -143,3 +248,55 @@ Filed and fixed as `frankentorch-e1f8z`. All three sites are inside
 exactly a copy and removing it is a bit-identical no-op — and it matches those
 sites' own comment, which already argues for "a direct element move" over
 clone-based copying.
+
+## VERDICT: REJECT
+
+The gate required both criteria. (a) passes, (b) fails on every realistic lane,
+so **`frankentorch-3i7c0` is rejected and STEP 1 does not open.** No pool is
+built.
+
+Restating the bead's own decision rule against what was measured:
+
+> PASS (churn is real): large-buffer alloc/free traffic persists across steps
+> **and** the allocator swap moves the loop measurably. Proceed to STEP 1.
+
+The traffic persists. The swap does not move the loop. The conjunction fails.
+
+**This outcome is the point of the gate, not a disappointment.** It saves the
+entire pooling implementation — which the bead itself flagged as carrying the
+project's highest-risk failure mode, a pooled buffer aliasing a tensor still
+reachable from the tape, against the non-regression rule that autograd
+correctness outranks kernel speed. Buying that risk for a measured 0% is a bad
+trade, and now it is a measured bad trade rather than an intuition.
+
+### What replaces it
+
+Nothing. The allocator question is closed by `frankentorch-1ji9l`'s option C
+(landed, `7f57fce3`): `fair-alloc` stays opt-in for FrankenTorch's own
+measurement binaries, the library never sets a global allocator, and the gauntlet
+prints which allocator produced its numbers. That combination already handles the
+one place the effect is real — the bench's own per-iteration input rebuild.
+
+### Retry predicate
+
+Re-open **only** if a real user workload — not a benchmark — is shown to
+repeatedly allocate large tensors in steady state **and** to be measurably moved
+by an allocator swap. Both halves are required: this bead's whole finding is that
+the first half alone is satisfied by workloads where the second half is not.
+
+A concrete trigger that would qualify: a training or inference loop whose
+allocation profile resembles `pool_rebuild` rather than `pool_reuse` — i.e. one
+that genuinely cannot reuse its input buffers across steps — showing a
+`fair-alloc` delta with non-overlapping ranges over interleaved reps.
+
+### Reproducing this
+
+```
+cargo build --release -p ft-api --example training_loop_alloc_profile
+cargo build --release -p ft-api --features fair-alloc --example training_loop_alloc_profile
+```
+
+Preserve each binary before building the other (they share an output path), then
+run them alternately. Each prints its own allocator name and ELF SHA-256 from
+inside the process, so a stale-binary mix-up is visible in the output rather than
+silent. `STEPS=<n>` overrides the step count.
