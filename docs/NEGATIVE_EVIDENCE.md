@@ -51,11 +51,23 @@ bias straight into the null; see `svabf`).
 Two further corollaries, both established by the 36-run two-oracle re-bank below
 (`lane-sweep-reps16`):
 
+- **A DELTA WHOSE INCUMBENT ARM MOVED IS NOT A WIN.** If the incumbent's
+  version, build, or measured time changed between two runs, the difference
+  between those runs is not attributable to our code and quoting it as a speedup
+  is proof-class inflation. This is the general rule; the two below are the
+  specific ways this campaign has been caught by it.
 - **The incumbent's *version* is part of the arm, and belongs in provenance.**
   On one unchanged ELF, `max_pool1d` reads 2.43x against torch 2.12.1 and 1.29x
   against torch 2.13.0, because PyTorch itself got 1.93x slower on that op. Our
   arm moved <3%. Upgrading the oracle would have "won" 1.9x on two lanes with no
-  code change. Record the torch version beside the host, thread count, and ELF.
+  code change — a free win available to anyone who re-runs after
+  `pip install -U torch` and quotes the delta, and nothing in the old provenance
+  block could have caught it. As of `wnku0` the three live-torch
+  provenance-emitting harnesses make this structural rather than advisory: the
+  PyTorch arm self-reports `PT_TORCH_VERSION` in the same invocation, and
+  `ft_api::harness_provenance::require_reported_version` **hard-fails the run**
+  if it did not, so a harness cannot emit ratios without the version they were
+  measured against.
 - **A passing A/A null gate does not certify a quiet host, and gets *easier* to
   pass as the host gets noisier.** The null is FT-vs-FT, so any disturbance that
   scales both arms cancels; what contention does is *widen* the CI, and a wider

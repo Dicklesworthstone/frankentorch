@@ -154,6 +154,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let py = r#"
 import time, torch
 import torch.nn.functional as Fn
+# frankentorch-wnku0: the arm self-reports its version, in this same invocation,
+# BEFORE any timing — so a run that dies mid-measurement still leaves provenance.
+print('PT_TORCH_VERSION %s' % torch.__version__, flush=True)
 torch.set_num_threads(8)
 def seq(n):
     return ((torch.arange(n,dtype=torch.int64)%251).double())*0.001-0.12
@@ -216,7 +219,15 @@ for name, base, fn in [
         })
     };
 
+    // frankentorch-wnku0: hard-fails if the arm did not self-report, so this
+    // harness cannot emit ratios without the version they were measured against.
+    let torch_version = ft_api::harness_provenance::require_reported_version(&pt)?;
+
     println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "{}",
+        ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
+    );
     println!(
         "allocator={}",
         if cfg!(feature = "fair-alloc") {
