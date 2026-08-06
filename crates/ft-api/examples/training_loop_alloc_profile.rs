@@ -278,7 +278,9 @@ fn mlp_reuse_step(
             )
             .expect("in-place SGD update");
     }
-    session.zero_grads_tensor(&[weight, bias]).expect("zero_grad");
+    session
+        .zero_grads_tensor(&[weight, bias])
+        .expect("zero_grad");
     // See `pool_reuse_step`: the generation free belongs inside the window.
     drop(report);
     session.truncate_autograd_graph(boundary);
@@ -297,8 +299,8 @@ fn report_lane(name: &str, steps: &[Step], warmup: usize) {
     let alloc_mib = median_u64(steady.iter().map(|s| s.traffic.alloc_bytes).collect()) as f64
         / (1024.0 * 1024.0);
     let frees = median_u64(steady.iter().map(|s| s.traffic.frees).collect());
-    let free_mib =
-        median_u64(steady.iter().map(|s| s.traffic.free_bytes).collect()) as f64 / (1024.0 * 1024.0);
+    let free_mib = median_u64(steady.iter().map(|s| s.traffic.free_bytes).collect()) as f64
+        / (1024.0 * 1024.0);
     let ms = median(steady.iter().map(|s| s.ms).collect());
     println!(
         "  {name:<18} step {ms:8.3} ms | steady-state large blocks/step: {allocs:4} alloc ({alloc_mib:8.2} MiB), {frees:4} free ({free_mib:8.2} MiB) | step0 alloc {} ({:.2} MiB)",
@@ -348,7 +350,11 @@ fn main() {
     // Lane 3 — parameterised training step, weights and batch allocated once.
     let mut mlp_session = FrankenTorchSession::new(ExecutionMode::Strict);
     let batch = mlp_session
-        .tensor_variable(seq(MLP_BATCH * MLP_DIM, 0.0), vec![MLP_BATCH, MLP_DIM], false)
+        .tensor_variable(
+            seq(MLP_BATCH * MLP_DIM, 0.0),
+            vec![MLP_BATCH, MLP_DIM],
+            false,
+        )
         .expect("batch");
     let weight = mlp_session
         .tensor_variable(seq(MLP_DIM * MLP_DIM, 1.0), vec![MLP_DIM, MLP_DIM], true)
@@ -393,12 +399,20 @@ fn main() {
             .collect(),
     ) as f64
         / (1024.0 * 1024.0);
-    let reuse_mib = median_u64(reuse[warmup..].iter().map(|s| s.traffic.alloc_bytes).collect())
-        as f64
+    let reuse_mib = median_u64(
+        reuse[warmup..]
+            .iter()
+            .map(|s| s.traffic.alloc_bytes)
+            .collect(),
+    ) as f64
         / (1024.0 * 1024.0);
-    let mlp_mib =
-        median_u64(mlp[warmup..].iter().map(|s| s.traffic.alloc_bytes).collect()) as f64
-            / (1024.0 * 1024.0);
+    let mlp_mib = median_u64(
+        mlp[warmup..]
+            .iter()
+            .map(|s| s.traffic.alloc_bytes)
+            .collect(),
+    ) as f64
+        / (1024.0 * 1024.0);
     println!(
         "\nGATE READING: rebuilding the input allocates {rebuild_mib:.2} MiB of large blocks per step;\n\
          reusing it allocates {reuse_mib:.2} MiB; the parameterised step allocates {mlp_mib:.2} MiB.\n\
