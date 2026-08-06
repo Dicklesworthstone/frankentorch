@@ -116,6 +116,25 @@ fn frankentorch_step(base: &[f64]) -> (f64, f64) {
     (started.elapsed().as_secs_f64() * 1_000.0, checksum)
 }
 
+/// The same train step through the **fused** scalar-loss API. This is the arm the
+/// gauntlet calls `frankentorch_kgs4_134_fused_sum_loss`, and it is the ceiling of
+/// the "route `tensor_sum(avg_pool1d(x))` to the fused path automatically" lever:
+/// no routing change can beat calling the fused API directly. Measuring it beside
+/// the compose says whether that lever is worth building at all.
+fn frankentorch_fused_step(base: &[f64]) -> (f64, f64) {
+    let started = Instant::now();
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(base.to_vec(), vec![N, C, L], true)
+        .expect("leaf");
+    let loss = session
+        .functional_avg_pool1d_sum(x, KERNEL, STRIDE)
+        .expect("avg_pool1d_sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    (started.elapsed().as_secs_f64() * 1_000.0, checksum)
+}
+
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let base = input_values();
     let anchor_values: Vec<f64> = (0..ANCHOR * ANCHOR).map(|i| (i % 17) as f64).collect();
@@ -193,8 +212,20 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     );
     println!("  avg_pool1d f64 parity: gradient sum matches PyTorch ({checksum:.12e})");
 
+    // The fused API must agree with the compose bit-for-bit, or the routing lever
+    // it represents would change results and is off the table regardless of speed.
+    let (_, fused_checksum) = frankentorch_fused_step(&base);
+    assert_eq!(
+        checksum.to_bits(),
+        fused_checksum.to_bits(),
+        "functional_avg_pool1d_sum must be bit-identical to sum(avg_pool1d(x)); \
+         compose {checksum}, fused {fused_checksum}"
+    );
+    println!("  fused vs compose: gradient sums are bit-identical");
+
     for _ in 0..4 {
         std::hint::black_box(frankentorch_step(&base));
+        std::hint::black_box(frankentorch_fused_step(&base));
     }
 
     // ── A/A null gate: the same arm against itself must come out at 1.0. If it
@@ -202,15 +233,19 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     let mut null_a = Vec::with_capacity(REPS);
     let mut null_b = Vec::with_capacity(REPS);
     let mut timings = Vec::with_capacity(REPS);
+    let mut fused_timings = Vec::with_capacity(REPS);
     for sample in 0..REPS {
         if sample.is_multiple_of(2) {
             null_a.push(frankentorch_step(&base).0);
             null_b.push(frankentorch_step(&base).0);
+            timings.push(frankentorch_step(&base).0);
+            fused_timings.push(frankentorch_fused_step(&base).0);
         } else {
             null_b.push(frankentorch_step(&base).0);
             null_a.push(frankentorch_step(&base).0);
+            fused_timings.push(frankentorch_fused_step(&base).0);
+            timings.push(frankentorch_step(&base).0);
         }
-        timings.push(frankentorch_step(&base).0);
     }
     let (null_ratio, null_low, null_high) = median_ratio_ci(&null_a, &null_b);
     let null_pass = null_low <= 1.0 && null_high >= 1.0;
@@ -230,6 +265,20 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     println!(
         "a_a_median_ratio={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] gate={}",
         if null_pass { "PASS" } else { "FAIL" }
+    );
+
+    // The ceiling of the "auto-route sum(avg_pool1d(x)) to the fused path" lever.
+    // No routing change can beat calling the fused API directly, so if this ratio
+    // does not clear 1.0 with its CI, the lever is not worth building.
+    let fused_ms = median(fused_timings.clone());
+    let (fused_ratio, fused_low, fused_high) = median_ratio_ci(&timings, &fused_timings);
+    let lever_decision = if null_pass && fused_low > 1.0 {
+        "LEVER HAS HEADROOM"
+    } else {
+        "LEVER REJECTED — fused is not measurably faster than the compose"
+    };
+    println!(
+        "compose_ms={frankentorch_ms:.4} fused_ms={fused_ms:.4} compose_over_fused={fused_ratio:.4} ci95=[{fused_low:.4},{fused_high:.4}] {lever_decision}"
     );
 
     println!("op            FT(ms)    PT(ms)   verdict");

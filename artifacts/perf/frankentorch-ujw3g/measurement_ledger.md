@@ -58,6 +58,41 @@ So do not compare this 33.601 ms against the gauntlet's 7.4 ms. Both are valid
 against their own in-invocation incumbent and neither is valid against the
 other's.
 
+## The lever's ceiling, measured before building it
+
+The obvious lever is "route `tensor_sum(avg_pool1d(x))` to the existing fused
+`functional_avg_pool1d_sum` automatically". Before writing it, the harness gained
+a third arm that **calls the fused API directly** — no routing change can beat
+that, so it is the lever's ceiling. Measured in the same invocation, interleaved
+with the compose:
+
+```
+executing_elf_sha256=afead5e17d3414ec9e49a57021080a707da1da2f6352055d96a51fff33f4b6c1
+allocator=mimalloc (--features fair-alloc)
+a_a_median_ratio=1.0232 ci95=[0.9990,1.0484] gate=PASS
+  fused vs compose: gradient sums are bit-identical
+compose_ms=30.5753 fused_ms=26.6170 compose_over_fused=1.1487 ci95=[1.1006,1.1746]
+op            FT(ms)    PT(ms)   verdict
+  cat_anchor     11.237   44.837   FT 3.99x FASTER
+  avg_pool1d     30.575   17.586   FT 1.74x SLOWER
+```
+
+**Ceiling = 1.15x**, CI lower bound 1.1006 so it clears 1.0 and is a real,
+resolvable effect — but a modest one. Landing it perfectly would move this lane
+from 1.74x slower to roughly 1.51x slower. It does **not** close the gap.
+
+This also corrects an inference I had drawn from the gauntlet's two FT arms
+(`kgs4_122` 8.08 ms vs `kgs4_134_fused_sum_loss` 7.44 ms, CIs overlapping): those
+were a single contended run on a worker and could not resolve the difference. A
+proper interleaved measurement does resolve it, and puts it at 1.15x rather than
+"not measurable" — so the fused path is genuinely better, just not by much.
+
+**What this rules out.** The dense output-gradient buffer that the fused path
+avoids is therefore *not* the dominant cost of this lane. With the fused arm still
+1.51x off PyTorch, the remaining gap lives elsewhere — most likely in leaf
+materialisation, which both arms pay and which the earlier phase-timing put at
+~43% of the step. A future lever should target that, not the pooling backward.
+
 ## The lead this exposes
 
 `functional_avg_pool1d_sum` already exists (`crates/ft-api/src/lib.rs:32466`,
