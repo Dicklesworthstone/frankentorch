@@ -1,5 +1,26 @@
 # frankentorch-svd-blocked-bidiag-r7jdo - blocked bidiagonalization for SVD
 
+> **WHICH SVD NUMBER IS CURRENT — read this before quoting any of them.**
+> Three different vs-LAPACK ratios for `svd N=256` are in circulation and **only
+> the last is current**:
+>
+> | ratio | status | why |
+> |---|---|---|
+> | **189x** | **SUPERSEDED — do not quote** | Contention-inflated (ledger 21bl). FT read 1874 ms on a loaded shared worker; the same unchanged code reads 115-154 ms quiet. The PyTorch arm never moved (9.9 -> 10.29 ms), which is the proof it was a measurement artifact, not a regression. Still carried in this bead's title and description; superseded by the row below. |
+> | **11-15x** | **SUPERSEDED — pre-ship** | The corrected *incumbent* on a quiet host, i.e. the gap **before** this bead's lever landed. Correct as a baseline, wrong as a current standing. |
+> | **4.5x (N=256), 5.2-7.2x (N=512)** | **CURRENT** | Post-ship head-to-head, blocked `dgebrd` in tree (`d4efd4a2`, `3dda5575`). See [Head-to-head standing vs PyTorch/LAPACK](#head-to-head-standing-vs-pytorchlapack). |
+>
+> So an audit reading 189x and an audit reading 11-15x were **both** reading
+> stale rows, for different reasons — one a contention artifact, one a pre-ship
+> baseline. Neither is the standing today.
+>
+> **Proof-class caveat on the current row, stated because it bounds the claim:**
+> the h2h is *mixed-location* — FrankenTorch on a remote worker, PyTorch on the
+> local host, both 8 threads, torch warmed 5 iterations. It is **not** a
+> same-invocation measurement, so treat 4.5-7.2x as indicative rather than
+> certified, and re-measure in one process before quoting it in a release
+> document.
+
 ## Claim
 
 Shipped. `golub_reinsch_svd_impl` now reduces to bidiagonal form via a blocked
