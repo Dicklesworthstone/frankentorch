@@ -57,11 +57,7 @@ pub fn parse_reported_version(stdout: &str) -> Option<&str> {
         let value = line.trim().strip_prefix(VERSION_MARKER)?;
         let value = value.trim();
         // A marker with an empty payload is a missing version, not a version.
-        if value.is_empty() {
-            None
-        } else {
-            Some(value)
-        }
+        if value.is_empty() { None } else { Some(value) }
     })
 }
 
@@ -108,10 +104,7 @@ pub fn payload_line(stdout: &str) -> Option<&str> {
 ///
 /// Returns `None` when they agree, or the message to fail with when they do not.
 #[must_use]
-pub fn version_disagreement(
-    first: (&str, &str),
-    observed: (&str, &str),
-) -> Option<String> {
+pub fn version_disagreement(first: (&str, &str), observed: (&str, &str)) -> Option<String> {
     let (first_version, first_label) = first;
     let (version, label) = observed;
     if first_version == version {
@@ -244,14 +237,20 @@ mod tests {
 
     #[test]
     fn payload_line_tolerates_blank_lines_and_ordering() {
-        assert_eq!(payload_line("\n\nPT_TORCH_VERSION 2.12.1\n\n1.5\n"), Some("1.5"));
+        assert_eq!(
+            payload_line("\n\nPT_TORCH_VERSION 2.12.1\n\n1.5\n"),
+            Some("1.5")
+        );
         assert_eq!(payload_line("1.5\nPT_TORCH_VERSION 2.12.1\n"), Some("1.5"));
     }
 
     #[test]
     fn matching_arm_versions_are_not_a_disagreement() {
         assert_eq!(
-            version_disagreement(("2.12.1+cpu", "PyTorch max_pool1d"), ("2.12.1+cpu", "PyTorch conv3d")),
+            version_disagreement(
+                ("2.12.1+cpu", "PyTorch max_pool1d"),
+                ("2.12.1+cpu", "PyTorch conv3d")
+            ),
             None
         );
     }
@@ -289,7 +288,10 @@ mod tests {
     fn provenance_block_names_the_version_and_the_rule() {
         let block = incumbent_provenance_block("2.12.1+cpu", 8);
         assert!(block.contains("2.12.1+cpu"), "version must appear: {block}");
-        assert!(block.contains("threads=8"), "thread count must appear: {block}");
+        assert!(
+            block.contains("threads=8"),
+            "thread count must appear: {block}"
+        );
         assert!(
             block.contains("is NOT a win"),
             "the incumbent-moved rule must travel with the block: {block}"

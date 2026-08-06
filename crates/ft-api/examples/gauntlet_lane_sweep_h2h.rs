@@ -236,7 +236,9 @@ for name, base, fn in [
             "system (glibc malloc) — re-run with --features fair-alloc before quoting"
         }
     );
-    println!("measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)");
+    println!(
+        "measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)"
+    );
     println!("reps={REPS}, PyTorch min-of-7 after 4 warmups, torch threads=8\n");
     println!("lane          FT(ms)    PT(ms)   standing            A/A gate           parity");
 
@@ -268,19 +270,36 @@ for name, base, fn in [
             let (nr, nlo, nhi) = median_ratio_ci(&a, &b);
             let null_pass = nlo <= 1.0 && nhi >= 1.0;
             let ft_ms = median(a.iter().chain(b.iter()).copied().collect());
-            lanes.push(($name, vec![ft_ms, nr, nlo, nhi, f64::from(u8::from(null_pass))], checksum));
+            lanes.push((
+                $name,
+                vec![ft_ms, nr, nlo, nhi, f64::from(u8::from(null_pass))],
+                checksum,
+            ));
         }};
     }
 
-    lane!("max_pool1d", mp1, vec![MP1_N, MP1_C, MP1_L], |s: &mut FrankenTorchSession, x| s
-        .functional_max_pool1d(x, 2, 2)
-        .expect("max_pool1d"));
-    lane!("avg_pool2d", ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s: &mut FrankenTorchSession, x| s
-        .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
-        .expect("avg_pool2d"));
-    lane!("max_pool3d", mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s: &mut FrankenTorchSession, x| s
-        .functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
-        .expect("max_pool3d"));
+    lane!(
+        "max_pool1d",
+        mp1,
+        vec![MP1_N, MP1_C, MP1_L],
+        |s: &mut FrankenTorchSession, x| s.functional_max_pool1d(x, 2, 2).expect("max_pool1d")
+    );
+    lane!(
+        "avg_pool2d",
+        ap2,
+        vec![AP2_N, AP2_C, AP2_H, AP2_W],
+        |s: &mut FrankenTorchSession, x| s
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d")
+    );
+    lane!(
+        "max_pool3d",
+        mp3,
+        vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W],
+        |s: &mut FrankenTorchSession, x| s
+            .functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+            .expect("max_pool3d")
+    );
 
     // conv3d needs a second leaf, so it does not fit the single-input macro.
     {
