@@ -8776,6 +8776,20 @@ fn max_pool3d_backward_2x2s2_f64(
     let out_plane_len = od * oh * ow;
     let depth_stride = ih * iw;
     let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-zoqws: `vec![0.0; n]` is `alloc_zeroed`, so at this size it is
+    // fresh `mmap` zero pages that nothing has touched yet. If the parallel pass
+    // below is what first touches them, 64 rayon threads fault the same fresh
+    // mapping simultaneously and contend on the kernel's page-table/mmap locks —
+    // measured at 6.39 GiB/s, and unmoved by chunk size (16 KiB..2 MiB) or store
+    // width (scalar, `fill`, `f64x4`). One thread doing the dumbest possible
+    // `fill` faults the same pages with no contention at 36.70 GiB/s, 5.7x
+    // faster (artifacts/perf/frankentorch-zoqws/).
+    //
+    // So pay the first touch serially here. The scatter below then writes to
+    // already-faulted pages and keeps its parallelism. Writing zeros over
+    // already-zero memory cannot change a single output bit; this is a
+    // page-fault scheduling change, not an arithmetic one.
+    din.fill(0.0);
     din.par_chunks_mut(plane_len)
         .enumerate()
         .for_each(|(plane, drow)| {
@@ -8870,6 +8884,12 @@ pub fn max_pool3d_backward_from_indices_f64(
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
     let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-zoqws: serialize the first touch — see the note in
+    // `max_pool3d_backward_2x2s2_f64`. This path is the profiled one
+    // (`87sz8` backward attribution: 84% of the backward is materialising this
+    // dense gradient, at 6.39 GiB/s, against 36.70 GiB/s for a serial fill).
+    // Zeros over already-zero memory cannot change an output bit.
+    din.fill(0.0);
     din.par_chunks_mut(plane_len)
         .enumerate()
         .for_each(|(plane, drow)| {
