@@ -63,6 +63,16 @@ Two further corollaries, both established by the 36-run two-oracle re-bank below
   its gate on a CI 78% wider than the clean run's. Read CI **width**, not just
   bracketing, as the quiet-host signal — and never read an A/A PASS as saying
   anything about the PyTorch arm, which is not in the null.
+- **"Same invocation" is not the same as "interleaved", and repetition — not the
+  preflight — is what makes a non-interleaved harness usable.** A harness that
+  runs its whole incumbent arm before its whole candidate arm samples the two
+  tens of seconds apart, so any load shift in that gap lands entirely and
+  undetectably in the ratio. A contention preflight cannot catch it: it certifies
+  only that nothing heavy sat on the placement CPUs *at the instant sampling
+  began*, and is blind to a peer job starting one second later and to page-cache
+  and thermal history entirely. State the arm ordering in provenance, take
+  medians over 10+ runs, quote ranges — and prefer interleaving the arms per
+  repetition, which removes the defect instead of averaging it down.
 
 ## 2026-08-06 - CERTIFIED: four gauntlet loss lanes re-banked at REPS=16, 36 runs, two oracles
 
@@ -106,11 +116,25 @@ its gate **PASSED** on CI `[0.528,1.359]` — 78% wider than the clean run's
 `[0.798,1.266]`. Noise widens the null, and a wider null brackets 1.0 more
 easily. Both observations are promoted to the ledger header.
 
+**Standing caveat on this harness — the arms are NOT interleaved.** The whole
+PyTorch arm completes before the first FT lane starts
+(`gauntlet_lane_sweep_h2h.rs:196` vs `:264`), so the two arms are sampled tens of
+seconds apart and any load shift in that gap lands entirely in the ratio. **What
+makes this set usable is 18 repetitions and a median, not the contention
+preflight** — a preflight certifies only the instant sampling began and is blind
+to a peer job starting a second later, and to page-cache and thermal history.
+That was live here: a neighbouring project's oracle cycled between idle and
+4000–6900% CPU across these runs, load average 6 to 69. The residual risk is
+unquantified; repetition averages it down but nothing bounds it. Interleaving the
+arms per repetition would remove the defect outright and is the highest-value
+change available to this harness.
+
 **Decision.** Quote the medians with ranges and the torch version. Do not quote
 a single run of this harness — 10+ runs and a median is the minimum. The gate
-defect is recorded as an observed defect class, deliberately **not** fixed in
-this change, so that this artifact's ELF remains the one that produced these
-numbers; a gate edit needs its own before/after integrity check.
+defect and the arm-ordering defect are both recorded as observed defect classes,
+deliberately **not** fixed in this change, so that this artifact's ELF remains
+the one that produced these numbers; each edit needs its own before/after
+integrity check.
 
 ## 2026-07-09 - REJECTED: cross_entropy f64 backward logsumexp sidecar (ft-api/ft-kernel-cpu) - 0.972x vs ORIG same-worker
 

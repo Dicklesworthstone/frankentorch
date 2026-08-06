@@ -12,6 +12,35 @@ This artifact banks a **fresh set** on the fixed `REPS=16` harness with its ELF
 recorded, across **36 runs on two PyTorch oracles**. It is **not** differenced
 against the old digits.
 
+## Read this before any number below: the arms are not interleaved
+
+The harness runs its **entire PyTorch arm to completion before the first
+FrankenTorch lane starts** (`gauntlet_lane_sweep_h2h.rs:196` waits out the Python
+child; the first FT lane is at `:264`). So every ratio here is
+**same-invocation and same-host, but NOT interleaved** — the two arms are
+sampled tens of seconds apart, and any load shift in that gap lands entirely and
+undetectably in the ratio.
+
+**What makes these numbers tolerable is 18 repetitions and a median — not the
+contention preflight.** A preflight certifies only that nothing heavy sat on the
+placement CPUs at the instant sampling began; it cannot see a peer job starting
+one second later, and it cannot see page-cache or thermal history at all. On this
+host that is not hypothetical: a neighbouring project's oracle cycled between
+idle and 4000–6900% CPU throughout these runs, and load average moved between 6
+and 69.
+
+Two direct consequences:
+
+- **A single run of this harness is not a measurement**, no matter how clean its
+  preflight looked or how convincingly its A/A gate passed.
+- **The residual risk is one-sided and unquantified.** Repetition averages the
+  gap's effect down; it does not eliminate it, and nothing here bounds it. Treat
+  the ranges as the honest width of each lane, not the medians as exact.
+
+Interleaving the arms per repetition would remove this defect outright and is the
+single highest-value change available to this harness. It is deliberately **not**
+made here, so this artifact's ELF stays the one that produced these numbers.
+
 ## Provenance
 
 | | |
@@ -23,6 +52,7 @@ against the old digits.
 | measurement | OP WORK ONLY — forward+backward, leaf built outside the timer on **both** sides |
 | host | 64 cores, governor `performance`, shared with a live agent swarm |
 | PyTorch arm | live, in the same invocation, min-of-7 after 4 warmups, `torch.set_num_threads(8)` |
+| arm ordering | **NOT interleaved** — the whole PT arm completes before the first FT lane; see the section above |
 | **oracle B (primary)** | **torch 2.12.1+cpu** — `/data/projects/.venvs/frankentorch-pytorch-cpu`, the repo's standing oracle |
 | oracle A (control) | torch 2.13.0+cpu |
 | runs | 18 per oracle, same ELF throughout |
