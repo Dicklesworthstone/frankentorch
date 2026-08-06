@@ -133,3 +133,62 @@ memcpy speed for a copy of that size — consistent with an extra copy and/or a
 serial first-touch fill, the same anti-pattern already fixed once in
 `expand`/`broadcast_to` (`vec![v; numel]` serial first-touch, replaced by an
 uninit buffer whose parallel fill does the first touch). Filed as its own bead.
+
+## Correction: it is the ALLOCATOR, not `tensor_variable`
+
+The `tensor_variable` hypothesis above (and `frankentorch-uqsit`, filed on it) is
+**refuted by reading the code**. `tensor_variable` -> `tape.leaf` ->
+`DenseTensor::from_contiguous_values` -> `from_storage` -> 
+`TensorStorage::F64(Arc::new(storage))`. That is a **move into an `Arc`**. It
+performs no copy and there is nothing in it to optimize.
+
+The 22 677 us attributed to "`tensor_variable`" is the probe's own
+`base.clone()` in the same timed region — a fresh 32 MB `Vec<f64>` allocation
+plus memcpy. Under glibc `malloc`, an allocation that size is served by `mmap`
+and returned by `munmap` on drop, so **every iteration re-faults all 8192
+pages**. That is the ~1.5 GB/s. PyTorch never pays it, because its caching
+allocator hands back the same warm block each iteration.
+
+So the asymmetry was real but it was never a tensor-code defect: it is
+first-touch page-fault churn, and it lives in the harness's input rebuild, which
+both sides perform.
+
+The repo already anticipated this — `pytorch_gauntlet_bench` documents a
+`fair-alloc` feature (mimalloc) "for allocator-sensitive FT/PyTorch
+comparisons". Re-running the two confirmed rows under it:
+
+| row | default allocator | **`--features fair-alloc`** |
+|---|---|---|
+| `avg_pool1d` grad | FT 32.283 vs PT 6.515 = **4.96x slower** | FT 11.560 vs PT 6.025 = **1.92x slower** |
+| BatchNorm2d f32 grad | FT 29.357 vs PT 7.831 = **3.75x slower** | FT 7.408 vs PT 6.117 = **1.21x slower** |
+
+Both PyTorch arms are unchanged within noise (6.5 -> 6.0, 7.8 -> 6.1), which is
+the control: the allocator swap moved the FrankenTorch side and left PyTorch
+alone, exactly as the mechanism predicts.
+
+## Final re-baseline
+
+| row | listed | true standing |
+|---|---|---|
+| GroupNorm f32 | 19x slower | **2.94x FASTER** |
+| linear hidden 2048 | 10.6-12.3x slower | **2.29x FASTER** |
+| BatchNorm2d f32 grad | 10x slower | **1.21x slower** (near parity) |
+| `avg_pool1d` grad | 4-7x slower | **1.92x slower** |
+| conv2d | 4-6x slower | **no harness — unverifiable** |
+
+**Not one of the five rows is a large real loss.** Two are wins, two are within
+2x under a fair allocator, and one has no evidence at all. The remaining
+headroom on this list is roughly 2x on a single op, not 5-19x across five.
+
+Anyone quoting these rows should quote the fair-alloc number, or state plainly
+that the default-allocator number includes per-iteration `mmap`/`munmap` churn
+that PyTorch's caching allocator avoids.
+
+## Open question worth a decision, not a lever
+
+Should FrankenTorch ship a caching allocator by default? PyTorch effectively
+does. Today `fair-alloc` is opt-in and off in normal builds, so **real users get
+the slow path on any workload that repeatedly allocates large buffers** — the
+gauntlet is only unusual in making that visible. That is a product decision
+about default behaviour, not a kernel optimization, so it is recorded here
+rather than actioned.
