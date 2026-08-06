@@ -84,6 +84,20 @@ pub fn require_reported_version(stdout: &str) -> Result<&str, MissingIncumbentVe
     parse_reported_version(stdout).ok_or(MissingIncumbentVersion)
 }
 
+/// The arm's actual payload — its first non-empty line that is not the version
+/// marker.
+///
+/// Adding a provenance line to a script that previously printed **only** its
+/// result silently breaks any caller doing `stdout.trim().parse()`. This is the
+/// paired accessor: provenance comes off the top, the payload is what remains.
+#[must_use]
+pub fn payload_line(stdout: &str) -> Option<&str> {
+    stdout
+        .lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty() && !line.starts_with(VERSION_MARKER))
+}
+
 /// The PyTorch arm ran but never said which PyTorch it was.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct MissingIncumbentVersion;
@@ -178,6 +192,34 @@ mod tests {
         assert!(message.contains(VERSION_MARKER.trim_end()), "{message}");
         assert!(message.contains("is NOT a win"), "{message}");
         assert!(message.contains("torch.__version__"), "{message}");
+    }
+
+    /// The exact stdout shape the gauntlet's Python arms now emit.
+    #[test]
+    fn payload_line_skips_the_provenance_line() {
+        let stdout = "PT_TORCH_VERSION 2.12.1+cpu\n0.008927762014\n";
+        assert_eq!(payload_line(stdout), Some("0.008927762014"));
+        assert_eq!(
+            payload_line(stdout).and_then(|l| l.parse::<f64>().ok()),
+            Some(0.008_927_762_014)
+        );
+    }
+
+    /// NEGATIVE CASE: the bug this accessor exists to prevent. A caller doing
+    /// `stdout.trim().parse()` on a script that gained a provenance line gets a
+    /// parse failure; `payload_line` must not reproduce that by returning the
+    /// marker.
+    #[test]
+    fn payload_line_never_returns_the_marker_line() {
+        assert_eq!(payload_line("PT_TORCH_VERSION 2.13.0+cpu\n"), None);
+        assert_eq!(payload_line(""), None);
+        assert_eq!(payload_line("\n  \n"), None);
+    }
+
+    #[test]
+    fn payload_line_tolerates_blank_lines_and_ordering() {
+        assert_eq!(payload_line("\n\nPT_TORCH_VERSION 2.12.1\n\n1.5\n"), Some("1.5"));
+        assert_eq!(payload_line("1.5\nPT_TORCH_VERSION 2.12.1\n"), Some("1.5"));
     }
 
     #[test]

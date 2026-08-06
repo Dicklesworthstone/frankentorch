@@ -4,6 +4,11 @@ import time
 import torch
 import torch.nn.functional as F
 
+# frankentorch-wnku0: this arm self-reports which PyTorch it is, before any
+# timing. The bench refuses to parse a run without it, and cross-checks that
+# every lane reported the same version.
+print(f"PT_TORCH_VERSION {torch.__version__}", flush=True)
+
 
 def deterministic_values(total: int, shift: float) -> torch.Tensor:
     idx = torch.arange(total, dtype=torch.float64)

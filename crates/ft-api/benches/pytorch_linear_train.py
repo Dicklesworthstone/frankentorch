@@ -4,6 +4,11 @@ import time
 import torch
 import torch.nn.functional as F
 
+# frankentorch-wnku0: this arm self-reports which PyTorch it is, before any
+# timing. The bench refuses to parse a run without it, and cross-checks that
+# every lane reported the same version.
+print(f"PT_TORCH_VERSION {torch.__version__}", flush=True)
+
 
 BATCH = 32
 IN_FEATURES = 512
