@@ -299,11 +299,63 @@ fn parse_pytorch_elapsed(output: std::process::Output, label: &str) -> Duration 
         String::from_utf8(output.stdout),
         "PyTorch benchmark emitted non-UTF8 stdout",
     );
+
+    // frankentorch-wnku0: every arm must say which PyTorch it is, or its number
+    // is not quotable. This bench spawns NINE separate Python processes, so it
+    // additionally has to prove they were all the same interpreter — see
+    // `record_incumbent_version`.
+    let version = match ft_api::harness_provenance::require_reported_version(&stdout) {
+        Ok(version) => version,
+        Err(err) => fail(format!("{label}: {err}")),
+    };
+    record_incumbent_version(label, version);
+
+    // The elapsed seconds are the one line that is not the version marker.
+    let elapsed_line = ft_api::harness_provenance::payload_line(&stdout).unwrap_or("");
     let seconds: f64 = require(
-        stdout.trim().parse(),
+        elapsed_line.parse(),
         &format!("failed to parse {label} elapsed seconds `{stdout}`"),
     );
     Duration::from_secs_f64(seconds)
+}
+
+/// Every PyTorch arm in this bench must be the *same* PyTorch.
+///
+/// The gauntlet launches a separate Python process per lane, so nothing
+/// structurally prevents two lanes running different interpreters — a
+/// `PYTORCH_PYTHON` change mid-run, a stale venv on one path, a rebuilt
+/// environment between lanes. That would silently produce a comparison table
+/// whose rows are measured against different incumbents, which is the
+/// version-substitution defect `wnku0` exists to close, in its most deniable
+/// form. Fail loudly instead.
+fn record_incumbent_version(label: &str, version: &str) {
+    use std::sync::Mutex;
+    use std::sync::OnceLock;
+
+    static INCUMBENT: OnceLock<Mutex<Option<(String, String)>>> = OnceLock::new();
+    let slot = INCUMBENT.get_or_init(|| Mutex::new(None));
+    let mut guard = match slot.lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    match guard.as_ref() {
+        None => {
+            eprintln!(
+                "incumbent=PyTorch {version} (self-reported by the arm, same invocation)\n\
+                 incumbent_rule={}",
+                ft_api::harness_provenance::INCUMBENT_MOVED_RULE
+            );
+            *guard = Some((version.to_owned(), label.to_owned()));
+        }
+        Some((seen, first_label)) => {
+            if let Some(message) = ft_api::harness_provenance::version_disagreement(
+                (seen.as_str(), first_label.as_str()),
+                (version, label),
+            ) {
+                fail(message);
+            }
+        }
+    }
 }
 
 fn bench_max_pool1d_unit_dout(c: &mut Criterion) {

@@ -1,0 +1,355 @@
+//! Re-baseline the gauntlet lanes that never got a live-PyTorch comparison under
+//! `--features fair-alloc` — `frankentorch-kgs4`.
+//!
+//! WHY THIS SHAPE OF MEASUREMENT. `frankentorch-ujw3g` established that the
+//! gauntlet's headline ratios are dominated by each lane's per-iteration input
+//! rebuild: for `avg_pool1d`, 57% of the step was the caller's 32 MiB `to_vec()`
+//! and only ~12% was the pooling forward, and FrankenTorch's *op work* turned out
+//! to be at ~1.18x while the whole-step ratio read 1.5-2.0x. A whole-step ratio
+//! therefore mostly measures buffer-copy cost, which is allocator-shaped and
+//! already settled by `frankentorch-1ji9l` option C.
+//!
+//! So this sweep times **op work only** — forward + backward with the input built
+//! OUTSIDE the timed region on both sides. That is the number that says whether a
+//! kernel is competitive, and it is the one a lever could actually move.
+//!
+//! Four lanes, shapes copied from `pytorch_gauntlet_bench` so the two describe the
+//! same workloads: `max_pool1d`, `avg_pool2d`, `conv3d`, `max_pool3d`.
+//!
+//! Run (must be local; rch workers have no PyTorch):
+//! ```text
+//! PYTORCH_PYTHON=/path/to/python \
+//!   cargo run --release -p ft-api --features fair-alloc --example gauntlet_lane_sweep_h2h
+//! ```
+
+use std::io::Write;
+use std::process::{Command, Stdio};
+use std::time::Instant;
+
+use ft_api::FrankenTorchSession;
+use ft_core::ExecutionMode;
+
+/// MUST BE EVEN (`frankentorch-svabf`). Each iteration runs two timed calls and
+/// assigns them to the A/A arms by iteration parity, which cancels a constant
+/// first-call-vs-second-call offset *only if the two positions are used equally
+/// often*. At the previous odd value of 15, arm `a` took the first position 8
+/// times and the second 7 — a 1-in-15 imbalance that leaks the position effect
+/// straight into the null ratio. That is what made `max_pool1d` and `conv3d`
+/// report A/A CIs excluding 1.0 (`[0.843,0.986]`, `[0.770,0.992]`) on a busy host
+/// while identical code ran in both arms.
+const REPS: usize = 16;
+const BOOTSTRAP_REPS: usize = 2_000;
+
+// Shapes lifted verbatim from pytorch_gauntlet_bench.
+const MP1_N: usize = 8;
+const MP1_C: usize = 64;
+const MP1_L: usize = 8192;
+
+const AP2_N: usize = 8;
+const AP2_C: usize = 64;
+const AP2_H: usize = 64;
+const AP2_W: usize = 64;
+
+const C3_N: usize = 2;
+const C3_CI: usize = 32;
+const C3_CO: usize = 32;
+const C3_D: usize = 8;
+const C3_H: usize = 16;
+const C3_W: usize = 16;
+const C3_K: usize = 3;
+
+const MP3_N: usize = 2;
+const MP3_C: usize = 32;
+const MP3_D: usize = 16;
+const MP3_H: usize = 32;
+const MP3_W: usize = 32;
+
+fn median(mut values: Vec<f64>) -> f64 {
+    values.sort_by(f64::total_cmp);
+    values[values.len() / 2]
+}
+
+fn next_random(state: &mut u64) -> u64 {
+    *state ^= *state << 13;
+    *state ^= *state >> 7;
+    *state ^= *state << 17;
+    *state
+}
+
+fn median_ratio_ci(numerator: &[f64], denominator: &[f64]) -> (f64, f64, f64) {
+    assert_eq!(numerator.len(), denominator.len());
+    let point = median(numerator.to_vec()) / median(denominator.to_vec());
+    let mut samples = Vec::with_capacity(BOOTSTRAP_REPS);
+    let mut state = 0x2f1e_9b47_c30d_a851_u64;
+    for _ in 0..BOOTSTRAP_REPS {
+        let mut left = Vec::with_capacity(numerator.len());
+        let mut right = Vec::with_capacity(denominator.len());
+        for _ in 0..numerator.len() {
+            let index = (next_random(&mut state) as usize) % numerator.len();
+            left.push(numerator[index]);
+            right.push(denominator[index]);
+        }
+        samples.push(median(left) / median(right));
+    }
+    samples.sort_by(f64::total_cmp);
+    (
+        point,
+        samples[BOOTSTRAP_REPS * 25 / 1_000],
+        samples[BOOTSTRAP_REPS * 975 / 1_000],
+    )
+}
+
+fn executable_sha256() -> String {
+    let executable = std::env::current_exe().expect("current executable must be available");
+    let output = Command::new("sha256sum")
+        .arg(executable)
+        .output()
+        .expect("sha256sum must be available");
+    assert!(output.status.success(), "sha256sum failed");
+    String::from_utf8(output.stdout)
+        .expect("sha256sum output must be UTF-8")
+        .split_whitespace()
+        .next()
+        .expect("sha256sum must print a digest")
+        .to_owned()
+}
+
+fn seq(n: usize) -> Vec<f64> {
+    (0..n).map(|i| ((i % 251) as f64) * 0.001 - 0.12).collect()
+}
+
+/// Time forward+backward with the leaf already built. Returns (ms, grad checksum).
+fn timed_op<F>(values: &[f64], shape: Vec<usize>, build: F) -> (f64, f64)
+where
+    F: Fn(&mut FrankenTorchSession, ft_autograd::TensorNodeId) -> ft_autograd::TensorNodeId,
+{
+    let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+    let x = session
+        .tensor_variable(values.to_vec(), shape, true)
+        .expect("leaf");
+    // Leaf construction is deliberately outside the timer — see the module note.
+    let started = Instant::now();
+    let out = build(&mut session, x);
+    let loss = session.tensor_sum(out).expect("sum");
+    let report = session.tensor_backward(loss).expect("backward");
+    let checksum = report.gradient(x).expect("grad").iter().sum::<f64>();
+    (started.elapsed().as_secs_f64() * 1_000.0, checksum)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // The A/A null gate is only meaningful if the two arms use the first- and
+    // second-call positions equally often; see the note on REPS.
+    assert!(
+        REPS.is_multiple_of(2),
+        "REPS must be even or the A/A arms are position-imbalanced and the null gate leaks bias"
+    );
+
+    let mp1 = seq(MP1_N * MP1_C * MP1_L);
+    let ap2 = seq(AP2_N * AP2_C * AP2_H * AP2_W);
+    let c3x = seq(C3_N * C3_CI * C3_D * C3_H * C3_W);
+    let c3w = seq(C3_CO * C3_CI * C3_K * C3_K * C3_K);
+    let mp3 = seq(MP3_N * MP3_C * MP3_D * MP3_H * MP3_W);
+
+    let python = std::env::var("PYTORCH_PYTHON").unwrap_or_else(|_| "python3".to_string());
+    let py = r#"
+import time, torch
+import torch.nn.functional as Fn
+# frankentorch-wnku0: the arm self-reports its version, in this same invocation,
+# BEFORE any timing — so a run that dies mid-measurement still leaves provenance.
+print('PT_TORCH_VERSION %s' % torch.__version__, flush=True)
+torch.set_num_threads(8)
+def seq(n):
+    return ((torch.arange(n,dtype=torch.int64)%251).double())*0.001-0.12
+mp1=seq(8*64*8192).reshape(8,64,8192)
+ap2=seq(8*64*64*64).reshape(8,64,64,64)
+c3x=seq(2*32*8*16*16).reshape(2,32,8,16,16)
+c3w=seq(32*32*3*3*3).reshape(32,32,3,3,3)
+mp3=seq(2*32*16*32*32).reshape(2,32,16,32,32)
+def run(base, fn):
+    # leaf built OUTSIDE the timed region, matching the FrankenTorch side
+    x=base.detach().clone().requires_grad_(True)
+    s=time.perf_counter()
+    fn(x).sum().backward()
+    return (time.perf_counter()-s)*1e3, x.grad.sum().item()
+def t(base, fn, n=7):
+    for _ in range(4): run(base, fn)
+    ts=[]
+    for _ in range(n):
+        ms,g = run(base, fn); ts.append(ms)
+    return min(ts), g
+for name, base, fn in [
+    ("max_pool1d", mp1, lambda x: Fn.max_pool1d(x,2,2)),
+    ("avg_pool2d", ap2, lambda x: Fn.avg_pool2d(x,(2,2),(2,2))),
+    ("conv3d",     c3x, lambda x: Fn.conv3d(x,c3w,None,(1,1,1),(1,1,1))),
+    ("max_pool3d", mp3, lambda x: Fn.max_pool3d(x,(2,2,2),(2,2,2))),
+]:
+    ms,g = t(base, fn)
+    print("PT %s %.4f %.12g"%(name, ms, g))
+"#;
+    let mut child = Command::new(&python)
+        .arg("-")
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+    child
+        .stdin
+        .as_mut()
+        .ok_or_else(|| std::io::Error::other("no stdin"))?
+        .write_all(py.as_bytes())?;
+    let out = child.wait_with_output();
+    let pt = out
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).to_string())
+        .unwrap_or_default();
+    assert!(
+        !pt.is_empty(),
+        "the PyTorch arm must run in this same invocation; set PYTORCH_PYTHON to an \
+         interpreter with torch installed. A FrankenTorch-only run cannot carry a \
+         vs-PyTorch claim."
+    );
+    let pt_row = |name: &str| -> Option<(f64, f64)> {
+        pt.lines().find_map(|line| {
+            let mut it = line.strip_prefix("PT ")?.split_whitespace();
+            if it.next()? == name {
+                Some((it.next()?.parse().ok()?, it.next()?.parse().ok()?))
+            } else {
+                None
+            }
+        })
+    };
+
+    // frankentorch-wnku0: hard-fails if the arm did not self-report, so this
+    // harness cannot emit ratios without the version they were measured against.
+    let torch_version = ft_api::harness_provenance::require_reported_version(&pt)?;
+
+    println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "{}",
+        ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
+    );
+    println!(
+        "allocator={}",
+        if cfg!(feature = "fair-alloc") {
+            "mimalloc (--features fair-alloc)"
+        } else {
+            "system (glibc malloc) — re-run with --features fair-alloc before quoting"
+        }
+    );
+    println!("measurement=OP WORK ONLY (forward+backward; leaf built outside the timer on BOTH sides)");
+    println!("reps={REPS}, PyTorch min-of-7 after 4 warmups, torch threads=8\n");
+    println!("lane          FT(ms)    PT(ms)   standing            A/A gate           parity");
+
+    let mut lanes: Vec<(&str, Vec<f64>, f64)> = Vec::new();
+
+    macro_rules! lane {
+        ($name:literal, $values:expr, $shape:expr, $build:expr) => {{
+            let build = $build;
+            let mut warm = 0.0;
+            for _ in 0..3 {
+                warm += timed_op(&$values, $shape, &build).0;
+            }
+            std::hint::black_box(warm);
+            let mut a = Vec::with_capacity(REPS);
+            let mut b = Vec::with_capacity(REPS);
+            let mut checksum = 0.0;
+            for i in 0..REPS {
+                let (t1, c) = timed_op(&$values, $shape, &build);
+                let (t2, _) = timed_op(&$values, $shape, &build);
+                checksum = c;
+                if i % 2 == 0 {
+                    a.push(t1);
+                    b.push(t2);
+                } else {
+                    b.push(t1);
+                    a.push(t2);
+                }
+            }
+            let (nr, nlo, nhi) = median_ratio_ci(&a, &b);
+            let null_pass = nlo <= 1.0 && nhi >= 1.0;
+            let ft_ms = median(a.iter().chain(b.iter()).copied().collect());
+            lanes.push(($name, vec![ft_ms, nr, nlo, nhi, f64::from(u8::from(null_pass))], checksum));
+        }};
+    }
+
+    lane!("max_pool1d", mp1, vec![MP1_N, MP1_C, MP1_L], |s: &mut FrankenTorchSession, x| s
+        .functional_max_pool1d(x, 2, 2)
+        .expect("max_pool1d"));
+    lane!("avg_pool2d", ap2, vec![AP2_N, AP2_C, AP2_H, AP2_W], |s: &mut FrankenTorchSession, x| s
+        .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+        .expect("avg_pool2d"));
+    lane!("max_pool3d", mp3, vec![MP3_N, MP3_C, MP3_D, MP3_H, MP3_W], |s: &mut FrankenTorchSession, x| s
+        .functional_max_pool3d(x, (2, 2, 2), (2, 2, 2))
+        .expect("max_pool3d"));
+
+    // conv3d needs a second leaf, so it does not fit the single-input macro.
+    {
+        let build_conv = |session: &mut FrankenTorchSession, x: ft_autograd::TensorNodeId| {
+            let w = session
+                .tensor_variable(c3w.clone(), vec![C3_CO, C3_CI, C3_K, C3_K, C3_K], false)
+                .expect("weight");
+            session
+                .functional_conv3d(x, w, None, (1, 1, 1), (1, 1, 1))
+                .expect("conv3d")
+        };
+        let shape = vec![C3_N, C3_CI, C3_D, C3_H, C3_W];
+        for _ in 0..3 {
+            std::hint::black_box(timed_op(&c3x, shape.clone(), build_conv).0);
+        }
+        let mut a = Vec::with_capacity(REPS);
+        let mut b = Vec::with_capacity(REPS);
+        let mut checksum = 0.0;
+        for i in 0..REPS {
+            let (t1, c) = timed_op(&c3x, shape.clone(), build_conv);
+            let (t2, _) = timed_op(&c3x, shape.clone(), build_conv);
+            checksum = c;
+            if i % 2 == 0 {
+                a.push(t1);
+                b.push(t2);
+            } else {
+                b.push(t1);
+                a.push(t2);
+            }
+        }
+        let (nr, nlo, nhi) = median_ratio_ci(&a, &b);
+        let null_pass = nlo <= 1.0 && nhi >= 1.0;
+        let ft_ms = median(a.iter().chain(b.iter()).copied().collect());
+        lanes.push((
+            "conv3d",
+            vec![ft_ms, nr, nlo, nhi, f64::from(u8::from(null_pass))],
+            checksum,
+        ));
+    }
+
+    for (name, stats, checksum) in &lanes {
+        let (ft_ms, nr, nlo, nhi, null_pass) =
+            (stats[0], stats[1], stats[2], stats[3], stats[4] != 0.0);
+        let Some((pt_ms, pt_grad)) = pt_row(name) else {
+            println!("  {name:<12} {ft_ms:8.3}       --   PyTorch row missing");
+            continue;
+        };
+        let ratio = pt_ms / ft_ms;
+        let standing = if ratio >= 1.0 {
+            format!("FT {ratio:.2}x FASTER")
+        } else {
+            format!("FT {:.2}x SLOWER", 1.0 / ratio)
+        };
+        // Gradient-sum agreement: the two sides must be computing the same thing.
+        let tolerance = 1e-6 * pt_grad.abs().max(1.0);
+        let parity = if (checksum - pt_grad).abs() <= tolerance {
+            "match"
+        } else {
+            "MISMATCH"
+        };
+        println!(
+            "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} {} [{nlo:.3},{nhi:.3}] {:<5} {parity}",
+            if null_pass { "PASS" } else { "FAIL" },
+            format!("{nr:.3}"),
+        );
+    }
+    println!(
+        "\nQuote a lane only if its A/A gate PASSed and parity is `match`. Op-work ratios are NOT\n\
+         comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild."
+    );
+    Ok(())
+}

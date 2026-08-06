@@ -1,5 +1,167 @@
 # FrankenTorch Negative-Evidence Ledger
 
+## STANDING RULE FOR EVERY LEVER: SPLIT THE PHASE BEFORE YOU CHOOSE THE LEVER
+
+**Do not pick an optimization target by reading the source. Split the work into
+phases, measure each, and aim at the largest one.** This is the single most
+transferable finding in this ledger, and it is at the top because every entry
+below inherits it.
+
+It is stated as a rule because it has now been paid for three times in one
+lineage, each time by a target that looked obvious in the code and turned out to
+be the *smaller half*:
+
+| the obvious target | what a phase split actually found | bead |
+|---|---|---|
+| "the `avg_pool1d` pooling kernel is slow" | the pooling forward was **10–14%** of the step | `ujw3g` |
+| "then it's leaf materialisation, 57% of the step" | that phase was **100% the caller's buffer copy and 0% FrankenTorch** — `tensor_variable` costs 5 µs | `ujw3g` |
+| "then it's the `max_pool3d` backward scatter loop" | the scatter is **16%** of the backward; 84% is materialising the dense gradient | `87sz8` |
+
+Each of those was a plausible reading of real code. Each would have produced a
+correct, well-tested, carefully-benchmarked change to something that was not the
+problem. The third one was explicitly labelled "inferred from source, not
+profiled" when it was written down — and profiling still refuted it. **A labelled
+guess is still a guess.**
+
+Practical form of the rule:
+
+1. **Split first.** Forward vs backward; kernel vs tape; allocation vs compute;
+   callee vs caller. One probe that attributes time to phases is worth more than
+   any amount of code reading.
+2. **Bound the phase you intend to attack.** Measure its floor — what the phase
+   costs if its logic were free. If the floor is already above your target, the
+   lever is dead before you write it, and you have saved the whole implementation.
+   (`87sz8`: a free scatter still left the backward at ~2x PyTorch's entire op.)
+3. **A floor is a floor for the implementation you measured**, not a proven
+   optimum. Say which. `zoqws` records ~6.3 GB/s as the floor for *a* dense-write
+   pattern, not as an inherent limit — establishing the true achievable number is
+   the first step of that bead, before any kernel is touched.
+4. **Attribution beats intuition even when intuition is expert.** The prior in
+   this repo that "avg/max pool are bandwidth-bound, <2x" was reasonable and
+   wrong for 3-D shapes; a gate calibrated on 2-D feature maps stranded
+   `max_pool3d` at half its threshold and ran it single-threaded.
+
+Corollary for measurement hygiene, learned the same way: **a ratio is only as
+good as the arm beside it.** Do not compare ratios across runs — in this lineage
+an *untouched* lane's PyTorch arm moved 1.833 → 1.155 ms between two runs, making
+its ratio look 40% worse for free. Quote same-invocation pairings, and make A/A
+null gates balanced (an odd rep count with parity-assigned arms leaks position
+bias straight into the null; see `svabf`).
+
+Two further corollaries, both established by the 36-run two-oracle re-bank below
+(`lane-sweep-reps16`):
+
+- **A DELTA WHOSE INCUMBENT ARM MOVED IS NOT A WIN.** If the incumbent's
+  version, build, or measured time changed between two runs, the difference
+  between those runs is not attributable to our code and quoting it as a speedup
+  is proof-class inflation. This is the general rule; the two below are the
+  specific ways this campaign has been caught by it.
+- **The incumbent's *version* is part of the arm, and belongs in provenance.**
+  On one unchanged ELF, `max_pool1d` reads 2.43x against torch 2.12.1 and 1.29x
+  against torch 2.13.0, because PyTorch itself got 1.93x slower on that op. Our
+  arm moved <3%. Upgrading the oracle would have "won" 1.9x on two lanes with no
+  code change — a free win available to anyone who re-runs after
+  `pip install -U torch` and quotes the delta, and nothing in the old provenance
+  block could have caught it. As of `wnku0` the three live-torch
+  provenance-emitting harnesses make this structural rather than advisory: the
+  PyTorch arm self-reports `PT_TORCH_VERSION` in the same invocation, and
+  `ft_api::harness_provenance::require_reported_version` **hard-fails the run**
+  if it did not, so a harness cannot emit ratios without the version they were
+  measured against.
+- **A passing A/A null gate does not certify a quiet host, and gets *easier* to
+  pass as the host gets noisier.** The null is FT-vs-FT, so any disturbance that
+  scales both arms cancels; what contention does is *widen* the CI, and a wider
+  CI brackets 1.0 more easily. A run whose ratio was 3.8x its own median passed
+  its gate on a CI 78% wider than the clean run's. Read CI **width**, not just
+  bracketing, as the quiet-host signal — and never read an A/A PASS as saying
+  anything about the PyTorch arm, which is not in the null.
+- **"Same invocation" is not the same as "interleaved", and repetition — not the
+  preflight — is what makes a non-interleaved harness usable.** A harness that
+  runs its whole incumbent arm before its whole candidate arm samples the two
+  tens of seconds apart, so any load shift in that gap lands entirely and
+  undetectably in the ratio. A contention preflight cannot catch it: it certifies
+  only that nothing heavy sat on the placement CPUs *at the instant sampling
+  began*, and is blind to a peer job starting one second later and to page-cache
+  and thermal history entirely. State the arm ordering in provenance, take
+  medians over 10+ runs, quote ranges — and prefer interleaving the arms per
+  repetition, which removes the defect instead of averaging it down.
+
+## 2026-08-06 - CERTIFIED: four gauntlet loss lanes re-banked at REPS=16, 36 runs, two oracles
+
+Agent `BeigeSummit`. The circulating loss-lane digits (`max_pool3d` 7.31x,
+`avg_pool2d` 6.00x, `conv3d` 3.49x, `max_pool1d` 2.24x) were each a **single run
+at `REPS=15`** — the rep count `svabf` proved position-biased — with **no ELF
+recorded**. Re-banked as a fresh set on the fixed harness; not differenced
+against the old digits.
+
+`crates/ft-api/examples/gauntlet_lane_sweep_h2h.rs`, `REPS=16`,
+`executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c`
+(self-reported from inside the process, identical across all 36 runs), mimalloc
+`--features fair-alloc`, op work only (leaf outside the timer on both sides), 64
+cores, governor `performance`, PyTorch live in the same invocation at 8 threads.
+Full artifact and raw logs: `artifacts/perf/frankentorch-lane-sweep-reps16/`.
+
+**Banked set — oracle torch 2.12.1 (the repo's standing oracle), 18 runs, median
+[range]:**
+
+- `max_pool3d` FT 5.309 ms vs PT 0.718 ms = **7.45x SLOWER** [5.85–8.53], spread 1.46x
+- `avg_pool2d` FT 8.011 ms vs PT 1.149 ms = **6.87x SLOWER** [3.09–8.07], spread 2.61x
+- `conv3d` FT 21.049 ms vs PT 5.530 ms = **3.77x SLOWER** [3.19–4.42], spread 1.39x
+- `max_pool1d` FT 17.413 ms vs PT 6.976 ms = **2.43x SLOWER** [1.14–3.18], spread 2.79x
+
+Gradient parity 36/36 `match`. A/A gates 70/72 PASS (both FAILs under load
+average 47–68). `max_pool3d` is still the largest confirmed loss in the tree;
+it and `conv3d` are the only two *decidable* lanes.
+
+**All four prior digits reproduce inside the fresh range.** The REPS-15 bias and
+missing ELF made them uncertifiable, not wrong. They are now certified.
+
+**Finding — two lanes move with the PyTorch version, not with our code.** Same
+ELF against torch 2.13.0: `max_pool1d` 1.29x (was 2.43x) and `avg_pool2d` 4.21x
+(was 6.87x), because PyTorch 2.13.0 is 1.93x and 1.82x *slower* than 2.12.1 on
+those ops here. FT's own medians moved <3% across the two oracles.
+`max_pool3d` (7.45→7.78x) and `conv3d` (3.77→3.89x) are version-robust.
+
+**Finding — the A/A null gate is anti-conservative under contention.** One run
+read `max_pool3d` at 29.22x (FT spiked to 19.186 ms, PT normal at 0.657 ms) and
+its gate **PASSED** on CI `[0.528,1.359]` — 78% wider than the clean run's
+`[0.798,1.266]`. Noise widens the null, and a wider null brackets 1.0 more
+easily. Both observations are promoted to the ledger header.
+
+**Standing caveat on the ranges — they were collected UNDER CONTENTION.** All 36
+runs shared the host with a live agent swarm; a neighbouring project's oracle
+cycled between idle and 4000–6900% CPU and load average moved between 6 and 69.
+So each range is an **upper bound on this code's variability, not an estimate of
+it** — part of every spread is the host, and it is not separable after the fact.
+The medians are the robust part; that is what 18 repetitions buy. A later run
+landing outside a range is therefore expected rather than anomalous, and one
+already has: the `wnku0` probe on the quietest window of the session (load ~6)
+read `avg_pool2d` at **2.79x**, below the banked 3.09–8.07x. One run is not a
+measurement and does not refute the bank — but it broke out *downward, on a quiet
+host*, exactly as a contention-widened range predicts, so `avg_pool2d`'s true
+floor is below 3.09x. Re-measure the two wide lanes on a quiet host before
+scoping a lever off them.
+
+**Standing caveat on this harness — the arms are NOT interleaved.** The whole
+PyTorch arm completes before the first FT lane starts
+(`gauntlet_lane_sweep_h2h.rs:196` vs `:264`), so the two arms are sampled tens of
+seconds apart and any load shift in that gap lands entirely in the ratio. **What
+makes this set usable is 18 repetitions and a median, not the contention
+preflight** — a preflight certifies only the instant sampling began and is blind
+to a peer job starting a second later, and to page-cache and thermal history.
+That was live here: a neighbouring project's oracle cycled between idle and
+4000–6900% CPU across these runs, load average 6 to 69. The residual risk is
+unquantified; repetition averages it down but nothing bounds it. Interleaving the
+arms per repetition would remove the defect outright and is the highest-value
+change available to this harness.
+
+**Decision.** Quote the medians with ranges and the torch version. Do not quote
+a single run of this harness — 10+ runs and a median is the minimum. The gate
+defect and the arm-ordering defect are both recorded as observed defect classes,
+deliberately **not** fixed in this change, so that this artifact's ELF remains
+the one that produced these numbers; each edit needs its own before/after
+integrity check.
+
 ## 2026-07-09 - REJECTED: cross_entropy f64 backward logsumexp sidecar (ft-api/ft-kernel-cpu) - 0.972x vs ORIG same-worker
 
 Agent `BlackThrush`. Negative-evidence pass ruled out the current Conv2d/Conv1d direct no-panel

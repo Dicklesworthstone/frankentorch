@@ -38,7 +38,10 @@ const STRIDE: usize = 2;
 /// known-value sanity check on the measurement environment.
 const ANCHOR: usize = 4000;
 
-const REPS: usize = 21;
+/// MUST BE EVEN (`frankentorch-svabf`): the A/A arms are assigned by iteration
+/// parity, so an odd count gives one arm the first-call position once more than
+/// the other and leaks that position's bias into the null ratio.
+const REPS: usize = 20;
 const BOOTSTRAP_REPS: usize = 2_000;
 
 thread_local! {
@@ -190,6 +193,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let py = r#"
 import time, torch
 import torch.nn.functional as Fn
+# frankentorch-wnku0: the arm self-reports its version, in this same invocation,
+# BEFORE any timing — so a run that dies mid-measurement still leaves provenance.
+print('PT_TORCH_VERSION %s' % torch.__version__, flush=True)
 torch.set_num_threads(8)
 N,C,L,K,S,A=8,64,8192,2,2,4000
 base=((torch.arange(N*C*L,dtype=torch.int64)%251).double())*0.001-0.12
@@ -322,7 +328,15 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
         "system (glibc malloc) — INFLATES the FrankenTorch arm, re-run with --features fair-alloc"
     };
 
+    // frankentorch-wnku0: hard-fails if the arm did not self-report, so this
+    // harness cannot emit ratios without the version they were measured against.
+    let torch_version = ft_api::harness_provenance::require_reported_version(&pt)?;
+
     println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "{}",
+        ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)
+    );
     println!("allocator={allocator}");
     println!(
         "workload=avg_pool1d_grad_sum_loss [{N},{C},{L}] f64 kernel={KERNEL} stride={STRIDE} reps={REPS}"

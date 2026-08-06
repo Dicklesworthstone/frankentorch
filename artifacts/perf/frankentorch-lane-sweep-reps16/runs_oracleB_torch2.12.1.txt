@@ -1,0 +1,126 @@
+########## CANON RUN 1 ##########
+pre_top=3400 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.847   14.694   FT 1.21x SLOWER     PASS [0.557,4.565] 1.248 match
+  avg_pool2d      7.394    1.381   FT 5.35x SLOWER     PASS [0.793,1.021] 0.919 match
+  max_pool3d      4.868    0.826   FT 5.90x SLOWER     PASS [0.896,1.220] 0.998 match
+  conv3d         21.122    5.028   FT 4.20x SLOWER     PASS [0.373,1.178] 0.932 match
+########## CANON RUN 2 ##########
+pre_top=1691 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     16.804    5.292   FT 3.18x SLOWER     PASS [0.206,1.091] 0.976 match
+  avg_pool2d      7.538    1.095   FT 6.88x SLOWER     PASS [0.780,1.210] 1.063 match
+  max_pool3d      5.446    0.646   FT 8.42x SLOWER     PASS [0.464,1.086] 0.976 match
+  conv3d         21.741    5.122   FT 4.24x SLOWER     PASS [0.902,3.170] 0.991 match
+########## CANON RUN 3 ##########
+pre_top=2566 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.564    5.861   FT 3.00x SLOWER     PASS [0.910,1.129] 0.998 match
+  avg_pool2d      7.582    1.106   FT 6.86x SLOWER     PASS [0.795,1.214] 1.097 match
+  max_pool3d      5.349    0.658   FT 8.13x SLOWER     PASS [0.874,1.318] 1.098 match
+  conv3d         20.655    5.321   FT 3.88x SLOWER     PASS [0.971,1.207] 1.086 match
+########## CANON RUN 4 ##########
+pre_top=3466 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.204    7.232   FT 2.38x SLOWER     PASS [0.945,1.287] 1.054 match
+  avg_pool2d      7.857    1.131   FT 6.95x SLOWER     PASS [0.837,1.170] 0.973 match
+  max_pool3d      6.012    0.716   FT 8.39x SLOWER     PASS [0.714,1.156] 0.977 match
+  conv3d         21.125    5.582   FT 3.78x SLOWER     PASS [0.866,1.380] 0.990 match
+########## CANON RUN 5 ##########
+pre_top=2637 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.171    6.285   FT 2.73x SLOWER     PASS [0.959,1.083] 1.031 match
+  avg_pool2d      8.240    1.021   FT 8.07x SLOWER     PASS [0.677,1.228] 0.947 match
+  max_pool3d      5.480    0.654   FT 8.38x SLOWER     PASS [0.421,1.162] 0.888 match
+  conv3d         20.439    5.463   FT 3.74x SLOWER     PASS [0.797,1.134] 1.029 match
+########## CANON RUN 6 ##########
+pre_top= 939 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.872    6.436   FT 2.78x SLOWER     PASS [0.240,1.142] 0.986 match
+  avg_pool2d      8.097    1.034   FT 7.83x SLOWER     PASS [0.861,1.330] 1.094 match
+  max_pool3d      5.176    0.631   FT 8.21x SLOWER     PASS [0.793,1.237] 1.027 match
+  conv3d         20.718    5.652   FT 3.67x SLOWER     PASS [0.841,1.333] 1.014 match
+########## CANON RUN 7 ##########
+pre_top=1685 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.875    5.728   FT 3.12x SLOWER     PASS [0.219,1.159] 0.973 match
+  avg_pool2d      7.852    2.098   FT 3.74x SLOWER     PASS [0.846,9.654] 1.095 match
+  max_pool3d      5.269    0.662   FT 7.96x SLOWER     PASS [0.863,1.303] 1.072 match
+  conv3d         20.552    5.459   FT 3.76x SLOWER     PASS [0.239,1.035] 0.460 match
+########## CANON RUN 8 ##########
+pre_top=3178 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.144    6.291   FT 2.73x SLOWER     PASS [0.212,4.422] 0.993 match
+  avg_pool2d      8.384    1.162   FT 7.21x SLOWER     PASS [0.900,1.530] 1.190 match
+  max_pool3d      4.885    0.835   FT 5.85x SLOWER     PASS [0.770,1.083] 0.973 match
+  conv3d         20.874    5.727   FT 3.64x SLOWER     PASS [0.941,1.749] 1.015 match
+########## CANON RUN 9 ##########
+pre_top=2644 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     16.835   14.818   FT 1.14x SLOWER     PASS [0.196,1.080] 0.949 match
+  avg_pool2d      7.781    1.804   FT 4.31x SLOWER     PASS [0.918,1.137] 1.013 match
+  max_pool3d      5.447    0.843   FT 6.46x SLOWER     PASS [0.998,1.441] 1.231 match
+  conv3d         21.151    5.798   FT 3.65x SLOWER     PASS [0.457,1.407] 0.996 match
+########## CANON RUN 10 ##########
+pre_top=3408 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.922    5.702   FT 3.14x SLOWER     PASS [0.884,4.921] 1.059 match
+  avg_pool2d      8.272    1.119   FT 7.39x SLOWER     PASS [0.759,1.063] 0.893 match
+  max_pool3d      5.369    0.643   FT 8.35x SLOWER     PASS [0.702,1.164] 0.955 match
+  conv3d         22.063    5.885   FT 3.75x SLOWER     PASS [0.879,1.175] 1.042 match
+########## CANON RUN 11 ##########
+pre_top=3410 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.123   13.931   FT 1.23x SLOWER     PASS [0.942,4.581] 1.064 match
+  avg_pool2d      8.038    1.097   FT 7.33x SLOWER     PASS [0.841,1.468] 0.958 match
+  max_pool3d      5.114    0.832   FT 6.15x SLOWER     PASS [0.880,1.221] 1.010 match
+  conv3d         21.085    5.567   FT 3.79x SLOWER     PASS [0.668,1.133] 1.066 match
+########## CANON RUN 12 ##########
+pre_top= 871 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.469   11.648   FT 1.50x SLOWER     PASS [0.892,1.087] 0.942 match
+  avg_pool2d      7.984    2.581   FT 3.09x SLOWER     PASS [0.840,1.118] 0.942 match
+  max_pool3d      5.499    0.644   FT 8.53x SLOWER     PASS [0.770,1.093] 0.983 match
+  conv3d         21.012    5.587   FT 3.76x SLOWER     PASS [0.771,1.140] 0.959 match
+########## CANON RUN 13 ##########
+pre_top=2650 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.407   11.125   FT 1.56x SLOWER     PASS [0.877,2.855] 1.108 match
+  avg_pool2d      8.725    1.116   FT 7.82x SLOWER     PASS [0.865,1.183] 0.987 match
+  max_pool3d      5.080    0.847   FT 6.00x SLOWER     FAIL [0.707,0.955] 0.880 match
+  conv3d         20.811    5.088   FT 4.09x SLOWER     PASS [0.287,3.131] 1.017 match
+########## CANON RUN 14 ##########
+pre_top=2921 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.614    9.852   FT 1.79x SLOWER     PASS [0.214,1.209] 1.005 match
+  avg_pool2d      8.354    1.257   FT 6.64x SLOWER     PASS [0.772,1.242] 0.911 match
+  max_pool3d      5.045    0.828   FT 6.09x SLOWER     PASS [0.859,1.284] 0.975 match
+  conv3d         21.152    4.785   FT 4.42x SLOWER     PASS [0.966,3.244] 1.236 match
+########## CANON RUN 15 ##########
+pre_top=3791 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.057    5.482   FT 3.11x SLOWER     PASS [0.203,1.141] 0.995 match
+  avg_pool2d      7.983    1.308   FT 6.10x SLOWER     PASS [0.842,1.097] 0.934 match
+  max_pool3d      5.635    0.812   FT 6.94x SLOWER     PASS [0.841,1.286] 1.049 match
+  conv3d         22.175    5.494   FT 4.04x SLOWER     PASS [0.281,1.076] 1.024 match
+########## CANON RUN 16 ##########
+pre_top=2721 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     18.206   14.354   FT 1.27x SLOWER     PASS [0.224,1.036] 0.895 match
+  avg_pool2d      8.292    1.816   FT 4.57x SLOWER     PASS [0.739,1.237] 1.049 match
+  max_pool3d      5.952    0.700   FT 8.51x SLOWER     PASS [0.742,1.222] 0.960 match
+  conv3d         20.860    6.537   FT 3.19x SLOWER     PASS [0.886,1.115] 0.958 match
+########## CANON RUN 17 ##########
+pre_top=1621 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     16.499    6.879   FT 2.40x SLOWER     PASS [0.945,2.968] 1.033 match
+  avg_pool2d      7.693    2.042   FT 3.77x SLOWER     PASS [0.859,1.278] 1.069 match
+  max_pool3d      4.922    0.720   FT 6.83x SLOWER     PASS [0.886,1.247] 1.039 match
+  conv3d         20.968    5.229   FT 4.01x SLOWER     FAIL [1.011,4.453] 1.239 match
+########## CANON RUN 18 ##########
+pre_top=1730 python3
+executing_elf_sha256=7286dcfc85bc6c77caff8b434be4429f05a4261e75fd011f1b0dc70d54fb982c
+  max_pool1d     17.418    7.072   FT 2.46x SLOWER     PASS [0.925,4.585] 1.049 match
+  avg_pool2d      8.149    1.136   FT 7.18x SLOWER     PASS [0.850,1.149] 0.941 match
+  max_pool3d      4.830    0.759   FT 6.36x SLOWER     PASS [0.861,1.078] 0.916 match
+  conv3d         22.848    6.538   FT 3.49x SLOWER     PASS [0.650,1.090] 0.993 match

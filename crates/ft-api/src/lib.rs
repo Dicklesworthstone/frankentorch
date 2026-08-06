@@ -25,6 +25,12 @@
     clippy::wildcard_in_or_patterns
 )]
 
+/// Provenance helpers for the head-to-head harnesses (`frankentorch-wnku0`).
+/// Not part of the tensor API surface; lives here so the examples that carry
+/// campaign claims cannot drift into three different provenance formats.
+#[doc(hidden)]
+pub mod harness_provenance;
+
 use std::collections::BTreeMap;
 use std::sync::Arc;
 

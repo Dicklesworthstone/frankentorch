@@ -115,6 +115,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let py = r#"
 import time, torch
 import torch.nn.functional as Fn
+# frankentorch-wnku0: the arm self-reports its version, in this same invocation,
+# BEFORE any timing — so a run that dies mid-measurement still leaves provenance.
+print('PT_TORCH_VERSION %s' % torch.__version__, flush=True)
 torch.set_num_threads(8)
 N,CH,H,W,G,R=16,256,64,64,32,4000
 x=((torch.arange(N*CH*H*W,dtype=torch.int64)%9973).float()-4986.0).reshape(N,CH,H,W)
@@ -278,9 +281,13 @@ print("PT group_norm_probe",*("%.9g"%y.flatten()[i].item() for i in indices))
     } else {
         "REJECT"
     };
+    // frankentorch-wnku0: hard-fails if the arm did not self-report, so this
+    // harness cannot emit ratios without the version they were measured against.
+    let torch_version = ft_api::harness_provenance::require_reported_version(&pt)?;
     let kernel_report = format!(
-        "executing_elf_sha256={}\nworkload=group_norm_f32_no_affine [16,256,64,64] groups=32 reps={REPS}\na_a_median_ratio={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] gate={}\nscalar_ms={:.4} simd_ms={:.4} scalar_over_simd={speedup:.4} ci95=[{speedup_low:.4},{speedup_high:.4}] decision={decision}\nborrow_a_a_median_ratio={borrow_null_ratio:.4} ci95=[{borrow_null_low:.4},{borrow_null_high:.4}] gate={}\nmaterialized_ms={:.4} borrowed_ms={:.4} materialized_over_borrowed={borrow_speedup:.4} ci95=[{borrow_speedup_low:.4},{borrow_speedup_high:.4}] decision={borrow_decision}\n",
+        "executing_elf_sha256={}\n{}\nworkload=group_norm_f32_no_affine [16,256,64,64] groups=32 reps={REPS}\na_a_median_ratio={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] gate={}\nscalar_ms={:.4} simd_ms={:.4} scalar_over_simd={speedup:.4} ci95=[{speedup_low:.4},{speedup_high:.4}] decision={decision}\nborrow_a_a_median_ratio={borrow_null_ratio:.4} ci95=[{borrow_null_low:.4},{borrow_null_high:.4}] gate={}\nmaterialized_ms={:.4} borrowed_ms={:.4} materialized_over_borrowed={borrow_speedup:.4} ci95=[{borrow_speedup_low:.4},{borrow_speedup_high:.4}] decision={borrow_decision}\n",
         executable_sha256(),
+        ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8),
         if null_pass { "PASS" } else { "FAIL" },
         median(old.clone()),
         median(new.clone()),

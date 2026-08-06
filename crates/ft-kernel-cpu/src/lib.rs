@@ -2516,6 +2516,28 @@ pub fn expand_row_structured<T: Copy + Send + Sync>(
 // 3.2M reads = 1.36-2.63x FAST). Gate on `out.len() * kh * kw >= this`.
 const POOL_FWD_PARALLEL_MIN: usize = 1 << 21; // ~2.1M input reads
 
+// ...but TOTAL reads alone mis-gates shapes with FEW, LARGE planes. The crossover
+// above was calibrated on 2-D CNN feature maps, where a plane is tiny and
+// cache-resident (ResNet 512ch x 28x28 pools 784 reads per plane), so fork/join
+// dominates. A 3-D pool has the opposite profile: `max_pool3d [2,32,16,32,32]`
+// is 64 planes of 16384 reads each — 21x more work per rayon task — and lands at
+// 1_048_576 total reads, exactly HALF the gate, so it ran single-threaded.
+// Measured (frankentorch-87sz8, examples/pool_kernel_vs_tape_probe): that shape
+// takes 2.136 ms serial, while DOUBLE the data crosses the gate and takes
+// 0.946 ms parallel — twice the work in 0.44x the time.
+//
+// So parallelise when EITHER the total-reads gate passes OR there is enough work
+// per plane to amortise a rayon task. The second clause can only ADD parallelism,
+// and by construction it cannot reach the small-plane shapes the gate above
+// protects: at 784 reads per plane they fail it by 5x.
+const POOL_FWD_PARALLEL_PER_PLANE_MIN: usize = 1 << 12; // 4096 input reads per plane
+
+#[inline]
+fn pool_fwd_should_parallelize(total_reads: usize, planes: usize) -> bool {
+    total_reads >= POOL_FWD_PARALLEL_MIN
+        || (planes >= 2 && total_reads / planes >= POOL_FWD_PARALLEL_PER_PLANE_MIN)
+}
+
 // The SIMD unary ops (relu/sqrt/reciprocal/...) were SERIAL while the scalar-map
 // unary path (exp/tanh/...) parallelises — so relu was ~36-59x slower than torch
 // at large N purely from single-threading. Parallelise above this gate (cheap
@@ -8216,7 +8238,7 @@ pub fn max_pool3d_forward_f64(
             }
         }
     };
-    if out.len() * kd * kh * kw >= POOL_FWD_PARALLEL_MIN {
+    if pool_fwd_should_parallelize(out.len() * kd * kh * kw, batch * ch) {
         out.par_chunks_mut(od * oh * ow)
             .enumerate()
             .for_each(|(plane, orow)| plane_fn(plane, orow));
@@ -8282,7 +8304,7 @@ pub fn max_pool3d_forward_with_indices_f64(
             }
         }
     };
-    if out.len() * kd * kh * kw >= POOL_FWD_PARALLEL_MIN {
+    if pool_fwd_should_parallelize(out.len() * kd * kh * kw, batch * ch) {
         out.par_chunks_mut(od * oh * ow)
             .zip(arg_offsets.par_chunks_mut(od * oh * ow))
             .enumerate()
@@ -8722,7 +8744,7 @@ pub fn max_pool3d_forward_f32(
             }
         }
     };
-    if out.len() * kd * kh * kw >= POOL_FWD_PARALLEL_MIN {
+    if pool_fwd_should_parallelize(out.len() * kd * kh * kw, batch * ch) {
         out.par_chunks_mut(od * oh * ow)
             .enumerate()
             .for_each(|(plane, orow)| plane_fn(plane, orow));
@@ -8754,6 +8776,20 @@ fn max_pool3d_backward_2x2s2_f64(
     let out_plane_len = od * oh * ow;
     let depth_stride = ih * iw;
     let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-zoqws: `vec![0.0; n]` is `alloc_zeroed`, so at this size it is
+    // fresh `mmap` zero pages that nothing has touched yet. If the parallel pass
+    // below is what first touches them, 64 rayon threads fault the same fresh
+    // mapping simultaneously and contend on the kernel's page-table/mmap locks —
+    // measured at 6.39 GiB/s, and unmoved by chunk size (16 KiB..2 MiB) or store
+    // width (scalar, `fill`, `f64x4`). One thread doing the dumbest possible
+    // `fill` faults the same pages with no contention at 36.70 GiB/s, 5.7x
+    // faster (artifacts/perf/frankentorch-zoqws/).
+    //
+    // So pay the first touch serially here. The scatter below then writes to
+    // already-faulted pages and keeps its parallelism. Writing zeros over
+    // already-zero memory cannot change a single output bit; this is a
+    // page-fault scheduling change, not an arithmetic one.
+    din.fill(0.0);
     din.par_chunks_mut(plane_len)
         .enumerate()
         .for_each(|(plane, drow)| {
@@ -8848,6 +8884,12 @@ pub fn max_pool3d_backward_from_indices_f64(
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
     let mut din = vec![0.0f64; batch * ch * plane_len];
+    // frankentorch-zoqws: serialize the first touch — see the note in
+    // `max_pool3d_backward_2x2s2_f64`. This path is the profiled one
+    // (`87sz8` backward attribution: 84% of the backward is materialising this
+    // dense gradient, at 6.39 GiB/s, against 36.70 GiB/s for a serial fill).
+    // Zeros over already-zero memory cannot change an output bit.
+    din.fill(0.0);
     din.par_chunks_mut(plane_len)
         .enumerate()
         .for_each(|(plane, drow)| {
