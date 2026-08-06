@@ -79,7 +79,26 @@ op            FT(ms)    PT(ms)   verdict
 
 **Ceiling = 1.15x**, CI lower bound 1.1006 so it clears 1.0 and is a real,
 resolvable effect — but a modest one. Landing it perfectly would move this lane
-from 1.74x slower to roughly 1.51x slower. It does **not** close the gap.
+from 1.74x slower to roughly 1.51x slower *on this run's pairing*. It does **not**
+close the gap. (Do not confuse that projected 1.51x with the separately *measured*
+1.51x of the later `bf81cc37…` run — they coincide by accident.)
+
+### All three runs, so nobody quotes one as if it were precise
+
+Every row below pairs FT with the PyTorch arm measured **in the same invocation**:
+
+| ELF | FT (ms) | PT (ms) | ratio |
+|---|---|---|---|
+| `6bbcb383…` | 33.601 | 17.142 | 1.96x slower |
+| `afead5e1…` | 30.575 | 17.586 | 1.74x slower |
+| `bf81cc37…` | 31.211 | 20.647 | 1.51x slower |
+
+The FrankenTorch arm is stable (30.6–33.6 ms); the **PyTorch arm carries almost
+all the spread** (17.1–20.6 ms). So the honest statement of this row is
+**"roughly 1.5x–2.0x slower"**, and any single-run figure quoted to three
+significant figures is overstating what was measured. The phase split and the
+fused-vs-compose ratio are both internal FT-vs-FT comparisons and are
+correspondingly tighter.
 
 This also corrects an inference I had drawn from the gauntlet's two FT arms
 (`kgs4_122` 8.08 ms vs `kgs4_134_fused_sum_loss` 7.44 ms, CIs overlapping): those
@@ -101,7 +120,8 @@ Same harness, same invocation, under `--features fair-alloc`
 ```
 phase_split materialise=18.232ms (57%) forward=3.176ms (10%) backward=10.747ms (33%) total=32.155ms
 compose_ms=31.2110 fused_ms=28.6522 compose_over_fused=1.0893 ci95=[1.0414,1.1369]
-avg_pool1d  FT 31.211 ms  PT 17.586 ms
+cat_anchor  10.468   43.698   FT 4.17x FASTER
+avg_pool1d  31.211   20.647   FT 1.51x SLOWER
 ```
 
 | phase | ms | share |
@@ -110,10 +130,22 @@ avg_pool1d  FT 31.211 ms  PT 17.586 ms
 | pooling forward + sum | 3.176 | 10% |
 | backward + gradient read | 10.747 | 33% |
 
-**FrankenTorch spends longer materialising the input (18.232 ms) than PyTorch
-spends on the entire train step (17.586 ms).** That single comparison is the whole
-story of this row: even a *free* pool forward and a *free* backward would leave
-FrankenTorch behind on this workload.
+**FrankenTorch's input materialisation alone (18.232 ms) is 88% of PyTorch's
+entire train step (20.647 ms).** Even a *free* pool forward and a *free* backward
+would leave this lane at roughly parity at best, not ahead.
+
+> **CORRECTION.** An earlier revision of this section paired this run's FT number
+> with the **previous run's** PyTorch number (17.586 ms, from ELF `afead5e1…`) and
+> claimed materialisation exceeded PyTorch's whole step. It does not — against its
+> own same-run incumbent (20.647 ms) it is 88% of it. The corrected ratio for this
+> run is **1.51x slower**, not 1.74x. Mixing arms across runs is precisely what
+> this campaign's same-invocation rule exists to prevent, and the conclusion below
+> is restated against the same-run pairing only.
+>
+> Worth noting in its own right: the PyTorch arm moved 17.586 -> 20.647 ms between
+> two runs minutes apart, a 17% spread. That is why a ratio is only quotable
+> against the incumbent measured beside it, and why the per-run pairing matters
+> more than either number alone.
 
 The pooling forward — the thing "avg_pool1d is slow" would lead you to optimize —
 is **10%** of the step. The fused-routing lever targets the backward, so its
