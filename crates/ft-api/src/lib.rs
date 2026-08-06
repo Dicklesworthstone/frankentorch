@@ -368,6 +368,21 @@ struct GroupNormF32SumShortcut {
     eps: f32,
 }
 
+/// Registered on the f64 grad-path output of `functional_avg_pool1d` so that a
+/// following `tensor_sum` can reach the fused scalar-loss backward without the
+/// caller having to know the `functional_avg_pool1d_sum` name
+/// (`frankentorch-o4782`). Mirrors the norm shortcuts above.
+#[derive(Clone, Copy)]
+struct AvgPool1dSumShortcut {
+    input: TensorNodeId,
+    batch: usize,
+    channels: usize,
+    length: usize,
+    kernel_size: usize,
+    output_len: usize,
+    stride: usize,
+}
+
 #[derive(Clone)]
 pub struct FrankenTorchSession {
     tape: Tape,
@@ -389,6 +404,7 @@ pub struct FrankenTorchSession {
     batch_norm1d_sum_shortcuts: BTreeMap<usize, BatchNorm1dSumShortcut>,
     batch_norm2d_f32_sum_shortcuts: BTreeMap<usize, BatchNorm2dF32SumShortcut>,
     group_norm_f32_sum_shortcuts: BTreeMap<usize, GroupNormF32SumShortcut>,
+    avg_pool1d_sum_shortcuts: BTreeMap<usize, AvgPool1dSumShortcut>,
 }
 
 impl std::fmt::Debug for FrankenTorchSession {
@@ -421,6 +437,10 @@ impl std::fmt::Debug for FrankenTorchSession {
             .field(
                 "group_norm_f32_sum_shortcuts",
                 &self.group_norm_f32_sum_shortcuts.len(),
+            )
+            .field(
+                "avg_pool1d_sum_shortcuts",
+                &self.avg_pool1d_sum_shortcuts.len(),
             )
             .finish()
     }
@@ -539,6 +559,7 @@ impl FrankenTorchSession {
             batch_norm1d_sum_shortcuts: BTreeMap::new(),
             batch_norm2d_f32_sum_shortcuts: BTreeMap::new(),
             group_norm_f32_sum_shortcuts: BTreeMap::new(),
+            avg_pool1d_sum_shortcuts: BTreeMap::new(),
         }
     }
 
@@ -588,6 +609,8 @@ impl FrankenTorchSession {
             .retain(|&node_id, _| node_id < boundary);
         self.group_norm_f32_sum_shortcuts
             .retain(|&node_id, _| node_id < boundary);
+        self.avg_pool1d_sum_shortcuts
+            .retain(|&node_id, _| node_id < boundary);
     }
 
     /// Free the entire autograd tape (`truncate_autograd_graph(0)`); invalidates
@@ -598,6 +621,7 @@ impl FrankenTorchSession {
         self.batch_norm1d_sum_shortcuts.clear();
         self.batch_norm2d_f32_sum_shortcuts.clear();
         self.group_norm_f32_sum_shortcuts.clear();
+        self.avg_pool1d_sum_shortcuts.clear();
     }
 
     fn compact_nograd_tensor_since(
@@ -25085,6 +25109,9 @@ impl FrankenTorchSession {
         if let Some(out) = self.try_group_norm_f32_sum_shortcut(input)? {
             return Ok(out);
         }
+        if let Some(out) = self.try_avg_pool1d_sum_shortcut(input)? {
+            return Ok(out);
+        }
         let (out, event) = self.tensor_tape.sum(input, self.mode())?;
         self.record_tensor_reduction_operation(&event);
         Ok(out)
@@ -25202,6 +25229,90 @@ impl FrankenTorchSession {
             format!(
                 "tensor_reduction_op=BatchNorm2dF32SumShortcut input={} source={} out={} channels={} spatial={}",
                 input.0, source.0, out.0, channels, spatial
+            ),
+        );
+        Ok(Some(out))
+    }
+
+    /// Reach the fused `avg_pool1d` scalar-loss backward from the idiomatic
+    /// `tensor_sum(functional_avg_pool1d(x))` (`frankentorch-o4782`).
+    ///
+    /// The forward value is the ordinary sum of the pooled tensor, so it is
+    /// bit-identical to the reduction this replaces. The saving is on the
+    /// backward edge: `avg_pool1d_backward_scalar_f64` distributes the scalar
+    /// upstream directly into the input gradient, instead of materialising a
+    /// dense output-gradient buffer and then distributing that.
+    ///
+    /// Declines whenever the pooled tensor is externally observable — if it
+    /// retains grad or carries hooks, its own gradient must actually be produced,
+    /// so the fused edge would skip a value the caller can see. That decline is
+    /// covered by `avg_pool1d_sum_shortcut_declines_when_pooled_retains_grad`,
+    /// which was mutation-verified: it fails with the check removed.
+    ///
+    /// VERIFICATION LIMIT, recorded deliberately. The map is also invalidated on
+    /// graph truncation, `clear_autograd_graph`, in-place mutation and
+    /// `tensor_detach_`, mirroring the norm shortcuts. Those four are
+    /// defense-in-depth **without a test that has teeth**: candidate probes for
+    /// in-place mutation and for post-truncation node-index aliasing both still
+    /// passed with the corresponding guard removed, so they were deleted rather
+    /// than kept as tautologies. The reason is structural — this consumer
+    /// recomputes the forward sum from whichever tensor currently occupies the
+    /// index, so a stale entry cannot corrupt the forward value, and no
+    /// deterministic route to an observable backward alias was found. Keep the
+    /// invalidations; treat them as unproven, and if you find a probe that does
+    /// discriminate, add it.
+    fn try_avg_pool1d_sum_shortcut(
+        &mut self,
+        input: TensorNodeId,
+    ) -> Result<Option<TensorNodeId>, AutogradError> {
+        let Some(shortcut) = self.avg_pool1d_sum_shortcuts.get(&input.0).copied() else {
+            return Ok(None);
+        };
+        if self.tensor_tape.tensor_retains_grad(input)?
+            || self.tensor_tape.tensor_has_hooks(input)?
+        {
+            return Ok(None);
+        }
+
+        let sum = {
+            let tensor = self.tensor_tape.tensor(input)?;
+            ft_kernel_cpu::sum_tensor_contiguous_f64(tensor.contiguous_values()?, tensor.meta())
+                .map_err(|error| {
+                    AutogradError::Dispatch(ft_dispatch::DispatchError::Kernel(error))
+                })?
+        };
+
+        let AvgPool1dSumShortcut {
+            input: source,
+            batch,
+            channels,
+            length,
+            kernel_size,
+            output_len,
+            stride,
+        } = shortcut;
+        let out = self.tensor_apply_function_f64_borrowed_inputs(
+            &[source],
+            move |_ctx, _ins| Ok((vec![sum], vec![1])),
+            move |_ctx, grad_outputs, _borrowed| {
+                let upstream = grad_outputs[0][0];
+                let din = ft_kernel_cpu::avg_pool1d_backward_scalar_f64(
+                    upstream,
+                    batch,
+                    channels,
+                    length,
+                    kernel_size,
+                    output_len,
+                    stride,
+                );
+                Ok(vec![Some(din)])
+            },
+        )?;
+        self.runtime.ledger_mut().record(
+            EvidenceKind::Dispatch,
+            format!(
+                "tensor_reduction_op=AvgPool1dSumShortcut input={} source={} out={} kernel={kernel_size} stride={stride}",
+                input.0, source.0, out.0
             ),
         );
         Ok(Some(out))
@@ -32411,7 +32522,7 @@ impl FrankenTorchSession {
             // output gradient (no saved input), so the input clone the generic
             // apply_function performs is pure waste on this loss lane (kgs4.122).
             // Bit-exact: the kernel sees identical contiguous values. frankentorch-0w3ns.
-            return self.tensor_apply_function_f64_borrowed_forward(
+            let pooled = self.tensor_apply_function_f64_borrowed_forward(
                 &[input],
                 move |_ctx, ins| {
                     let (iv, _) = ins[0];
@@ -32439,7 +32550,24 @@ impl FrankenTorchSession {
                     );
                     Ok(vec![Some(din)])
                 },
+            )?;
+            // Let a following `tensor_sum` reach the fused scalar-loss backward
+            // without the caller naming `functional_avg_pool1d_sum`
+            // (frankentorch-o4782). Registered only on the grad path: with no
+            // grad there is no backward edge to fuse.
+            self.avg_pool1d_sum_shortcuts.insert(
+                pooled.0,
+                AvgPool1dSumShortcut {
+                    input,
+                    batch: n,
+                    channels: ch,
+                    length: l,
+                    kernel_size,
+                    output_len,
+                    stride,
+                },
             );
+            return Ok(pooled);
         }
 
         // avg_pool1d [N,C,L] is avg_pool2d [N,C,1,L] (height-1 window). Route through
@@ -54700,6 +54828,7 @@ impl FrankenTorchSession {
         self.batch_norm1d_sum_shortcuts.remove(&target.0);
         self.batch_norm2d_f32_sum_shortcuts.remove(&target.0);
         self.group_norm_f32_sum_shortcuts.remove(&target.0);
+        self.avg_pool1d_sum_shortcuts.remove(&target.0);
         let mut summary = format!("tensor_inplace_op={op} target={}", target.0);
         if let Some(extra) = extra {
             summary.push(' ');
@@ -55904,6 +56033,7 @@ impl FrankenTorchSession {
         self.batch_norm1d_sum_shortcuts.remove(&node.0);
         self.batch_norm2d_f32_sum_shortcuts.remove(&node.0);
         self.group_norm_f32_sum_shortcuts.remove(&node.0);
+        self.avg_pool1d_sum_shortcuts.remove(&node.0);
         self.tensor_tape.detach_tensor_in_place(node)
     }
 
@@ -140016,6 +140146,83 @@ mod tests {
                 got.to_bits(),
                 want.to_bits(),
                 "avg_pool1d backward bit mismatch at index {index}"
+            );
+        }
+    }
+
+    /// The `tensor_sum(avg_pool1d(x))` shortcut (`frankentorch-o4782`) must be
+    /// bit-identical to the unfused compose it replaces.
+    ///
+    /// The reference arm defeats the shortcut by retaining grad on the pooled
+    /// tensor, which is the documented decline condition — that is the only way
+    /// to still reach the genuine unfused path from this API now that the
+    /// shortcut is registered.
+    #[test]
+    fn avg_pool1d_sum_shortcut_matches_unfused_compose_bits() {
+        let values: Vec<f64> = (0..2 * 3 * 17)
+            .map(|i| ((i * 43 + 17) % 181) as f64 * 0.015625 - 1.25)
+            .collect();
+
+        let mut unfused = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_unfused = unfused
+            .tensor_variable(values.clone(), vec![2, 3, 17], true)
+            .unwrap();
+        let pooled_unfused = unfused.functional_avg_pool1d(x_unfused, 5, 3).unwrap();
+        unfused.tensor_retain_grad(pooled_unfused).unwrap();
+        let loss_unfused = unfused.tensor_sum(pooled_unfused).unwrap();
+        let out_unfused = unfused.tensor_values(loss_unfused).unwrap();
+        let report_unfused = unfused.tensor_backward(loss_unfused).unwrap();
+        let grad_unfused = unfused
+            .tensor_gradient(&report_unfused, x_unfused)
+            .expect("unfused input grad");
+
+        let mut shortcut = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x_shortcut = shortcut
+            .tensor_variable(values, vec![2, 3, 17], true)
+            .unwrap();
+        let pooled_shortcut = shortcut.functional_avg_pool1d(x_shortcut, 5, 3).unwrap();
+        let loss_shortcut = shortcut.tensor_sum(pooled_shortcut).unwrap();
+        let out_shortcut = shortcut.tensor_values(loss_shortcut).unwrap();
+        let report_shortcut = shortcut.tensor_backward(loss_shortcut).unwrap();
+        let grad_shortcut = shortcut
+            .tensor_gradient(&report_shortcut, x_shortcut)
+            .expect("shortcut input grad");
+
+        assert_eq!(out_shortcut[0].to_bits(), out_unfused[0].to_bits());
+        for (index, (&got, &want)) in grad_shortcut.iter().zip(grad_unfused.iter()).enumerate() {
+            assert_eq!(
+                got.to_bits(),
+                want.to_bits(),
+                "avg_pool1d sum shortcut input grad[{index}]"
+            );
+        }
+    }
+
+    /// NEGATIVE CASE: a shortcut that always fired would skip producing the
+    /// pooled tensor's own gradient, which `retain_grad` makes observable. An
+    /// implementation missing the decline check passes the bit-equality test
+    /// above and fails this one.
+    #[test]
+    fn avg_pool1d_sum_shortcut_declines_when_pooled_retains_grad() {
+        let values: Vec<f64> = (0..2 * 3 * 17)
+            .map(|i| ((i * 43 + 17) % 181) as f64 * 0.015625 - 1.25)
+            .collect();
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session.tensor_variable(values, vec![2, 3, 17], true).unwrap();
+        let pooled = session.functional_avg_pool1d(x, 5, 3).unwrap();
+        session.tensor_retain_grad(pooled).unwrap();
+        let loss = session.tensor_sum(pooled).unwrap();
+        let report = session.tensor_backward(loss).unwrap();
+
+        let pooled_grad = session
+            .tensor_gradient(&report, pooled)
+            .expect("retained pooled grad must be produced, not skipped by the shortcut");
+        assert_eq!(pooled_grad.len(), 2 * 3 * 5);
+        for (index, &value) in pooled_grad.iter().enumerate() {
+            assert!(
+                (value - 1.0).abs() < 1e-12,
+                "d(sum)/d(pooled)[{index}] must be 1, got {value}"
             );
         }
     }
