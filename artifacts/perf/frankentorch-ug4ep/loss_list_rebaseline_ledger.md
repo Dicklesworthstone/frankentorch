@@ -192,3 +192,57 @@ the slow path on any workload that repeatedly allocates large buffers** — the
 gauntlet is only unusual in making that visible. That is a product decision
 about default behaviour, not a kernel optimization, so it is recorded here
 rather than actioned.
+
+## conv2d lane built — and the row is stale too
+
+The missing harness now exists: `gauntlet_conv2d_grad` in
+`crates/ft-api/benches/pytorch_gauntlet_bench.rs` plus
+`benches/pytorch_conv2d_grad.py`. Shape `8x64x32x32` against a `64x64x3x3`
+kernel, stride 1, padding 1, grads on both input and weight, `sum()` loss —
+sized into the same per-iteration band as the conv3d lane so it fits Criterion's
+3 s window.
+
+**Parity verified first, because a timing lane is worthless if the two sides
+compute different things** and the gauntlet groups do not assert that
+themselves. `crates/ft-api/examples/conv2d_gauntlet_parity.rs` reproduces the
+lane's exact workload; it agrees with the PyTorch script to all 12 printed
+digits:
+
+| | FrankenTorch | PyTorch |
+|---|---|---|
+| output shape | `[8, 64, 32, 32]` | `(8, 64, 32, 32)` |
+| loss | `-1.142627639693` | `-1.142627639693` |
+| `x.grad[0]` | `0.591702728516` | `0.591702728516` |
+| `w.grad[0]` | `7.440962005517` | `7.440962005517` |
+
+Result:
+
+| allocator | FrankenTorch | PyTorch | standing |
+|---|---|---|---|
+| default | 23.519 ms | 29.814 ms | **1.27x FASTER** |
+| `fair-alloc` | 24.148 ms | 30.988 ms | **1.28x FASTER** |
+
+`conv2d` listed at "4-6x slower" is **FASTER**, by 1.27x. The call holds at the
+bound that flatters PyTorch most: FT's slowest (23.779) against PyTorch's
+fastest (27.734) is still 1.17x in FrankenTorch's favour.
+
+Note the allocator barely moves this lane (1.27x vs 1.28x), unlike avg_pool1d
+and BatchNorm2d. That is a consistency check on the allocator finding rather than
+a contradiction: conv2d's input here is 4 MB against those lanes' 32 MB, and its
+compute per iteration is far higher, so per-iteration `mmap` churn is a small
+share of the number. The allocator effect appears exactly where the mechanism
+predicts it should.
+
+## Final answer for this bead
+
+| row | listed | true standing |
+|---|---|---|
+| GroupNorm f32 | 19x slower | **2.94x FASTER** |
+| linear hidden 2048 | 10.6-12.3x slower | **2.29x FASTER** |
+| conv2d | 4-6x slower | **1.27x FASTER** |
+| BatchNorm2d f32 grad | 10x slower | 1.21x slower (parity) |
+| `avg_pool1d` grad | 4-7x slower | 1.92x slower |
+
+**Three of the five rows are wins, and neither remaining row is a 2x gap.** The
+loss list as written described a codebase that no longer exists. The single
+largest real vs-PyTorch gap on it is `avg_pool1d` at 1.92x.
