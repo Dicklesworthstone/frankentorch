@@ -26,6 +26,7 @@ use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
+use rayon::prelude::*;
 
 const REPS: usize = 15;
 
@@ -195,6 +196,37 @@ fn main() {
            the time, which is what identified the gate as mis-set. With the per-plane clause in place\n\
            both shapes parallelise, so the ratio here should now sit near 1.0 (2x work, ~2x time per\n\
            unit) rather than below it. A ratio far below 1.0 again would mean a shape is stranded.\n"
+    );
+
+    // ── max_pool3d BACKWARD attribution (frankentorch-87sz8 next target) ────
+    // The backward allocates a dense 8 MiB f64 gradient and scatters only
+    // 131072 values into it — 1 element in 8. Three candidate costs:
+    //   alloc_only        the zeroed 8 MiB allocation itself
+    //   alloc_plus_touch  that allocation plus writing EVERY element once, which
+    //                     is the floor for producing a dense buffer at all
+    //   raw_bwd           the real backward
+    // If raw_bwd ~ alloc_plus_touch the kernel is at its memory floor and the
+    // scatter loop is free; if raw_bwd >> alloc_plus_touch, the loop is the cost.
+    let din_len = M_N * M_C * M_D * M_H * M_W;
+    let bwd_alloc_only = time_it(|| {
+        std::hint::black_box(vec![0.0f64; din_len]);
+    });
+    let bwd_alloc_touch = time_it(|| {
+        let mut v = vec![0.0f64; din_len];
+        v.par_chunks_mut(M_D * M_H * M_W).for_each(|row| {
+            for slot in row.iter_mut() {
+                *slot = 1.0;
+            }
+        });
+        std::hint::black_box(v);
+    });
+    println!(
+        "max_pool3d backward attribution: alloc_only={bwd_alloc_only:.3} ms | alloc+touch_every_element={bwd_alloc_touch:.3} ms | raw_bwd={m_raw_bwd:.3} ms"
+    );
+    println!(
+        "                                 scatter work above the dense-buffer floor = {:.3} ms ({:.0}% of raw_bwd); PyTorch's WHOLE op is 0.660 ms\n",
+        m_raw_bwd - bwd_alloc_touch,
+        100.0 * (m_raw_bwd - bwd_alloc_touch) / m_raw_bwd
     );
 
     println!("lane          kernel-vs-tape attribution (ms)");
