@@ -25611,6 +25611,10 @@ mod tests {
         // input by `padding` with that mode, then convolves with zero internal
         // padding. The module must equal manual functional_pad_mode + functional
         // conv applied to its own weight; and each mode must differ from zeros.
+        // frankentorch-r76bc: the leading `1 *` is the BATCH dim, kept so the extent reads
+        // as the tensor shape. clippy::identity_op is right arithmetically and wrong about
+        // the intent, so it is suppressed here rather than the shape being flattened away.
+        #[allow(clippy::identity_op)]
         let data: Vec<f64> = (0..1 * 2 * 5 * 5)
             .map(|i| (i as f64 * 0.31).sin())
             .collect();
@@ -25674,6 +25678,10 @@ mod tests {
         // torch nn.Conv1d(padding_mode=...) pads L by `padding` with the mode then
         // convolves with zero padding. Module must equal manual pad + functional
         // conv on its own weight, and differ from zeros.
+        // frankentorch-r76bc: the leading `1 *` is the BATCH dim, kept so the extent reads
+        // as the tensor shape. clippy::identity_op is right arithmetically and wrong about
+        // the intent, so it is suppressed here rather than the shape being flattened away.
+        #[allow(clippy::identity_op)]
         let data: Vec<f64> = (0..1 * 2 * 6).map(|i| (i as f64 * 0.4).sin()).collect();
         for (mode, pad_str) in [
             (PaddingMode::Reflect, "reflect"),
@@ -25722,6 +25730,10 @@ mod tests {
     fn conv3d_padding_mode_matches_mode_pad_plus_conv() {
         // torch nn.Conv3d(padding_mode=...) pads D/H/W then convolves with zero
         // padding. Module must equal manual pad + functional conv on its weight.
+        // frankentorch-r76bc: the leading `1 *` is the BATCH dim, kept so the extent reads
+        // as the tensor shape. clippy::identity_op is right arithmetically and wrong about
+        // the intent, so it is suppressed here rather than the shape being flattened away.
+        #[allow(clippy::identity_op)]
         let data: Vec<f64> = (0..1 * 1 * 4 * 4 * 4)
             .map(|i| (i as f64 * 0.13).cos())
             .collect();

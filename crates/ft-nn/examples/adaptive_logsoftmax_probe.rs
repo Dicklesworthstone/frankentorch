@@ -6,7 +6,7 @@
 //!   cargo run -q -p ft-nn --example adaptive_logsoftmax_probe
 use ft_api::FrankenTorchSession;
 use ft_core::ExecutionMode;
-use ft_nn::{AdaptiveLogSoftmaxWithLoss, Module};
+use ft_nn::AdaptiveLogSoftmaxWithLoss;
 
 fn line(key: &str, v: &[f64]) {
     let s: Vec<String> = v.iter().map(|x| format!("{x:.17e}")).collect();

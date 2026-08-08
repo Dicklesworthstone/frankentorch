@@ -292,7 +292,7 @@ fn bench_attention_core(c: &mut Criterion) {
         let v: Vec<f64> = (0..bh * s * hd)
             .map(|i| (i % 233) as f64 * 0.0009 - 0.10)
             .collect();
-        group.bench_function(&format!("materialized_{bh}x{s}x{hd}"), |b| {
+        group.bench_function(format!("materialized_{bh}x{s}x{hd}"), |b| {
             b.iter(|| {
                 let qs: Vec<f64> = q.iter().map(|&x| x * scale).collect();
                 let mut k_t = vec![0.0f64; bh * hd * s];
@@ -328,7 +328,7 @@ fn bench_attention_core(c: &mut Criterion) {
                 );
             });
         });
-        group.bench_function(&format!("flash_{bh}x{s}x{hd}"), |b| {
+        group.bench_function(format!("flash_{bh}x{s}x{hd}"), |b| {
             b.iter(|| {
                 black_box(ft_kernel_cpu::sdpa_forward_f64(
                     &q, &k, &v, bh, s, s, hd, hd, scale, false,
@@ -342,7 +342,7 @@ fn bench_attention_core(c: &mut Criterion) {
 fn bench_multihead_attention_train(c: &mut Criterion) {
     let mut group = c.benchmark_group("multihead_attention");
     for &(b_, s_, e_, h_) in &[(8usize, 64usize, 128usize, 8usize), (1, 512, 128, 8)] {
-        group.bench_function(&format!("train_{b_}x{s_}x{e_}_h{h_}"), |bch| {
+        group.bench_function(format!("train_{b_}x{s_}x{e_}_h{h_}"), |bch| {
             bch.iter_batched(
                 || make_mha_case(b_, s_, e_, h_),
                 |(mut session, attention, input)| {
