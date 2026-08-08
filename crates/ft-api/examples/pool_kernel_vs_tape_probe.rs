@@ -69,6 +69,35 @@ fn time_it<F: FnMut()>(mut f: F) -> f64 {
     median(samples)
 }
 
+/// frankentorch-27aci: put the allocator into a KNOWN state before each timed rep.
+///
+/// Without this the decomposition measures allocator HISTORY: the 27aci sweep showed
+/// the same work costing 11.9 ms or 1.8 ms depending purely on whether a larger block
+/// had already been faulted in this process. Dirtying and freeing a same-sized block
+/// outside the timed region gives every rep the same precondition — and it is the
+/// realistic one, since a training loop's previous iteration freed full buffers.
+fn condition_allocator(numel: usize) {
+    let mut w = vec![0.0f64; numel];
+    w.fill(1.0);
+    std::hint::black_box(&w);
+    drop(w);
+}
+
+fn time_it_conditioned<F: FnMut()>(numel: usize, mut f: F) -> f64 {
+    let mut samples = Vec::with_capacity(REPS);
+    for _ in 0..3 {
+        condition_allocator(numel);
+        f();
+    }
+    for _ in 0..REPS {
+        condition_allocator(numel);
+        let started = Instant::now();
+        f();
+        samples.push(started.elapsed().as_secs_f64() * 1_000.0);
+    }
+    median(samples)
+}
+
 fn report(lane: &str, raw_fwd: f64, raw_bwd: f64, session: f64, pytorch_whole_op: f64) {
     let kernels = raw_fwd + raw_bwd;
     let tape = session - kernels;
@@ -163,28 +192,12 @@ fn main() {
     // CUMULATIVE lanes: each adds one stage to the previous one, so successive
     // DIFFERENCES attribute that stage. Reported as differences below.
     let a_shape = vec![A_N, A_C, A_H, A_W];
-    let t_sess = time_it(|| {
-        let session = FrankenTorchSession::new(ExecutionMode::Strict);
-        std::hint::black_box(&session);
-    });
-    let t_leaf = time_it(|| {
-        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = session
-            .tensor_variable(a_input.clone(), a_shape.clone(), true)
-            .expect("leaf");
-        std::hint::black_box((&session, x));
-    });
-    let t_fwd = time_it(|| {
-        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
-        let x = session
-            .tensor_variable(a_input.clone(), a_shape.clone(), true)
-            .expect("leaf");
-        let out = session
-            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
-            .expect("avg_pool2d");
-        std::hint::black_box((&session, out));
-    });
-    let t_sum = time_it(|| {
+    let a_numel = A_N * A_C * A_H * A_W;
+    // A/A NULL for the cumulative chain: the SAME lane measured at two different
+    // positions. The decomposition had no null lane at all, which is the gap that let
+    // the 27aci ordering artifact through. Anything closer than this spread is not
+    // distinguishable, and the two must agree or the chain is measuring its own order.
+    let t_sum_aa_early = time_it_conditioned(a_numel, || {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(a_input.clone(), a_shape.clone(), true)
@@ -195,7 +208,39 @@ fn main() {
         let loss = session.tensor_sum(out).expect("sum");
         std::hint::black_box((&session, loss));
     });
-    let t_bwd = time_it(|| {
+    let t_sess = time_it_conditioned(a_numel, || {
+        let session = FrankenTorchSession::new(ExecutionMode::Strict);
+        std::hint::black_box(&session);
+    });
+    let t_leaf = time_it_conditioned(a_numel, || {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        std::hint::black_box((&session, x));
+    });
+    let t_fwd = time_it_conditioned(a_numel, || {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        let out = session
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d");
+        std::hint::black_box((&session, out));
+    });
+    let t_sum = time_it_conditioned(a_numel, || {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        let out = session
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d");
+        let loss = session.tensor_sum(out).expect("sum");
+        std::hint::black_box((&session, loss));
+    });
+    let t_bwd = time_it_conditioned(a_numel, || {
         let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
         let x = session
             .tensor_variable(a_input.clone(), a_shape.clone(), true)
@@ -209,12 +254,29 @@ fn main() {
     });
     // A control the decomposition needs: how much of `leaf` is just cloning 16 MiB
     // of input, as opposed to anything the session does with it?
-    let t_clone = time_it(|| {
+    let t_clone = time_it_conditioned(a_numel, || {
         std::hint::black_box(a_input.clone());
     });
-    println!("avg_pool2d SESSION DECOMPOSITION (frankentorch-uufyp), cumulative then differenced");
+    let t_full = time_it_conditioned(a_numel, || {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(a_input.clone(), a_shape.clone(), true)
+            .expect("leaf");
+        let out = session
+            .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+            .expect("avg_pool2d");
+        let loss = session.tensor_sum(out).expect("sum");
+        let rep = session.tensor_backward(loss).expect("backward");
+        std::hint::black_box(rep.gradient(x).expect("grad").iter().sum::<f64>());
+    });
+    println!("avg_pool2d SESSION DECOMPOSITION (uufyp, CONDITIONED per frankentorch-27aci)");
     println!(
-        "  cumulative:  session={t_sess:6.3}  +leaf={t_leaf:6.3}  +fwd={t_fwd:6.3}  +sum={t_sum:6.3}  +bwd={t_bwd:6.3}  +grad_fetch_sum={a_session:6.3}"
+        "  A/A NULL on the through-sum lane: early={t_sum_aa_early:.3} late={t_sum:.3} -> {:.1}% apart.\n\
+         Stage differences smaller than this are NOT attributable.",
+        100.0 * (t_sum / t_sum_aa_early.max(f64::MIN_POSITIVE) - 1.0).abs()
+    );
+    println!(
+        "  cumulative:  session={t_sess:6.3}  +leaf={t_leaf:6.3}  +fwd={t_fwd:6.3}  +sum={t_sum:6.3}  +bwd={t_bwd:6.3}  +grad_fetch_sum={t_full:6.3}"
     );
     println!(
         "  per stage:   session_new={t_sess:6.3}  leaf_build={:6.3}  forward={:6.3}  sum={:6.3}  backward={:6.3}  grad_fetch_sum={:6.3}",
@@ -222,7 +284,7 @@ fn main() {
         t_fwd - t_leaf,
         t_sum - t_fwd,
         t_bwd - t_sum,
-        a_session - t_bwd,
+        t_full - t_bwd,
     );
     println!(
         "  of which leaf_build is a bare 16 MiB input clone: {t_clone:.3} ms ({:.0}% of leaf_build)",
