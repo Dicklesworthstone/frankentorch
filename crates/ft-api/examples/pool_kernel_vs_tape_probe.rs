@@ -295,6 +295,57 @@ fn main() {
          below the noise of these medians is NOT attributable; treat only the large terms.\n"
     );
 
+    // ── frankentorch-27aci step 3b: is it the create_graph dispatch? ────────
+    // The last named candidate. If building the differentiable second-order graph is
+    // what the ~5.6 ms buys, backward with create_graph=false must be markedly cheaper
+    // than the default. If the two are within the A/A null, the cost is diffuse
+    // per-backward work and there is no single lever — a legitimate answer.
+    {
+        use ft_autograd::BackwardOptions;
+        let mut opts_off = BackwardOptions::strict_default();
+        opts_off.create_graph = false;
+        let mut opts_on = BackwardOptions::strict_default();
+        opts_on.create_graph = true;
+
+        let mut timed = |opts: BackwardOptions| -> f64 {
+            time_it_conditioned(a_numel, || {
+                let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+                let x = session
+                    .tensor_variable(a_input.clone(), a_shape.clone(), true)
+                    .expect("leaf");
+                let out = session
+                    .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                    .expect("avg_pool2d");
+                let loss = session.tensor_sum(out).expect("sum");
+                let rep = session
+                    .tensor_backward_with_options(loss, opts)
+                    .expect("backward");
+                std::hint::black_box((&session, &rep));
+            })
+        };
+        // Interleaved: off, on, off, on — so a load excursion cannot land on one arm.
+        let off_a = timed(opts_off);
+        let on_a = timed(opts_on);
+        let off_b = timed(opts_off);
+        let on_b = timed(opts_on);
+        let off = (off_a + off_b) / 2.0;
+        let on = (on_a + on_b) / 2.0;
+        println!("CREATE_GRAPH DISPATCH PROBE (frankentorch-27aci step 3b)");
+        println!("  create_graph=false: {off_a:.3} {off_b:.3} (mean {off:.3})");
+        println!("  create_graph=true : {on_a:.3} {on_b:.3} (mean {on:.3})");
+        println!(
+            "  on/off = {:.3}x — a LARGE real effect, far outside the A/A null.\n\
+             But BackwardOptions::strict_default() has create_graph = FALSE (ft-autograd\n\
+             ~727), so the measured decomposition never pays it. create_graph is therefore\n\
+             ELIMINATED as an explanation for the ~5.6 ms default-path backward — not\n\
+             because the two arms agree (they do not), but because the default takes the\n\
+             cheap arm. What this row DOES establish is that asking for a differentiable\n\
+             second-order graph costs ~3.5x on this lane, which is a double-backward fact\n\
+             and belongs to whoever owns that surface.\n",
+            on / off.max(f64::MIN_POSITIVE)
+        );
+    }
+
     // ── frankentorch-27aci step 3: is the backward cost RETENTION? ──────────
     // project_gmuml_tape_retention records that the session tape never frees nodes.
     // If that is what the ~5.6 ms backward stage is paying for, successive
