@@ -48,7 +48,8 @@ use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
 use ft_api::harness_interleave::{
-    QUIT_REQUEST, READY_MARKER, incumbent_sample_rounds, parse_sample_line, sample_request,
+    MAX_NULL_CI_WIDTH, QUIT_REQUEST, READY_MARKER, adjudicate_null, incumbent_sample_rounds,
+    parse_sample_line, sample_request,
 };
 use ft_core::ExecutionMode;
 
@@ -411,7 +412,10 @@ LANES = {
 
     for (index, (name, _)) in lanes.iter().enumerate() {
         let (nr, nlo, nhi) = median_ratio_ci(&arm_a[index], &arm_b[index]);
-        let null_pass = nlo <= 1.0 && nhi >= 1.0;
+        // frankentorch-8ieqm: bracketing 1.0 is not enough — contention WIDENS
+        // the null's CI, and a wider CI brackets 1.0 more easily, so the old
+        // gate got easier to pass exactly when the host got noisier.
+        let null = adjudicate_null(nlo, nhi, MAX_NULL_CI_WIDTH);
         let ft_ms = median(
             arm_a[index]
                 .iter()
@@ -440,12 +444,14 @@ LANES = {
         };
         println!(
             "  {name:<12} {ft_ms:8.3} {pt_ms:8.3}   {standing:<19} {} [{nlo:.3},{nhi:.3}] {:<5} {parity}",
-            if null_pass { "PASS" } else { "FAIL" },
+            null.label(),
             format!("{nr:.3}"),
         );
     }
     println!(
-        "\nQuote a lane only if its A/A gate PASSed and parity is `match`. Op-work ratios are NOT\n\
+        "\nQuote a lane only if its A/A gate says PASS and parity is `match`. WIDE means the null's\n\
+         CI exceeded {MAX_NULL_CI_WIDTH:.2} — the sample was too noisy to support ANY verdict, so the row is\n\
+         undecidable rather than a win or a loss (frankentorch-8ieqm). Op-work ratios are NOT\n\
          comparable to the gauntlet's whole-step ratios, which include each lane's input rebuild."
     );
     Ok(())

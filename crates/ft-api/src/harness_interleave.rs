@@ -126,6 +126,89 @@ pub fn parse_sample_line(line: &str) -> Option<IncumbentSample<'_>> {
     })
 }
 
+/// Widest A/A null CI that can still certify a calm sample
+/// (`frankentorch-8ieqm`).
+///
+/// # Why a width veto is needed at all
+///
+/// The old gate passed a row whenever the bootstrap median-ratio CI bracketed
+/// 1.0. But the null is FrankenTorch-vs-FrankenTorch, so any disturbance that
+/// scales both arms cancels exactly. What contention actually does to the null
+/// is **widen** its CI — and a wider CI brackets 1.0 more easily. The gate
+/// therefore got *easier* to pass as the host got noisier: anti-conservative in
+/// precisely the condition it is trusted to detect. One banked run measured
+/// `max_pool3d` at 29.22x, its FT arm spiking to 3.8x its own median, and the
+/// gate PASSED it on `[0.528,1.359]`.
+///
+/// # Where this number comes from
+///
+/// It is not fitted to make any particular row pass. The null compares identical
+/// code against itself, so its CI should sit tight around unity; 0.60 admits at
+/// most a ±30% band. The two observed populations bracket it with margin on both
+/// sides: the clean reference run's CI was 0.468 wide, and the disturbed 29.22x
+/// row's was 0.831. 0.60 sits between them, ~28% clear of each, and is a round
+/// number rather than either endpoint.
+pub const MAX_NULL_CI_WIDTH: f64 = 0.60;
+
+/// What an A/A null CI can support about the sample it came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NullVerdict {
+    /// Centred on unity and tight: the sample is calm enough to quote.
+    Calm,
+    /// Too noisy to conclude anything — neither certifies nor condemns.
+    TooWide,
+    /// Tight, but the two identical arms did not agree: a real position or
+    /// ordering effect, which is the failure the null exists to catch.
+    OffCentre,
+}
+
+impl NullVerdict {
+    /// Short label for the harness's gate column.
+    #[must_use]
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Calm => "PASS",
+            Self::TooWide => "WIDE",
+            Self::OffCentre => "FAIL",
+        }
+    }
+
+    /// Whether a row carrying this verdict may be quoted as a measurement.
+    #[must_use]
+    pub fn is_quotable(self) -> bool {
+        matches!(self, Self::Calm)
+    }
+}
+
+/// Adjudicate an A/A null from its bootstrap CI.
+///
+/// # Why width is checked before centring
+///
+/// Because at large widths the bracketing test is close to arbitrary in *both*
+/// directions. A banked `conv3d` row failed on `[1.011,4.453]` — a CI 3.44 wide
+/// that failed only because its lower bound cleared 1.0 by 0.011. Calling that a
+/// detected position effect is no more defensible than calling the 0.831-wide
+/// row calm. A sample that noisy supports no verdict at all, so width is
+/// answered first and such rows come out [`NullVerdict::TooWide`] rather than
+/// being scored either way.
+///
+/// Non-finite or inverted bounds are treated as [`NullVerdict::TooWide`]: the
+/// gate fails closed rather than certifying a row it could not evaluate.
+#[must_use]
+pub fn adjudicate_null(low: f64, high: f64, max_width: f64) -> NullVerdict {
+    if !low.is_finite() || !high.is_finite() || high < low {
+        return NullVerdict::TooWide;
+    }
+    if high - low > max_width {
+        return NullVerdict::TooWide;
+    }
+    if low <= 1.0 && high >= 1.0 {
+        NullVerdict::Calm
+    } else {
+        NullVerdict::OffCentre
+    }
+}
+
 /// Arguments for launching the incumbent co-process with `script`.
 ///
 /// # Why this exists rather than a literal in the harness
@@ -337,6 +420,137 @@ mod tests {
             SAMPLE_LOOP_PY.contains("flush=True"),
             "unflushed stdout deadlocks the driver on a pipe"
         );
+    }
+
+    /// **THE NAMED REGRESSION CASE (`frankentorch-8ieqm`).** A banked run
+    /// measured `max_pool3d` at 29.22x with its FT arm spiked to 3.8x its own
+    /// median, and the old bracketing gate PASSED it on `[0.528,1.359]`. That
+    /// row must be undecidable, or the gate is still certifying disturbed
+    /// samples.
+    #[test]
+    fn the_contended_null_that_used_to_pass_is_now_undecidable() {
+        let (low, high) = (0.528, 1.359);
+        assert!(
+            low <= 1.0 && high >= 1.0,
+            "precondition: the old bracketing rule passed this row"
+        );
+        assert_eq!(
+            adjudicate_null(low, high, MAX_NULL_CI_WIDTH),
+            NullVerdict::TooWide,
+            "the 29.22x contended run must not certify a calm sample"
+        );
+        assert!(!adjudicate_null(low, high, MAX_NULL_CI_WIDTH).is_quotable());
+    }
+
+    /// The clean reference run must survive, or the veto is not a tightening but
+    /// a blanket refusal that makes the gate useless.
+    #[test]
+    fn the_clean_reference_run_still_certifies() {
+        assert_eq!(
+            adjudicate_null(0.798, 1.266, MAX_NULL_CI_WIDTH),
+            NullVerdict::Calm
+        );
+        // A representative tight row from the banked set.
+        assert_eq!(
+            adjudicate_null(0.951, 1.067, MAX_NULL_CI_WIDTH),
+            NullVerdict::Calm
+        );
+    }
+
+    /// **THE DEFECT ITSELF, as a property.** Under the old rule a null centred on
+    /// unity passed no matter how wide it got, so contention made the gate
+    /// EASIER to pass. Widening must never improve a verdict.
+    #[test]
+    fn widening_a_centred_null_never_makes_it_easier_to_pass() {
+        let mut seen_too_wide = false;
+        let mut half = 0.01_f64;
+        while half < 4.0 {
+            let verdict = adjudicate_null(1.0 - half, 1.0 + half, MAX_NULL_CI_WIDTH);
+            // Every one of these brackets 1.0, so the OLD rule passed them all.
+            assert!(1.0 - half <= 1.0 && 1.0 + half >= 1.0);
+            if verdict == NullVerdict::TooWide {
+                seen_too_wide = true;
+            } else {
+                assert!(
+                    !seen_too_wide,
+                    "verdict improved back to {verdict:?} at half-width {half} after going wide"
+                );
+            }
+            half += 0.01;
+        }
+        assert!(
+            seen_too_wide,
+            "a centred null must eventually become undecidable as it widens"
+        );
+    }
+
+    /// A wide CI that just barely clears 1.0 is not a detected position effect.
+    /// The banked `conv3d` row failed on a CI 3.44 wide whose lower bound cleared
+    /// unity by 0.011 — arbitrary in the other direction, and now undecidable.
+    #[test]
+    fn a_hugely_wide_off_centre_null_is_undecidable_not_a_failure() {
+        assert_eq!(
+            adjudicate_null(1.011, 4.453, MAX_NULL_CI_WIDTH),
+            NullVerdict::TooWide,
+            "a 3.44-wide CI supports no verdict, in either direction"
+        );
+    }
+
+    /// A genuine position effect — tight AND off unity — must still FAIL, or the
+    /// width veto would have swallowed the failure the null exists to catch.
+    #[test]
+    fn a_tight_off_centre_null_still_fails() {
+        assert_eq!(
+            adjudicate_null(1.05, 1.20, MAX_NULL_CI_WIDTH),
+            NullVerdict::OffCentre
+        );
+        assert_eq!(
+            adjudicate_null(0.80, 0.95, MAX_NULL_CI_WIDTH),
+            NullVerdict::OffCentre
+        );
+        assert!(!NullVerdict::OffCentre.is_quotable());
+    }
+
+    /// The boundary is inclusive: a CI exactly at the limit still certifies.
+    ///
+    /// Deliberately uses exact binary fractions (0.75 and 1.25 differ by exactly
+    /// 0.5). Decimal-looking pairs do NOT work here — `1.3 - 0.7` evaluates to
+    /// 0.6000000000000001, so a test written that way fails on an ULP and says
+    /// nothing about the boundary rule it meant to check.
+    #[test]
+    fn the_width_boundary_is_inclusive() {
+        assert_eq!(1.25_f64 - 0.75_f64, 0.5_f64, "chosen bounds must be exact");
+        assert_eq!(adjudicate_null(0.75, 1.25, 0.5), NullVerdict::Calm);
+        // Just over the limit is undecidable.
+        assert_eq!(adjudicate_null(0.75, 1.3, 0.5), NullVerdict::TooWide);
+    }
+
+    /// NEGATIVE CASE: the gate must fail closed on input it cannot evaluate,
+    /// never certify it.
+    #[test]
+    fn unevaluable_bounds_fail_closed() {
+        for (low, high) in [
+            (f64::NAN, 1.2),
+            (0.8, f64::NAN),
+            (f64::NEG_INFINITY, 1.2),
+            (0.8, f64::INFINITY),
+            (1.2, 0.8),
+        ] {
+            assert_eq!(
+                adjudicate_null(low, high, MAX_NULL_CI_WIDTH),
+                NullVerdict::TooWide,
+                "[{low},{high}] must not certify"
+            );
+        }
+    }
+
+    #[test]
+    fn only_calm_is_quotable() {
+        assert!(NullVerdict::Calm.is_quotable());
+        assert!(!NullVerdict::TooWide.is_quotable());
+        assert_eq!(NullVerdict::Calm.label(), "PASS");
+        assert_eq!(NullVerdict::TooWide.label(), "WIDE");
+        assert_eq!(NullVerdict::OffCentre.label(), "FAIL");
     }
 
     /// NEGATIVE CASE: the deadlock that actually happened. Launching the child as
