@@ -174,6 +174,55 @@ fn main() {
         std::hint::black_box(s);
     }
 
+    // --- no-grad BatchNorm2d: raw kernels vs the session path ---------------
+    // frankentorch-we7ry. NOT a vs-PyTorch lane: the interleaved H2H harness has
+    // no BatchNorm lane and builds its leaves with requires_grad=true, so it
+    // takes the GRAD path and cannot observe a no-grad borrow at all. This is the
+    // FT-vs-FT wrapper term, which is the thing the change actually moves.
+    let bn_c = C;
+    let bn_spatial = H * W;
+    let bn_w: Vec<f64> = (0..bn_c).map(|j| 1.0 + (j as f64) * 0.01).collect();
+    let bn_b: Vec<f64> = (0..bn_c).map(|j| (j as f64) * 0.02 - 0.3).collect();
+
+    let mut bn_raw = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let started = Instant::now();
+        let (mean, var) = ft_kernel_cpu::batch_norm_stats_f64(&input, N, bn_c, bn_spatial);
+        let out = ft_kernel_cpu::batch_norm_apply_f64(
+            &input,
+            &mean,
+            &var,
+            Some(&bn_w),
+            Some(&bn_b),
+            N,
+            bn_c,
+            bn_spatial,
+            1e-5,
+        );
+        bn_raw.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(&out);
+    }
+
+    let mut bn_nograd = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(input.clone(), vec![N, C, H, W], false)
+            .expect("bn leaf");
+        let wt = session
+            .tensor_variable(bn_w.clone(), vec![bn_c], false)
+            .expect("bn weight");
+        let bt = session
+            .tensor_variable(bn_b.clone(), vec![bn_c], false)
+            .expect("bn bias");
+        let started = Instant::now();
+        let (out, _, _) = session
+            .functional_batch_norm2d(x, None, None, Some(wt), Some(bt), true, 0.1, 1e-5)
+            .expect("batch_norm2d");
+        bn_nograd.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(out);
+    }
+
     // --- full session forward+backward, exactly as the H2H harness times it -
     //
     // Also split into its four steps. Callgrind is useless for naming the frame
@@ -224,6 +273,12 @@ fn main() {
     report("raw fwd f32", &mut raw_f32);
     report("nograd fwd f32", &mut nograd_f32);
     report("nograd sum", &mut nograd_sum);
+    report("bn raw", &mut bn_raw);
+    report("bn nograd", &mut bn_nograd);
+    println!(
+        "  BN wrapper (bn nograd - bn raw) = {:.3} ms\n",
+        bn_nograd[0] - bn_raw[0]
+    );
     report("session", &mut session_ms);
     println!("\n  session broken down:");
     report("  fwd call", &mut t_fwd);
