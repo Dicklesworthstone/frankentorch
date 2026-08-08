@@ -23,6 +23,39 @@ same invocation, torch threads=8.
 
 All four lanes are internally quotable — A/A PASS, parity match.
 
+## Second reading, taken in a quieter window — and it sharpens the conclusion
+
+Same ELF, same torch 2.12.1 arm, 1-minute loadavg **8.07** at start (though the 5-
+and 15-minute averages were 27.7 / 24.4, so the box was still recovering rather than
+genuinely idle):
+
+| lane | FT (ms) | PT (ms) | standing | A/A gate |
+|---|---|---|---|---|
+| `max_pool1d` | 20.371 | 12.030 | 1.69x slower | PASS |
+| `avg_pool2d` | 6.313 | 2.705 | 2.33x slower | PASS |
+| `max_pool3d` | 5.560 | 1.164 | **4.78x slower** | PASS |
+| `conv3d` | 22.762 | 8.478 | 2.68x slower | PASS |
+
+Two things are visible across the three readings:
+
+| lane | baseline (load 28.9) | run 1 (load 86) | run 2 (load 8/27) |
+|---|---|---|---|
+| max_pool3d | 4.66x | 5.26x | 4.78x |
+| avg_pool2d | 2.01x | 2.20x | 2.33x |
+| max_pool1d | 1.50x | 1.47x | 1.69x |
+| conv3d | 3.09x | 3.40x | 2.68x |
+
+1. **The ratios are far more stable than the absolutes.** Both arms' absolute times
+   rose together in run 2 (FT max_pool3d 5.560 vs 4.770; PT 1.164 vs 0.906) — the
+   opposite of what a quieter box should give, which confirms the 1-minute loadavg
+   was misleading. Yet the *ratio* moved only 5.26 → 4.78. That is the interleaved
+   design doing its job: contention is common-mode and largely cancels.
+2. **Neither reading is below the 4.66x baseline.** Both sit at or above it.
+
+So the sharper statement is: **two independent readings show no sign of the kernel
+wins reaching this lane.** That is not proof they don't — see below — but it is
+evidence, and it leans toward the second hypothesis rather than the first.
+
 ## Why it is NOT comparable to the 4.66x baseline, and why I am not calling this a regression
 
 **Host load was 86** during this run. The 2026-08-08 baseline that recorded
