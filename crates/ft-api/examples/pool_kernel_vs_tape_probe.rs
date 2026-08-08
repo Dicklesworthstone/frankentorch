@@ -295,6 +295,49 @@ fn main() {
          below the noise of these medians is NOT attributable; treat only the large terms.\n"
     );
 
+    // ── frankentorch-27aci step 3: is the backward cost RETENTION? ──────────
+    // project_gmuml_tape_retention records that the session tape never frees nodes.
+    // If that is what the ~5.6 ms backward stage is paying for, successive
+    // forward+backward cycles IN ONE SESSION must get progressively slower as the tape
+    // grows. If each cycle costs the same, retention is not the term and the cost is
+    // per-backward work.
+    //
+    // Every other lane in this probe builds a FRESH session, so this is the only lane
+    // that can see the effect at all.
+    {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let mut per_cycle = Vec::new();
+        for _ in 0..8 {
+            condition_allocator(a_numel);
+            let started = Instant::now();
+            let x = session
+                .tensor_variable(a_input.clone(), a_shape.clone(), true)
+                .expect("leaf");
+            let out = session
+                .functional_avg_pool2d(x, (2, 2), (2, 2), (0, 0), false, true)
+                .expect("avg_pool2d");
+            let loss = session.tensor_sum(out).expect("sum");
+            let rep = session.tensor_backward(loss).expect("backward");
+            let elapsed = started.elapsed().as_secs_f64() * 1_000.0;
+            std::hint::black_box(&rep);
+            per_cycle.push(elapsed);
+        }
+        println!("TAPE-RETENTION PROBE (frankentorch-27aci): 8 fwd+bwd cycles in ONE session");
+        print!("  per-cycle ms:");
+        for value in &per_cycle {
+            print!(" {value:.2}");
+        }
+        println!();
+        println!(
+            "  first={:.2}  last={:.2}  last/first={:.2}x\n\
+             Growing roughly linearly => the tape's retention is the term. Flat => it is\n\
+             per-backward work and retention is NOT what the 5.6 ms buys.\n",
+            per_cycle[0],
+            per_cycle[per_cycle.len() - 1],
+            per_cycle[per_cycle.len() - 1] / per_cycle[0].max(f64::MIN_POSITIVE)
+        );
+    }
+
     // ── frankentorch-27aci: does the backward STAGE scale with numel? ───────
     // uufyp put ~11 ms in the engine between "backward called" and "kernel returns",
     // against a 0.32 ms kernel. That is either DATA MOVEMENT (extra full-size passes)
