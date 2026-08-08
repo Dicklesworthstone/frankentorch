@@ -21,7 +21,6 @@
 //!
 //! Run: `cargo run --release -p ft-api --features fair-alloc --example pool_kernel_vs_tape_probe`
 
-use std::process::Command;
 use std::time::Instant;
 
 use ft_api::FrankenTorchSession;
@@ -51,21 +50,6 @@ const A_OW: usize = A_W / 2;
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
-}
-
-fn executable_sha256() -> String {
-    let executable = std::env::current_exe().expect("current executable must be available");
-    let output = Command::new("sha256sum")
-        .arg(executable)
-        .output()
-        .expect("sha256sum must be available");
-    assert!(output.status.success(), "sha256sum failed");
-    String::from_utf8(output.stdout)
-        .expect("sha256sum output must be UTF-8")
-        .split_whitespace()
-        .next()
-        .expect("sha256sum must print a digest")
-        .to_owned()
 }
 
 fn seq(n: usize) -> Vec<f64> {
@@ -100,7 +84,10 @@ fn report(lane: &str, raw_fwd: f64, raw_bwd: f64, session: f64, pytorch_whole_op
 }
 
 fn main() {
-    println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "executing_elf_sha256={}",
+        ft_api::harness_provenance::executing_elf_sha256()
+    );
     println!(
         "allocator={}",
         if cfg!(feature = "fair-alloc") {

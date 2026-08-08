@@ -17,7 +17,6 @@
 //!
 //! Run: `cargo run --release -p ft-api --features fair-alloc --example dense_write_bandwidth_ladder`
 
-use std::process::Command;
 use std::time::Instant;
 
 use rayon::prelude::*;
@@ -31,21 +30,6 @@ const REPS: usize = 21;
 fn median(mut values: Vec<f64>) -> f64 {
     values.sort_by(f64::total_cmp);
     values[values.len() / 2]
-}
-
-fn executable_sha256() -> String {
-    let executable = std::env::current_exe().expect("current executable must be available");
-    let output = Command::new("sha256sum")
-        .arg(executable)
-        .output()
-        .expect("sha256sum must be available");
-    assert!(output.status.success(), "sha256sum failed");
-    String::from_utf8(output.stdout)
-        .expect("sha256sum output must be UTF-8")
-        .split_whitespace()
-        .next()
-        .expect("sha256sum must print a digest")
-        .to_owned()
 }
 
 fn bench<F: FnMut()>(label: &str, mut f: F, rows: &mut Vec<(String, f64, f64)>) {
@@ -65,7 +49,10 @@ fn bench<F: FnMut()>(label: &str, mut f: F, rows: &mut Vec<(String, f64, f64)>) 
 }
 
 fn main() {
-    println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "executing_elf_sha256={}",
+        ft_api::harness_provenance::executing_elf_sha256()
+    );
     println!(
         "allocator={}",
         if cfg!(feature = "fair-alloc") {

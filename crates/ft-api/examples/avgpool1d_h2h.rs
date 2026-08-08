@@ -86,21 +86,6 @@ fn median_ratio_ci(numerator: &[f64], denominator: &[f64]) -> (f64, f64, f64) {
     )
 }
 
-fn executable_sha256() -> String {
-    let executable = std::env::current_exe().expect("current executable must be available");
-    let output = Command::new("sha256sum")
-        .arg(executable)
-        .output()
-        .expect("sha256sum must be available");
-    assert!(output.status.success(), "sha256sum failed");
-    String::from_utf8(output.stdout)
-        .expect("sha256sum output must be UTF-8")
-        .split_whitespace()
-        .next()
-        .expect("sha256sum must print a digest")
-        .to_owned()
-}
-
 fn input_values() -> Vec<f64> {
     (0..N * C * L)
         .map(|i| ((i % 251) as f64) * 0.001 - 0.12)
@@ -332,7 +317,10 @@ print("PT grad_probe",*("%.12g"%g.flatten()[i].item() for i in (0,1,4095,262143)
     // harness cannot emit ratios without the version they were measured against.
     let torch_version = ft_api::harness_provenance::require_reported_version(&pt)?;
 
-    println!("executing_elf_sha256={}", executable_sha256());
+    println!(
+        "executing_elf_sha256={}",
+        ft_api::harness_provenance::executing_elf_sha256()
+    );
     println!(
         "{}",
         ft_api::harness_provenance::incumbent_provenance_block(torch_version, 8)

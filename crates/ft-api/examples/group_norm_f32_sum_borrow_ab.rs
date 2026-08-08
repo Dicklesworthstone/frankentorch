@@ -4,7 +4,6 @@
 //! null gate, and report a bootstrap CI for the median speedup.
 //! Run: `cargo run --release -p ft-api --example group_norm_f32_sum_borrow_ab`
 
-use std::process::Command;
 use std::time::Instant;
 
 use ft_kernel_cpu::group_norm_sum_forward_f32;
@@ -50,21 +49,6 @@ fn elapsed_ms<F: FnOnce() -> f32>(operation: F) -> f64 {
     let result = operation();
     std::hint::black_box(result);
     started.elapsed().as_secs_f64() * 1_000.0
-}
-
-fn executable_sha256() -> String {
-    let executable = std::env::current_exe().expect("current executable must be available");
-    let output = Command::new("sha256sum")
-        .arg(executable)
-        .output()
-        .expect("sha256sum must be available");
-    assert!(output.status.success(), "sha256sum failed");
-    String::from_utf8(output.stdout)
-        .expect("sha256sum output must be UTF-8")
-        .split_whitespace()
-        .next()
-        .expect("sha256sum must print a digest")
-        .to_owned()
 }
 
 fn main() {
@@ -129,7 +113,7 @@ fn main() {
     let (speedup, speedup_low, speedup_high) = median_ratio_ci(&old, &new);
     let report = format!(
         "executing_elf_sha256={}\nworkload=group_norm_sum_f32_no_grad [{batch},{channels},{height},{width}] groups={groups} reps={REPS}\na_a_median_ratio={null_ratio:.4} ci95=[{null_low:.4},{null_high:.4}] gate={}\nold_clone_ms={:.4} new_borrow_ms={:.4} old_over_new={speedup:.4} ci95=[{speedup_low:.4},{speedup_high:.4}] decision={}\n",
-        executable_sha256(),
+        ft_api::harness_provenance::executing_elf_sha256(),
         if null_low <= 1.0 && null_high >= 1.0 {
             "PASS"
         } else {

@@ -29,7 +29,6 @@
 #![allow(unsafe_code)]
 
 use std::alloc::{GlobalAlloc, Layout};
-use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Instant;
 
@@ -143,21 +142,6 @@ fn median(mut values: Vec<f64>) -> f64 {
 fn median_u64(mut values: Vec<u64>) -> u64 {
     values.sort_unstable();
     values[values.len() / 2]
-}
-
-fn executable_sha256() -> String {
-    let executable = std::env::current_exe().expect("current executable must be available");
-    let output = Command::new("sha256sum")
-        .arg(executable)
-        .output()
-        .expect("sha256sum must be available");
-    assert!(output.status.success(), "sha256sum failed");
-    String::from_utf8(output.stdout)
-        .expect("sha256sum output must be UTF-8")
-        .split_whitespace()
-        .next()
-        .expect("sha256sum must print a digest")
-        .to_owned()
 }
 
 // ── workload shapes ─────────────────────────────────────────────────────────
@@ -318,7 +302,10 @@ fn main() {
 
     println!("frankentorch-3i7c0 STEP 0 — large-buffer churn in a realistic training loop");
     println!("  allocator            {ALLOCATOR_NAME}");
-    println!("  executing_elf_sha256 {}", executable_sha256());
+    println!(
+        "  executing_elf_sha256 {}",
+        ft_api::harness_provenance::executing_elf_sha256()
+    );
     println!("  large-block threshold {LARGE} bytes | steps {steps} (first {warmup} discarded)");
     println!(
         "  shapes               avg_pool1d [{POOL_N},{POOL_C},{POOL_L}] f64 ({:.0} MiB input); mlp [{MLP_BATCH},{MLP_DIM}] x [{MLP_DIM},{MLP_DIM}] f64",
