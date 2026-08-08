@@ -124,6 +124,36 @@ fn main() {
         std::hint::black_box(out);
     }
 
+    // --- f32 no-grad forward: the same question one dtype over --------------
+    // The f32 branch of functional_avg_pool2d is written the same way as the f64
+    // one, so if the f64 no-grad path was copying its input the f32 path very
+    // likely is too. "Very likely" is not a measurement, hence this phase.
+    let input_f32: Vec<f32> = input.iter().map(|v| *v as f32).collect();
+    // Raw f32 kernel, so "is the f32 session path also copying its input?" is a
+    // measured question and not an argument by analogy with the f64 one.
+    let mut raw_f32 = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let started = Instant::now();
+        let out = ft_kernel_cpu::avg_pool2d_forward_f32(
+            &input_f32, N, C, H, W, KH, KW, OH, OW, SH, SW, 0, 0, H, W, true,
+        );
+        raw_f32.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(&out);
+    }
+    let mut nograd_f32 = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable_f32(input_f32.clone(), vec![N, C, H, W], false)
+            .expect("f32 leaf");
+        let started = Instant::now();
+        let out = session
+            .functional_avg_pool2d(x, (KH, KW), (SH, SW), (0, 0), false, true)
+            .expect("avg_pool2d f32");
+        nograd_f32.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(out);
+    }
+
     // --- full session forward+backward, exactly as the H2H harness times it -
     //
     // Also split into its four steps. Callgrind is useless for naming the frame
@@ -171,6 +201,8 @@ fn main() {
     report("raw bwd", &mut bwd);
     report("raw fwd+bwd", &mut raw_both);
     report("nograd fwd", &mut nograd);
+    report("raw fwd f32", &mut raw_f32);
+    report("nograd fwd f32", &mut nograd_f32);
     report("session", &mut session_ms);
     println!("\n  session broken down:");
     report("  fwd call", &mut t_fwd);

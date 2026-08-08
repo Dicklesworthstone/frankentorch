@@ -33458,25 +33458,33 @@ impl FrankenTorchSession {
         if self.tensor_dtype(input)? == DType::F32
             && !self.tensor_tape.tensor_requires_grad(input)?
         {
-            let pv = self.tensor_values_f32(padded)?;
-            let out = ft_kernel_cpu::avg_pool2d_forward_f32(
-                &pv,
-                batch_size,
-                channels,
-                padded_h,
-                padded_w,
-                kernel_h,
-                kernel_w,
-                output_h,
-                output_w,
-                stride_h,
-                stride_w,
-                padding_h,
-                padding_w,
-                input_h,
-                input_w,
-                count_include_pad,
-            );
+            // frankentorch-k1h8g: borrowed read, same reason as the f64 branch
+            // above — `tensor_values_f32` returns an owned Vec, so this path was
+            // copying the whole input before pooling it while the f32 GRAD path
+            // below borrows via apply_function_..._borrowed_inputs. Measured on
+            // [8,64,64,64]: the session wrapper cost 0.845 ms on top of a 0.491 ms
+            // kernel, i.e. more than the kernel itself.
+            let out = {
+                let pv = self.tensor_tape.values_f32_borrowed(padded)?;
+                ft_kernel_cpu::avg_pool2d_forward_f32(
+                    pv,
+                    batch_size,
+                    channels,
+                    padded_h,
+                    padded_w,
+                    kernel_h,
+                    kernel_w,
+                    output_h,
+                    output_w,
+                    stride_h,
+                    stride_w,
+                    padding_h,
+                    padding_w,
+                    input_h,
+                    input_w,
+                    count_include_pad,
+                )
+            };
             return self.tensor_variable_f32(
                 out,
                 vec![batch_size, channels, output_h, output_w],
