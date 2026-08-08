@@ -20909,6 +20909,71 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
+    // frankentorch-27aci. `accumulate_tensor_gradient_owned` bumps every element by
+    // `+= 0.0` before moving the buffer into an empty slot. That is a FULL-SIZE pass
+    // over the gradient and it looks like pure waste to anyone reading it for perf —
+    // I said so myself on 27aci before checking. It is load-bearing.
+    //
+    // The BORROWED accumulator builds an empty slot with `0.0 + value`, which maps
+    // -0.0 to +0.0. The OWNED path moves the caller's buffer in instead of rebuilding
+    // it, so without the bump a -0.0 contribution would survive as -0.0 and the two
+    // accumulators would disagree on the SIGN OF ZERO for the same gradient.
+    //
+    // Nothing tested this: the owned accumulator has one call site and no direct
+    // coverage. These two tests lock the invariant from both sides so the line cannot
+    // be deleted as dead weight.
+    #[test]
+    fn owned_gradient_accumulator_canonicalizes_negative_zero() {
+        let node = super::TensorNodeId(0);
+        let mut slot = super::TensorGradientSlot::new(4);
+        super::TensorTape::accumulate_tensor_gradient_owned(
+            node,
+            &mut slot,
+            vec![-0.0, 0.0, -0.0, 1.5],
+        )
+        .expect("accumulate");
+        assert_eq!(
+            slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vec![0.0f64, 0.0, 0.0, 1.5]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "owned accumulator must map -0.0 to +0.0 on an empty slot"
+        );
+    }
+
+    #[test]
+    fn owned_and_borrowed_gradient_accumulators_agree_on_signed_zero() {
+        let node = super::TensorNodeId(0);
+        let contribution = vec![-0.0f64, 0.0, -0.0, -2.25];
+
+        let mut owned_slot = super::TensorGradientSlot::new(contribution.len());
+        super::TensorTape::accumulate_tensor_gradient_owned(
+            node,
+            &mut owned_slot,
+            contribution.clone(),
+        )
+        .expect("owned");
+
+        let mut borrowed_slot = super::TensorGradientSlot::new(contribution.len());
+        super::TensorTape::accumulate_tensor_gradient(node, &mut borrowed_slot, &contribution)
+            .expect("borrowed");
+
+        assert_eq!(
+            owned_slot
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            borrowed_slot
+                .values
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "the two accumulators must be BIT-identical, including the sign of zero"
+        );
+    }
+
     use ft_core::{
         BFloat16, Complex64, Complex128, DType, DenseTensor, DenseTensorError, Device,
         ExecutionMode, Float16, TensorMeta, TensorStorage,
