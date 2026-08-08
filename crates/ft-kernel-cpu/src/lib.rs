@@ -9307,7 +9307,46 @@ fn avg_pool2d_backward_2x2s2_f64(
     oh: usize,
     ow: usize,
 ) -> Vec<f64> {
-    let mut dp = vec![0.0f64; batch * ch * ih * iw];
+    let numel = batch * ch * ih * iw;
+    // frankentorch-k1h8g: with 2x2 windows at stride 2 and no padding, the windows
+    // TILE the input — every element belongs to exactly one window, so the scatter
+    // below writes every element exactly once and never accumulates. The old
+    // `vec![0.0; numel]` was therefore a dead 16 MiB zero pass paid SERIALLY on the
+    // calling thread (allocator-recycled pages are a real memset, not lazy zero
+    // pages), and the parallel scatter then overwrote all of it. Building into an
+    // uninitialized buffer makes the parallel fill the sole writer and the page
+    // first-toucher. Same lever as the expand/transpose materialize wins.
+    //
+    // Exact tiling is what makes coverage total, so it is checked rather than
+    // assumed: for odd `ih`, `oh = ih/2` truncates and the final row would never be
+    // written, which against an uninitialized buffer is garbage rather than zeros.
+    if ih == 2 * oh && iw == 2 * ow {
+        return build_uninit(numel, |dp| {
+            dp.par_chunks_mut(ih * iw)
+                .enumerate()
+                .for_each(|(plane, drow)| {
+                    let dbase = plane * oh * ow;
+                    for oy in 0..oh {
+                        let row0 = (oy * 2) * iw;
+                        let row1 = row0 + iw;
+                        for ox in 0..ow {
+                            let col0 = ox * 2;
+                            let g = dout[dbase + oy * ow + ox] / 4.0;
+                            // `0.0 + g`, not a bare `g`: bit-exact with the
+                            // accumulate form this replaces. The two differ for
+                            // `g == -0.0`, where `0.0 + (-0.0) == +0.0` but a bare
+                            // store keeps `-0.0`. LLVM cannot fold the add away for
+                            // that same reason, so the exactness is not wishful.
+                            drow[row0 + col0] = 0.0 + g;
+                            drow[row0 + col0 + 1] = 0.0 + g;
+                            drow[row1 + col0] = 0.0 + g;
+                            drow[row1 + col0 + 1] = 0.0 + g;
+                        }
+                    }
+                });
+        });
+    }
+    let mut dp = vec![0.0f64; numel];
     dp.par_chunks_mut(ih * iw)
         .enumerate()
         .for_each(|(plane, drow)| {
@@ -39039,6 +39078,76 @@ mod tests {
             got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
             want.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
         );
+    }
+
+    /// `frankentorch-k1h8g`: the 2x2s2 backward writes into an UNINITIALIZED
+    /// buffer, which is only sound because 2x2 windows at stride 2 tile the input
+    /// exactly. When `ih` or `iw` is ODD the last row/column belongs to no window,
+    /// so that case must fall back to the zero-initialized accumulate path — with
+    /// an uninit buffer those elements would be garbage rather than 0.0.
+    ///
+    /// This is the coverage test for that guard: the untouched edge must read as
+    /// exactly +0.0, which garbage effectively never does.
+    #[test]
+    fn avg_pool2d_2x2s2_backward_odd_extent_leaves_exact_zero_edges() {
+        for (ih, iw) in [(7usize, 8usize), (6, 9), (7, 9)] {
+            let (batch, ch) = (2usize, 3usize);
+            let (oh, ow) = (ih / 2, iw / 2);
+            let dout: Vec<f64> = (0..batch * ch * oh * ow)
+                .map(|i| (((i * 43 + 5) % 211) as f64 - 101.0) * 0.015625)
+                .collect();
+            let got = super::avg_pool2d_backward_f64(
+                &dout, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+            );
+            assert_eq!(got.len(), batch * ch * ih * iw);
+            for plane in 0..batch * ch {
+                let base = plane * ih * iw;
+                if ih.is_multiple_of(2) {
+                    // no untouched row
+                } else {
+                    for c in 0..iw {
+                        let v = got[base + (ih - 1) * iw + c];
+                        assert_eq!(
+                            v.to_bits(),
+                            0.0f64.to_bits(),
+                            "ih={ih} iw={iw}: untouched last row must be +0.0, got {v}"
+                        );
+                    }
+                }
+                if !iw.is_multiple_of(2) {
+                    for r in 0..ih {
+                        let v = got[base + r * iw + (iw - 1)];
+                        assert_eq!(
+                            v.to_bits(),
+                            0.0f64.to_bits(),
+                            "ih={ih} iw={iw}: untouched last column must be +0.0, got {v}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `frankentorch-k1h8g`: the uninit path stores `0.0 + g` rather than `g`
+    /// because the two differ for `g == -0.0` — `0.0 + (-0.0)` is `+0.0` while a
+    /// bare store keeps `-0.0`. A negative-zero upstream gradient is exactly how
+    /// that reaches the kernel, so this pins the sign bit.
+    #[test]
+    fn avg_pool2d_2x2s2_backward_negative_zero_upstream_stays_positive_zero() {
+        let (batch, ch, ih, iw) = (1usize, 1usize, 4usize, 4usize);
+        let (oh, ow) = (ih / 2, iw / 2);
+        let dout = vec![-0.0f64; batch * ch * oh * ow];
+        let got = super::avg_pool2d_backward_f64(
+            &dout, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2, 0, 0, ih, iw, true,
+        );
+        for (i, v) in got.iter().enumerate() {
+            assert_eq!(
+                v.to_bits(),
+                0.0f64.to_bits(),
+                "element {i}: -0.0 upstream must accumulate to +0.0, got {v} (bits {:#x})",
+                v.to_bits()
+            );
+        }
     }
 
     #[test]
