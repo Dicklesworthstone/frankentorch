@@ -19736,17 +19736,19 @@ fn calculate_fan_in_fan_out(shape: &[usize]) -> Result<(usize, usize), AutogradE
     if shape.len() == 1 {
         return Ok((shape[0], shape[0]));
     }
-    let fan_in;
-    let fan_out;
-    if shape.len() == 2 {
-        fan_in = shape[1];
-        fan_out = shape[0];
+    // frankentorch-r76bc: was `let fan_in; let fan_out;` assigned in both branches, which trips
+    // clippy::needless_late_init and made `clippy -p ft-nn -D warnings` red for the WHOLE crate.
+    // Same two branches, same two values — an expression rather than deferred assignment.
+    let (fan_in, fan_out) = if shape.len() == 2 {
+        (shape[1], shape[0])
     } else {
         let receptive_field =
             checked_shape_numel(&shape[2..], "fan_in/fan_out receptive field overflow")?;
-        fan_in = checked_mul(shape[1], receptive_field, "fan_in overflow")?;
-        fan_out = checked_mul(shape[0], receptive_field, "fan_out overflow")?;
-    }
+        (
+            checked_mul(shape[1], receptive_field, "fan_in overflow")?,
+            checked_mul(shape[0], receptive_field, "fan_out overflow")?,
+        )
+    };
     Ok((fan_in, fan_out))
 }
 
