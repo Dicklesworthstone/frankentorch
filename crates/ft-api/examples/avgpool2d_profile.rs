@@ -223,6 +223,49 @@ fn main() {
         std::hint::black_box(out);
     }
 
+    // --- no-grad batch_norm1d_sum: same 16 MiB buffer viewed as [N, C, L] ----
+    // frankentorch-we7ry. Again FT-vs-FT: there is no BatchNorm lane in the
+    // interleaved H2H harness and its leaves are requires_grad=true.
+    let bn1_l = (N * C * H * W) / (N * bn_c);
+    let mut bn1_raw = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let started = Instant::now();
+        let (mean, var) = ft_kernel_cpu::batch_norm_stats_f64(&input, N, bn_c, bn1_l);
+        let s = ft_kernel_cpu::batch_norm_sum_forward_f64(
+            &input,
+            &mean,
+            &var,
+            Some(&bn_w),
+            Some(&bn_b),
+            N,
+            bn_c,
+            bn1_l,
+            1e-5,
+        );
+        bn1_raw.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(s);
+    }
+
+    let mut bn1_nograd = Vec::with_capacity(REPS);
+    for _ in 0..REPS {
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let x = session
+            .tensor_variable(input.clone(), vec![N, bn_c, bn1_l], false)
+            .expect("bn1 leaf");
+        let wt = session
+            .tensor_variable(bn_w.clone(), vec![bn_c], false)
+            .expect("bn1 weight");
+        let bt = session
+            .tensor_variable(bn_b.clone(), vec![bn_c], false)
+            .expect("bn1 bias");
+        let started = Instant::now();
+        let (out, _, _) = session
+            .functional_batch_norm1d_sum(x, None, None, Some(wt), Some(bt), true, 0.1, 1e-5)
+            .expect("batch_norm1d_sum");
+        bn1_nograd.push(started.elapsed().as_secs_f64() * 1e3);
+        std::hint::black_box(out);
+    }
+
     // --- full session forward+backward, exactly as the H2H harness times it -
     //
     // Also split into its four steps. Callgrind is useless for naming the frame
@@ -275,6 +318,12 @@ fn main() {
     report("nograd sum", &mut nograd_sum);
     report("bn raw", &mut bn_raw);
     report("bn nograd", &mut bn_nograd);
+    report("bn1sum raw", &mut bn1_raw);
+    report("bn1sum nograd", &mut bn1_nograd);
+    println!(
+        "  BN1sum wrapper (nograd - raw) = {:.3} ms",
+        bn1_nograd[0] - bn1_raw[0]
+    );
     println!(
         "  BN wrapper (bn nograd - bn raw) = {:.3} ms\n",
         bn_nograd[0] - bn_raw[0]

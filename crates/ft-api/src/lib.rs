@@ -38013,20 +38013,27 @@ impl FrankenTorchSession {
             let w_grad = self.tensor_tape.tensor_requires_grad(w)?;
             let b_grad = self.tensor_tape.tensor_requires_grad(bs)?;
             if !input_grad && !w_grad && !b_grad {
-                let x = self.tensor_values(input)?;
+                // frankentorch-we7ry: borrow the ACTIVATION; the grad path a few
+                // lines below already does, via
+                // tensor_apply_function_f64_borrowed_inputs. `w`/`bs` are
+                // per-CHANNEL and stay owned — activation-sized vs parameter-sized
+                // is the distinction that matters here.
                 let wv = self.tensor_values(w)?;
                 let bv = self.tensor_values(bs)?;
-                let sum = ft_kernel_cpu::batch_norm_sum_forward_f64(
-                    &x,
-                    &mean,
-                    &var,
-                    Some(&wv),
-                    Some(&bv),
-                    batch_size,
-                    channels,
-                    spatial,
-                    eps,
-                );
+                let sum = {
+                    let x = self.tensor_tape.values_borrowed(input)?;
+                    ft_kernel_cpu::batch_norm_sum_forward_f64(
+                        x,
+                        &mean,
+                        &var,
+                        Some(&wv),
+                        Some(&bv),
+                        batch_size,
+                        channels,
+                        spatial,
+                        eps,
+                    )
+                };
                 let out = self.tensor_variable(vec![sum], vec![1], false)?;
                 return Ok((out, updated_mean, updated_var));
             }
@@ -143051,6 +143058,72 @@ mod tests {
         assert_close(&got_x, &want_x, "dx");
         assert_bits(&got_w, &want_w, "dweight");
         assert_bits(&got_b, &want_b, "dbias");
+    }
+
+    /// `frankentorch-we7ry`: the fused no-grad `batch_norm1d_sum` path reads its
+    /// INPUT borrowed rather than cloning the whole `[N,C,L]` activation. Pinned
+    /// against a scalar reference written here from the definition — a wrong
+    /// slice, a wrong length or a stale node could not reproduce this sum.
+    ///
+    /// Uses the 3-D `[N, C, L]` form so `spatial > 1`, which exercises the
+    /// per-channel strided indexing rather than the degenerate `spatial == 1`
+    /// case a `[N, C]` input would take.
+    #[test]
+    fn fused_batch_norm1d_sum_no_grad_matches_an_independent_scalar_reference() {
+        let (n, c, l) = (3usize, 4usize, 5usize);
+        let numel = n * c * l;
+        let x: Vec<f64> = (0..numel)
+            .map(|i| ((i * 53 % 97) as f64 - 48.0) * 0.031_25)
+            .collect();
+        let weight: Vec<f64> = (0..c).map(|j| 0.75 + (j as f64) * 0.125).collect();
+        let bias: Vec<f64> = (0..c).map(|j| (j as f64) * 0.25 - 0.375).collect();
+        let eps = 1e-5_f64;
+
+        // Reference: per-channel mean/var over N*L, then normalise, scale, shift,
+        // and sum the lot.
+        let count = (n * l) as f64;
+        let mut want = 0.0f64;
+        for ch in 0..c {
+            let (mut acc, mut sq) = (0.0f64, 0.0f64);
+            for b in 0..n {
+                for s in 0..l {
+                    acc += x[(b * c + ch) * l + s];
+                }
+            }
+            let mean = acc / count;
+            for b in 0..n {
+                for s in 0..l {
+                    let d = x[(b * c + ch) * l + s] - mean;
+                    sq += d * d;
+                }
+            }
+            let var = sq / count;
+            for b in 0..n {
+                for s in 0..l {
+                    let v = x[(b * c + ch) * l + s];
+                    want += (v - mean) / (var + eps).sqrt() * weight[ch] + bias[ch];
+                }
+            }
+        }
+
+        let mut session = FrankenTorchSession::new(ExecutionMode::Strict);
+        let xt = session
+            .tensor_variable(x, vec![n, c, l], false)
+            .expect("input");
+        let wt = session
+            .tensor_variable(weight, vec![c], false)
+            .expect("weight");
+        let bt = session.tensor_variable(bias, vec![c], false).expect("bias");
+        let (out, _, _) = session
+            .functional_batch_norm1d_sum(xt, None, None, Some(wt), Some(bt), true, 0.1, eps)
+            .expect("batch_norm1d_sum");
+        let got = session.tensor_values(out).expect("sum value");
+        assert_eq!(got.len(), 1, "fused path must return a scalar");
+        assert!(
+            (got[0] - want).abs() <= 1e-11 * want.abs().max(1.0),
+            "fused sum {} vs independent reference {want}",
+            got[0]
+        );
     }
 
     /// `frankentorch-we7ry`: the fused no-grad BatchNorm path reads its INPUT
