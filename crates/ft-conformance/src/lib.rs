@@ -27141,10 +27141,10 @@ json.loads(sys.stdin.read())
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_shape_ops_preserve_float32_dtype_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_shape_ops_preserve_float32_dtype_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27467,10 +27467,10 @@ print(json.dumps({
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_max_pool2d_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_max_pool2d_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27595,10 +27595,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_conv_transpose1d_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_conv_transpose1d_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27697,10 +27697,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_conv_transpose3d_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_conv_transpose3d_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27820,10 +27820,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_layernorm_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_layernorm_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -27911,10 +27911,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_conv1d_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_conv1d_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28002,10 +28002,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_conv3d_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_conv3d_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28101,10 +28101,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_conv2d_f32_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_conv2d_f32_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28236,10 +28236,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_conv_transpose2d_output_shape_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_conv_transpose2d_output_shape_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28376,8 +28376,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_clamp_tensor_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_clamp_tensor_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28518,8 +28520,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_special_i1_i1e_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_special_i1_i1e_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28659,8 +28663,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_special_i0_i0e_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_special_i0_i0e_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28807,8 +28813,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_logaddexp2_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_logaddexp2_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -28943,8 +28951,8 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_windows_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip("torch_windows_subprocess_conformance", torch_available)
+        {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29051,8 +29059,10 @@ print(json.dumps({
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_special_ndtri_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_special_ndtri_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29172,8 +29182,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_nan_to_num_f32_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_nan_to_num_f32_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29313,8 +29325,10 @@ print(json.dumps({"forward": forward, "grad": grad}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_special_log_ndtr_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_special_log_ndtr_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29448,8 +29462,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_special_ndtr_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_special_ndtr_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29570,8 +29586,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_threshold_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_threshold_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29725,8 +29743,7 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_angle_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip("torch_angle_subprocess_conformance", torch_available) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -29870,8 +29887,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_fmax_fmin_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_fmax_fmin_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30046,8 +30065,7 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_frac_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip("torch_frac_subprocess_conformance", torch_available) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30231,8 +30249,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_round_decimals_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_round_decimals_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30400,8 +30420,7 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_exp10_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip("torch_exp10_subprocess_conformance", torch_available) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30562,8 +30581,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_nextafter_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_nextafter_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30726,8 +30747,10 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_floor_divide_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_floor_divide_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -30859,8 +30882,7 @@ print(json.dumps({"results": results}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_diag_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip("torch_diag_subprocess_conformance", torch_available) {
             return;
         }
         config.legacy_oracle_python = Some(python);
@@ -31011,10 +31033,10 @@ print(json.dumps({"results": out}, sort_keys=True))
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!(
-                "torch_ieee754_unary_edge_cases_subprocess_conformance: torch unavailable, skipping"
-            );
+        if !crate::oracle_required_or_skip(
+            "torch_ieee754_unary_edge_cases_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         // Torch internally falls back to numpy for some tensor
@@ -31317,8 +31339,10 @@ print(json.dumps({
             .status()
             .map(|status| status.success())
             .unwrap_or(false);
-        if !torch_available {
-            eprintln!("torch_float_power_subprocess_conformance: torch unavailable, skipping");
+        if !crate::oracle_required_or_skip(
+            "torch_float_power_subprocess_conformance",
+            torch_available,
+        ) {
             return;
         }
         config.legacy_oracle_python = Some(python);
