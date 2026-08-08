@@ -1567,9 +1567,22 @@ impl DenseTensor {
                         zero_points: qparams.zero_points.len(),
                     },
                 ))?;
+            // frankentorch-9rvxq: compute in f32 and widen ONCE, matching
+            // `torch.Tensor.dequantize()`, which produces float32 — callers wanting f64 widen
+            // afterwards, so torch's f32 rounding is baked into the value. Doing this in f64 is
+            // strictly MORE accurate and therefore diverges: a quantized linear consuming
+            // f64-dequantized weights landed 1.16e-6 off torch on an f64 dot product, because
+            // every weight carried ~16 significant digits here against torch's ~7. Verified
+            // bit-exact (full-tensor equality, not a tolerance) against
+            // `torch.quantize_per_tensor(...).dequantize()`. Being more precise than the
+            // reference is still a parity bug when the reference's rounding is observable.
+            #[allow(clippy::cast_possible_truncation)]
+            let scale = scale as f32;
             #[allow(clippy::cast_precision_loss)]
-            let zero_point = zero_point as f64;
-            Ok((qvalue - zero_point) * scale)
+            let zero_point = zero_point as f32;
+            #[allow(clippy::cast_possible_truncation)]
+            let qvalue = qvalue as f32;
+            Ok(f64::from((qvalue - zero_point) * scale))
         };
         match &self.storage {
             TensorStorage::QInt8(v) => Ok(v[start..end]

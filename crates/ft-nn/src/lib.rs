@@ -20469,12 +20469,27 @@ fn quantize_f64_to_i64(value: f64, qparams: QParams) -> Result<i64, AutogradErro
     Ok(qvalue as i64)
 }
 
+/// Dequantize one packed integer, matching `torch.Tensor.dequantize()` bit-for-bit.
+///
+/// frankentorch-9rvxq. torch's `dequantize()` on a quantized tensor produces **float32**, not
+/// float64 — callers that want f64 get it by widening AFTERWARDS, so the f32 rounding is baked
+/// into the value. This used to compute `(value - zero_point) * scale` entirely in f64, which is
+/// strictly more accurate and therefore diverged: a quantized linear whose weights were
+/// dequantized this way came out 1.16e-6 off torch on an f64 dot product, because every weight
+/// carried ~7 significant digits in torch and ~16 here.
+///
+/// Doing the arithmetic in f32 and widening once at the end reproduces torch exactly — verified
+/// against `torch.quantize_per_tensor(...).dequantize()` on quint8 (equality on the full tensor,
+/// not a tolerance). Being *more* precise than the reference is still a parity bug when the
+/// reference's rounding is observable in the output.
 fn dequantize_i64(value: i64, qparams: QParams) -> f64 {
     #[allow(clippy::cast_precision_loss)]
-    let value = value as f64;
+    let value = value as f32;
     #[allow(clippy::cast_precision_loss)]
-    let zero_point = qparams.zero_point as f64;
-    (value - zero_point) * qparams.scale
+    let zero_point = qparams.zero_point as f32;
+    #[allow(clippy::cast_possible_truncation)]
+    let scale = qparams.scale as f32;
+    f64::from((value - zero_point) * scale)
 }
 
 /// Linear layer with packed 8-bit weights and dequantize-on-forward execution.
