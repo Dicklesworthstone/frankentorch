@@ -103,9 +103,31 @@ struct Ctx {
     arg_offsets: Vec<f64>,
     arg_usize: Vec<usize>,
     dout: Vec<f64>,
+    /// The max_pool3d input, needed by the 2x2s2 sibling (which recomputes the
+    /// argmax rather than reading saved indices).
+    input: Vec<f64>,
+    /// 2-D sibling: [8,32,64,64] f64 = 8 MiB, below the gate.
+    arg2d: Vec<f64>,
+    dout2d: Vec<f64>,
+    /// 1-D sibling: [8,64,2048] f64 = 8 MiB, below the gate.
+    arg1d: Vec<f64>,
+    dout1d: Vec<f64>,
 }
 
-const LANES: [&str; 10] = [
+// Sibling shapes, all chosen to land BELOW the 16 MiB gate — that is the side the
+// gate changes, so it is the side worth measuring.
+const P2_N: usize = 8;
+const P2_C: usize = 32;
+const P2_H: usize = 64;
+const P2_W: usize = 64;
+const P2_OH: usize = P2_H / 2;
+const P2_OW: usize = P2_W / 2;
+const P1_N: usize = 8;
+const P1_C: usize = 64;
+const P1_L: usize = 2048;
+const P1_OL: usize = P1_L / 2;
+
+const LANES: [&str; 14] = [
     "alloc_only",
     "alloc_only_AA",
     "serial_fill",
@@ -116,6 +138,15 @@ const LANES: [&str; 10] = [
     "scatter_serial",
     "scatter_store",
     "scatter_usize_offsets",
+    // frankentorch-un3os, the SIBLING call sites. These four carry the same gate as
+    // `kernel_scatter` and exist so each one gets its OWN A/B row rather than
+    // inheriting a result measured on a different kernel. Flipping
+    // `dense_scatter_should_parallelize` to always-true builds the BEFORE arm for all
+    // of them at once, and each lane still attributes only its own kernel.
+    "sib_maxpool3d_2x2s2",
+    "sib_maxpool3d_scalar",
+    "sib_maxpool2d_indices",
+    "sib_maxpool1d_indices",
 ];
 
 /// Every lane allocates its own fresh buffer, exactly as the kernel does. Reusing
@@ -192,7 +223,7 @@ fn run_lane(idx: usize, ctx: &Ctx) -> f64 {
             black_box(&v);
             v[0]
         }
-        _ => {
+        9 => {
             let mut v = vec![0.0f64; DIN_LEN];
             v.par_chunks_mut(PLANE_LEN)
                 .enumerate()
@@ -203,6 +234,58 @@ fn run_lane(idx: usize, ctx: &Ctx) -> f64 {
                         drow[ctx.arg_usize[oidx]] += ctx.dout[oidx];
                     }
                 });
+            black_box(&v);
+            v[0]
+        }
+        // ── the four sibling call sites, each measured on its own ──────────────
+        10 => {
+            // kernel == stride == 2 dispatches into max_pool3d_backward_2x2s2_f64,
+            // which is private; this is how the gauntlet reaches it too.
+            let v = ft_kernel_cpu::max_pool3d_backward_f64(
+                &ctx.dout, &ctx.input, N, C, D, H, W, 2, 2, 2, OD, OH, OW, 2, 2, 2,
+            );
+            black_box(&v);
+            v[0]
+        }
+        11 => {
+            let v = ft_kernel_cpu::max_pool3d_backward_from_indices_scalar_f64(
+                1.0,
+                &ctx.arg_offsets,
+                N,
+                C,
+                D,
+                H,
+                W,
+                OD,
+                OH,
+                OW,
+            );
+            black_box(&v);
+            v[0]
+        }
+        12 => {
+            let v = ft_kernel_cpu::max_pool2d_backward_from_indices_f64(
+                &ctx.dout2d,
+                &ctx.arg2d,
+                P2_N,
+                P2_C,
+                P2_H,
+                P2_W,
+                P2_OH,
+                P2_OW,
+            );
+            black_box(&v);
+            v[0]
+        }
+        _ => {
+            let v = ft_kernel_cpu::max_pool1d_backward_from_indices_f64(
+                &ctx.dout1d,
+                &ctx.arg1d,
+                P1_N,
+                P1_C,
+                P1_L,
+                P1_OL,
+            );
             black_box(&v);
             v[0]
         }
@@ -244,10 +327,30 @@ fn main() {
     let dout = vec![1.0f64; DOUT_LEN];
     let arg_usize: Vec<usize> = arg_offsets.iter().map(|&a| a as usize).collect();
 
+    let p2_input: Vec<f64> = (0..P2_N * P2_C * P2_H * P2_W)
+        .map(|i| ((i % 241) as f64) * 0.001 - 0.11)
+        .collect();
+    let (_, arg2d) = ft_kernel_cpu::max_pool2d_forward_with_indices_f64(
+        &p2_input, P2_N, P2_C, P2_H, P2_W, 2, 2, P2_OH, P2_OW, 2, 2,
+    );
+    let dout2d = vec![1.0f64; P2_N * P2_C * P2_OH * P2_OW];
+    let p1_input: Vec<f64> = (0..P1_N * P1_C * P1_L)
+        .map(|i| ((i % 233) as f64) * 0.001 - 0.1)
+        .collect();
+    let (_, arg1d) = ft_kernel_cpu::max_pool1d_forward_with_indices_f64(
+        &p1_input, P1_N, P1_C, P1_L, 2, P1_OL, 2,
+    );
+    let dout1d = vec![1.0f64; P1_N * P1_C * P1_OL];
+
     let ctx = Ctx {
         arg_offsets,
         arg_usize,
         dout,
+        input,
+        arg2d,
+        dout2d,
+        arg1d,
+        dout1d,
     };
 
     let mut samples: Vec<Vec<f64>> = vec![Vec::with_capacity(REPS); LANES.len()];

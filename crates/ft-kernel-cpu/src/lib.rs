@@ -8813,77 +8813,88 @@ fn max_pool3d_backward_2x2s2_f64(
     // frankentorch-zoqws: do NOT insert a serial `din.fill(0.0)` here to "pay the
     // first touch cheaply". That was tried and MEASURED AS A REGRESSION — see the
     // note on `max_pool3d_backward_from_indices_f64` below for the numbers.
-    din.par_chunks_mut(plane_len)
-        .enumerate()
-        .for_each(|(plane, drow)| {
-            let input_plane = &input[plane * plane_len..plane * plane_len + plane_len];
-            let dout_plane = &dout[plane * out_plane_len..plane * out_plane_len + out_plane_len];
-            for oz in 0..od {
-                let z0 = (oz * 2) * depth_stride;
-                let z1 = z0 + depth_stride;
-                for oy in 0..oh {
-                    let row00 = z0 + (oy * 2) * iw;
-                    let row01 = row00 + iw;
-                    let row10 = z1 + (oy * 2) * iw;
-                    let row11 = row10 + iw;
-                    for ox in 0..ow {
-                        let x0 = ox * 2;
-                        let loc000 = row00 + x0;
-                        let loc001 = loc000 + 1;
-                        let loc010 = row01 + x0;
-                        let loc011 = loc010 + 1;
-                        let loc100 = row10 + x0;
-                        let loc101 = loc100 + 1;
-                        let loc110 = row11 + x0;
-                        let loc111 = loc110 + 1;
-                        let mut m = f64::NEG_INFINITY;
-                        let mut arg = loc000;
+    // frankentorch-un3os: this site is DELIBERATELY NOT GATED, unlike its siblings.
+    // The L3-residency gate that gave 1.42-2.24x on the pure-scatter backwards was
+    // measured here too and came back INCONCLUSIVE: control-normalised 1.03x, 95% CI
+    // [0.731, 1.122], straddling 1.0. No effect this harness can resolve, so no gate.
+    //
+    // That is consistent with the mechanism rather than a surprise. The gate helps
+    // when the pass does almost NO work per byte, so memory behaviour dominates. This
+    // kernel recomputes an 8-way max over the input plane per output element, so its
+    // work-per-byte is far higher and the memory term does not dominate it.
+    // See artifacts/perf/frankentorch-un3os/sibling_ab.md.
+    let scatter_plane = |plane: usize, drow: &mut [f64]| {
+        let input_plane = &input[plane * plane_len..plane * plane_len + plane_len];
+        let dout_plane = &dout[plane * out_plane_len..plane * out_plane_len + out_plane_len];
+        for oz in 0..od {
+            let z0 = (oz * 2) * depth_stride;
+            let z1 = z0 + depth_stride;
+            for oy in 0..oh {
+                let row00 = z0 + (oy * 2) * iw;
+                let row01 = row00 + iw;
+                let row10 = z1 + (oy * 2) * iw;
+                let row11 = row10 + iw;
+                for ox in 0..ow {
+                    let x0 = ox * 2;
+                    let loc000 = row00 + x0;
+                    let loc001 = loc000 + 1;
+                    let loc010 = row01 + x0;
+                    let loc011 = loc010 + 1;
+                    let loc100 = row10 + x0;
+                    let loc101 = loc100 + 1;
+                    let loc110 = row11 + x0;
+                    let loc111 = loc110 + 1;
+                    let mut m = f64::NEG_INFINITY;
+                    let mut arg = loc000;
 
-                        let candidate = input_plane[loc000];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc000;
-                        }
-                        let candidate = input_plane[loc001];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc001;
-                        }
-                        let candidate = input_plane[loc010];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc010;
-                        }
-                        let candidate = input_plane[loc011];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc011;
-                        }
-                        let candidate = input_plane[loc100];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc100;
-                        }
-                        let candidate = input_plane[loc101];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc101;
-                        }
-                        let candidate = input_plane[loc110];
-                        if candidate > m {
-                            m = candidate;
-                            arg = loc110;
-                        }
-                        let candidate = input_plane[loc111];
-                        if candidate > m {
-                            arg = loc111;
-                        }
-
-                        drow[arg] += dout_plane[(oz * oh + oy) * ow + ox];
+                    let candidate = input_plane[loc000];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc000;
                     }
+                    let candidate = input_plane[loc001];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc001;
+                    }
+                    let candidate = input_plane[loc010];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc010;
+                    }
+                    let candidate = input_plane[loc011];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc011;
+                    }
+                    let candidate = input_plane[loc100];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc100;
+                    }
+                    let candidate = input_plane[loc101];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc101;
+                    }
+                    let candidate = input_plane[loc110];
+                    if candidate > m {
+                        m = candidate;
+                        arg = loc110;
+                    }
+                    let candidate = input_plane[loc111];
+                    if candidate > m {
+                        arg = loc111;
+                    }
+
+                    drow[arg] += dout_plane[(oz * oh + oy) * ow + ox];
                 }
             }
-        });
+        }
+    };
+    din.par_chunks_mut(plane_len)
+        .enumerate()
+        .for_each(|(plane, drow)| scatter_plane(plane, drow));
     din
 }
 
@@ -8981,16 +8992,25 @@ pub fn max_pool3d_backward_from_indices_scalar_f64(
     let plane_len = id * ih * iw;
     let out_plane_len = od * oh * ow;
     let mut din = vec![0.0f64; batch * ch * plane_len];
-    din.par_chunks_mut(plane_len)
-        .enumerate()
-        .for_each(|(plane, drow)| {
-            let dbase = plane * out_plane_len;
-            let plane_offsets = &arg_offsets[dbase..dbase + out_plane_len];
-            for &arg_offset in plane_offsets {
-                let arg = arg_offset as usize;
-                drow[arg] += upstream;
-            }
-        });
+    // frankentorch-un3os: same trivial-work scatter into an L3-resident buffer as
+    // `max_pool3d_backward_from_indices_f64`; same gate. One body, two drivers.
+    let scatter_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * out_plane_len;
+        let plane_offsets = &arg_offsets[dbase..dbase + out_plane_len];
+        for &arg_offset in plane_offsets {
+            let arg = arg_offset as usize;
+            drow[arg] += upstream;
+        }
+    };
+    if dense_scatter_should_parallelize(din.len()) {
+        din.par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    } else {
+        din.chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    }
     din
 }
 
@@ -9874,16 +9894,24 @@ pub fn max_pool1d_backward_from_indices_f64(
     output_len: usize,
 ) -> Vec<f64> {
     let mut din = vec![0.0f64; batch * ch * len];
-    din.par_chunks_mut(len)
-        .enumerate()
-        .for_each(|(plane, drow)| {
-            let dbase = plane * output_len;
-            for ox in 0..output_len {
-                let oidx = dbase + ox;
-                let arg = arg_offsets[oidx] as usize;
-                drow[arg] += dout[oidx];
-            }
-        });
+    // frankentorch-un3os: same trivial-work scatter shape, same gate.
+    let scatter_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * output_len;
+        for ox in 0..output_len {
+            let oidx = dbase + ox;
+            let arg = arg_offsets[oidx] as usize;
+            drow[arg] += dout[oidx];
+        }
+    };
+    if dense_scatter_should_parallelize(din.len()) {
+        din.par_chunks_mut(len)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    } else {
+        din.chunks_mut(len)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    }
     din
 }
 
@@ -10199,18 +10227,26 @@ pub fn max_pool2d_backward_from_indices_f64(
     ow: usize,
 ) -> Vec<f64> {
     let mut din = vec![0.0f64; batch * ch * ih * iw];
-    din.par_chunks_mut(ih * iw)
-        .enumerate()
-        .for_each(|(plane, drow)| {
-            let dbase = plane * oh * ow;
-            for oy in 0..oh {
-                for ox in 0..ow {
-                    let oidx = dbase + oy * ow + ox;
-                    let arg = arg_offsets[oidx] as usize;
-                    drow[arg] += dout[oidx];
-                }
+    // frankentorch-un3os: same trivial-work scatter shape, same gate.
+    let scatter_plane = |plane: usize, drow: &mut [f64]| {
+        let dbase = plane * oh * ow;
+        for oy in 0..oh {
+            for ox in 0..ow {
+                let oidx = dbase + oy * ow + ox;
+                let arg = arg_offsets[oidx] as usize;
+                drow[arg] += dout[oidx];
             }
-        });
+        }
+    };
+    if dense_scatter_should_parallelize(din.len()) {
+        din.par_chunks_mut(ih * iw)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    } else {
+        din.chunks_mut(ih * iw)
+            .enumerate()
+            .for_each(|(plane, drow)| scatter_plane(plane, drow));
+    }
     din
 }
 
