@@ -53,7 +53,10 @@ fn grid_current(threads: usize) -> (usize, usize) {
 /// naive balance: largest divisor of T that is <= sqrt(T); q = T/p  => p*q == T (32 -> 4x8)
 fn grid_balanced(threads: usize) -> (usize, usize) {
     let lim = (threads as f64).sqrt().floor().max(1.0) as usize;
-    let p = (1..=lim).filter(|c| threads % c == 0).max().unwrap_or(1);
+    let p = (1..=lim)
+        .filter(|c| threads.is_multiple_of(*c))
+        .max()
+        .unwrap_or(1);
     (p, threads / p)
 }
 
@@ -64,7 +67,7 @@ fn grid_balanced(threads: usize) -> (usize, usize) {
 fn grid_selected(threads: usize, n: usize) -> (usize, usize) {
     let mut best_q = 1usize;
     for q in 1..=threads {
-        if threads % q == 0 && n.div_ceil(q) >= MIN_BLOCK_COLS {
+        if threads.is_multiple_of(q) && n.div_ceil(q) >= MIN_BLOCK_COLS {
             best_q = q; // keep the largest valid divisor q
         }
     }
@@ -74,7 +77,7 @@ fn grid_selected(threads: usize, n: usize) -> (usize, usize) {
 /// all divisor pairs (p, T/p) of T, ascending in p
 fn divisor_grids(threads: usize) -> Vec<(usize, usize)> {
     (1..=threads)
-        .filter(|p| threads % p == 0)
+        .filter(|p| threads.is_multiple_of(*p))
         .map(|p| (p, threads / p))
         .collect()
 }
