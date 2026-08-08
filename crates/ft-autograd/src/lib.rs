@@ -20942,6 +20942,54 @@ mod tests {
         );
     }
 
+    // The family has FOUR accumulators that can construct an empty slot, and all four
+    // must agree on the sign of zero or two code paths computing the same gradient
+    // disagree in its bits. A precise per-function audit (bounded by the next `fn`, not
+    // by a line window) confirmed all four canonicalize; these two extend the executable
+    // guard to the closure-based pair, which had been verified only by reading.
+    // `accumulate_existing_tensor_gradient` and `accumulate_persistent_gradients` are
+    // deliberately absent: neither constructs a slot — the first only accumulates into
+    // an existing buffer, the second Arc-clones an already-canonicalized one.
+    #[test]
+    fn zip_map_gradient_accumulator_canonicalizes_negative_zero() {
+        let node = super::TensorNodeId(0);
+        let mut slot = super::TensorGradientSlot::new(3);
+        // f returns -0.0 for every element, so an uncanonicalized empty-slot build
+        // would leave -0.0 in the buffer.
+        super::TensorTape::accumulate_tensor_gradient_zip_map(
+            node,
+            &mut slot,
+            &[1.0, 2.0, 3.0],
+            &[1.0, 2.0, 3.0],
+            |_incoming, _value| -0.0,
+        )
+        .expect("zip_map");
+        assert_eq!(
+            slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vec![0.0f64; 3]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "zip_map accumulator must map -0.0 to +0.0 on an empty slot"
+        );
+    }
+
+    #[test]
+    fn par_with_gradient_accumulator_canonicalizes_negative_zero() {
+        let node = super::TensorNodeId(0);
+        let mut slot = super::TensorGradientSlot::new(3);
+        super::TensorTape::accumulate_tensor_gradient_par_with(node, &mut slot, 3, |_index| -0.0)
+            .expect("par_with");
+        assert_eq!(
+            slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            vec![0.0f64; 3]
+                .iter()
+                .map(|v| v.to_bits())
+                .collect::<Vec<_>>(),
+            "par_with accumulator must map -0.0 to +0.0 on an empty slot"
+        );
+    }
+
     #[test]
     fn owned_and_borrowed_gradient_accumulators_agree_on_signed_zero() {
         let node = super::TensorNodeId(0);
