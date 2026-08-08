@@ -39095,6 +39095,160 @@ mod tests {
         );
     }
 
+    // frankentorch-un3os. The 3-D `from_indices` site above got a direct bit-identity
+    // test when it was gated; the other THREE gated sites did not, and were covered
+    // only indirectly by cross-implementation tests. That is a real gap: those tests
+    // compare one kernel against another kernel, so if both were gated the comparison
+    // is serial-vs-serial and a broken serial driver passes. These three close it by
+    // running the PARALLEL driver by hand and comparing bit patterns, exactly as the
+    // 3-D test does.
+    //
+    // Each uses tie-heavy input (so a changed argmax shows) and puts a -0.0 in `dout`
+    // (so a dropped accumulate shows, since -0.0 + 0.0 == +0.0).
+    #[test]
+    fn max_pool3d_backward_scalar_serial_and_parallel_drivers_are_bit_identical() {
+        use rayon::prelude::*;
+
+        let (batch, ch, id, ih, iw) = (2usize, 3usize, 4usize, 6usize, 6usize);
+        let (od, oh, ow) = (id / 2, ih / 2, iw / 2);
+        let n = batch * ch * id * ih * iw;
+        let input: Vec<f64> = (0..n).map(|i| ((i % 5) as f64) - 2.0).collect();
+        let (_, arg_offsets) = super::max_pool3d_forward_with_indices_f64(
+            &input, batch, ch, id, ih, iw, 2, 2, 2, od, oh, ow, 2, 2, 2,
+        );
+        // -0.0 upstream: the scalar path adds the SAME value everywhere, so if the
+        // accumulate were replaced by a store this is what would change sign.
+        let upstream = -0.0f64;
+        let plane_len = id * ih * iw;
+        let out_plane_len = od * oh * ow;
+
+        let mut expected = vec![0.0f64; batch * ch * plane_len];
+        expected
+            .par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| {
+                let dbase = plane * out_plane_len;
+                for &arg_offset in &arg_offsets[dbase..dbase + out_plane_len] {
+                    drow[arg_offset as usize] += upstream;
+                }
+            });
+
+        assert!(!super::dense_scatter_should_parallelize(
+            batch * ch * plane_len
+        ));
+        let got = super::max_pool3d_backward_from_indices_scalar_f64(
+            upstream,
+            &arg_offsets,
+            batch,
+            ch,
+            id,
+            ih,
+            iw,
+            od,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "scalar serial driver must be bit-identical to the parallel one"
+        );
+    }
+
+    #[test]
+    fn max_pool2d_backward_from_indices_serial_and_parallel_drivers_are_bit_identical() {
+        use rayon::prelude::*;
+
+        let (batch, ch, ih, iw) = (2usize, 3usize, 8usize, 8usize);
+        let (oh, ow) = (ih / 2, iw / 2);
+        let n = batch * ch * ih * iw;
+        let input: Vec<f64> = (0..n).map(|i| ((i % 5) as f64) - 2.0).collect();
+        let (_, arg_offsets) = super::max_pool2d_forward_with_indices_f64(
+            &input, batch, ch, ih, iw, 2, 2, oh, ow, 2, 2,
+        );
+        let mut dout: Vec<f64> = (0..batch * ch * oh * ow)
+            .map(|i| ((i % 7) as f64) * 0.25 - 0.75)
+            .collect();
+        dout[0] = -0.0;
+
+        let plane_len = ih * iw;
+        let mut expected = vec![0.0f64; batch * ch * plane_len];
+        expected
+            .par_chunks_mut(plane_len)
+            .enumerate()
+            .for_each(|(plane, drow)| {
+                let dbase = plane * oh * ow;
+                for oy in 0..oh {
+                    for ox in 0..ow {
+                        let oidx = dbase + oy * ow + ox;
+                        drow[arg_offsets[oidx] as usize] += dout[oidx];
+                    }
+                }
+            });
+
+        assert!(!super::dense_scatter_should_parallelize(
+            batch * ch * plane_len
+        ));
+        let got = super::max_pool2d_backward_from_indices_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            ih,
+            iw,
+            oh,
+            ow,
+        );
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "2-D serial driver must be bit-identical to the parallel one"
+        );
+    }
+
+    #[test]
+    fn max_pool1d_backward_from_indices_serial_and_parallel_drivers_are_bit_identical() {
+        use rayon::prelude::*;
+
+        let (batch, ch, len) = (2usize, 3usize, 16usize);
+        let output_len = len / 2;
+        let n = batch * ch * len;
+        let input: Vec<f64> = (0..n).map(|i| ((i % 5) as f64) - 2.0).collect();
+        let (_, arg_offsets) =
+            super::max_pool1d_forward_with_indices_f64(&input, batch, ch, len, 2, output_len, 2);
+        let mut dout: Vec<f64> = (0..batch * ch * output_len)
+            .map(|i| ((i % 7) as f64) * 0.25 - 0.75)
+            .collect();
+        dout[0] = -0.0;
+
+        let mut expected = vec![0.0f64; batch * ch * len];
+        expected
+            .par_chunks_mut(len)
+            .enumerate()
+            .for_each(|(plane, drow)| {
+                let dbase = plane * output_len;
+                for ox in 0..output_len {
+                    let oidx = dbase + ox;
+                    drow[arg_offsets[oidx] as usize] += dout[oidx];
+                }
+            });
+
+        assert!(!super::dense_scatter_should_parallelize(batch * ch * len));
+        let got = super::max_pool1d_backward_from_indices_f64(
+            &dout,
+            &arg_offsets,
+            batch,
+            ch,
+            len,
+            output_len,
+        );
+        assert_eq!(
+            got.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            expected.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            "1-D serial driver must be bit-identical to the parallel one"
+        );
+    }
+
     // Locks WHERE the gate sits. The crossover it encodes is asymmetric — serial wins
     // only ~1.35x just below it but loses ~5.9x just above — so a silent drift upward
     // is far more expensive than a drift downward, and neither should happen unnoticed.
