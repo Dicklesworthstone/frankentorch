@@ -19085,3 +19085,86 @@ Decision: KEEP the already-landed SIMD and contiguous-borrow paths. The next
 GroupNorm performance attempt must target a different measured loss; neither
 the scalar normalization loop nor input materialization remains an acceptable
 incumbent on this workload.
+
+## 2026-08-08 - ★★ REVERT + 5 REFUTATIONS: the pooling dense-scatter lineage, and why a size gate cannot see the tape
+
+Six entries from one lineage. The headline is a lever that was **4.24x faster on
+the isolated kernel and 1.13x slower at the lane**, was shipped, and was reverted.
+Everything else here is a mechanism that looked right and was measured wrong.
+
+**1. REFUTED — "contended first-touch faults" on the dense gradient write
+(`frankentorch-zoqws`).** A standalone bandwidth ladder measured serial
+`slice::fill` at 36.70 GiB/s against `par_chunks_mut` at 6.39 GiB/s and named a
+lever: pay the first touch serially. Landed, then measured in situ: **1.118x
+SLOWER**, CI `[1.050, 1.183]`, 11/12 rounds, +0.152 ms — which is almost exactly
+one serial 8 MiB write, i.e. the fill bought *no* reduction in the parallel pass.
+Reverted. **A standalone ladder's arms differ in allocator warmth, not only in
+write pattern; a kernel called in a loop gets a recycled block, so the fresh-mmap
+premise never applies.**
+
+**2. REVERTED — the L3-residency size gate (`un3os` → `frankentorch-8obhh`).**
+A real, reproducible crossover exists: for *sparse* scatter into an L3-resident
+buffer, one thread beats 64.
+
+```
+  MiB     1      4      8     12     16     24  |    32    128    256
+par/ser  12.5   5.27   3.16   2.88   2.29   1.35 |  0.17   0.15   0.15
+```
+
+Gating four max_pool backwards to serial below 16 MiB gave 1.4–2.2x per kernel
+(4.24x on the profiled one) with flat controls. **At the lane it was a LOSS:**
+pooled n=31 across two 16-round two-ELF A/Bs, rr `1.133`, CI `[1.042, 1.198]`,
+**31/31 rounds slower**, with conv3d as a clean negative control at `1.002`
+`[0.963, 1.032]`. Reverted in full.
+
+**The transferable finding: the gate keyed on BUFFER SIZE as a proxy for L3
+residency. In an isolated probe the buffer owns L3 and the proxy holds. In a real
+session the autograd tape holds many live tensors and it does not. A SIZE GATE
+CANNOT SEE THE TAPE.** Any future residency lever needs a working-set signal, and
+must be A/B'd at the lane with a negative control — not only at the kernel.
+
+**3. REFUTED — the same gate on avg_pool backward (`frankentorch-o5t00`).** An
+active **~1.27x LOSS** (avg_pool2d `1.266`, CI `[1.108, 1.502]`; avg_pool1d
+`1.289`, CI `[1.185, 1.646]`), while the anchor kernel reconfirmed 1.96x in the
+same run. **The discriminator is sparsity of the write, not work-per-byte:**
+max_pool scatters write one value per output element (every cache line touched,
+no work, L3-resident → serial wins); avg_pool writes *every* element with
+arithmetic (real work → parallel wins). `max_pool3d_backward_2x2s2` sits between —
+sparse writes but heavy input re-reads — and measured inconclusive (`1.03`, CI
+`[0.731, 1.122]`), so it was left ungated.
+
+**4. NO KERNEL LEVER — avg_pool2d (`frankentorch-k1h8g`, closed).** FT's
+avg_pool2d kernels are **~1.5 ms conditioned against PyTorch's *whole op* of
+1.70–2.71 ms**. They already win. Infinitely fast kernels barely move a lane that
+is 2.2–2.3x slower; the remainder is engine.
+
+**5. NO SINGLE SUB-MECHANISM — the backward stage (`frankentorch-27aci`,
+closed).** The dominant stage is `tensor_backward` at ~4–6x its own kernel. All
+five named candidates were tested and eliminated: the pad/unpad pair (no pad node
+at padding `(0,0)`), the full-size root init (root is the scalar sum, numel = 1),
+tape retention (flat over 8 fwd+bwd cycles in one session, 0.93x / 1.08x),
+create_graph (`strict_default` sets it FALSE so the path never pays it — though it
+costs **3.5x** when enabled, 8.2 → 29.8 ms, a separate double-backward fact), and
+a full-size −0.0 canonicalization pass in `accumulate_tensor_gradient_owned` that
+is real but plausibly only ~5–10%. **The cost is diffuse.** Advancing it needs
+instruction-granularity profiling, which no probe in this tree does, or a
+ledgered bound. **Do not add a sixth speculative candidate.**
+
+**6. MEASUREMENT HAZARDS THAT PRODUCED THREE WRONG PUBLISHED NUMBERS OF MINE.**
+Recorded because each survived review-by-plausibility:
+
+- **An unconditioned probe measures allocator history.** Two byte-identical lanes
+  read **83% apart**; a later sweep showed identical work costing 11.9 ms or
+  1.8 ms purely by direction — cost tracks *whether the size is the largest yet
+  allocated in the process*. Fix: `condition_allocator()` before every timed rep,
+  plus an A/A pair **at different positions** (back-to-back passes and hides it).
+- **A harness that prints a hard-coded conclusion.** A probe printed "within the
+  A/A null ⇒ not the term" over an 8.2-vs-29.8 ms gap. If the verdict cannot
+  change when the numbers change, it is documentation posing as a result.
+- **A ratio mixing conditioned and unconditioned figures.** "18x its kernel" was a
+  conditioned stage over an unconditioned kernel; both conditioned it is ~6x. An
+  earlier "34x" was ~2x inflated the same way. Both withdrawn.
+
+**Also: an A/A PASS does not license a CROSS-RUN comparison.** It certifies
+within-invocation resolution only. Two h2h runs at load 28.9 and 86 are not a
+delta, however green both gates are.
