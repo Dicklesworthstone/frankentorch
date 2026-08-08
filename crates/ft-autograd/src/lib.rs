@@ -20459,21 +20459,23 @@ impl TensorTape {
     ) -> Result<(), AutogradError> {
         // The single most-called gradient accumulator (~95 backward arms). Fan the
         // fill/accumulate over Rayon above a threshold — bit-for-bit identical to the
-        // serial form (empty slot: ordered `0.0 + value` collect; non-empty:
-        // index-aligned `target[i] += contribution[i]`; below-threshold serial
-        // fallback keeps small-shape callers deterministic). frankentorch-accum-par.
+        // serial form (empty slot: ordered copy; non-empty: index-aligned
+        // `target[i] += contribution[i]`; below-threshold serial fallback keeps
+        // small-shape callers deterministic). frankentorch-accum-par.
+        //
+        // frankentorch-dtyiz: the empty-slot build is a plain COPY. It used to be
+        // `0.0 + value`, which canonicalized `-0.0 -> +0.0` and diverged from PyTorch:
+        // measured on torch 2.12.1, `sum(x * -0.0)` gives `x.grad == -0.0` while
+        // FrankenTorch gave `+0.0`. All four accumulators that can construct an empty
+        // slot dropped it TOGETHER — removing it from only some would make two paths
+        // computing one gradient disagree, which is worse than a uniform divergence.
         const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
-            if contribution.len() >= PAR_MIN {
-                use rayon::prelude::*;
-                target.values = contribution.par_iter().map(|&value| 0.0 + value).collect();
-            } else {
-                target.values.reserve(contribution.len());
-                for &value in contribution {
-                    target.values.push(0.0 + value);
-                }
-            }
+            // frankentorch-dtyiz: with the -0.0 canonicalization gone this is a plain
+            // copy, so the parallel/serial split that used to straddle `0.0 + value`
+            // has nothing left to straddle. One memcpy for both sizes.
+            target.values.extend_from_slice(contribution);
             return Ok(());
         }
         Self::ensure_tensor_len(node, target.values.len(), contribution.len())?;
@@ -20498,31 +20500,24 @@ impl TensorTape {
     /// buffer. On the FIRST contribution to a (lazy, empty) gradient slot — the
     /// common case for a leaf or single-use intermediate input — the owned buffer is
     /// moved into the slot in place (no fresh allocation, no second-buffer copy)
-    /// instead of `reserve + push(0.0 + value)`. The `*v = 0.0 + *v` normalization is
-    /// applied in place so the result is BIT-IDENTICAL to the borrowed path (it only
-    /// canonicalizes `-0.0 -> +0.0`, matching the prior `0.0 + value`). Used by the
+    /// instead of `reserve + push`. It is BIT-IDENTICAL to the borrowed path, which
+    /// also copies the contribution verbatim — frankentorch-dtyiz removed the old
+    /// `-0.0 -> +0.0` normalization from both, since PyTorch PRESERVES the sign of a
+    /// zero gradient and FrankenTorch was canonicalizing it away. Used by the
     /// CustomFunction backward arm, whose closures return freshly-allocated, cache-hot
     /// per-input gradient Vecs — eliminating one numel allocation + one numel copy per
     /// backward op (bandwidth-bound win, core-count-independent). frankentorch-kwarf.
     fn accumulate_tensor_gradient_owned(
         node: TensorNodeId,
         target: &mut TensorGradientSlot,
-        mut contribution: Vec<f64>,
+        contribution: Vec<f64>,
     ) -> Result<(), AutogradError> {
         const PAR_MIN: usize = 1 << 15;
         Self::ensure_tensor_len(node, target.expected_len, contribution.len())?;
         if target.values.is_empty() {
-            // Canonicalize -0.0 -> +0.0 in place to match the borrowed path's
-            // `0.0 + value` bit-for-bit (`x += 0.0` == `0.0 + x` by IEEE add
-            // commutativity), then move the buffer in with no fresh allocation.
-            if contribution.len() >= PAR_MIN {
-                use rayon::prelude::*;
-                contribution.par_iter_mut().for_each(|value| *value += 0.0);
-            } else {
-                for value in contribution.iter_mut() {
-                    *value += 0.0;
-                }
-            }
+            // Move the buffer in with no fresh allocation. No sign-of-zero fixup:
+            // the borrowed path copies verbatim too, and PyTorch preserves -0.0
+            // (frankentorch-dtyiz).
             target.values = contribution;
             return Ok(());
         }
@@ -20606,12 +20601,12 @@ impl TensorTape {
                     .par_iter()
                     .copied()
                     .zip(values.par_iter().copied())
-                    .map(|(grad, value)| 0.0 + f(grad, value))
+                    .map(|(grad, value)| f(grad, value))
                     .collect();
             } else {
                 target.values.reserve(incoming.len());
                 for (grad, value) in incoming.iter().copied().zip(values.iter().copied()) {
-                    target.values.push(0.0 + f(grad, value));
+                    target.values.push(f(grad, value));
                 }
             }
             return Ok(());
@@ -20662,12 +20657,12 @@ impl TensorTape {
                 use rayon::prelude::*;
                 target.values = (0..contribution_len)
                     .into_par_iter()
-                    .map(|index| 0.0 + contribution(index))
+                    .map(&contribution)
                     .collect();
             } else {
                 target.values.reserve(contribution_len);
                 for index in 0..contribution_len {
-                    target.values.push(0.0 + contribution(index));
+                    target.values.push(contribution(index));
                 }
             }
             return Ok(());
@@ -20909,21 +20904,19 @@ mod tests {
     use std::collections::BTreeMap;
     use std::sync::{Arc, Mutex};
 
-    // frankentorch-27aci. `accumulate_tensor_gradient_owned` bumps every element by
-    // `+= 0.0` before moving the buffer into an empty slot. That is a FULL-SIZE pass
-    // over the gradient and it looks like pure waste to anyone reading it for perf —
-    // I said so myself on 27aci before checking. It is load-bearing.
+    // frankentorch-dtyiz. These lock the SIGN OF ZERO in gradient accumulation and
+    // assert PRESERVATION, because that is what PyTorch does: measured on torch
+    // 2.12.1, `sum(x * -0.0)` gives `x.grad == -0.0`, and two -0.0 contributions
+    // accumulate to -0.0.
     //
-    // The BORROWED accumulator builds an empty slot with `0.0 + value`, which maps
-    // -0.0 to +0.0. The OWNED path moves the caller's buffer in instead of rebuilding
-    // it, so without the bump a -0.0 contribution would survive as -0.0 and the two
-    // accumulators would disagree on the SIGN OF ZERO for the same gradient.
-    //
-    // Nothing tested this: the owned accumulator has one call site and no direct
-    // coverage. These two tests lock the invariant from both sides so the line cannot
-    // be deleted as dead weight.
+    // They were first written (27aci) asserting the OPPOSITE — that canonicalizing
+    // -0.0 to +0.0 was load-bearing — because I checked FrankenTorch's two paths
+    // against each other and never checked either against torch. Self-consistency is
+    // a real invariant and is still guarded here, but it is not correctness: the
+    // owned-vs-borrowed test below passes under EITHER convention, while the three
+    // single-accumulator tests are what pin the convention itself.
     #[test]
-    fn owned_gradient_accumulator_canonicalizes_negative_zero() {
+    fn owned_gradient_accumulator_preserves_negative_zero() {
         let node = super::TensorNodeId(0);
         let mut slot = super::TensorGradientSlot::new(4);
         super::TensorTape::accumulate_tensor_gradient_owned(
@@ -20934,11 +20927,11 @@ mod tests {
         .expect("accumulate");
         assert_eq!(
             slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vec![0.0f64, 0.0, 0.0, 1.5]
+            vec![-0.0f64, 0.0, -0.0, 1.5]
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
-            "owned accumulator must map -0.0 to +0.0 on an empty slot"
+            "owned accumulator must PRESERVE -0.0, matching PyTorch"
         );
     }
 
@@ -20951,7 +20944,7 @@ mod tests {
     // deliberately absent: neither constructs a slot — the first only accumulates into
     // an existing buffer, the second Arc-clones an already-canonicalized one.
     #[test]
-    fn zip_map_gradient_accumulator_canonicalizes_negative_zero() {
+    fn zip_map_gradient_accumulator_preserves_negative_zero() {
         let node = super::TensorNodeId(0);
         let mut slot = super::TensorGradientSlot::new(3);
         // f returns -0.0 for every element, so an uncanonicalized empty-slot build
@@ -20966,27 +20959,27 @@ mod tests {
         .expect("zip_map");
         assert_eq!(
             slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vec![0.0f64; 3]
+            vec![-0.0f64; 3]
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
-            "zip_map accumulator must map -0.0 to +0.0 on an empty slot"
+            "zip_map accumulator must PRESERVE -0.0, matching PyTorch"
         );
     }
 
     #[test]
-    fn par_with_gradient_accumulator_canonicalizes_negative_zero() {
+    fn par_with_gradient_accumulator_preserves_negative_zero() {
         let node = super::TensorNodeId(0);
         let mut slot = super::TensorGradientSlot::new(3);
         super::TensorTape::accumulate_tensor_gradient_par_with(node, &mut slot, 3, |_index| -0.0)
             .expect("par_with");
         assert_eq!(
             slot.values.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
-            vec![0.0f64; 3]
+            vec![-0.0f64; 3]
                 .iter()
                 .map(|v| v.to_bits())
                 .collect::<Vec<_>>(),
-            "par_with accumulator must map -0.0 to +0.0 on an empty slot"
+            "par_with accumulator must PRESERVE -0.0, matching PyTorch"
         );
     }
 
