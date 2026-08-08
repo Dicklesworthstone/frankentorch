@@ -16032,11 +16032,10 @@ impl TensorTape {
                         &exp_shape,
                         "pow backward exponent shape overflow",
                     )?;
-                    let exp_node =
-                        self.leaf(vec![exponent; exp_numel], exp_shape.clone(), false)?;
-                    let exp_m1_node =
-                        self.leaf(vec![exponent - 1.0; exp_numel], exp_shape, false)?;
-                    let x_pow = self.cg_pow(input, exp_m1_node)?;
+                    let exp_node = self.leaf(vec![exponent; exp_numel], exp_shape, false)?;
+                    // frankentorch-ut5sy: cg_pow takes the scalar directly now; the uniform
+                    // exp_m1 leaf that used to carry it was a numel-sized allocation for one value.
+                    let x_pow = self.cg_pow(input, exponent - 1.0)?;
                     let n_x_pow = self.cg_mul(exp_node, x_pow)?;
                     let grad_in = self.cg_mul(incoming_id, n_x_pow)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
@@ -16533,10 +16532,10 @@ impl TensorTape {
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let numel = Self::checked_shape_numel(&shape, "asin backward shape overflow")?;
                     let ones = self.leaf(vec![1.0; numel], shape.clone(), false)?;
-                    let half = self.leaf(vec![0.5; numel], shape, false)?;
                     let x_sq = self.cg_mul(input, input)?;
                     let one_minus = self.cg_sub(ones, x_sq)?;
-                    let sqrt_term = self.cg_pow(one_minus, half)?;
+                    // frankentorch-ut5sy: scalar exponent, no uniform-0.5 leaf needed.
+                    let sqrt_term = self.cg_pow(one_minus, 0.5)?;
                     let grad_in = self.cg_div(incoming_id, sqrt_term)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
                     Self::complete_dependency(&mut pending, input, &mut queue)?;
@@ -16551,10 +16550,10 @@ impl TensorTape {
                     let shape = self.nodes[input.0].tensor.meta().shape().to_vec();
                     let numel = Self::checked_shape_numel(&shape, "acos backward shape overflow")?;
                     let ones = self.leaf(vec![1.0; numel], shape.clone(), false)?;
-                    let half = self.leaf(vec![0.5; numel], shape, false)?;
                     let x_sq = self.cg_mul(input, input)?;
                     let one_minus = self.cg_sub(ones, x_sq)?;
-                    let sqrt_term = self.cg_pow(one_minus, half)?;
+                    // frankentorch-ut5sy: scalar exponent, no uniform-0.5 leaf needed.
+                    let sqrt_term = self.cg_pow(one_minus, 0.5)?;
                     let quot = self.cg_div(incoming_id, sqrt_term)?;
                     let grad_in = self.cg_neg(quot)?;
                     self.cg_accumulate(input, &mut grad_nodes, grad_in)?;
@@ -18958,27 +18957,32 @@ impl TensorTape {
     }
 
     /// Helper: elementwise pow for create_graph backward.
-    fn cg_pow(
-        &mut self,
-        base: TensorNodeId,
-        exponent: TensorNodeId,
-    ) -> Result<TensorNodeId, AutogradError> {
-        let (requires_grad, result, shape, dtype, device, exp_val) = {
+    /// `base^exponent` for a SCALAR exponent, as a create_graph node.
+    ///
+    /// frankentorch-ut5sy: this used to take `exponent: TensorNodeId`. It mapped the pair
+    /// elementwise with `b.powf(e)` — correct — and then recorded the tape node as
+    /// `TensorNodeOp::Pow { exponent: exp_data[0] }`, collapsing the whole exponent tensor to its
+    /// FIRST ELEMENT. For a non-uniform exponent the forward was right while the recorded op was
+    /// wrong, so backward would differentiate every element as though its exponent were element
+    /// 0's. Silently: no shape error, no dtype error, just wrong gradients.
+    ///
+    /// Every caller built a uniform-fill leaf purely to pass it, so the tensor parameter bought
+    /// nothing and cost a numel-sized allocation per call. Taking an `f64` makes the recorded op
+    /// accurate BY CONSTRUCTION rather than by caller discipline, and removes the trap outright.
+    ///
+    /// A genuine tensor-exponent pow is a different op with a two-input backward
+    /// (`d/de = x^e·ln x`), tracked as frankentorch-v8f5k. It must not be built by bending this
+    /// one into the role.
+    fn cg_pow(&mut self, base: TensorNodeId, exponent: f64) -> Result<TensorNodeId, AutogradError> {
+        let (requires_grad, result, shape, dtype, device) = {
             let base_node = self.node(base)?;
-            let exp_node = self.node(exponent)?;
             let base_data = base_node.tensor.contiguous_values_as_f64()?;
-            let exp_data = exp_node.tensor.contiguous_values_as_f64()?;
             let shape = base_node.tensor.meta().shape().to_vec();
             let dtype = base_node.tensor.meta().dtype();
             let device = base_node.tensor.meta().device();
-            let rg = base_node.requires_grad || exp_node.requires_grad;
-            let exp_val = exp_data[0];
-            let result: Vec<f64> = base_data
-                .iter()
-                .zip(exp_data.iter())
-                .map(|(&b, &e)| b.powf(e))
-                .collect();
-            (rg, result, shape, dtype, device, exp_val)
+            let rg = base_node.requires_grad;
+            let result: Vec<f64> = base_data.iter().map(|&b| b.powf(exponent)).collect();
+            (rg, result, shape, dtype, device)
         };
 
         let meta = ft_core::TensorMeta::from_shape(shape, dtype, device);
@@ -18988,7 +18992,7 @@ impl TensorTape {
             requires_grad,
             op: TensorNodeOp::Pow {
                 input: base,
-                exponent: exp_val,
+                exponent,
             },
         });
         Ok(out)
